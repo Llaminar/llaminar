@@ -24,6 +24,7 @@
 
 namespace llaminar2
 {
+    struct ContiguousFloatingPointWeightDescriptor;
     class IBackend;
     class IWorkerGPUContext;
 
@@ -62,6 +63,8 @@ namespace llaminar2
      *   bytes in device staging storage, then DMA writes a pinned host chunk;
      * - CPU to GPU: pinned CPU-format bytes DMA into device staging storage,
      *   then the destination GPU converts them into its inactive packed arrays.
+     * - floating GPU/CPU edges: FP16, BF16, or FP32 bytes stream unchanged
+     *   through the same pinned chunks and event-polled auxiliary stream.
      *
      * Only one transfer may occupy a lane at a time. A scheduler obtains true
      * parallelism by materializing several named lanes before inference starts.
@@ -138,6 +141,32 @@ namespace llaminar2
             std::string *error = nullptr) noexcept;
 
         /**
+         * @brief Stream one contiguous floating matrix from GPU to final CPU storage.
+         * @param source Exact immutable GPU FP16/BF16/FP32 matrix.
+         * @param final_cpu_bytes Inactive CPU slot with exactly @p source bytes.
+         * @param source_readiness Exact producer event or installed-bank proof.
+         * @param error Optional exact start failure.
+         * @return Whether the first D2H chunk and completion event were enqueued.
+         */
+        bool startGpuToCpuContiguous(
+            const ContiguousFloatingPointWeightDescriptor &source,
+            std::span<std::uint8_t> final_cpu_bytes,
+            const ExpertTierSourceReadiness &source_readiness,
+            std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Stream final CPU floating bytes into an inactive GPU matrix.
+         * @param cpu_bytes Immutable CPU FP16/BF16/FP32 matrix bytes.
+         * @param destination Exact inactive GPU floating matrix descriptor.
+         * @param error Optional exact start failure.
+         * @return Whether the first H2D chunk and completion event were enqueued.
+         */
+        bool startCpuToGpuContiguous(
+            std::span<const std::uint8_t> cpu_bytes,
+            const ContiguousFloatingPointWeightDescriptor &destination,
+            std::string *error = nullptr) noexcept;
+
+        /**
          * @brief Advance the state machine using a non-blocking event query.
          * @param error Optional exact query or enqueue failure.
          * @return Current transfer progress after at most one completed chunk.
@@ -185,9 +214,17 @@ namespace llaminar2
         enum class Direction
         {
             None,
-            GpuToCpu,
-            CpuToGpu,
+            GpuToCpuRepacked,
+            CpuToGpuRepacked,
+            GpuToCpuContiguous,
+            CpuToGpuContiguous,
         };
+
+        /** @return Whether the active direction writes final host storage. */
+        [[nodiscard]] bool isGpuToCpuDirection() const noexcept;
+
+        /** @return Whether the active direction carries raw floating bytes. */
+        [[nodiscard]] bool isContiguousDirection() const noexcept;
 
         /** @brief Record a stable failure diagnostic and exported counter. */
         ExpertTierWeightTransferProgress fail(
@@ -244,6 +281,10 @@ namespace llaminar2
         ExpertTierGpuMutableProjectionView gpu_destination_;
         std::span<std::uint8_t> cpu_destination_;
         std::span<const std::uint8_t> cpu_source_;
+        const std::uint8_t *gpu_contiguous_source_ = nullptr;
+        std::uint8_t *gpu_contiguous_destination_ = nullptr;
+        std::size_t contiguous_total_bytes_ = 0;
+        std::size_t contiguous_completed_bytes_ = 0;
         std::uint32_t completed_units_ = 0;
         std::uint32_t in_flight_units_ = 0;
         std::size_t in_flight_bytes_ = 0;

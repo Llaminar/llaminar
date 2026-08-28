@@ -291,6 +291,15 @@ namespace llaminar2
         uint32_t expert = 0;
         uint32_t source_participant = 0;
         uint32_t destination_participant = 0;
+        /**
+         * Overlay-wide route published when ownership moves to the destination.
+         *
+         * `destination_participant` is scoped to one homogeneous compute
+         * domain. This field names the corresponding global sparse-packet
+         * endpoint and is deliberately signed so `-1` remains an invalid,
+         * fail-fast command value. Replica-only commands do not consume it.
+         */
+        int32_t destination_overlay_participant = -1;
         uint32_t source_resident_mask = 0;
         uint32_t flags = 0;
         uint32_t destination_slot = kDeviceMoEInvalidSlot;
@@ -783,6 +792,10 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceWaveProgress>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceGraphControllerState>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
+    static_assert(
+        sizeof(DeviceMoERebalancePlanEntry) ==
+            moe_rebalance_abi::kPlanEntryBytes,
+        "host rebalance plan ABI must match the shared device contract");
     static_assert(std::is_trivially_copyable_v<DeviceMoEExpertDirectoryEntry>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceApplyStatus>);
 
@@ -2118,6 +2131,12 @@ namespace llaminar2
                     static_cast<uint8_t>(DeviceMoEReplicaRole::None);
             }
             bank.experts[plan.expert] = desc;
+            if (ownership_transfer &&
+                plan.destination_overlay_participant >= 0)
+            {
+                bank.overlay_route_participant[plan.expert] =
+                    plan.destination_overlay_participant;
+            }
             bank.resident_participant_mask[plan.expert] =
                 resident_mask & valid_mask;
             if (plan.op == static_cast<uint32_t>(

@@ -66,6 +66,8 @@ namespace llaminar2
                 return "exchanging_service_readiness";
             case MoEOverlayEconomyCertificationState::ExchangingServiceEvidence:
                 return "exchanging_service_evidence";
+            case MoEOverlayEconomyCertificationState::RebasingRoutingEvidence:
+                return "rebasing_routing_evidence";
             case MoEOverlayEconomyCertificationState::Complete:
                 return "complete";
             case MoEOverlayEconomyCertificationState::Failed:
@@ -220,6 +222,56 @@ namespace llaminar2
         try
         {
             auto current = state();
+            if (current ==
+                MoEOverlayEconomyCertificationState::
+                    RebasingRoutingEvidence)
+            {
+                if (config_.target !=
+                        MoEOverlayEconomyCertificationTarget::
+                            ResidencyAuthority ||
+                    !pending_host_profiles_ ||
+                    !pending_host_profiles_->valid())
+                {
+                    throw std::logic_error(
+                        "ExpertOverlay routing-evidence rebase lost its complete host profiles");
+                }
+
+                routing_evidence_rebase_polls_.fetch_add(
+                    1, std::memory_order_relaxed);
+                const auto progress =
+                    config_.authority->progressEconomyEvidenceRebase();
+                if (progress == MoEOverlayHistogramRebaseProgress::Pending)
+                    return;
+
+                /*
+                 * The fresh histogram generation is authoritative before the
+                 * economy certificate becomes visible.  Consequently the
+                 * maintenance service cannot issue a proposal from traffic
+                 * used only to measure prepared-expert service cost.
+                 */
+                auto profiles = std::move(*pending_host_profiles_);
+                pending_host_profiles_.reset();
+                config_.authority->installEconomyCertification(
+                    std::move(profiles.service),
+                    std::move(profiles.migration),
+                    profiles.policy);
+                routing_evidence_rebases_.fetch_add(
+                    1, std::memory_order_relaxed);
+                certifications_installed_.fetch_add(
+                    1, std::memory_order_relaxed);
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_residency",
+                    "economy_routing_evidence_rebases",
+                    1.0,
+                    "maintenance",
+                    config_.perf_device,
+                    {{"calibration_demand_discarded", "true"},
+                     {"blocking_inference", "false"},
+                     {"policy_owner", "host"}});
+                markComplete();
+                return;
+            }
+
             if (current ==
                 MoEOverlayEconomyCertificationState::CalibratingMovement)
             {
@@ -409,7 +461,7 @@ namespace llaminar2
                  * stop request arriving after that point cannot roll one rank
                  * back while its peers install the same immutable certificate.
                  */
-                installCompleteEvidence(std::move(complete_service));
+                composeCompleteEvidence(std::move(complete_service));
                 return;
             }
 
@@ -598,7 +650,7 @@ namespace llaminar2
                     now + config_.service_readiness_retry_interval;
                 return;
             }
-            installCompleteEvidence(std::move(raw_service));
+            composeCompleteEvidence(std::move(raw_service));
         }
         catch (const std::exception &error)
         {
@@ -611,7 +663,7 @@ namespace llaminar2
         }
     }
 
-    void MoEOverlayEconomyCertificationController::installCompleteEvidence(
+    void MoEOverlayEconomyCertificationController::composeCompleteEvidence(
         std::vector<MoEOverlayParticipantLayerServiceTotals> raw_service)
     {
         if (!expanded_migration_measurements_ ||
@@ -655,38 +707,45 @@ namespace llaminar2
                 "ExpertOverlay economy composer returned incomplete certified profiles");
         }
         profiles_composed_.fetch_add(1, std::memory_order_relaxed);
-        recordServicePriorityCrossovers(
+        recordCertifiedServiceEconomy(
             *profiles.service,
             *snapshot->placement_plan);
         if (config_.target ==
             MoEOverlayEconomyCertificationTarget::ResidencyAuthority)
         {
-            config_.authority->installEconomyCertification(
-                std::move(profiles.service),
-                std::move(profiles.migration),
-                profiles.policy);
-            certifications_installed_.fetch_add(
-                1, std::memory_order_relaxed);
-        }
-        else
-        {
-            /* The host owns measurement evidence, not placement. Publish one
-             * immutable bundle for the mapped-fabric writer before Complete is
-             * release-stored; the device controller remains the only policy
-             * and durable-epoch authority. */
+            if (pending_host_profiles_)
             {
-                std::lock_guard<std::mutex> lock(
-                    detached_profiles_mutex_);
-                if (detached_profiles_)
-                {
-                    throw std::logic_error(
-                        "ExpertOverlay detached economy profiles were published more than once");
-                }
-                detached_profiles_ = std::move(profiles);
+                throw std::logic_error(
+                    "ExpertOverlay host economy profiles were composed more than once");
             }
-            detached_profiles_completed_.fetch_add(
-                1, std::memory_order_relaxed);
+            pending_host_profiles_ = std::move(profiles);
+            state_.store(
+                MoEOverlayEconomyCertificationState::
+                    RebasingRoutingEvidence,
+                std::memory_order_release);
+            return;
         }
+
+        /* The host owns measurement evidence, not placement. Publish one
+         * immutable bundle for the mapped-fabric writer before Complete is
+         * release-stored; the device controller remains the only policy and
+         * durable-epoch authority. */
+        {
+            std::lock_guard<std::mutex> lock(detached_profiles_mutex_);
+            if (detached_profiles_)
+            {
+                throw std::logic_error(
+                    "ExpertOverlay detached economy profiles were published more than once");
+            }
+            detached_profiles_ = std::move(profiles);
+        }
+        detached_profiles_completed_.fetch_add(
+            1, std::memory_order_relaxed);
+        markComplete();
+    }
+
+    void MoEOverlayEconomyCertificationController::markComplete()
+    {
         state_.store(
             MoEOverlayEconomyCertificationState::Complete,
             std::memory_order_release);
@@ -711,7 +770,7 @@ namespace llaminar2
     }
 
     void MoEOverlayEconomyCertificationController::
-        recordServicePriorityCrossovers(
+        recordCertifiedServiceEconomy(
         const MoERoutedTierServiceProfile &profile,
         const MoERoutedExpertPlacementPlan &plan) const
     {
@@ -722,6 +781,54 @@ namespace llaminar2
         {
             throw std::invalid_argument(
                 "ExpertOverlay crossover diagnostics received incomplete service geometry");
+        }
+
+        const std::size_t participant_count =
+            profile.participant_costs.empty()
+                ? 0u
+                : profile.participant_costs.size() / layer_count;
+        if (participant_count == 0u ||
+            profile.participant_costs.size() !=
+                participant_count * layer_count)
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay service diagnostics received incomplete participant geometry");
+        }
+        for (const auto &row : profile.participant_costs)
+        {
+            if (row.participant_id < 0 || row.layer < 0 ||
+                static_cast<std::size_t>(row.participant_id) >=
+                    participant_count ||
+                static_cast<std::size_t>(row.layer) >= layer_count)
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay service diagnostics received an invalid participant coordinate");
+            }
+            for (std::size_t phase = 0;
+                 phase < kExpertHistogramProductionSourceCount;
+                 ++phase)
+            {
+                if (!profile.active_sources[phase])
+                    continue;
+                const std::uint64_t cost =
+                    row.nanoseconds_per_activation[phase];
+                if (cost == 0u)
+                {
+                    throw std::invalid_argument(
+                        "ExpertOverlay service diagnostics received a zero active participant cost");
+                }
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_residency",
+                    "certified_participant_service_ns_per_activation",
+                    static_cast<double>(cost),
+                    "maintenance",
+                    config_.perf_device,
+                    {{"participant",
+                      std::to_string(row.participant_id)},
+                     {"layer", std::to_string(row.layer)},
+                     {"source", serviceSourceName(phase)},
+                     {"service_profile", profile.identity}});
+            }
         }
 
         std::vector<const MoERoutedTierLayerPhaseServiceCost *> rows(
@@ -1051,6 +1158,12 @@ namespace llaminar2
                     std::memory_order_relaxed),
             .profiles_composed =
                 profiles_composed_.load(std::memory_order_relaxed),
+            .routing_evidence_rebase_polls =
+                routing_evidence_rebase_polls_.load(
+                    std::memory_order_relaxed),
+            .routing_evidence_rebases =
+                routing_evidence_rebases_.load(
+                    std::memory_order_relaxed),
             .certifications_installed =
                 certifications_installed_.load(std::memory_order_relaxed),
             .detached_profiles_completed =

@@ -1200,6 +1200,100 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEOverlayParticipantResidencyRegistry::
+        finalizeInitialBanksFromPreparedRegistry(
+            const ExpertGemmRegistry &registry,
+            std::string *error)
+    {
+        if (error)
+            error->clear();
+
+        /*
+         * Do not hold the registry mutex while acquiring model-owned engine
+         * lifetimes or calling registerInitialLayer(). The configuration is
+         * immutable after construction, and registerInitialLayer owns the
+         * short assembly/publication critical section for each exact layer.
+         */
+        const auto participant_ids = localParticipantIds();
+        for (const int participant_id : participant_ids)
+        {
+            const auto *participant =
+                config_.owner_map.participantForId(participant_id);
+            if (!participant)
+            {
+                if (error)
+                {
+                    *error =
+                        "ExpertOverlay initial-bank finalization lost participant " +
+                        std::to_string(participant_id) +
+                        " from the frozen owner map";
+                }
+                return false;
+            }
+
+            for (int layer_idx = 0;
+                 layer_idx < config_.num_layers;
+                 ++layer_idx)
+            {
+                const auto resident_mask =
+                    config_.owner_map.expertMaskForParticipant(
+                        layer_idx,
+                        participant_id,
+                        config_.num_experts);
+                std::vector<MoEOverlayPreparedExpertTriplet> experts;
+                std::string detail;
+                if (!resolveMoEOverlayPreparedExpertTriplets(
+                        registry,
+                        *participant,
+                        layer_idx,
+                        config_.num_experts,
+                        resident_mask,
+                        experts,
+                        &detail))
+                {
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay initial-bank finalization could not "
+                            "resolve participant " +
+                            std::to_string(participant_id) + " layer " +
+                            std::to_string(layer_idx) + ": " + detail;
+                    }
+                    return false;
+                }
+                if (!registerInitialLayer(
+                        participant_id,
+                        layer_idx,
+                        resident_mask,
+                        experts,
+                        &detail))
+                {
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay initial-bank finalization rejected "
+                            "participant " +
+                            std::to_string(participant_id) + " layer " +
+                            std::to_string(layer_idx) + ": " + detail;
+                    }
+                    return false;
+                }
+            }
+        }
+
+        if (!allInitialBanksReady())
+        {
+            if (error)
+            {
+                *error =
+                    "ExpertOverlay initial-bank finalization completed every "
+                    "prepared layer but did not publish every local bank";
+            }
+            return false;
+        }
+        return true;
+    }
+
     std::shared_ptr<MoEOverlayParticipantResidency>
     MoEOverlayParticipantResidencyRegistry::endpoint(
         int participant_id) const noexcept
@@ -1252,6 +1346,20 @@ namespace llaminar2
             static_cast<std::size_t>(config_.num_layers));
         for (const int participant_id : participant_ids)
         {
+            const auto *const participant =
+                config_.owner_map.participantForId(participant_id);
+            if (!participant)
+            {
+                throw std::logic_error(
+                    "ExpertOverlay initial-bank snapshot cannot resolve its canonical participant");
+            }
+            const auto tier_participants =
+                config_.owner_map.participantIdsForTier(participant->tier_idx);
+            if (tier_participants.empty())
+            {
+                throw std::logic_error(
+                    "ExpertOverlay initial-bank snapshot resolved an empty ownership tier");
+            }
             const auto found = endpoints_.find(participant_id);
             if (found == endpoints_.end())
             {
@@ -1291,6 +1399,9 @@ namespace llaminar2
                 InitialBankExpertSelection selection{
                     .participant_id = participant_id,
                     .device = lease->device,
+                    .tier_idx = participant->tier_idx,
+                    .tier_participant_count =
+                        static_cast<int>(tier_participants.size()),
                     .layer_idx = layer_idx,
                 };
                 selection.expert_ids.reserve(
@@ -1308,6 +1419,10 @@ namespace llaminar2
                         selection.expert_ids.push_back(expert_id);
                     }
                 }
+                selection.matches_frozen_owner_map =
+                    selection.expert_ids ==
+                    config_.owner_map.expertsForParticipant(
+                        layer_idx, participant_id);
                 selections.push_back(std::move(selection));
             }
         }

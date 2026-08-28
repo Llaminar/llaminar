@@ -81,6 +81,55 @@ TEST(Test__DecodeExpertHistogram, Construction)
     EXPECT_FALSE(hist.windowFull());
 }
 
+TEST(Test__DecodeExpertHistogram,
+     AdaptiveWindowPublicationIsRaceSafeAndChangesDemandCapacity)
+{
+    DecodeExpertHistogram hist(makeConfig(1, 8, 2, 4));
+    EXPECT_EQ(hist.windowSize(), 4);
+
+    hist.recordTokenBoundary(0, 4u);
+    EXPECT_TRUE(hist.windowFull());
+    (void)hist.freezeAndRotateWindow();
+    hist.setWindowSize(16);
+
+    EXPECT_EQ(hist.windowSize(), 16);
+    const auto demand = hist.optimizationDemandWindow();
+    EXPECT_EQ(demand.generation, 1u);
+    EXPECT_EQ(demand.capacity_routed_rows, 16u);
+    EXPECT_FALSE(hist.windowFull());
+    EXPECT_THROW(hist.setWindowSize(0), std::invalid_argument);
+}
+
+TEST(Test__DecodeExpertHistogram, OptimizationDemandWindowTracksActiveRCUBank)
+{
+    auto cfg = makeConfig(1, 8, 2, 4);
+    DecodeExpertHistogram hist(cfg);
+
+    const auto initial = hist.optimizationDemandWindow();
+    EXPECT_TRUE(initial.valid());
+    EXPECT_EQ(initial.generation, 0u);
+    EXPECT_EQ(initial.collected_routed_rows, 0u);
+    EXPECT_EQ(initial.capacity_routed_rows, 4u);
+    EXPECT_EQ(initial.remainingRoutedRows(), 4u);
+    EXPECT_TRUE(initial.canAdmitExclusiveCohort(3u));
+    EXPECT_FALSE(initial.canAdmitExclusiveCohort(4u));
+
+    hist.recordTokenBoundary(0, 4u);
+    const auto complete = hist.optimizationDemandWindow();
+    EXPECT_EQ(complete.generation, 0u);
+    EXPECT_EQ(complete.collected_routed_rows, 4u);
+    EXPECT_EQ(complete.remainingRoutedRows(), 0u);
+    EXPECT_FALSE(complete.canAdmitExclusiveCohort(1u));
+
+    const auto frozen = hist.freezeAndRotateWindow();
+    EXPECT_EQ(frozen.generation, 0u);
+    EXPECT_EQ(frozen.token_count, 4u);
+    const auto rotated = hist.optimizationDemandWindow();
+    EXPECT_EQ(rotated.generation, 1u);
+    EXPECT_EQ(rotated.collected_routed_rows, 0u);
+    EXPECT_EQ(rotated.capacity_routed_rows, 4u);
+}
+
 TEST(Test__DecodeExpertHistogram, SingleRecord)
 {
     auto cfg = makeConfig(1, 8, 2, 256);
@@ -928,6 +977,47 @@ TEST(Test__DecodeExpertHistogram, FrozenWindowRetainsExactProductionPhaseEvidenc
         (void)frozen.activationCount(
             ExpertHistogramSource::SyntheticTest, 0, 0),
         std::invalid_argument);
+}
+
+TEST(Test__DecodeExpertHistogram,
+     ValidatedFrozenViewAuthenticatesOnceAndProvidesTypedConstantTimeReads)
+{
+    DecodeExpertHistogram hist(makeConfig(2, 4, 2, 8));
+    const std::array<int, 2> decode_routes{1, 3};
+    const auto merge = hist.mergeRoutedExpertRows(
+        decode_routes.data(),
+        RoutedExpertHistogramMerge{
+            .source = ExpertHistogramSource::DecodeToken,
+            .layer_idx = 1,
+            .real_token_count = 1,
+            .bucket_token_count = 1,
+            .top_k = 2,
+            .route_stride = 2,
+            .count_window_tokens = true,
+        });
+    ASSERT_TRUE(merge) << merge.error;
+
+    const auto frozen = hist.freezeAndRotateWindow();
+    const auto view = frozen.validatedView();
+    EXPECT_EQ(view.numLayers(), 2);
+    EXPECT_EQ(view.numExperts(), 4);
+    EXPECT_EQ(view.generation(), frozen.generation);
+    EXPECT_EQ(view.tokenCount(), frozen.token_count);
+    EXPECT_EQ(view.activationCount(1, 1), 1u);
+    EXPECT_EQ(
+        view.activationCount(
+            ExpertHistogramSource::DecodeToken, 1, 3),
+        1u);
+    EXPECT_THROW((void)view.activationCount(2, 0), std::out_of_range);
+    EXPECT_THROW(
+        (void)view.activationCount(
+            ExpertHistogramSource::SyntheticTest, 1, 1),
+        std::invalid_argument);
+
+    auto malformed = frozen;
+    ++malformed.source_expert_counts.front();
+    EXPECT_FALSE(malformed.valid());
+    EXPECT_THROW((void)malformed.validatedView(), std::invalid_argument);
 }
 
 TEST(Test__DecodeExpertHistogram, PrefillChunkRouteMergeRejectsInvalidRealRowsBeforeMutation)

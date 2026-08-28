@@ -98,6 +98,23 @@ namespace llaminar2
         /// Replace residency metadata for an already registered tensor pointer.
         void updateResidency(const TensorBase *tensor, WeightResidency residency);
 
+        /**
+         * @brief Merge one materialized binding's host-retention policy.
+         *
+         * A physical tensor can feed several graph bindings, including GPU
+         * prepared engines and a CPU floating-point engine at the same time.
+         * `RequiredForCPUExecution` is therefore monotonic for the lifetime of
+         * the model context: a later accelerator binding may not downgrade the
+         * live CPU consumer's source-byte requirement.
+         *
+         * @param tensor Physical tensor consumed by the binding.
+         * @param policy Host policy declared by that binding's typed plan.
+         * @return True when metadata existed and now includes the policy.
+         */
+        bool mergeHostPolicy(
+            const TensorBase *tensor,
+            WeightHostPolicy policy);
+
         /// Render a compact diagnostic string for the tensor metadata.
         std::string describe(const TensorBase *tensor) const;
 

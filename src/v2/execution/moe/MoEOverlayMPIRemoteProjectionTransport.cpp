@@ -76,6 +76,9 @@ namespace llaminar2
                 return "placement_change";
             case MoEOverlayResidencyTransactionPurpose::EconomyCalibration:
                 return "economy_calibration";
+            case MoEOverlayResidencyTransactionPurpose::
+                PreparedContextRestoration:
+                return "prepared_context_restoration";
             }
             return "invalid";
         }
@@ -87,7 +90,9 @@ namespace llaminar2
             return purpose ==
                        MoEOverlayResidencyTransactionPurpose::PlacementChange ||
                    purpose ==
-                       MoEOverlayResidencyTransactionPurpose::EconomyCalibration;
+                       MoEOverlayResidencyTransactionPurpose::EconomyCalibration ||
+                   purpose == MoEOverlayResidencyTransactionPurpose::
+                                  PreparedContextRestoration;
         }
 
         /**
@@ -1612,12 +1617,25 @@ namespace llaminar2
              ++binding_index)
         {
             auto &binding = bindings[binding_index];
-            if (!binding.identity.valid() ||
-                !validTransactionPurpose(binding.purpose) ||
-                binding.lane_index >= impl_->lanes.size())
+            if (!binding.identity.valid())
             {
                 return fail(
-                    "Remote ExpertOverlay wave contains an invalid identity or lane index");
+                    "Remote ExpertOverlay wave contains an invalid projection identity at binding " +
+                    std::to_string(binding_index));
+            }
+            if (!validTransactionPurpose(binding.purpose))
+            {
+                return fail(
+                    "Remote ExpertOverlay wave contains an invalid transaction purpose at binding " +
+                    std::to_string(binding_index));
+            }
+            if (binding.lane_index >= impl_->lanes.size())
+            {
+                return fail(
+                    "Remote ExpertOverlay wave lane exceeds its setup-time BOM: binding=" +
+                    std::to_string(binding_index) +
+                    " lane=" + std::to_string(binding.lane_index) +
+                    " lanes=" + std::to_string(impl_->lanes.size()));
             }
 
             const bool is_source =

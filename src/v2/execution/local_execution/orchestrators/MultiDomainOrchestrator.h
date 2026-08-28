@@ -165,6 +165,8 @@ namespace llaminar2
          * @brief Clear KV cache (reset for new sequence)
          */
         void clear_cache() override;
+        /** @copydoc IInferenceRunner::purgePrefixCache */
+        bool purgePrefixCache() override;
 
         /**
          * @brief Get current position in cache

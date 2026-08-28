@@ -134,6 +134,38 @@ TEST(Test__WeightMetadataRegistry, SourceRegistrationRefreshesStalePointerIdenti
     EXPECT_EQ(meta->residency.home_device, DeviceId::rocm(1));
 }
 
+/**
+ * @brief Accelerator bindings cannot erase a live CPU source-byte consumer.
+ */
+TEST(Test__WeightMetadataRegistry, CpuExecutionHostPolicyIsMonotonic)
+{
+    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 8});
+    WeightMetadataRegistry registry;
+    ASSERT_TRUE(registry.registerSource(
+        tensor.get(), "blk.0.ffn_gate_exps.weight", DeviceId::cpu()));
+
+    ASSERT_TRUE(registry.mergeHostPolicy(
+        tensor.get(), WeightHostPolicy::RequiredForCPUExecution));
+    ASSERT_TRUE(registry.mergeHostPolicy(
+        tensor.get(), WeightHostPolicy::ReleasableAfterPreparation));
+
+    auto residency = registry.residency(tensor.get());
+    ASSERT_TRUE(residency.has_value());
+    EXPECT_EQ(
+        residency->host_policy,
+        WeightHostPolicy::RequiredForCPUExecution);
+
+    // Refreshing the same source for another device is also a policy join,
+    // because the CPU graph remains live in the same model context.
+    EXPECT_FALSE(registry.registerSource(
+        tensor.get(), "blk.0.ffn_gate_exps.weight", DeviceId::cuda(0)));
+    residency = registry.residency(tensor.get());
+    ASSERT_TRUE(residency.has_value());
+    EXPECT_EQ(
+        residency->host_policy,
+        WeightHostPolicy::RequiredForCPUExecution);
+}
+
 TEST(Test__WeightMetadataRegistry, DescribeIncludesIdentity)
 {
     auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 2});

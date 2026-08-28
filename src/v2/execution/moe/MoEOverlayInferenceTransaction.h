@@ -36,6 +36,21 @@ namespace llaminar2
     class MoEExpertOwnerMap;
     class IModelLoader;
 
+    /**
+     * @brief Setup-time routed graph families retained by ExpertOverlay.
+     *
+     * This is deliberately not the current request's MTP execution switch.
+     * A model context may retain learned NextN sidecars, activation channels,
+     * and transaction slots while an individual request executes only the
+     * main model. Keeping this policy typed prevents setup identity from being
+     * accidentally derived from a mutable request policy.
+     */
+    enum class MoEOverlayMTPGraphFamilyPolicy : std::uint8_t
+    {
+        MainOnly = 0, ///< Retain only ordinary transformer routed layers.
+        RetainModelSidecars = 1, ///< Also retain model-declared MTP layers.
+    };
+
     /** @brief Operation requested by one immutable transaction ticket. */
     enum class MoEOverlayInferenceTransactionAction : std::uint32_t
     {
@@ -131,7 +146,7 @@ namespace llaminar2
         const IModelLoader &loader,
         const std::string &architecture,
         int raw_layer_count,
-        bool mtp_enabled,
+        MoEOverlayMTPGraphFamilyPolicy mtp_policy,
         std::uint64_t graph_family_generation,
         int max_graph_rows,
         int max_decode_rows,

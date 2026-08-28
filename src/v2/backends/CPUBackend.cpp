@@ -3,13 +3,14 @@
  * @brief CPU/NUMA backend implementation
  *
  * Implements IBackend for CPU execution with NUMA-aware memory allocation.
- * Reads memory info from /sys/devices/system/node/nodeN/meminfo for NUMA nodes
- * or /proc/meminfo as fallback.
+ * Reads memory through HostMemoryCapacity so runtime queries, hardware
+ * inventory, and admission preflight share one NUMA-aware accounting policy.
  *
  * @author David Sanftenberg
  */
 
 #include "CPUBackend.h"
+#include "HostMemoryCapacity.h"
 #include "../utils/Logger.h"
 
 #include <cerrno>
@@ -17,7 +18,6 @@
 #include <cstdlib> // aligned_alloc, free
 #include <fstream>
 #include <stdexcept>
-#include <sstream>
 #include <string>
 
 #include <numa.h>
@@ -104,14 +104,15 @@ namespace llaminar2
 
         if (local_numa_node_ >= 0)
         {
-            size_t numa_total = readNumaMemTotal();
-            if (numa_total > 0)
+            const auto memory =
+                observeNUMAMemoryCapacity(local_numa_node_);
+            if (memory.valid())
             {
-                return numa_total;
+                return memory.total_bytes;
             }
         }
 
-        return readSystemMemTotal();
+        return observeSystemMemoryCapacity().total_bytes;
     }
 
     size_t CPUBackend::deviceMemoryFree(int device_id) const
@@ -123,14 +124,15 @@ namespace llaminar2
 
         if (local_numa_node_ >= 0)
         {
-            size_t numa_free = readNumaMemFree();
-            if (numa_free > 0)
+            const auto memory =
+                observeNUMAMemoryCapacity(local_numa_node_);
+            if (memory.valid())
             {
-                return numa_free;
+                return memory.admission_available_bytes;
             }
         }
 
-        return readSystemMemFree();
+        return observeSystemMemoryCapacity().admission_available_bytes;
     }
 
     // ====================================================================
@@ -478,127 +480,6 @@ namespace llaminar2
 
         LOG_WARN("[CPUBackend] gemmIQ4NL not implemented - use CPU kernel directly");
         return false;
-    }
-
-    // ====================================================================
-    // Private Helper Methods
-    // ====================================================================
-
-    size_t CPUBackend::readNumaMemTotal() const
-    {
-        if (local_numa_node_ < 0)
-        {
-            return 0;
-        }
-
-        std::string path = "/sys/devices/system/node/node" + std::to_string(local_numa_node_) + "/meminfo";
-        std::ifstream file(path);
-        if (!file.is_open())
-        {
-            return 0;
-        }
-
-        std::string line;
-        while (std::getline(file, line))
-        {
-            // Format: "Node 0 MemTotal:       12345678 kB"
-            if (line.find("MemTotal:") != std::string::npos)
-            {
-                size_t value_kb = 0;
-                // Parse the value (skip "Node N MemTotal:" prefix)
-                size_t pos = line.find("MemTotal:");
-                if (pos != std::string::npos)
-                {
-                    std::istringstream iss(line.substr(pos + 9)); // Skip "MemTotal:"
-                    iss >> value_kb;
-                    return value_kb * 1024; // Convert KB to bytes
-                }
-            }
-        }
-
-        return 0;
-    }
-
-    size_t CPUBackend::readNumaMemFree() const
-    {
-        if (local_numa_node_ < 0)
-        {
-            return 0;
-        }
-
-        std::string path = "/sys/devices/system/node/node" + std::to_string(local_numa_node_) + "/meminfo";
-        std::ifstream file(path);
-        if (!file.is_open())
-        {
-            return 0;
-        }
-
-        std::string line;
-        while (std::getline(file, line))
-        {
-            // Format: "Node 0 MemFree:        12345678 kB"
-            if (line.find("MemFree:") != std::string::npos)
-            {
-                size_t value_kb = 0;
-                size_t pos = line.find("MemFree:");
-                if (pos != std::string::npos)
-                {
-                    std::istringstream iss(line.substr(pos + 8)); // Skip "MemFree:"
-                    iss >> value_kb;
-                    return value_kb * 1024; // Convert KB to bytes
-                }
-            }
-        }
-
-        return 0;
-    }
-
-    size_t CPUBackend::readSystemMemTotal() const
-    {
-        std::ifstream file("/proc/meminfo");
-        if (!file.is_open())
-        {
-            return 0;
-        }
-
-        std::string line;
-        while (std::getline(file, line))
-        {
-            // Format: "MemTotal:       12345678 kB"
-            if (line.find("MemTotal:") == 0)
-            {
-                size_t value_kb = 0;
-                std::istringstream iss(line.substr(9)); // Skip "MemTotal:"
-                iss >> value_kb;
-                return value_kb * 1024; // Convert KB to bytes
-            }
-        }
-
-        return 0;
-    }
-
-    size_t CPUBackend::readSystemMemFree() const
-    {
-        std::ifstream file("/proc/meminfo");
-        if (!file.is_open())
-        {
-            return 0;
-        }
-
-        std::string line;
-        while (std::getline(file, line))
-        {
-            // Format: "MemFree:        12345678 kB"
-            if (line.find("MemFree:") == 0)
-            {
-                size_t value_kb = 0;
-                std::istringstream iss(line.substr(8)); // Skip "MemFree:"
-                iss >> value_kb;
-                return value_kb * 1024; // Convert KB to bytes
-            }
-        }
-
-        return 0;
     }
 
     bool CPUBackend::isValidDeviceId(int device_id) const

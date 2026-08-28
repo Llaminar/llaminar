@@ -11,6 +11,7 @@
 
 #include "../../backends/DeviceId.h"
 #include "MoELayeredExpertOwnership.h"
+#include "MoEOptimizationStatus.h"
 #include "RuntimeExpertHistogramDrain.h"
 #include <array>
 #include <atomic>
@@ -24,6 +25,8 @@
 
 namespace llaminar2
 {
+
+    class ValidatedDecodeExpertHistogramWindowView;
 
     struct DecodeExpertHistogramConfig
     {
@@ -181,6 +184,73 @@ namespace llaminar2
 
         /** @return Whether dimensions and flattened storage agree. */
         [[nodiscard]] bool valid() const noexcept;
+
+        /**
+         * @brief Authenticate this immutable window and borrow an O(1) reader.
+         * @return A non-null view whose geometry and redundant phase totals
+         *         were checked exactly once.
+         * @throws std::invalid_argument when this window is malformed.
+         *
+         * `activationCount()` deliberately authenticates a freely constructed
+         * public window on every standalone call. Planner hot loops must not
+         * repeat that O(layers * experts) proof for every element: they create
+         * this typed view once at their ownership boundary and retain the
+         * underlying immutable window for at least as long as the view.
+         */
+        [[nodiscard]] ValidatedDecodeExpertHistogramWindowView
+        validatedView() const;
+    };
+
+    /**
+     * @brief Borrowed, already-authenticated read view of one frozen window.
+     *
+     * Construction is private and available only through
+     * @ref DecodeExpertHistogramWindow::validatedView, making the expensive
+     * aggregate/phase consistency proof a one-time lifecycle transition. Each
+     * subsequent accessor still rejects an invalid coordinate or source in
+     * constant time. The referenced window must outlive this view.
+     */
+    class ValidatedDecodeExpertHistogramWindowView final
+    {
+    public:
+        /** @return Authenticated layer count. */
+        [[nodiscard]] int numLayers() const noexcept;
+
+        /** @return Authenticated routed-expert count. */
+        [[nodiscard]] int numExperts() const noexcept;
+
+        /** @return Immutable histogram generation. */
+        [[nodiscard]] std::uint64_t generation() const noexcept;
+
+        /** @return Immutable routed-token count. */
+        [[nodiscard]] std::uint64_t tokenCount() const noexcept;
+
+        /**
+         * @brief Read one aggregate layer/expert count in constant time.
+         * @throws std::out_of_range for an invalid coordinate.
+         */
+        [[nodiscard]] std::uint64_t activationCount(
+            int layer_idx,
+            int expert_id) const;
+
+        /**
+         * @brief Read one phase/layer/expert count in constant time.
+         * @throws std::invalid_argument for the SyntheticTest ingestion alias.
+         * @throws std::out_of_range for an invalid coordinate.
+         */
+        [[nodiscard]] std::uint64_t activationCount(
+            ExpertHistogramSource source,
+            int layer_idx,
+            int expert_id) const;
+
+    private:
+        friend struct DecodeExpertHistogramWindow;
+
+        /** @brief Bind an already-authenticated immutable window. */
+        explicit ValidatedDecodeExpertHistogramWindowView(
+            const DecodeExpertHistogramWindow &window) noexcept;
+
+        const DecodeExpertHistogramWindow *window_;
     };
 
     class DecodeExpertHistogram
@@ -232,6 +302,8 @@ namespace llaminar2
         using RuntimeHistogramSyncCallback = std::function<bool()>;
         using RuntimeHistogramDrainCallback =
             std::function<RuntimeExpertHistogramDrainResult()>;
+        using RuntimeHistogramAdmissionCallback =
+            std::function<bool(RuntimeExpertHistogramAdmission)>;
 
         /// Register a lazy sync source for device/runtime histograms.
         /// Callbacks should merge pending counts into this histogram and reset
@@ -261,6 +333,46 @@ namespace llaminar2
          */
         [[nodiscard]] RuntimeExpertHistogramDrainResult
         progressRuntimeHistogramDrains();
+
+        /**
+         * @brief Register a model-lifetime device admission publisher.
+         *
+         * The callback publishes the supplied phase onto every exact producer
+         * stream without synchronizing. Registration is model setup and is
+         * rejected after the calibration-to-live transition begins.
+         */
+        void registerRuntimeHistogramAdmission(
+            RuntimeHistogramAdmissionCallback callback);
+
+        /**
+         * @brief Close route admission before calibration evidence is drained.
+         *
+         * Existing writers retain their pinned old bank and are discarded by
+         * the following RCU rotation. New CPU writers observe quarantine
+         * immediately; device writers observe it through the drain's ordered
+         * writer-state publication.
+         */
+        void beginOptimizationDemandRebase();
+
+        /**
+         * @brief Open the first live demand generation at a request boundary.
+         *
+         * Every registered device publisher is enqueued before the host state
+         * becomes live. Failure is fatal and leaves host admission quarantined.
+         */
+        void activateOptimizationDemand();
+
+        /**
+         * @brief Mark setup-provided economics live before graph construction.
+         *
+         * Pre-certified authorities never enter quarantine. This transition is
+         * model setup only and therefore has no registered device publishers.
+         */
+        void activatePrecertifiedOptimizationDemand();
+
+        /** @return Exact calibration/quarantine/live admission phase. */
+        [[nodiscard]] RuntimeExpertHistogramAdmission admissionState() const
+            noexcept;
 
         // ── Queries (read-only, lock-free for counts) ─────
 
@@ -311,6 +423,17 @@ namespace llaminar2
         /// Current window generation (incremented each reset)
         uint64_t windowGeneration() const;
 
+        /**
+         * @brief Snapshot the active bank's generation, occupancy, and capacity.
+         * @return One internally consistent passive demand-window observation.
+         *
+         * The implementation rechecks the complete RCU generation after reading
+         * the pinned bank. A concurrent rotation therefore returns the new active
+         * bank rather than pairing an old count with a new lifecycle state.
+         */
+        [[nodiscard]] MoEOptimizationDemandWindow
+        optimizationDemandWindow() const noexcept;
+
         // ── Window management ─────────────────────────────
 
         /// Reset all counters and advance window generation
@@ -326,8 +449,21 @@ namespace llaminar2
          */
         [[nodiscard]] DecodeExpertHistogramWindow freezeAndRotateWindow();
 
-        /// Update the window size (for adaptive window growth)
-        void setWindowSize(int new_size) { config_.window_size = new_size; }
+        /** @return Race-safe active routed-token capacity for the current bank. */
+        [[nodiscard]] int windowSize() const noexcept;
+
+        /**
+         * @brief Publish the routed-token capacity used by future rotations.
+         *
+         * Maintenance owns this operation after an RCU bank rotation. Route
+         * writers never read the capacity, while passive status readers use
+         * the same atomic value as @ref windowFull, so a campaign or server
+         * cannot observe a torn generation/capacity pair.
+         *
+         * @param new_size Positive routed-token capacity.
+         * @throws std::invalid_argument when @p new_size is not positive.
+         */
+        void setWindowSize(int new_size);
 
         // ── Placement update ──────────────────────────────
 
@@ -348,6 +484,8 @@ namespace llaminar2
         bool isTokenBoundaryLayer(int layer_idx) const;
 
         DecodeExpertHistogramConfig config_;
+        /** Live adaptive capacity; `config_` remains immutable setup identity. */
+        std::atomic<int> active_window_size_;
 
         struct LayerData
         {
@@ -399,6 +537,7 @@ namespace llaminar2
 
             HistogramBank &mutableBank() noexcept { return *bank_; }
             const HistogramBank &bank() const noexcept { return *bank_; }
+            explicit operator bool() const noexcept { return bank_ != nullptr; }
 
         private:
             friend class DecodeExpertHistogram;
@@ -410,6 +549,15 @@ namespace llaminar2
 
         /** @brief Acquire and recheck the exact active RCU bank. */
         [[nodiscard]] BankLease acquireActiveBank() const noexcept;
+
+        /**
+         * @brief Pin the active bank only while route admission is open.
+         *
+         * Rechecking admission after the RCU pin ensures a writer racing the
+         * quarantine edge either finishes in the old bank (which rotation
+         * waits for and discards) or performs no mutation at all.
+         */
+        [[nodiscard]] BankLease acquireAdmittedBank() const noexcept;
 
         std::array<std::unique_ptr<HistogramBank>, 2> banks_;
         /**
@@ -431,7 +579,11 @@ namespace llaminar2
         std::vector<RuntimeHistogramSyncCallback> runtime_sync_callbacks_;
         std::vector<RuntimeHistogramDrainCallback> runtime_drain_callbacks_;
         std::vector<bool> runtime_drain_completed_;
+        std::vector<RuntimeHistogramAdmissionCallback>
+            runtime_admission_callbacks_;
         bool runtime_drain_generation_active_ = false;
+        std::atomic<RuntimeExpertHistogramAdmission> admission_state_{
+            RuntimeExpertHistogramAdmission::CalibrationEvidence};
     };
 
     using DomainExpertHistogram = DecodeExpertHistogram;

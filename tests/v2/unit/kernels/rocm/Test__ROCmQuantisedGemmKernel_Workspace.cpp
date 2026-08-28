@@ -2,22 +2,28 @@
  * @file Test__ROCmQuantisedGemmKernel_Workspace.cpp
  * @brief Unit tests for ROCmQuantisedGemmKernel IWorkspaceConsumer implementation
  *
- * These tests verify the workspace integration (Phase 2) for ROCm GEMM kernels.
- * Tests run on CPU backend without requiring actual ROCm hardware.
+ * These tests verify ordinary and fused-bundle workspace declarations for ROCm
+ * GEMM kernels. Tests run on the CPU backend without requiring ROCm hardware;
+ * kernel construction and requirement calculation are host-only operations.
  *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include <gtest/gtest.h>
+#include <array>
 #include <cstring>
 
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "backends/BackendManager.h"
+#include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "../../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
+using llaminar2::rocm::ROCmQuantisedGemmKernel;
+using llaminar2::test::TestTensorFactory;
 
 /**
  * @brief Test fixture for ROCmQuantisedGemmKernel workspace tests
@@ -392,4 +398,79 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, LMHeadRequiresLargeBudget)
     // For decode (seq_len=1), even LM head fits easily
     size_t total = lm_head_reqs.total_bytes_with_alignment();
     EXPECT_LT(total, 256 * 1024 * 1024); // Should fit in 256MB for decode
+}
+
+TEST_F(Test__ROCmQuantisedGemmKernel_Workspace,
+       LargeSingletonDoesNotReserveFusedProjectionArena)
+{
+    auto weights = TestTensorFactory::createQ8_0Random({64, 128}, /*seed=*/17);
+    ROCmQuantisedGemmKernel kernel(weights.get(), /*rocm_device_id=*/0);
+
+    const auto requirements = kernel.getWorkspaceRequirements(
+        /*m=*/16,
+        /*n=*/248320,
+        /*k=*/5120);
+
+    EXPECT_EQ(
+        requirements.find(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED),
+        nullptr)
+        << "A standalone LM head has no simultaneous projection bundle";
+    ASSERT_NE(
+        requirements.find(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL),
+        nullptr)
+        << "The ordinary single-projection split-K arena remains required";
+}
+
+TEST_F(Test__ROCmQuantisedGemmKernel_Workspace,
+       FusedProjectionArenaUsesExactOrderedBundleWidths)
+{
+    auto weights = TestTensorFactory::createQ8_0Random({64, 128}, /*seed=*/18);
+    ROCmQuantisedGemmKernel kernel(weights.get(), /*rocm_device_id=*/0);
+
+    WorkspaceRequirements requirements = kernel.getWorkspaceRequirements(
+        /*m=*/16,
+        /*n=*/12288,
+        /*k=*/5120);
+    const std::array<int, 4> projection_columns = {
+        12288, 2048, 2048, 128};
+    kernel.appendFusedProjectionWorkspaceRequirements(
+        requirements,
+        /*m=*/16,
+        projection_columns,
+        /*k=*/5120);
+
+    const auto *batched = requirements.find(
+        GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED);
+    ASSERT_NE(batched, nullptr);
+    constexpr size_t kGraphSafeSplitK = 64;
+    const size_t expected_columns = 12288u + 2048u + 2048u + 128u;
+    EXPECT_EQ(
+        batched->size_bytes,
+        kGraphSafeSplitK * 16u * expected_columns * sizeof(float));
+}
+
+TEST_F(Test__ROCmQuantisedGemmKernel_Workspace,
+       FusedProjectionArenaSizesReusedSideStreamsByTheirWidestMember)
+{
+    auto weights = TestTensorFactory::createQ8_0Random({64, 128}, /*seed=*/19);
+    ROCmQuantisedGemmKernel kernel(weights.get(), /*rocm_device_id=*/0);
+
+    WorkspaceRequirements requirements;
+    const std::array<int, 6> projection_columns = {
+        100, 200, 300, 400, 500, 600};
+    kernel.appendFusedProjectionWorkspaceRequirements(
+        requirements,
+        /*m=*/1,
+        projection_columns,
+        /*k=*/128);
+
+    const auto *batched = requirements.find(
+        GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED);
+    ASSERT_NE(batched, nullptr);
+    constexpr size_t kGraphSafeSplitK = 64;
+    // Four side streams receive max widths {500, 600, 300, 400}.
+    constexpr size_t kSimultaneousColumns = 1800;
+    EXPECT_EQ(
+        batched->size_bytes,
+        kGraphSafeSplitK * kSimultaneousColumns * sizeof(float));
 }

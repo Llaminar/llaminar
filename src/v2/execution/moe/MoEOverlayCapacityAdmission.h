@@ -38,7 +38,6 @@ namespace llaminar2
         std::size_t fixed_bytes = 0;
         /** Extra setup-owned transfer bytes outside the canonical fabric BOM. */
         std::size_t additional_transfer_staging_bytes = 0;
-        std::size_t safety_reserve_bytes = 0;
     };
 
     /** @brief One logical endpoint after domain participants are rank-bound. */
@@ -68,10 +67,6 @@ namespace llaminar2
         /** Canonical streaming chunk used by local and remote transfer lanes. */
         static constexpr std::size_t kProductionStagingBytes =
             4u * 1024u * 1024u;
-        /** Free VRAM retained after graph, live experts, staging, and shadows. */
-        static constexpr std::size_t kProductionGpuSafetyMarginBytes =
-            128u * 1024u * 1024u;
-
         /** Whether runtime promotion/demotion resources will be materialized. */
         bool materialize_migration_fabric = false;
         /** Number of inactive RCU arrival slots owned by each endpoint/layer. */

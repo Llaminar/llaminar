@@ -685,6 +685,184 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
     }
 }
 
+/**
+ * @brief A sealed reusable context must retain its physical CPU slot aliases.
+ *
+ * Swapping the two complete triplets models a migration followed by terminal
+ * logical-placement restoration: logical experts are back in their original
+ * participant, but their bytes now occupy recycled physical slots. Re-entering
+ * weight preparation must adopt the atomically rebound registry and must not
+ * reinterpret loader tensor slot zero as logical expert zero again.
+ */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     ReusesSealedCpuParticipantBankWithoutRebuildingLoaderOffsets)
+{
+    constexpr size_t kModel = 64;
+    constexpr size_t kIntermediate = 32;
+    constexpr size_t kExperts = 4;
+    auto loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader, kModel, kIntermediate, kExperts);
+    WeightManager manager(*loader);
+    const auto plan = singleLayerCpuColdPlan(kExperts);
+    const auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan, DeviceId::cpu()));
+
+    auto &registry = manager.expertGemmRegistry();
+    const auto acquire = [&](int expert, Role role)
+    {
+        return registry.getEngineLifetimeForParticipant(
+            "cpu_cold", DeviceId::cpu(), 0, 0, 0, expert, role);
+    };
+    const auto gate0 = acquire(0, Role::GATE);
+    const auto up0 = acquire(0, Role::UP);
+    const auto down0 = acquire(0, Role::DOWN);
+    const auto gate1 = acquire(1, Role::GATE);
+    const auto up1 = acquire(1, Role::UP);
+    const auto down1 = acquire(1, Role::DOWN);
+    ASSERT_NE(gate0, nullptr);
+    ASSERT_NE(up0, nullptr);
+    ASSERT_NE(down0, nullptr);
+    ASSERT_NE(gate1, nullptr);
+    ASSERT_NE(up1, nullptr);
+    ASSERT_NE(down1, nullptr);
+
+    const ExpertGemmRegistry::ParticipantLayerScope scope{
+        .domain_name = "cpu_cold",
+        .device = DeviceId::cpu(),
+        .participant_world_rank = 0,
+        .participant_index = 0,
+        .layer = 0,
+    };
+    const std::vector<ExpertGemmRegistry::ParticipantExpertBinding> rebound{
+        {
+            .scope = scope,
+            .expert = 0,
+            .gate = gate1,
+            .up = up1,
+            .down = down1,
+        },
+        {
+            .scope = scope,
+            .expert = 1,
+            .gate = gate0,
+            .up = up0,
+            .down = down0,
+        },
+    };
+    std::string replacement_error;
+    ASSERT_TRUE(registry.replaceParticipantResidency(
+        std::span<const ExpertGemmRegistry::ParticipantLayerScope>(&scope, 1u),
+        rebound,
+        &replacement_error))
+        << replacement_error;
+
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan, DeviceId::cpu()));
+    EXPECT_EQ(acquire(0, Role::GATE).get(), gate1.get());
+    EXPECT_EQ(acquire(0, Role::UP).get(), up1.get());
+    EXPECT_EQ(acquire(0, Role::DOWN).get(), down1.get());
+    EXPECT_EQ(acquire(1, Role::GATE).get(), gate0.get());
+    EXPECT_EQ(acquire(1, Role::UP).get(), up0.get());
+    EXPECT_EQ(acquire(1, Role::DOWN).get(), down0.get());
+    EXPECT_EQ(
+        registry.getEngineForDomain(
+            "cpu_cold", DeviceId::cpu(), 0, 0, Role::GATE),
+        gate1.get());
+    EXPECT_EQ(
+        registry.getEngineForDomain(
+            "cpu_cold", DeviceId::cpu(), 0, 1, Role::GATE),
+        gate0.get());
+}
+
+/**
+ * @brief Certified reuse consumes one complete sealed registry or fails.
+ *
+ * Registry population alone is deliberately insufficient: the production
+ * model-context lifecycle must first certify preparation and graph completion.
+ * Once admitted, deleting one domain alias models a torn terminal seal. The
+ * reuse path must reject it without consulting the still-live loader parents
+ * or repairing the missing entry.
+ */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     CertifiedReuseRequiresLifecycleAndRejectsTornRegistryWithoutFallback)
+{
+    constexpr size_t kExperts = 4;
+    auto loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader, 64, 32, kExperts);
+    WeightManager manager(*loader);
+    const auto plan = singleLayerCpuColdPlan(kExperts);
+    const auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan, DeviceId::cpu()));
+
+    EXPECT_FALSE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan,
+        DeviceId::cpu(),
+        nullptr,
+        nullptr,
+        PreparedWeightAdmission::ReuseCertifiedCompleteSet));
+
+    manager.markMaterializationComplete();
+    manager.markDevicePreparationComplete();
+    manager.markGraphMaterializationComplete();
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan,
+        DeviceId::cpu(),
+        nullptr,
+        nullptr,
+        PreparedWeightAdmission::ReuseCertifiedCompleteSet));
+
+    auto &registry = manager.expertGemmRegistry();
+    ASSERT_TRUE(registry.removeEngineForDomain(
+        "cpu_cold", DeviceId::cpu(), 0, 0, Role::GATE));
+    ASSERT_NE(
+        registry.getEngineForParticipant(
+            "cpu_cold", DeviceId::cpu(), 0, 0, 0, 0, Role::GATE),
+        nullptr);
+
+    EXPECT_FALSE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan,
+        DeviceId::cpu(),
+        nullptr,
+        nullptr,
+        PreparedWeightAdmission::ReuseCertifiedCompleteSet));
+    EXPECT_EQ(
+        registry.getEngineForDomain(
+            "cpu_cold", DeviceId::cpu(), 0, 0, Role::GATE),
+        nullptr);
+}
+
+/**
+ * @brief Reject a torn scoped bank instead of repairing it from stale slots.
+ */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     RejectsPartialCpuParticipantBankOnPreparationReentry)
+{
+    constexpr size_t kExperts = 4;
+    auto loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader, 64, 32, kExperts);
+    WeightManager manager(*loader);
+    const auto plan = singleLayerCpuColdPlan(kExperts);
+    const auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan, DeviceId::cpu()));
+
+    auto &registry = manager.expertGemmRegistry();
+    ASSERT_TRUE(registry.removeEngineForDomain(
+        "cpu_cold", DeviceId::cpu(), 0, 0, Role::GATE));
+    EXPECT_FALSE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan, DeviceId::cpu()));
+    EXPECT_NE(
+        registry.getEngineForParticipant(
+            "cpu_cold", DeviceId::cpu(), 0, 0, 0, 0, Role::GATE),
+        nullptr);
+    EXPECT_EQ(
+        registry.getEngineForDomain(
+            "cpu_cold", DeviceId::cpu(), 0, 0, Role::GATE),
+        nullptr);
+}
+
 TEST(Test__WeightManagerMoEExpertOverlayPreparation, HydratesCpuFallbackParentsWhenParentsWereNotPreloaded)
 {
     auto loader = MockModelLoader::createMinimal();

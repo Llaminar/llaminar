@@ -87,7 +87,7 @@ namespace llaminar2
             std::uint64_t base_epoch = 0u;
             std::uint64_t candidate_epoch = 0u;
             std::uint64_t command_digest = 0u;
-            MoEOverlayResidencyTransactionFingerprint fingerprint;
+            MoEOverlayResidencyExecutionFingerprint fingerprint;
             std::vector<MoEOverlayTierMigration> migrations;
             std::map<
                 MoEOverlayDevicePhysicalSlotKey,
@@ -108,7 +108,7 @@ namespace llaminar2
                    pending->base_epoch == batch.base_epoch &&
                    pending->candidate_epoch == batch.candidate_epoch &&
                    pending->command_digest == batch.command_digest &&
-                   pending->fingerprint == batch.transaction_fingerprint;
+                   pending->fingerprint == batch.execution_fingerprint;
         }
 
         /** @return Whether this process owns @p participant_id. */
@@ -228,7 +228,7 @@ namespace llaminar2
             .base_epoch = batch.base_epoch,
             .candidate_epoch = batch.candidate_epoch,
             .command_digest = batch.command_digest,
-            .fingerprint = batch.transaction_fingerprint,
+            .fingerprint = batch.execution_fingerprint,
             .migrations = batch.migrations,
         };
         return true;

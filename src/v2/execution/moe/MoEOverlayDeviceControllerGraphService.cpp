@@ -128,6 +128,21 @@ namespace llaminar2
                     backend->freePinned(allocation, ordinal);
             }
         };
+
+        /** @return Stable diagnostic spelling of a controller-authored axis. */
+        const char *movementAxisName(MoEOptimizationMovementAxis axis)
+        {
+            switch (axis)
+            {
+            case MoEOptimizationMovementAxis::TierResidency:
+                return "tier_residency";
+            case MoEOptimizationMovementAxis::ParticipantPlacement:
+                return "participant_placement";
+            case MoEOptimizationMovementAxis::Combined:
+                return "combined";
+            }
+            return "unknown";
+        }
     } // namespace
 
     MoEOverlayMaintenanceBoundaryGate::MoEOverlayMaintenanceBoundaryGate(
@@ -355,11 +370,28 @@ namespace llaminar2
         /** Immutable recurring growth multiplier selected at setup. */
         const double window_growth_factor = 1.0;
         std::atomic<bool> healthy{true};
+        /** Passive public projection of this worker's exact background work. */
+        std::atomic<MoEOptimizationActivityState> activity{
+            MoEOptimizationActivityState::LearningEconomy};
         /** Monotonic owner/worker proof that shutdown has no admitted work. */
         MoEOverlayWorkerDrainProtocol drain;
         mutable std::mutex failure_mutex;
         std::string failure;
         std::uint64_t last_transaction = 0u;
+        /** Even outside publication; odd while the worker updates all totals. */
+        std::atomic<std::uint64_t> movement_publication_sequence{0u};
+        /** Host-observed totals for physically completed device decisions. */
+        std::atomic<std::uint64_t> movement_transactions{0u};
+        std::atomic<std::uint64_t> movement_commands{0u};
+        std::atomic<std::uint64_t> movement_physical_bytes{0u};
+        std::atomic<std::uint64_t> movement_promotions{0u};
+        std::atomic<std::uint64_t> movement_demotions{0u};
+        std::atomic<std::uint64_t> movement_same_priority{0u};
+        /** Exact completed edges retained independently of optional telemetry. */
+        mutable std::mutex movement_ledger_mutex;
+        std::vector<MoEOptimizationMovementEdge> movement_ledger;
+        /** Sole leader's immutable admitting economics for completed waves. */
+        std::vector<MoEOptimizationMovementEconomy> movement_economy;
         bool economy_ready = false;
         /** True after the retained local rebase graph has been submitted. */
         bool histogram_rebase_started = false;
@@ -378,6 +410,50 @@ namespace llaminar2
          */
         std::vector<std::array<bool, kExpertHistogramProductionSourceCount>>
             service_phase_observed;
+
+        /** @return One coherent snapshot of all completed movement totals. */
+        [[nodiscard]] MoEOptimizationMovementTotals
+        completedMovement() const noexcept
+        {
+            for (;;)
+            {
+                const auto before = movement_publication_sequence.load(
+                    std::memory_order_acquire);
+                if ((before & 1u) != 0u)
+                    continue;
+                const MoEOptimizationMovementTotals totals{
+                    .transactions = movement_transactions.load(
+                        std::memory_order_relaxed),
+                    .commands = movement_commands.load(
+                        std::memory_order_relaxed),
+                    .physical_bytes = movement_physical_bytes.load(
+                        std::memory_order_relaxed),
+                    .promotions = movement_promotions.load(
+                        std::memory_order_relaxed),
+                    .demotions = movement_demotions.load(
+                        std::memory_order_relaxed),
+                    .same_priority_moves = movement_same_priority.load(
+                        std::memory_order_relaxed),
+                };
+                const auto after = movement_publication_sequence.load(
+                    std::memory_order_acquire);
+                if (before == after)
+                    return totals;
+            }
+        }
+
+        /** @return Race-safe complete movement identities for this runner. */
+        [[nodiscard]] MoEOptimizationMovementLedger
+        completedMovementLedger() const
+        {
+            std::lock_guard<std::mutex> lock(movement_ledger_mutex);
+            return {
+                .edges = movement_ledger,
+                .discarded_edges = 0u,
+                .economy = movement_economy,
+                .discarded_economy_records = 0u,
+            };
+        }
 
         /** Run coalesced complete device/physical transactions until stopped. */
         void run(std::stop_token stop_token) noexcept;
@@ -541,6 +617,7 @@ namespace llaminar2
         {
             const auto &runtime = config_.runtime_bindings[local_index];
             if (!runtime.valid() ||
+                !runtime.initialRuntimePublicationValid() ||
                 runtime.overlay_participant_id != local_ids[local_index] ||
                 runtime.layer_count != config_.fabric->layout().header.num_layers ||
                 runtime.expert_count != config_.fabric->layout().header.num_experts)
@@ -721,6 +798,14 @@ namespace llaminar2
     MoEOverlayDeviceControllerGraphService::
         ~MoEOverlayDeviceControllerGraphService()
     {
+        stopAndDrain();
+    }
+
+    void MoEOverlayDeviceControllerGraphService::stopAndDrain() noexcept
+    {
+        if (stopped_)
+            return;
+
         if (dynamic_worker_)
         {
             /*
@@ -780,6 +865,21 @@ namespace llaminar2
             dynamic_worker_->wake_cv.notify_all();
             if (dynamic_worker_->thread.joinable())
                 dynamic_worker_->thread.join();
+
+            /*
+             * The worker is now immutable and every topology peer has crossed
+             * the same terminal barrier. Retain its completed authority state
+             * before releasing worker storage so runner-lifetime diagnostics
+             * do not depend on an implementation object's lifetime.
+             */
+            terminal_movement_totals_ =
+                dynamic_worker_->completedMovement();
+            terminal_movement_ledger_ =
+                dynamic_worker_->completedMovementLedger();
+            terminal_published_movement_waves_ =
+                config_.fabric
+                    ? config_.fabric->completedDurableMovementEpochs()
+                    : 0u;
             dynamic_worker_.reset();
         }
         for (auto &endpoint : endpoints_)
@@ -787,6 +887,8 @@ namespace llaminar2
             if (endpoint)
                 releaseEndpoint(*endpoint);
         }
+        endpoints_.clear();
+        stopped_ = true;
     }
 
     void MoEOverlayDeviceControllerGraphService::materializeEndpoint(
@@ -810,6 +912,16 @@ namespace llaminar2
                 endpoint.stream = endpoint.worker->getOrCreateAuxiliaryStream(
                     streamName(endpoint.binding));
                 endpoint.terminal_event = endpoint.worker->createEvent();
+                if (!endpoint.stream ||
+                    !endpoint.runtime_binding.initial_runtime_publisher ||
+                    !endpoint.runtime_binding.initial_runtime_publisher
+                         ->publishMoEOverlayDeviceInitialRuntime(
+                             endpoint.stream))
+                {
+                    throw std::runtime_error(
+                        "Device controller could not order a complete retained-layer runtime image for participant " +
+                        std::to_string(endpoint.binding.participant_id));
+                }
                 if (endpoint.binding.authority_leader)
                 {
                     endpoint.policy_result = static_cast<
@@ -1801,6 +1913,107 @@ namespace llaminar2
         return readiness;
     }
 
+    MoEOptimizationStatus
+    MoEOverlayDeviceControllerGraphService::optimizationStatus() const
+    {
+        if (stopped_)
+        {
+            return {
+                .authority = MoEOptimizationAuthority::Device,
+                .state = MoEOptimizationLifecycleState::Drained,
+                .activity = MoEOptimizationActivityState::Draining,
+                .published_movement_waves =
+                    terminal_published_movement_waves_,
+                .completed_movement = terminal_movement_totals_,
+            };
+        }
+        MoEOptimizationStatus status{
+            .authority = MoEOptimizationAuthority::Device,
+            .state = MoEOptimizationLifecycleState::MovementDisabled,
+            .activity = MoEOptimizationActivityState::Dormant,
+            .published_movement_waves =
+                config_.fabric
+                    ? config_.fabric->completedDurableMovementEpochs()
+                    : 0u,
+        };
+        if (dynamic_worker_)
+            status.completed_movement = dynamic_worker_->completedMovement();
+        if (!healthy())
+        {
+            status.state = MoEOptimizationLifecycleState::Failed;
+            status.activity = MoEOptimizationActivityState::Failed;
+            status.diagnostic = failureMessage().empty()
+                                    ? "ExpertOverlay device controller failed"
+                                    : failureMessage();
+            return status;
+        }
+        if (config_.execution_mode == ExecutionMode::Static)
+            return status;
+        if (!config_.fabric)
+        {
+            status.state = MoEOptimizationLifecycleState::Failed;
+            status.diagnostic =
+                "Dynamic ExpertOverlay device controller has no mapped control fabric";
+            return status;
+        }
+        if (config_.fabric->economyProfilesPublished() &&
+            config_.fabric->demandHistogramsRebased())
+        {
+            status.state = MoEOptimizationLifecycleState::Active;
+            status.activity = dynamic_worker_
+                                  ? dynamic_worker_->activity.load(
+                                        std::memory_order_acquire)
+                                  : MoEOptimizationActivityState::Failed;
+            return status;
+        }
+        if (!config_.economy_certification)
+        {
+            status.state = MoEOptimizationLifecycleState::Failed;
+            status.activity = MoEOptimizationActivityState::Failed;
+            status.diagnostic =
+                "Dynamic ExpertOverlay device controller has no economy certification owner";
+            return status;
+        }
+
+        switch (config_.economy_certification->state())
+        {
+        case MoEOverlayEconomyCertificationState::Failed:
+        case MoEOverlayEconomyCertificationState::Stopped:
+            status.state = MoEOptimizationLifecycleState::Failed;
+            status.activity = MoEOptimizationActivityState::Failed;
+            status.diagnostic =
+                config_.economy_certification->failureMessage();
+            if (status.diagnostic.empty())
+            {
+                status.diagnostic =
+                    "Dynamic ExpertOverlay device economy certification stopped before activation";
+            }
+            break;
+        case MoEOverlayEconomyCertificationState::CalibratingMovement:
+        case MoEOverlayEconomyCertificationState::AwaitingServiceEvidence:
+        case MoEOverlayEconomyCertificationState::ExchangingServiceReadiness:
+        case MoEOverlayEconomyCertificationState::ExchangingServiceEvidence:
+        case MoEOverlayEconomyCertificationState::RebasingRoutingEvidence:
+        case MoEOverlayEconomyCertificationState::Complete:
+            /*
+             * Complete certification still needs one device-profile publish
+             * and demand-histogram rebase before policy may consume it.
+             */
+            status.state = MoEOptimizationLifecycleState::LearningEconomy;
+            status.activity = MoEOptimizationActivityState::LearningEconomy;
+            break;
+        }
+        return status;
+    }
+
+    MoEOptimizationMovementLedger
+    MoEOverlayDeviceControllerGraphService::movementLedger() const
+    {
+        return dynamic_worker_
+                   ? dynamic_worker_->completedMovementLedger()
+                   : terminal_movement_ledger_;
+    }
+
     bool MoEOverlayDeviceControllerGraphService::launchDynamicEpoch(
         DynamicGraphEpoch epoch,
         std::string *error)
@@ -2127,6 +2340,9 @@ namespace llaminar2
         if (dynamic_worker_->healthy.compare_exchange_strong(
                 expected, false, std::memory_order_acq_rel))
         {
+            dynamic_worker_->activity.store(
+                MoEOptimizationActivityState::Failed,
+                std::memory_order_release);
             std::lock_guard<std::mutex> lock(
                 dynamic_worker_->failure_mutex);
             dynamic_worker_->failure = std::move(message);
@@ -2146,6 +2362,11 @@ namespace llaminar2
         while (!stop_token.stop_requested() &&
                healthy.load(std::memory_order_acquire))
         {
+            activity.store(
+                economy_ready
+                    ? MoEOptimizationActivityState::CollectingDemand
+                    : MoEOptimizationActivityState::LearningEconomy,
+                std::memory_order_release);
             {
                 std::unique_lock<std::mutex> lock(wake_mutex);
                 wake_cv.wait_for(
@@ -2164,6 +2385,12 @@ namespace llaminar2
             {
                 break;
             }
+
+            activity.store(
+                economy_ready
+                    ? MoEOptimizationActivityState::ReconcilingDemand
+                    : MoEOptimizationActivityState::LearningEconomy,
+                std::memory_order_release);
 
             std::string economy_error;
             if (!progressEconomy(&economy_error))
@@ -2361,6 +2588,9 @@ namespace llaminar2
                 continue;
             }
             std::string error;
+            activity.store(
+                MoEOptimizationActivityState::ReconcilingDemand,
+                std::memory_order_release);
             if (!runOne(window.phase, &error))
             {
                 if (error.empty())
@@ -2431,6 +2661,11 @@ namespace llaminar2
                 wake_cv.notify_all();
             }
         }
+        activity.store(
+            healthy.load(std::memory_order_acquire)
+                ? MoEOptimizationActivityState::Draining
+                : MoEOptimizationActivityState::Failed,
+            std::memory_order_release);
         stopEconomy();
     }
 
@@ -3297,6 +3532,10 @@ namespace llaminar2
             return true;
         }
 
+        activity.store(
+            MoEOptimizationActivityState::MovingWeights,
+            std::memory_order_release);
+
         MoEOverlayParticipantPreparedTransfers prepared;
         const auto prepare_deadline = protocolDeadline();
         do
@@ -3662,6 +3901,9 @@ namespace llaminar2
                         : std::move(publication_error));
             }
         }
+        activity.store(
+            MoEOptimizationActivityState::PublishingResidency,
+            std::memory_order_release);
         if (!run_epoch(
                 DynamicGraphEpoch::Publish,
                 "Dynamic bounded publication epoch"))
@@ -3687,6 +3929,9 @@ namespace llaminar2
                               ? *error
                               : "device retirement admission failed");
         }
+        activity.store(
+            MoEOptimizationActivityState::MovingWeights,
+            std::memory_order_release);
 
         if (!wait_protocol(
                 [&]
@@ -3784,6 +4029,153 @@ namespace llaminar2
             return false;
         }
         last_transaction = command.header.transaction_id;
+
+        std::vector<std::size_t> cycle_index_by_migration(
+            batch.migrations.size(),
+            std::numeric_limits<std::size_t>::max());
+        std::vector<std::size_t> cycle_size_by_migration(
+            batch.migrations.size(), 0u);
+        for (std::size_t cycle_index = 0u;
+             cycle_index < batch.migration_cycles.size(); ++cycle_index)
+        {
+            const auto &cycle = batch.migration_cycles[cycle_index];
+            for (const std::size_t migration_index : cycle.migration_indices)
+            {
+                if (migration_index >= batch.migrations.size() ||
+                    cycle_index_by_migration[migration_index] !=
+                        std::numeric_limits<std::size_t>::max())
+                {
+                    return fail(
+                        error,
+                        "completed device movement has an invalid migration-cycle identity");
+                }
+                cycle_index_by_migration[migration_index] = cycle_index;
+                cycle_size_by_migration[migration_index] =
+                    cycle.migration_indices.size();
+            }
+        }
+
+        std::vector<MoEOptimizationMovementEdge> completed_edges;
+        completed_edges.reserve(batch.migrations.size());
+        for (std::size_t migration_index = 0u;
+             migration_index < batch.migrations.size(); ++migration_index)
+        {
+            const auto &migration = batch.migrations[migration_index];
+            const auto *const source_group =
+                owner->config_.topology->groupForParticipant(
+                    migration.source.owner_participant);
+            const auto *const destination_group =
+                owner->config_.topology->groupForParticipant(
+                    migration.destination.owner_participant);
+            if (!source_group || !destination_group ||
+                cycle_index_by_migration[migration_index] ==
+                    std::numeric_limits<std::size_t>::max() ||
+                cycle_size_by_migration[migration_index] == 0u)
+            {
+                return fail(
+                    error,
+                    "completed device movement lost its frozen topology or cycle identity");
+            }
+
+            MoEOptimizationMovementDirection direction =
+                MoEOptimizationMovementDirection::SamePriority;
+            if (migration.direction ==
+                MoEOverlayTierMigrationDirection::Promotion)
+            {
+                direction = MoEOptimizationMovementDirection::Promotion;
+            }
+            else if (migration.direction ==
+                     MoEOverlayTierMigrationDirection::Demotion)
+            {
+                direction = MoEOptimizationMovementDirection::Demotion;
+            }
+            completed_edges.push_back({
+                .authority = MoEOptimizationAuthority::Device,
+                .transaction = last_transaction,
+                .candidate_epoch = batch.candidate_epoch,
+                .layer = migration.layer_idx,
+                .expert = migration.expert_id,
+                .cycle_index = cycle_index_by_migration[migration_index],
+                .cycle_size = cycle_size_by_migration[migration_index],
+                .direction = direction,
+                .axis = migration.axis,
+                .source_participant =
+                    migration.source.owner_participant,
+                .destination_participant =
+                    migration.destination.owner_participant,
+                .source_priority = source_group->tier_priority,
+                .destination_priority = destination_group->tier_priority,
+                .source_device = migration.source.device,
+                .destination_device = migration.destination.device,
+                .source_world_rank = migration.source.owner_world_rank,
+                .destination_world_rank =
+                    migration.destination.owner_world_rank,
+                .source_world_rank_known =
+                    migration.source.owner_world_rank_known,
+                .destination_world_rank_known =
+                    migration.destination.owner_world_rank_known,
+                .estimated_weight_bytes =
+                    static_cast<std::uint64_t>(
+                        migration.estimated_weight_bytes),
+                .activation_count = migration.activation_count,
+                .blocking_inference = false,
+            });
+        }
+        std::optional<MoEOptimizationMovementEconomy> completed_economy;
+        if (owner->ownsLeaderGraph())
+        {
+            completed_economy = MoEOptimizationMovementEconomy{
+                .authority = MoEOptimizationAuthority::Device,
+                .transaction = last_transaction,
+                .candidate_epoch = batch.candidate_epoch,
+                .command_count = batch.command_count,
+                .cycle_count = static_cast<std::uint64_t>(
+                    batch.migration_cycles.size()),
+                .projected_service_gain_ns =
+                    command.header.projected_service_gain_ns,
+                .projected_transfer_and_repack_ns =
+                    command.header.projected_transfer_and_repack_ns,
+                .projected_inference_interference_ns =
+                    command.header.projected_inference_interference_ns,
+                .projected_net_benefit_ns =
+                    command.header.projected_net_benefit_ns,
+            };
+            if (!completed_economy->valid())
+            {
+                return fail(
+                    error,
+                    "completed device movement lost its authoritative economy proof");
+            }
+        }
+        {
+            /* One lock publishes every edge plus the leader-only policy proof. */
+            std::lock_guard<std::mutex> lock(movement_ledger_mutex);
+            movement_ledger.insert(
+                movement_ledger.end(),
+                completed_edges.begin(),
+                completed_edges.end());
+            if (completed_economy)
+                movement_economy.push_back(*completed_economy);
+        }
+
+        /*
+         * Publish operational totals before optional telemetry. Benchmark and
+         * correctness callers therefore observe completed physical work even
+         * when PerfStats is disabled or filtered to an unrelated domain.
+         */
+        movement_publication_sequence.fetch_add(
+            1u, std::memory_order_acq_rel);
+        movement_commands.fetch_add(
+            batch.command_count, std::memory_order_relaxed);
+        movement_physical_bytes.fetch_add(
+            batch.packed_weight_bytes, std::memory_order_relaxed);
+        movement_promotions.fetch_add(promotions, std::memory_order_relaxed);
+        movement_demotions.fetch_add(demotions, std::memory_order_relaxed);
+        movement_same_priority.fetch_add(
+            same_priority_moves, std::memory_order_relaxed);
+        movement_transactions.fetch_add(1u, std::memory_order_relaxed);
+        movement_publication_sequence.fetch_add(
+            1u, std::memory_order_release);
 
         PerfStatsCollector::addCounter(
             "moe_overlay_controller",
@@ -3983,6 +4375,7 @@ namespace llaminar2
                  {"layer", std::to_string(migration.layer_idx)},
                  {"expert", std::to_string(migration.expert_id)},
                  {"direction", direction},
+                 {"movement_axis", movementAxisName(migration.axis)},
                  {"source_participant",
                   std::to_string(migration.source.owner_participant)},
                  {"destination_participant",

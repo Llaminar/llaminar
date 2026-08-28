@@ -19,12 +19,23 @@ A complete mathematical cell contains:
 - `decode_steps.csv`
 - `decode_layers.csv`
 - `decode_stages.csv`
+- `prefix_restore.csv`
 - `production_path.csv`
 
-Specialized cells can add router, MTP, rank-fragment, or other diagnostics, but
-they cannot replace the six canonical files. Pipeline-parallel tests merge
+MTP cells additionally require `mtp_transactions.csv`. Specialized cells can
+add router, rank-fragment, or other diagnostics, but they cannot replace the
+canonical files. Pipeline-parallel tests merge
 rank-local fragments into the canonical set; missing owned layers, embedding,
 final norm, or LM-head evidence is a failure.
+
+ExpertOverlay cells additionally retain:
+
+- `expert_residency_diagnostics.csv` for rank zero and
+  `expert_residency_diagnostics_rank_<rank>.csv` for every follower, containing
+  the controller transaction and physical-residency publication counters even
+  when the cell passes;
+- `promoted_expert_execution.csv`, which ties moved expert identities to
+  independently routed native/reference numerical rows.
 
 ## Read in this order
 
@@ -42,11 +53,16 @@ on eager or segmented homogeneous execution as uncertified.
 For MTP, `forward_full_graph_capture` and `forward_full_graph_replay` describe
 captured transaction fragments only. The complete `full_graph_capture` and
 `full_graph_replay` fields remain false unless PerfStats also proves one native
-device-generation parent. Require `device_generation_controller=true`,
+device-generation parent. CUDA requires
+`device_generation_controller=true`,
 `generation_execution_policy=native_conditional_parent`, and
-`native_generation_parent=true`. A
-`host_scheduled_captured_transactions`, `unclassified`, or `inconsistent`
-policy is an architectural failure even when every numerical checkpoint passes.
+`native_generation_parent=true`. ROCm instead requires the authenticated
+`host_scheduled_captured_transactions` policy: the device controller owns all
+mutable state and the host may copy only the exact 48-byte immutable ticket
+that selects a complete retained transaction graph. Its ticket provenance,
+participant submission ledger, and controller transaction count must agree.
+`unclassified`, `inconsistent`, a mutable state payload, or hosted eager
+execution is an architectural failure even when every checkpoint passes.
 
 Unexpected `model_context_reused=false` in compatible adjacent cells usually
 means the immutable context key includes runner-owned policy. Unexpected
@@ -59,6 +75,18 @@ cache.
 `prefill_summary.csv` contains LM-head cosine and KL divergence, Top-1/Top-5
 overlap, whether the reference Top-1 is in the native Top-K, layer pass counts,
 and the overall result.
+
+`prefix_restore.csv` proves fresh seed, complete hit, and partial hit through
+the production cache surface. Complete hits require exact persistent-state
+identity. For a partial hit, `main_kv_policy` remains `exact_bytes` unless the
+snapshots themselves prove that ExpertOverlay changed placement between the
+serial oracle and replay. The placement-aware policy still hashes the entire
+restored prefix byte-for-byte; only the explicitly retained recomputed suffix
+may use full-value FP16/BF16/FP32 comparison. Require positive
+`main_kv_exact_prefix_segments` and `main_kv_numerical_suffix_payloads`, a
+passing numerical flag, and a minimum cosine at or above the cell's typed
+threshold whenever that policy is reported. Missing suffix bytes or any cached
+prefix hash drift is a hard failure.
 
 `decode_steps.csv` contains the same distribution evidence per incremental
 step plus native/reference token IDs and exact/Top-3/Top-5 token matches. Find
@@ -78,6 +106,16 @@ the prior transaction's draft vector is stale publication; an empty vector on a
 speculative row is missing publication. A terminal absorbing row may retain the
 last committed identity while selecting depth zero because it commits no new
 verifier transaction.
+
+For a dynamic-depth row, also require
+`dynamic_policy_witness_executed=true`,
+`dynamic_policy_witness_serial_token_exact=true`, a positive
+`dynamic_policy_witness_window_delta`, positive attempted-draft and verifier
+counts, and identical emitted/oracle token vectors. The witness deliberately
+runs after any initially due ExpertOverlay maintenance boundary. If the
+physical depth-15 checkpoint transaction passes but this witness remains zero,
+inspect generation-budget clipping and maintenance cadence before inspecting
+sidecar arithmetic.
 
 ### 3. Layer rollups
 
@@ -133,6 +171,19 @@ native tensor also contains no NaN or Inf.
   arena-event identity, or mirrored-rank aggregation—not sidecar arithmetic.
 - routing set differs while dense stages match: router normalization/top-K tie
   policy or expert index mapping, not expert GEMM arithmetic.
+- `promoted_expert_execution.csv` reports `exact_zero_route_rows`: the native
+  and reference expert outputs were independently routed and both bytewise
+  zero, which is exact equality (quantized experts with all-zero scales can
+  legitimately do this). `one_sided_zero_route_rows` is a real mismatch and
+  must be zero for the witness to pass.
+- `reference_lineage=diverged_by_prior_routing` with
+  `proof_disposition=inconclusive`: an earlier top-k branch changed the hidden
+  state, so this later per-expert HF comparison used different inputs. It is
+  diagnostic, cannot certify movement, and is not evidence of a kernel defect.
+  Confirm that the same destination has another `certified` witness and that
+  the ordinary downstream stage/LM-head/KL gates pass. A `failed` disposition,
+  one-sided zero, invalid evidence, or a canonical-lineage numerical mismatch
+  still fails closed.
 - metrics look good but counts/stages differ: snapshot publication or PP merge
   completeness defect; do not accept the run.
 
@@ -141,21 +192,38 @@ stays high. Low error entropy suggests a systematic layout/scale/bias problem;
 broad entropy with gradual drift more often suggests accumulated arithmetic
 differences. Use these as diagnostic clues, not replacement pass criteria.
 
-## Correlate PerfStats
+## Correlate authority state and PerfStats
 
-CSV mathematics cannot prove expert movement or capture selection by itself.
-Correlate the exact cell log and request-local PerfStats domains:
+Numerical CSV mathematics cannot prove expert movement or capture selection by
+itself. For ExpertOverlay, `expert_movement.csv` is a direct serialization of
+`IOrchestrationRunner::moeOptimizationMovementLedger()` and is the movement
+authority. Read `movement_axis` as logical intent (`tier_residency`,
+`participant_placement`, or `combined`) independently from `direction`
+(`promotion`, `demotion`, or `same_priority`). A combined promotion is valid
+proof of both Dynamic axes even when there is no same-priority edge. PerfStats
+must corroborate lifecycle, physical transport, economy, and publication, but
+must never be promoted from optional observability into placement authority.
+Correlate the exact cell log and request-local domains:
 
 - `forward_graph`: full capture/replay and segmentation evidence;
 - `moe_placement`: requested ordinal/random physical owner mapping;
-- `moe_rebalance`: Dynamic/LLEP planning, transport bytes, ownership/replica
-  change, destination apply, and Static zero-movement proof;
+- `moe_rebalance`: host-authoritative planning, transport bytes,
+  ownership/replica change, destination apply, and Static zero-movement proof;
+- `moe_overlay_controller`: device-authoritative accepted movement
+  transactions and physical byte counts;
+- `moe_overlay_residency`: device-side staging and atomic epoch publication of
+  the new physical placement;
 - MTP domains used by the fixture: requested/effective depth, verifier work,
   and dynamic-controller decisions.
 
-Positive movement requires both a semantic change and payload evidence. A plan
-entry without transferred/applied bytes is not movement. Static must assert the
-whole movement family remains zero rather than checking one convenient counter.
+Positive movement requires both an authority-ledger semantic change and payload
+evidence. A proposal or plan entry without a durable ledger edge and
+transferred/applied bytes is not movement. Static must assert an empty ledger
+and that the whole physical movement family remains zero rather than checking
+one convenient counter.
+Use the per-rank `expert_residency_diagnostics*.csv` files to reconcile a
+cross-rank failure before treating a missing rank-zero counter as missing
+movement.
 
 ## From evidence to regression
 

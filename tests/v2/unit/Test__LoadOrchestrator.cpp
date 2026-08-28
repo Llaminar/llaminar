@@ -484,22 +484,21 @@ namespace llaminar2
     TEST(Test__LoadOrchestrator, AllocateFailsBeforeBackendAllocationWhenVramBudgetExceeded)
     {
         BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
-                                  /*free_bytes=*/640ULL * kMiB);
+                                  /*free_bytes=*/160ULL * kMiB - 1u);
         LoadOrchestrator orch(&backend);
         orch.addDevice(0);
         orch.planRawWeight(0, "large_raw_weight", 1, 1, 128ULL * kMiB);
 
-        // Required = 128 MiB planned + 32 MiB staging + 512 MiB safety margin,
-        // which exceeds the reported 640 MiB free budget.
+        // Exact requirement is 128 MiB planned plus one 32 MiB staging slot.
         EXPECT_THROW(orch.allocate(32ULL * kMiB, 1), std::runtime_error);
         EXPECT_EQ(backend.allocateCalls(), 0)
             << "VRAM preflight should fail before WeightVRAMPool calls backend->allocate()";
     }
 
-    TEST(Test__LoadOrchestrator, AllocateSucceedsWhenVramBudgetHasHeadroom)
+    TEST(Test__LoadOrchestrator, AllocateSucceedsAtExactVramBoundary)
     {
         BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
-                                  /*free_bytes=*/1024ULL * kMiB);
+                                  /*free_bytes=*/160ULL * kMiB);
         LoadOrchestrator orch(&backend);
         orch.addDevice(0);
         orch.planRawWeight(0, "large_raw_weight", 1, 1, 128ULL * kMiB);
@@ -513,27 +512,15 @@ namespace llaminar2
         EXPECT_TRUE(pool->isAllocated());
     }
 
-    TEST(Test__LoadOrchestrator, DirectRebalanceMarginAllowsTightNoStagingArrival)
+    TEST(Test__LoadOrchestrator, NoStagingArrivalUsesExactConcreteBill)
     {
         const size_t planned_bytes = 8ULL * kMiB;
         BudgetMockBackend backend(/*total_bytes=*/24ULL * 1024ULL * kMiB,
-                                  /*free_bytes=*/131ULL * kMiB);
-
-        {
-            LoadOrchestrator generic(&backend);
-            generic.setVramPreflightSafetyMarginBytes(128ULL * kMiB);
-            generic.addDevice(0);
-            generic.planRawWeight(0, "arrival_generic_margin", 1, 1, planned_bytes);
-            EXPECT_THROW(generic.allocate(/*pinned_slot_size=*/0, /*num_h2d_streams=*/0),
-                         std::runtime_error);
-        }
-        EXPECT_EQ(backend.allocateCalls(), 0)
-            << "The generic reserve should fail before any device allocation";
+                                  /*free_bytes=*/8ULL * kMiB);
 
         LoadOrchestrator direct(&backend);
-        direct.setVramPreflightSafetyMarginBytes(gpuDirectRebalanceVramSafetyMarginBytes());
         direct.addDevice(0);
-        direct.planRawWeight(0, "arrival_direct_margin", 1, 1, planned_bytes);
+        direct.planRawWeight(0, "arrival_exact_bill", 1, 1, planned_bytes);
 
         ASSERT_NO_THROW(direct.allocate(/*pinned_slot_size=*/0, /*num_h2d_streams=*/0));
         EXPECT_GT(backend.allocateCalls(), 0);

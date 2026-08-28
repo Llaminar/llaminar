@@ -141,8 +141,9 @@ namespace llaminar2::test::parity::qwen36
      * @brief Return one homogeneous two-GPU ExpertOverlay topology.
      *
      * Capacity is deliberately automatic: the sole priority-zero fallback tier
-     * fills to the production planner's device safety margin. No model-specific
-     * expert-count or byte cap is embedded in parity configuration.
+     * fills to the production planner's exact admitted device capacity after
+     * every named allocation. No model-specific expert-count or byte cap is
+     * embedded in parity configuration.
      */
     inline ModelParityTopologyDefinition qwen36MoEGPU2ExpertOverlayTopology(
         std::string test_id,
@@ -201,7 +202,23 @@ namespace llaminar2::test::parity::qwen36
     inline MoERebalanceRuntimeConfig qwen36MoEDynamicParityEconomics()
     {
         auto config = qwen35moe::qwen35MoEDynamicParityEconomics();
-        config.dynamic_imbalance_threshold_per_mille = 0;
+        /*
+         * The production policy expresses imbalance as a ratio in per-mille,
+         * so 1000 is the neutral lower bound accepted by configuration
+         * validation.  The remaining zero-improvement thresholds still make
+         * the short parity trace admit an economical move without inventing
+         * an invalid policy value solely for the test.
+         */
+        config.dynamic_imbalance_threshold_per_mille = 1000;
+        /*
+         * The first one-token boundary still forces physical movement.  Once
+         * that epoch retires, leave one complete maximum-width MTP verifier
+         * transaction between maintenance boundaries.  Otherwise a cadence
+         * of one marks every adaptive-depth observation budget-limited and the
+         * two independent device controllers can never both make progress.
+         */
+        config.device_min_maintenance_period_tokens =
+            kModelParityRequiredMaximumMTPDepth + 1;
         config.release_raw_expert_weights = false;
         return config;
     }
@@ -236,7 +253,11 @@ namespace llaminar2::test::parity::qwen36
         definition.precisions.activation = {ActivationPrecision::FP32};
         definition.precisions.kv_cache = {KVCachePrecision::FP16};
         definition.features.mtp = ModelParityAxisProfile::Standard;
-        definition.dynamic_rebalance = qwen36MoEDynamicParityEconomics();
+        const auto dynamic_policy = qwen36MoEDynamicParityEconomics();
+        definition.dynamic_rebalance = {
+            .economic_movement = dynamic_policy,
+            .economic_movement_and_observed_speedup = dynamic_policy,
+        };
         definition.collective_evidence_source =
             ParityCollectiveEvidenceSource::PostCollectiveSnapshot;
         definition.tp_allreduce_precision_override = "schema";

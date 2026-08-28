@@ -3878,6 +3878,257 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+
+    /**
+     * @brief Prove dense movable floating experts use one CPU/GPU arithmetic tree.
+     *
+     * The historical floating MoE device tests used diagonal matrices, which
+     * removed reduction-order ambiguity and therefore could not detect a CPU
+     * expert changing its answer after promotion. This regression uses dense
+     * K>256 matrices, multiple rows, and every floating storage precision. It
+     * checks gate, up, deterministic SwiGLU, and down checkpoints against the
+     * canonical 256-lane tree consumed by CUDA and ROCm.
+     */
+    TEST_F(
+        CPUNativeVNNIGemvTest,
+        MovableFloatingExpertsAllFormatsMatchCanonicalDenseTree)
+    {
+        constexpr int M = 3;
+        constexpr int DModel = 517;
+        constexpr int Intermediate = 263;
+        constexpr int OutputWidth = 41;
+
+        struct FormatCase
+        {
+            TensorType type;
+            const char *label;
+        };
+        constexpr std::array<FormatCase, 3> formats{{
+            {TensorType::FP16, "FP16"},
+            {TensorType::BF16, "BF16"},
+            {TensorType::FP32, "FP32"},
+        }};
+
+        auto make_weight = [](
+                               TensorType type,
+                               const std::vector<size_t> &shape,
+                               const std::vector<float> &values)
+            -> std::unique_ptr<TensorBase>
+        {
+            switch (type)
+            {
+            case TensorType::FP16:
+            {
+                auto tensor = TestTensorFactory::createFP16(shape);
+                tensor->from_fp32(values.data(), values.size());
+                return tensor;
+            }
+            case TensorType::BF16:
+            {
+                auto tensor = TestTensorFactory::createBF16(shape);
+                tensor->from_fp32(values.data(), values.size());
+                return tensor;
+            }
+            case TensorType::FP32:
+            {
+                auto tensor = TestTensorFactory::createFP32(shape);
+                std::copy(
+                    values.begin(), values.end(), tensor->mutable_data());
+                return tensor;
+            }
+            default:
+                throw std::invalid_argument(
+                    "movable floating expert test received non-floating type");
+            }
+        };
+
+        std::vector<float> input_values(
+            static_cast<size_t>(M) * DModel);
+        for (size_t index = 0; index < input_values.size(); ++index)
+        {
+            const int centered =
+                static_cast<int>((index * 29u + index / 7u) % 67u) - 33;
+            input_values[index] =
+                static_cast<float>(centered) * 0.015625f;
+        }
+        FP32Tensor input({static_cast<size_t>(M),
+                          static_cast<size_t>(DModel)});
+        std::copy(
+            input_values.begin(), input_values.end(), input.mutable_data());
+
+        auto dense_values = [](size_t count, uint32_t seed)
+        {
+            std::vector<float> values(count);
+            for (size_t index = 0; index < count; ++index)
+            {
+                const int centered = static_cast<int>(
+                    (index * 37u + seed * 17u + index / 11u) % 97u) - 48;
+                values[index] = static_cast<float>(centered) * 0.00390625f;
+            }
+            return values;
+        };
+
+        for (size_t format_index = 0;
+             format_index < formats.size();
+             ++format_index)
+        {
+            const auto &format = formats[format_index];
+            SCOPED_TRACE(format.label);
+            auto gate_source = dense_values(
+                static_cast<size_t>(Intermediate) * DModel,
+                110u + static_cast<uint32_t>(format_index));
+            auto up_source = dense_values(
+                static_cast<size_t>(Intermediate) * DModel,
+                210u + static_cast<uint32_t>(format_index));
+            auto down_source = dense_values(
+                static_cast<size_t>(OutputWidth) * Intermediate,
+                310u + static_cast<uint32_t>(format_index));
+            auto gate_weight = make_weight(
+                format.type,
+                {static_cast<size_t>(Intermediate),
+                 static_cast<size_t>(DModel)},
+                gate_source);
+            auto up_weight = make_weight(
+                format.type,
+                {static_cast<size_t>(Intermediate),
+                 static_cast<size_t>(DModel)},
+                up_source);
+            auto down_weight = make_weight(
+                format.type,
+                {static_cast<size_t>(OutputWidth),
+                 static_cast<size_t>(Intermediate)},
+                down_source);
+
+            std::vector<float> rounded_gate(gate_source.size());
+            std::vector<float> rounded_up(up_source.size());
+            std::vector<float> rounded_down(down_source.size());
+            gate_weight->to_fp32(rounded_gate.data());
+            up_weight->to_fp32(rounded_up.data());
+            down_weight->to_fp32(rounded_down.data());
+
+            using Policy = gemm::FloatingPointGemmKernel::NumericalPolicy;
+            gemm::FloatingPointGemmKernel gate_kernel(
+                gate_weight.get(), Policy::MovableExpert);
+            gemm::FloatingPointGemmKernel up_kernel(
+                up_weight.get(), Policy::MovableExpert);
+            gemm::FloatingPointGemmKernel down_kernel(
+                down_weight.get(), Policy::MovableExpert);
+            FP32Tensor observed_gate({static_cast<size_t>(M),
+                                      static_cast<size_t>(Intermediate)});
+            FP32Tensor observed_up({static_cast<size_t>(M),
+                                    static_cast<size_t>(Intermediate)});
+            FP32Tensor observed_down({static_cast<size_t>(M),
+                                      static_cast<size_t>(OutputWidth)});
+            ASSERT_TRUE(gate_kernel.multiply_tensor(
+                &input, &observed_gate, M, Intermediate, DModel));
+            ASSERT_TRUE(up_kernel.multiply_tensor(
+                &input, &observed_up, M, Intermediate, DModel));
+            ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu(
+                &observed_gate,
+                &observed_up,
+                &observed_down,
+                M,
+                OutputWidth,
+                Intermediate));
+
+            std::vector<float> expected_gate(
+                static_cast<size_t>(M) * Intermediate);
+            std::vector<float> expected_up(expected_gate.size());
+            for (int row = 0; row < M; ++row)
+            {
+                for (int column = 0; column < Intermediate; ++column)
+                {
+                    std::array<float, 1> gate_result{};
+                    std::array<float, 1> up_result{};
+                    floating_expert_numerical_contract::dotRows<1>(
+                        1,
+                        DModel,
+                        [&](int, int k)
+                        {
+                            return input_values[
+                                static_cast<size_t>(row) * DModel + k];
+                        },
+                        [&](int k)
+                        {
+                            return rounded_gate[
+                                static_cast<size_t>(column) * DModel + k];
+                        },
+                        gate_result);
+                    floating_expert_numerical_contract::dotRows<1>(
+                        1,
+                        DModel,
+                        [&](int, int k)
+                        {
+                            return input_values[
+                                static_cast<size_t>(row) * DModel + k];
+                        },
+                        [&](int k)
+                        {
+                            return rounded_up[
+                                static_cast<size_t>(column) * DModel + k];
+                        },
+                        up_result);
+                    expected_gate[
+                        static_cast<size_t>(row) * Intermediate + column] =
+                        gate_result[0];
+                    expected_up[
+                        static_cast<size_t>(row) * Intermediate + column] =
+                        up_result[0];
+                }
+            }
+
+            std::vector<float> expected_down(
+                static_cast<size_t>(M) * OutputWidth);
+            for (int row = 0; row < M; ++row)
+            {
+                for (int column = 0; column < OutputWidth; ++column)
+                {
+                    std::array<float, 1> result{};
+                    floating_expert_numerical_contract::dotRows<1>(
+                        1,
+                        Intermediate,
+                        [&](int, int k)
+                        {
+                            const size_t index =
+                                static_cast<size_t>(row) * Intermediate + k;
+                            return floating_expert_numerical_contract::
+                                swigluValue(
+                                    expected_gate[index],
+                                    expected_up[index]);
+                        },
+                        [&](int k)
+                        {
+                            return rounded_down[
+                                static_cast<size_t>(column) * Intermediate +
+                                k];
+                        },
+                        result);
+                    expected_down[
+                        static_cast<size_t>(row) * OutputWidth + column] =
+                        result[0];
+                }
+            }
+
+            EXPECT_EQ(
+                std::memcmp(
+                    observed_gate.data(),
+                    expected_gate.data(),
+                    expected_gate.size() * sizeof(float)),
+                0);
+            EXPECT_EQ(
+                std::memcmp(
+                    observed_up.data(),
+                    expected_up.data(),
+                    expected_up.size() * sizeof(float)),
+                0);
+            EXPECT_EQ(
+                std::memcmp(
+                    observed_down.data(),
+                    expected_down.data(),
+                    expected_down.size() * sizeof(float)),
+                0);
+        }
+    }
 #endif
 
     TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierPolicyIsTotalAcrossPositiveThreadRegimes)

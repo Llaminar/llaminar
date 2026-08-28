@@ -46,6 +46,10 @@ namespace llaminar2::test
             ON_CALL(*this, executionPlan()).WillByDefault(testing::ReturnRef(default_plan_));
             ON_CALL(*this, config()).WillByDefault(testing::ReturnRef(default_config_));
             ON_CALL(*this, primaryDeviceId()).WillByDefault(testing::Return(DeviceId::cpu()));
+            ON_CALL(*this, moeRuntimeMovementEpoch())
+                .WillByDefault(testing::Return(0u));
+            ON_CALL(*this, moeOptimizationStatus())
+                .WillByDefault(testing::Return(MoEOptimizationStatus{}));
             ON_CALL(*this, supportsPrefillBatch(testing::_)).WillByDefault(testing::Return(false));
             ON_CALL(*this, prefillBatch(testing::_)).WillByDefault(testing::Return(false));
             ON_CALL(*this, supportsDecodeStepBatch(testing::_)).WillByDefault(testing::Return(false));
@@ -62,6 +66,7 @@ namespace llaminar2::test
             ON_CALL(*this, maybeApplyMoERebalance(testing::_))
                 .WillByDefault(testing::Return(true));
             ON_CALL(*this, prefixStateProbe()).WillByDefault(testing::Return(PrefixRuntimeStateSnapshot{}));
+            ON_CALL(*this, purgePrefixCache()).WillByDefault(testing::Return(true));
             ON_CALL(*this, inferenceReadiness())
                 .WillByDefault(testing::Return(InferenceReadiness{}));
             ON_CALL(*this, prepareForInference())
@@ -100,7 +105,10 @@ namespace llaminar2::test
         MOCK_METHOD(int, vocabSize, (), (const, override));
         MOCK_METHOD(int, currentPosition, (), (const, override));
         MOCK_METHOD(void, clearCache, (), (override));
+        MOCK_METHOD(bool, purgePrefixCache, (), (override));
         MOCK_METHOD(DeviceId, primaryDeviceId, (), (const, override));
+        MOCK_METHOD(uint64_t, moeRuntimeMovementEpoch, (), (const, override));
+        MOCK_METHOD(MoEOptimizationStatus, moeOptimizationStatus, (), (const, override));
         MOCK_METHOD(InferenceReadiness, inferenceReadiness, (), (const, override));
         MOCK_METHOD(bool, prepareForInference, (), (override));
 

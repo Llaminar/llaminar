@@ -295,10 +295,27 @@ namespace llaminar2
                                        const uint16_t *b, size_t count);
 
     private:
-        /// Create or open the POSIX shared memory segment
+        /**
+         * @brief Construct, map, first-touch, and anonymize one shared arena.
+         *
+         * Rank zero creates and sizes a collision-free POSIX object. Every
+         * participant maps it, first-touches its NUMA-local payload region,
+         * and observes a root-authored unlink-completion publication before
+         * this method returns. Open descriptors and mappings retain the
+         * anonymous object until teardown; no filesystem name remains that a
+         * stale or concurrent process can reopen.
+         *
+         * @return True only when every participant owns a mapping and has
+         *         observed successful name removal.
+         */
         bool setupSharedMemory();
 
-        /// Unmap and optionally unlink the shared memory segment
+        /**
+         * @brief Release this rank's mapping and descriptor.
+         *
+         * Rank zero also removes the POSIX name when setup failed before the
+         * normal unlink-completion publication. The operation is idempotent.
+         */
         void teardownSharedMemory();
 
         /// Wait for a peer epoch in the shared-memory protocol, with abort/timeout handling.

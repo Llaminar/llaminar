@@ -20,7 +20,7 @@ SPEC.loader.exec_module(summary)
 
 
 HEADER = (
-    "backend,device,execution_path,homogeneous_gpu,"
+    "backend,device,execution_path,execution_topology,graph_contract,"
     "forward_full_graph_capture,forward_full_graph_replay,"
     "full_graph_capture,full_graph_replay,decode_graph_capture,"
     "decode_graph_replay,device_generation_controller,"
@@ -47,7 +47,8 @@ class ParityResultSummaryTest(unittest.TestCase):
 
     def test_homogeneous_full_graph_evidence_passes(self) -> None:
         markdown, total, failed = self._summarize(
-            "CUDA,cuda:0,graph,true,true,false,true,false,false,true,"
+            "CUDA,cuda:0,graph,homogeneous_gpu,homogeneous_gpu_captured,"
+            "true,false,true,false,false,true,"
             "false,not_observed,false,false,false,not_observed,false,false,false,true,"
             "12.5,3600,true"
         )
@@ -59,7 +60,8 @@ class ParityResultSummaryTest(unittest.TestCase):
 
     def test_homogeneous_segmented_replay_fails(self) -> None:
         markdown, total, failed = self._summarize(
-            "ROCm,rocm:0,graph,true,true,false,true,false,true,false,"
+            "ROCm,rocm:0,graph,homogeneous_gpu,homogeneous_gpu_captured,"
+            "true,false,true,false,true,false,"
             "false,not_observed,false,false,false,not_observed,false,false,true,false,"
             "8.0,3600,true"
         )
@@ -72,7 +74,8 @@ class ParityResultSummaryTest(unittest.TestCase):
         self,
     ) -> None:
         markdown, total, failed = self._summarize(
-            "ROCm,rocm:0,graph,true,true,false,false,false,true,true,"
+            "ROCm,rocm:0,graph,homogeneous_gpu,homogeneous_gpu_captured,"
+            "true,false,false,false,true,true,"
             "true,host_scheduled_captured_transactions,false,"
             "false,false,missing_ticket,false,false,false,false,9.0,3600,true"
         )
@@ -85,7 +88,8 @@ class ParityResultSummaryTest(unittest.TestCase):
         self,
     ) -> None:
         markdown, total, failed = self._summarize(
-            "ROCm,rocm:0,graph,true,true,true,false,false,true,true,"
+            "ROCm,rocm:0,graph,homogeneous_gpu,homogeneous_gpu_captured,"
+            "true,true,false,false,true,true,"
             "true,host_scheduled_captured_transactions,false,"
             "true,true,certified_rocm_ticket_boundary,false,false,false,true,"
             "9.0,3600,true"
@@ -97,13 +101,36 @@ class ParityResultSummaryTest(unittest.TestCase):
 
     def test_native_cuda_generation_parent_passes(self) -> None:
         markdown, total, failed = self._summarize(
-            "CUDA,cuda:0,graph,true,true,true,true,true,true,true,"
+            "CUDA,cuda:0,graph,homogeneous_gpu,homogeneous_gpu_captured,"
+            "true,true,true,true,true,true,"
             "true,native_conditional_parent,true,false,true,"
             "native_conditional_parent,false,false,false,true,7.0,3600,true"
         )
 
         self.assertEqual((total, failed), (1, 0))
         self.assertIn("native_conditional_parent", markdown)
+        self.assertIn("| ✅ |", markdown)
+
+    def test_uncaptured_heterogeneous_accelerator_fails(self) -> None:
+        markdown, total, failed = self._summarize(
+            "ExpertOverlay,cpu:0,graph,heterogeneous_accelerator,"
+            "heterogeneous_coordinator_segmented,"
+            "true,true,true,true,true,true,false,not_observed,false,false,false,"
+            "not_observed,false,false,false,false,7.0,3600,true"
+        )
+
+        self.assertEqual((total, failed), (1, 1))
+        self.assertIn("| ❌ |", markdown)
+
+    def test_captured_heterogeneous_segments_pass(self) -> None:
+        markdown, total, failed = self._summarize(
+            "ExpertOverlay,cuda:0,graph,heterogeneous_accelerator,"
+            "heterogeneous_coordinator_segmented,"
+            "false,false,false,false,true,true,false,not_observed,false,false,false,"
+            "not_observed,true,true,true,false,7.0,3600,true"
+        )
+
+        self.assertEqual((total, failed), (1, 0))
         self.assertIn("| ✅ |", markdown)
 
 

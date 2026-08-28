@@ -25,9 +25,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -127,9 +130,9 @@ namespace
         std::shared_ptr<GpuExpertSlotPool> gpu_direct_slot_pool;
 
         // 3D parent tensors (owned — must be shared_ptr for create_view/shared_from_this)
-        std::shared_ptr<Q4_0Tensor> gate_3d;
-        std::shared_ptr<Q4_0Tensor> up_3d;
-        std::shared_ptr<Q4_0Tensor> down_3d;
+        std::shared_ptr<TensorBase> gate_3d;
+        std::shared_ptr<TensorBase> up_3d;
+        std::shared_ptr<TensorBase> down_3d;
 
         TestWeightContextOwner()
         {
@@ -734,6 +737,88 @@ TEST(Test__MoEExpertWeightService, ReleaseRawWeights_NullsParentPointers)
     EXPECT_GT(freed, 0u);
 }
 
+/**
+ * @brief Prepared floating experts remain executable after parent retirement.
+ *
+ * This reproduces the production CPU-tier lifetime boundary: ExpertOverlay
+ * prepares per-expert engines from 2-D views, publishes their ownership into
+ * PreparedWeightStore, and then releases the graph-frozen 3-D loader tensors.
+ * Every native floating format must execute from independent prepared bytes.
+ */
+TEST(Test__MoEExpertWeightService,
+     ReleaseRawWeights_FloatingPreparedStoreEnginesRemainExecutable)
+{
+    const auto prove_format = [](TensorType type)
+    {
+        const auto make_tensor = [type](std::vector<size_t> shape)
+            -> std::shared_ptr<TensorBase>
+        {
+            const size_t elements =
+                std::accumulate(
+                    shape.begin(), shape.end(), size_t{1},
+                    std::multiplies<size_t>{});
+            switch (type)
+            {
+            case TensorType::FP32:
+                return std::make_shared<FP32Tensor>(shape);
+            case TensorType::FP16:
+                return std::make_shared<FP16Tensor>(
+                    shape, std::vector<uint16_t>(elements, 0));
+            case TensorType::BF16:
+                return std::make_shared<BF16Tensor>(
+                    shape, std::vector<uint16_t>(elements, 0));
+            default:
+                throw std::invalid_argument(
+                    "floating expert regression received a non-floating format");
+            }
+        };
+
+        TestWeightContextOwner owner;
+        owner.gate_3d = make_tensor(
+            {kDModel, kExpertIntermediate, kNumExperts});
+        owner.up_3d = make_tensor(
+            {kDModel, kExpertIntermediate, kNumExperts});
+        owner.down_3d = make_tensor(
+            {kExpertIntermediate, kDModel, kNumExperts});
+
+        PreparedWeightStore store(ModelContextId{
+            static_cast<uint64_t>(900 + static_cast<int>(type))});
+        owner.prepared_store = &store;
+
+        {
+            auto ctx = owner.buildContext();
+            ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+            ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
+        }
+
+        ITensorGemm *gate_engine = owner.prepared_gate_gemm.front();
+        ASSERT_NE(gate_engine, nullptr) << tensorTypeName(type);
+
+        {
+            auto ctx = owner.buildContext();
+            EXPECT_GT(MoEExpertWeightService::releaseRawWeights(ctx), 0u)
+                << tensorTypeName(type);
+            EXPECT_EQ(ctx.gate_exps, nullptr) << tensorTypeName(type);
+        }
+        EXPECT_EQ(owner.gate_3d->raw_data(), nullptr)
+            << tensorTypeName(type);
+
+        FP32Tensor input({1, static_cast<size_t>(kDModel)});
+        FP32Tensor output({1, static_cast<size_t>(kExpertIntermediate)});
+        EXPECT_TRUE(gate_engine->multiply_tensor(
+            &input,
+            &output,
+            1,
+            kExpertIntermediate,
+            kDModel))
+            << tensorTypeName(type);
+    };
+
+    prove_format(TensorType::FP32);
+    prove_format(TensorType::FP16);
+    prove_format(TensorType::BF16);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // releaseDepartedExperts
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1118,8 +1203,7 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_ReusesReleasedPhysicalSlot)
         /*device_ordinal=*/0,
         /*layer_idx=*/3,
         /*capacity=*/2,
-        std::move(specs),
-        /*vram_safety_margin_bytes=*/0);
+        std::move(specs));
 
     auto first = pool->acquire(11);
     auto second = pool->acquire(12);
@@ -1170,8 +1254,7 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_RetainsSameExpertAcrossRcuE
         /*device_ordinal=*/0,
         /*layer_idx=*/3,
         /*active_capacity=*/2,
-        std::move(specs),
-        /*vram_safety_margin_bytes=*/0);
+        std::move(specs));
 
     auto old_epoch = pool->acquire(11, /*residency_epoch=*/40);
     auto candidate_epoch = pool->acquire(11, /*residency_epoch=*/41);
@@ -1224,7 +1307,6 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_TransferSlotsAreSurplusAndR
         /*layer_idx=*/4,
         /*active_capacity=*/1,
         std::move(specs),
-        /*vram_safety_margin_bytes=*/0,
         /*transfer_capacity=*/1);
 
     EXPECT_EQ(pool->capacity(), 1u);
@@ -1320,8 +1402,7 @@ TEST(Test__MoEExpertWeightService, GpuDirectTransferStagingPool_RecommendedCapac
         DeviceId::cuda(0),
         /*device_ordinal=*/0,
         /*capacity=*/2,
-        specs,
-        /*vram_safety_margin_bytes=*/0);
+        specs);
 
     EXPECT_TRUE(pool->compatibleWith(specs));
     auto different_specs = specs;

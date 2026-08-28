@@ -11,7 +11,6 @@
 
 #include "MoEOverlayLocalCapacityPlanner.h"
 
-#include "backends/GPUAllocationPolicy.h"
 #include "planning/ActivationBufferSizing.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "planning/MemoryPlanner.h"
@@ -139,6 +138,50 @@ namespace llaminar2
                 { return config.device == device; });
         }
     } // namespace
+
+    CapturedGraphExecutableInventory
+    resolveMoEOverlayCapturedGraphExecutableInventory(
+        int model_layer_count,
+        MoEOverlayAuthorityExecutionKind authority_execution,
+        std::size_t model_graph_identity_count,
+        std::size_t auxiliary_native_executable_count)
+    {
+        if (model_layer_count <= 0)
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay captured graph inventory requires positive model layers");
+        }
+        if (authority_execution ==
+            MoEOverlayAuthorityExecutionKind::Unresolved)
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay captured graph inventory requires a frozen authority topology");
+        }
+
+        std::size_t native_segments_per_model_graph =
+            model_graph_identity_count == 0u ? 0u : 1u;
+        if (model_graph_identity_count != 0u &&
+            authority_execution ==
+                MoEOverlayAuthorityExecutionKind::HostResident)
+        {
+            const std::size_t layers =
+                static_cast<std::size_t>(model_layer_count);
+            if (layers == std::numeric_limits<std::size_t>::max())
+            {
+                throw std::overflow_error(
+                    "ExpertOverlay captured graph segment count overflows size_t");
+            }
+            native_segments_per_model_graph = layers + 1u;
+        }
+
+        return {
+            .model_graph_identity_count = model_graph_identity_count,
+            .native_segments_per_model_graph =
+                native_segments_per_model_graph,
+            .auxiliary_native_executable_count =
+                auxiliary_native_executable_count,
+        };
+    }
 
     void installMoEOverlayRuntimeGPUCapacityObservation(
         RankInventory &inventory,
@@ -314,16 +357,17 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay local capacity planner received invalid model/rank geometry");
         }
-        if (rank_plan.runtime.mtp.enabled &&
+        if (retainsMTPGraphCapacity(rank_plan.runtime.mtp) &&
             input.resident_graph_rows > 0 &&
             input.resident_graph_rows <
-                resolveMTPMaxTargetQueryRows(rank_plan.runtime.mtp))
+                resolveMTPRetainedTargetQueryRows(rank_plan.runtime.mtp))
         {
             throw std::invalid_argument(
                 "ExpertOverlay resident graph rows cannot hold the configured MTP verification ceiling: resident=" +
                 std::to_string(input.resident_graph_rows) +
                 " required=" + std::to_string(
-                    resolveMTPMaxTargetQueryRows(rank_plan.runtime.mtp)));
+                    resolveMTPRetainedTargetQueryRows(
+                        rank_plan.runtime.mtp)));
         }
 
         const auto bound =
@@ -413,9 +457,7 @@ namespace llaminar2
                     /*planned_weight_bytes=*/0,
                     input.gpu_weight_load->maximum_source_bytes,
                     config.device_free_bytes,
-                    total_bytes,
                     input.gpu_weight_load->policy);
-                config.headroom_bytes = load_bom.safety_margin_bytes;
                 gpu_weight_load_boms[device] = load_bom;
             }
             config.device_compute_units =
@@ -435,9 +477,19 @@ namespace llaminar2
                           input.resident_graph_rows)
                     : resolveActivationBufferSeqLen(
                           config.max_seq_len, device);
-            config.mtp_enabled = rank_plan.runtime.mtp.enabled;
+            /*
+             * DevicePlanConfig describes resident setup bytes, not whether the
+             * next request executes MTP. A positive disabled capacity therefore
+             * reserves the same shifted state and verifier workspace as the
+             * enabled runner that will later reuse this physical authority.
+             */
+            config.mtp_enabled =
+                retainsMTPGraphCapacity(rank_plan.runtime.mtp);
             config.mtp_target_query_rows =
-                resolveMTPMaxTargetQueryRows(rank_plan.runtime.mtp);
+                std::max(
+                    1,
+                    resolveMTPRetainedTargetQueryRows(
+                        rank_plan.runtime.mtp));
             config.mtp_terminal_logits_layout =
                 resolveMTPTerminalLogitsLayout(
                     total_shards > 1,
@@ -451,6 +503,7 @@ namespace llaminar2
                 resolveKVCacheStoragePrecision(
                     rank_plan.runtime.kv_cache_precision,
                     device.is_cpu()));
+            config.prefix_cache = rank_plan.runtime.prefix_cache;
             if (total_shards > 1 && profile.n_kv_heads > 0)
             {
                 config.local_kv_heads =
@@ -481,8 +534,7 @@ namespace llaminar2
                         overlay_plan.continuation_domain_spec
                             .effectiveDensePolicy(),
                         total_shards,
-                        config.mtp_enabled,
-                        config.mtp_terminal_logits_layout);
+                        rank_plan.runtime.mtp.terminal_head_policy);
             }
             config.weight_residency =
                 role == DeviceExecutionMemoryRole::ContinuationGraph
@@ -591,12 +643,7 @@ namespace llaminar2
             std::move(activation_channel_plan);
         result.fixed_memory_plan = MemoryPlanner::plan(profile, configs);
 
-        struct GroupedBytes
-        {
-            std::size_t fixed = 0;
-            std::size_t safety = 0;
-        };
-        std::map<DeviceId, GroupedBytes> grouped;
+        std::map<DeviceId, std::size_t> grouped_fixed_bytes;
         for (const auto &device_plan : result.fixed_memory_plan.devices)
         {
             LOG_DEBUG(
@@ -608,17 +655,21 @@ namespace llaminar2
                 << " kv_cache=" << device_plan.kv_cache_bytes
                 << " persistent_state="
                 << device_plan.persistent_state_bytes
+                << " prefix_staging="
+                << device_plan.prefix_cache_staging_bytes
+                << " prefix_device_hot="
+                << device_plan.prefix_cache_device_hot_bytes
                 << " collective=" << device_plan.collective_bytes
                 << " activations=" << device_plan.activation_bytes
                 << " workspace=" << device_plan.workspace_bytes
+                << " retained_workspace="
+                << device_plan.retained_workspace_bytes
                 << " total=" << device_plan.total_bytes());
-            auto &entry = grouped[device_plan.device];
-            entry.fixed = checkedAdd(
-                entry.fixed,
+            auto &fixed_bytes = grouped_fixed_bytes[device_plan.device];
+            fixed_bytes = checkedAdd(
+                fixed_bytes,
                 device_plan.total_bytes(),
                 "fixed device BOM");
-            entry.safety = std::max(
-                entry.safety, device_plan.headroom_bytes);
         }
 
         result.physical_budgets.reserve(resource_devices.size());
@@ -627,9 +678,9 @@ namespace llaminar2
             const auto [total_bytes, available_bytes] =
                 inventoryMemory(inventory, device);
             (void)total_bytes;
-            const auto found = grouped.find(device);
-            const GroupedBytes bytes =
-                found == grouped.end() ? GroupedBytes{} : found->second;
+            const auto found = grouped_fixed_bytes.find(device);
+            const std::size_t fixed_bytes =
+                found == grouped_fixed_bytes.end() ? 0u : found->second;
             const auto gpu_load = gpu_weight_load_boms.find(device);
             const std::size_t gpu_load_staging_bytes =
                 gpu_load == gpu_weight_load_boms.end()
@@ -642,7 +693,7 @@ namespace llaminar2
                 device.is_gpu()
                     ? estimateCapturedGraphExecutableBytes(
                           profile.n_layers,
-                          input.captured_graph_executable_count)
+                          input.captured_graph_inventory)
                     : 0u;
             result.physical_budgets.push_back({
                 .world_rank = rank_plan.rank,
@@ -651,7 +702,7 @@ namespace llaminar2
                 .usable_budget_bytes = usableMemory(
                     available_bytes, device, input),
                 .fixed_bytes = checkedAdd(
-                    bytes.fixed,
+                    fixed_bytes,
                     captured_graph_bytes,
                     "captured graph driver storage"),
                 .additional_transfer_staging_bytes =
@@ -659,14 +710,6 @@ namespace llaminar2
                         gpu_load_staging_bytes,
                         activation_staging_bytes,
                         "combined transfer staging"),
-                .safety_reserve_bytes =
-                    device.is_gpu()
-                        ? checkedAdd(
-                              bytes.safety,
-                              gpu_allocation_policy::
-                                  kMinimumFreeHeadroomBytes,
-                              "allocator free-memory reserve")
-                        : bytes.safety,
             });
         }
         return result;

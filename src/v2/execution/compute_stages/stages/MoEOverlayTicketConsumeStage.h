@@ -15,6 +15,7 @@
 
 namespace llaminar2
 {
+    class IMoEKernel;
     class TensorBase;
 
     /**
@@ -37,13 +38,23 @@ namespace llaminar2
             std::optional<BufferId> output_buffer_id;
             int layer_idx = -1;
             int bucket_rows = 0;
+            int top_k = 0;
             int d_model = 0;
             std::shared_ptr<MoEOverlayDispatchTicketStorage> ticket_storage;
+            /**
+             * Colocated CPU sparse-route publication. Exactly one ticket kind
+             * must be selected; this mode writes canonical route slots rather
+             * than a dense row aggregate.
+             */
+            std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage>
+                canonical_route_ticket_storage;
         };
 
         static_assert(StageParamsRequired<Params>);
 
         explicit MoEOverlayTicketConsumeStage(Params params);
+        /** @brief Destroy the optional backend kernel after its complete type is visible. */
+        ~MoEOverlayTicketConsumeStage() override;
 
         /** @brief Record or enqueue the fixed H2D ingress after its typed boundary. */
         bool execute(IDeviceContext *ctx) override;
@@ -91,7 +102,14 @@ namespace llaminar2
         /** @brief Validate the complete capture-ready ticket and device binding. */
         bool hasFixedTicketContract() const noexcept;
 
+        /** @return Whether this stage consumes sparse canonical route rows. */
+        [[nodiscard]] bool consumesCanonicalRouteTicket() const noexcept
+        {
+            return params_.canonical_route_ticket_storage != nullptr;
+        }
+
         Params params_;
+        std::unique_ptr<IMoEKernel> moe_kernel_;
     };
 
 } // namespace llaminar2

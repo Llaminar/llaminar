@@ -1442,7 +1442,7 @@ namespace llaminar2::test
                 model_ctx->concreteLoader(),
                 model_ctx->architecture(),
                 model_ctx->totalBlockCount(),
-                /*mtp_enabled=*/false,
+                MoEOverlayMTPGraphFamilyPolicy::MainOnly,
                 /*graph_family_generation=*/1,
                 /*max_graph_rows=*/kSeqLen,
                 /*max_decode_rows=*/1,
@@ -1974,7 +1974,7 @@ namespace llaminar2::test
                 model_ctx->concreteLoader(),
                 model_ctx->architecture(),
                 model_ctx->totalBlockCount(),
-                /*mtp_enabled=*/false,
+                MoEOverlayMTPGraphFamilyPolicy::MainOnly,
                 /*graph_family_generation=*/1,
                 /*max_graph_rows=*/kSeqLen,
                 /*max_decode_rows=*/1,
@@ -2599,6 +2599,15 @@ namespace llaminar2::test
             EXPECT_TRUE(hasDependency(
                 *graph, shared_gate_name, shared_reduce_name));
             EXPECT_TRUE(hasDependency(
+                *graph, shared_reduce_name, ordered_name))
+                << "The rooted shared reduction must remain in the post-ticket "
+                   "unit so every LocalTP participant launches its matching "
+                   "collective in the same capture wave";
+            EXPECT_FALSE(hasDependency(
+                *graph, ordered_name, shared_reduce_name))
+                << "An unmatched pre-ticket rooted reduction can occupy the GPU "
+                   "while its peer waits at the next capture-wave rendezvous";
+            EXPECT_TRUE(hasDependency(
                 *graph, combined_broadcast_name, shared_gate_name));
             EXPECT_TRUE(hasDependency(
                 *graph, shared_gate_name, ordered_name));
@@ -2676,8 +2685,12 @@ namespace llaminar2::test
                     "runtime_route_weights");
                 const auto bank0_dump = find_output(
                     "overlay_route_participants_bank0");
+                const auto bank0_epoch_dump = find_output(
+                    "overlay_route_bank0_epoch");
                 const auto bank1_dump = find_output(
                     "overlay_route_participants_bank1");
+                const auto bank1_epoch_dump = find_output(
+                    "overlay_route_bank1_epoch");
                 const auto selected_bank_dump = find_output(
                     "overlay_route_selected_bank");
                 if (expected_role ==
@@ -2704,10 +2717,14 @@ namespace llaminar2::test
                               static_cast<std::size_t>(kTopK));
                     EXPECT_STREQ(runtime_weights_dump->dtype, "FP32");
                     ASSERT_NE(bank0_dump, dump.outputs.end());
+                    ASSERT_NE(bank0_epoch_dump, dump.outputs.end());
                     ASSERT_NE(bank1_dump, dump.outputs.end());
+                    ASSERT_NE(bank1_epoch_dump, dump.outputs.end());
                     ASSERT_NE(selected_bank_dump, dump.outputs.end());
                     ASSERT_NE(bank0_dump->tensor, nullptr);
+                    ASSERT_NE(bank0_epoch_dump->tensor, nullptr);
                     ASSERT_NE(bank1_dump->tensor, nullptr);
+                    ASSERT_NE(bank1_epoch_dump->tensor, nullptr);
                     ASSERT_NE(selected_bank_dump->tensor, nullptr);
                     EXPECT_EQ(
                         bank0_dump->tensor->gpu_data_ptr(),
@@ -2718,18 +2735,30 @@ namespace llaminar2::test
                         params.overlay_route_placement.banks[1]
                             .route_participants);
                     EXPECT_EQ(
+                        bank0_epoch_dump->tensor->gpu_data_ptr(),
+                        params.overlay_route_placement.banks[0].epoch);
+                    EXPECT_EQ(
+                        bank1_epoch_dump->tensor->gpu_data_ptr(),
+                        params.overlay_route_placement.banks[1].epoch);
+                    EXPECT_EQ(
                         selected_bank_dump->tensor->gpu_data_ptr(),
                         &params.overlay_route_placement.status->bank);
                     EXPECT_EQ(bank0_dump->rows, 1u);
                     EXPECT_EQ(bank1_dump->rows, 1u);
                     EXPECT_EQ(bank0_dump->cols,
                               static_cast<std::size_t>(kNumExperts));
+                    EXPECT_EQ(bank0_epoch_dump->rows, 1u);
+                    EXPECT_EQ(bank0_epoch_dump->cols, 1u);
                     EXPECT_EQ(bank1_dump->cols,
                               static_cast<std::size_t>(kNumExperts));
+                    EXPECT_EQ(bank1_epoch_dump->rows, 1u);
+                    EXPECT_EQ(bank1_epoch_dump->cols, 1u);
                     EXPECT_EQ(selected_bank_dump->rows, 1u);
                     EXPECT_EQ(selected_bank_dump->cols, 1u);
                     EXPECT_STREQ(bank0_dump->dtype, "INT32");
+                    EXPECT_STREQ(bank0_epoch_dump->dtype, "INT32");
                     EXPECT_STREQ(bank1_dump->dtype, "INT32");
+                    EXPECT_STREQ(bank1_epoch_dump->dtype, "INT32");
                     EXPECT_STREQ(selected_bank_dump->dtype, "INT32");
                 }
                 else
@@ -2739,7 +2768,9 @@ namespace llaminar2::test
                            "domain route-assignment diagnostic";
                     EXPECT_EQ(runtime_weights_dump, dump.outputs.end());
                     EXPECT_EQ(bank0_dump, dump.outputs.end());
+                    EXPECT_EQ(bank0_epoch_dump, dump.outputs.end());
                     EXPECT_EQ(bank1_dump, dump.outputs.end());
+                    EXPECT_EQ(bank1_epoch_dump, dump.outputs.end());
                     EXPECT_EQ(selected_bank_dump, dump.outputs.end());
                 }
             }

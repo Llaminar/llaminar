@@ -206,6 +206,11 @@ namespace
         const float *logits() const override { return logits_.data(); }
         int vocab_size() const override { return VOCAB_SIZE; }
         void clear_cache() override { clear_cache_count_++; }
+        bool purgePrefixCache() override
+        {
+            ++purge_prefix_cache_count_;
+            return purge_prefix_cache_success_;
+        }
         int get_position() const override { return 0; }
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
         const char *architecture() const override { return "mock"; }
@@ -236,6 +241,7 @@ namespace
         // Test inspection
         int forwardCallCount() const { return forward_call_count_; }
         int clearCacheCount() const { return clear_cache_count_; }
+        int purgePrefixCacheCount() const { return purge_prefix_cache_count_; }
         int sampleGreedyOnDeviceCount() const { return sample_greedy_on_device_count_; }
         int skipLogitsCalls() const { return skip_logits_calls_; }
         bool skipLogitsGather() const { return skip_logits_gather_; }
@@ -253,11 +259,16 @@ namespace
         {
             requires_mpi_coordinated_decode_sampling_ = required;
         }
+        void setPurgePrefixCacheSuccess(bool success)
+        {
+            purge_prefix_cache_success_ = success;
+        }
 
     private:
         std::vector<float> logits_;
         int forward_call_count_{0};
         int clear_cache_count_{0};
+        int purge_prefix_cache_count_{0};
         int sample_greedy_on_device_count_{0};
         int skip_logits_calls_{0};
         int sample_greedy_on_device_token_{-1};
@@ -265,6 +276,7 @@ namespace
         bool forward_success_{true};
         bool throw_on_forward_{false};
         bool requires_mpi_coordinated_decode_sampling_{false};
+        bool purge_prefix_cache_success_{true};
         int fail_after_n_forwards_{0}; // 0 = disabled
         std::vector<int> last_forward_tokens_;
         std::vector<int32_t> stop_tokens_;
@@ -556,6 +568,39 @@ namespace
         EXPECT_EQ(mock->clearCacheCount(), 1);
     }
 
+    TEST_F(Test__MPICoordinatedMode,
+           PurgePrefixCacheBroadcastsCommandAndInvokesLocalAuthority)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        ASSERT_TRUE(runner->purgePrefixCache());
+
+        ASSERT_EQ(mpi->broadcastCount(), 1u);
+        const auto &cmd = mpi->broadcasts()[0];
+        EXPECT_EQ(cmd.type,
+                  RecordingMPIContext::BroadcastRecord::Type::INT32);
+        ASSERT_EQ(cmd.int_data.size(), 1u);
+        EXPECT_EQ(
+            cmd.int_data[0],
+            static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::PURGE_PREFIX_CACHE));
+        EXPECT_EQ(mock->purgePrefixCacheCount(), 1);
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           PurgePrefixCachePropagatesLocalLeaseRejection)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 1);
+        mock->setPurgePrefixCacheSuccess(false);
+
+        EXPECT_FALSE(runner->purgePrefixCache());
+        EXPECT_EQ(mock->purgePrefixCacheCount(), 1);
+        EXPECT_NE(
+            runner->lastError().find("active cache lease"),
+            std::string::npos);
+    }
+
     // =========================================================================
     // setSamplingParams() Coordination Tests
     // =========================================================================
@@ -690,7 +735,7 @@ namespace
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN));
     }
 
-    TEST_F(Test__MPICoordinatedMode, ShutdownNoopForSingleRank)
+    TEST_F(Test__MPICoordinatedMode, ShutdownSingleRankSendsNoWireCommand)
     {
         auto [runner, mock, mpi] = createRunner(0, 1);
         runner->setMPICoordinatedMode(true);
@@ -758,12 +803,64 @@ namespace
         const auto publish = body.find(
             "broadcastCommand(MPICommand::SHUTDOWN);");
         const auto drain = body.find(
-            "shutdownMoEExpertOverlayResidencyMaintenance();");
+            "shutdownMoEExpertOverlayResidencyMaintenance(",
+            publish);
+        const auto terminal_drain_intent = body.find(
+            "MoEOverlayMaintenanceDrainIntent::TerminalContextSeal",
+            drain);
         ASSERT_NE(publish, std::string_view::npos);
         ASSERT_NE(drain, std::string_view::npos);
+        ASSERT_NE(terminal_drain_intent, std::string_view::npos);
         EXPECT_LT(publish, drain)
             << "Barrier-before-Bcast mismatches the root maintenance drain "
                "against the worker command receive and deadlocks teardown";
+        EXPECT_LT(drain, terminal_drain_intent)
+            << "Terminal shutdown must name the terminal context-seal drain "
+               "rather than relying on an implicit maintenance policy";
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           SingleRankTerminalAdmissionStillDrainsResidencyMaintenance)
+    {
+        /* A one-rank topology has no command wire to observe, so lock down the
+         * lifecycle edge structurally. Real device integration independently
+         * proves that this drain retires old banks and recycles live slots. */
+        std::ifstream source(LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
+        ASSERT_TRUE(source.good());
+        const std::string text{
+            std::istreambuf_iterator<char>(source),
+            std::istreambuf_iterator<char>()};
+        const auto function_begin = text.find(
+            "void OrchestrationRunner::shutdownMPIWorkers()");
+        ASSERT_NE(function_begin, std::string::npos);
+        const auto function_end = text.find(
+            "[[noreturn]] void OrchestrationRunner::terminateFailedMPIWorkerCommand",
+            function_begin);
+        ASSERT_NE(function_end, std::string::npos);
+        const std::string_view body(
+            text.data() + function_begin,
+            function_end - function_begin);
+        const auto single_rank_branch = body.find(
+            "if (!mpi_ctx_ || mpi_ctx_->world_size() <= 1)");
+        const auto local_drain = body.find(
+            "shutdownMoEExpertOverlayResidencyMaintenance(",
+            single_rank_branch);
+        const auto terminal_drain_intent = body.find(
+            "MoEOverlayMaintenanceDrainIntent::TerminalContextSeal",
+            local_drain);
+        const auto multi_rank_authority_check = body.find(
+            "if (mpi_ctx_->rank() != mpi_coordinated_root_rank_)",
+            single_rank_branch);
+        ASSERT_NE(single_rank_branch, std::string_view::npos);
+        ASSERT_NE(local_drain, std::string_view::npos);
+        ASSERT_NE(terminal_drain_intent, std::string_view::npos);
+        ASSERT_NE(multi_rank_authority_check, std::string_view::npos);
+        EXPECT_LT(single_rank_branch, local_drain);
+        EXPECT_LT(local_drain, terminal_drain_intent);
+        EXPECT_LT(terminal_drain_intent, multi_rank_authority_check);
+        EXPECT_LT(local_drain, multi_rank_authority_check)
+            << "Single-rank terminal admission returned before draining the "
+               "model-lifetime residency service";
     }
 
     // =========================================================================
@@ -1159,6 +1256,44 @@ namespace
 
         EXPECT_EQ(mock->forwardCallCount(), 1);
         EXPECT_THAT(mock->lastForwardTokens(), ElementsAre(100, 200, 300));
+    }
+
+    TEST_F(
+        Test__MPICoordinatedMode,
+        WorkerPrefillActivatesExpertOverlayDemandBeforeFollowerTickets)
+    {
+        /*
+         * The injected runner seam does not materialize a physical
+         * ExpertOverlay authority. Lock down the command wiring structurally;
+         * authority and histogram transition semantics have their own
+         * device-free tests, while production parity proves this exact branch
+         * with a retained transaction follower and real weights.
+         */
+        std::ifstream source(LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
+        ASSERT_TRUE(source.good());
+        const std::string text{
+            std::istreambuf_iterator<char>(source),
+            std::istreambuf_iterator<char>()};
+        const auto prefill_case = text.find("case MPICommand::PREFILL:");
+        ASSERT_NE(prefill_case, std::string::npos);
+        const auto next_case = text.find(
+            "case MPICommand::DECODE_STEP:", prefill_case);
+        ASSERT_NE(next_case, std::string::npos);
+        const std::string_view body(
+            text.data() + prefill_case,
+            next_case - prefill_case);
+        const auto activation = body.find(
+            "activateMoEOverlayDemandAtRequestBoundary()");
+        const auto follower = body.find(
+            "if (moe_overlay_inference_transaction_follower_)");
+        const auto ticket = body.find("->runOneCommand()", follower);
+        ASSERT_NE(activation, std::string_view::npos);
+        ASSERT_NE(follower, std::string_view::npos);
+        ASSERT_NE(ticket, std::string_view::npos);
+        EXPECT_LT(activation, follower);
+        EXPECT_LT(activation, ticket)
+            << "A remote ExpertOverlay request must leave certification "
+               "quarantine before its first retained graph ticket executes";
     }
 
     TEST_F(Test__MPICoordinatedMode, WorkerLoopDispatchesDecodeStep)

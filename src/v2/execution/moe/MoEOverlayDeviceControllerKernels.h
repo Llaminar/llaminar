@@ -420,13 +420,20 @@ namespace llaminar2
         std::uint64_t base_epoch,
         std::uint64_t candidate_epoch) noexcept
     {
+        const auto movement_axis =
+            static_cast<MoEOverlayDeviceMovementAxis>(entry.flags);
+        const bool movement_axis_valid =
+            movement_axis == MoEOverlayDeviceMovementAxis::TierResidency ||
+            movement_axis ==
+                MoEOverlayDeviceMovementAxis::ParticipantPlacement ||
+            movement_axis == MoEOverlayDeviceMovementAxis::Combined;
         if (entry.magic != kMoEOverlayDeviceMovementCommandMagic ||
             entry.version != kMoEOverlayDeviceMovementCommandVersion ||
             entry.ordinal != ordinal || entry.layer >= num_layers ||
             entry.expert >= num_experts ||
             entry.source_participant >= participant_count ||
             entry.destination_participant >= participant_count ||
-            entry.flags != 0u || entry.source_epoch != base_epoch ||
+            !movement_axis_valid || entry.source_epoch != base_epoch ||
             entry.candidate_epoch != candidate_epoch)
         {
             return false;
@@ -445,7 +452,12 @@ namespace llaminar2
                 (kind == MoEOverlayDeviceControllerTransactionKind::
                              CurrentBatchLLEP &&
                  op == MoEOverlayDeviceMovementOp::TransientArrival);
-            return correct_kind &&
+            const bool correct_axis =
+                kind == MoEOverlayDeviceControllerTransactionKind::
+                            DynamicPlacement ||
+                movement_axis ==
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement;
+            return correct_kind && correct_axis &&
                    entry.source_participant !=
                        entry.destination_participant &&
                    entry.payload_slot == ordinal &&
@@ -460,6 +472,8 @@ namespace llaminar2
         return kind ==
                    MoEOverlayDeviceControllerTransactionKind::CurrentBatchLLEP &&
                op == MoEOverlayDeviceMovementOp::TransientAssignment &&
+               movement_axis ==
+                   MoEOverlayDeviceMovementAxis::ParticipantPlacement &&
                entry.source_participant == entry.destination_participant &&
                entry.payload_slot == kMoEOverlayDeviceInvalidSlot &&
                entry.payload_bytes == 0u && entry.source_epoch != 0u &&

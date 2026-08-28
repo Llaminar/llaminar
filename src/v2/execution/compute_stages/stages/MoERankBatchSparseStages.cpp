@@ -417,8 +417,16 @@ namespace llaminar2
                     LOG_ERROR("[MoERankBatchDispatchStage] Invalid targeted route descriptor entry");
                     return false;
                 }
+                const std::int32_t local_route =
+                    static_cast<std::int32_t>(entry_cursor - row_begin);
                 outbound.expert_ids_host[entry_cursor] = entry.expert_id;
                 outbound.route_weights_host[entry_cursor] = entry.route_weight;
+                outbound.original_route_slots_host[entry_cursor] =
+                    static_cast<std::int32_t>(token_row) * params_.top_k +
+                    entry.route_slot;
+                outbound.compact_route_slots_host[entry_cursor] =
+                    static_cast<std::int32_t>(compact_row) * params_.top_k +
+                    local_route;
                 ++entry_cursor;
             }
             if (entry_cursor == row_begin)
@@ -588,9 +596,10 @@ namespace llaminar2
                 MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
                     runtime_key.layer_idx,
                     runtime_key.tier_idx,
-                    runtime_key.toString(),
-                    rows.source_participant,
-                    rows.target_participant,
+                    MoEOverlayProfileEdge{
+                        .source_participant = rows.source_participant,
+                        .target_participant = rows.target_participant,
+                    },
                     rows.live_row_count,
                     rows.live_entry_count,
                     /*inbound_rows=*/0,
@@ -999,9 +1008,10 @@ namespace llaminar2
                 MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
                     runtime_key.layer_idx,
                     runtime_key.tier_idx,
-                    runtime_key.toString(),
-                    rows->source_participant,
-                    rows->target_participant,
+                    MoEOverlayProfileEdge{
+                        .source_participant = rows->source_participant,
+                        .target_participant = rows->target_participant,
+                    },
                     rows->live_row_count,
                     rows->live_row_count,
                     compactMoEOverlayReturnBytes(*rows),

@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include "backends/IGPUGraphCapture.h"
+#include "execution/mtp/HostedDeviceGenerationLifecycle.h"
 #include "kernels/common/SamplingMath.h"
 
 #include <algorithm>
@@ -29,6 +30,170 @@ namespace
 
     using ControlRow = std::array<int, kDeviceGenerationControlCount>;
     using MetaRow = std::array<int, kSpeculativeBatchMetaCount>;
+
+    /**
+     * @brief Prove the controller handoff admits only the complete transaction cycle.
+     */
+    TEST(
+        Test__DeviceGenerationController,
+        StateHandoffRequiresPublishBorrowRepublishOrder)
+    {
+        using llaminar2::DeviceGenerationStateHandoff;
+        using llaminar2::DeviceGenerationStatePublicationKind;
+        using llaminar2::DeviceTimelineRole;
+
+        DeviceGenerationStateHandoff handoff;
+        void *const admission_stream = reinterpret_cast<void *>(0x1000);
+        void *const verifier_stream = reinterpret_cast<void *>(0x2000);
+        void *const terminal_stream = reinterpret_cast<void *>(0x3000);
+
+        EXPECT_TRUE(handoff.inactive());
+        ASSERT_TRUE(handoff.publish(
+            DeviceGenerationStatePublicationKind::Admission,
+            admission_stream,
+            /*request_count=*/2,
+            [] { return true; }));
+        EXPECT_TRUE(handoff.published());
+        EXPECT_EQ(handoff.frontierStream(), admission_stream);
+        EXPECT_EQ(handoff.requestCount(), 2);
+
+        EXPECT_FALSE(handoff.publish(
+            DeviceGenerationStatePublicationKind::CommittedTransaction,
+            admission_stream,
+            2,
+            [] { return true; }))
+            << "A published version must be borrowed before it can be replaced.";
+
+        ASSERT_TRUE(handoff.borrow(
+            verifier_stream,
+            DeviceTimelineRole::AllPositionVerifier,
+            2,
+            [&](void *producer, void *consumer)
+            {
+                EXPECT_EQ(producer, admission_stream);
+                EXPECT_EQ(consumer, verifier_stream);
+                return true;
+            }));
+        EXPECT_TRUE(handoff.borrowed());
+        EXPECT_EQ(
+            handoff.borrowerRole(),
+            DeviceTimelineRole::AllPositionVerifier);
+
+        ASSERT_TRUE(handoff.publish(
+            DeviceGenerationStatePublicationKind::Terminal,
+            terminal_stream,
+            2,
+            [] { return true; }));
+        EXPECT_TRUE(handoff.published());
+        EXPECT_EQ(
+            handoff.lastPublication(),
+            DeviceGenerationStatePublicationKind::Terminal);
+
+        ASSERT_TRUE(handoff.borrow(
+            terminal_stream,
+            DeviceTimelineRole::HostResultBridge,
+            2,
+            [](void *, void *) { return true; }));
+        ASSERT_TRUE(handoff.retireAfterHostCompletion(2));
+        EXPECT_TRUE(handoff.inactive());
+    }
+
+    /**
+     * @brief Failed backend submissions must leave lifecycle authority unchanged.
+     */
+    TEST(
+        Test__DeviceGenerationController,
+        StateHandoffCommitsOnlyAfterBackendEdgeSucceeds)
+    {
+        using llaminar2::DeviceGenerationStateHandoff;
+        using llaminar2::DeviceGenerationStatePublicationKind;
+        using llaminar2::DeviceTimelineRole;
+
+        DeviceGenerationStateHandoff handoff;
+        void *const producer = reinterpret_cast<void *>(0x4000);
+        void *const consumer = reinterpret_cast<void *>(0x5000);
+
+        EXPECT_FALSE(handoff.publish(
+            DeviceGenerationStatePublicationKind::Admission,
+            producer,
+            1,
+            [] { return false; }));
+        EXPECT_TRUE(handoff.inactive());
+
+        ASSERT_TRUE(handoff.publish(
+            DeviceGenerationStatePublicationKind::Admission,
+            producer,
+            1,
+            [] { return true; }));
+        EXPECT_FALSE(handoff.borrow(
+            consumer,
+            DeviceTimelineRole::AllPositionVerifier,
+            1,
+            [](void *, void *) { return false; }));
+        EXPECT_TRUE(handoff.published());
+        EXPECT_EQ(handoff.frontierStream(), producer);
+    }
+
+    /**
+     * @brief Reset can retire both an untouched publication and a failed borrow.
+     */
+    TEST(
+        Test__DeviceGenerationController,
+        StateHandoffResetRetiresPublishedAndBorrowedFrontiers)
+    {
+        using llaminar2::DeviceGenerationStateHandoff;
+        using llaminar2::DeviceGenerationStateHandoffPhase;
+        using llaminar2::DeviceGenerationStatePublicationKind;
+        using llaminar2::DeviceTimelineRole;
+
+        void *const producer = reinterpret_cast<void *>(0x6000);
+        void *const borrower = reinterpret_cast<void *>(0x7000);
+        void *const reset = reinterpret_cast<void *>(0x8000);
+
+        for (const bool borrow_before_reset : {false, true})
+        {
+            DeviceGenerationStateHandoff handoff;
+            ASSERT_TRUE(handoff.publish(
+                DeviceGenerationStatePublicationKind::Admission,
+                producer,
+                1,
+                [] { return true; }));
+            if (borrow_before_reset)
+            {
+                ASSERT_TRUE(handoff.borrow(
+                    borrower,
+                    DeviceTimelineRole::AllPositionVerifier,
+                    1,
+                    [](void *, void *) { return true; }));
+            }
+
+            ASSERT_TRUE(handoff.retireForReset(
+                reset,
+                1,
+                [&](DeviceGenerationStateHandoffPhase phase,
+                    void *frontier,
+                    DeviceTimelineRole role,
+                    void *reset_stream)
+                {
+                    EXPECT_EQ(reset_stream, reset);
+                    EXPECT_EQ(
+                        phase,
+                        borrow_before_reset
+                            ? DeviceGenerationStateHandoffPhase::Borrowed
+                            : DeviceGenerationStateHandoffPhase::Published);
+                    EXPECT_EQ(
+                        frontier,
+                        borrow_before_reset ? borrower : producer);
+                    EXPECT_EQ(
+                        role,
+                        borrow_before_reset
+                            ? DeviceTimelineRole::AllPositionVerifier
+                            : DeviceTimelineRole::Count);
+                    return true;
+                }));
+            EXPECT_TRUE(handoff.inactive());
+        }
+    }
 
     TEST(
         Test__DeviceGenerationController,

@@ -9,7 +9,6 @@
  */
 
 #include "ROCmBackend.h"
-#include "backends/GPUAllocationPolicy.h"
 #include "HipDeviceGuard.h"
 #include "HIPGraphTimelineKernels.h"
 #include "../../utils/Logger.h"
@@ -39,6 +38,8 @@
 
 namespace llaminar2
 {
+    extern "C" bool llaminar2_retireROCmTensorValidatorRuntimeGeneration(
+        int device_id);
 
     extern "C" bool rocmOps_vector_add_inplace_fp32(
         float *output,
@@ -52,6 +53,19 @@ namespace llaminar2
         constexpr std::uintptr_t kDeviceAllocationAlignment = 256;
         constexpr unsigned int kMappedHostCopyThreads = 256u;
         constexpr unsigned int kMappedHostCopyMaximumBlocks = 4096u;
+
+        /**
+         * @return Mutex serializing HIP resource mutation against runtime reset.
+         *
+         * All tracked device allocations and host registrations take this lock
+         * before entering the HIP runtime. The exclusive generation reset holds
+         * it across preflight, hipDeviceReset, and new-generation publication.
+         */
+        std::mutex &rocmRuntimeResourceLifecycleMutex()
+        {
+            static auto *mutex = new std::mutex();
+            return *mutex;
+        }
 
         /** @return System-scope acquire load from a node-local mapped word. */
         __device__ __forceinline__ std::uint64_t mappedSystemAcquire64(
@@ -377,6 +391,9 @@ namespace llaminar2
             HipDeviceSaveRestore(const HipDeviceSaveRestore &) = delete;
             HipDeviceSaveRestore &operator=(const HipDeviceSaveRestore &) = delete;
 
+            /** @return Whether the caller's exact HIP device was captured. */
+            [[nodiscard]] bool valid() const noexcept { return valid_; }
+
         private:
             int saved_device_;
             bool valid_;
@@ -440,6 +457,8 @@ namespace llaminar2
         }
         penalty_buffers_.resize(
             static_cast<size_t>(std::max(device_count_, 0)));
+        runtime_generations_.assign(
+            static_cast<size_t>(std::max(device_count_, 0)), 1u);
     }
 
     ROCmBackend::~ROCmBackend()
@@ -546,6 +565,8 @@ namespace llaminar2
 
     bool ROCmBackend::pinHostMemory(void *ptr, size_t bytes, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
         HipDeviceSaveRestore device_guard;
         if (!ptr || bytes == 0 || device_id < 0 || device_id >= device_count_ ||
             static_cast<hipError_t>(HipDeviceGuard::forceSetDevice(device_id)) != hipSuccess)
@@ -562,11 +583,17 @@ namespace llaminar2
                      << hipGetErrorString(err));
             return false;
         }
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            rocmPinnedAllocations()[ptr] = device_id;
+        }
         return true;
     }
 
     bool ROCmBackend::unpinHostMemory(void *ptr, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
         HipDeviceSaveRestore device_guard;
         if (!ptr || device_id < 0 || device_id >= device_count_ ||
             static_cast<hipError_t>(HipDeviceGuard::forceSetDevice(device_id)) != hipSuccess)
@@ -583,6 +610,10 @@ namespace llaminar2
                      << " ptr=" << ptr);
             return false;
         }
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            rocmPinnedAllocations().erase(ptr);
+        }
         return true;
     }
 
@@ -591,6 +622,8 @@ namespace llaminar2
         size_t bytes,
         int registration_device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
         if (!ptr || bytes == 0u || registration_device_id < 0 ||
             registration_device_id >= device_count_)
         {
@@ -611,6 +644,10 @@ namespace llaminar2
             LOG_ERROR("[ROCmBackend::registerExternalMappedHostMemory] hipHostRegister(mapped|portable|uncached) failed for "
                       << bytes << " bytes: " << hipGetErrorString(error));
             return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            rocmPinnedAllocations()[ptr] = registration_device_id;
         }
         return true;
     }
@@ -648,6 +685,8 @@ namespace llaminar2
         void *ptr,
         int registration_device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
         if (!ptr || registration_device_id < 0 ||
             registration_device_id >= device_count_)
         {
@@ -662,6 +701,10 @@ namespace llaminar2
             LOG_ERROR("[ROCmBackend::unregisterExternalMappedHostMemory] hipHostUnregister failed: "
                       << hipGetErrorString(error));
             return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            rocmPinnedAllocations().erase(ptr);
         }
         return true;
     }
@@ -4351,6 +4394,8 @@ namespace llaminar2
 
     void *ROCmBackend::allocate(size_t bytes, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
         if (device_id >= device_count_ || device_id < 0)
         {
             LOG_ERROR("[ROCmBackend] Invalid device ID " << device_id << " (max: " << device_count_ - 1 << ")");
@@ -4366,35 +4411,18 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Pre-allocation memory check: verify sufficient free VRAM before attempting hipMalloc.
-        // This provides a graceful error with actionable diagnostics instead of a raw OOM crash.
-        {
-            size_t free_bytes = 0, total_bytes = 0;
-            hipError_t mem_err = hipMemGetInfo(&free_bytes, &total_bytes);
-            if (mem_err == hipSuccess)
-            {
-                // Preserve the same terminal free-memory invariant priced by
-                // canonical capacity admission and model preflight.
-                if (bytes +
-                        gpu_allocation_policy::kMinimumFreeHeadroomBytes >
-                    free_bytes)
-                {
-                    double req_mb = bytes / (1024.0 * 1024.0);
-                    double free_mb = free_bytes / (1024.0 * 1024.0);
-                    double total_mb = total_bytes / (1024.0 * 1024.0);
-                    double used_mb = (total_bytes - free_bytes) / (1024.0 * 1024.0);
-                    LOG_ERROR("[ROCmBackend] Insufficient GPU memory on device " << device_id
-                                                                                 << ": requested " << std::fixed << std::setprecision(1) << req_mb
-                                                                                 << " MB but only " << free_mb << " MB free ("
-                                                                                 << used_mb << " / " << total_mb << " MB used). "
-                                                                                 << "Try reducing context length (-c), using a smaller model, "
-                                                                                 << "or adding more GPUs for tensor parallelism.");
-                    return nullptr;
-                }
-            }
-        }
-
         void *ptr = nullptr;
+        /*
+         * hipMemGetInfo reports memory returned to the device driver, not the
+         * complete allocation capacity reusable by this process. In
+         * particular, HIP may retain successfully freed graph-bound slabs and
+         * satisfy a later hipMalloc from that process cache without increasing
+         * the reported free-byte scalar. Admission owns the complete workload
+         * BOM; at this infrastructure boundary hipMalloc is therefore the only
+         * valid authority for one concrete allocation. A speculative
+         * `bytes + cushion <= free` test can reject an allocation the runtime
+         * can satisfy and made prepared-model reuse topology-order dependent.
+         */
         err = hipMalloc(&ptr, bytes);
         if (err != hipSuccess)
         {
@@ -4469,6 +4497,8 @@ namespace llaminar2
 
     void *ROCmBackend::allocateMapped(size_t bytes, int device_id, void **device_ptr)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
         if (device_id >= device_count_ || device_id < 0)
         {
             LOG_ERROR("[ROCmBackend] Invalid device ID " << device_id << " for allocateMapped");
@@ -4519,11 +4549,17 @@ namespace llaminar2
                                                        << ", device_ptr=" << *device_ptr);
         }
 
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            rocmPinnedAllocations()[host_ptr] = device_id;
+        }
         return host_ptr;
     }
 
     void ROCmBackend::freeMapped(void *host_ptr, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
         if (host_ptr == nullptr)
         {
             return; // Freeing nullptr is a no-op
@@ -4545,10 +4581,17 @@ namespace llaminar2
         {
             LOG_WARN("[ROCmBackend] hipHostFree failed: " << hipGetErrorString(err));
         }
+        else
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            rocmPinnedAllocations().erase(host_ptr);
+        }
     }
 
     void ROCmBackend::free(void *ptr, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
         if (ptr == nullptr)
         {
             return; // Freeing nullptr is a no-op
@@ -4586,13 +4629,6 @@ namespace llaminar2
             if (it != g_active_ptrs.end())
             {
                 recorded_size = it->second.size_bytes;
-                it->second.active = false;
-                recordPointerEvent("free", ptr, it->second.size_bytes, device_id, false);
-                g_active_ptrs.erase(it);
-            }
-            else
-            {
-                recordPointerEvent("free-unknown", ptr, 0, device_id, false);
             }
         }
 
@@ -4614,6 +4650,21 @@ namespace llaminar2
         }
         else
         {
+            {
+                std::lock_guard<std::mutex> lock(g_ptr_registry_mutex);
+                const auto it = g_active_ptrs.find(ptr);
+                if (it != g_active_ptrs.end())
+                {
+                    recordPointerEvent(
+                        "free", ptr, it->second.size_bytes, device_id, false);
+                    g_active_ptrs.erase(it);
+                }
+                else
+                {
+                    recordPointerEvent(
+                        "free-unknown", ptr, 0, device_id, false);
+                }
+            }
             LOG_TRACE("[ROCM_PTR_FREE] ptr=" << ptr
                                              << " bytes=" << recorded_size
                                              << " device=" << device_id);
@@ -4859,6 +4910,413 @@ namespace llaminar2
         }
 
         return free_bytes;
+    }
+
+    DeviceAllocationAccounting
+    ROCmBackend::deviceAllocationAccounting(int device_id) const
+    {
+        DeviceAllocationAccounting accounting;
+        if (device_id < 0 || device_id >= device_count_)
+        {
+            accounting.diagnostic = "invalid HIP device ordinal " +
+                                    std::to_string(device_id);
+            return accounting;
+        }
+
+        /* The lifecycle lock excludes allocation/free and native reset while
+         * the pointer-registry lock makes the count and byte sum one atomic
+         * observation of canonical ROCm ownership. */
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
+        std::lock_guard<std::mutex> pointer_lock(g_ptr_registry_mutex);
+        for (const auto &[pointer, allocation] : g_active_ptrs)
+        {
+            (void)pointer;
+            if (!allocation.active || allocation.device_id != device_id)
+                continue;
+            if (allocation.size_bytes >
+                std::numeric_limits<size_t>::max() - accounting.active_bytes)
+            {
+                accounting.diagnostic =
+                    "HIP canonical allocation byte accounting overflow";
+                return accounting;
+            }
+            ++accounting.active_allocations;
+            accounting.active_bytes += allocation.size_bytes;
+        }
+        accounting.supported = true;
+        return accounting;
+    }
+
+    DeviceMemoryCacheReclamationResult
+    ROCmBackend::trimUnusedDeviceMemoryCaches(int device_id)
+    {
+        DeviceMemoryCacheReclamationResult result;
+        if (device_id < 0 || device_id >= device_count_)
+        {
+            result.diagnostic = "invalid HIP device ordinal " +
+                                std::to_string(device_id);
+            return result;
+        }
+
+        HipDeviceSaveRestore device_guard;
+        if (!device_guard.valid())
+        {
+            (void)hipGetLastError();
+            result.diagnostic =
+                "hipGetDevice could not preserve the caller device identity";
+            return result;
+        }
+        const hipError_t select_error = static_cast<hipError_t>(
+            HipDeviceGuard::forceSetDevice(device_id));
+        if (select_error != hipSuccess)
+        {
+            result.diagnostic =
+                "hipSetDevice failed for ROCm:" + std::to_string(device_id) +
+                ": " + hipGetErrorString(select_error);
+            (void)hipGetLastError();
+            return result;
+        }
+        result.supported = true;
+
+        hipMemPool_t default_pool = nullptr;
+        bool default_pool_available = false;
+        const auto query_snapshot =
+            [&](DeviceMemoryCacheSnapshot &snapshot,
+                const char *phase) -> bool
+        {
+            size_t total_bytes = 0u;
+            hipError_t error = hipMemGetInfo(
+                &snapshot.driver_free_bytes, &total_bytes);
+            if (error != hipSuccess)
+            {
+                result.diagnostic = std::string("hipMemGetInfo failed ") +
+                                    phase + ": " + hipGetErrorString(error);
+                (void)hipGetLastError();
+                return false;
+            }
+
+            std::uint64_t graph_used = 0u;
+            std::uint64_t graph_reserved = 0u;
+            error = hipDeviceGetGraphMemAttribute(
+                device_id, hipGraphMemAttrUsedMemCurrent, &graph_used);
+            if (error == hipSuccess)
+            {
+                error = hipDeviceGetGraphMemAttribute(
+                    device_id,
+                    hipGraphMemAttrReservedMemCurrent,
+                    &graph_reserved);
+            }
+            if (error != hipSuccess)
+            {
+                result.diagnostic =
+                    std::string("HIP graph-memory accounting failed ") +
+                    phase + ": " + hipGetErrorString(error);
+                (void)hipGetLastError();
+                return false;
+            }
+            snapshot.graph_accounting_available = true;
+            snapshot.graph_used_bytes = static_cast<size_t>(graph_used);
+            snapshot.graph_reserved_bytes =
+                static_cast<size_t>(graph_reserved);
+
+            if (!default_pool_available)
+            {
+                error = hipDeviceGetDefaultMemPool(
+                    &default_pool, device_id);
+                if (error == hipErrorNotSupported)
+                {
+                    (void)hipGetLastError();
+                    return true;
+                }
+                if (error != hipSuccess || default_pool == nullptr)
+                {
+                    result.diagnostic =
+                        std::string("HIP default memory-pool resolution failed ") +
+                        phase + ": " + hipGetErrorString(error);
+                    (void)hipGetLastError();
+                    return false;
+                }
+                default_pool_available = true;
+            }
+
+            std::uint64_t pool_used = 0u;
+            std::uint64_t pool_reserved = 0u;
+            error = hipMemPoolGetAttribute(
+                default_pool, hipMemPoolAttrUsedMemCurrent, &pool_used);
+            if (error == hipSuccess)
+            {
+                error = hipMemPoolGetAttribute(
+                    default_pool,
+                    hipMemPoolAttrReservedMemCurrent,
+                    &pool_reserved);
+            }
+            if (error != hipSuccess)
+            {
+                result.diagnostic =
+                    std::string("HIP default memory-pool accounting failed ") +
+                    phase + ": " + hipGetErrorString(error);
+                (void)hipGetLastError();
+                return false;
+            }
+            snapshot.async_pool_accounting_available = true;
+            snapshot.async_pool_used_bytes = static_cast<size_t>(pool_used);
+            snapshot.async_pool_reserved_bytes =
+                static_cast<size_t>(pool_reserved);
+            return true;
+        };
+
+        if (!query_snapshot(result.before, "before trim"))
+            return result;
+
+        const hipError_t graph_trim_error =
+            hipDeviceGraphMemTrim(device_id);
+        result.graph_trim_invoked = true;
+        if (graph_trim_error != hipSuccess)
+        {
+            result.diagnostic =
+                "hipDeviceGraphMemTrim failed for ROCm:" +
+                std::to_string(device_id) + ": " +
+                hipGetErrorString(graph_trim_error);
+            (void)hipGetLastError();
+            return result;
+        }
+
+        if (default_pool_available)
+        {
+            const hipError_t pool_trim_error =
+                hipMemPoolTrimTo(default_pool, 0u);
+            result.async_pool_trim_invoked = true;
+            if (pool_trim_error != hipSuccess)
+            {
+                result.diagnostic =
+                    "hipMemPoolTrimTo failed for ROCm:" +
+                    std::to_string(device_id) + ": " +
+                    hipGetErrorString(pool_trim_error);
+                (void)hipGetLastError();
+                return result;
+            }
+        }
+
+        if (!query_snapshot(result.after, "after trim"))
+            return result;
+
+        result.success = true;
+        return result;
+    }
+
+    DeviceRuntimeGenerationRetirementResult
+    ROCmBackend::retireExclusiveDeviceRuntimeGeneration(
+        const DeviceRuntimeGenerationRetirementRequest &request)
+    {
+        DeviceRuntimeGenerationRetirementResult result;
+        result.supported = true;
+        const int device_id = request.deviceOrdinal();
+        if (device_id < 0 || device_id >= device_count_)
+        {
+            result.diagnostic = "invalid HIP device ordinal " +
+                                std::to_string(device_id);
+            return result;
+        }
+
+        /*
+         * Exclude canonical allocation/registration mutation across preflight
+         * and reset. The unforgeable request separately proves that ordinary
+         * model execution has ended before this backend boundary is entered.
+         */
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
+
+        {
+            std::lock_guard<std::mutex> pointer_lock(g_ptr_registry_mutex);
+            for (const auto &[pointer, allocation] : g_active_ptrs)
+            {
+                (void)pointer;
+                if (allocation.active && allocation.device_id == device_id)
+                {
+                    ++result.tracked_device_allocations;
+                    if (allocation.size_bytes >
+                        std::numeric_limits<size_t>::max() -
+                            result.tracked_device_allocation_bytes)
+                    {
+                        result.diagnostic =
+                            "HIP runtime-generation allocation byte accounting overflow";
+                        return result;
+                    }
+                    result.tracked_device_allocation_bytes +=
+                        allocation.size_bytes;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> registration_lock(
+                rocmPinnedAllocationsMutex());
+            result.tracked_host_registrations =
+                rocmPinnedAllocations().size();
+        }
+        if (result.tracked_device_allocations != 0u ||
+            result.tracked_host_registrations != 0u)
+        {
+            std::ostringstream diagnostic;
+            diagnostic
+                << "HIP runtime-generation retirement rejected: live "
+                << "tracked_device_allocations="
+                << result.tracked_device_allocations
+                << " tracked_device_allocation_bytes="
+                << result.tracked_device_allocation_bytes
+                << " tracked_host_registrations="
+                << result.tracked_host_registrations;
+            result.diagnostic = diagnostic.str();
+            return result;
+        }
+
+        {
+            std::lock_guard<std::mutex> generation_lock(
+                runtime_generation_mutex_);
+            result.retired_generation =
+                runtime_generations_[static_cast<size_t>(device_id)];
+            if (result.retired_generation == 0u ||
+                result.retired_generation ==
+                    std::numeric_limits<std::uint64_t>::max())
+            {
+                result.diagnostic =
+                    "HIP runtime generation is invalid or exhausted";
+                return result;
+            }
+        }
+
+        int previous_device = -1;
+        hipError_t error = hipGetDevice(&previous_device);
+        if (error != hipSuccess || previous_device < 0)
+        {
+            result.diagnostic =
+                "hipGetDevice failed before runtime reset: " +
+                std::string(hipGetErrorString(error));
+            (void)hipGetLastError();
+            return result;
+        }
+        error = static_cast<hipError_t>(
+            HipDeviceGuard::forceSetDevice(device_id));
+        if (error != hipSuccess)
+        {
+            result.diagnostic =
+                "hipSetDevice failed before runtime reset: " +
+                std::string(hipGetErrorString(error));
+            (void)hipGetLastError();
+            return result;
+        }
+
+        size_t total_bytes = 0u;
+        error = hipMemGetInfo(
+            &result.driver_free_bytes_before, &total_bytes);
+        if (error != hipSuccess)
+        {
+            result.diagnostic =
+                "hipMemGetInfo failed before runtime reset: " +
+                std::string(hipGetErrorString(error));
+            (void)hipGetLastError();
+            if (previous_device != device_id)
+                (void)HipDeviceGuard::forceSetDevice(previous_device);
+            return result;
+        }
+
+        if (!llaminar2_retireROCmTensorValidatorRuntimeGeneration(device_id))
+        {
+            result.diagnostic =
+                "ROCm tensor-validator generation could not retire";
+            if (previous_device != device_id)
+                (void)HipDeviceGuard::forceSetDevice(previous_device);
+            return result;
+        }
+
+        result.reset_invoked = true;
+        error = hipDeviceReset();
+        if (error != hipSuccess)
+        {
+            result.diagnostic = "hipDeviceReset failed for ROCm:" +
+                                std::to_string(device_id) + ": " +
+                                hipGetErrorString(error);
+            (void)hipGetLastError();
+            HipDeviceGuard::resetTracking();
+            if (previous_device != device_id)
+                (void)HipDeviceGuard::forceSetDevice(previous_device);
+            return result;
+        }
+
+        /*
+         * hipDeviceReset destroyed these backend-owned device pointers and
+         * events. Their host identities must be cleared without calling HIP on
+         * the now-stale handles; the next model lazily creates fresh storage.
+         */
+        if (static_cast<size_t>(device_id) < argmax_buffers_.size())
+            argmax_buffers_[static_cast<size_t>(device_id)] = {};
+        if (static_cast<size_t>(device_id) < topk_buffers_.size())
+            topk_buffers_[static_cast<size_t>(device_id)] = {};
+        if (static_cast<size_t>(device_id) < sample_token_buffers_.size())
+            sample_token_buffers_[static_cast<size_t>(device_id)] = {};
+        if (static_cast<size_t>(device_id) < penalty_buffers_.size())
+            penalty_buffers_[static_cast<size_t>(device_id)] = {};
+
+        /* hipDeviceReset is irrevocable. Advance the authority before the
+         * diagnostic reinitialization below so no error path can advertise the
+         * retired generation as live. */
+        {
+            std::lock_guard<std::mutex> generation_lock(
+                runtime_generation_mutex_);
+            result.active_generation = result.retired_generation + 1u;
+            runtime_generations_[static_cast<size_t>(device_id)] =
+                result.active_generation;
+        }
+
+        HipDeviceGuard::resetTracking();
+        error = static_cast<hipError_t>(
+            HipDeviceGuard::forceSetDevice(device_id));
+        if (error == hipSuccess)
+        {
+            error = hipMemGetInfo(
+                &result.driver_free_bytes_after, &total_bytes);
+        }
+        if (error != hipSuccess)
+        {
+            result.diagnostic =
+                "HIP runtime could not materialize the fresh generation: " +
+                std::string(hipGetErrorString(error));
+            (void)hipGetLastError();
+            HipDeviceGuard::resetTracking();
+            if (previous_device != device_id &&
+                static_cast<hipError_t>(
+                    HipDeviceGuard::forceSetDevice(previous_device)) !=
+                    hipSuccess)
+            {
+                (void)hipGetLastError();
+                std::terminate();
+            }
+            return result;
+        }
+
+        if (previous_device != device_id &&
+            static_cast<hipError_t>(
+                HipDeviceGuard::forceSetDevice(previous_device)) != hipSuccess)
+        {
+            (void)hipGetLastError();
+            LOG_ERROR(
+                "[ROCmBackend] Failed to restore HIP device "
+                << previous_device << " after retiring ROCm:" << device_id);
+            std::terminate();
+        }
+
+        result.success = true;
+        result.diagnostic = "HIP runtime generation retired";
+        return result;
+    }
+
+    std::uint64_t ROCmBackend::deviceRuntimeGeneration(
+        int device_id) const
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            return 0u;
+        std::lock_guard<std::mutex> lock(runtime_generation_mutex_);
+        return runtime_generations_[static_cast<size_t>(device_id)];
     }
 
     // ====================================================================
@@ -5498,6 +5956,8 @@ namespace llaminar2
 
     void *ROCmBackend::allocatePinned(size_t bytes, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
         hipError_t set_err = hipSetDevice(device_id);
         if (set_err != hipSuccess)
         {
@@ -5523,6 +5983,8 @@ namespace llaminar2
 
     void ROCmBackend::freePinned(void *ptr, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
         if (!ptr)
             return;
 
@@ -5534,7 +5996,6 @@ namespace llaminar2
             if (it != allocations.end())
             {
                 owner_device = it->second;
-                allocations.erase(it);
             }
             else
             {
@@ -5565,6 +6026,11 @@ namespace llaminar2
             LOG_DEBUG("[ROCmBackend::freePinned] hipHostFree failed for " << ptr
                      << " on device " << owner_device << ": " << hipGetErrorString(err)
                      << " (may be normal during shutdown)");
+        }
+        else
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            rocmPinnedAllocations().erase(ptr);
         }
     }
 

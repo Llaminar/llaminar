@@ -186,6 +186,47 @@ namespace llaminar2::test::parity
             MTPParityTransactionActivity::Inconsistent);
     }
 
+    TEST(Test__MTPParitySnapshotContext,
+         PlacementTrajectoryRequiresOneEpochForCompleteHistory)
+    {
+        MTPParityPlacementEpochTrajectory stable{.epoch = 7u};
+        stable.observe(7u, 7u, 7u);
+        EXPECT_TRUE(stable.matches(7u));
+        EXPECT_FALSE(stable.matches(8u));
+
+        MTPParityPlacementEpochTrajectory crossed{.epoch = 7u};
+        crossed.observe(7u, 8u, 7u);
+        EXPECT_FALSE(crossed.epoch.has_value());
+        crossed.observe(8u, 8u, 8u);
+        EXPECT_FALSE(crossed.epoch.has_value())
+            << "A stable suffix cannot erase recurrent state inherited from "
+               "the earlier placement";
+
+        MTPParityPlacementEpochTrajectory execution_mismatch{.epoch = 9u};
+        execution_mismatch.observe(9u, 9u, 8u);
+        EXPECT_FALSE(execution_mismatch.epoch.has_value());
+
+        MTPParityPlacementEpochTrajectory missing_authority{.epoch = 3u};
+        missing_authority.observe(3u, 3u, 0u);
+        EXPECT_FALSE(missing_authority.epoch.has_value());
+
+        MTPParityPlacementEpochTrajectory unknown_restore{.epoch = 11u};
+        unknown_restore.invalidate();
+        EXPECT_FALSE(unknown_restore.matches(11u));
+    }
+
+    TEST(Test__MTPParitySnapshotContext,
+         FullWidthPolicyWitnessBudgetLeavesOnePendingResponseSlot)
+    {
+        EXPECT_EQ(mtpParityFullWidthPolicyWitnessBudget(1), 3);
+        EXPECT_EQ(mtpParityFullWidthPolicyWitnessBudget(15), 17);
+        EXPECT_EQ(mtpParityFullWidthPolicyWitnessBudget(0), 0);
+        EXPECT_EQ(
+            mtpParityFullWidthPolicyWitnessBudget(
+                std::numeric_limits<int>::max()),
+            0);
+    }
+
     TEST(Test__MTPParitySnapshotContext, GroupedTokensUseSerialNotHuggingFaceOracle)
     {
         constexpr std::array<int32_t, 3> serial = {13, 271, 760};

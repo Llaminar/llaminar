@@ -116,7 +116,9 @@ namespace
                 {"backend", "HIP"},
                 {"execution",
                  "hosted_captured_transactions_with_ticket_only_dispatch"},
-                {"fragments", "5"}},
+                {"fragments", "5"},
+                {"conditional_fragments", "0"},
+                {"ticket_conditioned_fragments", "1"}},
             .value = 1.0,
         });
         records.push_back(PerfStatRecord{
@@ -128,7 +130,9 @@ namespace
                 {"backend", "HIP"},
                 {"execution",
                  "hosted_ticket_selected_captured_transactions"},
-                {"fragments", "5"}},
+                {"fragments", "5"},
+                {"conditional_fragments", "0"},
+                {"ticket_conditioned_fragments", "1"}},
             .value = 1.0,
         });
         records.push_back(PerfStatRecord{
@@ -318,6 +322,86 @@ TEST(Test__PerfStatsCollector, AggregatesCountersAndTimers)
     EXPECT_EQ(timer_it->device, "rocm:0");
 }
 
+TEST(Test__PerfStatsCollector, OrderedSequenceEvidenceIsBoundedAndRoleComparable)
+{
+    ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    constexpr uint64_t kSteps = 2048u;
+    for (uint64_t step = 1u; step <= kSteps; ++step)
+    {
+        const uint64_t generation = 17u + step / 31u;
+        PerfStatsCollector::recordOrderedSequenceStep(
+            "forward_graph",
+            "collective_sequence",
+            {generation, step},
+            "decode",
+            "node",
+            {{"role", "continuation"}});
+        PerfStatsCollector::recordOrderedSequenceStep(
+            "forward_graph",
+            "collective_sequence",
+            {generation, step},
+            "decode",
+            "node",
+            {{"role", "participant"}});
+    }
+    // One reordered pair must produce distinct evidence even though the word
+    // count and the multiset of identifiers are unchanged.
+    PerfStatsCollector::recordOrderedSequenceStep(
+        "forward_graph",
+        "collective_sequence",
+        {2u, 1u},
+        "decode",
+        "node",
+        {{"role", "reordered"}});
+    PerfStatsCollector::recordOrderedSequenceStep(
+        "forward_graph",
+        "collective_sequence",
+        {1u, 2u},
+        "decode",
+        "node",
+        {{"role", "reordered"}});
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    ASSERT_EQ(records.size(), 3u)
+        << "Sequence cardinality must be bounded by stable roles, not steps";
+    const auto by_role = [&](const char *role)
+    {
+        return std::find_if(
+            records.begin(),
+            records.end(),
+            [role](const PerfStatRecord &record)
+            {
+                const auto tag = record.tags.find("role");
+                return record.kind == PerfStatRecord::Kind::OrderedSequence &&
+                       tag != record.tags.end() && tag->second == role;
+            });
+    };
+
+    const auto continuation_it = by_role("continuation");
+    const auto participant_it = by_role("participant");
+    const auto reordered_it = by_role("reordered");
+    ASSERT_NE(continuation_it, records.end());
+    ASSERT_NE(participant_it, records.end());
+    ASSERT_NE(reordered_it, records.end());
+    const auto &continuation = *continuation_it;
+    const auto &participant = *participant_it;
+    const auto &reordered = *reordered_it;
+    EXPECT_EQ(continuation.count, kSteps);
+    EXPECT_EQ(continuation.sequence_word_count, kSteps * 2u);
+    EXPECT_EQ(continuation.sequence_digest_lo, participant.sequence_digest_lo);
+    EXPECT_EQ(continuation.sequence_digest_hi, participant.sequence_digest_hi);
+    EXPECT_NE(reordered.sequence_digest_lo, continuation.sequence_digest_lo);
+    EXPECT_NE(reordered.sequence_digest_hi, continuation.sequence_digest_hi);
+
+    const std::string csv =
+        PerfStatsCollector::csvString({"forward_graph"});
+    EXPECT_NE(csv.find("sequence_word_count"), std::string::npos);
+    EXPECT_NE(csv.find("ordered_sequence,forward_graph,collective_sequence"),
+              std::string::npos);
+}
+
 TEST(Test__ProductionParityEvidence, RecognizesNativeConditionalGenerationParent)
 {
     const std::vector<PerfStatRecord> records = {
@@ -355,6 +439,137 @@ TEST(Test__ProductionParityEvidence, RecognizesNativeConditionalGenerationParent
     EXPECT_STREQ(
         productionDeviceGenerationPolicyName(evidence.policy),
         "native_conditional_parent");
+}
+
+TEST(Test__ProductionParityEvidence,
+     ClassifiesEveryAcceleratorBearingTopologyExplicitly)
+{
+    EXPECT_EQ(
+        classifyProductionParityExecutionTopology(2, 0, 0),
+        ProductionParityExecutionTopology::CPUOnly);
+    EXPECT_EQ(
+        classifyProductionParityExecutionTopology(0, 2, 0),
+        ProductionParityExecutionTopology::HomogeneousGPU);
+    EXPECT_EQ(
+        classifyProductionParityExecutionTopology(0, 0, 4),
+        ProductionParityExecutionTopology::HomogeneousGPU);
+    EXPECT_EQ(
+        classifyProductionParityExecutionTopology(2, 1, 0),
+        ProductionParityExecutionTopology::HeterogeneousAccelerator);
+    EXPECT_EQ(
+        classifyProductionParityExecutionTopology(0, 1, 1),
+        ProductionParityExecutionTopology::HeterogeneousAccelerator);
+    EXPECT_EQ(
+        resolveProductionParityGraphContract(
+            ProductionParityExecutionTopology::HeterogeneousAccelerator,
+            /*is_campaign_authority=*/true,
+            /*local_accelerator=*/true),
+        ProductionParityGraphContract::HeterogeneousCoordinatorSegmented);
+    EXPECT_EQ(
+        resolveProductionParityGraphContract(
+            ProductionParityExecutionTopology::HeterogeneousAccelerator,
+            /*is_campaign_authority=*/false,
+            /*local_accelerator=*/true),
+        ProductionParityGraphContract::
+            HeterogeneousGPUParticipantCaptured);
+    EXPECT_EQ(
+        resolveProductionParityGraphContract(
+            ProductionParityExecutionTopology::HeterogeneousAccelerator,
+            /*is_campaign_authority=*/false,
+            /*local_accelerator=*/false),
+        ProductionParityGraphContract::
+            HeterogeneousCPUParticipantDeclarative);
+}
+
+TEST(Test__ProductionParityEvidence,
+     RejectsUncapturedHeterogeneousGraphExecution)
+{
+    ProductionParityEvidence evidence;
+    evidence.graph_execution = true;
+    evidence.execution_topology =
+        ProductionParityExecutionTopology::HeterogeneousAccelerator;
+    evidence.graph_contract =
+        ProductionParityGraphContract::HeterogeneousCoordinatorSegmented;
+
+    EXPECT_EQ(
+        certifyProductionParityGraphExecution(evidence),
+        ProductionParityGraphCertification::
+            MissingHeterogeneousSegmentPlan)
+        << "Declarative graph entry alone must never certify a GPU-bearing "
+           "heterogeneous production cell";
+
+    evidence.segmented_plan = true;
+    evidence.segmented_capture = true;
+    evidence.decode_graph_capture = true;
+    evidence.decode_graph_replay = true;
+    evidence.segmented_replay = true;
+    EXPECT_EQ(
+        certifyProductionParityGraphExecution(evidence),
+        ProductionParityGraphCertification::Certified);
+}
+
+TEST(Test__ProductionParityEvidence,
+     DistinguishesNativeAndSegmentedCaptureContracts)
+{
+    ProductionParityEvidence homogeneous;
+    homogeneous.graph_execution = true;
+    homogeneous.execution_topology =
+        ProductionParityExecutionTopology::HomogeneousGPU;
+    homogeneous.graph_contract =
+        ProductionParityGraphContract::HomogeneousGPUCaptured;
+    homogeneous.full_graph_replay = true;
+    homogeneous.decode_graph_replay = true;
+    EXPECT_EQ(
+        certifyProductionParityGraphExecution(homogeneous),
+        ProductionParityGraphCertification::Certified);
+
+    homogeneous.segmented_plan = true;
+    EXPECT_EQ(
+        certifyProductionParityGraphExecution(homogeneous),
+        ProductionParityGraphCertification::
+            UnexpectedNativeSegmentation);
+
+    ProductionParityEvidence cpu;
+    cpu.graph_execution = true;
+    cpu.execution_topology = ProductionParityExecutionTopology::CPUOnly;
+    EXPECT_EQ(
+        certifyProductionParityGraphExecution(cpu),
+        ProductionParityGraphCertification::Certified);
+}
+
+TEST(Test__ProductionParityEvidence,
+     HeterogeneousFollowersProveTheirRankLocalGraphContract)
+{
+    ProductionParityEvidence gpu_follower;
+    gpu_follower.graph_execution = true;
+    gpu_follower.execution_topology =
+        ProductionParityExecutionTopology::HeterogeneousAccelerator;
+    gpu_follower.graph_contract = ProductionParityGraphContract::
+        HeterogeneousGPUParticipantCaptured;
+    gpu_follower.full_graph_replay = true;
+    gpu_follower.decode_graph_replay = true;
+    EXPECT_EQ(
+        certifyProductionParityGraphExecution(gpu_follower),
+        ProductionParityGraphCertification::Certified);
+
+    ProductionParityEvidence cpu_follower;
+    cpu_follower.graph_execution = true;
+    cpu_follower.execution_topology =
+        ProductionParityExecutionTopology::HeterogeneousAccelerator;
+    cpu_follower.graph_contract = ProductionParityGraphContract::
+        HeterogeneousCPUParticipantDeclarative;
+    EXPECT_EQ(
+        certifyProductionParityGraphExecution(cpu_follower),
+        ProductionParityGraphCertification::Certified);
+
+    gpu_follower.graph_contract =
+        ProductionParityGraphContract::HeterogeneousCoordinatorSegmented;
+    EXPECT_EQ(
+        certifyProductionParityGraphExecution(gpu_follower),
+        ProductionParityGraphCertification::
+            MissingHeterogeneousSegmentPlan)
+        << "Only the inventory-resolved authority may satisfy the campaign's "
+           "mandatory segmented-boundary proof";
 }
 
 TEST(Test__ProductionParityEvidence,
@@ -513,6 +728,7 @@ TEST(Test__ProductionParityEvidence, CertifiesExactRetainedHostedGraphReuse)
             {"depth_policy", "fixed_width"},
             {"sampling_mode", "stochastic"},
             {"conditional_fragments", "0"},
+            {"ticket_conditioned_fragments", "1"},
             {"workspace_generation", "7"},
         });
     }
@@ -541,6 +757,22 @@ TEST(Test__ProductionParityEvidence, CertifiesExactRetainedHostedGraphReuse)
 
 TEST(Test__ProductionParityEvidence, RejectsMalformedHostedTicketEvidence)
 {
+    auto native_conditionals = certifiedHostedTicketRecords();
+    auto materialization = std::find_if(
+        native_conditionals.begin(),
+        native_conditionals.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.name ==
+                       "device_generation_loop_graph_materializations" &&
+                   record.device == "ROCm:0";
+        });
+    ASSERT_NE(materialization, native_conditionals.end());
+    materialization->tags["conditional_fragments"] = "1";
+    EXPECT_FALSE(collectProductionDeviceGenerationEvidence(native_conditionals)
+                     .hosted_ticket_boundary_certified)
+        << "HIP hosted execution must not claim native conditional graph nodes.";
+
     auto malformed_ticket = certifiedHostedTicketRecords();
     auto ticket = std::find_if(
         malformed_ticket.begin(),

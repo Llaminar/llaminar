@@ -7,7 +7,7 @@
  * bytes, but it must not reconstruct histograms, desired ownership, or policy.
  * This file defines that narrow boundary: it translates one immutable command
  * batch plus the frozen topology into physical migrations, closed durable
- * cycles, shadow-slot demand, and a cross-rank transaction fingerprint.
+ * cycles, shadow-slot demand, and a cross-rank execution fingerprint.
  */
 
 #pragma once
@@ -102,7 +102,7 @@ namespace llaminar2
         std::uint32_t participant_count = 0u;
         std::uint32_t num_layers = 0u;
         std::uint32_t num_experts = 0u;
-        MoEOverlayResidencyTransactionFingerprint transaction_fingerprint;
+        MoEOverlayResidencyExecutionFingerprint execution_fingerprint;
         std::vector<MoEOverlayTierMigration> migrations;
         std::vector<MoEOverlayTierMigrationCycle> migration_cycles;
         std::vector<MoEOverlayTierShadowRequirement> shadow_requirements;

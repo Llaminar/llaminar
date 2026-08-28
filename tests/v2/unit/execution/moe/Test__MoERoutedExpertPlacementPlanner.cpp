@@ -169,6 +169,42 @@ namespace llaminar2::test
                   (std::vector<int>{0, 0, 1, 1, 2, 2}));
     }
 
+    /**
+     * @brief Setup ordering is applied only after exact live quotas exist.
+     *
+     * This models the production sequence used by automatic ExpertOverlay
+     * capacity admission: physical memory resolves two priority-zero slots,
+     * then the declarative permutation chooses their expert identities.
+     */
+    TEST(Test__MoERoutedExpertPlacementPlanner,
+         DeferredInitialOrderUsesResolvedPhysicalQuotasAndDefaultsOtherLayers)
+    {
+        auto plan = twoTierRocmCpuPlan(
+            RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+        plan.routed_tiers[0].resolved_live_experts_per_layer = {2, 2};
+        plan.routed_tiers[1].resolved_live_experts_per_layer = {4, 4};
+        plan.initial_layer_order_overrides = {
+            RoutedExpertInitialLayerOrder{
+                .layer = 0,
+                .expert_ids = {5, 4, 3, 2, 1, 0},
+            },
+        };
+
+        const auto result = MoERoutedExpertPlacementPlanner::plan(
+            plan, metadata(/*num_layers=*/2, /*num_experts=*/6));
+
+        ASSERT_EQ(result.planned_plan.placements.size(), 2u);
+        EXPECT_EQ(
+            result.planned_plan.placements[0].routed_expert_tier,
+            (std::vector<int>{1, 1, 1, 1, 0, 0}));
+        EXPECT_EQ(
+            result.planned_plan.placements[1].routed_expert_tier,
+            (std::vector<int>{0, 0, 1, 1, 1, 1}))
+            << "the retained MTP source layer must use deterministic default ordering";
+        EXPECT_TRUE(result.planned_plan.initial_layer_order_overrides.empty())
+            << "the frozen plan must retain one concrete epoch-one authority";
+    }
+
     TEST(Test__MoERoutedExpertPlacementPlanner, HistogramTieredCacheChoosesHottestExpertsWithDeterministicTieBreak)
     {
         auto plan = threeTierCudaRocmCpuPlan(RoutedExpertResidencyPolicy::HistogramTieredCache);

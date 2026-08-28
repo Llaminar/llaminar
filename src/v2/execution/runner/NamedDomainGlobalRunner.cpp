@@ -534,6 +534,11 @@ namespace llaminar2
             inner_->clearCache();
     }
 
+    bool NamedDomainGlobalRunner::purgePrefixCache()
+    {
+        return !inner_ || inner_->purgePrefixCache();
+    }
+
     PrefixRuntimeStateSnapshot NamedDomainGlobalRunner::prefixStateProbe() const
     {
         return inner_ ? inner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};

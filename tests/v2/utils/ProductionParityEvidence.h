@@ -17,6 +17,8 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <charconv>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <sstream>
 #include <string>
@@ -105,6 +107,364 @@ namespace llaminar2::test::parity
         }
     };
 
+    /**
+     * @brief Physical execution shape whose graph contract parity must prove.
+     *
+     * CPU execution is declarative but has no accelerator graph to capture. A
+     * homogeneous GPU topology must execute one backend-native captured graph
+     * policy. Any topology containing an accelerator plus another device type
+     * crosses an explicitly declared captured-segment boundary; merely
+     * entering the declarative graph runner is not sufficient evidence.
+     */
+    enum class ProductionParityExecutionTopology : std::uint8_t
+    {
+        CPUOnly,
+        HomogeneousGPU,
+        HeterogeneousAccelerator,
+    };
+
+    /** @return Stable diagnostic spelling for an execution topology. */
+    inline const char *productionParityExecutionTopologyName(
+        ProductionParityExecutionTopology topology)
+    {
+        switch (topology)
+        {
+        case ProductionParityExecutionTopology::CPUOnly:
+            return "cpu_only";
+        case ProductionParityExecutionTopology::HomogeneousGPU:
+            return "homogeneous_gpu";
+        case ProductionParityExecutionTopology::HeterogeneousAccelerator:
+            return "heterogeneous_accelerator";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Rank-local graph proof required by one global execution topology.
+     *
+     * A heterogeneous campaign has exactly one continuation/artifact authority
+     * that proves the global segmented boundary. GPU follower ranks prove their
+     * own native captured participant graph; CPU-only followers prove their
+     * declarative participant graph. This distinction preserves a mandatory
+     * global boundary proof without pretending every rank owns that boundary.
+     */
+    enum class ProductionParityGraphContract : std::uint8_t
+    {
+        CPUDeclarative,
+        HomogeneousGPUCaptured,
+        HeterogeneousCoordinatorSegmented,
+        HeterogeneousGPUParticipantCaptured,
+        HeterogeneousCPUParticipantDeclarative,
+    };
+
+    /** @return Stable diagnostic spelling for a rank-local graph contract. */
+    inline const char *productionParityGraphContractName(
+        ProductionParityGraphContract contract)
+    {
+        switch (contract)
+        {
+        case ProductionParityGraphContract::CPUDeclarative:
+            return "cpu_declarative";
+        case ProductionParityGraphContract::HomogeneousGPUCaptured:
+            return "homogeneous_gpu_captured";
+        case ProductionParityGraphContract::
+            HeterogeneousCoordinatorSegmented:
+            return "heterogeneous_coordinator_segmented";
+        case ProductionParityGraphContract::
+            HeterogeneousGPUParticipantCaptured:
+            return "heterogeneous_gpu_participant_captured";
+        case ProductionParityGraphContract::
+            HeterogeneousCPUParticipantDeclarative:
+            return "heterogeneous_cpu_participant_declarative";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Classify a topology from its typed participant inventory.
+     *
+     * @param cpu_count Number of CPU participants.
+     * @param cuda_count Number of CUDA participants.
+     * @param rocm_count Number of ROCm participants.
+     * @return The one graph-execution contract applicable to the inventory.
+     */
+    inline ProductionParityExecutionTopology
+    classifyProductionParityExecutionTopology(
+        std::size_t cpu_count,
+        std::size_t cuda_count,
+        std::size_t rocm_count)
+    {
+        const std::size_t gpu_count = cuda_count + rocm_count;
+        if (gpu_count == 0)
+            return ProductionParityExecutionTopology::CPUOnly;
+        if (cpu_count == 0 && (cuda_count == 0 || rocm_count == 0))
+            return ProductionParityExecutionTopology::HomogeneousGPU;
+        return ProductionParityExecutionTopology::HeterogeneousAccelerator;
+    }
+
+    /**
+     * @brief Resolve one rank's proof obligation from global typed ownership.
+     *
+     * @param topology Global participant topology for the matrix cell.
+     * @param is_campaign_authority Whether this rank owns continuation output
+     *        and canonical artifacts after inventory binding.
+     * @param local_accelerator Whether this rank's production runner owns an
+     *        accelerator graph.
+     * @return The only graph contract valid for this rank.
+     */
+    inline ProductionParityGraphContract resolveProductionParityGraphContract(
+        ProductionParityExecutionTopology topology,
+        bool is_campaign_authority,
+        bool local_accelerator)
+    {
+        switch (topology)
+        {
+        case ProductionParityExecutionTopology::CPUOnly:
+            return ProductionParityGraphContract::CPUDeclarative;
+        case ProductionParityExecutionTopology::HomogeneousGPU:
+            return ProductionParityGraphContract::HomogeneousGPUCaptured;
+        case ProductionParityExecutionTopology::HeterogeneousAccelerator:
+            if (is_campaign_authority)
+            {
+                return ProductionParityGraphContract::
+                    HeterogeneousCoordinatorSegmented;
+            }
+            return local_accelerator
+                       ? ProductionParityGraphContract::
+                             HeterogeneousGPUParticipantCaptured
+                       : ProductionParityGraphContract::
+                             HeterogeneousCPUParticipantDeclarative;
+        }
+        return ProductionParityGraphContract::CPUDeclarative;
+    }
+
+    /**
+     * @brief Structured proof emitted by one live production parity campaign.
+     *
+     * Numerical CSVs remain the mathematical oracle. This record separately
+     * proves that those values came from the production graph topology and,
+     * for MTP, from the backend's complete device-generation policy.
+     */
+    struct ProductionParityEvidence
+    {
+        bool graph_execution = false;
+        ProductionParityExecutionTopology execution_topology =
+            ProductionParityExecutionTopology::CPUOnly;
+        ProductionParityGraphContract graph_contract =
+            ProductionParityGraphContract::CPUDeclarative;
+        bool forward_full_graph_capture = false;
+        bool forward_full_graph_replay = false;
+        bool full_graph_capture = false;
+        bool full_graph_replay = false;
+        bool decode_graph_capture = false;
+        bool decode_graph_replay = false;
+        bool device_generation_controller = false;
+        ProductionDeviceGenerationPolicy generation_execution_policy =
+            ProductionDeviceGenerationPolicy::NotObserved;
+        bool native_generation_parent = false;
+        bool hosted_ticket_boundary_certified = false;
+        bool generation_loop_certified = false;
+        std::string generation_certification_detail = "not_observed";
+        bool segmented_plan = false;
+        bool segmented_capture = false;
+        bool segmented_replay = false;
+        bool model_context_reused = false;
+        double elapsed_seconds = 0.0;
+        double target_seconds = 4500.0;
+
+        /** @return Whether at least one accelerator participates. */
+        bool hasAccelerator() const
+        {
+            return execution_topology !=
+                   ProductionParityExecutionTopology::CPUOnly;
+        }
+
+        /** @return Whether every participant is the same GPU backend. */
+        bool usesHomogeneousGPU() const
+        {
+            return execution_topology ==
+                   ProductionParityExecutionTopology::HomogeneousGPU;
+        }
+    };
+
+    /**
+     * @brief Fail-closed result of validating graph-path evidence.
+     *
+     * A typed result makes the first violated lifecycle invariant explicit and
+     * prevents independent boolean checks from accidentally omitting an entire
+     * topology class.
+     */
+    enum class ProductionParityGraphCertification : std::uint8_t
+    {
+        Certified,
+        InconsistentTopologyContract,
+        MissingDeclarativeGraphExecution,
+        MissingNativeCapturedGraph,
+        MissingNativeDecodeGraph,
+        UnexpectedNativeSegmentation,
+        MissingHeterogeneousSegmentPlan,
+        MissingHeterogeneousSegmentCapture,
+        MissingHeterogeneousDecodeCapture,
+        MissingHeterogeneousDecodeReplay,
+        MissingHeterogeneousSegmentReplay,
+    };
+
+    /** @return Stable diagnostic spelling for a graph certification result. */
+    inline const char *productionParityGraphCertificationName(
+        ProductionParityGraphCertification certification)
+    {
+        switch (certification)
+        {
+        case ProductionParityGraphCertification::Certified:
+            return "certified";
+        case ProductionParityGraphCertification::
+            InconsistentTopologyContract:
+            return "inconsistent_topology_contract";
+        case ProductionParityGraphCertification::
+            MissingDeclarativeGraphExecution:
+            return "missing_declarative_graph_execution";
+        case ProductionParityGraphCertification::
+            MissingNativeCapturedGraph:
+            return "missing_native_captured_graph";
+        case ProductionParityGraphCertification::
+            MissingNativeDecodeGraph:
+            return "missing_native_decode_graph";
+        case ProductionParityGraphCertification::
+            UnexpectedNativeSegmentation:
+            return "unexpected_native_segmentation";
+        case ProductionParityGraphCertification::
+            MissingHeterogeneousSegmentPlan:
+            return "missing_heterogeneous_segment_plan";
+        case ProductionParityGraphCertification::
+            MissingHeterogeneousSegmentCapture:
+            return "missing_heterogeneous_segment_capture";
+        case ProductionParityGraphCertification::
+            MissingHeterogeneousDecodeCapture:
+            return "missing_heterogeneous_decode_capture";
+        case ProductionParityGraphCertification::
+            MissingHeterogeneousDecodeReplay:
+            return "missing_heterogeneous_decode_replay";
+        case ProductionParityGraphCertification::
+            MissingHeterogeneousSegmentReplay:
+            return "missing_heterogeneous_segment_replay";
+        }
+        return "unknown";
+    }
+
+    /** @return Whether the selected generation policy ran captured work. */
+    inline bool productionParityHasRequiredGenerationGraph(
+        const ProductionParityEvidence &evidence)
+    {
+        if (evidence.device_generation_controller &&
+            evidence.generation_execution_policy ==
+                ProductionDeviceGenerationPolicy::
+                    HostScheduledCapturedTransactions)
+        {
+            return evidence.forward_full_graph_capture ||
+                   evidence.forward_full_graph_replay;
+        }
+        return evidence.full_graph_capture || evidence.full_graph_replay;
+    }
+
+    /**
+     * @brief Validate the complete graph contract for one production cell.
+     *
+     * @return `Certified` only when the topology's production capture/replay
+     *         lifecycle is explicitly evidenced.
+     */
+    inline ProductionParityGraphCertification
+    certifyProductionParityGraphExecution(
+        const ProductionParityEvidence &evidence)
+    {
+        if (!evidence.graph_execution)
+        {
+            return ProductionParityGraphCertification::
+                MissingDeclarativeGraphExecution;
+        }
+
+        const bool contract_matches_topology =
+            (evidence.execution_topology ==
+                 ProductionParityExecutionTopology::CPUOnly &&
+             evidence.graph_contract ==
+                 ProductionParityGraphContract::CPUDeclarative) ||
+            (evidence.execution_topology ==
+                 ProductionParityExecutionTopology::HomogeneousGPU &&
+             evidence.graph_contract == ProductionParityGraphContract::
+                                            HomogeneousGPUCaptured) ||
+            (evidence.execution_topology == ProductionParityExecutionTopology::
+                                                HeterogeneousAccelerator &&
+             (evidence.graph_contract == ProductionParityGraphContract::
+                                             HeterogeneousCoordinatorSegmented ||
+              evidence.graph_contract == ProductionParityGraphContract::
+                                             HeterogeneousGPUParticipantCaptured ||
+              evidence.graph_contract == ProductionParityGraphContract::
+                                             HeterogeneousCPUParticipantDeclarative));
+        if (!contract_matches_topology)
+        {
+            return ProductionParityGraphCertification::
+                InconsistentTopologyContract;
+        }
+
+        switch (evidence.graph_contract)
+        {
+        case ProductionParityGraphContract::CPUDeclarative:
+        case ProductionParityGraphContract::
+            HeterogeneousCPUParticipantDeclarative:
+            return ProductionParityGraphCertification::Certified;
+        case ProductionParityGraphContract::HomogeneousGPUCaptured:
+        case ProductionParityGraphContract::
+            HeterogeneousGPUParticipantCaptured:
+            if (evidence.segmented_plan || evidence.segmented_capture ||
+                evidence.segmented_replay)
+            {
+                return ProductionParityGraphCertification::
+                    UnexpectedNativeSegmentation;
+            }
+            if (!productionParityHasRequiredGenerationGraph(evidence))
+            {
+                return ProductionParityGraphCertification::
+                    MissingNativeCapturedGraph;
+            }
+            if (!evidence.decode_graph_capture &&
+                !evidence.decode_graph_replay)
+            {
+                return ProductionParityGraphCertification::
+                    MissingNativeDecodeGraph;
+            }
+            return ProductionParityGraphCertification::Certified;
+        case ProductionParityGraphContract::
+            HeterogeneousCoordinatorSegmented:
+            if (!evidence.segmented_plan)
+            {
+                return ProductionParityGraphCertification::
+                    MissingHeterogeneousSegmentPlan;
+            }
+            if (!evidence.segmented_capture)
+            {
+                return ProductionParityGraphCertification::
+                    MissingHeterogeneousSegmentCapture;
+            }
+            if (!evidence.decode_graph_capture)
+            {
+                return ProductionParityGraphCertification::
+                    MissingHeterogeneousDecodeCapture;
+            }
+            if (!evidence.decode_graph_replay)
+            {
+                return ProductionParityGraphCertification::
+                    MissingHeterogeneousDecodeReplay;
+            }
+            if (!evidence.segmented_replay)
+            {
+                return ProductionParityGraphCertification::
+                    MissingHeterogeneousSegmentReplay;
+            }
+            return ProductionParityGraphCertification::Certified;
+        }
+        return ProductionParityGraphCertification::
+            InconsistentTopologyContract;
+    }
+
     namespace detail
     {
         /** @brief Classify one known execution-policy tag value. */
@@ -162,6 +522,23 @@ namespace llaminar2::test::parity
             const auto [next, error] =
                 std::from_chars(begin, end, parsed, 10);
             return error == std::errc{} && next == end && parsed > 0;
+        }
+
+        /** @brief Parse and validate one non-negative integral tag. */
+        inline bool nonNegativeIntegerTag(
+            const PerfStatRecord &record,
+            std::string_view key)
+        {
+            const auto it = record.tags.find(std::string(key));
+            if (it == record.tags.end() || it->second.empty())
+                return false;
+
+            long long parsed = 0;
+            const char *const begin = it->second.data();
+            const char *const end = begin + it->second.size();
+            const auto [next, error] =
+                std::from_chars(begin, end, parsed, 10);
+            return error == std::errc{} && next == end && parsed >= 0;
         }
 
         /**
@@ -390,7 +767,11 @@ namespace llaminar2::test::parity
                             record,
                             "execution",
                             "hosted_captured_transactions_with_ticket_only_dispatch") &&
-                        positiveIntegerTag(record, "fragments");
+                        positiveIntegerTag(record, "fragments") &&
+                        tagEquals(record, "conditional_fragments", "0") &&
+                        nonNegativeIntegerTag(
+                            record,
+                            "ticket_conditioned_fragments");
                 }
                 else if (
                     record.name == "device_generation_loop_graph_reuses")
@@ -418,6 +799,9 @@ namespace llaminar2::test::parity
                         positiveIntegerTag(record, "fragments") &&
                         positiveIntegerTag(record, "workspace_generation") &&
                         tagEquals(record, "conditional_fragments", "0") &&
+                        nonNegativeIntegerTag(
+                            record,
+                            "ticket_conditioned_fragments") &&
                         (tagEquals(record, "depth_policy", "fixed_width") ||
                          tagEquals(record, "depth_policy", "dynamic")) &&
                         (tagEquals(record, "sampling_mode", "greedy") ||
@@ -434,7 +818,11 @@ namespace llaminar2::test::parity
                             record,
                             "execution",
                             "hosted_ticket_selected_captured_transactions") &&
-                        positiveIntegerTag(record, "fragments");
+                        positiveIntegerTag(record, "fragments") &&
+                        tagEquals(record, "conditional_fragments", "0") &&
+                        nonNegativeIntegerTag(
+                            record,
+                            "ticket_conditioned_fragments");
                     device.launches += record.value;
                 }
                 else if (

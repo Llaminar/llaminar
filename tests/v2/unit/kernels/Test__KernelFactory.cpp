@@ -565,6 +565,81 @@ TEST_F(Test__KernelFactory, CreateGemm_ConsistentWithTensorCreateGemm)
     // We can't easily compare types, but we can verify they're both valid
 }
 
+/**
+ * @brief A prepared floating expert owns independent execution bytes.
+ *
+ * Rank-local ExpertOverlay preparation publishes only the returned engine into
+ * its registry. This regression explicitly retires and destroys the loader
+ * tensor before GEMM, matching the production lifecycle that exposed the null
+ * matrix pointer and proving all floating formats are self-contained.
+ */
+TEST_F(Test__KernelFactory, PreparedFloatingExpertsOwnExecutionBytes)
+{
+    constexpr size_t N = 3;
+    constexpr size_t K = 4;
+    const auto prove_lifetime = [&](std::shared_ptr<TensorBase> weight)
+    {
+        const TensorType type = weight->native_type();
+        const void *source_bytes = weight->raw_data();
+        ASSERT_NE(source_bytes, nullptr);
+
+        auto engine = KernelFactory::prepareExpertGemmLocal(
+            weight, DeviceId::cpu());
+        ASSERT_NE(engine, nullptr) << tensorTypeName(type);
+
+        ContiguousFloatingPointWeightDescriptor prepared;
+        ASSERT_TRUE(engine->exportContiguousFloatingPointWeights(prepared));
+        EXPECT_NE(prepared.data, source_bytes)
+            << "prepared engine still aliases loader storage for "
+            << tensorTypeName(type);
+
+        // This is the exact destructive transition performed after weight
+        // preparation. The engine must remain usable without the source.
+        weight->release_host_weight_data();
+        EXPECT_EQ(weight->raw_data(), nullptr) << tensorTypeName(type);
+        weight.reset();
+
+        FP32Tensor input({1, K});
+        FP32Tensor output({1, N});
+        ASSERT_TRUE(engine->multiply_tensor(
+            &input,
+            &output,
+            1,
+            static_cast<int>(N),
+            static_cast<int>(K)))
+            << tensorTypeName(type);
+
+        engine.reset();
+    };
+
+    prove_lifetime(std::make_shared<FP32Tensor>(
+        std::vector<size_t>{N, K}));
+    prove_lifetime(std::make_shared<FP16Tensor>(
+        std::vector<size_t>{N, K}, std::vector<uint16_t>(N * K, 0)));
+    prove_lifetime(std::make_shared<BF16Tensor>(
+        std::vector<size_t>{N, K}, std::vector<uint16_t>(N * K, 0)));
+}
+
+/** A borrowed pointer cannot express floating expert source ownership. */
+TEST_F(Test__KernelFactory, BorrowedFloatingExpertPreparationFailsClosed)
+{
+    FP32Tensor fp32_weight({3, 4});
+    FP16Tensor fp16_weight({3, 4});
+    BF16Tensor bf16_weight({3, 4});
+    EXPECT_EQ(
+        KernelFactory::prepareExpertGemmLocal(
+            &fp32_weight, DeviceId::cpu()),
+        nullptr);
+    EXPECT_EQ(
+        KernelFactory::prepareExpertGemmLocal(
+            &fp16_weight, DeviceId::cpu()),
+        nullptr);
+    EXPECT_EQ(
+        KernelFactory::prepareExpertGemmLocal(
+            &bf16_weight, DeviceId::cpu()),
+        nullptr);
+}
+
 // ============================================================================
 // createGemmRaw() Tests (IQ4_NL only has raw variant)
 // ============================================================================

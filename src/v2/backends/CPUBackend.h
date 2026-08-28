@@ -87,9 +87,9 @@ namespace llaminar2
         size_t deviceMemoryTotal(int device_id) const override;
 
         /**
-         * @brief Get free memory for this rank's NUMA node
+         * @brief Get conservatively allocatable memory for this rank's NUMA node
          * @param device_id Must be 0
-         * @return Free memory in bytes from /sys/devices/system/node/nodeN/meminfo
+         * @return Canonical free-plus-reclaimable-file-cache bytes with tmpfs charged
          */
         size_t deviceMemoryFree(int device_id) const override;
 
@@ -304,14 +304,6 @@ namespace llaminar2
 
     private:
         int local_numa_node_;
-
-        // Read NUMA memory info from /sys/devices/system/node/nodeN/meminfo
-        size_t readNumaMemTotal() const;
-        size_t readNumaMemFree() const;
-
-        // Read system-wide memory info from /proc/meminfo (fallback)
-        size_t readSystemMemTotal() const;
-        size_t readSystemMemFree() const;
 
         // Validate device_id (must be 0 for rank-local view)
         bool isValidDeviceId(int device_id) const;

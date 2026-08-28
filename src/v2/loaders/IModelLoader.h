@@ -349,14 +349,13 @@ namespace llaminar2
         virtual void releaseMmapRegions() {}
 
         /**
-         * @brief Advise the OS to reclaim physical pages backing the mmap regions.
+         * @brief Perform backing-aware advice for all owned mmap regions.
          *
-         * Uses madvise(MADV_DONTNEED) to release physical pages without
-         * unmapping the virtual address range. Future reads re-fault from
-         * the page cache. Safe to call after all GEMM weights have been
-         * packed into interleaved format.
+         * This infrastructure method is called only by WeightManager's reclaim
+         * worker after every mmap host registration has retired. Durable files
+         * use MADV_DONTNEED; memory-filesystem mappings intentionally no-op.
          *
-         * @return Total bytes advised
+         * @return Total durable-mapping bytes actually advised.
          */
         virtual size_t adviseMmapDontneed() { return 0; }
     };

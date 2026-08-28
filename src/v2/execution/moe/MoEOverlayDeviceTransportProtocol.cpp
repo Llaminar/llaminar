@@ -51,6 +51,30 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @return A bounded diagnostic for the sole authority's terminal edge.
+         *
+         * The transport worker is permitted to observe controller lifecycle
+         * identity and its first terminal error, but no placement payload. This
+         * turns an already-published device failure into an immediate scheduler
+         * failure instead of hiding it behind the ordinary command deadline.
+         */
+        std::string controllerFailureMessage(
+            const MoEOverlayDeviceControllerSharedHeader &controller)
+        {
+            std::ostringstream out;
+            out << "device overlay authority is terminal: state="
+                << loadAcquire(controller.state)
+                << " error_code=" << loadAcquire(controller.error_code)
+                << " error_group_id="
+                << loadAcquire(controller.error_group_id)
+                << " transaction="
+                << loadAcquire(controller.transaction_id)
+                << " command_transaction="
+                << loadAcquire(controller.command_transaction);
+            return out.str();
+        }
+
         /** @return Exact digest over the fixed-width command byte sequence. */
         std::uint64_t commandDigest(
             const std::vector<MoEOverlayDeviceMovementCommand> &entries) noexcept
@@ -477,6 +501,22 @@ namespace llaminar2
         {
             result.status = MoEOverlayDeviceTransportAcquireStatus::Failed;
             result.error = "device transport lane is already terminal";
+            return result;
+        }
+
+        /* Policy authoring may fail before command_transaction is published.
+         * That is a terminal device-owned edge, not an absent command. Observe
+         * it before returning Waiting so the scheduler never converts a precise
+         * controller failure into a derivative 30-second transport timeout. */
+        if (loadAcquire(binding_.controller->state) ==
+                static_cast<std::uint32_t>(
+                    MoEOverlayDeviceControllerState::Error) ||
+            loadAcquire(binding_.controller->error_code) !=
+                static_cast<std::uint32_t>(
+                    MoEOverlayDeviceControllerError::None))
+        {
+            result.status = MoEOverlayDeviceTransportAcquireStatus::Failed;
+            result.error = controllerFailureMessage(*binding_.controller);
             return result;
         }
 

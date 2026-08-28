@@ -18,6 +18,8 @@
 #include <cmath>
 #include <cstring>
 #include <atomic>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <stdexcept>
 
@@ -35,7 +37,17 @@ namespace llaminar2
 
     // Precomputed RoPE frequencies: freq[i] = 1/theta^(2i/D) for i in [0, D/2)
     __constant__ float d_HIP_ROPE_FREQS[64]; // max head_dim/2 = 128/2 = 64
-    static std::atomic<int> s_hip_rope_freqs_head_dim{0};
+    /** Host mirror identity for one HIP module's uploaded RoPE constants. */
+    struct HIPRopeConstantGeneration
+    {
+        std::uint64_t runtime_generation = 0u;
+        float rope_theta = 0.0f;
+        int head_dim = 0;
+    };
+
+    static std::mutex s_hip_rope_freqs_mutex;
+    static std::unordered_map<int, HIPRopeConstantGeneration>
+        s_hip_rope_freqs_by_device;
 
     bool hip_tq_upload_codebooks(hipStream_t stream)
     {
@@ -64,8 +76,26 @@ namespace llaminar2
 
     void hip_tq_upload_rope_freqs(float rope_theta, int head_dim, hipStream_t stream)
     {
-        if (s_hip_rope_freqs_head_dim.load(std::memory_order_acquire) == head_dim)
+        int device_id = -1;
+        if (hipGetDevice(&device_id) != hipSuccess)
             return;
+        IBackend *const backend = getROCmBackend();
+        const std::uint64_t generation = backend
+                                             ? backend->deviceRuntimeGeneration(
+                                                   device_id)
+                                             : 0u;
+        if (generation == 0u)
+            return;
+
+        std::lock_guard<std::mutex> lock(s_hip_rope_freqs_mutex);
+        const auto existing = s_hip_rope_freqs_by_device.find(device_id);
+        if (existing != s_hip_rope_freqs_by_device.end() &&
+            existing->second.runtime_generation == generation &&
+            existing->second.rope_theta == rope_theta &&
+            existing->second.head_dim == head_dim)
+        {
+            return;
+        }
 
         const int half_dim = head_dim / 2;
         std::vector<float> freqs(half_dim);
@@ -77,7 +107,13 @@ namespace llaminar2
         (void)hipStreamSynchronize(stream);
 
         if (hipGetLastError() == hipSuccess)
-            s_hip_rope_freqs_head_dim.store(head_dim, std::memory_order_release);
+        {
+            s_hip_rope_freqs_by_device[device_id] = {
+                .runtime_generation = generation,
+                .rope_theta = rope_theta,
+                .head_dim = head_dim,
+            };
+        }
     }
 
     // =========================================================================

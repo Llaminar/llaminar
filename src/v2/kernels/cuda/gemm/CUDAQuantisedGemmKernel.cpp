@@ -25,6 +25,7 @@
 #include "CUDAQuantisedGemmKernel.h"
 #include "CUDADeviceWorkspace.h"
 #include "backends/ComputeBackend.h" // DeviceManager
+#include "backends/BackendManager.h"
 #include "backends/DeviceId.h"       // DeviceId
 #include "backends/GPUDeviceContextPool.h"
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
@@ -896,10 +897,27 @@ namespace llaminar2
                 }
 
                 static std::mutex iq_table_mutex;
-                static std::unordered_set<int> iq_init_devices;
+                static std::unordered_map<int, std::uint64_t>
+                    iq_grid_runtime_generations;
 
                 std::lock_guard<std::mutex> lock(iq_table_mutex);
-                if (iq_init_devices.count(cuda_device_id))
+                IBackend *const backend = getCUDABackend();
+                const std::uint64_t runtime_generation = backend
+                                                             ? backend->deviceRuntimeGeneration(
+                                                                   cuda_device_id)
+                                                             : 0u;
+                if (runtime_generation == 0u)
+                {
+                    LOG_ERROR(
+                        "[CUDAQuantisedGemmKernel] " << context
+                        << " has no live CUDA runtime generation for device "
+                        << cuda_device_id);
+                    return false;
+                }
+                const auto initialized =
+                    iq_grid_runtime_generations.find(cuda_device_id);
+                if (initialized != iq_grid_runtime_generations.end() &&
+                    initialized->second == runtime_generation)
                 {
                     return true;
                 }
@@ -919,7 +937,8 @@ namespace llaminar2
                     return false;
                 }
 
-                iq_init_devices.insert(cuda_device_id);
+                iq_grid_runtime_generations[cuda_device_id] =
+                    runtime_generation;
                 return true;
             }
 

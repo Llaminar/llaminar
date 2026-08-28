@@ -289,6 +289,61 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyFP32Tensor)
 }
 
 /**
+ * @brief A typed CPU binding keeps bytes live after accelerator preparation.
+ *
+ * ExpertOverlay materializes participant plans independently. This deliberately
+ * registers the CPU consumer first and an accelerator consumer second, matching
+ * the ordering that previously downgraded pointer-keyed metadata and cleared
+ * the source vector beneath a retained floating-point expert engine.
+ */
+TEST_F(Test__WeightManager_PPSafety,
+       MaterializedCPUConsumerPreventsAcceleratorPreparedHostReclaim)
+{
+    mock_loader_ = MockModelLoader::createMinimal();
+    mock_loader_->addFP32RandomTensor("test_weight", {8, 8});
+    PPSafetyTestableWeightManager wm(*mock_loader_);
+
+    const auto materialize_for = [&](DeviceId target, WeightHostPolicy policy)
+    {
+        InferenceStrategy strategy;
+        strategy.mode = WeightInferenceMode::SingleDevice;
+        strategy.model_id = ModelContextId{77};
+        strategy.devices = {target};
+        WeightPlan plan(strategy);
+
+        WeightRequirement requirement;
+        requirement.canonical_name = "test_weight";
+        requirement.target_device = target;
+        requirement.lookup_device = DeviceId::cpu();
+        requirement.host_policy = policy;
+        plan.add(std::move(requirement));
+        return wm.materialize(plan);
+    };
+
+    const auto cpu_weights = materialize_for(
+        DeviceId::cpu(), WeightHostPolicy::RequiredForCPUExecution);
+    const auto accelerator_weights = materialize_for(
+        DeviceId::cuda(0),
+        WeightHostPolicy::ReleasableAfterPreparation);
+    ASSERT_EQ(cpu_weights.bindings().size(), 1u);
+    ASSERT_EQ(accelerator_weights.bindings().size(), 1u);
+    ASSERT_EQ(
+        cpu_weights.bindings().front().tensor,
+        accelerator_weights.bindings().front().tensor);
+
+    auto tensor = cpu_weights.bindings().front().tensor_owner;
+    ASSERT_NE(tensor, nullptr);
+    tensor->setHostResident();
+    PreparedWeightStore prepared_store(ModelContextId{99});
+    registerPreparedState(prepared_store, tensor);
+    ASSERT_TRUE(tensor->hasPreparedDeviceState());
+
+    EXPECT_EQ(wm.releaseAllHostWeightData(), 0u);
+    EXPECT_FALSE(tensor->is_raw_data_released());
+    EXPECT_NE(tensor->raw_data(), nullptr);
+}
+
+/**
  * @test CPU-only quantized tensor is NOT released when no device copy exists
  */
 TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyQuantizedTensor)

@@ -53,6 +53,7 @@ namespace llaminar2
     class CPUGroupedMoESerialWorkspace;
     class IWorkerGPUContext;
     class PinnedHostTransferBuffer;
+    class MappedHostTransferRegion;
 
     /**
      * @brief Immutable compact-route tensor owner for one serial graph family.
@@ -313,6 +314,21 @@ namespace llaminar2
         }
 
         /**
+         * @brief Register serial CPU canonical rows for one exact GPU consumer.
+         *
+         * Registration is setup-only and idempotent for the same device. The
+         * maximum route tensor is already shared by every serial graph family,
+         * so this mapping avoids a top-k return allocation for every layer while
+         * retaining one immutable address in captured ingress kernels.
+         *
+         * @param continuation_device Exact local CUDA/ROCm continuation owner.
+         * @return Model-lifetime mapped region containing the canonical rows.
+         * @throws std::logic_error for absent storage or a conflicting consumer.
+         */
+        std::shared_ptr<MappedHostTransferRegion>
+        mappedCPUCanonicalRoutes(DeviceId continuation_device);
+
+        /**
          * @brief Return setup-owned scratch for the serial CPU graph family.
          *
          * The pointer is null only when construction explicitly selected
@@ -334,6 +350,11 @@ namespace llaminar2
         size_t pinned_transfer_bytes_ = 0;
         std::vector<TensorFamily> families_;
         std::shared_ptr<FP32Tensor> cpu_canonical_routes_; ///< Maximum-capacity raw route rows shared by serial CPU families.
+        /** TransferEngine mapping of @ref cpu_canonical_routes_. */
+        std::shared_ptr<MappedHostTransferRegion>
+            mapped_cpu_canonical_routes_;
+        /** Exact continuation endpoint embedded by the mapped route region. */
+        DeviceId mapped_cpu_canonical_route_consumer_ = DeviceId::invalid();
         /** Maximum-capacity CPU grouped execution scratch shared by serial roles. */
         std::shared_ptr<CPUGroupedMoESerialWorkspace> cpu_grouped_workspace_;
     };
@@ -373,6 +394,26 @@ namespace llaminar2
                 return original_route_slots && compact_route_slots &&
                        preweighted_route_contributions &&
                        route_slot_capacity > 0u;
+            }
+        };
+
+        /**
+         * @brief Colocated CPU publication into a captured GPU route ticket.
+         *
+         * Unlike the mapped rank-pair binding above, this ticket keeps compact
+         * route rows in the CPU participant's serial arena and publishes only
+         * original/compact slot identities plus one release word. The following
+         * captured GPU ingress materializes those rows into its canonical bank.
+         */
+        struct CPUCanonicalRouteTicketReturnBinding
+        {
+            std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage>
+                storage;
+
+            /** @return Whether setup bound a complete immutable ticket. */
+            [[nodiscard]] bool valid() const noexcept
+            {
+                return storage && storage->hasValidBoundIdentity();
             }
         };
 
@@ -423,6 +464,9 @@ namespace llaminar2
              */
             std::optional<CPUCanonicalRouteReturnBinding>
                 cpu_canonical_route_return;
+            /** Optional same-rank CPU-to-GPU compact canonical return ticket. */
+            std::optional<CPUCanonicalRouteTicketReturnBinding>
+                cpu_canonical_route_ticket_return;
             std::shared_ptr<MoEOverlayCollectiveWorkspace> workspace_lifetime;
             /**
              * Immutable compact tensors shared by one ordered graph family.
@@ -836,7 +880,10 @@ namespace llaminar2
          * producer event here preserves multi-device overlap while avoiding
          * redundant thread-pool scheduling around HIP/CUDA graph launches.
          */
-        bool completeDeferredOutputOnCurrentThread(IDeviceContext *ctx);
+        bool completeDeferredOutputOnCurrentThread(
+            IDeviceContext *ctx,
+            MoEOverlayCanonicalRouteReturnTicketStorage::Publication *
+                canonical_route_publication = nullptr);
         /**
          * @brief Build retained GPU graphs for every tensor/route-width family.
          *

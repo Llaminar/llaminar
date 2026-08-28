@@ -10,7 +10,7 @@
  */
 
 #include "execution/moe/MoEOverlayResidencyMaintenanceService.h"
-#include "execution/moe/MoEOverlayMPIHistogramPublisher.h"
+#include "execution/moe/MoEOverlayMPIResidencyProposalPublisher.h"
 
 #include <gtest/gtest.h>
 
@@ -18,6 +18,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -146,7 +147,14 @@ namespace llaminar2::test
             return histogram;
         }
 
-        /** @brief Complete measured-policy fixture for protocol-only movement tests. */
+        /**
+         * @brief Complete measured-policy fixture for protocol-only movement tests.
+         *
+         * The authority prices the parallel critical path using exact
+         * participant rows; tier aggregates alone are only sufficient for
+         * initial capacity placement.  This fixture therefore describes both
+         * views of the same three single-participant tiers.
+         */
         std::shared_ptr<const MoERoutedTierServiceProfile> serviceProfile()
         {
             auto profile = std::make_shared<MoERoutedTierServiceProfile>();
@@ -159,6 +167,17 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {50, 100, 150}},
                 {.tier_index = 2,
+                 .layer = 0,
+                 .nanoseconds_per_activation = {100, 200, 300}},
+            };
+            profile->participant_costs = {
+                {.participant_id = 0,
+                 .layer = 0,
+                 .nanoseconds_per_activation = {10, 20, 30}},
+                {.participant_id = 1,
+                 .layer = 0,
+                 .nanoseconds_per_activation = {50, 100, 150}},
+                {.participant_id = 2,
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 200, 300}},
             };
@@ -484,39 +503,41 @@ namespace llaminar2::test
             bool retained_identity_ = true;
         };
 
-        /** @brief Immediate thread-safe frozen-window publisher for CPU tests. */
-        class ImmediateHistogramPublisher final
-            : public IMoEOverlayHistogramPublisher
+        /** @brief Immediate thread-safe canonical-plan publisher for CPU tests. */
+        class ImmediateProposalPublisher final
+            : public IMoEOverlayResidencyProposalPublisher
         {
         public:
             /**
              * @brief Construct a coordinator or an initially armed peer.
              * @param coordinator Whether this process owns routing evidence.
-             * @param peer_window First authenticated peer window, when any.
+             * @param peer_proposal First authenticated peer plan, when any.
              */
-            ImmediateHistogramPublisher(
+            ImmediateProposalPublisher(
                 bool coordinator,
-                std::shared_ptr<const DecodeExpertHistogramWindow> peer_window = {})
+                std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+                    peer_proposal = {})
                 : coordinator_(coordinator),
-                  peer_window_(std::move(peer_window)),
+                  peer_proposal_(std::move(peer_proposal)),
                   active_(!coordinator)
             {
             }
 
-            /** @brief Capture the exact coordinator window and begin its send. */
+            /** @brief Capture the exact coordinator plan and begin its send. */
             bool beginPublish(
-                const DecodeExpertHistogramWindow &window,
+                const MoEOverlayDistributedResidencyProposal &proposal,
                 std::string *error) override
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (!coordinator_ || active_ || !window.valid())
+                if (!coordinator_ || active_ || !proposal.valid())
                 {
                     if (error)
-                        *error = "invalid immediate histogram publication";
+                        *error = "invalid immediate proposal publication";
                     return false;
                 }
-                published_window_ =
-                    std::make_shared<DecodeExpertHistogramWindow>(window);
+                published_proposal_ =
+                    std::make_shared<
+                        MoEOverlayDistributedResidencyProposal>(proposal);
                 active_ = true;
                 ++publication_begins_;
                 if (error)
@@ -524,9 +545,10 @@ namespace llaminar2::test
                 return true;
             }
 
-            /** @brief Complete a send or deliver one copied peer window. */
+            /** @brief Complete a send or deliver one copied peer proposal. */
             MoEOverlayResidencyWaveProgress poll(
-                std::shared_ptr<const DecodeExpertHistogramWindow> *received,
+                std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+                    *received,
                 std::string *error) override
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -536,7 +558,7 @@ namespace llaminar2::test
                 if (!active_)
                 {
                     if (error)
-                        *error = "immediate histogram lane is idle";
+                        *error = "immediate proposal lane is idle";
                     return MoEOverlayResidencyWaveProgress::Failed;
                 }
                 if (coordinator_)
@@ -549,28 +571,77 @@ namespace llaminar2::test
                         error->clear();
                     return MoEOverlayResidencyWaveProgress::Ready;
                 }
-                if (!peer_window_)
+                if (acknowledgement_pending_)
+                {
+                    acknowledgement_pending_ = false;
+                    active_ = false;
+                    if (error)
+                        error->clear();
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                }
+                if (!peer_proposal_)
                     return MoEOverlayResidencyWaveProgress::Pending;
 
+                awaiting_generation_ =
+                    peer_proposal_->plan.histogram_window->generation;
                 if (received)
-                    *received = std::move(peer_window_);
+                    *received = std::move(peer_proposal_);
                 else
-                    peer_window_.reset();
+                    peer_proposal_.reset();
                 active_ = false;
+                awaiting_validation_ = true;
                 ++deliveries_;
                 if (error)
                     error->clear();
                 return MoEOverlayResidencyWaveProgress::Ready;
             }
 
+            /** @brief Complete device-free semantic adoption before readiness. */
+            bool acceptReceivedProposal(
+                std::uint64_t histogram_generation,
+                std::string *error) override
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (coordinator_ || !awaiting_validation_ ||
+                    histogram_generation != awaiting_generation_)
+                {
+                    if (error)
+                        *error = "invalid immediate proposal acceptance";
+                    return false;
+                }
+                awaiting_validation_ = false;
+                awaiting_generation_ = 0u;
+                acknowledgement_pending_ = true;
+                active_ = true;
+                ++acceptances_;
+                if (error)
+                    error->clear();
+                return true;
+            }
+
+            /** @brief Retain one adversarial semantic rejection for inspection. */
+            void rejectReceivedProposal(
+                std::uint64_t histogram_generation,
+                std::string diagnostic) override
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                rejected_generation_ = histogram_generation;
+                rejection_ = std::move(diagnostic);
+                awaiting_validation_ = false;
+                acknowledgement_pending_ = false;
+                active_ = false;
+                ++rejections_;
+            }
+
             /** @brief Arm the peer for another generation immediately. */
             bool armReceive(std::string *error) override
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (coordinator_ || active_)
+                if (coordinator_ || active_ || awaiting_validation_ ||
+                    acknowledgement_pending_)
                 {
                     if (error)
-                        *error = "invalid immediate histogram rearm";
+                        *error = "invalid immediate proposal rearm";
                     return false;
                 }
                 active_ = true;
@@ -585,6 +656,8 @@ namespace llaminar2::test
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 active_ = false;
+                awaiting_validation_ = false;
+                acknowledgement_pending_ = false;
             }
 
             /** @return Whether this fixture is the coordinator. */
@@ -614,7 +687,7 @@ namespace llaminar2::test
                 return polls_;
             }
 
-            /** @return Number of authenticated peer window deliveries. */
+            /** @return Number of authenticated peer proposal deliveries. */
             int deliveries() const
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -635,26 +708,34 @@ namespace llaminar2::test
                 publication_ready_ = ready;
             }
 
-            /** @return Coordinator window copied at beginPublish(). */
-            std::shared_ptr<const DecodeExpertHistogramWindow>
-            publishedWindow() const
+            /** @return Coordinator proposal copied at beginPublish(). */
+            std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+            publishedProposal() const
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                return published_window_;
+                return published_proposal_;
             }
 
         private:
             bool coordinator_ = false;
             mutable std::mutex mutex_;
-            std::shared_ptr<const DecodeExpertHistogramWindow> peer_window_;
-            std::shared_ptr<const DecodeExpertHistogramWindow>
-                published_window_;
+            std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+                peer_proposal_;
+            std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+                published_proposal_;
             bool active_ = false;
+            bool awaiting_validation_ = false;
+            bool acknowledgement_pending_ = false;
             bool publication_ready_ = true;
+            std::uint64_t awaiting_generation_ = 0u;
+            std::uint64_t rejected_generation_ = 0u;
+            std::string rejection_;
             int publication_begins_ = 0;
             int publication_completions_ = 0;
             int polls_ = 0;
             int deliveries_ = 0;
+            int acceptances_ = 0;
+            int rejections_ = 0;
             int receive_rearms_ = 0;
         };
 
@@ -662,14 +743,15 @@ namespace llaminar2::test
         std::unique_ptr<MoEOverlayResidencyMaintenanceService> startService(
             std::shared_ptr<MoEOverlayResidencyAuthority> authority,
             std::shared_ptr<ControlledTransport> transport,
-            std::shared_ptr<IMoEOverlayHistogramPublisher> publisher = {})
+            std::shared_ptr<IMoEOverlayResidencyProposalPublisher>
+                publisher = {})
         {
             auto service = std::make_unique<
                 MoEOverlayResidencyMaintenanceService>(
                 MoEOverlayResidencyMaintenanceService::Config{
                     .authority = std::move(authority),
                     .transport = std::move(transport),
-                    .histogram_publisher = std::move(publisher),
+                    .proposal_publisher = std::move(publisher),
                     .idle_poll_interval = 100us,
                     .perf_device = "device-free-test",
                 });
@@ -702,7 +784,8 @@ namespace llaminar2::test
         ASSERT_TRUE(waitUntil(
             [&] { return service.stats().worker_starts == 1u; }));
         EXPECT_THROW(service.start(), std::logic_error);
-        service.stopAndDrain();
+        service.stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
         EXPECT_EQ(service.state(), MoEOverlayMaintenanceState::Stopped);
         EXPECT_THROW(service.start(), std::logic_error);
     }
@@ -720,8 +803,10 @@ namespace llaminar2::test
         });
 
         ASSERT_EQ(service.state(), MoEOverlayMaintenanceState::Prepared);
-        service.stopAndDrain();
-        service.stopAndDrain();
+        service.stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+        service.stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
         EXPECT_EQ(service.state(), MoEOverlayMaintenanceState::Stopped);
         EXPECT_EQ(service.stats().worker_starts, 0u);
         EXPECT_THROW(service.start(), std::logic_error);
@@ -753,6 +838,11 @@ namespace llaminar2::test
             Action::Stop)
             << "The ready snapshot is immutable once evidence exchange begins";
         EXPECT_EQ(
+            moeOverlayDeviceServicePublicationAction(
+                State::RebasingRoutingEvidence),
+            Action::Stop)
+            << "Rebase owns the immutable profile and needs no new service rows";
+        EXPECT_EQ(
             moeOverlayDeviceServicePublicationAction(State::Complete),
             Action::Stop);
         EXPECT_EQ(
@@ -765,23 +855,284 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayResidencyMaintenanceService,
-        PassiveHistogramReceiveDoesNotOwnPublicationDeadline)
+        PublicActivityDistinguishesDemandReconciliationFromSettledCollection)
     {
-        EXPECT_FALSE(moeOverlayHistogramOwnsProgressDeadline(
-            MoEOverlayMPIHistogramPublisherState::Idle));
-        EXPECT_FALSE(moeOverlayHistogramOwnsProgressDeadline(
-            MoEOverlayMPIHistogramPublisherState::Receiving))
+        using Activity = MoEOptimizationActivityState;
+        using State = MoEOverlayMaintenanceState;
+
+        EXPECT_EQ(
+            moeOptimizationActivityState(State::Waiting),
+            Activity::CollectingDemand);
+        EXPECT_EQ(
+            moeOptimizationActivityState(State::ReconcilingDemand),
+            Activity::ReconcilingDemand);
+        EXPECT_EQ(
+            moeOptimizationActivityState(State::DrainingEvidence),
+            Activity::ReconcilingDemand);
+        EXPECT_EQ(
+            moeOptimizationActivityState(State::PlanningProposal),
+            Activity::PlanningMovement);
+        EXPECT_EQ(
+            moeOptimizationActivityState(State::PublishingProposal),
+            Activity::ExchangingProposal);
+        EXPECT_EQ(
+            moeOptimizationActivityState(State::ReceivingProposal),
+            Activity::AwaitingAuthorityProposal);
+        EXPECT_EQ(
+            moeOptimizationActivityState(State::Staging),
+            Activity::MovingWeights);
+        EXPECT_EQ(
+            moeOptimizationActivityState(State::Preparing),
+            Activity::MovingWeights);
+        EXPECT_EQ(
+            moeOptimizationActivityState(State::Publishing),
+            Activity::PublishingResidency);
+
+        const MoEOptimizationStatus settled{
+            .authority = MoEOptimizationAuthority::Host,
+            .state = MoEOptimizationLifecycleState::Active,
+            .activity = Activity::CollectingDemand,
+        };
+        const MoEOptimizationStatus reconciling{
+            .authority = MoEOptimizationAuthority::Host,
+            .state = MoEOptimizationLifecycleState::Active,
+            .activity = Activity::ReconcilingDemand,
+        };
+        const MoEOptimizationStatus notified_but_not_reconciled{
+            .authority = MoEOptimizationAuthority::Host,
+            .state = MoEOptimizationLifecycleState::Active,
+            .activity = Activity::CollectingDemand,
+            .published_progress_generation = 8u,
+            .reconciled_progress_generation = 7u,
+        };
+        const MoEOptimizationStatus notification_reconciled{
+            .authority = MoEOptimizationAuthority::Host,
+            .state = MoEOptimizationLifecycleState::Active,
+            .activity = Activity::CollectingDemand,
+            .demand_window = {
+                .generation = 4u,
+                .collected_routed_rows = 87u,
+                .capacity_routed_rows = 640u,
+            },
+            .published_progress_generation = 8u,
+            .reconciled_progress_generation = 8u,
+        };
+        EXPECT_TRUE(settled.quiescentBetweenWaves());
+        EXPECT_FALSE(reconciling.quiescentBetweenWaves())
+            << "A completed publication is not a timing boundary until the "
+               "authority proves that no full demand window is queued";
+        EXPECT_FALSE(notified_but_not_reconciled.quiescentBetweenWaves())
+            << "A stale Waiting activity cannot hide inference progress that "
+               "the policy worker has not reconciled";
+        EXPECT_TRUE(notification_reconciled.quiescentBetweenWaves());
+        EXPECT_TRUE(notification_reconciled.canBeginExclusiveCohort(552u))
+            << "The complete cohort should fit strictly below the next decision";
+
+        auto exact_boundary = notification_reconciled;
+        exact_boundary.demand_window.collected_routed_rows = 88u;
+        EXPECT_FALSE(exact_boundary.canBeginExclusiveCohort(552u))
+            << "Completing the histogram on the cohort's final row would admit "
+               "an asynchronous publication before terminal validation";
+
+        auto no_authoritative_window = notification_reconciled;
+        no_authoritative_window.demand_window = {};
+        EXPECT_FALSE(no_authoritative_window.canBeginExclusiveCohort(1u));
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        TypedEconomyProofRequiresExactAuthorityArithmetic)
+    {
+        const MoEOptimizationMovementEconomy valid{
+            .authority = MoEOptimizationAuthority::Host,
+            .transaction = 2u,
+            .candidate_epoch = 2u,
+            .command_count = 4u,
+            .cycle_count = 2u,
+            .projected_service_gain_ns = 1'000u,
+            .projected_transfer_and_repack_ns = 200u,
+            .projected_inference_interference_ns = 100u,
+            .projected_net_benefit_ns = 700u,
+        };
+        EXPECT_TRUE(valid.valid());
+
+        auto mismatched_net = valid;
+        mismatched_net.projected_net_benefit_ns = 701u;
+        EXPECT_FALSE(mismatched_net.valid());
+
+        auto follower_fabrication = valid;
+        follower_fabrication.authority = MoEOptimizationAuthority::None;
+        EXPECT_FALSE(follower_fabrication.valid());
+
+        auto overflowed_cost = valid;
+        overflowed_cost.projected_transfer_and_repack_ns =
+            std::numeric_limits<std::uint64_t>::max();
+        EXPECT_FALSE(overflowed_cost.valid());
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        TypedHostAdmissionProofRequiresTotalClassificationAndExactCapacity)
+    {
+        const MoEOptimizationHostMovementAdmission valid{
+            .authority = MoEOptimizationAuthority::Host,
+            .transaction = 2u,
+            .candidate_epoch = 2u,
+            .cycle_capacity_kind =
+                MoEOptimizationCycleCapacityKind::Bounded,
+            .maximum_concurrent_cycles = 2u,
+            .candidate_cycles = 4u,
+            .policy_eligible_cycles = 3u,
+            .policy_eligible_axes = {
+                .tier_residency = 1u,
+                .participant_placement = 1u,
+                .combined = 1u,
+            },
+            .admitted_candidate_cycles = 2u,
+            .admitted_candidate_axes = {
+                .tier_residency = 1u,
+                .participant_placement = 1u,
+            },
+            .admitted_physical_cycles = 2u,
+            .admitted_physical_axes = {
+                .tier_residency = 1u,
+                .combined = 1u,
+            },
+            .individual_policy_rejected_cycles = 1u,
+            .dependent_payoff_rejected_cycles = 1u,
+            .physical_cycle_recomposition = false,
+            .capacity_bounded = false,
+            .policy_bounded = true,
+        };
+        EXPECT_TRUE(valid.valid());
+
+        auto follower_fabrication = valid;
+        follower_fabrication.authority = MoEOptimizationAuthority::None;
+        EXPECT_FALSE(follower_fabrication.valid());
+
+        auto unclassified_candidate = valid;
+        ++unclassified_candidate.candidate_cycles;
+        EXPECT_FALSE(unclassified_candidate.valid());
+
+        auto axis_double_count = valid;
+        ++axis_double_count.admitted_physical_axes.combined;
+        EXPECT_FALSE(axis_double_count.valid());
+
+        auto over_capacity = valid;
+        over_capacity.maximum_concurrent_cycles = 1u;
+        EXPECT_FALSE(over_capacity.valid());
+
+        auto mislabeled_capacity = valid;
+        mislabeled_capacity.capacity_bounded = true;
+        EXPECT_FALSE(mislabeled_capacity.valid());
+    }
+
+    /**
+     * @brief A watchdog renews on authority progress, not activity churn.
+     *
+     * A full device histogram can be drained only after the preceding
+     * movement publishes. Rotating that RCU bank resets its row count but is
+     * still monotonic progress. Conversely, activity enum changes do not prove
+     * that a stuck proposal or transfer advanced and must not renew a timeout.
+     */
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        ProgressStampOrdersQueuedHistogramAndMovementEdges)
+    {
+        MoEOptimizationStatus initial{
+            .authority = MoEOptimizationAuthority::Host,
+            .state = MoEOptimizationLifecycleState::Active,
+            .activity =
+                MoEOptimizationActivityState::ReconcilingDemand,
+            .demand_window = {
+                .generation = 1u,
+                .collected_routed_rows = 2u,
+                .capacity_routed_rows = 4u,
+            },
+            .published_progress_generation = 3u,
+            .reconciled_progress_generation = 2u,
+        };
+        const MoEOptimizationProgressStamp initial_stamp =
+            initial.progressStamp();
+        EXPECT_EQ(
+            initial_stamp.relationTo(initial_stamp),
+            MoEOptimizationProgressRelation::Unchanged);
+
+        auto rows_advanced = initial;
+        rows_advanced.demand_window.collected_routed_rows = 4u;
+        EXPECT_EQ(
+            rows_advanced.progressStamp().relationTo(initial_stamp),
+            MoEOptimizationProgressRelation::Advanced);
+
+        auto bank_rotated = rows_advanced;
+        bank_rotated.demand_window.generation = 2u;
+        bank_rotated.demand_window.collected_routed_rows = 0u;
+        EXPECT_EQ(
+            bank_rotated.progressStamp().relationTo(
+                rows_advanced.progressStamp()),
+            MoEOptimizationProgressRelation::Advanced)
+            << "A new RCU bank is progress even though its occupancy resets";
+
+        auto wave_completed = bank_rotated;
+        wave_completed.published_movement_waves = 1u;
+        wave_completed.completed_movement = {
+            .transactions = 1u,
+            .commands = 2u,
+            .physical_bytes = 4096u,
+            .promotions = 1u,
+            .demotions = 1u,
+        };
+        EXPECT_EQ(
+            wave_completed.progressStamp().relationTo(
+                bank_rotated.progressStamp()),
+            MoEOptimizationProgressRelation::Advanced);
+
+        auto activity_only = wave_completed;
+        activity_only.activity =
+            MoEOptimizationActivityState::ExchangingProposal;
+        EXPECT_EQ(
+            activity_only.progressStamp().relationTo(
+                wave_completed.progressStamp()),
+            MoEOptimizationProgressRelation::Unchanged)
+            << "Activity churn cannot conceal a stalled lifecycle edge";
+
+        auto transaction_regressed = wave_completed;
+        transaction_regressed.completed_movement.transactions = 0u;
+        EXPECT_EQ(
+            transaction_regressed.progressStamp().relationTo(
+                wave_completed.progressStamp()),
+            MoEOptimizationProgressRelation::Regressed);
+
+        auto demand_regressed = rows_advanced;
+        demand_regressed.demand_window.collected_routed_rows = 1u;
+        EXPECT_EQ(
+            demand_regressed.progressStamp().relationTo(
+                rows_advanced.progressStamp()),
+            MoEOptimizationProgressRelation::Regressed);
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        PassiveProposalReceiveDoesNotOwnPublicationDeadline)
+    {
+        EXPECT_FALSE(moeOverlayProposalOwnsProgressDeadline(
+            MoEOverlayMPIResidencyProposalPublisherState::Idle));
+        EXPECT_FALSE(moeOverlayProposalOwnsProgressDeadline(
+            MoEOverlayMPIResidencyProposalPublisherState::Receiving))
             << "A preposted peer mailbox may span calibration and idle serving";
-        EXPECT_TRUE(moeOverlayHistogramOwnsProgressDeadline(
-            MoEOverlayMPIHistogramPublisherState::Publishing))
+        EXPECT_FALSE(moeOverlayProposalOwnsProgressDeadline(
+            MoEOverlayMPIResidencyProposalPublisherState::AwaitingValidation))
+            << "The coordinator's active publication deadline covers local semantic adoption";
+        EXPECT_TRUE(moeOverlayProposalOwnsProgressDeadline(
+            MoEOverlayMPIResidencyProposalPublisherState::Publishing))
             << "An initiated coordinator send must retain the canonical timeout";
-        EXPECT_TRUE(moeOverlayHistogramOwnsProgressDeadline(
-            MoEOverlayMPIHistogramPublisherState::Acknowledging))
+        EXPECT_TRUE(moeOverlayProposalOwnsProgressDeadline(
+            MoEOverlayMPIResidencyProposalPublisherState::Acknowledging))
             << "A decoded peer generation must finish its readiness acknowledgement";
-        EXPECT_FALSE(moeOverlayHistogramOwnsProgressDeadline(
-            MoEOverlayMPIHistogramPublisherState::Failed));
-        EXPECT_FALSE(moeOverlayHistogramOwnsProgressDeadline(
-            MoEOverlayMPIHistogramPublisherState::Stopped));
+        EXPECT_FALSE(moeOverlayProposalOwnsProgressDeadline(
+            MoEOverlayMPIResidencyProposalPublisherState::Failed));
+        EXPECT_FALSE(moeOverlayProposalOwnsProgressDeadline(
+            MoEOverlayMPIResidencyProposalPublisherState::Stopped));
     }
 
     TEST(
@@ -796,6 +1147,14 @@ namespace llaminar2::test
         ASSERT_EQ((*old_ticket)->epoch, 1u);
 
         auto service = startService(authority, transport);
+        const auto initial_optimization = service->optimizationStatus();
+        EXPECT_EQ(
+            initial_optimization.authority,
+            MoEOptimizationAuthority::Host);
+        EXPECT_EQ(
+            initial_optimization.state,
+            MoEOptimizationLifecycleState::Active);
+        EXPECT_EQ(initial_optimization.published_movement_waves, 0u);
         service->notifyMaintenanceProgress();
         ASSERT_TRUE(waitUntil(
             [&]
@@ -810,6 +1169,11 @@ namespace llaminar2::test
         }
         EXPECT_EQ(authority->snapshot()->epoch, 1u);
         EXPECT_EQ(service->state(), MoEOverlayMaintenanceState::Staging);
+        const auto staging_optimization = service->optimizationStatus();
+        EXPECT_EQ(
+            staging_optimization.activity,
+            MoEOptimizationActivityState::MovingWeights);
+        EXPECT_FALSE(staging_optimization.quiescentBetweenWaves());
 
         transport->setStageReady(true);
         service->notifyMaintenanceProgress();
@@ -856,9 +1220,54 @@ namespace llaminar2::test
         EXPECT_TRUE(service->healthy()) << service->failureMessage();
         EXPECT_EQ(service->stats().committed_waves, 1u);
         EXPECT_EQ(authority->stats().committed_migrations, 4u);
+        const auto moved_optimization = service->optimizationStatus();
+        EXPECT_EQ(
+            moved_optimization.state,
+            MoEOptimizationLifecycleState::Active);
+        EXPECT_EQ(moved_optimization.published_movement_waves, 1u);
+        const auto authoritative_totals = authority->stats();
+        EXPECT_EQ(moved_optimization.completed_movement.transactions, 1u);
+        EXPECT_EQ(
+            moved_optimization.completed_movement.commands,
+            authoritative_totals.committed_migrations);
+        EXPECT_EQ(
+            moved_optimization.completed_movement.promotions,
+            authoritative_totals.promotions);
+        EXPECT_EQ(
+            moved_optimization.completed_movement.demotions,
+            authoritative_totals.demotions);
+        EXPECT_EQ(
+            moved_optimization.completed_movement.same_priority_moves,
+            authoritative_totals.same_priority_moves);
+        EXPECT_EQ(moved_optimization.completed_movement.physical_bytes, 0u)
+            << "The structural transport deliberately owns no byte payload";
+        const auto movement_ledger = authority->movementLedger();
+        ASSERT_TRUE(movement_ledger.complete());
+        EXPECT_EQ(
+            movement_ledger.edges.size(),
+            authoritative_totals.committed_migrations);
+        ASSERT_EQ(movement_ledger.economy.size(), 1u)
+            << "The host policy authority must retain one admitting proof per "
+               "committed Dynamic wave";
+        const auto &economy = movement_ledger.economy.front();
+        EXPECT_TRUE(economy.valid());
+        EXPECT_EQ(economy.authority, MoEOptimizationAuthority::Host);
+        EXPECT_EQ(economy.transaction, 2u);
+        EXPECT_EQ(economy.candidate_epoch, 2u);
+        EXPECT_EQ(economy.command_count, movement_ledger.edges.size());
+        EXPECT_GT(economy.cycle_count, 0u);
+
+        ASSERT_TRUE(waitUntil(
+            [&]
+            { return service->optimizationStatus().quiescentBetweenWaves(); }))
+            << "The worker never completed its post-publication demand poll";
+        EXPECT_EQ(
+            service->optimizationStatus().activity,
+            MoEOptimizationActivityState::CollectingDemand);
 
         new_ticket.reset();
-        service->stopAndDrain();
+        service->stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
         EXPECT_EQ(service->state(), MoEOverlayMaintenanceState::Stopped);
     }
 
@@ -904,7 +1313,70 @@ namespace llaminar2::test
         EXPECT_GE(service->stats().deferred_attempts, 2u);
         EXPECT_TRUE(service->healthy()) << service->failureMessage();
 
-        service->stopAndDrain();
+        service->stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        QueuedDemandCannotMasqueradeAsASettledBetweenWaveBoundary)
+    {
+        auto histogram = fullMovementHistogram();
+        auto authority = dynamicAuthority(histogram.get());
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setStageReady(true);
+        transport->setPrepareReady(true);
+        auto service = startService(authority, transport);
+
+        ASSERT_TRUE(waitUntil(
+            [&]
+            { return transport->observations().publication_begins == 1; }));
+
+        /* Queue a deliberately reversed hotness window while epoch two is
+         * waiting on its publication event. The next poll must consume this
+         * complete demand rather than briefly advertise an idle boundary. */
+        const std::vector<uint64_t> reversed_counts{2, 100, 3, 90, 1, 4};
+        histogram->mergeLayerCounts(
+            0,
+            reversed_counts.data(),
+            reversed_counts.size(),
+            false);
+        histogram->recordTokenBoundary(0, 4);
+        ASSERT_TRUE(histogram->windowFull());
+
+        /* Epoch two no longer needs staging. Hold epoch three at that event so
+         * the typed public state can be observed without a timing race. */
+        transport->setStageReady(false);
+        transport->setPublicationReady(true);
+        service->notifyMaintenanceProgress();
+        ASSERT_TRUE(waitUntil(
+            [&]
+            {
+                return authority->snapshot()->epoch == 2u &&
+                       transport->observations().begin_calls >= 2 &&
+                       service->state() ==
+                           MoEOverlayMaintenanceState::Staging;
+            }));
+
+        const auto queued = service->optimizationStatus();
+        EXPECT_EQ(
+            queued.activity,
+            MoEOptimizationActivityState::MovingWeights);
+        EXPECT_FALSE(queued.quiescentBetweenWaves())
+            << "A queued post-publication wave was exposed as a stable timing "
+               "cohort boundary";
+
+        transport->setStageReady(true);
+        service->notifyMaintenanceProgress();
+        ASSERT_TRUE(waitUntil(
+            [&]
+            { return authority->snapshot()->epoch == 3u; }));
+        ASSERT_TRUE(waitUntil(
+            [&]
+            { return service->stats().committed_waves == 2u; }));
+        EXPECT_TRUE(service->healthy()) << service->failureMessage();
+        service->stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
     }
 
     TEST(
@@ -949,7 +1421,8 @@ namespace llaminar2::test
         EXPECT_EQ(service->stats().committed_waves, 1u);
         EXPECT_TRUE(service->healthy()) << service->failureMessage();
 
-        service->stopAndDrain();
+        service->stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
     }
 
     TEST(
@@ -963,7 +1436,7 @@ namespace llaminar2::test
         transport->setPrepareReady(true);
         transport->setPublicationReady(true);
         auto publisher =
-            std::make_shared<ImmediateHistogramPublisher>(true);
+            std::make_shared<ImmediateProposalPublisher>(true);
         auto service = startService(authority, transport, publisher);
 
         ASSERT_TRUE(waitUntil(
@@ -972,18 +1445,20 @@ namespace llaminar2::test
         ASSERT_TRUE(waitUntil(
             [&]
             { return service->stats().committed_waves == 1u; }));
-        ASSERT_NE(publisher->publishedWindow(), nullptr);
+        ASSERT_NE(publisher->publishedProposal(), nullptr);
         EXPECT_EQ(publisher->publicationBegins(), 1);
         EXPECT_EQ(publisher->publicationCompletions(), 1);
         EXPECT_EQ(
-            publisher->publishedWindow()->expert_counts,
+            publisher->publishedProposal()
+                ->plan.histogram_window->expert_counts,
             (std::vector<std::uint64_t>{90, 20, 80, 10, 100, 70}));
-        EXPECT_EQ(service->stats().histogram_windows_published, 1u);
-        EXPECT_EQ(service->stats().histogram_windows_received, 0u);
+        EXPECT_EQ(service->stats().proposals_published, 1u);
+        EXPECT_EQ(service->stats().proposals_received, 0u);
         EXPECT_EQ(authority->stats().checks, 1u);
         EXPECT_TRUE(service->healthy()) << service->failureMessage();
 
-        service->stopAndDrain();
+        service->stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
         publisher->stopAndDrain();
     }
 
@@ -998,7 +1473,7 @@ namespace llaminar2::test
         transport->setPrepareReady(true);
         transport->setPublicationReady(true);
         auto publisher =
-            std::make_shared<ImmediateHistogramPublisher>(true);
+            std::make_shared<ImmediateProposalPublisher>(true);
         publisher->setPublicationReady(false);
         auto service = startService(authority, transport, publisher);
 
@@ -1019,7 +1494,8 @@ namespace llaminar2::test
         std::jthread drain_thread(
             [&]
             {
-                service->stopAndDrain();
+                service->stopAndDrain(
+                    MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
                 drain_returned.store(true, std::memory_order_release);
             });
         ASSERT_TRUE(waitUntil(
@@ -1048,10 +1524,109 @@ namespace llaminar2::test
         DistributedPeerIgnoresPartialLocalHistogramAndRearmsImmediately)
     {
         auto histogram = fullMovementHistogram();
-        auto published_window =
-            std::make_shared<const DecodeExpertHistogramWindow>(
-                histogram->freezeAndRotateWindow());
-        ASSERT_TRUE(published_window->valid());
+        auto coordinator_histogram = fullMovementHistogram();
+        auto coordinator_authority =
+            dynamicAuthority(coordinator_histogram.get());
+        const auto published_window =
+            coordinator_authority->freezeAndRotateHistogramWindow();
+        const auto root_transaction =
+            coordinator_authority->proposeFromFrozenHistogramWindow(
+                published_window);
+        auto published_proposal = std::make_shared<
+            const MoEOverlayDistributedResidencyProposal>(
+            makeMoEOverlayDistributedResidencyProposal(
+                coordinator_authority->exportAuthoritativeResidencyPlan(
+                    root_transaction),
+                root_transaction));
+        ASSERT_TRUE(published_proposal->valid());
+
+        /*
+         * Adoption is an executable-identity operation, not a second policy
+         * decision.  Prove the proposal alone reconstructs the root's exact
+         * transaction before exercising the asynchronous service lifecycle;
+         * otherwise a lifecycle timeout would hide which canonical field the
+         * wire plan failed to carry.
+         */
+        auto reconstruction_histogram = fullMovementHistogram();
+        auto reconstruction_authority =
+            dynamicAuthority(reconstruction_histogram.get());
+        const auto reconstructed_transaction =
+            reconstruction_authority->adoptAuthoritativeResidencyPlan(
+                published_proposal->plan);
+        EXPECT_EQ(
+            root_transaction.previous->layered_ownership,
+            reconstructed_transaction.previous->layered_ownership);
+        EXPECT_EQ(
+            root_transaction.candidate->layered_ownership,
+            reconstructed_transaction.candidate->layered_ownership);
+        ASSERT_EQ(
+            root_transaction.candidate->placement_plan->routed_tiers.size(),
+            reconstructed_transaction.candidate->placement_plan->routed_tiers
+                .size());
+        for (size_t tier_idx = 0;
+             tier_idx <
+             root_transaction.candidate->placement_plan->routed_tiers.size();
+             ++tier_idx)
+        {
+            const auto &root_tier =
+                root_transaction.candidate->placement_plan->routed_tiers[
+                    tier_idx];
+            const auto &reconstructed_tier = reconstructed_transaction
+                                                 .candidate->placement_plan
+                                                 ->routed_tiers[tier_idx];
+            EXPECT_EQ(root_tier.name, reconstructed_tier.name);
+            EXPECT_EQ(root_tier.domain, reconstructed_tier.domain);
+            EXPECT_EQ(root_tier.priority, reconstructed_tier.priority);
+            EXPECT_EQ(
+                root_tier.max_experts_per_layer,
+                reconstructed_tier.max_experts_per_layer);
+            EXPECT_EQ(
+                root_tier.memory_budget_bytes,
+                reconstructed_tier.memory_budget_bytes);
+            EXPECT_EQ(root_tier.fallback, reconstructed_tier.fallback);
+            EXPECT_EQ(
+                root_tier.resolved_live_experts_per_layer,
+                reconstructed_tier.resolved_live_experts_per_layer);
+        }
+        ASSERT_EQ(
+            root_transaction.candidate->owner_map.owners().size(),
+            reconstructed_transaction.candidate->owner_map.owners().size());
+        for (size_t owner_idx = 0;
+             owner_idx < root_transaction.candidate->owner_map.owners().size();
+             ++owner_idx)
+        {
+            const auto &root_owner =
+                root_transaction.candidate->owner_map.owners()[owner_idx];
+            const auto &reconstructed_owner =
+                reconstructed_transaction.candidate->owner_map.owners()[
+                    owner_idx];
+            EXPECT_EQ(root_owner.layer_idx, reconstructed_owner.layer_idx);
+            EXPECT_EQ(root_owner.expert_id, reconstructed_owner.expert_id);
+            EXPECT_EQ(root_owner.tier_idx, reconstructed_owner.tier_idx);
+            EXPECT_EQ(
+                root_owner.owner_participant,
+                reconstructed_owner.owner_participant);
+            EXPECT_EQ(root_owner.device, reconstructed_owner.device);
+            EXPECT_EQ(root_owner.resident, reconstructed_owner.resident);
+            EXPECT_EQ(root_owner.tier_name, reconstructed_owner.tier_name);
+            EXPECT_EQ(root_owner.domain_name, reconstructed_owner.domain_name);
+            EXPECT_EQ(
+                root_owner.domain_participant_index,
+                reconstructed_owner.domain_participant_index);
+            EXPECT_EQ(
+                root_owner.owner_world_rank,
+                reconstructed_owner.owner_world_rank);
+            EXPECT_EQ(
+                root_owner.owner_world_rank_known,
+                reconstructed_owner.owner_world_rank_known);
+            EXPECT_EQ(root_owner.address, reconstructed_owner.address);
+        }
+        EXPECT_EQ(
+            fingerprintMoEOverlayResidencyExecutionPlan(root_transaction),
+            fingerprintMoEOverlayResidencyExecutionPlan(
+                reconstructed_transaction));
+
+        (void)histogram->freezeAndRotateWindow();
         ASSERT_FALSE(histogram->windowFull());
 
         auto authority = dynamicAuthority(histogram.get());
@@ -1059,9 +1634,9 @@ namespace llaminar2::test
         transport->setStageReady(true);
         transport->setPrepareReady(true);
         transport->setPublicationReady(true);
-        auto publisher = std::make_shared<ImmediateHistogramPublisher>(
+        auto publisher = std::make_shared<ImmediateProposalPublisher>(
             false,
-            published_window);
+            published_proposal);
         auto service = startService(authority, transport, publisher);
 
         ASSERT_TRUE(waitUntil(
@@ -1072,17 +1647,18 @@ namespace llaminar2::test
             { return service->stats().committed_waves == 1u; }));
         EXPECT_EQ(publisher->deliveries(), 1);
         EXPECT_EQ(publisher->receiveRearms(), 1);
-        EXPECT_EQ(service->stats().histogram_windows_received, 1u);
-        EXPECT_EQ(service->stats().histogram_receives_rearmed, 1u);
+        EXPECT_EQ(service->stats().proposals_received, 1u);
+        EXPECT_EQ(service->stats().proposal_receives_rearmed, 1u);
         EXPECT_FALSE(histogram->windowFull())
             << "A peer must not rotate or substitute its partial local evidence";
         EXPECT_EQ(
             histogram->windowGeneration(),
-            published_window->generation + 1);
+            1u);
         EXPECT_EQ(authority->stats().checks, 1u);
         EXPECT_TRUE(service->healthy()) << service->failureMessage();
 
-        service->stopAndDrain();
+        service->stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
         publisher->stopAndDrain();
     }
 
@@ -1111,8 +1687,16 @@ namespace llaminar2::test
         EXPECT_EQ(authority->stats().committed_migrations, 0u);
         EXPECT_EQ(service->stats().proposals, 1u);
         EXPECT_TRUE(service->healthy()) << service->failureMessage();
+        const auto optimization = service->optimizationStatus();
+        EXPECT_EQ(
+            optimization.state,
+            MoEOptimizationLifecycleState::MovementDisabled);
+        EXPECT_EQ(optimization.published_movement_waves, 0u);
+        EXPECT_EQ(optimization.completed_movement.transactions, 0u);
+        EXPECT_EQ(optimization.completed_movement.commands, 0u);
 
-        service->stopAndDrain();
+        service->stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
     }
 
     TEST(
@@ -1144,8 +1728,14 @@ namespace llaminar2::test
             << "A fatal transport result must clear retry intent before the "
                "worker publishes its Failed state";
         EXPECT_EQ(transport->observations().waves_started, 0);
+        const auto optimization = service->optimizationStatus();
+        EXPECT_EQ(
+            optimization.state,
+            MoEOptimizationLifecycleState::Failed);
+        EXPECT_FALSE(optimization.diagnostic.empty());
 
-        service->stopAndDrain();
+        service->stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
     }
 
 } // namespace llaminar2::test

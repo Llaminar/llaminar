@@ -78,7 +78,7 @@ namespace llaminar2
     inline constexpr std::uint32_t kMoEOverlayActivationMagic = 0x41454f4du;
 
     /** Current binary layout and semantic-contract version. */
-    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 4u;
+    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 5u;
 
     /** Device endpoint participating in one sparse activation round trip. */
     enum class MoEOverlayActivationEndpoint : std::uint32_t
@@ -198,11 +198,14 @@ namespace llaminar2
      * which makes admission visibility explicit even when distinct device APIs
      * register different virtual mappings of the same node-local pages. A
      * watchdog failure is terminal and intentionally prevents reset.
+     * `timeout_not_before_ns` is only the earliest legal terminal watchdog
+     * observation. It is not a wall-clock budget for the complete transaction,
+     * which contains one independently bounded rendezvous per routed layer.
      */
     struct alignas(64) MoEOverlayActivationAdmissionControl
     {
         std::uint64_t last_generation = 0u;
-        std::uint64_t deadline_ns = 0u;
+        std::uint64_t timeout_not_before_ns = 0u;
         std::uint64_t observed_timeout_ns = 0u;
         MoEOverlayActivationDigest digest{};
         std::uint32_t state = static_cast<std::uint32_t>(

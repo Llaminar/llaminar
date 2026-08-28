@@ -2,11 +2,12 @@
  * @file MappedTransferProgressEpoch.cpp
  * @brief Event-polled asynchronous DMA implementation for expert movement.
  *
- * Setup owns one registered mapped-host region, background stream, and event
- * per permanent topology slot. Maintenance release-publishes a bounded device
- * region, the exact GPU worker enqueues a TransferEngine DMA, and a later
- * non-blocking event query release-publishes host completion. Inference graphs
- * never capture, launch, join, or wait for this maintenance scheduler.
+ * Setup owns permanent topology command identities and a separately bounded
+ * pool of background stream/event execution lanes. Maintenance
+ * release-publishes a bounded device region, the exact GPU worker assigns it to
+ * a free lane and enqueues a TransferEngine DMA, and a later non-blocking event
+ * query release-publishes host completion. Inference graphs never capture,
+ * launch, join, or wait for this maintenance scheduler.
  */
 
 #include "MappedTransferProgressEpoch.h"
@@ -233,10 +234,12 @@ namespace llaminar2
         : config_(std::move(config))
     {
         if (!config_.device.is_gpu() || config_.slot_capacity == 0u ||
+            config_.execution_lane_capacity == 0u ||
+            config_.execution_lane_capacity > config_.slot_capacity ||
             config_.maximum_bytes == 0u || config_.name.empty())
         {
             throw std::invalid_argument(
-                "Mapped transfer-progress epoch requires one GPU, positive geometry, and a stable name");
+                "Mapped transfer-progress epoch requires one GPU, positive command and execution-lane geometry, execution lanes no greater than command slots, and a stable name");
         }
         if (config_.perf_device.empty())
             config_.perf_device = config_.device.toString();
@@ -260,21 +263,42 @@ namespace llaminar2
                 context_->submitAndWait(
                     [this]
                     {
-                        for (SlotRuntime &runtime : slot_runtimes_)
+                        for (const SlotRuntime &runtime : slot_runtimes_)
                         {
-                            if (runtime.in_flight)
+                            if (runtime.lifecycle == SlotLifecycle::InFlight)
                             {
                                 LOG_ERROR(
                                     "[MappedTransferProgressEpoch] Teardown reached a live DMA on "
                                     << config_.device.toString());
                                 std::terminate();
                             }
-                            if (runtime.terminal_event)
+                            if (runtime.lifecycle != SlotLifecycle::Unreserved &&
+                                runtime.lifecycle != SlotLifecycle::Idle)
                             {
-                                context_->destroyEvent(runtime.terminal_event);
-                                runtime.terminal_event = nullptr;
+                                LOG_ERROR(
+                                    "[MappedTransferProgressEpoch] Teardown reached an unretired command slot on "
+                                    << config_.device.toString());
+                                std::terminate();
                             }
-                            runtime.stream = nullptr;
+                        }
+                        for (ExecutionLaneRuntime &lane : execution_lanes_)
+                        {
+                            if (lane.busy())
+                            {
+                                LOG_ERROR(
+                                    "[MappedTransferProgressEpoch] Teardown reached a leased execution lane on "
+                                    << config_.device.toString());
+                                std::terminate();
+                            }
+                            if (lane.terminal_event)
+                            {
+                                context_->destroyEvent(lane.terminal_event);
+                                lane.terminal_event = nullptr;
+                            }
+                            /* Named auxiliary streams belong to the worker
+                             * context and may be reused by the next model
+                             * instance; this epoch owns only their identity. */
+                            lane.stream = nullptr;
                         }
                     });
             }
@@ -303,23 +327,25 @@ namespace llaminar2
             config_.slot_capacity);
         slot_runtimes_.resize(config_.slot_capacity);
         slot_labels_.resize(config_.slot_capacity);
+        execution_lanes_.resize(config_.execution_lane_capacity);
 
         context_->submitAndWait(
             [this]
             {
                 for (std::size_t index = 0u;
-                     index < config_.slot_capacity; ++index)
+                     index < config_.execution_lane_capacity; ++index)
                 {
-                    SlotRuntime &runtime = slot_runtimes_[index];
-                    runtime.stream = context_->getOrCreateAuxiliaryStream(
-                        "mapped_transfer_progress:" + config_.name + ":" +
+                    ExecutionLaneRuntime &lane = execution_lanes_[index];
+                    lane.stream = context_->getOrCreateAuxiliaryStream(
+                        "mapped_transfer_progress:" + config_.name +
+                            ":execution_lane:" +
                             std::to_string(index),
                         GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance);
-                    runtime.terminal_event = context_->createEvent();
-                    if (!runtime.stream || !runtime.terminal_event)
+                    lane.terminal_event = context_->createEvent();
+                    if (!lane.stream || !lane.terminal_event)
                     {
                         throw std::runtime_error(
-                            "Mapped transfer-progress epoch could not allocate a background stream and event per permanent slot");
+                            "Mapped transfer-progress epoch could not materialize its bounded background execution-lane pool");
                     }
                 }
             });
@@ -332,6 +358,8 @@ namespace llaminar2
             config_.perf_device,
             {{"device", config_.device.toString()},
              {"slot_capacity", std::to_string(config_.slot_capacity)},
+             {"execution_lane_capacity",
+              std::to_string(config_.execution_lane_capacity)},
              {"maximum_bytes", std::to_string(config_.maximum_bytes)},
              {"stream_class", "background_maintenance"},
              {"copy_mechanism", "async_dma"},
@@ -361,12 +389,13 @@ namespace llaminar2
             diagnostic_label = "slot_" + std::to_string(index);
 
         SlotRuntime &runtime = slot_runtimes_[index];
-        if (runtime.reserved || !runtime.stream || !runtime.terminal_event)
+        if (runtime.lifecycle != SlotLifecycle::Unreserved ||
+            runtime.mapped_region)
             throw std::logic_error(
                 "Mapped transfer-progress slot runtime lost setup identity");
         runtime.direction = direction;
         runtime.mapped_region = std::move(mapped_region);
-        runtime.reserved = true;
+        runtime.lifecycle = SlotLifecycle::Idle;
         slot_labels_[index] = std::move(diagnostic_label);
         return MappedTransferProgressSlot(shared_from_this(), index);
     }
@@ -450,8 +479,8 @@ namespace llaminar2
         std::size_t device_offset,
         std::size_t bytes)
     {
-        if (index >= reserved_slots_ || generation == 0u || !device_region ||
-            bytes == 0u || bytes > config_.maximum_bytes ||
+        if (generation == 0u || !device_region || bytes == 0u ||
+            bytes > config_.maximum_bytes ||
             device_offset > device_capacity ||
             bytes > device_capacity - device_offset)
         {
@@ -459,57 +488,77 @@ namespace llaminar2
                 "Mapped transfer-progress command has invalid slot, device bounds, generation, or bytes");
         }
 
-        const SlotRuntime &runtime = slot_runtimes_[index];
-        if (!runtime.reserved || runtime.direction != direction ||
-            !runtime.mapped_region)
+        std::size_t previous_outstanding = 0u;
         {
-            throw std::logic_error(
-                "Mapped transfer-progress publication contradicts its permanent slot direction");
+            /* Publication and device-worker lane assignment share this lock.
+             * The immutable command cache line is still release-published so
+             * observation remains correct if submission later moves to a
+             * retained device-side dispatcher. */
+            std::lock_guard<std::mutex> lock(reservation_mutex_);
+            if (index >= reserved_slots_)
+                throw std::invalid_argument(
+                    "Mapped transfer-progress command names an unreserved slot");
+
+            SlotRuntime &runtime = slot_runtimes_[index];
+            if (runtime.lifecycle != SlotLifecycle::Idle ||
+                runtime.direction != direction || !runtime.mapped_region)
+            {
+                throw std::logic_error(
+                    "Mapped transfer-progress publication contradicts its permanent slot direction or lifecycle");
+            }
+
+            MappedTransferProgressCommand &entry = command(index);
+            const std::uint64_t completed =
+                std::atomic_ref<std::uint64_t>(
+                    completion(index).completed_generation)
+                    .load(std::memory_order_acquire);
+            const std::uint64_t prior_generation =
+                std::atomic_ref<std::uint64_t>(entry.generation)
+                    .load(std::memory_order_acquire);
+            if (completed != prior_generation)
+                throw std::logic_error(
+                    "Mapped transfer-progress slot publication raced an unobserved generation");
+
+            const auto *const device_bytes =
+                static_cast<const unsigned char *>(device_region) +
+                device_offset;
+            const std::uint64_t device_address = static_cast<std::uint64_t>(
+                reinterpret_cast<std::uintptr_t>(device_bytes));
+            const std::uint64_t host_address = static_cast<std::uint64_t>(
+                reinterpret_cast<std::uintptr_t>(
+                    runtime.mapped_region->mutableHostData()));
+            const std::uint64_t source_address =
+                direction == MappedTransferDirection::DeviceToHost
+                    ? device_address
+                    : host_address;
+            const std::uint64_t destination_address =
+                direction == MappedTransferDirection::DeviceToHost
+                    ? host_address
+                    : device_address;
+            const std::uint64_t byte_count =
+                static_cast<std::uint64_t>(bytes);
+
+            /* Publish generation last. The release/acquire pair keeps the
+             * command body coherent until a free execution lane claims it. */
+            entry.generation_magic =
+                mappedTransferProgressGenerationMagic(generation);
+            entry.generation_version =
+                mappedTransferProgressGenerationVersion(generation);
+            entry.source_address = source_address;
+            entry.destination_address = destination_address;
+            entry.bytes = byte_count;
+            entry.source_complement = ~source_address;
+            entry.destination_complement = ~destination_address;
+            entry.bytes_complement = ~byte_count;
+            std::atomic_ref<std::uint64_t>(entry.generation).store(
+                generation, std::memory_order_release);
+
+            runtime.launched_generation = 0u;
+            runtime.execution_lane_index = static_cast<std::size_t>(-1);
+            runtime.lifecycle = SlotLifecycle::Published;
+            previous_outstanding = outstanding_commands_.fetch_add(
+                1u, std::memory_order_acq_rel);
         }
-
-        MappedTransferProgressCommand &entry = command(index);
-        const std::uint64_t completed =
-            std::atomic_ref<std::uint64_t>(
-                completion(index).completed_generation)
-                .load(std::memory_order_acquire);
-        if (completed != entry.generation || runtime.in_flight)
-            throw std::logic_error(
-                "Mapped transfer-progress slot publication raced an unobserved generation");
-
-        const auto *const device_bytes =
-            static_cast<const unsigned char *>(device_region) + device_offset;
-        const std::uint64_t device_address = static_cast<std::uint64_t>(
-            reinterpret_cast<std::uintptr_t>(device_bytes));
-        const std::uint64_t host_address = static_cast<std::uint64_t>(
-            reinterpret_cast<std::uintptr_t>(
-                runtime.mapped_region->mutableHostData()));
-        const std::uint64_t source_address =
-            direction == MappedTransferDirection::DeviceToHost
-                ? device_address
-                : host_address;
-        const std::uint64_t destination_address =
-            direction == MappedTransferDirection::DeviceToHost
-                ? host_address
-                : device_address;
-        const std::uint64_t byte_count = static_cast<std::uint64_t>(bytes);
-
-        /* Publish generation last. The release/acquire pair keeps a future
-         * independently queued maintenance submission safe without a shadow. */
-        entry.generation_magic =
-            mappedTransferProgressGenerationMagic(generation);
-        entry.generation_version =
-            mappedTransferProgressGenerationVersion(generation);
-        entry.source_address = source_address;
-        entry.destination_address = destination_address;
-        entry.bytes = byte_count;
-        entry.source_complement = ~source_address;
-        entry.destination_complement = ~destination_address;
-        entry.bytes_complement = ~byte_count;
-        std::atomic_ref<std::uint64_t>(entry.generation).store(
-            generation, std::memory_order_release);
-
-        const std::size_t previous_outstanding =
-            outstanding_commands_.fetch_add(1u, std::memory_order_acq_rel);
         if (previous_outstanding == 0u)
         {
             active_batch_started_ns_.store(
@@ -533,12 +582,24 @@ namespace llaminar2
         std::size_t expected_bytes,
         std::string *error) noexcept
     {
-        if (index >= reserved_slots_ || generation == 0u)
+        if (generation == 0u)
         {
             if (error)
                 *error =
                     "Mapped transfer-progress completion identity is invalid";
             return MappedTransferProgress::Failed;
+        }
+        {
+            std::lock_guard<std::mutex> lock(reservation_mutex_);
+            if (index >= reserved_slots_ ||
+                slot_runtimes_[index].lifecycle ==
+                    SlotLifecycle::Unreserved)
+            {
+                if (error)
+                    *error =
+                        "Mapped transfer-progress completion names an unreserved slot";
+                return MappedTransferProgress::Failed;
+            }
         }
         MappedTransferProgressCompletion &result = completion(index);
         const std::uint64_t completed =
@@ -559,6 +620,7 @@ namespace llaminar2
                     last, now, std::memory_order_acq_rel,
                     std::memory_order_acquire))
             {
+                std::lock_guard<std::mutex> lock(reservation_mutex_);
                 const SlotRuntime &runtime = slot_runtimes_[index];
                 LOG_WARN(
                     "[MappedTransferProgressEpoch] DMA command remains pending"
@@ -570,7 +632,10 @@ namespace llaminar2
                     << " requested_generation=" << generation
                     << " completed_generation=" << completed
                     << " bytes=" << command(index).bytes
-                    << " in_flight=" << runtime.in_flight
+                    << " lifecycle="
+                    << static_cast<unsigned>(runtime.lifecycle)
+                    << " execution_lane="
+                    << runtime.execution_lane_index
                     << " outstanding="
                     << outstanding_commands_.load(std::memory_order_acquire)
                     << " published="
@@ -583,7 +648,23 @@ namespace llaminar2
             return MappedTransferProgress::Pending;
         }
 
-        const auto finish = [this]()
+        bool lifecycle_valid = false;
+        {
+            /* The completion generation is release-published before the worker
+             * releases this lock. Acquiring the same lock therefore observes
+             * the matching typed state transition as one indivisible fact. */
+            std::lock_guard<std::mutex> lock(reservation_mutex_);
+            SlotRuntime &runtime = slot_runtimes_[index];
+            lifecycle_valid =
+                runtime.lifecycle == SlotLifecycle::CompletionPublished &&
+                runtime.launched_generation == completed &&
+                runtime.execution_lane_index ==
+                    static_cast<std::size_t>(-1);
+            runtime.lifecycle = SlotLifecycle::Idle;
+            runtime.launched_generation = 0u;
+        }
+
+        const auto finish = [this]() noexcept
         {
             const std::size_t previous = outstanding_commands_.fetch_sub(
                 1u, std::memory_order_acq_rel);
@@ -591,7 +672,7 @@ namespace llaminar2
                 std::terminate();
             return previous == 1u;
         };
-        if (completed != generation)
+        if (!lifecycle_valid || completed != generation)
         {
             const bool batch_drained = finish();
             if (batch_drained)
@@ -599,8 +680,11 @@ namespace llaminar2
                     0u, std::memory_order_release);
             command_failures_.fetch_add(1u, std::memory_order_relaxed);
             if (error)
-                *error =
-                    "Mapped transfer-progress completion skipped the requested generation";
+            {
+                *error = !lifecycle_valid
+                             ? "Mapped transfer-progress completion contradicted the typed slot lifecycle"
+                             : "Mapped transfer-progress completion skipped the requested generation";
+            }
             return MappedTransferProgress::Failed;
         }
 
@@ -736,22 +820,56 @@ namespace llaminar2
         TransferEngine transfer_engine;
         const auto begin = std::chrono::steady_clock::now();
 
+        constexpr std::size_t no_index = static_cast<std::size_t>(-1);
         std::lock_guard<std::mutex> lock(reservation_mutex_);
-        for (std::size_t index = 0u; index < reserved_slots_; ++index)
+
+        /* Completion belongs to the execution lane, not the permanent command
+         * slot. Query every busy lane once, then publish the matching slot's
+         * completion before making that lane available to another command. */
+        for (std::size_t lane_index = 0u;
+             lane_index < execution_lanes_.size(); ++lane_index)
         {
-            SlotRuntime &runtime = slot_runtimes_[index];
-            if (!runtime.in_flight)
+            ExecutionLaneRuntime &lane = execution_lanes_[lane_index];
+            if (!lane.busy())
                 continue;
 
             observed_work = true;
+            if (lane.active_slot >= reserved_slots_)
+            {
+                LOG_ERROR(
+                    "[MappedTransferProgressEpoch] Execution lane owns an invalid command slot"
+                    << " device=" << config_.device.toString()
+                    << " lane=" << lane_index
+                    << " slot=" << lane.active_slot);
+                all_ok = false;
+                continue;
+            }
+            const std::size_t slot_index = lane.active_slot;
+            SlotRuntime &runtime = slot_runtimes_[slot_index];
+            if (runtime.lifecycle != SlotLifecycle::InFlight ||
+                runtime.execution_lane_index != lane_index)
+            {
+                LOG_ERROR(
+                    "[MappedTransferProgressEpoch] Execution lane and command slot disagree on ownership"
+                    << " device=" << config_.device.toString()
+                    << " lane=" << lane_index
+                    << " slot=" << slot_index
+                    << " slot_lane=" << runtime.execution_lane_index
+                    << " lifecycle="
+                    << static_cast<unsigned>(runtime.lifecycle));
+                all_ok = false;
+                continue;
+            }
+
             bool ready = false;
-            if (!context_->queryEventChecked(runtime.terminal_event, ready))
+            if (!context_->queryEventChecked(lane.terminal_event, ready))
             {
                 LOG_ERROR(
                     "[MappedTransferProgressEpoch] DMA event query failed"
                     << " device=" << config_.device.toString()
-                    << " slot=" << index
-                    << " label=" << slot_labels_[index]);
+                    << " lane=" << lane_index
+                    << " slot=" << slot_index
+                    << " label=" << slot_labels_[slot_index]);
                 all_ok = false;
                 continue;
             }
@@ -762,19 +880,22 @@ namespace llaminar2
                 continue;
             }
 
-            MappedTransferProgressCompletion &result = completion(index);
-            result.completed_bytes = command(index).bytes;
+            MappedTransferProgressCompletion &result = completion(slot_index);
+            result.completed_bytes = command(slot_index).bytes;
             result.error = static_cast<std::uint32_t>(
                 MappedTransferProgressError::None);
             std::atomic_ref<std::uint64_t>(result.completed_generation)
                 .store(runtime.launched_generation, std::memory_order_release);
-            runtime.in_flight = false;
+            runtime.execution_lane_index = no_index;
+            runtime.lifecycle = SlotLifecycle::CompletionPublished;
+            lane.active_slot = no_index;
         }
 
+        std::size_t free_lane_cursor = 0u;
         for (std::size_t index = 0u; index < reserved_slots_; ++index)
         {
             SlotRuntime &runtime = slot_runtimes_[index];
-            if (runtime.in_flight)
+            if (runtime.lifecycle != SlotLifecycle::Published)
                 continue;
 
             MappedTransferProgressCommand &entry = command(index);
@@ -785,11 +906,9 @@ namespace llaminar2
                 std::atomic_ref<std::uint64_t>(
                     completion(index).completed_generation)
                     .load(std::memory_order_acquire);
-            if (generation == 0u || generation <= completed)
-                continue;
-
             observed_work = true;
-            if (!runtime.reserved || !runtime.mapped_region ||
+            if (generation == 0u || generation <= completed ||
+                !runtime.mapped_region ||
                 !commandIdentityIsValid(
                     entry, generation, config_.maximum_bytes))
             {
@@ -800,11 +919,46 @@ namespace llaminar2
                 std::atomic_ref<std::uint64_t>(
                     result.completed_generation)
                     .store(generation, std::memory_order_release);
+                runtime.launched_generation = generation;
+                runtime.execution_lane_index = no_index;
+                runtime.lifecycle = SlotLifecycle::CompletionPublished;
                 command_failures_.fetch_add(1u, std::memory_order_relaxed);
                 all_ok = false;
                 continue;
             }
 
+            while (free_lane_cursor < execution_lanes_.size() &&
+                   execution_lanes_[free_lane_cursor].busy())
+            {
+                ++free_lane_cursor;
+            }
+            if (free_lane_cursor == execution_lanes_.size())
+            {
+                /* A queued command is normal bounded backpressure. Its slot and
+                 * mapped bytes remain immutable until a later progress pass
+                 * observes a free physical execution lane. */
+                break;
+            }
+
+            const std::size_t lane_index = free_lane_cursor++;
+            ExecutionLaneRuntime &lane = execution_lanes_[lane_index];
+            if (!lane.stream || !lane.terminal_event || lane.busy())
+            {
+                LOG_ERROR(
+                    "[MappedTransferProgressEpoch] Free execution lane lost its setup identity"
+                    << " device=" << config_.device.toString()
+                    << " lane=" << lane_index);
+                all_ok = false;
+                break;
+            }
+
+            /* Claim ownership before invoking backend code. If an enqueue or
+             * event record fails after partially submitting work, the lane
+             * remains non-reusable and teardown fails rather than guessing. */
+            runtime.launched_generation = generation;
+            runtime.execution_lane_index = lane_index;
+            runtime.lifecycle = SlotLifecycle::InFlight;
+            lane.active_slot = index;
             try
             {
                 const std::size_t bytes =
@@ -816,7 +970,7 @@ namespace llaminar2
                         reinterpret_cast<const void *>(
                             static_cast<std::uintptr_t>(entry.source_address)),
                         bytes, 0u, *runtime.mapped_region, 0u, bytes,
-                        config_.device, runtime.stream);
+                        config_.device, lane.stream);
                 }
                 else
                 {
@@ -825,16 +979,14 @@ namespace llaminar2
                         reinterpret_cast<void *>(
                             static_cast<std::uintptr_t>(
                                 entry.destination_address)),
-                        bytes, 0u, bytes, config_.device, runtime.stream);
+                        bytes, 0u, bytes, config_.device, lane.stream);
                 }
                 if (!context_->recordEventChecked(
-                        runtime.terminal_event, runtime.stream))
+                        lane.terminal_event, lane.stream))
                 {
                     throw std::runtime_error(
                         "could not record the exact DMA completion event");
                 }
-                runtime.launched_generation = generation;
-                runtime.in_flight = true;
                 ++submissions;
             }
             catch (const std::exception &exception)
@@ -871,6 +1023,8 @@ namespace llaminar2
                 "maintenance",
                 config_.perf_device,
                 {{"device", config_.device.toString()},
+                 {"execution_lane_capacity",
+                  std::to_string(config_.execution_lane_capacity)},
                  {"stream_class", "background_maintenance"},
                  {"copy_mechanism", "async_dma"},
                  {"inference_wait", "false"},

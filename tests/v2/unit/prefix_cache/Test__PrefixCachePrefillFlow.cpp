@@ -172,9 +172,13 @@ namespace
             return populate_ok;
         }
 
-        bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override
+        bool harvestPrefix(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            int prompt_token_count) override
         {
             ++harvest_calls;
+            harvested_fingerprint = admission.fingerprint_key;
             harvested_tokens = tokens;
             harvested_prompt_token_count = prompt_token_count;
             return true;
@@ -472,6 +476,7 @@ namespace
         int last_mtp_condition_token = -1;
         int restored_tokens = 0;
         int harvested_prompt_token_count = 0;
+        uint64_t harvested_fingerprint = 0;
         int position = 0;
         int shifted_mtp_rows = 0;
         int last_commit_already_appended = 0;
@@ -995,7 +1000,7 @@ TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixUsesChunkScheduleWhenRunnerSu
 }
 
 TEST(Test__PrefixCachePrefillFlow,
-     NativeCapturedOneTokenPrefixSuffixUsesRetainedGraphSchedule)
+     NativeCapturedOneTokenPrefixSuffixUsesSerialDecodeTransaction)
 {
     ScopedPrefillChunkScheduleEnv env;
     auto mock = std::make_unique<PrefixFlowMockRunner>();
@@ -1011,20 +1016,20 @@ TEST(Test__PrefixCachePrefillFlow,
     auto runner = makeRunner(std::move(mock));
     ASSERT_TRUE(runner->prefill({1, 2, 3})) << runner->lastError();
 
-    EXPECT_EQ(mock_ptr->forward_calls, 0);
-    EXPECT_EQ(mock_ptr->chunk_schedule_calls, 1);
-    EXPECT_THAT(mock_ptr->last_chunk_schedule_tokens, ElementsAre(3));
-    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.real_token_start, 2);
-    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.real_token_count, 1);
-    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.fixed_chunk_real_tokens, 0);
-    EXPECT_THAT(mock_ptr->last_chunk_schedule_policy.bucket_sizes, ElementsAre(2));
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3));
+    EXPECT_EQ(mock_ptr->restored_prefix_bridge_calls, 0)
+        << "Non-MTP restoration owns only main-model state and must not enter the MTP bridge.";
+    EXPECT_EQ(mock_ptr->chunk_schedule_calls, 0)
+        << "A one-row restored suffix is mathematically decode and must not acquire padded prefill arithmetic.";
+    EXPECT_EQ(mock_ptr->position, 3);
 
     const auto probe = runner->prefixStateProbe();
-    EXPECT_EQ(probe.prefill_chunk_schedules, 1u);
-    EXPECT_EQ(probe.prefill_chunk_successful_schedules, 1u);
-    EXPECT_EQ(probe.prefill_chunks, 1u);
-    EXPECT_EQ(probe.prefill_chunk_real_tokens, 1u);
-    EXPECT_EQ(probe.prefill_chunk_padded_tokens, 1u);
+    EXPECT_EQ(probe.prefill_chunk_schedules, 0u);
+    EXPECT_EQ(probe.prefill_chunk_successful_schedules, 0u);
+    EXPECT_EQ(probe.prefill_chunks, 0u);
+    EXPECT_EQ(probe.prefill_chunk_real_tokens, 0u);
+    EXPECT_EQ(probe.prefill_chunk_padded_tokens, 0u);
     EXPECT_EQ(probe.prefill_chunk_failures, 0u);
 }
 

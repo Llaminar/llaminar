@@ -65,6 +65,15 @@ static bool hasUnifiedRecord(
                        });
 }
 
+/** @brief Build a stable typed sparse edge for concise profiler tests. */
+static MoEOverlayProfileEdge profileEdge(int source, int target)
+{
+    return MoEOverlayProfileEdge{
+        .source_participant = source,
+        .target_participant = target,
+    };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests: gn_sparse_dispatch
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,9 +82,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_Pop
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
         /*layer=*/3,
         /*tier_index=*/0,
-        /*domain_key=*/"layer3/tier0/dispatch",
-        /*source_participant=*/0,
-        /*target_participant=*/1,
+        /*edge=*/profileEdge(0, 1),
         /*outbound_rows=*/16,
         /*outbound_entries=*/32,
         /*inbound_rows=*/12,
@@ -88,6 +95,9 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_Pop
     EXPECT_EQ(rows[0].phase, "gn_sparse_dispatch");
     EXPECT_EQ(rows[0].layer, 3);
     EXPECT_EQ(rows[0].tier_index, 0);
+    EXPECT_EQ(rows[0].source_participant, 0);
+    EXPECT_EQ(rows[0].target_participant, 1);
+    EXPECT_EQ(rows[0].domain, "p0->p1");
     EXPECT_EQ(rows[0].selected_rows, 16u);
     EXPECT_EQ(rows[0].inbound_rows, 12u);
     EXPECT_EQ(rows[0].routed_entries, 32u);
@@ -101,7 +111,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_Pop
 TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_DenseBytesAvoided_IsPositive)
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, 1, "key", 0, 0, 8, 16, 6, /*compact=*/1024, /*dense=*/4096, 0.0);
+        0, 1, profileEdge(0, 0), 8, 16, 6, /*compact=*/1024, /*dense=*/4096, 0.0);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     ASSERT_FALSE(rows.empty());
@@ -113,7 +123,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_Den
 {
     // compact >= dense — dense_bytes_avoided must be 0 (no underflow)
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, 1, "key", 0, 0, 8, 16, 6, /*compact=*/8192, /*dense=*/4096, 0.0);
+        0, 1, profileEdge(0, 0), 8, 16, 6, /*compact=*/8192, /*dense=*/4096, 0.0);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     ASSERT_FALSE(rows.empty());
@@ -123,13 +133,114 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_Den
 TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_TierIndexSeparatesRows)
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, 0, "domain", 0, 1, 4, 8, 4, 512, 2048, 0.0);
+        0, 0, profileEdge(0, 1), 4, 8, 4, 512, 2048, 0.0);
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, 1, "domain", 0, 1, 6, 12, 6, 768, 2048, 0.0);
+        0, 1, profileEdge(0, 1), 6, 12, 6, 768, 2048, 0.0);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     ASSERT_EQ(rows.size(), 2u);
     EXPECT_NE(rows[0].tier_index, rows[1].tier_index);
+}
+
+/**
+ * @brief Long horizons must aggregate into topology-bounded identities.
+ *
+ * This is the regression for transaction strings entering both the profiler
+ * row key and the PerfStats device/tags. That defect made every token/layer a
+ * new record and progressively slowed later requests in parity campaigns.
+ */
+TEST_F(Test__MoEGraphNativeProfilingMetrics,
+       RepeatedEdgeObservationsKeepProfilerAndPerfStatsCardinalityBounded)
+{
+    const auto record = []
+    {
+        MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
+            9, 2, profileEdge(3, 1), 4, 8, 4, 512, 2048, 0.125);
+    };
+
+    record();
+    const size_t initial_perf_records =
+        PerfStatsCollector::snapshot({"moe_overlay"}).size();
+    ASSERT_GT(initial_perf_records, 0u);
+
+    for (int logical_step = 1; logical_step < 2048; ++logical_step)
+        record();
+
+    const auto rows = MoEExpertOverlayProfiler::rows();
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows.front().source_participant, 3);
+    EXPECT_EQ(rows.front().target_participant, 1);
+    EXPECT_EQ(rows.front().domain, "p3->p1");
+    EXPECT_EQ(rows.front().selected_rows, 4u * 2048u);
+    EXPECT_EQ(
+        PerfStatsCollector::snapshot({"moe_overlay"}).size(),
+        initial_perf_records);
+}
+
+/**
+ * @brief Endpoint timing identity must remain bounded across a long decode.
+ *
+ * The production regression used generation, logical step, residency epoch,
+ * and the complete routed-expert set as PerfStats tags. Every packet therefore
+ * inserted new map rows and made the later economy cohort progressively more
+ * expensive. The typed API intentionally cannot represent those values.
+ */
+TEST_F(Test__MoEGraphNativeProfilingMetrics,
+       EndpointPacketTimingCardinalityIsIndependentOfLogicalStep)
+{
+    const MoEOverlayEndpointIdentity identity{
+        .phase = MoEOverlayEndpointPhase::Prefill,
+        .device = "CPU",
+        .layer = 17,
+        .tier_index = 1,
+        .participant_id = 3,
+        .row_capacity = 16,
+        .route_width = 8,
+    };
+    MoEOverlayEndpointTimings timings{
+        .packet_service_ns = 10'000,
+        .route_validation_and_compaction_ns = 1'000,
+        .stage_setup_and_transfers_ns = 2'000,
+        .compute_submission_ns = 3'000,
+        .output_materialization_ns = 2'000,
+        .canonical_route_preweight_and_publication_ns = 1'000,
+        .return_validation_and_aggregation_ns = 1'000,
+    };
+
+    MoEExpertOverlayProfiler::recordEndpointPacket(identity, timings);
+    const auto first =
+        PerfStatsCollector::snapshot({"moe_overlay_endpoint"});
+    ASSERT_EQ(first.size(), 7u);
+
+    constexpr std::size_t kPacketCount = 2048u;
+    for (std::size_t logical_step = 1u;
+         logical_step < kPacketCount;
+         ++logical_step)
+    {
+        // Vary the measurements as real packets do; identity must not change.
+        timings.packet_service_ns = 10'000u + logical_step;
+        timings.compute_submission_ns = 3'000u + logical_step % 13u;
+        MoEExpertOverlayProfiler::recordEndpointPacket(identity, timings);
+    }
+
+    const auto records =
+        PerfStatsCollector::snapshot({"moe_overlay_endpoint"});
+    ASSERT_EQ(records.size(), first.size());
+    for (const PerfStatRecord &record : records)
+    {
+        EXPECT_EQ(record.count, kPacketCount);
+        EXPECT_EQ(record.tags.size(), 5u);
+        EXPECT_TRUE(record.tags.contains("layer"));
+        EXPECT_TRUE(record.tags.contains("participant"));
+        EXPECT_TRUE(record.tags.contains("row_capacity"));
+        EXPECT_TRUE(record.tags.contains("route_width"));
+        EXPECT_TRUE(record.tags.contains("tier"));
+        EXPECT_FALSE(record.tags.contains("active_experts"));
+        EXPECT_FALSE(record.tags.contains("active_routes"));
+        EXPECT_FALSE(record.tags.contains("generation"));
+        EXPECT_FALSE(record.tags.contains("logical_step"));
+        EXPECT_FALSE(record.tags.contains("residency_epoch"));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -165,6 +276,28 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeLocalExpert_Popula
     EXPECT_NEAR(rows[0].compute_ms, 3.14, 1e-6);
     EXPECT_EQ(rows[0].transport_mode, "local");
     EXPECT_FALSE(rows[0].executed_experts.empty());
+}
+
+TEST_F(Test__MoEGraphNativeProfilingMetrics,
+       LocalExpertEvidenceUsesBoundedUnionNotRouteSetIdentity)
+{
+    MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
+        5, 2, 3, "cpu:0", true, 4, 4, 4, {10, 2}, 0.1);
+    const size_t initial_perf_records =
+        PerfStatsCollector::snapshot({"moe_overlay"}).size();
+    MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
+        5, 2, 3, "cpu:0", true, 4, 4, 4, {7, 2}, 0.1);
+
+    const auto rows = MoEExpertOverlayProfiler::rows();
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows.front().executed_experts, "2;7;10");
+    const auto records = PerfStatsCollector::snapshot({"moe_overlay"});
+    EXPECT_EQ(records.size(), initial_perf_records);
+    EXPECT_TRUE(std::none_of(
+        records.begin(), records.end(), [](const PerfStatRecord &record)
+        {
+            return record.tags.contains("experts");
+        }));
 }
 
 TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeLocalExpert_GpuFlag)
@@ -222,9 +355,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeReturnReduce_Popul
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
         /*layer=*/7,
         /*tier_index=*/3,
-        /*domain_key=*/"layer7/tier0/return",
-        /*source_participant=*/1,
-        /*target_participant=*/0,
+        /*edge=*/profileEdge(1, 0),
         /*outbound_rows=*/12,
         /*inbound_rows=*/16,
         /*compact_return_bytes=*/2048,
@@ -253,7 +384,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeReturnReduce_Popul
 TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeReturnReduce_ScatterAndBroadcastTimed)
 {
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, 1, "k", 0, 1, 8, 8, 512, 2048, 0.5, 0.25, 0.1);
+        0, 1, profileEdge(0, 1), 8, 8, 512, 2048, 0.5, 0.25, 0.1);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     ASSERT_FALSE(rows.empty());
@@ -267,13 +398,13 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeReturnReduce_Scatt
 TEST_F(Test__MoEGraphNativeProfilingMetrics, AllThreePhases_AllPresent)
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.1);
+        0, 1, profileEdge(0, 1), 8, 16, 6, 1024, 4096, 0.1);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
         0, 1, /*participant_id=*/2, "cpu:0", true,
         /*inbound_rows=*/6, /*active_routes=*/8, /*output_rows=*/6,
         {0, 1}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.2, 0.1, 0.0);
+        0, 1, profileEdge(1, 0), 6, 8, 512, 2048, 0.2, 0.1, 0.0);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     EXPECT_EQ(rows.size(), 3u);
@@ -285,13 +416,13 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, AllThreePhases_AllPresent)
 TEST_F(Test__MoEGraphNativeProfilingMetrics, GraphNativeRowsPublishUnifiedPerfStats)
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, 1, "dispatch_domain", 0, 1, 8, 16, 6, 1024, 4096, 0.1);
+        0, 1, profileEdge(0, 1), 8, 16, 6, 1024, 4096, 0.1);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
         0, 1, /*participant_id=*/1, "rocm:0", false,
         /*inbound_rows=*/6, /*active_routes=*/6, /*output_rows=*/6,
         {0, 2}, 1.25);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, 1, "return_domain", 1, 0, 6, 8, 512, 2048, 0.2, 0.05, 0.03);
+        0, 1, profileEdge(1, 0), 6, 8, 512, 2048, 0.2, 0.05, 0.03);
 
     const auto records = PerfStatsCollector::snapshot({"moe_overlay"});
     ASSERT_FALSE(records.empty());
@@ -313,18 +444,20 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, GraphNativeRowsPublishUnifiedPerfSt
     EXPECT_EQ(dispatch_counter->tags.at("layer"), "0");
     EXPECT_EQ(dispatch_counter->tags.at("tier"), "1");
     EXPECT_EQ(dispatch_counter->tags.at("transport"), "compact");
+    EXPECT_EQ(dispatch_counter->tags.at("source_participant"), "0");
+    EXPECT_EQ(dispatch_counter->tags.at("target_participant"), "1");
 }
 
 TEST_F(Test__MoEGraphNativeProfilingMetrics, CsvIncludesGraphNativePhases)
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
+        0, 1, profileEdge(0, 1), 8, 16, 6, 1024, 4096, 0.0);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
         0, 1, /*participant_id=*/2, "cpu:0", true,
         /*inbound_rows=*/6, /*active_routes=*/6, /*output_rows=*/6,
         {0}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
+        0, 1, profileEdge(1, 0), 6, 8, 512, 2048, 0.0, 0.0, 0.0);
 
     const std::string csv = MoEExpertOverlayProfiler::csvString();
     EXPECT_NE(csv.find("gn_sparse_dispatch"), std::string::npos);
@@ -333,6 +466,8 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, CsvIncludesGraphNativePhases)
     // New CSV columns must be present in header
     EXPECT_NE(csv.find("tier_index"), std::string::npos);
     EXPECT_NE(csv.find("participant_id"), std::string::npos);
+    EXPECT_NE(csv.find("source_participant"), std::string::npos);
+    EXPECT_NE(csv.find("target_participant"), std::string::npos);
     EXPECT_NE(csv.find("active_routes"), std::string::npos);
     EXPECT_NE(csv.find("dense_bytes_avoided"), std::string::npos);
     EXPECT_NE(csv.find("inbound_rows"), std::string::npos);
@@ -347,13 +482,13 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, CsvIncludesGraphNativePhases)
 TEST_F(Test__MoEGraphNativeProfilingMetrics, SummaryIncludesGraphNativePhases)
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
+        0, 1, profileEdge(0, 1), 8, 16, 6, 1024, 4096, 0.0);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
         0, 1, /*participant_id=*/2, "cpu:0", true,
         /*inbound_rows=*/6, /*active_routes=*/6, /*output_rows=*/6,
         {0}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
+        0, 1, profileEdge(1, 0), 6, 8, 512, 2048, 0.0, 0.0, 0.0);
 
     // renderSummary should not throw; output should contain the phases
     EXPECT_NO_THROW(MoEExpertOverlayProfiler::renderSummary());
@@ -364,13 +499,13 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, WhenProfilingDisabled_NoRowsRecorde
     mutableDebugEnv().profile.enabled = false;
 
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
+        0, 1, profileEdge(0, 1), 8, 16, 6, 1024, 4096, 0.0);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
         0, 1, /*participant_id=*/2, "cpu:0", true,
         /*inbound_rows=*/6, /*active_routes=*/6, /*output_rows=*/6,
         {0}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
+        0, 1, profileEdge(1, 0), 6, 8, 512, 2048, 0.0, 0.0, 0.0);
 
     EXPECT_TRUE(MoEExpertOverlayProfiler::rows().empty());
 }

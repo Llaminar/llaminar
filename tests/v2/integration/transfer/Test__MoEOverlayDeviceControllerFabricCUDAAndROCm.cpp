@@ -715,6 +715,7 @@ namespace llaminar2::test
 
         /** Own one minimal but ABI-real model runtime table on an exact GPU. */
         class ControllerRuntimeFixture final
+            : public IMoEOverlayDeviceInitialRuntimePublisher
         {
         public:
             /** Allocate and publish two live runtime layers for one participant. */
@@ -819,7 +820,19 @@ namespace llaminar2::test
                     .layer_count = kLayers,
                     .expert_count = kExperts,
                     .top_k = kTopK,
+                    .initial_runtime_publisher = this,
                 };
+            }
+
+            /**
+             * The fixture synchronously certifies its setup upload above, so
+             * no additional device edge is needed when a retained test
+             * controller adopts it.
+             */
+            [[nodiscard]] bool publishMoEOverlayDeviceInitialRuntime(
+                void *controller_stream) override
+            {
+                return controller_stream != nullptr;
             }
 
             /** Release the table after every retained graph has been destroyed. */
@@ -1049,6 +1062,10 @@ namespace llaminar2::test
                 .source_participant = 0u,
                 .destination_participant = dynamic ? 2u : 0u,
                 .payload_slot = dynamic ? 0u : kMoEOverlayDeviceInvalidSlot,
+                .flags = static_cast<std::uint32_t>(
+                    dynamic
+                        ? MoEOverlayDeviceMovementAxis::TierResidency
+                        : MoEOverlayDeviceMovementAxis::ParticipantPlacement),
                 .payload_bytes = dynamic ? 4096u : 0u,
                 .source_epoch = base_epoch,
                 .candidate_epoch = dynamic ? base_epoch + 1u : base_epoch,
@@ -3385,6 +3402,8 @@ namespace llaminar2::test
                 .source_participant = 4u,
                 .destination_participant = 3u,
                 .payload_slot = 0u,
+                .flags = static_cast<std::uint32_t>(
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement),
                 .payload_bytes = 4096u,
                 .source_epoch = policy_input.base_epoch,
                 .candidate_epoch = policy_input.base_epoch + 1u,
@@ -3398,6 +3417,8 @@ namespace llaminar2::test
                 .source_participant = 3u,
                 .destination_participant = 4u,
                 .payload_slot = 1u,
+                .flags = static_cast<std::uint32_t>(
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement),
                 .payload_bytes = 4096u,
                 .source_epoch = policy_input.base_epoch,
                 .candidate_epoch = policy_input.base_epoch + 1u,

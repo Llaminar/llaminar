@@ -378,6 +378,14 @@ namespace llaminar2
             return false;
         }
 
+        /* `initialize()` promises that the public name is gone on return, not
+         * merely that every participant has mapped the segment.  Without the
+         * publication below, a non-root rank can leave this method while rank
+         * zero is still between the preceding barrier and `shm_unlink()`.  A
+         * root-authored broadcast is the exact construction edge: observing a
+         * successful value proves that unlink already completed, while all
+         * open descriptors and mappings continue to own the anonymous object. */
+        int unlink_success = 1;
         if (my_rank_ == 0)
         {
             if (shm_unlink(shm_name_.c_str()) == 0 || errno == ENOENT)
@@ -386,9 +394,30 @@ namespace llaminar2
             }
             else
             {
-                LOG_WARN("ShmemSpinBackend::setupSharedMemory - shm_unlink(" << shm_name_
-                                                                              << ") failed after mmap: " << strerror(errno));
+                unlink_success = 0;
+                last_error_ =
+                    "shm_unlink failed after every rank mapped " +
+                    shm_name_ + ": " + std::string(strerror(errno));
             }
+        }
+        if (MPI_Bcast(&unlink_success, 1, MPI_INT, 0, comm) != MPI_SUCCESS)
+        {
+            last_error_ =
+                "MPI_Bcast failed while publishing shared-memory unlink completion";
+            teardownSharedMemory();
+            return false;
+        }
+        if (!unlink_success)
+        {
+            if (my_rank_ != 0)
+            {
+                last_error_ =
+                    "rank 0 failed to unlink shared-memory arena after every rank mapped it";
+            }
+            LOG_ERROR(
+                "ShmemSpinBackend::setupSharedMemory - " << last_error_);
+            teardownSharedMemory();
+            return false;
         }
 
         LOG_DEBUG("ShmemSpinBackend: Shared memory mapped at " << ptr

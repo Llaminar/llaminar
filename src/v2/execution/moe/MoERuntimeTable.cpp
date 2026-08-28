@@ -491,7 +491,15 @@ namespace llaminar2
             state.router_hot_cache_replicated_selected_expert_slots = 0;
         }
 
-        struct RuntimeScratchBindings
+        /**
+         * @brief Immutable-address bindings that survive every request reset.
+         *
+         * Placement contents and per-request counters are reset separately.
+         * Route scratch, deferred ledgers, overlay placement, and external
+         * histogram banks are model-topology pointers and must be restored as
+         * one typed unit whenever a pristine runtime template is rebuilt.
+         */
+        struct RuntimePersistentBindings
         {
             int32_t *route_expert_ids = nullptr;
             float *route_weights = nullptr;
@@ -511,12 +519,15 @@ namespace llaminar2
             uint32_t prefill_token_capacity = 0;
             uint32_t prefill_route_capacity = 0;
             uint32_t deferred_verifier_route_capacity = 0;
+            DeviceMoERuntimeHistogramBank *runtime_histogram_banks = nullptr;
+            const uint32_t *runtime_histogram_active_bank = nullptr;
             const DeviceMoEPlacementBank *overlay_placement_banks = nullptr;
         };
 
-        RuntimeScratchBindings captureRuntimeScratchBindings(const DeviceMoELayerRuntime &state) noexcept
+        RuntimePersistentBindings captureRuntimePersistentBindings(
+            const DeviceMoELayerRuntime &state) noexcept
         {
-            RuntimeScratchBindings scratch;
+            RuntimePersistentBindings scratch;
             scratch.route_expert_ids = state.route_expert_ids;
             scratch.route_weights = state.route_weights;
             scratch.route_participant_ids = state.route_participant_ids;
@@ -541,13 +552,18 @@ namespace llaminar2
             scratch.prefill_route_capacity = state.prefill_route_capacity;
             scratch.deferred_verifier_route_capacity =
                 state.deferred_verifier_route_capacity;
+            scratch.runtime_histogram_banks =
+                state.runtime_histogram_banks;
+            scratch.runtime_histogram_active_bank =
+                state.runtime_histogram_active_bank;
             scratch.overlay_placement_banks =
                 state.overlay_placement_banks;
             return scratch;
         }
 
-        void restoreRuntimeScratchBindings(DeviceMoELayerRuntime &state,
-                                           const RuntimeScratchBindings &scratch) noexcept
+        void restoreRuntimePersistentBindings(
+            DeviceMoELayerRuntime &state,
+            const RuntimePersistentBindings &scratch) noexcept
         {
             state.route_expert_ids = scratch.route_expert_ids;
             state.route_weights = scratch.route_weights;
@@ -575,6 +591,10 @@ namespace llaminar2
             state.prefill_route_capacity = scratch.prefill_route_capacity;
             state.deferred_verifier_route_capacity =
                 scratch.deferred_verifier_route_capacity;
+            state.runtime_histogram_banks =
+                scratch.runtime_histogram_banks;
+            state.runtime_histogram_active_bank =
+                scratch.runtime_histogram_active_bank;
             state.overlay_placement_banks =
                 scratch.overlay_placement_banks;
         }
@@ -1323,8 +1343,19 @@ namespace llaminar2
         }
 
         std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        if (runtime_histogram_producer_lifecycle_ !=
+            RuntimeHistogramProducerLifecycle::CollectingProducers)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] histogram producer preparation occurred after producer retirement");
+        }
         if (mirror_to_device_ && runtime_histogram_drain_enabled_)
-            registerRuntimeHistogramProducerStreamLocked(stream);
+        {
+            registerRuntimeHistogramProducerStreamLocked(
+                stream,
+                RuntimeHistogramProducerStream::Ownership::
+                    BorrowedExecutionStream);
+        }
         decode_histogram_producer_stream_ = stream;
     }
 
@@ -1337,6 +1368,12 @@ namespace llaminar2
         }
 
         std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        if (runtime_histogram_producer_lifecycle_ !=
+            RuntimeHistogramProducerLifecycle::CollectingProducers)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] histogram producer publication occurred after producer retirement");
+        }
         if (mirror_to_device_ && runtime_histogram_drain_enabled_ &&
             !isRuntimeHistogramProducerStreamRegisteredLocked(stream))
         {
@@ -1349,10 +1386,23 @@ namespace llaminar2
         decode_histogram_producer_stream_ = stream;
     }
 
+    void DeviceMoERuntimeTable::retireRuntimeHistogramProducerStreams()
+    {
+        std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        retireRuntimeHistogramProducerStreamsLocked();
+    }
+
     void *DeviceMoERuntimeTable::decodeHistogramProducerStream() const
     {
         std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
         return decode_histogram_producer_stream_;
+    }
+
+    void *DeviceMoERuntimeTable::
+        groupedVerifierHistogramPublicationStream() const
+    {
+        std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        return grouped_verifier_histogram_publication_stream_;
     }
 
     void DeviceMoERuntimeTable::enableAsyncDecodeHistogramDrain(
@@ -1366,6 +1416,12 @@ namespace llaminar2
         }
 
         std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        if (runtime_histogram_producer_lifecycle_ !=
+            RuntimeHistogramProducerLifecycle::CollectingProducers)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] asynchronous histogram drain enablement occurred after producer retirement");
+        }
         if (runtime_histogram_drain_enabled_)
         {
             if (runtime_histogram_sources_ != sources)
@@ -1387,8 +1443,12 @@ namespace llaminar2
                  * the histogram owner was attached. Install its event edge
                  * before publishing the enabled lifecycle state. */
                 if (decode_histogram_producer_stream_)
+                {
                     registerRuntimeHistogramProducerStreamLocked(
-                        decode_histogram_producer_stream_);
+                        decode_histogram_producer_stream_,
+                        RuntimeHistogramProducerStream::Ownership::
+                            BorrowedExecutionStream);
+                }
             }
             runtime_histogram_drain_enabled_ = true;
         }
@@ -1405,6 +1465,12 @@ namespace llaminar2
         DecodeExpertHistogram &histogram)
     {
         std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        if (runtime_histogram_producer_lifecycle_ !=
+            RuntimeHistogramProducerLifecycle::CollectingProducers)
+        {
+            return RuntimeExpertHistogramDrainResult::failed(
+                "Runtime histogram drain was polled after producer retirement");
+        }
         if (!runtime_histogram_drain_enabled_)
         {
             return RuntimeExpertHistogramDrainResult::failed(
@@ -1465,40 +1531,28 @@ namespace llaminar2
                 "Runtime histogram drain began before any exact producer stream was registered");
         }
 
-        runtime_histogram_producers_sealed_ = true;
+        runtime_histogram_producer_topology_ =
+            RuntimeHistogramProducerTopology::Sealed;
         const uint32_t frozen_bank = runtime_histogram_active_bank_host_;
         const uint32_t next_bank = 1u - frozen_bank;
+        const bool admit_next_generation =
+            admitsRuntimeExpertHistogramRows(histogram.admissionState());
+        const uint32_t next_writer_state =
+            moe_runtime_abi::makeHistogramWriterState(
+                next_bank,
+                admit_next_generation);
 
-        /* Every producer orders the same idempotent bank publication after its
-         * previous writes. The maintenance stream waits for all arrivals, so
-         * no writer can still target the frozen generation when DMA begins. */
-        for (const auto &producer : runtime_histogram_producer_streams_)
+        /* Certification rotates into a quarantined bank; ordinary proposal
+         * drains rotate into an admitted bank. One maintenance-stream writer
+         * publishes the state after joining all previous producer work, then
+         * every producer waits on its exact publication event. */
+        std::string publication_failure;
+        if (!publishRuntimeHistogramWriterStateLocked(
+                next_writer_state,
+                publication_failure))
         {
-            if (!backend->hostToDeviceOnStream(
-                    device_runtime_histogram_active_bank_,
-                    host_runtime_histogram_bank_indices_ + next_bank,
-                    sizeof(uint32_t),
-                    ordinal,
-                    producer.stream) ||
-                !backend->recordEvent(
-                    producer.flip_arrival_event,
-                    ordinal,
-                    producer.stream))
-            {
-                return RuntimeExpertHistogramDrainResult::failed(
-                    "Failed to publish the next runtime histogram bank on an exact producer stream");
-            }
-        }
-        for (const auto &producer : runtime_histogram_producer_streams_)
-        {
-            if (!backend->streamWaitEvent(
-                    runtime_histogram_maintenance_stream_,
-                    producer.flip_arrival_event,
-                    ordinal))
-            {
-                return RuntimeExpertHistogramDrainResult::failed(
-                    "Maintenance stream failed to join a runtime histogram producer event");
-            }
+            return RuntimeExpertHistogramDrainResult::failed(
+                std::move(publication_failure));
         }
 
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
@@ -1549,6 +1603,62 @@ namespace llaminar2
               std::to_string(runtime_histogram_producer_streams_.size())},
              {"bank", std::to_string(frozen_bank)}});
         return RuntimeExpertHistogramDrainResult::pending();
+    }
+
+    bool DeviceMoERuntimeTable::publishAsyncDecodeHistogramAdmission(
+        RuntimeExpertHistogramAdmission admission)
+    {
+        if (admission !=
+            RuntimeExpertHistogramAdmission::OptimizationDemand)
+        {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        if (runtime_histogram_producer_lifecycle_ !=
+            RuntimeHistogramProducerLifecycle::CollectingProducers)
+        {
+            return false;
+        }
+        if (!runtime_histogram_drain_enabled_)
+            return false;
+        if (!mirror_to_device_)
+            return true;
+        if (runtime_histogram_drain_in_flight_ ||
+            runtime_histogram_producer_streams_.empty() ||
+            !host_runtime_histogram_writer_states_)
+        {
+            return false;
+        }
+
+        const uint32_t writer_state =
+            moe_runtime_abi::makeHistogramWriterState(
+                runtime_histogram_active_bank_host_,
+                /*admit_rows=*/true);
+        std::string publication_failure;
+        if (!publishRuntimeHistogramWriterStateLocked(
+                writer_state,
+                publication_failure))
+        {
+            LOG_ERROR(
+                "[MoERuntimeTable] runtime histogram demand activation failed on "
+                << device_id_.to_string() << ": "
+                << publication_failure);
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "moe_overlay_residency",
+            "runtime_histogram_demand_activations",
+            1.0,
+            "request_admission",
+            device_id_.toString(),
+            {{"blocking", "false"},
+             {"producer_streams",
+              std::to_string(runtime_histogram_producer_streams_.size())},
+             {"bank",
+              std::to_string(runtime_histogram_active_bank_host_)}});
+        return true;
     }
 
     bool DeviceMoERuntimeTable::syncDecodeHistogramToHost(
@@ -2025,11 +2135,11 @@ namespace llaminar2
              * the stage-local "warmed" bit then remained true while the device
              * table advertised a zero route capacity.
              */
-            const RuntimeScratchBindings scratch =
-                captureRuntimeScratchBindings(state);
+            const RuntimePersistentBindings scratch =
+                captureRuntimePersistentBindings(state);
 
             resetLayer(state);
-            restoreRuntimeScratchBindings(state, scratch);
+            restoreRuntimePersistentBindings(state, scratch);
         }
     }
 
@@ -2039,6 +2149,107 @@ namespace llaminar2
                            initial_layer_captured_.end(),
                            [](uint8_t captured)
                            { return captured != 0u; });
+    }
+
+    bool DeviceMoERuntimeTable::hasCompleteInitialRuntimeState() const noexcept
+    {
+        if (initial_layer_captured_.size() != host_layers_.size() ||
+            decode_runtime_publication_required_.size() !=
+                host_layers_.size() ||
+            host_layers_.empty())
+        {
+            return false;
+        }
+        for (std::size_t layer = 0u; layer < host_layers_.size(); ++layer)
+        {
+            const auto &runtime = host_layers_[layer];
+            if (initial_layer_captured_[layer] == 0u ||
+                decode_runtime_publication_required_[layer] != 0u ||
+                runtime.active_bank > 1u || runtime.active_epoch == 0u ||
+                runtime.expert_count !=
+                    static_cast<std::uint32_t>(num_experts_) ||
+                runtime.top_k != static_cast<std::uint32_t>(top_k_))
+            {
+                return false;
+            }
+            const auto &bank = runtime.banks[runtime.active_bank];
+            if (bank.epoch != runtime.active_epoch ||
+                bank.expert_count !=
+                    static_cast<std::uint32_t>(num_experts_))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void DeviceMoERuntimeTable::sealAndPublishCompleteInitialRuntimeState(
+        void *stream)
+    {
+        if (!mirror_to_device_ || !device_id_.is_gpu() || !stream)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] complete initial runtime publication "
+                "requires a mirrored GPU table and an explicit stream");
+        }
+        if (initial_runtime_family_lifecycle_ !=
+            InitialRuntimeFamilyLifecycle::Collecting)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] complete initial runtime family was "
+                "already published");
+        }
+        if (!hasCompleteInitialRuntimeState())
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] cannot publish an incomplete retained "
+                "runtime family");
+        }
+
+        /*
+         * The first valid bank is only a construction checkpoint. Later graph
+         * families may finish persistent scratch binding or replace that bank
+         * with a newer setup-only recipe before controller ownership begins.
+         * Freezing the first checkpoint made reset publish an older generation
+         * than the live recipe that was validated above. Close Collecting by
+         * snapshotting the exact final family now; after this transition the
+         * device controller, rather than either host vector, owns placement.
+         */
+        for (std::size_t layer = 0u; layer < host_layers_.size(); ++layer)
+        {
+            initial_host_layers_[layer] = host_layers_[layer];
+            resetPerRequestRuntimeFields(
+                initial_host_layers_[layer], num_experts_);
+            initial_layer_captured_[layer] = 1u;
+        }
+
+        const size_t bytes =
+            initial_host_layers_.size() * sizeof(DeviceMoELayerRuntime);
+        /*
+         * Layer setup can occur while a future graph is being materialized.
+         * A valid host recipe therefore does not prove that an unlaunched
+         * retained graph has made the recipe device-visible. Publish the
+         * complete immutable template once outside capture, then use a D2D
+         * edge to install exactly those bytes as the live starting state.
+         * This setup handoff is the last host-authored placement publication;
+         * Dynamic epochs that follow remain device-owned.
+         */
+        copyHostToMirror(
+            device_id_,
+            device_initial_layers_,
+            initial_host_layers_.data(),
+            bytes,
+            stream,
+            "[MoERuntimeTable] sealed initial runtime template publication");
+        copyMirrorToMirrorAsync(
+            device_id_,
+            device_layers_,
+            device_initial_layers_,
+            bytes,
+            stream,
+            "[MoERuntimeTable] sealed live runtime family publication");
+        initial_runtime_family_lifecycle_ =
+            InitialRuntimeFamilyLifecycle::Published;
     }
 
     void DeviceMoERuntimeTable::restoreInitialRuntimeState(void *stream)
@@ -2073,11 +2284,11 @@ namespace llaminar2
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
             auto &state = host_layers_[static_cast<size_t>(layer_idx)];
-            const auto scratch = captureRuntimeScratchBindings(state);
+            const auto scratch = captureRuntimePersistentBindings(state);
             state = initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u
                         ? initial_host_layers_[static_cast<size_t>(layer_idx)]
                         : empty_host_layers_[static_cast<size_t>(layer_idx)];
-            restoreRuntimeScratchBindings(state, scratch);
+            restoreRuntimePersistentBindings(state, scratch);
             resetPerRequestRuntimeFields(state, num_experts_);
             decode_runtime_publication_required_[static_cast<size_t>(layer_idx)] =
                 initial_layer_captured_[static_cast<size_t>(layer_idx)] == 0u ? 1u : 0u;
@@ -2152,7 +2363,7 @@ namespace llaminar2
             for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
             {
                 auto &state = host_layers_[static_cast<size_t>(layer_idx)];
-                const auto scratch = captureRuntimeScratchBindings(state);
+                const auto scratch = captureRuntimePersistentBindings(state);
                 const auto &snapshot = layers[static_cast<size_t>(layer_idx)];
                 if (snapshot.expert_count != static_cast<uint32_t>(num_experts_) ||
                     snapshot.top_k != static_cast<uint32_t>(top_k_) ||
@@ -2171,7 +2382,7 @@ namespace llaminar2
                 }
 
                 state = snapshot;
-                restoreRuntimeScratchBindings(state, scratch);
+                restoreRuntimePersistentBindings(state, scratch);
                 resetPerRequestRuntimeFields(state, num_experts_);
                 if (mirror_to_device_)
                     uploadLayerState(layer_idx, active_stream);
@@ -2445,7 +2656,7 @@ namespace llaminar2
                     return {};
                 }
 
-                const auto scratch = captureRuntimeScratchBindings(state);
+                const auto scratch = captureRuntimePersistentBindings(state);
                 if (!scratch.reserved_ptrs[2] ||
                     scratch.reserved_u64[1] == 0u)
                 {
@@ -2547,7 +2758,7 @@ namespace llaminar2
                 }
 
                 state = initial;
-                restoreRuntimeScratchBindings(state, scratch);
+                restoreRuntimePersistentBindings(state, scratch);
                 std::copy(snapshot.selected_histogram.begin(),
                           snapshot.selected_histogram.end(),
                           state.decode_histogram);
@@ -2841,10 +3052,10 @@ namespace llaminar2
              * the generation boundary.
              */
             auto &staging_state = host_layers_[layer];
-            const RuntimeScratchBindings scratch =
-                captureRuntimeScratchBindings(staging_state);
+            const RuntimePersistentBindings scratch =
+                captureRuntimePersistentBindings(staging_state);
             resetLayer(staging_state);
-            restoreRuntimeScratchBindings(staging_state, scratch);
+            restoreRuntimePersistentBindings(staging_state, scratch);
         }
 
         validateUpdate(layer_idx, update);
@@ -3000,6 +3211,7 @@ namespace llaminar2
         /* The ticket address is model topology. Request reset clears routed
          * data but must never unbind the captured residency authority. */
         state.overlay_epoch_ticket = overlayEpochTicket();
+        state.overlay_epoch_status = overlayEpochStatus();
     }
 
     void DeviceMoERuntimeTable::captureInitialLayerStateIfNeeded(
@@ -3108,13 +3320,13 @@ namespace llaminar2
          * workspace, while preserving each template's placement semantics.
          * This happens only during setup/replanning, never in inference.
          */
-        const auto scratch = captureRuntimeScratchBindings(state);
+        const auto scratch = captureRuntimePersistentBindings(state);
         auto &empty = empty_host_layers_[static_cast<size_t>(layer_idx)];
         resetLayer(empty);
-        restoreRuntimeScratchBindings(empty, scratch);
+        restoreRuntimePersistentBindings(empty, scratch);
         if (initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u)
         {
-            restoreRuntimeScratchBindings(
+            restoreRuntimePersistentBindings(
                 initial_host_layers_[static_cast<size_t>(layer_idx)],
                 scratch);
         }
@@ -3235,13 +3447,13 @@ namespace llaminar2
             state.deferred_verifier_route_capacity =
                 deferred_verifier_route_capacity_;
 
-            const auto bindings = captureRuntimeScratchBindings(state);
+            const auto bindings = captureRuntimePersistentBindings(state);
             auto &empty = empty_host_layers_[static_cast<size_t>(layer_idx)];
             resetLayer(empty);
-            restoreRuntimeScratchBindings(empty, bindings);
+            restoreRuntimePersistentBindings(empty, bindings);
             if (initial_layer_captured_[static_cast<size_t>(layer_idx)] != 0u)
             {
-                restoreRuntimeScratchBindings(
+                restoreRuntimePersistentBindings(
                     initial_host_layers_[static_cast<size_t>(layer_idx)],
                     bindings);
             }
@@ -3405,9 +3617,11 @@ namespace llaminar2
             device_runtime_histogram_banks_ ||
             device_runtime_histogram_active_bank_ ||
             host_runtime_histogram_snapshot_ ||
-            host_runtime_histogram_bank_indices_ ||
+            host_runtime_histogram_writer_states_ ||
             runtime_histogram_maintenance_stream_ ||
+            grouped_verifier_histogram_publication_stream_ ||
             runtime_histogram_initialization_event_ ||
+            runtime_histogram_writer_state_published_event_ ||
             runtime_histogram_drain_complete_event_)
         {
             throw std::logic_error(
@@ -3443,27 +3657,44 @@ namespace llaminar2
             host_runtime_histogram_snapshot_ =
                 static_cast<DeviceMoERuntimeHistogramBank *>(
                     backend->allocatePinned(snapshot_bytes, ordinal));
-            host_runtime_histogram_bank_indices_ =
+            host_runtime_histogram_writer_states_ =
                 static_cast<uint32_t *>(
-                    backend->allocatePinned(2u * sizeof(uint32_t), ordinal));
+                    backend->allocatePinned(4u * sizeof(uint32_t), ordinal));
             runtime_histogram_maintenance_stream_ =
                 backend->createStream(ordinal);
+            const auto grouped_verifier_source =
+                static_cast<std::size_t>(
+                    moe_runtime_abi::HistogramSource::GroupedVerifier);
+            if (runtime_histogram_sources_[grouped_verifier_source])
+            {
+                grouped_verifier_histogram_publication_stream_ =
+                    backend->createStream(ordinal);
+            }
             runtime_histogram_initialization_event_ =
+                backend->createEvent(ordinal);
+            runtime_histogram_writer_state_published_event_ =
                 backend->createEvent(ordinal);
             runtime_histogram_drain_complete_event_ =
                 backend->createEvent(ordinal);
             if (!host_runtime_histogram_snapshot_ ||
-                !host_runtime_histogram_bank_indices_ ||
+                !host_runtime_histogram_writer_states_ ||
                 !runtime_histogram_maintenance_stream_ ||
+                (runtime_histogram_sources_[grouped_verifier_source] &&
+                 !grouped_verifier_histogram_publication_stream_) ||
                 !runtime_histogram_initialization_event_ ||
+                !runtime_histogram_writer_state_published_event_ ||
                 !runtime_histogram_drain_complete_event_)
             {
                 throw std::runtime_error(
                     "[MoERuntimeTable] backend failed to allocate persistent asynchronous histogram resources");
             }
 
-            host_runtime_histogram_bank_indices_[0] = 0u;
-            host_runtime_histogram_bank_indices_[1] = 1u;
+            for (uint32_t state = 0u;
+                 state <= moe_runtime_abi::kHistogramWriterStateMask;
+                 ++state)
+            {
+                host_runtime_histogram_writer_states_[state] = state;
+            }
             runtime_histogram_active_bank_host_ = 0u;
             runtime_histogram_frozen_bank_host_ = 0u;
 
@@ -3475,7 +3706,7 @@ namespace llaminar2
                     runtime_histogram_maintenance_stream_) ||
                 !backend->hostToDeviceOnStream(
                     device_runtime_histogram_active_bank_,
-                    host_runtime_histogram_bank_indices_,
+                    host_runtime_histogram_writer_states_,
                     sizeof(uint32_t),
                     ordinal,
                     runtime_histogram_maintenance_stream_) ||
@@ -3486,6 +3717,19 @@ namespace llaminar2
             {
                 throw std::runtime_error(
                     "[MoERuntimeTable] failed to initialize persistent asynchronous histogram resources");
+            }
+
+            /* Accepted-state publication is the one histogram-writing graph
+             * family whose first materialization legitimately occurs after a
+             * verifier has produced an outcome. Admit its table-owned stream
+             * now, before the first maintenance poll can seal the producer
+             * topology. Every later graph identity borrows this exact stream. */
+            if (grouped_verifier_histogram_publication_stream_)
+            {
+                registerRuntimeHistogramProducerStreamLocked(
+                    grouped_verifier_histogram_publication_stream_,
+                    RuntimeHistogramProducerStream::Ownership::
+                        TableOwnedStream);
             }
 
             /* The event, rather than a host fence, publishes setup completion.
@@ -3520,7 +3764,7 @@ namespace llaminar2
                 "moe_runtime_async_histogram_bytes",
                 static_cast<double>(
                     device_bytes + sizeof(uint32_t) + snapshot_bytes +
-                    2u * sizeof(uint32_t)),
+                    4u * sizeof(uint32_t)),
                 "model_setup",
                 device_id_.toString(),
                 {{"layers", std::to_string(num_layers_)},
@@ -3535,7 +3779,8 @@ namespace llaminar2
     }
 
     void DeviceMoERuntimeTable::registerRuntimeHistogramProducerStreamLocked(
-        void *stream)
+        void *stream,
+        RuntimeHistogramProducerStream::Ownership ownership)
     {
         if (!stream || !runtime_histogram_initialization_event_)
         {
@@ -3550,7 +3795,8 @@ namespace llaminar2
             { return producer.stream == stream; });
         if (existing != runtime_histogram_producer_streams_.end())
             return;
-        if (runtime_histogram_producers_sealed_)
+        if (runtime_histogram_producer_topology_ ==
+            RuntimeHistogramProducerTopology::Sealed)
         {
             throw std::logic_error(
                 "[MoERuntimeTable] a new histogram producer stream appeared after the asynchronous drain topology was sealed");
@@ -3560,11 +3806,16 @@ namespace llaminar2
             device_id_,
             "[MoERuntimeTable] runtime histogram producer registration");
         const int ordinal = device_id_.toKernelDeviceIndex();
-        void *event = backend->createEvent(ordinal);
-        if (!event)
+        void *arrival_event = backend->createEvent(ordinal);
+        void *departure_event = backend->createEvent(ordinal);
+        if (!arrival_event || !departure_event)
         {
+            if (arrival_event)
+                backend->destroyEvent(arrival_event, ordinal);
+            if (departure_event)
+                backend->destroyEvent(departure_event, ordinal);
             throw std::runtime_error(
-                "[MoERuntimeTable] failed to allocate an exact histogram producer event on " +
+                "[MoERuntimeTable] failed to allocate exact two-phase histogram producer events on " +
                 device_id_.to_string());
         }
         if (!backend->streamWaitEvent(
@@ -3572,13 +3823,17 @@ namespace llaminar2
                 runtime_histogram_initialization_event_,
                 ordinal))
         {
-            backend->destroyEvent(event, ordinal);
+            backend->destroyEvent(arrival_event, ordinal);
+            backend->destroyEvent(departure_event, ordinal);
             throw std::runtime_error(
                 "[MoERuntimeTable] failed to order a histogram producer after asynchronous bank initialization on " +
                 device_id_.to_string());
         }
         runtime_histogram_producer_streams_.push_back(
-            {.stream = stream, .flip_arrival_event = event});
+            {.stream = stream,
+             .flip_arrival_event = arrival_event,
+             .flip_departure_event = departure_event,
+             .ownership = ownership});
     }
 
     bool DeviceMoERuntimeTable::isRuntimeHistogramProducerStreamRegisteredLocked(
@@ -3591,8 +3846,253 @@ namespace llaminar2
             { return producer.stream == stream; });
     }
 
+    bool DeviceMoERuntimeTable::publishRuntimeHistogramWriterStateLocked(
+        uint32_t writer_state,
+        std::string &failure)
+    {
+        failure.clear();
+        if (!moe_runtime_abi::validHistogramWriterState(writer_state))
+        {
+            failure =
+                "Runtime histogram writer-state publication received an invalid encoded state";
+            return false;
+        }
+        if (runtime_histogram_producer_streams_.empty() ||
+            !device_runtime_histogram_active_bank_ ||
+            !host_runtime_histogram_writer_states_ ||
+            !runtime_histogram_maintenance_stream_ ||
+            !runtime_histogram_writer_state_published_event_)
+        {
+            failure =
+                "Runtime histogram writer-state publication has incomplete persistent resources";
+            return false;
+        }
+
+        IBackend *backend = mirrorBackend(
+            device_id_,
+            "[MoERuntimeTable] runtime histogram writer-state publication");
+        const int ordinal = device_id_.toKernelDeviceIndex();
+
+        /* Arrival events close the prior producer generation. They are
+         * recorded before the corresponding producer wait below, making the
+         * event DAG acyclic even while inference is still draining. */
+        for (const auto &producer : runtime_histogram_producer_streams_)
+        {
+            if (!backend->recordEvent(
+                    producer.flip_arrival_event,
+                    ordinal,
+                    producer.stream))
+            {
+                failure =
+                    "Failed to record a runtime histogram producer arrival";
+                return false;
+            }
+        }
+        for (const auto &producer : runtime_histogram_producer_streams_)
+        {
+            if (!backend->streamWaitEvent(
+                    runtime_histogram_maintenance_stream_,
+                    producer.flip_arrival_event,
+                    ordinal))
+            {
+                failure =
+                    "Maintenance stream failed to join a runtime histogram producer arrival";
+                return false;
+            }
+        }
+
+        /* This is the only live mutation of the shared device scalar. A
+         * single writer is required even when several producers would publish
+         * identical bytes: concurrent DMA to graph-read state has no defined
+         * cross-stream ordering. */
+        if (!backend->hostToDeviceOnStream(
+                device_runtime_histogram_active_bank_,
+                host_runtime_histogram_writer_states_ + writer_state,
+                sizeof(uint32_t),
+                ordinal,
+                runtime_histogram_maintenance_stream_))
+        {
+            failure =
+                "Failed to enqueue the sole runtime histogram writer-state publication";
+            return false;
+        }
+        if (!backend->recordEvent(
+                runtime_histogram_writer_state_published_event_,
+                ordinal,
+                runtime_histogram_maintenance_stream_))
+        {
+            failure =
+                "Failed to record the runtime histogram writer-state publication event";
+            return false;
+        }
+        for (const auto &producer : runtime_histogram_producer_streams_)
+        {
+            if (!backend->streamWaitEvent(
+                    producer.stream,
+                    runtime_histogram_writer_state_published_event_,
+                    ordinal) ||
+                !backend->recordEvent(
+                    producer.flip_departure_event,
+                    ordinal,
+                    producer.stream))
+            {
+                failure =
+                    "A runtime histogram producer failed to consume and acknowledge the writer-state publication";
+                return false;
+            }
+        }
+
+        /* Another host thread may submit a retained graph between any two
+         * backend calls above. Such work is necessarily ordered either before
+         * the arrival, between arrival and departure, or after departure. By
+         * joining the departure phase here, the frozen bank cannot be drained
+         * while an interleaved graph still owns its old writer-state snapshot. */
+        for (const auto &producer : runtime_histogram_producer_streams_)
+        {
+            if (!backend->streamWaitEvent(
+                    runtime_histogram_maintenance_stream_,
+                    producer.flip_departure_event,
+                    ordinal))
+            {
+                failure =
+                    "Maintenance stream failed to join a runtime histogram producer departure";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void DeviceMoERuntimeTable::
+        retireRuntimeHistogramProducerStreamsLocked()
+    {
+        if (runtime_histogram_producer_lifecycle_ ==
+                RuntimeHistogramProducerLifecycle::ResourcesReleased ||
+            runtime_histogram_producer_lifecycle_ ==
+                RuntimeHistogramProducerLifecycle::ProducersRetired)
+        {
+            return;
+        }
+
+        IBackend *backend = nullptr;
+        const int ordinal = device_id_.is_gpu()
+                                ? device_id_.toKernelDeviceIndex()
+                                : 0;
+        if (device_id_.is_gpu() && runtime_histogram_maintenance_stream_)
+        {
+            backend = mirrorBackend(
+                device_id_,
+                "[MoERuntimeTable] runtime histogram producer retirement");
+
+            /* No graph submission may begin after this terminal transition.
+             * Recording each producer's model-lifetime arrival event closes
+             * its exact queue without guessing a replacement stream. The one
+             * maintenance fence then covers initialization, any in-flight bank
+             * drain, and all producer work admitted before teardown. */
+            for (const auto &producer :
+                 runtime_histogram_producer_streams_)
+            {
+                if (!producer.stream || !producer.flip_arrival_event)
+                {
+                    throw std::logic_error(
+                        "[MoERuntimeTable] terminal histogram retirement found an incomplete producer registration on " +
+                        device_id_.to_string());
+                }
+                if (!backend->recordEvent(
+                        producer.flip_arrival_event,
+                        ordinal,
+                        producer.stream) ||
+                    !backend->streamWaitEvent(
+                        runtime_histogram_maintenance_stream_,
+                        producer.flip_arrival_event,
+                        ordinal))
+                {
+                    throw std::runtime_error(
+                        "[MoERuntimeTable] failed to join a histogram producer into the terminal maintenance fence on " +
+                        device_id_.to_string());
+                }
+            }
+
+            /* Model teardown may block after request admission has stopped.
+             * This is the sole terminal host fence for the entire producer
+             * family, never a request, graph, or maintenance-wave edge. */
+            if (!backend->synchronizeStream(
+                    runtime_histogram_maintenance_stream_, ordinal))
+            {
+                throw std::runtime_error(
+                    "[MoERuntimeTable] failed to drain the terminal histogram maintenance fence on " +
+                    device_id_.to_string());
+            }
+        }
+
+        /* Events remain table-owned until resource destruction. Only the raw
+         * borrowed stream identities must disappear before graph contexts do.
+         * The table-owned grouped-verifier stream remains live so release can
+         * destroy it after graph executables have relinquished it. */
+        for (auto &producer : runtime_histogram_producer_streams_)
+        {
+            if (producer.ownership ==
+                RuntimeHistogramProducerStream::Ownership::
+                    BorrowedExecutionStream)
+            {
+                producer.stream = nullptr;
+            }
+        }
+        decode_histogram_producer_stream_ = nullptr;
+        runtime_histogram_producer_lifecycle_ =
+            RuntimeHistogramProducerLifecycle::ProducersRetired;
+    }
+
     void DeviceMoERuntimeTable::releaseRuntimeHistogramDrainResources() noexcept
     {
+        if (runtime_histogram_producer_lifecycle_ ==
+            RuntimeHistogramProducerLifecycle::ResourcesReleased)
+        {
+            return;
+        }
+
+        if (runtime_histogram_producer_lifecycle_ ==
+            RuntimeHistogramProducerLifecycle::CollectingProducers)
+        {
+            const bool owns_borrowed_stream = std::any_of(
+                runtime_histogram_producer_streams_.begin(),
+                runtime_histogram_producer_streams_.end(),
+                [](const RuntimeHistogramProducerStream &producer)
+                {
+                    return producer.ownership ==
+                           RuntimeHistogramProducerStream::Ownership::
+                               BorrowedExecutionStream;
+                });
+            if (owns_borrowed_stream)
+            {
+                LOG_ERROR(
+                    "[MoERuntimeTable] borrowed histogram producer streams reached resource destruction before explicit retirement on "
+                    << device_id_.to_string());
+                std::terminate();
+            }
+
+            /* Constructor-failure cleanup can own only table-created streams.
+             * Retiring those streams here is safe because their lifetime is a
+             * strict subset of this table's lifetime. */
+            try
+            {
+                retireRuntimeHistogramProducerStreamsLocked();
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR(
+                    "[MoERuntimeTable] table-owned histogram producer retirement failed on "
+                    << device_id_.to_string() << ": " << error.what());
+                std::terminate();
+            }
+            catch (...)
+            {
+                LOG_ERROR(
+                    "[MoERuntimeTable] table-owned histogram producer retirement failed on "
+                    << device_id_.to_string() << ": unknown exception");
+                std::terminate();
+            }
+        }
+
         IBackend *backend = nullptr;
         try
         {
@@ -3600,18 +4100,6 @@ namespace llaminar2
             const int ordinal = device_id_.is_gpu()
                                     ? device_id_.toKernelDeviceIndex()
                                     : 0;
-            if (backend && runtime_histogram_maintenance_stream_)
-            {
-                /* Model teardown may block after inference admission has
-                 * stopped; this is not part of a request or migration wave. */
-                if (!backend->synchronizeStream(
-                        runtime_histogram_maintenance_stream_, ordinal))
-                {
-                    LOG_ERROR(
-                        "[MoERuntimeTable] failed to drain histogram maintenance stream during teardown on "
-                        << device_id_.to_string());
-                }
-            }
             if (backend)
             {
                 for (auto &producer : runtime_histogram_producer_streams_)
@@ -3619,22 +4107,33 @@ namespace llaminar2
                     if (producer.flip_arrival_event)
                         backend->destroyEvent(
                             producer.flip_arrival_event, ordinal);
+                    if (producer.flip_departure_event)
+                        backend->destroyEvent(
+                            producer.flip_departure_event, ordinal);
                 }
                 if (runtime_histogram_drain_complete_event_)
                     backend->destroyEvent(
                         runtime_histogram_drain_complete_event_, ordinal);
+                if (runtime_histogram_writer_state_published_event_)
+                    backend->destroyEvent(
+                        runtime_histogram_writer_state_published_event_,
+                        ordinal);
                 if (runtime_histogram_initialization_event_)
                     backend->destroyEvent(
                         runtime_histogram_initialization_event_, ordinal);
                 if (runtime_histogram_maintenance_stream_)
                     backend->destroyStream(
                         runtime_histogram_maintenance_stream_, ordinal);
+                if (grouped_verifier_histogram_publication_stream_)
+                    backend->destroyStream(
+                        grouped_verifier_histogram_publication_stream_,
+                        ordinal);
                 if (host_runtime_histogram_snapshot_)
                     backend->freePinned(
                         host_runtime_histogram_snapshot_, ordinal);
-                if (host_runtime_histogram_bank_indices_)
+                if (host_runtime_histogram_writer_states_)
                     backend->freePinned(
-                        host_runtime_histogram_bank_indices_, ordinal);
+                        host_runtime_histogram_writer_states_, ordinal);
             }
         }
         catch (const std::exception &error)
@@ -3652,10 +4151,12 @@ namespace llaminar2
 
         runtime_histogram_producer_streams_.clear();
         runtime_histogram_drain_complete_event_ = nullptr;
+        runtime_histogram_writer_state_published_event_ = nullptr;
         runtime_histogram_initialization_event_ = nullptr;
         runtime_histogram_maintenance_stream_ = nullptr;
+        grouped_verifier_histogram_publication_stream_ = nullptr;
         host_runtime_histogram_snapshot_ = nullptr;
-        host_runtime_histogram_bank_indices_ = nullptr;
+        host_runtime_histogram_writer_states_ = nullptr;
         freeMirror(
             device_id_,
             device_runtime_histogram_active_bank_,
@@ -3667,7 +4168,11 @@ namespace llaminar2
         device_runtime_histogram_active_bank_ = nullptr;
         device_runtime_histogram_banks_ = nullptr;
         runtime_histogram_drain_in_flight_ = false;
-        runtime_histogram_producers_sealed_ = false;
+        runtime_histogram_producer_topology_ =
+            RuntimeHistogramProducerTopology::Sealed;
+        runtime_histogram_drain_enabled_ = false;
+        runtime_histogram_producer_lifecycle_ =
+            RuntimeHistogramProducerLifecycle::ResourcesReleased;
     }
 
     bool DeviceMoERuntimeTable::mergeRuntimeHistogramSnapshot(

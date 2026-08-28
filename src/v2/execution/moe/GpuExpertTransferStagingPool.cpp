@@ -27,8 +27,7 @@ namespace llaminar2
         DeviceId device,
         int device_ordinal,
         int capacity,
-        std::vector<ProjectionSpec> specs,
-        size_t vram_safety_margin_bytes)
+        std::vector<ProjectionSpec> specs)
     {
         if (capacity <= 0)
             throw std::invalid_argument("GpuExpertTransferStagingPool capacity must be positive");
@@ -36,7 +35,6 @@ namespace llaminar2
             throw std::invalid_argument("GpuExpertTransferStagingPool requires at least one projection spec");
 
         auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
-        orchestrator->setVramPreflightSafetyMarginBytes(vram_safety_margin_bytes);
         orchestrator->addDevice(device_ordinal);
 
         for (int slot = 0; slot < capacity; ++slot)

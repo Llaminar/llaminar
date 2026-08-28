@@ -52,9 +52,10 @@
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/ExpertWeightPayloadProvider.h"
 #include "../../moe/GpuExpertTransferStagingPool.h"
-#include "../../moe/IMoEGroupedVerifierHistogramPublisher.h"
+#include "../../moe/MoEGroupedVerifierHistogramBoundarySet.h"
 #include "../../moe/MoEOverlayInferenceTransactionService.h"
 #include "../../moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
+#include "../../moe/MoEOverlayResidencyAuthority.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../loaders/WeightPlan.h"
 #include "../../../backends/BackendManager.h"
@@ -1485,7 +1486,8 @@ namespace llaminar2
             uint64_t transfer_payload_edge_mask,
             const std::vector<uint64_t> &trace_gathered_histograms,
             uint32_t trace_histogram_layer_count,
-            const std::vector<int32_t> &trace_owner_participants)
+            const std::vector<int32_t> &trace_owner_participants,
+            const DeviceMoERuntimeTable *trace_runtime_table)
         {
             static std::mutex trace_mutex;
             std::ostringstream out;
@@ -2096,11 +2098,158 @@ namespace llaminar2
                     appendJsonNumberField(out, command_first, "source_resident_mask", entry.source_resident_mask);
                     appendJsonNumberField(out, command_first, "flags", entry.flags);
                     appendJsonNumberField(out, command_first, "destination_slot", entry.destination_slot);
+                    appendJsonNumberField(
+                        out,
+                        command_first,
+                        "destination_previous_layer",
+                        entry.destination_previous_layer);
+                    appendJsonNumberField(
+                        out,
+                        command_first,
+                        "destination_previous_expert",
+                        entry.destination_previous_expert);
+                    appendJsonNumberField(
+                        out,
+                        command_first,
+                        "destination_generation",
+                        entry.destination_generation);
                     appendJsonNumberField(out, command_first, "payload_slot", entry.payload_slot);
                     out << '}';
                 }
             }
             out << ']';
+
+            /*
+             * A maintenance trace is an explicit diagnostic boundary at which
+             * the completion event has already been consumed. Record both RCU
+             * banks for only the logical experts named by the current command
+             * family. This lets a developer distinguish a malformed candidate
+             * publication from a later request-reset or prefix-restore rewrite
+             * without turning the host mirror into an inference authority.
+             */
+            if (trace_runtime_table)
+            {
+                if (!first)
+                    out << ',';
+                first = false;
+                out << "\"runtime_command_experts\":[";
+                bool first_runtime_expert = true;
+                for (uint32_t buffer = 0; buffer < command_headers.size(); ++buffer)
+                {
+                    const uint32_t header_count =
+                        command_headers[buffer].command_count;
+                    const uint32_t buffered_plan_count =
+                        buffer < plan_counts.size() ? plan_counts[buffer] : 0u;
+                    const uint32_t wave_count_for_buffer =
+                        buffer < wave_count
+                            ? controller_state.waves[buffer].command_count
+                            : 0u;
+                    const uint32_t command_count =
+                        std::min<uint32_t>(
+                            std::max({header_count,
+                                      buffered_plan_count,
+                                      wave_count_for_buffer}),
+                            plan_capacity);
+                    for (uint32_t entry_index = 0;
+                         entry_index < command_count;
+                         ++entry_index)
+                    {
+                        const size_t flat_index =
+                            static_cast<size_t>(buffer) *
+                                static_cast<size_t>(plan_capacity) +
+                            static_cast<size_t>(entry_index);
+                        if (flat_index >= plan_entries.size())
+                            break;
+                        const auto &entry = plan_entries[flat_index];
+                        if (entry.op == 0u ||
+                            entry.layer >= static_cast<uint32_t>(
+                                               trace_runtime_table->layerCount()) ||
+                            entry.expert >= static_cast<uint32_t>(
+                                                trace_runtime_table->expertCount()))
+                        {
+                            continue;
+                        }
+
+                        const auto &runtime =
+                            trace_runtime_table->hostLayerState(
+                                static_cast<int>(entry.layer));
+                        if (!first_runtime_expert)
+                            out << ',';
+                        first_runtime_expert = false;
+                        out << '{';
+                        bool runtime_first = true;
+                        appendJsonNumberField(
+                            out, runtime_first, "buffer_slot", buffer);
+                        appendJsonNumberField(
+                            out,
+                            runtime_first,
+                            "entry_index",
+                            entry_index);
+                        appendJsonNumberField(
+                            out, runtime_first, "layer", entry.layer);
+                        appendJsonNumberField(
+                            out, runtime_first, "expert", entry.expert);
+                        appendJsonNumberField(
+                            out,
+                            runtime_first,
+                            "active_bank",
+                            runtime.active_bank);
+                        appendJsonNumberField(
+                            out,
+                            runtime_first,
+                            "active_epoch",
+                            runtime.active_epoch);
+                        for (uint32_t bank_index = 0u;
+                             bank_index < 2u;
+                             ++bank_index)
+                        {
+                            const auto &bank = runtime.banks[bank_index];
+                            const auto &descriptor =
+                                bank.experts[entry.expert];
+                            const std::string prefix =
+                                "bank" + std::to_string(bank_index) + "_";
+                            appendJsonNumberField(
+                                out,
+                                runtime_first,
+                                (prefix + "epoch").c_str(),
+                                bank.epoch);
+                            appendJsonNumberField(
+                                out,
+                                runtime_first,
+                                (prefix + "owner").c_str(),
+                                descriptor.owner_participant);
+                            appendJsonNumberField(
+                                out,
+                                runtime_first,
+                                (prefix + "local_slot").c_str(),
+                                descriptor.local_slot);
+                            appendJsonNumberField(
+                                out,
+                                runtime_first,
+                                (prefix + "flags").c_str(),
+                                descriptor.flags);
+                            appendJsonNumberField(
+                                out,
+                                runtime_first,
+                                (prefix + "local_compute").c_str(),
+                                static_cast<unsigned int>(
+                                    bank.local_compute_mask[entry.expert]));
+                            appendJsonNumberField(
+                                out,
+                                runtime_first,
+                                (prefix + "resident_mask").c_str(),
+                                bank.resident_participant_mask[entry.expert]);
+                            appendJsonNumberField(
+                                out,
+                                runtime_first,
+                                (prefix + "route_participant").c_str(),
+                                bank.overlay_route_participant[entry.expert]);
+                        }
+                        out << '}';
+                    }
+                }
+                out << ']';
+            }
             appendJsonNumberField(out, first, "noop_command_entries", noop_command_entries);
             out << "}\n";
 
@@ -4276,7 +4425,7 @@ namespace llaminar2
     DeviceGraphOrchestrator::DeviceGraphOrchestrator(
         Dependencies deps)
         : graph_builder_(std::move(deps.graph_builder)),
-          mpi_ctx_(nullptr), // No direct MPI context - use injected topology
+          mpi_ctx_(std::move(deps.mpi_ctx)),
           cache_config_(deps.cache_config),
           injected_model_ctx_(std::move(deps.model_ctx)),
           injected_topology_(std::move(deps.topology)),
@@ -4290,7 +4439,9 @@ namespace llaminar2
           weight_manager_(std::move(deps.weight_manager)),
           weight_placement_map_(std::move(deps.weight_placement_map)),
           tp_config_(std::move(deps.tp_config)),
-          domain_config_(std::move(deps.domain_config))
+          domain_config_(std::move(deps.domain_config)),
+          reusable_execution_workspaces_(
+              std::move(deps.reusable_execution_workspaces))
     {
         if (!injected_model_ctx_)
         {
@@ -4300,6 +4451,12 @@ namespace llaminar2
         if (!graph_builder_)
         {
             throw std::invalid_argument("DeviceGraphOrchestrator Dependencies requires a valid graph_builder");
+        }
+
+        if (mpi_ctx_ && injected_topology_)
+        {
+            throw std::invalid_argument(
+                "DeviceGraphOrchestrator Dependencies cannot provide both mpi_ctx and topology authorities");
         }
 
         graph_builder_->setCPUCurrentBatchLLEPPhysicalExecutor(this);
@@ -4314,10 +4471,14 @@ namespace llaminar2
         if (!domain_tp_contexts_.empty())
             tp_contexts_initialized_ = true;
 
-        // Propagate MPI rank to executor for stage dumping (from injected topology)
+        // Propagate the one distributed rank authority to stage diagnostics.
         if (injected_topology_)
         {
             executor_.setMPIRank(injected_topology_->rank());
+        }
+        else if (mpi_ctx_)
+        {
+            executor_.setMPIRank(mpi_ctx_->rank());
         }
 
         // Wire CollectiveContext to executor for GPU-native collectives (RCCL/NCCL/HOST)
@@ -4338,6 +4499,7 @@ namespace llaminar2
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Initialized with dependencies, caching="
                   << (cache_config_.enabled ? "enabled" : "disabled")
+                  << ", mpi_context=" << (mpi_ctx_ ? "provided" : "none")
                   << ", topology=" << (injected_topology_ ? "provided" : "none")
                   << ", collective=" << (injected_collective_ctx_ ? "provided" : "none")
                   << ", turboquant=" << (turboquant_ctx_ ? "provided" : "none")
@@ -4390,6 +4552,43 @@ namespace llaminar2
          */
         clearPendingLivePrefixMutationReady();
         retirePendingPrefixPayloadUses(/*wait_for_all=*/true);
+
+        /* Runtime-table producer events must close while the exact graph
+         * streams they name still belong to live device contexts. This typed
+         * edge deliberately precedes graph/context destruction; relying on
+         * reverse member order left Dynamic teardown with stale HIP handles. */
+        retireGraphBorrowedExecutionStreamsBeforeTopologyRelease();
+
+        /*
+         * Event retirement proves that no device work can still dereference an
+         * arena pointer.  Destroy the executable topology while the arena is
+         * nevertheless still its valid backing owner: HIP may defer a free for
+         * memory embedded by a live graph, which would make the next runner pay
+         * for both the old and new arena even though the old pointer has left
+         * Llaminar's allocation registry.
+         */
+        destroyCapturedExecutionTopologyBeforeArenaRelease();
+
+        /*
+         * Captured executables were the final borrowers of named workspace
+         * pointers. Only now may the allocator discard its publication map and
+         * expose the unchanged primary allocation to another runner. The
+         * registry retains failure state so OrchestrationRunner can invalidate
+         * the enclosing model-context contract after this destructor returns.
+         */
+        if (reusable_workspace_lease_)
+        {
+            std::string reuse_error;
+            if (!reusable_workspace_lease_->publishReusable(&reuse_error))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Could not seal reusable execution workspace on "
+                    << state_.device_id.toString() << ": "
+                    << (reuse_error.empty()
+                            ? std::string("unknown workspace lifecycle failure")
+                            : reuse_error));
+            }
+        }
     }
 
     void DeviceGraphOrchestrator::retirePublishedDeviceWorkBeforeArenaRelease() noexcept
@@ -4590,6 +4789,130 @@ namespace llaminar2
                                  submission.state()));
                 std::terminate();
             }
+        }
+    }
+
+    void DeviceGraphOrchestrator::
+        retireGraphBorrowedExecutionStreamsBeforeTopologyRelease() noexcept
+    {
+        if (!graph_builder_)
+            return;
+
+        try
+        {
+            graph_builder_->retireBorrowedExecutionStreams(
+                state_.device_id);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Could not retire graph-borrowed execution streams before topology release on "
+                << state_.device_id.toString() << ": " << error.what());
+            std::terminate();
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Could not retire graph-borrowed execution streams before topology release on "
+                << state_.device_id.toString() << ": unknown exception");
+            std::terminate();
+        }
+    }
+
+    void DeviceGraphOrchestrator::destroyCapturedExecutionTopologyBeforeArenaRelease() noexcept
+    {
+        try
+        {
+            /*
+             * The generation controller embeds borrowed child-capture
+             * identities.  Retire that parent first so no surviving native
+             * executable names a child while the child family is destroyed.
+             */
+            mtp_device_generation_loop_graph_.release();
+
+            if (forward_engine_)
+                forward_engine_->discardAllCachedGraphs();
+
+            for (auto &cache : layer_graph_cache_)
+                cache.invalidate();
+
+            mtp_sidecar_depth0_cache_.invalidate();
+            mtp_sidecar_depth0_device_token_cache_.invalidate();
+            mtp_sidecar_depth0_chained_cache_.invalidate();
+            mtp_sidecar_depth0_chained_device_token_cache_.invalidate();
+            mtp_sidecar_depth0_kv_only_cache_.invalidate();
+            mtp_sidecar_depth0_kv_only_device_token_cache_.invalidate();
+            for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
+            {
+                if (cache)
+                    cache->invalidate();
+            }
+
+            mtp_terminal_hidden_row_select_cache_.invalidate();
+            mtp_terminal_hidden_rows_select_cache_.invalidate();
+            for (auto &cache :
+                 mtp_terminal_hidden_contiguous_rows_select_caches_)
+            {
+                if (cache)
+                    cache->invalidate();
+            }
+            for (auto &cache :
+                 mtp_terminal_hidden_device_accepted_rows_select_caches_)
+            {
+                if (cache)
+                    cache->invalidate();
+            }
+            for (auto &cache :
+                 mtp_terminal_hidden_request_rows_select_caches_)
+            {
+                if (cache)
+                    cache->invalidate();
+            }
+            for (auto &cache :
+                 mtp_shifted_prefill_hidden_rows_select_caches_)
+            {
+                if (cache)
+                    cache->invalidate();
+            }
+
+            mtp_speculative_state_publication_graph_.invalidate();
+            for (auto &cache : mtp_draft_token_publication_graphs_)
+            {
+                if (cache)
+                    cache->invalidate();
+            }
+            for (auto &cache : mtp_verifier_preparation_graphs_)
+            {
+                if (cache)
+                    cache->invalidate();
+            }
+            mtp_stochastic_serial_outcome_graph_.invalidate();
+            mtp_stochastic_target_distribution_graph_.invalidate();
+            moe_overlay_epoch_acquire_graph_.invalidate();
+            moe_overlay_epoch_release_graph_.invalidate();
+            device_moe_rebalance_maintenance_graph_.invalidate();
+
+            last_mirrored_layer_checkpoint_prefix_.clear();
+
+            /*
+             * Graph caches own captures/streams created from these contexts.
+             * Context destruction is therefore the final topology transition,
+             * immediately before the caller may release arena storage.
+             */
+            device_contexts_.clear();
+        }
+        catch (const std::exception &exception)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Captured execution topology teardown threw before arena release: "
+                << exception.what());
+            std::terminate();
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Captured execution topology teardown threw an unknown exception before arena release");
+            std::terminate();
         }
     }
 
@@ -4967,7 +5290,31 @@ namespace llaminar2
 
     uint64_t DeviceGraphOrchestrator::moeRuntimeMovementEpoch() const
     {
-        return std::max(moePlacementEpoch(), moe_runtime_movement_epoch_);
+        uint64_t epoch =
+            std::max(moePlacementEpoch(), moe_runtime_movement_epoch_);
+        if (!graph_builder_)
+            return epoch;
+
+        const auto &authority = graph_builder_->config()
+                                    .moe
+                                    .expert_overlay_residency_authority;
+        if (!authority)
+            return epoch;
+
+        /*
+         * A heterogeneous ExpertOverlay has one host-side RCU authority.  Its
+         * immutable publication is the live placement value; copying that
+         * epoch into a device-owned shadow would create a second authority and
+         * a coherence race.  Prefix lookup and diagnostics instead sample the
+         * current RCU snapshot directly at the request boundary.
+         */
+        const auto snapshot = authority->snapshot();
+        if (!snapshot || !snapshot->valid())
+        {
+            throw std::logic_error(
+                "ExpertOverlay runtime movement epoch has no valid authoritative snapshot");
+        }
+        return std::max(epoch, snapshot->epoch);
     }
 
     std::string DeviceGraphOrchestrator::prefillGraphDomainId() const
@@ -5537,7 +5884,7 @@ namespace llaminar2
             {
                 missing.emplace_back("output.weight");
             }
-            if (graph_config.mtp.enabled &&
+            if (retainsMTPGraphCapacity(graph_config.mtp) &&
                 requires_full_replicated_dense &&
                 owns_lm_head_stage &&
                 (weight_bindings.mtp.empty() || weight_bindings.mtp.depths.empty()))
@@ -6065,7 +6412,7 @@ namespace llaminar2
          * from scalar decode to grouped verification cannot replace that
          * address underneath an already-cached stage.
          */
-        if (config.mtp.enabled)
+        if (retainsMTPGraphCapacity(config.mtp))
         {
             const size_t terminal_hidden_row_capacity =
                 static_cast<size_t>(
@@ -6311,18 +6658,15 @@ namespace llaminar2
                 static_cast<size_t>(
                     stochastic_batch_output_request_capacity_));
             /*
-             * A dynamic SWITCH parent duplicates the common verifier/publication
-             * tail in every legal branch because CUDA conditional graphs may not
-             * execute a common tail after an invalid selector. Reserve the full
-             * depth-1-through-depth-D inventory here. The largest branch has one
-             * optional maintenance fragment plus the mandatory acquire/release
-             * pair used by ExpertOverlay, so the exact upper bound is
-             * sum(2*d + 9) = D * (D + 10). Non-overlay parents simply leave the
-             * two reserved entries unused.
+             * Reserve the complete retained branch family through the same
+             * typed authority used by graph-driver memory admission. This
+             * scratch owns references to the physical CUDA conditional/HIP
+             * ticket fragments; a divergent local formula would make one of
+             * those two owners understate the production family.
              */
             const size_t device_generation_dynamic_fragment_capacity =
-                static_cast<size_t>(mtp_max_draft_depth_) *
-                static_cast<size_t>(mtp_max_draft_depth_ + 10);
+                resolveMTPRetainedDeviceGenerationFragmentCapacity(
+                    mtp_max_draft_depth_);
             mtp_device_generation_loop_fragment_scratch_.clear();
             mtp_device_generation_loop_fragment_scratch_.reserve(
                 device_generation_dynamic_fragment_capacity);
@@ -6546,7 +6890,7 @@ namespace llaminar2
          * the same immutable-owner lifetime even though only GPU needs an
          * explicit device-storage allocation here.
          */
-        if (graph_builder_->config().mtp.enabled)
+        if (retainsMTPGraphCapacity(graph_builder_->config().mtp))
         {
             if (!arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
             {
@@ -6588,7 +6932,7 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to resolve the persistent MTP terminal-hidden archive");
                 return false;
             }
-            state_.mtp_terminal_hidden_current = false;
+            state_.mtp_terminal_hidden_publication.invalidate();
         }
 
         /*
@@ -6604,7 +6948,7 @@ namespace llaminar2
          * absent from the schema and therefore intentionally skipped here.
          */
         if (state_.device_id.is_gpu() &&
-            graph_builder_->config().mtp.enabled)
+            retainsMTPGraphCapacity(graph_builder_->config().mtp))
         {
             constexpr std::array<BufferId, 22> kMTPGraphTensorFamily{
                 BufferId::MTP_EMBEDDING,
@@ -6847,11 +7191,17 @@ namespace llaminar2
                 make_request_input_event();
             mtp_graph_build_device_state_ready_.event =
                 make_request_input_event();
+            moe_overlay_initial_runtime_source_ready_event_ =
+                make_request_input_event();
+            moe_overlay_initial_runtime_published_event_ =
+                make_request_input_event();
             if (!request_input_admission_ready_.event ||
                 !request_input_reuse_ready_.event ||
                 !request_state_reset_ready_.event ||
                 !main_graph_build_device_state_ready_.event ||
                 !mtp_graph_build_device_state_ready_.event ||
+                !moe_overlay_initial_runtime_source_ready_event_ ||
+                !moe_overlay_initial_runtime_published_event_ ||
                 !device_generation_state_ready_.event)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to preallocate request-boundary and graph-build ordering events");
@@ -7874,8 +8224,16 @@ namespace llaminar2
                     "DeviceGraphOrchestrator buffer retirement left an ExpertOverlay epoch lease active: ") +
                 moeOverlayEpochLeaseStateName(lease_state));
         }
-        moe_overlay_epoch_acquire_graph_.invalidate();
-        moe_overlay_epoch_release_graph_.invalidate();
+
+        /*
+         * Every native executable embeds arena addresses.  Destroy the whole
+         * parent/child topology before arena_.reset(); freeing the arena first
+         * lets HIP defer its physical release behind those live graph owners,
+         * which makes a subsequently constructed runner allocate a second
+         * complete workspace family against the same VRAM.
+         */
+        destroyCapturedExecutionTopologyBeforeArenaRelease();
+
         moe_overlay_epoch_acquired_event_.reset();
         moe_overlay_epoch_released_event_.reset();
         moe_overlay_epoch_acquire_producer_stream_ = nullptr;
@@ -7887,7 +8245,6 @@ namespace llaminar2
             arena_.reset();
             LOG_DEBUG("[DeviceGraphOrchestrator] BufferArena released");
         }
-        device_moe_rebalance_maintenance_graph_.invalidate();
 
         owned_buffers_.clear();
 
@@ -8161,11 +8518,112 @@ namespace llaminar2
             // participant-local producer/release timeline to the controller.
             binding.inference_boundary = const_cast<
                 DeviceGraphOrchestrator *>(this);
+            binding.initial_runtime_publisher = const_cast<
+                DeviceGraphOrchestrator *>(this);
         }
         return binding.valid()
                    ? std::vector<MoEOverlayDeviceControllerRuntimeBinding>{
                          binding}
                    : std::vector<MoEOverlayDeviceControllerRuntimeBinding>{};
+    }
+
+    bool DeviceGraphOrchestrator::publishMoEOverlayDeviceInitialRuntime(
+        void *controller_stream)
+    {
+        if (!state_.device_id.is_gpu() || !controller_stream ||
+            !graph_builder_ ||
+            !moe_overlay_initial_runtime_source_ready_event_ ||
+            !moe_overlay_initial_runtime_published_event_)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay initial runtime "
+                "publication has incomplete device, stream, graph, or event ownership");
+            return false;
+        }
+
+        IBackend *const backend = getBackendFor(state_.device_id);
+        if (!backend)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay initial runtime "
+                "publication cannot resolve its GPU backend");
+            return false;
+        }
+        const auto edge = DeviceEventEdge::at(
+                              DeviceTimelinePoint::
+                                  MoEOverlayInitialRuntimeReady)
+                              .from(
+                                  DeviceTimelineRole::
+                                      MoEOverlayRuntimePublication);
+
+        if (moe_overlay_initial_runtime_published_)
+        {
+            if (!moe_overlay_initial_runtime_publication_stream_ ||
+                !edge.to(DeviceTimelineRole::MoERebalanceMaintenance)
+                     .enqueueWait(
+                         *backend,
+                         state_.device_id,
+                         moe_overlay_initial_runtime_published_event_.get(),
+                         moe_overlay_initial_runtime_publication_stream_,
+                         controller_stream))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay could not order "
+                    "a replacement controller after its published initial runtime");
+                return false;
+            }
+            return true;
+        }
+
+        void *const graph_build_stream = explicitGPUStreamForOperation(
+            "moe_overlay_initial_runtime_source");
+        if (!graph_build_stream ||
+            !edge.publish(
+                *backend,
+                state_.device_id,
+                moe_overlay_initial_runtime_source_ready_event_.get(),
+                graph_build_stream) ||
+            !edge.to(DeviceTimelineRole::MoEOverlayRuntimePublication)
+                 .enqueueWait(
+                     *backend,
+                     state_.device_id,
+                     moe_overlay_initial_runtime_source_ready_event_.get(),
+                     graph_build_stream,
+                     controller_stream))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay could not join its "
+                "graph-build runtime producer to the controller stream");
+            return false;
+        }
+
+        if (!graph_builder_->finalizeMoEOverlayDeviceControllerRuntime(
+                state_.device_id,
+                controller_stream) ||
+            !edge.publish(
+                *backend,
+                state_.device_id,
+                moe_overlay_initial_runtime_published_event_.get(),
+                controller_stream))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay could not publish "
+                "the complete retained-layer runtime family");
+            return false;
+        }
+
+        moe_overlay_initial_runtime_publication_stream_ = controller_stream;
+        moe_overlay_initial_runtime_published_ = true;
+        PerfStatsCollector::addCounter(
+            "moe_overlay_controller",
+            "initial_runtime_publications",
+            1.0,
+            "model_setup",
+            state_.device_id.toString(),
+            {{"source", "continuation_graph_builder"},
+             {"ordering", "event_wait"},
+             {"blocking", "false"}});
+        return true;
     }
 
     bool DeviceGraphOrchestrator::installMoEOverlayTransferProgressEpoch(
@@ -8883,6 +9341,7 @@ namespace llaminar2
         };
 
         DeviceMoERebalanceStatus status{};
+        DeviceMoETransferSlotClaimIndex transfer_slot_claim_index{};
         DeviceMoERebalanceGraphControllerState controller_state{};
         DeviceMoERebalanceApplyStatus copy_status{};
         DeviceMoERebalanceApplyStatus apply_status{};
@@ -8917,6 +9376,12 @@ namespace llaminar2
             if (!copy_required(&controller_state,
                                buffer_name(MoEDeviceRebalanceStage::WS_CONTROLLER_STATE),
                                sizeof(controller_state)) ||
+                !copy_required(
+                    &transfer_slot_claim_index,
+                    buffer_name(
+                        MoEDeviceRebalanceStage::
+                            WS_TRANSFER_SLOT_CLAIM_INDEX),
+                    sizeof(transfer_slot_claim_index)) ||
                 !copy_required(command_headers.data(),
                                buffer_name(MoEDeviceRebalanceStage::WS_COMMAND_HEADER),
                                command_headers.size() * sizeof(command_headers.front())) ||
@@ -9017,6 +9482,23 @@ namespace llaminar2
                  apply_status.version == kDeviceMoERebalanceVersion);
             outcome->status_code = status.status_code;
             outcome->invalid_runtime_layers = status.invalid_runtime_layers;
+            outcome->first_invalid_runtime_layer =
+                transfer_slot_claim_index.first_invalid_runtime_layer;
+            outcome->first_invalid_runtime_active_bank =
+                transfer_slot_claim_index
+                    .first_invalid_runtime_active_bank;
+            outcome->first_invalid_runtime_active_epoch =
+                transfer_slot_claim_index
+                    .first_invalid_runtime_active_epoch;
+            outcome->first_invalid_runtime_expert_count =
+                transfer_slot_claim_index
+                    .first_invalid_runtime_expert_count;
+            outcome->first_invalid_runtime_participant_id =
+                transfer_slot_claim_index
+                    .first_invalid_runtime_participant_id;
+            outcome->first_invalid_runtime_participant_count =
+                transfer_slot_claim_index
+                    .first_invalid_runtime_participant_count;
             outcome->plan_overflow = status.plan_overflow;
             outcome->capacity_limited_candidates =
                 status.capacity_limited_candidates;
@@ -9892,6 +10374,17 @@ namespace llaminar2
 
         if (export_trace)
         {
+            DeviceMoERuntimeTable *trace_runtime_table =
+                dynamic_cast<DeviceMoERuntimeTable *>(
+                    params.moe_runtime_table);
+            if (trace_runtime_table)
+            {
+                /* Trace export already owns the completed maintenance stream.
+                 * This D2H is diagnostic-only and never participates in the
+                 * placement or request lifecycle. */
+                trace_runtime_table->syncRuntimeStateToHost(
+                    maintenance_stream);
+            }
             if (!appendDeviceMoERebalanceTraceJsonl(
                     trace_path,
                     device_key,
@@ -9915,7 +10408,8 @@ namespace llaminar2
                     transfer_payload_edge_mask,
                     trace_gathered_histograms,
                     trace_histogram_layer_count,
-                    trace_owner_participants))
+                    trace_owner_participants,
+                    trace_runtime_table))
             {
                 return false;
             }
@@ -10265,6 +10759,18 @@ namespace llaminar2
                     << " status_valid=" << outcome.valid
                     << " status_code=" << outcome.status_code
                     << " invalid_runtime_layers=" << outcome.invalid_runtime_layers
+                    << " first_invalid_runtime_layer="
+                    << outcome.first_invalid_runtime_layer
+                    << " first_invalid_runtime_active_bank="
+                    << outcome.first_invalid_runtime_active_bank
+                    << " first_invalid_runtime_active_epoch="
+                    << outcome.first_invalid_runtime_active_epoch
+                    << " first_invalid_runtime_expert_count="
+                    << outcome.first_invalid_runtime_expert_count
+                    << " first_invalid_runtime_participant_id="
+                    << outcome.first_invalid_runtime_participant_id
+                    << " first_invalid_runtime_participant_count="
+                    << outcome.first_invalid_runtime_participant_count
                     << " plan_overflow=" << outcome.plan_overflow
                     << " capacity_limited_candidates="
                     << outcome.capacity_limited_candidates
@@ -11988,6 +12494,7 @@ namespace llaminar2
                 moeOverlayDeviceControllerRuntimeBindings();
             if (bindings.size() != 1u ||
                 !bindings.front().backgroundPublicationValid() ||
+                !bindings.front().initialRuntimePublicationValid() ||
                 bindings.front().device != state_.device_id ||
                 bindings.front().inference_boundary != this)
             {
@@ -14241,9 +14748,65 @@ namespace llaminar2
             exact_serial_participants)
     {
         const auto &config = graph_builder_->config();
+        /*
+         * Execution enablement and retained setup capacity are deliberately
+         * different policies. A runner may keep MTP execution disabled while
+         * reserving a wider graph family for a later model-context lease. Use
+         * the canonical retained-capacity predicate for every workspace
+         * contributor; consulting `enabled` here would make the first runner
+         * under-allocate the model-lifetime backing block even though memory
+         * admission already charged the complete declared envelope.
+         */
+        const bool retains_mtp_graph_capacity =
+            retainsMTPGraphCapacity(config.mtp);
         if (!workspace_allocator_)
         {
-            workspace_allocator_ = std::make_unique<WorkspaceAllocator>();
+            if (reusable_execution_workspaces_ && state_.device_id.is_gpu())
+            {
+                const int first_layer = pp_stage_config_.has_value()
+                                            ? pp_stage_config_->first_layer
+                                            : std::max(0, config.pp_layer_offset);
+                const int last_layer = pp_stage_config_.has_value()
+                                           ? pp_stage_config_->last_layer - 1
+                                           : first_layer +
+                                                 std::max(1, config.n_layers) - 1;
+                const int tp_degree = config.tp_ctx
+                                          ? std::max(1, config.tp_ctx->degree())
+                                          : 1;
+                const ReusableExecutionWorkspaceKey key{
+                    .device = state_.device_id,
+                    .first_layer = first_layer,
+                    .last_layer = last_layer,
+                    .tensor_parallel_participant =
+                        std::max(0, config.tp_device_idx),
+                    .tensor_parallel_degree = tp_degree,
+                    .owns_embedding = !pp_stage_config_.has_value() ||
+                                      pp_stage_config_->has_embedding,
+                    .owns_terminal_head = !pp_stage_config_.has_value() ||
+                                          pp_stage_config_->has_lm_head,
+                };
+                std::string acquire_error;
+                reusable_workspace_lease_ =
+                    reusable_execution_workspaces_->acquire(
+                        key, &acquire_error);
+                if (!reusable_workspace_lease_)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Could not acquire reusable execution workspace for "
+                        << state_.device_id.toString() << ": "
+                        << (acquire_error.empty()
+                                ? std::string("unknown workspace ownership failure")
+                                : acquire_error));
+                    return false;
+                }
+                workspace_allocator_ =
+                    reusable_workspace_lease_->allocator();
+            }
+            else
+            {
+                workspace_allocator_ =
+                    std::make_shared<WorkspaceAllocator>();
+            }
         }
 
         const uint64_t workspace_generation_before =
@@ -14286,7 +14849,7 @@ namespace llaminar2
         }
         if (graph_family_policy !=
                 WorkspaceGraphFamilyPolicy::ExclusiveLifetime &&
-            config.mtp.enabled)
+            retains_mtp_graph_capacity)
         {
             hints.serial_family_max_compact_rows =
                 std::max(1, mtp_max_verifier_rows_) *
@@ -14351,7 +14914,7 @@ namespace llaminar2
                 });
             }
         }
-        if (state_.device_id.is_gpu() && config.mtp.enabled)
+        if (state_.device_id.is_gpu() && retains_mtp_graph_capacity)
         {
             /*
              * Verifier metadata is a configured graph-family participant, not a
@@ -14433,24 +14996,24 @@ namespace llaminar2
         // transfers. Reclaim happens after the first successful prefill instead.
     }
 
-    void DeviceGraphOrchestrator::adviseMmapDontneedAfterFirstPrefill()
+    void DeviceGraphOrchestrator::scheduleMmapReclaimAfterFirstPrefill()
     {
-        if (mmap_dontneed_advised_ || !weight_manager_)
+        if (!weight_manager_)
             return;
 
-        mmap_dontneed_advised_ = true;
         /*
          * WeightManager reaches inference only after DeviceLoadPipeline has
          * drained every H2D and repack stream. Runtime graph execution consumes
          * the resulting device allocations, never the mmap source pages.
-         * Reclaiming those host pages therefore has no dependency on the
-         * current inference stream and must not synchronize the device.
+         * Publish reclaim to its prestarted owner worker; this authority thread
+         * performs no host unregistration, page advice, or synchronization.
          */
+        const auto submission = weight_manager_->scheduleMmapReclaim();
         if (debugEnv().vram_trace)
-            LOG_TRACE("[VRAM_TRACE] mmap_release.before_advise phase=after_first_prefill");
-        const size_t advised_bytes = weight_manager_->adviseMmapDontneed();
-        if (debugEnv().vram_trace)
-            LOG_TRACE("[VRAM_TRACE] mmap_release.after_advise phase=after_first_prefill bytes=" << advised_bytes);
+        {
+            LOG_TRACE("[VRAM_TRACE] mmap_reclaim phase=after_first_prefill submission="
+                      << MmapReclaimLifecycle::toString(submission));
+        }
     }
 
     bool DeviceGraphOrchestrator::executeAttention(
@@ -14800,60 +15363,13 @@ namespace llaminar2
 
     void DeviceGraphOrchestrator::invalidateExecutionCaches()
     {
-        // Clear graph caches
-        for (auto &cache : layer_graph_cache_)
-        {
-            cache.invalidate();
-        }
-
-        // Clear forward graph caches
-        if (forward_engine_)
-            forward_engine_->discardAllCachedGraphs();
-        mtp_sidecar_depth0_cache_.invalidate();
-        mtp_sidecar_depth0_device_token_cache_.invalidate();
-        mtp_sidecar_depth0_chained_cache_.invalidate();
-        mtp_sidecar_depth0_chained_device_token_cache_.invalidate();
-        mtp_sidecar_depth0_kv_only_cache_.invalidate();
-        mtp_sidecar_depth0_kv_only_device_token_cache_.invalidate();
-        for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
-            cache->invalidate();
-        mtp_terminal_hidden_row_select_cache_.invalidate();
-        mtp_terminal_hidden_rows_select_cache_.invalidate();
-        for (auto &cache :
-             mtp_terminal_hidden_contiguous_rows_select_caches_)
-        {
-            if (cache)
-                cache->invalidate();
-        }
-        for (auto &cache :
-             mtp_terminal_hidden_device_accepted_rows_select_caches_)
-        {
-            if (cache)
-                cache->invalidate();
-        }
-        for (auto &cache :
-             mtp_terminal_hidden_request_rows_select_caches_)
-        {
-            if (cache)
-                cache->invalidate();
-        }
-        for (auto &cache :
-             mtp_shifted_prefill_hidden_rows_select_caches_)
-        {
-            if (cache)
-                cache->invalidate();
-        }
-        for (auto &cache : mtp_verifier_preparation_graphs_)
-        {
-            if (cache)
-                cache->invalidate();
-        }
-        mtp_device_generation_loop_graph_.invalidateGraph();
-        last_mirrored_layer_checkpoint_prefix_.clear();
-        device_moe_rebalance_maintenance_graph_.invalidate();
-
-        // Clear device contexts
-        device_contexts_.clear();
+        /*
+         * Use the same complete destructive transition as public buffer release
+         * and object teardown.  Keeping one inventory prevents a newly added
+         * MTP/controller graph from silently outliving the arena merely because
+         * one reset path forgot to name it.
+         */
+        destroyCapturedExecutionTopologyBeforeArenaRelease();
 
         // Reset state
         last_pos_offset_ = -1;
@@ -15563,7 +16079,7 @@ namespace llaminar2
             logKVCacheBom("main", device, state_.kv_cache.get(), batch_size);
         }
 
-        if (config.mtp.enabled)
+        if (retainsMTPGraphCapacity(config.mtp))
         {
             if (pipeline_config_ && pipeline_config_->hasPP())
             {
@@ -15679,13 +16195,18 @@ namespace llaminar2
                 "strictly increasing, duplicate-free physical bucket ladder");
             return false;
         }
-        if (!state_.isInitialized() || !hasGlobalWeights() ||
-            !state_.device_id.is_gpu() || !cache_config_.enabled ||
-            !debugEnv().execution.gpu_graphs)
+        if (!state_.isInitialized() || !hasGlobalWeights())
         {
             LOG_ERROR(
                 "[DeviceGraphOrchestrator] Serving graph setup requires a "
-                "fully initialized GPU runner with native graph caching enabled");
+                "fully initialized runner with model weights");
+            return false;
+        }
+        if (serving_graph_family_lifecycle_ ==
+            ServingGraphFamilyLifecycle::Sealed)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Serving graph family is already sealed; its setup inventory is immutable");
             return false;
         }
         if (moe_overlay_inference_transaction_coordinator_ ||
@@ -15712,7 +16233,8 @@ namespace llaminar2
             return false;
         }
         if (normalized_buckets.back() > residentGraphRows() ||
-            normalized_buckets.back() > prefill_chunk_row_capacity_)
+            (state_.device_id.is_gpu() &&
+             normalized_buckets.back() > prefill_chunk_row_capacity_))
         {
             LOG_ERROR(
                 "[DeviceGraphOrchestrator] Serving graph setup bucket exceeds "
@@ -15720,6 +16242,24 @@ namespace llaminar2
                 << " largest_bucket=" << normalized_buckets.back()
                 << " resident_rows=" << residentGraphRows()
                 << " chunk_rows=" << prefill_chunk_row_capacity_);
+            return false;
+        }
+        if (state_.device_id.is_gpu() &&
+            (!cache_config_.enabled ||
+             !debugEnv().execution.gpu_graphs))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Native device serving graph setup requires graph caching and GPU graphs to be enabled");
+            return false;
+        }
+
+        if (graph_builder_->config().prefix_cache.enabled &&
+            !ensurePrefixCacheReady())
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Serving graph setup could not "
+                "reserve its configured prefix-cache storage topology: "
+                << prefix_cache_bypass_reason_);
             return false;
         }
 
@@ -15738,6 +16278,36 @@ namespace llaminar2
             LOG_ERROR(
                 "[DeviceGraphOrchestrator] Serving graph setup could not materialize its complete workspace family");
             return false;
+        }
+
+        if (state_.device_id.is_cpu())
+        {
+            /*
+             * Host execution has no native executable to capture. The common
+             * workspace-family declaration above nevertheless builds every
+             * exact CPU stage topology (including grouped MTP and MoE),
+             * validates the frozen maximum-row envelope, and publishes its
+             * stable workspace allocation. Construct the long-lived eager
+             * engine now so admission certifies the same runtime owner that
+             * will build and execute request graphs. No model arithmetic, KV
+             * mutation, ticket publication, or synthetic inference occurs.
+             */
+            ensureForwardEngine();
+            serving_graph_family_lifecycle_ =
+                ServingGraphFamilyLifecycle::Sealed;
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "serving_graph_family_participant_completions",
+                1.0,
+                "setup",
+                state_.device_id.toString(),
+                {{"prefill_buckets",
+                  std::to_string(normalized_buckets.size())},
+                 {"main_decode_graphs", "1"},
+                 {"preparation_kind", "eager_host_graph"},
+                 {"request_state_mutations", "0"},
+                 {"executable_launches", "0"}});
+            return true;
         }
 
         ModelBuffers model_buffers = state_.toModelBuffers();
@@ -16089,6 +16659,8 @@ namespace llaminar2
                 << " background_dma_submissions="
                 << progress_stats.dma_submissions);
         }
+        serving_graph_family_lifecycle_ =
+            ServingGraphFamilyLifecycle::Sealed;
         return true;
     }
 
@@ -16156,6 +16728,13 @@ namespace llaminar2
             LOG_ERROR(
                 "[DeviceGraphOrchestrator] Refusing an invalid "
                 "heterogeneous ExpertOverlay graph-submission binding");
+            return false;
+        }
+        if (serving_graph_family_lifecycle_ !=
+            ServingGraphFamilyLifecycle::Sealed)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay transaction authority cannot be installed before the serving graph family is sealed");
             return false;
         }
         if (moe_overlay_inference_transaction_coordinator_ ||
@@ -17466,8 +18045,12 @@ namespace llaminar2
                                     ? 0
                                     : state_.positions[0];
         input.token_offset = input.position_offset;
+        const auto sparse_request_identity =
+            currentMoESparseRequestIdentity();
         input.moe_overlay_collective_generation_id =
-            moe_overlay_collective_request_generation_;
+            sparse_request_identity
+                ? sparse_request_identity->generation()
+                : 0;
         input.moe_overlay_collective_step_id =
             static_cast<uint64_t>(std::max(input.token_offset, 0));
         if (execution_role == ForwardExecutionRole::GroupedMTPVerifier)
@@ -17907,7 +18490,7 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Enabled GPU MTP prefill completed without its graph-integrated shifted-KV transaction");
                 return nullptr;
             }
-            state_.mtp_terminal_hidden_current = true;
+            state_.mtp_terminal_hidden_publication.publishMainForward();
             PerfStatsCollector::addCounter(
                 "mtp",
                 "shifted_prefill_integrated_graph_transactions",
@@ -17982,16 +18565,18 @@ namespace llaminar2
                 input.mtp_main_terminal_hidden.has_value() ||
                 (main_prefill && state_.device_id.is_cpu() &&
                  graph_builder_ && graph_builder_->config().mtp.enabled &&
-                 state_.mtp_terminal_hidden_current) ||
+                 state_.mtp_terminal_hidden_publication.current()) ||
                 (restored_prefix_mtp_decode_bridge &&
                  state_.device_id.is_cpu() && graph_builder_ &&
                  graph_builder_->config().mtp.enabled &&
-                 state_.mtp_terminal_hidden_current);
+                 state_.mtp_terminal_hidden_publication.current());
             noteMainForwardHiddenProducedForMTP(
                 seq_len,
                 batch_size,
                 std::move(last_forward_request_lengths),
-                terminal_hidden_archived);
+                terminal_hidden_archived
+                    ? MTPTerminalHiddenPublication::Source::MainForward
+                    : MTPTerminalHiddenPublication::Source::Unavailable);
         }
 
         // After first prefill, release host-resident weight data. Keep the host
@@ -18000,8 +18585,7 @@ namespace llaminar2
         if (release_host_resident_after_forward_ && !host_resident_released_ && seq_len > 1 && weight_manager_)
         {
             host_resident_released_ = true;
-            weight_manager_->releaseHostResidentWeightData();
-            adviseMmapDontneedAfterFirstPrefill();
+            scheduleMmapReclaimAfterFirstPrefill();
         }
 
         LOG_TRACE("[FORWARD_TRACE] seq_len=" << seq_len
@@ -18533,8 +19117,12 @@ namespace llaminar2
         input.real_seq_len = seq_len;
         input.position_offset = state_.positions[0];
         input.token_offset = state_.positions[0];
+        const auto sparse_request_identity =
+            currentMoESparseRequestIdentity();
         input.moe_overlay_collective_generation_id =
-            moe_overlay_collective_request_generation_;
+            sparse_request_identity
+                ? sparse_request_identity->generation()
+                : 0;
         input.moe_overlay_collective_step_id =
             static_cast<uint64_t>(std::max(input.token_offset, 0));
         input.device_state_publication_stream =
@@ -18616,7 +19204,10 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] GPU chunked prefill completed without its graph-integrated shifted-MTP transaction");
             return false;
         }
-        state_.mtp_terminal_hidden_current = mtp_enabled;
+        if (mtp_enabled)
+            state_.mtp_terminal_hidden_publication.publishMainForward();
+        else
+            state_.mtp_terminal_hidden_publication.invalidate();
         PerfStatsCollector::addCounter(
             "graph",
             "device_resident_prefill_chunk_transactions",
@@ -18653,7 +19244,10 @@ namespace llaminar2
             terminal_seq_len,
             1,
             {},
-            mtp_enabled && state_.mtp_terminal_hidden_current);
+            mtp_enabled &&
+                    state_.mtp_terminal_hidden_publication.current()
+                ? MTPTerminalHiddenPublication::Source::MainForward
+                : MTPTerminalHiddenPublication::Source::Unavailable);
 
         // The main captured graph has now consumed both ordinary and MTP
         // prefill weights. Host payload release therefore follows the exact
@@ -18661,8 +19255,7 @@ namespace llaminar2
         if (release_host_resident_after_forward_ && !host_resident_released_ && weight_manager_)
         {
             host_resident_released_ = true;
-            weight_manager_->releaseHostResidentWeightData();
-            adviseMmapDontneedAfterFirstPrefill();
+            scheduleMmapReclaimAfterFirstPrefill();
         }
 
         LOG_TRACE("[FORWARD_TRACE] chunk_schedule seq_len=" << seq_len
@@ -18674,7 +19267,8 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::ensureMTPTerminalHiddenBuffer(int min_rows)
     {
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        if (!graph_builder_ ||
+            !retainsMTPGraphCapacity(graph_builder_->config().mtp))
             return true;
         if (min_rows <= 0)
         {
@@ -19863,7 +20457,7 @@ namespace llaminar2
             {{"rows", std::to_string(row_count)}});
         if (seq_len <= 0)
             return false;
-        state_.mtp_terminal_hidden_current = false;
+        state_.mtp_terminal_hidden_publication.invalidate();
         if (row_count == 1 && !state_.device_id.is_gpu())
             return selectMTPTerminalHiddenRow(row_start, seq_len, stream);
         if (!state_.hidden)
@@ -19933,7 +20527,7 @@ namespace llaminar2
         {
             return false;
         }
-        state_.mtp_terminal_hidden_current = true;
+        state_.mtp_terminal_hidden_publication.publishMainForward();
         return true;
     }
 
@@ -19949,7 +20543,7 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] GPU terminal-hidden publication forbids host-authored row vectors; use a fixed-range or device-metadata graph");
             return false;
         }
-        state_.mtp_terminal_hidden_current = false;
+        state_.mtp_terminal_hidden_publication.invalidate();
         PerfStatsCollector::ScopedTimer timer(
             "mtp",
             "terminal_hidden_rows_select",
@@ -19991,7 +20585,7 @@ namespace llaminar2
         {
             return false;
         }
-        state_.mtp_terminal_hidden_current = true;
+        state_.mtp_terminal_hidden_publication.publishMainForward();
         return true;
     }
 
@@ -20003,7 +20597,7 @@ namespace llaminar2
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
-        state_.mtp_terminal_hidden_current = false;
+        state_.mtp_terminal_hidden_publication.invalidate();
         PerfStatsCollector::ScopedTimer timer(
             "mtp",
             "terminal_hidden_rows_select",
@@ -20130,7 +20724,7 @@ namespace llaminar2
             return false;
         }
 
-        state_.mtp_terminal_hidden_current = true;
+        state_.mtp_terminal_hidden_publication.publishMainForward();
         return true;
     }
 
@@ -20143,7 +20737,7 @@ namespace llaminar2
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
-        state_.mtp_terminal_hidden_current = false;
+        state_.mtp_terminal_hidden_publication.invalidate();
         PerfStatsCollector::ScopedTimer timer(
             "mtp",
             "terminal_hidden_rows_select",
@@ -20275,7 +20869,7 @@ namespace llaminar2
             return false;
         }
 
-        state_.mtp_terminal_hidden_current = true;
+        state_.mtp_terminal_hidden_publication.publishMainForward();
         PerfStatsCollector::addCounter(
             "mtp",
             "shifted_prefill_device_progress_hidden_publications",
@@ -20295,7 +20889,7 @@ namespace llaminar2
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
-        state_.mtp_terminal_hidden_current = false;
+        state_.mtp_terminal_hidden_publication.invalidate();
         PerfStatsCollector::ScopedTimer timer(
             "mtp",
             "terminal_hidden_rows_select",
@@ -20397,7 +20991,7 @@ namespace llaminar2
             return false;
         }
 
-        state_.mtp_terminal_hidden_current = true;
+        state_.mtp_terminal_hidden_publication.publishAcceptedVerifier();
         return true;
     }
 
@@ -20405,7 +20999,7 @@ namespace llaminar2
         int seq_len,
         int batch_size,
         std::vector<int> request_lengths,
-        bool terminal_hidden_archived)
+        MTPTerminalHiddenPublication::Source terminal_hidden_source)
     {
         state_.last_forward_seq_len = seq_len;
         state_.last_forward_batch_size = batch_size;
@@ -20416,7 +21010,15 @@ namespace llaminar2
                 seq_len);
         }
         state_.last_forward_request_lengths = std::move(request_lengths);
-        state_.mtp_terminal_hidden_current = terminal_hidden_archived;
+        if (terminal_hidden_source ==
+            MTPTerminalHiddenPublication::Source::MainForward)
+            state_.mtp_terminal_hidden_publication.publishMainForward();
+        else if (terminal_hidden_source ==
+                 MTPTerminalHiddenPublication::Source::Unavailable)
+            state_.mtp_terminal_hidden_publication.invalidate();
+        else
+            throw std::logic_error(
+                "Main-forward terminal-hidden publication received a non-main producer");
     }
 
     bool DeviceGraphOrchestrator::resolveMTPTerminalHiddenInput(
@@ -20430,7 +21032,8 @@ namespace llaminar2
         *terminal_hidden = nullptr;
         *terminal_hidden_buffer_id = BufferId::HIDDEN_STATE;
 
-        if (state_.prefix_terminal_hidden && state_.mtp_terminal_hidden_current)
+        if (state_.prefix_terminal_hidden &&
+            state_.mtp_terminal_hidden_publication.current())
         {
             *terminal_hidden = state_.prefix_terminal_hidden.get();
             *terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
@@ -20447,7 +21050,8 @@ namespace llaminar2
                           << (operation ? operation : "MTP sidecar"));
                 return false;
             }
-            if (!state_.prefix_terminal_hidden || !state_.mtp_terminal_hidden_current)
+            if (!state_.prefix_terminal_hidden ||
+                !state_.mtp_terminal_hidden_publication.current())
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] MTP terminal hidden refresh did not publish a current buffer for "
                           << (operation ? operation : "MTP sidecar"));
@@ -20468,7 +21072,8 @@ namespace llaminar2
                           << (operation ? operation : "MTP sidecar"));
                 return false;
             }
-            if (!state_.prefix_terminal_hidden || !state_.mtp_terminal_hidden_current)
+            if (!state_.prefix_terminal_hidden ||
+                !state_.mtp_terminal_hidden_publication.current())
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP terminal hidden refresh did not publish"
                           << " a current prefix buffer for "
@@ -20501,7 +21106,8 @@ namespace llaminar2
                               << (operation ? operation : "MTP sidecar"));
                     return false;
                 }
-                if (!state_.prefix_terminal_hidden || !state_.mtp_terminal_hidden_current)
+                if (!state_.prefix_terminal_hidden ||
+                    !state_.mtp_terminal_hidden_publication.current())
                 {
                     LOG_ERROR("[DeviceGraphOrchestrator] Single-row MTP terminal hidden refresh did not publish"
                               << " a current prefix buffer for "
@@ -20530,7 +21136,7 @@ namespace llaminar2
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
-        state_.mtp_terminal_hidden_current = false;
+        state_.mtp_terminal_hidden_publication.invalidate();
         PerfStatsCollector::ScopedTimer timer(
             "mtp",
             "terminal_hidden_refresh",
@@ -20645,7 +21251,11 @@ namespace llaminar2
             }
         }
 
-        state_.mtp_terminal_hidden_current = true;
+        /*
+         * Each selector publishes the mailbox at its exact producer boundary.
+         * Do not manufacture a second generation here: callers lease the
+         * selector's publication, not an administrative wrapper transition.
+         */
         return true;
     }
 
@@ -20653,7 +21263,8 @@ namespace llaminar2
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
-        if (state_.prefix_terminal_hidden && state_.mtp_terminal_hidden_current)
+        if (state_.prefix_terminal_hidden &&
+            state_.mtp_terminal_hidden_publication.current())
             return true;
         if (!state_.hidden ||
             state_.last_forward_seq_len <= 0 ||
@@ -20785,7 +21396,7 @@ namespace llaminar2
                     ? state_.device_id
                     : DeviceId::cpu());
         }
-        state_.mtp_terminal_hidden_current = true;
+        state_.mtp_terminal_hidden_publication.publishCheckpointRestore();
 
         if (publish_mailbox &&
             !publishMTPTerminalHiddenMailboxReady(
@@ -20889,7 +21500,7 @@ namespace llaminar2
                 seq_len,
                 stream);
         }
-        state_.mtp_terminal_hidden_current = false;
+        state_.mtp_terminal_hidden_publication.invalidate();
         PerfStatsCollector::ScopedTimer timer(
             "mtp",
             "terminal_hidden_row_select",
@@ -20912,7 +21523,7 @@ namespace llaminar2
         {
             return false;
         }
-        state_.mtp_terminal_hidden_current = true;
+        state_.mtp_terminal_hidden_publication.publishMainForward();
         return true;
     }
 
@@ -21111,6 +21722,119 @@ namespace llaminar2
         return true;
     }
 
+    std::optional<MoESparseRequestIdentity>
+    DeviceGraphOrchestrator::currentMoESparseRequestIdentity() const noexcept
+    {
+        const auto plan = graph_builder_
+                              ? graph_builder_->config()
+                                    .moe.routed_expert_plan
+                              : nullptr;
+        if (plan && plan->usesExpertOverlayAuthority())
+        {
+            return MoESparseRequestIdentity::expertOverlayRoot(
+                moe_overlay_collective_request_generation_);
+        }
+        return MoESparseRequestIdentity::localRequestState(session_epoch_);
+    }
+
+    std::optional<IComputeStage::MoEOverlayCollectiveRuntimeParams>
+    DeviceGraphOrchestrator::resolveMTPMoEOverlayCollectiveRuntimeParams(
+        const MoEOverlayInferenceParticipantGraphScope &graph_scope,
+        IComputeStage::MoEOverlayCollectiveRuntimeParams::ExecutionSemantics
+            execution_semantics,
+        std::optional<int> expected_transaction_draft_depth,
+        int sparse_graph_depth,
+        std::string *error) const
+    {
+        using RuntimeParams =
+            IComputeStage::MoEOverlayCollectiveRuntimeParams;
+        using Semantics = RuntimeParams::ExecutionSemantics;
+        const auto reject = [&](std::string reason)
+            -> std::optional<RuntimeParams>
+        {
+            if (error)
+                *error = std::move(reason);
+            return std::nullopt;
+        };
+        if (error)
+            error->clear();
+
+        if ((expected_transaction_draft_depth &&
+             *expected_transaction_draft_depth <= 0) ||
+            sparse_graph_depth < 0 ||
+            (execution_semantics != Semantics::MTPDraft &&
+             execution_semantics != Semantics::GroupedVerifier) ||
+            (execution_semantics == Semantics::GroupedVerifier &&
+             (!expected_transaction_draft_depth ||
+              sparse_graph_depth !=
+                  *expected_transaction_draft_depth)))
+        {
+            return reject(
+                "MTP sparse runtime binding received an invalid typed role or depth");
+        }
+        if (!graph_scope.ready())
+            return reject(graph_scope.error());
+
+        const auto request_identity = currentMoESparseRequestIdentity();
+        if (!request_identity)
+        {
+            return reject(
+                "MTP sparse runtime binding has no admitted request identity");
+        }
+
+        RuntimeParams params{
+            .generation_id = request_identity->generation(),
+            .step_id = 0,
+            .execution_semantics = execution_semantics,
+            .mtp_depth = sparse_graph_depth,
+            .placement_epoch = 0,
+        };
+
+        if (moe_overlay_inference_transaction_coordinator_)
+        {
+            /*
+             * Once a cross-rank authority is installed, an inert scope is a
+             * lifecycle error. Falling back to process-local identity here
+             * would let a remote follower and continuation use different
+             * operation ids while appearing to execute the same graph.
+             */
+            if (!graph_scope.active())
+            {
+                return reject(
+                    "Distributed MTP sparse graph has no active transaction binding");
+            }
+            const auto &binding = graph_scope.binding();
+            if (binding.request_generation == 0 ||
+                binding.request_generation !=
+                    moe_overlay_collective_request_generation_ ||
+                binding.descriptor.draft_depth <= 0 ||
+                (expected_transaction_draft_depth &&
+                 binding.descriptor.draft_depth !=
+                     *expected_transaction_draft_depth))
+            {
+                return reject(
+                    "MTP sparse transaction binding disagrees with request generation or selected depth");
+            }
+            params.generation_id = binding.request_generation;
+            params.step_id = binding.descriptor.logical_step_id;
+            params.placement_epoch =
+                binding.descriptor.placement_epoch;
+        }
+
+        /*
+         * A process-local CPU/GPU overlay has no control-plane follower, but
+         * its manual sparse boundary still needs the typed histogram phase.
+         * The stage intentionally owns its monotonically increasing local
+         * step; generation merely proves that request admission occurred.
+         */
+        if (!params.valid() || !params.hasExecutionSemantics())
+        {
+            return reject(
+                "MTP sparse runtime binding has no admitted request generation or execution semantics");
+        }
+        return params;
+    }
+
     bool DeviceGraphOrchestrator::replayHostedMTPSidecar(
         MTPSidecarCaptureRole role,
         int draft_depth,
@@ -21184,32 +21908,22 @@ namespace llaminar2
         if (!graph_scope.ready())
             return fail(graph_scope.error());
 
-        if (graph_scope.active())
+        const auto sparse_params =
+            resolveMTPMoEOverlayCollectiveRuntimeParams(
+                graph_scope,
+                IComputeStage::MoEOverlayCollectiveRuntimeParams::
+                    ExecutionSemantics::MTPDraft,
+                std::optional<int>{draft_depth},
+                /*sparse_graph_depth=*/0,
+                &validation_error);
+        if (!sparse_params)
+            return fail(validation_error);
+        for (IComputeStage *stage :
+             cache->moe_overlay_collective_runtime_stages)
         {
-            const auto &binding = graph_scope.binding();
-            if (binding.request_generation == 0 ||
-                binding.request_generation !=
-                    moe_overlay_collective_request_generation_ ||
-                binding.descriptor.draft_depth != draft_depth)
-            {
-                return fail(
-                    "hosted MTP sidecar binding disagrees with request or selected depth");
-            }
-            const IComputeStage::MoEOverlayCollectiveRuntimeParams params{
-                .generation_id = binding.request_generation,
-                .step_id = binding.descriptor.logical_step_id,
-                .execution_semantics =
-                    IComputeStage::MoEOverlayCollectiveRuntimeParams::
-                        ExecutionSemantics::MTPDraft,
-                .mtp_depth = 0,
-            };
-            for (IComputeStage *stage :
-                 cache->moe_overlay_collective_runtime_stages)
-            {
-                if (!stage)
-                    return fail("hosted MTP sidecar contains a null sparse stage");
-                stage->updateMoEOverlayCollectiveRuntimeParams(params);
-            }
+            if (!stage)
+                return fail("hosted MTP sidecar contains a null sparse stage");
+            stage->updateMoEOverlayCollectiveRuntimeParams(*sparse_params);
         }
 
         IDeviceContext *const ctx = getDeviceContext(state_.device_id);
@@ -21376,27 +22090,16 @@ namespace llaminar2
         if (!graph_scope.ready())
             return fail(graph_scope.error());
 
-        IComputeStage::MoEOverlayCollectiveRuntimeParams params;
-        if (graph_scope.active())
-        {
-            const auto &binding = graph_scope.binding();
-            if (binding.request_generation == 0 ||
-                binding.request_generation !=
-                    moe_overlay_collective_request_generation_ ||
-                binding.descriptor.draft_depth != draft_depth)
-            {
-                return fail(
-                    "hosted grouped verifier binding disagrees with request or selected depth");
-            }
-            params = {
-                .generation_id = binding.request_generation,
-                .step_id = binding.descriptor.logical_step_id,
-                .execution_semantics =
-                    IComputeStage::MoEOverlayCollectiveRuntimeParams::
-                        ExecutionSemantics::GroupedVerifier,
-                .mtp_depth = draft_depth,
-            };
-        }
+        const auto params =
+            resolveMTPMoEOverlayCollectiveRuntimeParams(
+                graph_scope,
+                IComputeStage::MoEOverlayCollectiveRuntimeParams::
+                    ExecutionSemantics::GroupedVerifier,
+                std::optional<int>{draft_depth},
+                /*sparse_graph_depth=*/draft_depth,
+                &retained_error);
+        if (!params)
+            return fail(retained_error);
 
         void *producer_stream = nullptr;
         IDeviceContext *const ctx = getDeviceContext(state_.device_id);
@@ -21434,7 +22137,7 @@ namespace llaminar2
         const bool submitted = forward_engine_->replayRetainedDecodeGraph(
             signature,
             ctx,
-            params,
+            *params,
             launch_dependency,
             GraphCaptureAuxiliaryBranchFactory{},
             mtp_device_generation_loop_graph_.stream.get(),
@@ -22890,7 +23593,7 @@ namespace llaminar2
          * after source identity is checked, while publication is intentionally
          * placed below that check and immediately before graph construction.
          */
-        const size_t conditional_fragment_count = hosted_execution
+        const size_t ticket_conditioned_fragment_count = hosted_execution
             ? static_cast<size_t>(std::count_if(
                   mtp_device_generation_loop_hosted_fragment_scratch_.begin(),
                   mtp_device_generation_loop_hosted_fragment_scratch_.end(),
@@ -22899,6 +23602,9 @@ namespace llaminar2
                       return fragment.execution !=
                              DeviceControlledLoopFragmentExecution::Always;
                   }))
+            : 0u;
+        const size_t native_conditional_fragment_count = hosted_execution
+            ? 0u
             : static_cast<size_t>(std::count_if(
                   mtp_device_generation_loop_fragment_scratch_.begin(),
                   mtp_device_generation_loop_fragment_scratch_.end(),
@@ -22939,7 +23645,10 @@ namespace llaminar2
             loop.depth_policy_mode == static_cast<int>(depth_policy.mode) &&
             loop.sampling_mode == sampling_mode &&
             loop.fragment_count == expected_fragment_count &&
-            loop.conditional_fragment_count == conditional_fragment_count &&
+            loop.native_conditional_fragment_count ==
+                native_conditional_fragment_count &&
+            loop.ticket_conditioned_fragment_count ==
+                ticket_conditioned_fragment_count &&
             loop.execution_kind == desired_execution_kind &&
             source_identity_matches)
         {
@@ -22964,7 +23673,9 @@ namespace llaminar2
                   deviceGenerationExecutionPolicyName(execution_policy)},
                  {"fragments", std::to_string(expected_fragment_count)},
                  {"conditional_fragments",
-                  std::to_string(conditional_fragment_count)},
+                  std::to_string(native_conditional_fragment_count)},
+                 {"ticket_conditioned_fragments",
+                  std::to_string(ticket_conditioned_fragment_count)},
                  {"workspace_generation", std::to_string(generation)}});
             return true;
         }
@@ -23146,7 +23857,10 @@ namespace llaminar2
         loop.depth_policy_mode = static_cast<int>(depth_policy.mode);
         loop.sampling_mode = sampling_mode;
         loop.fragment_count = expected_fragment_count;
-        loop.conditional_fragment_count = conditional_fragment_count;
+        loop.native_conditional_fragment_count =
+            native_conditional_fragment_count;
+        loop.ticket_conditioned_fragment_count =
+            ticket_conditioned_fragment_count;
         loop.branch_offsets = branch_offsets;
         loop.branch_fragment_counts = branch_fragment_counts;
         loop.execution_kind = desired_execution_kind;
@@ -23176,7 +23890,9 @@ namespace llaminar2
               std::to_string(physical_verifier_rows_per_request)},
              {"fragments", std::to_string(expected_fragment_count)},
              {"conditional_fragments",
-              std::to_string(conditional_fragment_count)},
+              std::to_string(native_conditional_fragment_count)},
+             {"ticket_conditioned_fragments",
+              std::to_string(ticket_conditioned_fragment_count)},
              {"device_moe_maintenance",
               include_device_moe_maintenance ? "true" : "false"},
              {"workspace_generation", std::to_string(generation)},
@@ -23815,6 +24531,54 @@ namespace llaminar2
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to build MTP sidecar graph");
                 return false;
+            }
+            if (terminal_hidden_buffer_id ==
+                BufferId::PREFIX_TERMINAL_HIDDEN)
+            {
+                /*
+                 * A persistent terminal-hidden publication survives a sidecar
+                 * launch only when every stage declares that mailbox as
+                 * read-only.  Validate the production graph itself at the cold
+                 * construction boundary; a later writer is an architecture
+                 * error, not a reason to copy or reselect the row after every
+                 * sidecar.
+                 */
+                for (const std::string &node_name : graph.getExecutionOrder())
+                {
+                    const ComputeNode *node = graph.getNode(node_name);
+                    if (!node || !node->stage)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar graph contains an incomplete node while validating terminal-hidden ownership: node="
+                                  << node_name);
+                        return false;
+                    }
+                    const auto writes =
+                        node->stage->bufferContract().allWrites();
+                    const bool overwrites_terminal_hidden =
+                        std::any_of(
+                            writes.begin(),
+                            writes.end(),
+                            [](const BufferBinding &binding)
+                            {
+                                return binding.id ==
+                                       BufferId::PREFIX_TERMINAL_HIDDEN;
+                            });
+                    if (overwrites_terminal_hidden)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar stage violates the persistent terminal-hidden read-only contract: node="
+                                  << node_name
+                                  << " stage=" << node->stage->name());
+                        return false;
+                    }
+                }
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "sidecar_terminal_hidden_read_only_contracts",
+                    1.0,
+                    "graph_setup",
+                    device_key,
+                    {{"context", sidecar_context},
+                     {"nodes", std::to_string(graph.size())}});
             }
             if (state_.device_id.is_gpu())
             {
@@ -24601,35 +25365,68 @@ namespace llaminar2
             }
             return true;
         };
-        if (overlay_graph_scope.active())
+        if (has_moe_overlay_sparse_boundary)
         {
-            const auto &binding = overlay_graph_scope.binding();
-            if (moe_overlay_collective_request_generation_ == 0 ||
-                moe_overlay_collective_request_generation_ !=
-                    binding.request_generation)
-            {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] MTP sidecar transaction "
-                    "generation disagrees with request admission");
-                return false;
-            }
-            const IComputeStage::MoEOverlayCollectiveRuntimeParams params{
-                .generation_id = binding.request_generation,
-                .step_id = binding.descriptor.logical_step_id,
-                .execution_semantics =
+            std::string runtime_binding_error;
+            const auto params =
+                resolveMTPMoEOverlayCollectiveRuntimeParams(
+                    overlay_graph_scope,
                     IComputeStage::MoEOverlayCollectiveRuntimeParams::
                         ExecutionSemantics::MTPDraft,
-                /*
-                 * Qwen 3.5 has one learned NextN sidecar graph.  The ticket's
-                 * sidecar_depth is the speculative ordinal; the stage key's
-                 * mtp_depth remains the learned graph depth zero.
-                 */
-                .mtp_depth = 0,
-            };
+                    /*expected_transaction_draft_depth=*/std::nullopt,
+                    /*sparse_graph_depth=*/0,
+                    &runtime_binding_error);
+            if (!params)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] MTP sidecar could not bind "
+                    "its typed sparse execution phase: "
+                    << runtime_binding_error);
+                return false;
+            }
             for (auto *stage :
                  sidecar_cache.moe_overlay_collective_runtime_stages)
             {
-                stage->updateMoEOverlayCollectiveRuntimeParams(params);
+                if (!stage)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] MTP sidecar contains a null sparse runtime stage");
+                    return false;
+                }
+                stage->updateMoEOverlayCollectiveRuntimeParams(*params);
+            }
+        }
+
+        /*
+         * Every sidecar that binds the persistent terminal-hidden mailbox
+         * acquires the same typed read lease here, immediately before graph
+         * submission.  Keeping this at the common execution boundary covers
+         * ordinary decode, resident logical-state correction, batched
+         * device-outcome catch-up, and prefix-restore replay without asking
+         * each caller to reproduce the ownership protocol.
+         */
+        std::optional<MTPTerminalHiddenPublication::ReadLease>
+            terminal_hidden_read;
+        if (terminal_hidden_buffer_id ==
+            BufferId::PREFIX_TERMINAL_HIDDEN)
+        {
+            if (!state_.prefix_terminal_hidden ||
+                terminal_hidden != state_.prefix_terminal_hidden.get())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] MTP sidecar declared the "
+                    "persistent terminal-hidden mailbox with a foreign "
+                    "tensor binding");
+                return false;
+            }
+            terminal_hidden_read =
+                state_.mtp_terminal_hidden_publication.acquireReadLease();
+            if (!terminal_hidden_read)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] MTP sidecar could not lease a "
+                    "current persistent terminal-hidden publication");
+                return false;
             }
         }
 
@@ -24982,6 +25779,36 @@ namespace llaminar2
                               ? DeviceGraphCaptureController::replayModeName(sidecar_cache.segment_cache)
                               : "plain"}});
         }
+        if (ok && terminal_hidden_read)
+        {
+            /*
+             * Graph execution above has submitted every read on the exact
+             * sidecar stream.  A changed generation at this point means a
+             * producer crossed that submission window, so continuing would
+             * make the captured pointer's contents ambiguous.
+             */
+            if (!state_.mtp_terminal_hidden_publication.stillOwns(
+                    *terminal_hidden_read))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] MTP sidecar crossed a "
+                    "terminal-hidden publication transition while submitting "
+                    "its read-only graph");
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "sidecar_terminal_hidden_read_leases",
+                1.0,
+                phase,
+                device_key,
+                {{"context", sidecar_context},
+                 {"source",
+                  MTPTerminalHiddenPublication::sourceName(
+                      terminal_hidden_read->source)},
+                 {"kv_cache_only", boolTag(kv_cache_only)},
+                 {"rows", std::to_string(total_rows)}});
+        }
         if (ok && state_.device_id.is_gpu() && sidecar_dynamic_stream &&
             !peekPendingLogitsStream(PendingLogitsStreamRole::MTPSidecar))
         {
@@ -25100,8 +25927,23 @@ namespace llaminar2
     {
         input.shifted_mtp_prefill.reset();
 
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        const bool declaration_only =
+            purpose == ShiftedMTPPrefillGraphBinding::Purpose::
+                           WorkspaceFamilyDeclaration;
+        if (!graph_builder_ ||
+            (!graph_builder_->config().mtp.enabled &&
+             !(declaration_only &&
+               retainsMTPGraphCapacity(graph_builder_->config().mtp))))
             return true;
+        /*
+         * Logical execution-off and physical graph-capacity-off are different
+         * states. A declaration-only call must expose the exact shifted-KV
+         * stages retained by a later MTP-enabled runner, otherwise the first
+         * process-campaign cell seals a reusable block that is smaller than
+         * the model's already-admitted graph family. The purpose tag keeps
+         * this topology out of ForwardExecutionEngine, so declaring it cannot
+         * accidentally execute MTP for an MTPOff request.
+         */
         const bool main_prefill =
             input.execution_phase == ForwardExecutionPhase::Prefill &&
             input.state_transaction == ForwardStateTransaction::Ordinary;
@@ -25304,9 +26146,7 @@ namespace llaminar2
         }
 
         const uint64_t generation = workspaceGeneration(state_.device_id);
-        const bool workspace_family_declaration =
-            purpose == ShiftedMTPPrefillGraphBinding::Purpose::
-                           WorkspaceFamilyDeclaration;
+        const bool workspace_family_declaration = declaration_only;
         if (!workspace_family_declaration && generation == 0)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] GPU MTP prefill requires a finalized workspace generation");
@@ -25395,7 +26235,13 @@ namespace llaminar2
     {
         input.mtp_main_terminal_hidden.reset();
 
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        const bool declaration_only =
+            purpose == MTPMainTerminalHiddenGraphBinding::Purpose::
+                           WorkspaceFamilyDeclaration;
+        if (!graph_builder_ ||
+            (!graph_builder_->config().mtp.enabled &&
+             !(declaration_only &&
+               retainsMTPGraphCapacity(graph_builder_->config().mtp))))
             return true;
         if (input.execution_role != ForwardExecutionRole::MainInference &&
             input.execution_role != ForwardExecutionRole::MTPCondition)
@@ -25467,9 +26313,6 @@ namespace llaminar2
             return false;
         }
 
-        const bool declaration_only =
-            purpose == MTPMainTerminalHiddenGraphBinding::Purpose::
-                           WorkspaceFamilyDeclaration;
         const uint64_t generation = workspaceGeneration(state_.device_id);
         if (state_.device_id.is_gpu() && !declaration_only && generation == 0)
         {
@@ -25656,7 +26499,7 @@ namespace llaminar2
 
         if (previous_tokens > 0 &&
             state_.prefix_terminal_hidden &&
-            state_.mtp_terminal_hidden_current)
+            state_.mtp_terminal_hidden_publication.current())
         {
             const bool bridge_ok = executeMTPDepth0(
                 tokens[0],
@@ -32810,35 +33653,8 @@ namespace llaminar2
         params.require_captured_verifier_state =
             mtpSpecStatePublicationRequiresCapturedStage();
 
-        std::map<int, std::string> routed_moe_layers;
-        std::map<int, IMoEGroupedVerifierHistogramPublisher *>
-            histogram_publishers_by_layer;
-        const auto register_histogram_publisher =
-            [&](IMoEGroupedVerifierHistogramPublisher *publisher,
-                const std::string &node_name) -> bool
-        {
-            if (!publisher ||
-                !publisher
-                     ->requiresCommittedGroupedVerifierHistogramPublication())
-            {
-                return false;
-            }
-            const int layer =
-                publisher->groupedVerifierHistogramLayerIndex();
-            if (layer < 0)
-                return false;
-            const auto [existing, inserted] =
-                histogram_publishers_by_layer.emplace(layer, publisher);
-            if (!inserted && existing->second != publisher)
-            {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] MTP verifier has multiple "
-                    "accepted-history publishers for routed MoE layer "
-                    << layer << " second_node=" << node_name);
-                return false;
-            }
-            return true;
-        };
+        MoEGroupedVerifierHistogramBoundarySet histogram_boundaries;
+        std::string histogram_boundary_error;
 
         for (const std::string &node_name :
              verifier_graph.getExecutionOrder())
@@ -32861,24 +33677,24 @@ namespace llaminar2
                         "MTP speculative publication graph found an invalid MoE router: " +
                         node_name);
                 }
-                const auto [existing, inserted] =
-                    routed_moe_layers.emplace(
-                        router->layerIndex(), node_name);
-                if (!inserted)
+                if (!histogram_boundaries.registerRoutedLayer(
+                        router->layerIndex(),
+                        node_name,
+                        &histogram_boundary_error))
                 {
                     return fail(
-                        "MTP speculative publication graph found duplicate routers for MoE layer " +
-                        std::to_string(router->layerIndex()) +
-                        ": " + existing->second + " and " + node_name);
+                        "MTP speculative publication graph rejected a routed MoE layer: " +
+                        histogram_boundary_error);
                 }
 
-                if (router
-                        ->requiresCommittedGroupedVerifierHistogramPublication() &&
-                    !register_histogram_publisher(router, node_name))
+                if (!histogram_boundaries.registerStage(
+                        router,
+                        node_name,
+                        &histogram_boundary_error))
                 {
                     return fail(
-                        "MTP speculative publication graph rejected the overlay-router history publisher: " +
-                        node_name);
+                        "MTP speculative publication graph rejected the overlay-router history boundary: " +
+                        histogram_boundary_error);
                 }
             }
             if (stage->type() == ComputeStageType::MOE_EXPERT_FFN)
@@ -32886,36 +33702,32 @@ namespace llaminar2
                 auto *moe_stage =
                     dynamic_cast<MoEExpertComputeStage *>(stage);
                 if (!moe_stage ||
-                    !moe_stage
-                         ->requiresCommittedGroupedVerifierHistogramPublication() ||
-                    !register_histogram_publisher(moe_stage, node_name))
+                    !histogram_boundaries.registerStage(
+                        moe_stage,
+                        node_name,
+                        &histogram_boundary_error))
                 {
                     return fail(
-                        "MTP speculative publication graph found an MoE verifier stage without committed-history ownership: " +
-                        node_name);
+                        "MTP speculative publication graph rejected an MoE verifier history boundary: " +
+                        histogram_boundary_error);
                 }
             }
         }
 
-        for (const auto &[layer, router_node] : routed_moe_layers)
-        {
-            const auto publisher =
-                histogram_publishers_by_layer.find(layer);
-            if (publisher == histogram_publishers_by_layer.end())
-            {
-                return fail(
-                    "MTP speculative publication graph found routed MoE layer " +
-                    std::to_string(layer) +
-                    " without an accepted-history publisher: " +
-                    router_node);
-            }
-            params.moe_histogram_publishers.push_back(publisher->second);
-        }
-        if (histogram_publishers_by_layer.size() != routed_moe_layers.size())
+        MoEGroupedVerifierHistogramBoundaryResolution
+            histogram_boundary_resolution;
+        if (!histogram_boundaries.resolve(
+                histogram_boundary_resolution,
+                &histogram_boundary_error))
         {
             return fail(
-                "MTP speculative publication graph found a histogram publisher without a matching MoE router");
+                "MTP speculative publication graph has an invalid verifier-history lifecycle: " +
+                histogram_boundary_error);
         }
+        params.moe_histogram_publishers =
+            std::move(histogram_boundary_resolution.publishers);
+        params.moe_histogram_publication_stream =
+            histogram_boundary_resolution.publication_stream;
 
         auto &cache = mtp_speculative_state_publication_graph_;
         if (cache.valid && cache.graph && cache.stage &&
@@ -32936,7 +33748,11 @@ namespace llaminar2
             state_.device_id);
 
         mtp_device_generation_loop_graph_.invalidateGraph();
-        cache.invalidate();
+        /* All publication identities are sequential and share one exact MoE
+         * histogram producer.  Retain its certified stream across geometry or
+         * pointer-identity replacement; only final topology teardown destroys
+         * that stream. */
+        cache.replaceIdentityPreservingProducerStream();
         cache.graph = std::move(graph);
         cache.stage = publication_stage;
         cache.workspace_generation = generation;
@@ -32988,10 +33804,20 @@ namespace llaminar2
             return fail("captured MTP state publication could not resolve its device context");
         auto &gpu_ctx =
             GPUDeviceContextPool::instance().getContext(state_.device_id);
-        if (!cache.segment_cache.ensureCaptureStream(
-                &gpu_ctx,
-                state_.device_id,
-                /*context_from_process_pool=*/true) ||
+        void *const histogram_publication_stream =
+            cache.stage->getParams().moe_histogram_publication_stream;
+        const bool capture_stream_ready =
+            histogram_publication_stream
+                ? cache.segment_cache.bindBorrowedCaptureStream(
+                      &gpu_ctx,
+                      histogram_publication_stream,
+                      state_.device_id,
+                      /*context_from_process_pool=*/true)
+                : cache.segment_cache.ensureCaptureStream(
+                      &gpu_ctx,
+                      state_.device_id,
+                      /*context_from_process_pool=*/true);
+        if (!capture_stream_ready ||
             !cache.segment_cache.orderCaptureStreamAfter(
                 &gpu_ctx,
                 request.outcome.stream))
@@ -34281,7 +35107,7 @@ namespace llaminar2
                  request.requestCount()) ||
              device_generation_storage_.active_request_count !=
                  request.requestCount() ||
-             device_generation_state_ready_.valid))
+             !device_generation_state_ready_.handoff.borrowed()))
         {
             return fail(
                 "device-resident stochastic publication does not own an exclusive consumed generation controller");
@@ -34992,7 +35818,11 @@ namespace llaminar2
                 &terminal_hidden_buffer_id,
                 "commitMTPShiftedRowFromDeviceResidentLogicalState"))
             return false;
-
+        if (terminal_hidden_buffer_id != BufferId::PREFIX_TERMINAL_HIDDEN)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit requires the persistent terminal-hidden mailbox");
+            return false;
+        }
         PerfStatsCollector::ScopedTimer timer(
             "mtp",
             "shifted_row_resident_logical_state_commit",
@@ -35000,8 +35830,6 @@ namespace llaminar2
             state_.device_id.toString());
         const uint64_t workspace_generation_before_commit =
             workspaceGeneration(state_.device_id);
-        const int verifier_total_rows_before_sidecar =
-            state_.last_forward_seq_len * state_.last_forward_batch_size;
 
         /*
          * Both dynamic inputs remain device-owned.  entry 0 of the sidecar
@@ -35040,34 +35868,6 @@ namespace llaminar2
         {
             return false;
         }
-
-        /*
-         * executeMTPDepth0Batched() consumes PREFIX_TERMINAL_HIDDEN as the
-         * shifted-KV input, but MoE sidecar stages are free to reuse graph
-         * scratch around that handoff.  The accepted-state publication
-         * contract is stronger: after the correction shifted row is appended,
-         * PREFIX_TERMINAL_HIDDEN must still name the accepted verifier row.
-         * Reselect from the resident device metadata before publishing the
-         * shifted-KV epoch so the next verifier observes the same state that a
-         * serial replay would have restored.
-         */
-        if (verifier_total_rows_before_sidecar <= 0 ||
-            !selectMTPTerminalHiddenRowsFromDeviceAcceptedState(
-                /*row_count=*/1,
-                verifier_total_rows_before_sidecar,
-                stream))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Resident logical-state MTP shifted-row commit failed to restore accepted terminal hidden after sidecar append");
-            return false;
-        }
-        PerfStatsCollector::addCounter(
-            "mtp",
-            "shifted_row_resident_terminal_hidden_reselects",
-            1.0,
-            perfPhaseName(),
-            state_.device_id.toString(),
-            {{"request_index", std::to_string(request_index)},
-             {"verifier_rows", std::to_string(verifier_total_rows_before_sidecar)}});
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -35936,7 +36736,7 @@ namespace llaminar2
          * Coherent zero bytes satisfy the captured read/write contract, but no
          * main or verifier graph has produced a request terminal yet.
          */
-        state_.mtp_terminal_hidden_current = false;
+        state_.mtp_terminal_hidden_publication.invalidate();
         return true;
     }
 
@@ -42689,6 +43489,7 @@ namespace llaminar2
                     bool *available,
                     size_t *reported_bytes,
                     uint64_t *reported_hash,
+                    std::vector<float> *reported_fp32_values,
                     const char *name)
             {
                 if (!tensor || bytes == 0)
@@ -42730,10 +43531,25 @@ namespace llaminar2
                 *reported_bytes = bytes;
                 *reported_hash =
                     hashByteBufferForPrefixProbe(payload.data(), payload.size());
+                if (reported_fp32_values)
+                {
+                    if (tensor->native_type() != TensorType::FP32 ||
+                        bytes % sizeof(float) != 0u)
+                    {
+                        throw std::runtime_error(
+                            std::string("Prefix-state diagnostics cannot retain non-FP32 terminal ") +
+                            name);
+                    }
+                    reported_fp32_values->resize(bytes / sizeof(float));
+                    std::memcpy(
+                        reported_fp32_values->data(),
+                        payload.data(),
+                        bytes);
+                }
             };
 
             if (state_.prefix_terminal_hidden &&
-                state_.mtp_terminal_hidden_current &&
+                state_.mtp_terminal_hidden_publication.current() &&
                 prefix_layout_.terminal_hidden_bytes > 0)
             {
                 hash_terminal_tensor(
@@ -42742,6 +43558,9 @@ namespace llaminar2
                     &snapshot.terminal_hidden_hash_available,
                     &snapshot.terminal_hidden_bytes,
                     &snapshot.terminal_hidden_hash,
+                    capture_policy.capture_terminal_hidden_values
+                        ? &snapshot.terminal_hidden_values
+                        : nullptr,
                     "hidden row");
             }
 
@@ -42758,6 +43577,9 @@ namespace llaminar2
                     &snapshot.terminal_logits_hash_available,
                     &snapshot.terminal_logits_bytes,
                     &snapshot.terminal_logits_hash,
+                    capture_policy.capture_terminal_logits_values
+                        ? &snapshot.terminal_logits_values
+                        : nullptr,
                     "logits row");
             }
 
@@ -43683,6 +44505,28 @@ namespace llaminar2
                                        std::move(tags));
     }
 
+    bool DeviceGraphOrchestrator::purgePrefixCache()
+    {
+        /*
+         * PrefixStateCache owns every capacity-tier index. Dropping that one
+         * authority retires RAM, device-hot, and disk records together while
+         * shared payload/event owners keep any already-admitted asynchronous
+         * producer safe. The operation intentionally does not touch live KV,
+         * graph captures, prepared weights, or placement state.
+         */
+        if (!prefix_cache_)
+            return true;
+        if (!prefix_cache_->clear())
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Prefix-cache purge was rejected by an active explicit lease"
+                << " device=" << state_.device_id.toString());
+            return false;
+        }
+        prefix_cache_stats_ = prefix_cache_->stats();
+        return true;
+    }
+
     void DeviceGraphOrchestrator::resetMTPSidecarDepth0ReplayState()
     {
         mtp_sidecar_depth0_cache_.resetReplayState();
@@ -44301,13 +45145,15 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::promotePrefixBlockToDeviceHotForRestore(
+    PrefixDeviceHotLeaseResult
+    DeviceGraphOrchestrator::promotePrefixBlockToDeviceHotForRestore(
         const PrefixBlockHandle &lower_tier_handle,
         void *producer_stream,
         PrefixBlockHandle *promoted_handle)
     {
         auto fail = [&](const std::string &reason,
-                        PrefixBlockHandle *prepared = nullptr) -> bool
+                        PrefixBlockHandle *prepared = nullptr)
+            -> PrefixDeviceHotLeaseResult
         {
             if (prepared && prepared->valid() && prefix_device_hot_backend_)
             {
@@ -44323,7 +45169,7 @@ namespace llaminar2
                       << reason
                       << " key=" << lower_tier_handle.key.toHex()
                       << " bytes=" << lower_tier_handle.total_bytes);
-            return false;
+            return PrefixDeviceHotLeaseResult::Error;
         };
 
         if (!promoted_handle ||
@@ -44347,11 +45193,15 @@ namespace llaminar2
         }
 
         PrefixBlockHandle prepared;
-        if (!prefix_cache_->prepareDeviceHotCopy(
-                lower_tier_handle,
-                &prepared))
+        const PrefixDeviceHotLeaseResult lease_result =
+            prefix_cache_->prepareDeviceHotCopy(
+                lower_tier_handle, producer_stream, &prepared);
+        if (lease_result == PrefixDeviceHotLeaseResult::Busy)
+            return lease_result;
+        if (lease_result != PrefixDeviceHotLeaseResult::Acquired)
         {
-            return fail("VRAM allocation or hot-tier LRU reservation failed");
+            return fail(
+                "hot-tier arena rejected an eligible promotion lease");
         }
 
         IBackend *backend = getBackendFor(state_.device_id);
@@ -44475,6 +45325,77 @@ namespace llaminar2
                 {"source", "ram_or_disk_hydration"},
             });
         *promoted_handle = std::move(prepared);
+        return PrefixDeviceHotLeaseResult::Acquired;
+    }
+
+    bool DeviceGraphOrchestrator::publishPrefixFingerprintTransition(
+        uint64_t next_fingerprint,
+        PrefixCacheMoEPolicy policy,
+        const char *operation)
+    {
+        if (next_fingerprint == 0 || prefix_fingerprint_ == 0 ||
+            !prefix_cache_)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Prefix fingerprint transition has "
+                "incomplete old/new identity or cache ownership"
+                << " operation=" << (operation ? operation : "<unknown>")
+                << " previous=" << prefixHashHex(prefix_fingerprint_)
+                << " next=" << prefixHashHex(next_fingerprint)
+                << " cache=" << (prefix_cache_ ? "ready" : "missing"));
+            return false;
+        }
+        if (next_fingerprint == prefix_fingerprint_)
+            return true;
+
+        const uint64_t previous_fingerprint = prefix_fingerprint_;
+        std::optional<PrefixFingerprintRebase> rebase;
+        if (policy == PrefixCacheMoEPolicy::InvalidateOnRebalance)
+        {
+            rebase = prefix_cache_->rebaseFingerprint(
+                previous_fingerprint,
+                next_fingerprint);
+            if (!rebase)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Prefix fingerprint rebase was "
+                    "rejected by a busy or invalid cache lifecycle"
+                    << " operation=" << (operation ? operation : "<unknown>")
+                    << " previous=" << prefixHashHex(previous_fingerprint)
+                    << " next=" << prefixHashHex(next_fingerprint));
+                return false;
+            }
+
+            PerfStatsCollector::addCounter(
+                "prefix_cache",
+                "fingerprint_rebases",
+                1.0,
+                "request_boundary",
+                state_.device_id.toString(),
+                {
+                    {"operation", operation ? operation : "unknown"},
+                    {"ram_entries", std::to_string(rebase->invalidated_ram_entries)},
+                    {"device_entries", std::to_string(rebase->invalidated_device_entries)},
+                    {"disk_entries", std::to_string(rebase->unindexed_disk_entries)},
+                    {"ram_bytes", std::to_string(rebase->released_ram_bytes)},
+                    {"device_bytes", std::to_string(rebase->released_device_bytes)},
+                });
+        }
+
+        prefix_fingerprint_ = next_fingerprint;
+        LOG_INFO(
+            "[DeviceGraphOrchestrator] Prefix cache fingerprint published"
+            << " operation=" << (operation ? operation : "<unknown>")
+            << " policy=" << prefixCacheMoEPolicyToString(policy)
+            << " previous=" << prefixHashHex(previous_fingerprint)
+            << " next=" << prefixHashHex(next_fingerprint)
+            << " volatile_rebase=" << (rebase ? "yes" : "no")
+            << " invalidated_ram_entries="
+            << (rebase ? rebase->invalidated_ram_entries : 0u)
+            << " invalidated_device_entries="
+            << (rebase ? rebase->invalidated_device_entries : 0u)
+            << " unindexed_disk_entries="
+            << (rebase ? rebase->unindexed_disk_entries : 0u));
         return true;
     }
 
@@ -44504,9 +45425,13 @@ namespace llaminar2
             }
             if (fingerprint.key != prefix_fingerprint_)
             {
-                LOG_DEBUG("[DeviceGraphOrchestrator] Prefix cache fingerprint refreshed for "
-                          << graph_builder_->architectureName());
-                prefix_fingerprint_ = fingerprint.key;
+                if (!publishPrefixFingerprintTransition(
+                        fingerprint.key,
+                        prefix_config.moe_policy,
+                        "ensure_prefix_cache_ready"))
+                {
+                    return false;
+                }
             }
             return true;
         }
@@ -44604,9 +45529,19 @@ namespace llaminar2
             state_.device_id.is_gpu() &&
             prefix_config.device_budget_bytes >= block_bytes)
         {
-            prefix_device_hot_backend_ = std::make_shared<DeviceHotPrefixStorageBackend>(
+            std::string device_hot_error;
+            prefix_device_hot_backend_ = DeviceHotPrefixStorageBackend::create(
                 state_.device_id,
-                prefix_config.device_budget_bytes);
+                prefix_config.device_budget_bytes,
+                block_bytes,
+                &device_hot_error);
+            if (!prefix_device_hot_backend_)
+            {
+                disablePrefixCacheForRunner(
+                    "device-hot prefix arena admission failed: " +
+                    device_hot_error);
+                return false;
+            }
         }
         prefix_disk_backend_.reset();
         if (prefix_config.storage_mode == PrefixCacheStorageMode::Tiered &&
@@ -44681,7 +45616,9 @@ namespace llaminar2
                  << prefix_layout_.block_size
                  << " block_bytes=" << block_bytes
                  << " ram_budget_bytes=" << prefix_config.ram_budget_bytes
-                 << " device_hot_budget_bytes=" << (prefix_device_hot_backend_ ? prefix_config.device_budget_bytes : 0)
+                 << " device_hot_budget_bytes=" << (prefix_device_hot_backend_ ? prefix_device_hot_backend_->budgetBytes() : 0)
+                 << " device_hot_reserved_bytes=" << (prefix_device_hot_backend_ ? prefix_device_hot_backend_->reservedBytes() : 0)
+                 << " device_hot_slots=" << (prefix_device_hot_backend_ ? prefix_device_hot_backend_->slotCount() : 0)
                  << " disk_budget_bytes=" << (prefix_disk_backend_ ? prefix_config.disk_budget_bytes : 0)
                  << " disk_archive="
                  << (prefix_disk_backend_
@@ -44763,15 +45700,19 @@ namespace llaminar2
         }
         if (fingerprint.key != prefix_fingerprint_)
         {
-            LOG_DEBUG("[DeviceGraphOrchestrator] Prefix cache fingerprint refreshed after live hybrid layout update for "
-                      << graph_builder_->architectureName()
-                      << " fingerprint=" << prefixHashHex(fingerprint.key));
-            prefix_fingerprint_ = fingerprint.key;
+            if (!publishPrefixFingerprintTransition(
+                    fingerprint.key,
+                    prefix_config.moe_policy,
+                    "refresh_live_hybrid_layout"))
+            {
+                return false;
+            }
         }
         return true;
     }
 
     PrefixCacheKey DeviceGraphOrchestrator::makePrefixKeyForBlock(
+        uint64_t request_fingerprint,
         const std::vector<int32_t> &tokens,
         int block_index,
         uint64_t parent_hash) const
@@ -44779,7 +45720,12 @@ namespace llaminar2
         const int start = block_index * prefix_layout_.block_size;
         const int end = std::min<int>(start + prefix_layout_.block_size, tokens.size());
         std::vector<int32_t> block_tokens(tokens.begin() + start, tokens.begin() + end);
-        return makePrefixCacheKey(prefix_fingerprint_, parent_hash, block_index, start, block_tokens);
+        return makePrefixCacheKey(
+            request_fingerprint,
+            parent_hash,
+            block_index,
+            start,
+            block_tokens);
     }
 
     PrefixLookupResult DeviceGraphOrchestrator::lookupPrefix(const std::vector<int32_t> &tokens)
@@ -44811,7 +45757,11 @@ namespace llaminar2
         for (int block = 0; block < complete_blocks; ++block)
         {
             const PrefixCacheKey requested_key =
-                makePrefixKeyForBlock(tokens, block, parent_hash);
+                makePrefixKeyForBlock(
+                    result.fingerprint_key,
+                    tokens,
+                    block,
+                    parent_hash);
             const int block_start = block * prefix_layout_.block_size;
             const int block_end = std::min<int>(
                 block_start + prefix_layout_.block_size,
@@ -45097,10 +46047,11 @@ namespace llaminar2
 
         /*
          * A lookup result owns the tier that was resident when lookup ran. Cold
-         * GPU hits are promoted before live-state import so every subsequent
-         * operation in this transaction consumes the same device-owned bytes.
-         * Blocks larger than the entire configured hot tier are intentionally
-         * restored from RAM; an eligible promotion failure is never hidden.
+         * GPU hits are promoted before live-state import when a preallocated
+         * slot is reusable. Blocks larger than the tier, and eligible blocks
+         * contending with a hot handle retained by this same immutable lookup,
+         * restore directly from pinned RAM. Busy is therefore a declared tier
+         * choice; event/copy/arena lifecycle errors remain fatal.
          */
         std::vector<PrefixBlockHandle> restore_blocks = hit.blocks;
         if (state_.device_id.is_gpu())
@@ -45115,10 +46066,29 @@ namespace llaminar2
                 }
 
                 PrefixBlockHandle promoted;
-                if (!promotePrefixBlockToDeviceHotForRestore(
-                        handle,
-                        stream,
-                        &promoted))
+                const PrefixDeviceHotLeaseResult promotion =
+                    promotePrefixBlockToDeviceHotForRestore(
+                        handle, stream, &promoted);
+                if (promotion == PrefixDeviceHotLeaseResult::Busy)
+                {
+                    /*
+                     * Another block in this immutable lookup result still
+                     * owns the bounded arena slot. Preserve that hot source
+                     * and import this block from its configured pinned-RAM
+                     * tier; waiting or allocating here would block inference.
+                     */
+                    PerfStatsCollector::addCounter(
+                        "prefix_cache",
+                        "device_hot_promotion_busy_ram_restores",
+                        1.0,
+                        "restore",
+                        state_.device_id.toString(),
+                        {{"block", std::to_string(handle.key.block_index)},
+                         {"bytes", std::to_string(handle.total_bytes)},
+                         {"policy", "non_blocking_bounded_arena"}});
+                    continue;
+                }
+                if (promotion != PrefixDeviceHotLeaseResult::Acquired)
                 {
                     return fail("eligible lower-tier block could not be promoted");
                 }
@@ -45510,7 +46480,7 @@ namespace llaminar2
                 TransferEngine::publishHostWrite(
                     state_.prefix_terminal_hidden.get());
             }
-            state_.mtp_terminal_hidden_current = true;
+            state_.mtp_terminal_hidden_publication.publishPrefixRestore();
             if (arena_ && arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
             {
                 arena_->markWrittenFlagsOnly(
@@ -45883,7 +46853,7 @@ namespace llaminar2
                 TransferEngine::publishHostWrite(
                     state_.prefix_terminal_hidden.get());
             }
-            state_.mtp_terminal_hidden_current = true;
+            state_.mtp_terminal_hidden_publication.publishPrefixRestore();
             if (arena_ && arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
             {
                 arena_->markWrittenFlagsOnly(
@@ -45928,9 +46898,23 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::harvestPrefix(
+        const PrefixLookupResult &admission,
         const std::vector<int32_t> &tokens,
         int prompt_token_count)
     {
+        if (!admission.cache_enabled ||
+            !admission.supported ||
+            admission.fingerprint_key == 0)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Prefix harvest rejected an invalid "
+                "request admission identity"
+                << " cache_enabled=" << (admission.cache_enabled ? "yes" : "no")
+                << " supported=" << (admission.supported ? "yes" : "no")
+                << " fingerprint="
+                << prefixHashHex(admission.fingerprint_key));
+            return false;
+        }
         if (prompt_token_count <= 0 || prompt_token_count > static_cast<int>(tokens.size()))
         {
             LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest skipped: invalid prompt_token_count="
@@ -45964,6 +46948,44 @@ namespace llaminar2
         {
             return false;
         }
+
+        const uint64_t request_fingerprint = admission.fingerprint_key;
+        if (request_fingerprint != prefix_fingerprint_)
+        {
+            /*
+             * InvalidateOnRebalance deliberately keys cached state by the
+             * ExpertOverlay movement epoch.  The request may retain its old
+             * RCU placement lease while background maintenance publishes a
+             * newer epoch.  Its output remains a valid inference result, but
+             * archiving that output under the new live fingerprint would make
+             * stale request state appear current.  Discard the archive write;
+             * the next request will look up and harvest under the new epoch.
+             */
+            PerfStatsCollector::addCounter(
+                "prefix_cache",
+                "stale_request_harvest_discards",
+                1.0,
+                "harvest",
+                state_.device_id.toString(),
+                {
+                    {"admission_fingerprint", prefixHashHex(request_fingerprint)},
+                    {"live_fingerprint", prefixHashHex(prefix_fingerprint_)},
+                    {"admission_movement_epoch", std::to_string(admission.placement_epoch)},
+                    {"live_movement_epoch", std::to_string(moeRuntimeMovementEpoch())},
+                });
+            LOG_DEBUG(
+                "[DeviceGraphOrchestrator] Prefix harvest discarded after "
+                "request-scoped fingerprint became stale"
+                << " admission_fingerprint="
+                << prefixHashHex(request_fingerprint)
+                << " live_fingerprint="
+                << prefixHashHex(prefix_fingerprint_)
+                << " admission_movement_epoch="
+                << admission.placement_epoch
+                << " live_movement_epoch="
+                << moeRuntimeMovementEpoch());
+            return true;
+        }
         IBackend *prefix_backend =
             state_.device_id.is_gpu() ? getBackendFor(state_.device_id) : nullptr;
         if (state_.device_id.is_gpu() &&
@@ -45980,7 +47002,11 @@ namespace llaminar2
         uint64_t parent_hash = 0;
         for (int block = 0; block < complete_blocks; ++block)
         {
-            PrefixCacheKey key = makePrefixKeyForBlock(tokens, block, parent_hash);
+            PrefixCacheKey key = makePrefixKeyForBlock(
+                request_fingerprint,
+                tokens,
+                block,
+                parent_hash);
             parent_hash = key.stableHash();
             const bool terminal_block =
                 (key.token_start + key.token_count) == prompt_token_count;
@@ -46045,19 +47071,33 @@ namespace llaminar2
 
             PrefixBlockHandle device_hot_handle;
             const bool prepare_device_hot =
-                prefix_device_hot_backend_ &&
-                total_block_bytes <= prefix_device_hot_backend_->budgetBytes();
-            if (prepare_device_hot &&
-                !prefix_cache_->prepareDeviceHotCopy(
-                    handle,
-                    &device_hot_handle))
+                prefix_cache_->deviceHotCapacityEligible(
+                    total_block_bytes);
+            const PrefixDeviceHotLeaseResult hot_lease =
+                prepare_device_hot
+                    ? prefix_cache_->prepareDeviceHotCopy(
+                          handle, stream, &device_hot_handle)
+                    : PrefixDeviceHotLeaseResult::Ineligible;
+            if (hot_lease == PrefixDeviceHotLeaseResult::Error)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Prefix harvest failed: "
-                          "device-hot allocation rejected key="
+                          "device-hot arena lifecycle rejected key="
                           << key.toHex()
                           << " block_bytes=" << total_block_bytes);
                 prefix_ram_backend_->release(handle);
                 return false;
+            }
+            if (hot_lease == PrefixDeviceHotLeaseResult::Busy)
+            {
+                PerfStatsCollector::addCounter(
+                    "prefix_cache",
+                    "device_hot_harvest_busy_ram_only_stores",
+                    1.0,
+                    "harvest",
+                    state_.device_id.toString(),
+                    {{"block", std::to_string(key.block_index)},
+                     {"bytes", std::to_string(total_block_bytes)},
+                     {"policy", "non_blocking_bounded_arena"}});
             }
 
             /*
@@ -46306,7 +47346,7 @@ namespace llaminar2
             }
 
             if (ok && terminal_block && prefix_layout_.includes_terminal_hidden &&
-                !state_.mtp_terminal_hidden_current)
+                !state_.mtp_terminal_hidden_publication.current())
             {
                 /*
                  * Prefix full hits with MTP need the terminal hidden row from
@@ -46398,7 +47438,7 @@ namespace llaminar2
 
             if (ok && terminal_block && prefix_layout_.includes_terminal_hidden &&
                 state_.prefix_terminal_hidden &&
-                state_.mtp_terminal_hidden_current &&
+                state_.mtp_terminal_hidden_publication.current() &&
                 handle.terminal_hidden)
             {
                 if (state_.device_id.is_gpu())
@@ -46461,7 +47501,7 @@ namespace llaminar2
                  * MTP decode must not skip its own terminal-hidden refresh
                  * because a cache-miss observer happened to run first.
                  */
-                state_.mtp_terminal_hidden_current = false;
+                state_.mtp_terminal_hidden_publication.invalidate();
                 PerfStatsCollector::addCounter(
                     "prefix_cache",
                     "harvest_terminal_hidden_live_current_clears",
@@ -46666,7 +47706,7 @@ namespace llaminar2
             if (graph_builder_ &&
                 graph_builder_->config().mtp.enabled &&
                 state_.prefix_terminal_hidden &&
-                state_.mtp_terminal_hidden_current &&
+                state_.mtp_terminal_hidden_publication.current() &&
                 state_.d_model > 0)
             {
                 live_terminal_hidden_bytes =
@@ -47700,7 +48740,7 @@ namespace llaminar2
         if (graph_builder_ &&
             graph_builder_->config().mtp.enabled &&
             state_.prefix_terminal_hidden &&
-            state_.mtp_terminal_hidden_current &&
+            state_.mtp_terminal_hidden_publication.current() &&
             cached_tokens > 0 &&
             state_.d_model > 0)
         {
@@ -48042,7 +49082,7 @@ namespace llaminar2
          */
         if (graph_builder_ && graph_builder_->config().mtp.enabled)
         {
-            state_.mtp_terminal_hidden_current = false;
+            state_.mtp_terminal_hidden_publication.invalidate();
         }
 
         if (snapshot.logical_checkpoint)
@@ -49049,7 +50089,7 @@ namespace llaminar2
         if (!producer_stream || request_count <= 0 ||
             request_count != device_generation_storage_.active_request_count ||
             !device_generation_storage_.validFor(request_count) ||
-            !ready.event || ready.valid)
+            !ready.event)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation state publication has invalid lifecycle ownership"
                       << " producer="
@@ -49060,38 +50100,47 @@ namespace llaminar2
                       << " active_request_count="
                       << device_generation_storage_.active_request_count
                       << " event=" << static_cast<bool>(ready.event)
-                      << " already_valid=" << ready.valid);
+                      << " handoff_phase="
+                      << static_cast<int>(ready.handoff.phase()));
             return false;
         }
 
         IBackend *backend = getBackendFor(state_.device_id);
         if (!backend ||
-            !publishDeviceGenerationArenaState(
+            !ready.handoff.publish(
+                kind,
                 producer_stream,
-                producer_name) ||
-            (!mtp_committed_verifier_identity_dev_ ||
-             !publishPreparedArenaGraphInput(
-                 BufferId::MTP_COMMITTED_VERIFIER_IDENTITY,
-                 mtp_committed_verifier_identity_dev_,
-                 producer_stream,
-                 state_.device_id,
-                 producer_name)) ||
-            !DeviceEventEdge::at(
-                 DeviceTimelinePoint::DeviceGenerationStateReady)
-                 .from(DeviceTimelineRole::DeviceGenerationController)
-                 .publish(
-                     *backend,
-                     state_.device_id,
-                     ready.event.get(),
-                     producer_stream))
+                request_count,
+                [&]() -> bool
+                {
+                    return publishDeviceGenerationArenaState(
+                               producer_stream,
+                               producer_name) &&
+                           mtp_committed_verifier_identity_dev_ &&
+                           publishPreparedArenaGraphInput(
+                               BufferId::MTP_COMMITTED_VERIFIER_IDENTITY,
+                               mtp_committed_verifier_identity_dev_,
+                               producer_stream,
+                               state_.device_id,
+                               producer_name) &&
+                           DeviceEventEdge::at(
+                               DeviceTimelinePoint::DeviceGenerationStateReady)
+                               .from(
+                                   DeviceTimelineRole::DeviceGenerationController)
+                               .publish(
+                                   *backend,
+                                   state_.device_id,
+                                   ready.event.get(),
+                                   producer_stream);
+                }))
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to publish device-generation controller readiness");
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to publish device-generation controller readiness"
+                      << " kind=" << static_cast<int>(kind)
+                      << " handoff_phase="
+                      << static_cast<int>(ready.handoff.phase()));
             return false;
         }
 
-        ready.producer_stream = producer_stream;
-        ready.request_count = request_count;
-        ready.valid = true;
         PerfStatsCollector::addCounter(
             "mtp",
             "device_generation_state_publications",
@@ -49116,8 +50165,7 @@ namespace llaminar2
 
         auto &ready = device_generation_state_ready_;
         if (!consumer_stream || expected_request_count <= 0 ||
-            !ready.valid || !ready.event || !ready.producer_stream ||
-            ready.request_count != expected_request_count ||
+            !ready.event ||
             device_generation_storage_.active_request_count !=
                 expected_request_count)
         {
@@ -49127,23 +50175,35 @@ namespace llaminar2
                               ? consumer_name
                               : "unknown")
                       << " expected_requests=" << expected_request_count
-                      << " published_requests=" << ready.request_count
-                      << " valid=" << ready.valid);
+                      << " published_requests="
+                      << ready.handoff.requestCount()
+                      << " handoff_phase="
+                      << static_cast<int>(ready.handoff.phase()));
             return false;
         }
 
         IBackend *backend = getBackendFor(state_.device_id);
         if (!backend ||
-            !DeviceEventEdge::at(
-                 DeviceTimelinePoint::DeviceGenerationStateReady)
-                 .from(DeviceTimelineRole::DeviceGenerationController)
-                 .to(consumer_role)
-                 .enqueueWait(
-                     *backend,
-                     state_.device_id,
-                     ready.event.get(),
-                     ready.producer_stream,
-                     consumer_stream))
+            !ready.handoff.borrow(
+                consumer_stream,
+                consumer_role,
+                expected_request_count,
+                [&](void *producer, void *consumer) -> bool
+                {
+                    return DeviceEventEdge::at(
+                               DeviceTimelinePoint::
+                                   DeviceGenerationStateReady)
+                        .from(
+                            DeviceTimelineRole::
+                                DeviceGenerationController)
+                        .to(consumer_role)
+                        .enqueueWait(
+                            *backend,
+                            state_.device_id,
+                            ready.event.get(),
+                            producer,
+                            consumer);
+                }))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to consume device-generation controller readiness"
                       << " consumer="
@@ -49153,9 +50213,100 @@ namespace llaminar2
             return false;
         }
 
-        ready.producer_stream = nullptr;
-        ready.request_count = 0;
-        ready.valid = false;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::
+        retireDeviceGenerationStateForRequestReset(
+            void *reset_stream,
+            int expected_request_count,
+            const char *consumer_name)
+    {
+        if (!state_.device_id.is_gpu())
+            return true;
+
+        auto &ready = device_generation_state_ready_;
+        IBackend *const backend = getBackendFor(state_.device_id);
+        if (!backend || !ready.event || !reset_stream ||
+            expected_request_count <= 0)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Device-generation reset retirement "
+                "has incomplete event or stream ownership"
+                << " consumer="
+                << (consumer_name && consumer_name[0] != '\0'
+                        ? consumer_name
+                        : "unknown")
+                << " expected_requests=" << expected_request_count
+                << " handoff_phase="
+                << static_cast<int>(ready.handoff.phase()));
+            return false;
+        }
+
+        const auto phase_before = ready.handoff.phase();
+        const auto borrower_before = ready.handoff.borrowerRole();
+        if (!ready.handoff.retireForReset(
+                reset_stream,
+                expected_request_count,
+                [&](DeviceGenerationStateHandoffPhase phase,
+                    void *frontier_stream,
+                    DeviceTimelineRole,
+                    void *consumer_stream) -> bool
+                {
+                    const auto edge =
+                        DeviceEventEdge::at(
+                            DeviceTimelinePoint::
+                                DeviceGenerationStateReady)
+                            .from(
+                                DeviceTimelineRole::
+                                    DeviceGenerationController);
+                    if (phase ==
+                            DeviceGenerationStateHandoffPhase::Borrowed &&
+                        !edge.publish(
+                            *backend,
+                            state_.device_id,
+                            ready.event.get(),
+                            frontier_stream))
+                    {
+                        return false;
+                    }
+                    return edge.to(DeviceTimelineRole::RequestStateReset)
+                        .enqueueWait(
+                            *backend,
+                            state_.device_id,
+                            ready.event.get(),
+                            frontier_stream,
+                            consumer_stream);
+                }))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Device-generation reset could not "
+                "retire its exact controller frontier"
+                << " consumer="
+                << (consumer_name && consumer_name[0] != '\0'
+                        ? consumer_name
+                        : "unknown")
+                << " expected_requests=" << expected_request_count
+                << " handoff_phase="
+                << static_cast<int>(phase_before)
+                << " borrower_role="
+                << deviceTimelineRoleName(borrower_before));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "request_reset",
+            "device_generation_frontier_retirements",
+            1.0,
+            "request_reset",
+            state_.device_id.toString(),
+            {{"phase",
+              phase_before == DeviceGenerationStateHandoffPhase::Published
+                  ? "published"
+                  : "borrowed"},
+             {"borrower_role",
+              std::string(deviceTimelineRoleName(borrower_before))},
+             {"ordering", "event_wait"}});
         return true;
     }
 
@@ -49163,7 +50314,7 @@ namespace llaminar2
     DeviceGraphOrchestrator::deviceGenerationExecutionPolicy(
         DeviceGenerationLoopTopology topology) const noexcept
     {
-        if (!state_.device_id.is_gpu())
+        if (!state_.device_id.is_gpu() || !graph_builder_)
             return DeviceGenerationExecutionPolicy::Unsupported;
 
         const auto &capture = mtp_device_generation_loop_graph_.capture;
@@ -49171,13 +50322,16 @@ namespace llaminar2
             return DeviceGenerationExecutionPolicy::Unsupported;
 
         /*
-         * A native CUDA WHILE cannot launch a retained ROCm graph on another
-         * process. Installing the heterogeneous transaction coordinator is the
-         * typed proof that this participant crosses such a boundary, so retain
-         * CUDA's complete branch family but select it from authenticated device
-         * tickets. Homogeneous CUDA keeps its native conditional parent below.
+         * A native CUDA WHILE cannot launch a CPU stage, a retained ROCm graph,
+         * or a remote participant transaction.  Decode capture and generation
+         * therefore consume the same typed topology proof: mixed device types
+         * require hosted submission even when every participant is process-local,
+         * while the rank coordinator additionally proves a remote boundary.
+         * The complete retained branch remains device-state-owned in either
+         * case; only its authenticated submission is hosted.
          */
-        if (moe_overlay_inference_transaction_coordinator_)
+        if (hasHeterogeneousCollectiveExecutionDomain() ||
+            moe_overlay_inference_transaction_coordinator_)
         {
             return DeviceGenerationExecutionPolicy::
                 HostScheduledCapturedTransactions;
@@ -49273,9 +50427,13 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation admission found an unretired loop launch");
             return false;
         }
-        if (device_generation_state_ready_.valid)
+        if (!device_generation_state_ready_.handoff.inactive())
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Device-generation admission found a published controller without an active request");
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-generation admission found an unretired controller handoff without an active request"
+                      << " phase="
+                      << static_cast<int>(
+                             device_generation_state_ready_
+                                 .handoff.phase()));
             return false;
         }
         if (!hosted_device_generation_cursor_.inactive() ||
@@ -49372,8 +50530,9 @@ namespace llaminar2
             !isValidDeviceGenerationSamplingMode(sampling_mode) ||
             device_generation_storage_.active_request_count != request_count ||
             !device_generation_storage_.validFor(request_count) ||
-            !device_generation_state_ready_.valid ||
-            device_generation_state_ready_.request_count != request_count)
+            !device_generation_state_ready_.handoff.published() ||
+            device_generation_state_ready_.handoff.requestCount() !=
+                request_count)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation parent preparation requires one committed admitted transaction"
                       << " device=" << state_.device_id.toString()
@@ -49383,8 +50542,10 @@ namespace llaminar2
                       << " draft_depth=" << draft_depth
                       << " sampling_mode="
                       << deviceGenerationSamplingModeName(sampling_mode)
-                      << " controller_ready="
-                      << device_generation_state_ready_.valid);
+                      << " controller_handoff_phase="
+                      << static_cast<int>(
+                             device_generation_state_ready_
+                                 .handoff.phase()));
             return false;
         }
 
@@ -50081,7 +51242,10 @@ namespace llaminar2
                           std::to_string(loop.fragment_count)},
                          {"conditional_fragments",
                           std::to_string(
-                              loop.conditional_fragment_count)},
+                              loop.native_conditional_fragment_count)},
+                         {"ticket_conditioned_fragments",
+                          std::to_string(
+                              loop.ticket_conditioned_fragment_count)},
                          {"execution",
                           "hosted_ticket_selected_captured_transactions"}});
                     return true;
@@ -50166,7 +51330,9 @@ namespace llaminar2
                std::to_string(loop.maximum_draft_depth)},
               {"fragments", std::to_string(loop.fragment_count)},
               {"conditional_fragments",
-               std::to_string(loop.conditional_fragment_count)},
+               std::to_string(loop.native_conditional_fragment_count)},
+              {"ticket_conditioned_fragments",
+               std::to_string(loop.ticket_conditioned_fragment_count)},
               {"execution",
                loop.minimum_draft_depth != loop.maximum_draft_depth
                    ? "single_async_native_switch_while_launch"
@@ -50378,6 +51544,14 @@ namespace llaminar2
                 control[kDeviceGenerationControlMaximumDraftDepth];
             const int depth_policy_mode =
                 control[kDeviceGenerationControlDepthPolicyMode];
+            const int depth_window_size =
+                control[kDeviceGenerationControlDepthWindowSize];
+            const int depth_minimum_samples =
+                control[kDeviceGenerationControlDepthMinimumSamples];
+            const int depth_window_verifier_runs =
+                control[kDeviceGenerationControlDepthWindowVerifierRuns];
+            const int depth_window_attempted_tokens =
+                control[kDeviceGenerationControlDepthWindowAttemptedTokens];
             const int depth_evaluated_windows =
                 control[kDeviceGenerationControlDepthEvaluatedWindows];
             const int depth_updates =
@@ -50422,6 +51596,11 @@ namespace llaminar2
                 maximum_draft_depth >= minimum_draft_depth &&
                 final_draft_depth >= minimum_draft_depth &&
                 final_draft_depth <= maximum_draft_depth &&
+                depth_window_size > 0 && depth_minimum_samples > 0 &&
+                depth_window_verifier_runs >= 0 &&
+                depth_window_verifier_runs <
+                    std::max(depth_window_size, depth_minimum_samples) &&
+                depth_window_attempted_tokens >= 0 &&
                 attempted_draft_tokens >=
                     transaction_count * minimum_draft_depth &&
                 attempted_draft_tokens <=
@@ -50487,6 +51666,13 @@ namespace llaminar2
                           << " depth_range=[" << minimum_draft_depth << ','
                           << maximum_draft_depth << ']'
                           << " depth_policy=" << depth_policy_mode
+                          << " depth_window_size=" << depth_window_size
+                          << " depth_minimum_samples="
+                          << depth_minimum_samples
+                          << " pending_depth_window_runs="
+                          << depth_window_verifier_runs
+                          << " pending_depth_window_tokens="
+                          << depth_window_attempted_tokens
                           << " evaluated_windows="
                           << depth_evaluated_windows
                           << " depth_updates=" << depth_updates
@@ -50560,6 +51746,32 @@ namespace llaminar2
             total_depth_updates += depth_updates;
             total_depth_promotions += depth_promotions;
             total_depth_demotions += depth_demotions;
+            /*
+             * The terminal bridge already reads this compact controller row
+             * to return the public response.  Publish the immutable policy and
+             * its residual window beside that existing readback so a parity or
+             * production diagnosis can distinguish a clipped observation from
+             * a stale/default policy without adding another device transfer.
+             */
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "device_generation_terminal_depth_policy_state",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"request", std::to_string(request_index)},
+                 {"mode", std::to_string(depth_policy_mode)},
+                 {"minimum_depth", std::to_string(minimum_draft_depth)},
+                 {"maximum_depth", std::to_string(maximum_draft_depth)},
+                 {"final_depth", std::to_string(final_draft_depth)},
+                 {"window_size", std::to_string(depth_window_size)},
+                 {"minimum_samples", std::to_string(depth_minimum_samples)},
+                 {"pending_window_runs",
+                  std::to_string(depth_window_verifier_runs)},
+                 {"pending_window_tokens",
+                  std::to_string(depth_window_attempted_tokens)},
+                 {"evaluated_windows",
+                  std::to_string(depth_evaluated_windows)}});
             parsed.requests.push_back(std::move(request_result));
         }
 
@@ -50596,6 +51808,12 @@ namespace llaminar2
             /* Preconditions above make this an internal transition defect. */
             LOG_ERROR("[DeviceGraphOrchestrator] Terminal response bridge lost hosted scheduler lifecycle ownership");
             std::terminate();
+        }
+        if (!device_generation_state_ready_
+                 .handoff.retireAfterHostCompletion(request_count))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Terminal response bridge could not retire its completed controller borrow");
+            return false;
         }
         device_generation_storage_.active_request_count = 0;
         last_device_generation_dispatch_ticket_.reset();
@@ -50853,10 +52071,8 @@ namespace llaminar2
         }
         if (device_generation_storage_.active_request_count > 0)
         {
-            if (!device_generation_state_ready_.valid ||
-                !consumeDeviceGenerationStateReady(
+            if (!retireDeviceGenerationStateForRequestReset(
                     reset_stream,
-                    DeviceTimelineRole::RequestStateReset,
                     device_generation_storage_.active_request_count,
                     consumer_name))
             {
@@ -54974,7 +56190,7 @@ namespace llaminar2
          */
         if (!device_generation_storage_.validFor(request_count) ||
             device_generation_storage_.active_request_count != request_count ||
-            device_generation_state_ready_.valid)
+            !device_generation_state_ready_.handoff.borrowed())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-owned stochastic verifier did not receive one exclusively consumed preparation transaction");
             return false;
@@ -58467,7 +59683,8 @@ namespace llaminar2
             LOG_ERROR("[DGO] MTP workspace-family manifest requires an empty dedicated owner");
             return false;
         }
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        if (!graph_builder_ ||
+            !retainsMTPGraphCapacity(graph_builder_->config().mtp))
             return true;
         if (!state_.isInitialized() || !hasGlobalWeights())
         {
@@ -58836,8 +60053,12 @@ namespace llaminar2
                 ? ForwardExecutionPhase::Decode
                 : ForwardExecutionPhase::Prefill;
         input.position_offset = 0;
+        const auto sparse_request_identity =
+            currentMoESparseRequestIdentity();
         input.moe_overlay_collective_generation_id =
-            moe_overlay_collective_request_generation_;
+            sparse_request_identity
+                ? sparse_request_identity->generation()
+                : 0;
         input.moe_overlay_collective_step_id = 0;
         input.device = state_.device_id;
         input.kv_cache = state_.kv_cache.get();
@@ -59083,7 +60304,7 @@ namespace llaminar2
         std::vector<int> grouped_verifier_tokens;
         std::vector<int> grouped_verifier_positions;
         std::vector<int> grouped_verifier_request_lengths;
-        if (graph_builder_->config().mtp.enabled &&
+        if (retainsMTPGraphCapacity(graph_builder_->config().mtp) &&
             mtp_max_verifier_rows_ > 1)
         {
             /*
@@ -59207,7 +60428,7 @@ namespace llaminar2
         std::vector<int> mtp_condition_positions;
         std::vector<int> mtp_condition_sequence_lengths;
         if (state_.device_id.is_gpu() &&
-            graph_builder_->config().mtp.enabled)
+            retainsMTPGraphCapacity(graph_builder_->config().mtp))
         {
             /*
              * A live MTP condition is not the ordinary scalar decode graph.
@@ -59441,6 +60662,29 @@ namespace llaminar2
             if (!maintenance_stream)
             {
                 LOG_ERROR("[DGO] Device MoE scheduler setup produced a null stream on "
+                          << state_.device_id.toString());
+                return false;
+            }
+
+            /*
+             * A topology-wide controller performs this handoff while it
+             * materializes each endpoint.  The homogeneous single-domain
+             * special case has no external controller service: this retained
+             * maintenance stream is the controller.  Publish the complete
+             * physical runtime family here, after main, MTP, and maintenance
+             * graph declaration has finished, so dormant retained layers
+             * (for example a disabled NextN source layer) cannot remain as an
+             * epoch-zero template when the first maintenance scan executes.
+             *
+             * finalizeMoEOverlayDeviceControllerRuntime() and the following
+             * maintenance work share this exact stream.  Their ordering is
+             * therefore entirely device-side; no setup or inference stream is
+             * synchronized on the host.
+             */
+            if (!publishMoEOverlayDeviceInitialRuntime(
+                    maintenance_stream))
+            {
+                LOG_ERROR("[DGO] Participant-local device MoE controller could not publish its complete initial runtime family on "
                           << state_.device_id.toString());
                 return false;
             }

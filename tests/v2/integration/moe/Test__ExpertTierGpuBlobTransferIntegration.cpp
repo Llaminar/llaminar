@@ -401,6 +401,7 @@ namespace llaminar2
                 .source = MappedTransferProgressEpoch::create({
                     .device = source_device,
                     .slot_capacity = 2u,
+                    .execution_lane_capacity = 2u,
                     .maximum_bytes = staging_bytes,
                     .name = "blob_source:" + identity,
                     .perf_device = identity,
@@ -408,6 +409,7 @@ namespace llaminar2
                 .destination = MappedTransferProgressEpoch::create({
                     .device = destination_device,
                     .slot_capacity = 2u,
+                    .execution_lane_capacity = 2u,
                     .maximum_bytes = staging_bytes,
                     .name = "blob_destination:" + identity,
                     .perf_device = identity,
@@ -1145,7 +1147,7 @@ namespace llaminar2
             const MoEOverlayRemoteProjectionIdentity identity{
                 .expected_epoch = 1000u + seed,
                 .candidate_epoch = 1001u + seed,
-                .transaction_fingerprint = {
+                .execution_fingerprint = {
                     .low = 0xabc00000u + seed,
                     .high = 0xdef00000u + seed,
                 },
@@ -1482,7 +1484,7 @@ namespace llaminar2
             const MoEOverlayRemoteProjectionIdentity identity{
                 .expected_epoch = 2000u + seed,
                 .candidate_epoch = 2001u + seed,
-                .transaction_fingerprint = {
+                .execution_fingerprint = {
                     .low = 0xf1000000u + seed,
                     .high = 0xf2000000u + seed,
                 },
@@ -1513,7 +1515,7 @@ namespace llaminar2
                     .bytes = projection_bytes,
                 };
             const auto manifest =
-                makeMoEOverlayRemoteGpuFloatingProjectionManifest(
+                makeMoEOverlayRemoteFloatingProjectionManifest(
                     identity,
                     source_descriptor,
                     /*maximum_chunk_bytes=*/1024u);

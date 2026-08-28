@@ -122,9 +122,10 @@ namespace llaminar2
      * Aggregate throughput is useful for a stable headline number, but it
      * erases the trajectory of an adaptive placement policy.  These records
      * retain exact request timings together with completed ExpertOverlay
-     * movement evidence delimited by the request boundaries. The
-     * counters come from PerfStats and therefore never download a device owner
-     * map or synchronize an inference stream.
+     * movement evidence delimited by the request boundaries. The counters are
+     * a passive projection of the sole host/device optimization authority and
+     * therefore remain available when PerfStats is disabled without downloading
+     * a device owner map or synchronizing an inference stream.
      */
     struct BenchmarkIterationResult
     {

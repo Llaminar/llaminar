@@ -617,6 +617,7 @@ namespace llaminar2
                         MappedTransferProgressEpoch::create({
                             .device = DeviceId::cuda(0),
                             .slot_capacity = blob_slots_per_device,
+                            .execution_lane_capacity = blob_slots_per_device,
                             .maximum_bytes = blob_staging_bytes,
                             .name = "three_tier_cuda_relay",
                             .perf_device =
@@ -626,6 +627,7 @@ namespace llaminar2
                         MappedTransferProgressEpoch::create({
                             .device = DeviceId::rocm(0),
                             .slot_capacity = blob_slots_per_device,
+                            .execution_lane_capacity = blob_slots_per_device,
                             .maximum_bytes = blob_staging_bytes,
                             .name = "three_tier_rocm_relay",
                             .perf_device =

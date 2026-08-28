@@ -42,6 +42,26 @@ namespace llaminar2
         size_t v_payload_bytes = 0;
         uint64_t k_payload_hash = 0;
         uint64_t v_payload_hash = 0;
+
+        /**
+         * @brief Optional canonical native-precision K bytes for deep parity.
+         *
+         * Ordinary probes retain only hashes.  A typed capture policy may keep
+         * the bytes already exported for one bounded segment so a later state
+         * comparison can prove numerical equivalence without issuing another
+         * device transfer.  These bytes use the enclosing cache's declared K
+         * precision and canonical logical-block layout.
+         */
+        std::vector<uint8_t> k_payload;
+
+        /**
+         * @brief Optional canonical native-precision V bytes for deep parity.
+         *
+         * Ownership and layout are identical to @ref k_payload.  Keeping K and
+         * V independent makes a one-sided cache defect visible rather than
+         * allowing a combined digest or metric to conceal it.
+         */
+        std::vector<uint8_t> v_payload;
     };
 
     /**
@@ -125,6 +145,16 @@ namespace llaminar2
         std::vector<PrefixKVSegmentProbe> requested_kv_segments;
 
         /**
+         * @brief Retain canonical bytes for explicitly requested KV segments.
+         *
+         * This never retains a full cache implicitly: only entries named in
+         * @ref requested_kv_segments receive payload vectors.  It is intended
+         * for bounded parity boundaries such as the single suffix row
+         * recomputed after a partial prefix hit.
+         */
+        bool capture_requested_kv_segment_payloads = false;
+
+        /**
          * @brief Hash only the newest N logical K/V tokens.
          *
          * Failed grouped-verifier diagnostics use this bounded export.  The
@@ -146,6 +176,31 @@ namespace llaminar2
          * result transfer.  Production inference never enables this policy.
          */
         bool hash_terminal_state = false;
+
+        /**
+         * @brief Retain the FP32 terminal-hidden payload for numerical evidence.
+         *
+         * Expert migration can move an otherwise identical routed expert
+         * between CPU and GPU kernels.  Those kernels are required to remain
+         * numerically equivalent, but they are not required to produce the
+         * same floating-point bytes across device types.  Deep parity probes
+         * may retain the terminal-hidden row that was already materialized for
+         * hashing so a placement-aware comparison can prove equivalence
+         * without issuing a second device transfer.  Ordinary runtime probes
+         * leave this disabled.
+         */
+        bool capture_terminal_hidden_values = false;
+
+        /**
+         * @brief Retain the FP32 terminal-logits payload for numerical evidence.
+         *
+         * A partial prefix hit recomputes its uncached suffix.  When an expert
+         * moved between device types after the serial oracle was recorded, the
+         * recomputed logits can be mathematically equivalent without being
+         * byte-identical.  Deep parity probes retain the already-materialized
+         * logits row so that transition is certified rather than ignored.
+         */
+        bool capture_terminal_logits_values = false;
 
         /// Retain raw CPU-owned GDN values for tolerance-aware diagnostics.
         bool capture_gdn_values = false;
@@ -357,9 +412,19 @@ namespace llaminar2
         bool terminal_hidden_hash_available = false;
         size_t terminal_hidden_bytes = 0;
         uint64_t terminal_hidden_hash = 0;
+        /**
+         * @brief Optional full FP32 terminal-hidden values in participant order.
+         *
+         * A rank/global aggregate concatenates child rows in the same stable
+         * order used to fold their hashes.  The vector is populated only by an
+         * explicit deep-probe policy and is never part of production inference.
+         */
+        std::vector<float> terminal_hidden_values;
         bool terminal_logits_hash_available = false;
         size_t terminal_logits_bytes = 0;
         uint64_t terminal_logits_hash = 0;
+        /** Optional full FP32 terminal logits in stable participant order. */
+        std::vector<float> terminal_logits_values;
         PrefixCacheRequestSummary prefix_request;
         MTPRequestSummary mtp_request;
         std::vector<int> positions;

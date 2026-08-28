@@ -666,7 +666,8 @@ namespace llaminar2
                     full_indices,
                     full_output_weights,
                     params_.active_row_count_device,
-                    params_.defer_overlay_grouped_verifier_histogram_publication
+                    params_.grouped_verifier_histogram_role ==
+                            MoEGroupedVerifierHistogramRole::DeferredAcceptedRows
                         ? moe_runtime_layer_
                         : nullptr))
             {
@@ -763,6 +764,41 @@ namespace llaminar2
         return true;
     }
 
+    bool MoERoutingStage::prepareGroupedVerifierHistogramProducer(
+        void *producer_stream)
+    {
+        void *const publication_stream =
+            groupedVerifierHistogramPublicationStream();
+        if (groupedVerifierHistogramRole() !=
+                MoEGroupedVerifierHistogramRole::DeferredAcceptedRows ||
+            !params_.moe_runtime_table || !producer_stream ||
+            !publication_stream || producer_stream != publication_stream)
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Overlay verifier histogram producer "
+                "preparation requires the table-owned publication stream"
+                << " layer=" << params_.layer_idx
+                << " stream=" << producer_stream
+                << " expected=" << publication_stream);
+            return false;
+        }
+        try
+        {
+            params_.moe_runtime_table->prepareDecodeHistogramProducerStream(
+                producer_stream);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Overlay verifier histogram producer "
+                "preparation failed"
+                << " layer=" << params_.layer_idx
+                << " reason=" << error.what());
+            return false;
+        }
+        return true;
+    }
+
     bool MoERoutingStage::enqueueCommittedGroupedVerifierHistograms(
         const int32_t *accepted_state_counts_device,
         const int32_t *publication_ok_flags_device,
@@ -770,7 +806,8 @@ namespace llaminar2
         int rows_per_request,
         void *producer_stream)
     {
-        if (!requiresCommittedGroupedVerifierHistogramPublication())
+        if (groupedVerifierHistogramRole() !=
+            MoEGroupedVerifierHistogramRole::DeferredAcceptedRows)
         {
             LOG_ERROR(
                 "[MoERoutingStage] Committed grouped-verifier publication was "
@@ -800,6 +837,20 @@ namespace llaminar2
                 "[MoERoutingStage] Committed overlay-verifier publication has "
                 "no complete per-layer selected-route ledger"
                 << " layer=" << params_.layer_idx);
+            return false;
+        }
+        try
+        {
+            params_.moe_runtime_table->recordDecodeHistogramProducerStream(
+                producer_stream);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Overlay verifier histogram producer was "
+                "not prepared before enqueue"
+                << " layer=" << params_.layer_idx
+                << " reason=" << error.what());
             return false;
         }
 
@@ -1498,7 +1549,8 @@ namespace llaminar2
 
     bool MoERoutingStage::hasCompleteOverlayVerifierLedgerBinding() const
     {
-        if (!params_.defer_overlay_grouped_verifier_histogram_publication)
+        if (params_.grouped_verifier_histogram_role !=
+            MoEGroupedVerifierHistogramRole::DeferredAcceptedRows)
             return true;
         if (!params_.device_id.is_gpu() ||
             !params_.force_decode_equivalent_verifier_prefill ||

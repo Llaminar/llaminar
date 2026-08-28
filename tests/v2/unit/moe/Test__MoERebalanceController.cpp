@@ -258,16 +258,17 @@ TEST(Test__MoERebalanceController,
  * @brief Lock the generation-stamped transfer-slot transaction into the ABI.
  *
  * Destination projection turns a logical root command into a participant-local
- * compare-and-replace transaction. The invalid prior identity is meaningful for
- * an empty slot, while generation zero is the first valid directory generation.
- * These defaults must therefore remain explicit and trivially transportable
- * through device command buffers.
+ * compare-and-replace transaction. ABI version 12 also authenticates the
+ * overlay-wide destination separately from the intra-domain participant. The
+ * invalid prior identity is meaningful for an empty slot, while generation
+ * zero is the first valid directory generation. These defaults must therefore
+ * remain explicit and trivially transportable through device command buffers.
  */
 TEST(Test__MoERebalanceController,
      DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
 {
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 11u);
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 12u);
     EXPECT_EQ(
         sizeof(DeviceMoERebalanceConfig),
         moe_rebalance_abi::kConfigBytes);
@@ -278,6 +279,7 @@ TEST(Test__MoERebalanceController,
     EXPECT_EQ(plan.destination_previous_layer, kDeviceMoEInvalidSlot);
     EXPECT_EQ(plan.destination_previous_expert, kDeviceMoEInvalidSlot);
     EXPECT_EQ(plan.destination_generation, 0u);
+    EXPECT_EQ(plan.destination_overlay_participant, -1);
 }
 
 /**
@@ -687,6 +689,44 @@ TEST(Test__MoERebalanceController, DynamicPolicyDefaultsAreSharedAcrossCpuAndDev
               moe_rebalance_policy::kDefaultDynamicMinWindowActivations);
 }
 
+TEST(Test__MoERebalanceController,
+     DynamicPlanAdmissionDistinguishesWaveBackpressureFromCorruption)
+{
+    using Admission = moe_rebalance_policy::DynamicPlanAdmission;
+
+    EXPECT_EQ(
+        moe_rebalance_policy::dynamicPlanAdmission(
+            /*command_count=*/18u,
+            /*required_entries=*/2u,
+            /*configured_wave_limit=*/20u,
+            /*physical_plan_capacity=*/20u),
+        Admission::Admit);
+    EXPECT_EQ(
+        moe_rebalance_policy::dynamicPlanAdmission(
+            /*command_count=*/20u,
+            /*required_entries=*/2u,
+            /*configured_wave_limit=*/20u,
+            /*physical_plan_capacity=*/20u),
+        Admission::ConfiguredWaveLimit)
+        << "An exactly-full configured wave is valid scheduling backpressure";
+    EXPECT_EQ(
+        moe_rebalance_policy::dynamicPlanAdmission(
+            /*command_count=*/8u,
+            /*required_entries=*/2u,
+            /*configured_wave_limit=*/20u,
+            /*physical_plan_capacity=*/9u),
+        Admission::PhysicalPlanOverflow)
+        << "Only an under-sized physical plan is a fatal representation error";
+    EXPECT_EQ(
+        moe_rebalance_policy::dynamicPlanAdmission(
+            /*command_count=*/8u,
+            /*required_entries=*/2u,
+            /*configured_wave_limit=*/0u,
+            /*physical_plan_capacity=*/9u),
+        Admission::PhysicalPlanOverflow)
+        << "Zero policy limit leaves physical capacity as the sole bound";
+}
+
 TEST(Test__MoERebalanceController, DeviceSidePayloadBucketsRoundToPowerOfTwoCapacity)
 {
     EXPECT_EQ(deviceMoERebalancePayloadBucketSlots(0, 8), 0u);
@@ -884,7 +924,7 @@ TEST(Test__MoERebalanceController, DeviceSideTransferWaveRequiresAggregateSpread
         << "No projected load cannot justify a payload transfer.";
 }
 
-TEST(Test__MoERebalanceController, DeviceSideTransferWaveRejectsWorseParticipantSpreadWithoutRouterPayback)
+TEST(Test__MoERebalanceController, DeviceSideTransferWaveAcceptsIndependentCriticalPathPayback)
 {
     EXPECT_TRUE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
         200, 300, 10000, 10000, 0, false))
@@ -896,13 +936,13 @@ TEST(Test__MoERebalanceController, DeviceSideTransferWaveRejectsWorseParticipant
         << "Paid waves should not merely tie projected participant spread.";
     EXPECT_FALSE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
         200, 201, 10000, 10000, 1, false))
-        << "Paid waves should not worsen projected participant spread without measured router payback.";
+        << "Paid waves should not worsen projected participant spread without independent payoff.";
     EXPECT_TRUE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
         200, 201, 10000, 10000, 1, true))
-        << "Measured cache-aware routing payback can justify accepting the next paid wave.";
+        << "Proven layer-critical-path or cache-routing payback can justify the paid wave.";
     EXPECT_FALSE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
         200, 199, 10000, 9999, 1, true))
-        << "Router payback must not paper over inconsistent projected totals.";
+        << "Critical-path payback must not paper over inconsistent projected totals.";
     EXPECT_FALSE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
         0, 0, 0, 0, 1, true))
         << "No projected load cannot justify a payload transfer.";
@@ -1322,6 +1362,50 @@ TEST(Test__MoERebalanceController, DeviceSideLoadSpreadStatusIsOptIn)
     EXPECT_GT(stats_status.pre_policy_load_total, 0u);
     EXPECT_GT(stats_status.pre_policy_imbalance_numerator, 0u);
     EXPECT_GT(stats_status.post_policy_load_total, 0u);
+
+    /* PerfStats may request richer device diagnostics, but that request is
+     * never a policy input. Prove the complete published ownership decision is
+     * identical with the diagnostic flag disabled and enabled. */
+    EXPECT_EQ(stats_runtime.active_bank, default_runtime.active_bank);
+    EXPECT_EQ(stats_runtime.active_epoch, default_runtime.active_epoch);
+    EXPECT_EQ(stats_runtime.expert_count, default_runtime.expert_count);
+    EXPECT_EQ(stats_runtime.top_k, default_runtime.top_k);
+    for (std::size_t bank_index = 0; bank_index < 2; ++bank_index)
+    {
+        const auto &without_stats = default_runtime.banks[bank_index];
+        const auto &with_stats = stats_runtime.banks[bank_index];
+        EXPECT_EQ(with_stats.epoch, without_stats.epoch);
+        EXPECT_EQ(with_stats.expert_count, without_stats.expert_count);
+        EXPECT_EQ(
+            with_stats.multi_resident_expert_count,
+            without_stats.multi_resident_expert_count);
+        EXPECT_EQ(
+            with_stats.transient_placement_observed,
+            without_stats.transient_placement_observed);
+        for (std::size_t expert = 0;
+             expert < static_cast<std::size_t>(config.num_experts);
+             ++expert)
+        {
+            const auto &expected = without_stats.experts[expert];
+            const auto &observed = with_stats.experts[expert];
+            EXPECT_EQ(observed.logical_expert_id, expected.logical_expert_id);
+            EXPECT_EQ(observed.owner_participant, expected.owner_participant);
+            EXPECT_EQ(observed.local_slot, expected.local_slot);
+            EXPECT_EQ(observed.flags, expected.flags);
+            EXPECT_EQ(
+                with_stats.local_compute_mask[expert],
+                without_stats.local_compute_mask[expert]);
+            EXPECT_EQ(
+                with_stats.replica_role[expert],
+                without_stats.replica_role[expert]);
+            EXPECT_EQ(
+                with_stats.resident_participant_mask[expert],
+                without_stats.resident_participant_mask[expert]);
+            EXPECT_EQ(
+                with_stats.overlay_route_participant[expert],
+                without_stats.overlay_route_participant[expert]);
+        }
+    }
 }
 
 TEST(Test__MoERebalanceController, Construction_OffMode)

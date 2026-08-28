@@ -656,9 +656,18 @@ namespace
         {
             producer_stream = stream;
         }
+        void retireRuntimeHistogramProducerStreams() override
+        {
+            producer_stream = nullptr;
+            prepared_producer_stream = nullptr;
+        }
         void *decodeHistogramProducerStream() const override
         {
             return producer_stream;
+        }
+        void *groupedVerifierHistogramPublicationStream() const override
+        {
+            return grouped_verifier_publication_stream;
         }
         bool syncDecodeHistogramToHost(
             DecodeExpertHistogram &histogram,
@@ -691,6 +700,13 @@ namespace
                        : RuntimeExpertHistogramDrainResult::failed(
                              "fake async drain failed");
         }
+        bool publishAsyncDecodeHistogramAdmission(
+            RuntimeExpertHistogramAdmission admission) override
+        {
+            published_admission = admission;
+            ++admission_publications;
+            return async_enabled;
+        }
         bool captureDecodeHistogramCounts(
             std::vector<uint64_t> &selected_counts,
             std::vector<uint64_t> &local_counts,
@@ -720,9 +736,13 @@ namespace
 
         RuntimeExpertHistogramSourceMask async_sources{};
         bool async_enabled = false;
+        int admission_publications = 0;
+        RuntimeExpertHistogramAdmission published_admission =
+            RuntimeExpertHistogramAdmission::CalibrationEvidence;
 
         void *prepared_producer_stream = nullptr;
         void *producer_stream = nullptr;
+        void *grouped_verifier_publication_stream = nullptr;
     };
 
     ModelWeightBindings makeDecodeDenseBindingSource()
@@ -3316,7 +3336,7 @@ TEST(Test__Qwen35MoEGraph, SnapshotShardingDeclaresFinalCombinedOutputReplicated
     EXPECT_EQ(sharding.at("MOE_EXPERT_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
     EXPECT_EQ(sharding.at("MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
     EXPECT_EQ(
-        sharding.at("MOE_CANONICAL_ROUTE_CONTRIBUTIONS"),
+        sharding.at("MOE_ROUTE_CONTRIBUTIONS"),
         SnapshotShardingMode::ROW_PARALLEL);
     EXPECT_EQ(sharding.count("MOE_COMBINED_OUTPUT_ALLREDUCED"), 0u)
         << "The combined-output allreduce was retired when branch-wise reduction "
@@ -3346,7 +3366,13 @@ TEST(Test__Qwen35MoEGraph, SnapshotShardingDeclaresFinalCombinedOutputReplicated
         sharding.at("MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0"),
         SnapshotShardingMode::ROOT_ONLY);
     EXPECT_EQ(
+        sharding.at("MOE_OVERLAY_ROUTE_BANK0_EPOCH"),
+        SnapshotShardingMode::ROOT_ONLY);
+    EXPECT_EQ(
         sharding.at("MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1"),
+        SnapshotShardingMode::ROOT_ONLY);
+    EXPECT_EQ(
+        sharding.at("MOE_OVERLAY_ROUTE_BANK1_EPOCH"),
         SnapshotShardingMode::ROOT_ONLY);
     EXPECT_EQ(
         sharding.at("MOE_OVERLAY_ROUTE_SELECTED_BANK"),
@@ -4497,6 +4523,56 @@ TEST(Test__Qwen35MoEGraph, CapturedOverlayRouteLedgerHasOneTypedProducerLifecycl
             "captured_distributed_overlay_dynamic_prefill_runtime_table"),
         std::string::npos)
         << "The retired Dynamic-only route publication gate must not return";
+}
+
+/**
+ * @brief Distributed route evidence belongs to the GPU authority, not transport.
+ *
+ * Mapped and portable multi-rank continuations both consume the same device
+ * runtime table. Keep the binding under the typed dispatch-authority gate so
+ * changing transport cannot erase that certificate. Rank-local heterogeneous
+ * execution must reach the same finalized route-evidence boundary; dispatch
+ * itself is never an evidence authority.
+ */
+TEST(Test__Qwen35MoEGraph,
+     DistributedOverlayAuthorityPinsRouteEvidenceForEveryTransport)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open())
+        << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t transport_selection = source.find(
+        "use_mapped_activation_parent =");
+    ASSERT_NE(transport_selection, std::string::npos);
+    const size_t authority_binding = source.find(
+        "if (sparse_graph_contract.ownsDispatchAuthority())",
+        transport_selection);
+    ASSERT_NE(authority_binding, std::string::npos);
+    const size_t follower_branch = source.find(
+        "else if (mapped_activation_topology &&",
+        authority_binding);
+    ASSERT_NE(follower_branch, std::string::npos);
+    const std::string authority_body = source.substr(
+        authority_binding,
+        follower_branch - authority_binding);
+
+    EXPECT_NE(
+        authority_body.find("overlayRoutePlacementBinding"),
+        std::string::npos);
+    EXPECT_NE(
+        authority_body.find("runtime_layer.route_participant_ids"),
+        std::string::npos);
+    EXPECT_NE(
+        authority_body.find("runtime_layer.route_weights"),
+        std::string::npos);
+    EXPECT_EQ(
+        authority_body.find("if (use_mapped_activation_parent)"),
+        std::string::npos)
+        << "Pinned route evidence must not disappear on local-ticket or "
+           "portable transports";
 }
 
 TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSelectsDecodeBindingByRole)

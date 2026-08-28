@@ -38,6 +38,16 @@ namespace
         return makePrefixCacheKey(0xbeef, 0, block, block, {block});
     }
 
+    PrefixCacheKey keyForFingerprint(uint64_t fingerprint, int block)
+    {
+        return makePrefixCacheKey(
+            fingerprint,
+            0,
+            block,
+            block,
+            {block});
+    }
+
     std::filesystem::path tempDir()
     {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -73,6 +83,110 @@ TEST(Test__PrefixStateCacheLRU, InsertFindAndTouchUpdatesRecency)
     EXPECT_EQ(cache.stats().lookups, 1u);
     EXPECT_EQ(cache.stats().hits, 1u);
     EXPECT_EQ(cache.stats().stores, 2u);
+}
+
+/**
+ * A placement-invalidating fingerprint transition must immediately recover
+ * volatile capacity. Persisting stale blocks during that request boundary
+ * would charge disk checksums, writes, and fsync to the next inference.
+ */
+TEST(
+    Test__PrefixStateCacheLRU,
+    FingerprintRebaseRetiresVolatileEntriesWithoutWritingDisk)
+{
+    const auto dir = tempDir();
+    const auto cleanup = [&]() { std::filesystem::remove_all(dir); };
+
+    constexpr size_t kBlockBytes = 32;
+    constexpr uint64_t kOldFingerprint = 0x1111;
+    constexpr uint64_t kNewFingerprint = 0x2222;
+    auto ram = std::make_shared<RamPrefixStorageBackend>(kBlockBytes * 3);
+    auto disk = makeDiskBackend(dir, kBlockBytes * 4);
+    ASSERT_TRUE(disk->ready()) << disk->initializationError();
+    PrefixStateCache cache(kBlockBytes * 2, ram, disk);
+
+    auto old_a = ram->allocate(
+        keyForFingerprint(kOldFingerprint, 0),
+        layoutBytes(kBlockBytes));
+    auto old_b = ram->allocate(
+        keyForFingerprint(kOldFingerprint, 1),
+        layoutBytes(kBlockBytes));
+    auto old_c = ram->allocate(
+        keyForFingerprint(kOldFingerprint, 2),
+        layoutBytes(kBlockBytes));
+    ASSERT_TRUE(old_a.valid());
+    ASSERT_TRUE(old_b.valid());
+    ASSERT_TRUE(old_c.valid());
+    ASSERT_TRUE(cache.insert(old_a));
+    ASSERT_TRUE(cache.insert(old_b));
+    ASSERT_TRUE(cache.insert(old_c));
+    ASSERT_EQ(cache.stats().ram_to_disk_demotions, 1u);
+    ASSERT_GT(disk->usedBytes(), 0u);
+    const size_t durable_bytes_before_rebase = disk->usedBytes();
+
+    const auto transition = cache.rebaseFingerprint(
+        kOldFingerprint,
+        kNewFingerprint);
+    ASSERT_TRUE(transition.has_value());
+    EXPECT_TRUE(transition->changed());
+    EXPECT_EQ(transition->invalidated_ram_entries, 2u);
+    EXPECT_EQ(transition->unindexed_disk_entries, 1u);
+    EXPECT_EQ(transition->released_ram_bytes, kBlockBytes * 2);
+    EXPECT_EQ(cache.usedBytes(), 0u);
+    EXPECT_EQ(ram->usedBytes(), 0u);
+    EXPECT_EQ(cache.size(), 0u);
+    EXPECT_FALSE(cache.isDiskResident(old_a.key));
+    EXPECT_EQ(disk->usedBytes(), durable_bytes_before_rebase)
+        << "Rebase must not serialize a delete or compact the durable archive";
+    EXPECT_EQ(cache.stats().fingerprint_rebases, 1u);
+    EXPECT_EQ(cache.stats().fingerprint_invalidated_ram_entries, 2u);
+    EXPECT_EQ(cache.stats().fingerprint_unindexed_disk_entries, 1u);
+
+    auto current = ram->allocate(
+        keyForFingerprint(kNewFingerprint, 0),
+        layoutBytes(kBlockBytes));
+    ASSERT_TRUE(current.valid());
+    ASSERT_TRUE(cache.insert(current));
+    EXPECT_EQ(cache.stats().ram_to_disk_demotions, 1u)
+        << "A new-epoch insert must consume recovered RAM rather than spill a stale epoch";
+
+    cleanup();
+}
+
+/** A retained legacy lease rejects the complete rebase before any tier moves. */
+TEST(Test__PrefixStateCacheLRU, BusyFingerprintRebaseIsAtomic)
+{
+    constexpr size_t kBlockBytes = 32;
+    constexpr uint64_t kOldFingerprint = 0x1111;
+    constexpr uint64_t kNewFingerprint = 0x2222;
+    auto ram = std::make_shared<RamPrefixStorageBackend>(kBlockBytes * 2);
+    PrefixStateCache cache(kBlockBytes * 2, ram);
+
+    auto old = ram->allocate(
+        keyForFingerprint(kOldFingerprint, 0),
+        layoutBytes(kBlockBytes));
+    auto current = ram->allocate(
+        keyForFingerprint(kNewFingerprint, 0),
+        layoutBytes(kBlockBytes));
+    ASSERT_TRUE(old.valid());
+    ASSERT_TRUE(current.valid());
+    ASSERT_TRUE(cache.insert(old));
+    ASSERT_TRUE(cache.insert(current));
+    ASSERT_TRUE(cache.retain(old.key));
+
+    EXPECT_FALSE(cache.rebaseFingerprint(
+        kOldFingerprint,
+        kNewFingerprint));
+    EXPECT_TRUE(cache.isRamResident(old.key));
+    EXPECT_TRUE(cache.isRamResident(current.key));
+    EXPECT_EQ(cache.stats().fingerprint_rebases, 0u);
+
+    EXPECT_TRUE(cache.release(old.key));
+    ASSERT_TRUE(cache.rebaseFingerprint(
+        kOldFingerprint,
+        kNewFingerprint));
+    EXPECT_FALSE(cache.isRamResident(old.key));
+    EXPECT_TRUE(cache.isRamResident(current.key));
 }
 
 /**

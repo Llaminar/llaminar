@@ -33,6 +33,7 @@
 #include "../../collective/ILocalTPContext.h"
 #include "../../collective/ILocalPPContext.h"
 #include "../../loaders/ModelContext.h"
+#include "../local_execution/device/ReusableExecutionWorkspace.h"
 #include "../../interfaces/IMPIContext.h"
 #include "../../utils/Assertions.h"
 #include "../../utils/MPIContext.h"
@@ -46,6 +47,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace llaminar2
 {
@@ -53,13 +55,14 @@ namespace llaminar2
     class MoEOverlayResidencyAuthority;
     class MoEOverlayParticipantResidencyRegistry;
     class MoEOverlayPhysicalResidencyFabric;
+    struct MoEOverlayReusableContextSeal;
     class MoEOverlayHostAuthorityDeviceBankPublisher;
     class MoEOverlayParticipantPreparedWaveFactory;
     class MoEOverlayTierMigrationTransport;
     class MoEOverlayMPIRemoteProjectionTransport;
     class MoEOverlayMPIResidencyConsensus;
     class MoEOverlayDistributedResidencyTransport;
-    class MoEOverlayMPIHistogramPublisher;
+    class MoEOverlayMPIResidencyProposalPublisher;
     class MoEOverlayResidencyMaintenanceService;
     class MoEOverlayInferenceInterferenceProbe;
     class MoEOverlayRankBatchTransportRegistry;
@@ -241,6 +244,9 @@ namespace llaminar2
         void setDecodeStepTokenBudget(int max_tokens) override;
         bool maybeApplyMoERebalance(uint64_t committed_tokens) override;
         uint64_t moeRuntimeMovementEpoch() const override;
+        MoEOptimizationStatus moeOptimizationStatus() const override;
+        MoEOptimizationMovementLedger
+        moeOptimizationMovementLedger() const override;
 
         // =====================================================================
         // IOrchestrationRunner: Configuration
@@ -258,6 +264,7 @@ namespace llaminar2
         int vocabSize() const override;
         int currentPosition() const override;
         void clearCache() override;
+        bool purgePrefixCache() override;
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
         PrefixRuntimeStateSnapshot prefixStateProbe() const override;
         DeviceId primaryDeviceId() const override;
@@ -284,6 +291,7 @@ namespace llaminar2
 
         std::optional<ModelContextReuseContract>
         modelContextReuseContract() const override;
+        ModelContextReuseStatus modelContextReuseStatus() const override;
         // =====================================================================
         // IOrchestrationRunner: Snapshot API
         // =====================================================================
@@ -338,6 +346,7 @@ namespace llaminar2
             PREFILL = 3,             ///< Prefill (followed by token count + tokens)
             DECODE_STEP = 4,         ///< Run one decode step (followed by typed progress payload)
             SKIP_LOGITS_DECODE = 5,  ///< Set skip-logits-gather for decode
+            PURGE_PREFIX_CACHE = 6,  ///< Retire reusable prefix records on every rank
             FORCE_DECODE_TOKEN = 7,  ///< Commit a forced token (followed by token id)
             SET_STOP_TOKENS = 8,     ///< Install request stop policy (followed by count + token IDs)
             SHUTDOWN = 99            ///< Exit the worker loop
@@ -360,7 +369,11 @@ namespace llaminar2
         void runMPIWorkerLoop() override;
 
         /**
-         * @brief Signal workers to exit their loops.
+         * @brief Close command admission and drain topology maintenance.
+         *
+         * Multi-rank roots publish SHUTDOWN before the collective drain.
+         * Single-rank runners perform the identical local drain without a wire
+         * command so old residency banks retire before terminal evidence.
          */
         void shutdownMPIWorkers() override;
         int coordinatedRootRank() const override
@@ -438,6 +451,18 @@ namespace llaminar2
          * @brief Load model weights (partial for PP, sharded for TP)
          */
         bool loadWeights(bool prepopulate_page_cache = true);
+
+        /**
+         * @brief Wait for prior asynchronous host reclaim before runtime allocation.
+         *
+         * Reused model contexts may still be completing the first-prefill
+         * release submitted by their previous runner.  Initialization crosses
+         * this model/JIT admission edge collectively before memory planning or
+         * graph construction; inference itself never waits on reclamation.
+         *
+         * @return True after reclaim is complete or was never submitted.
+         */
+        bool awaitMmapReclaimBeforeRuntimeAllocation();
 
         bool freezeMoEExpertOverlayPlanForLoadedModel();
 
@@ -565,14 +590,83 @@ namespace llaminar2
          */
         bool initializeMoEOverlayInferenceTransactions();
 
+        /** @brief Why one residency-maintenance composition is being drained. */
+        enum class MoEOverlayMaintenanceDrainIntent : std::uint8_t
+        {
+            /**
+             * Discard an empty, superseded, or partially built composition.
+             *
+             * Initialization uses this before rebuilding the maintenance
+             * graph. It must never change reusable-model lifecycle state:
+             * there is not yet a complete residency authority to certify.
+             */
+            ResetComposition,
+            /**
+             * End runner ownership and certify model-owned prepared weights.
+             *
+             * This is the only intent allowed to restore Dynamic placement and
+             * publish the `Sealing -> Reusable` model-context transition.
+             */
+            TerminalContextSeal,
+        };
+
         /**
          * @brief Stop background proposals and destroy migration ownership safely.
+         * @param intent Typed distinction between setup cleanup and terminal seal.
          *
          * The maintenance worker drains exact transfer events while the graph,
          * prepared engines, and devices are still alive. Destruction then
-         * proceeds transport, factory, fabric, registry, and authority.
+         * proceeds transport, factory, fabric, registry, and authority. Only
+         * @ref MoEOverlayMaintenanceDrainIntent::TerminalContextSeal may mutate
+         * the reusable model-context lifecycle.
          */
-        void shutdownMoEExpertOverlayResidencyMaintenance() noexcept;
+        void shutdownMoEExpertOverlayResidencyMaintenance(
+            MoEOverlayMaintenanceDrainIntent intent) noexcept;
+
+        /**
+         * @brief Enter the exclusive terminal seal for an exported context.
+         * @param error Optional precise lifecycle rejection diagnostic.
+         * @return True when no contract exists or this runner owns `Sealing`.
+         */
+        bool beginModelContextReuseSealIfNeeded(
+            std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Restore Dynamic placement and atomically rebind prepared keys.
+         * @param error Receives the first protocol or registry failure.
+         * @return True when the model context is physically reusable.
+         */
+        bool sealReusableModelContextPhysicalState(
+            std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Seal the exact GPU allocations still owned by the model value.
+         * @param retention Receives one unique row per rank-local prepared GPU.
+         * @param error Receives missing ownership or overflow diagnostics.
+         * @return True after every live model pool and workspace is accounted.
+         *
+         * This runs only after graph, controller, transport, and local-context
+         * teardown. It queries model-owned allocation registries rather than an
+         * admission projection or driver free-memory delta, then supplies the
+         * value for the atomic `Sealing -> Reusable` publication.
+         */
+        bool sealModelContextDeviceMemoryRetention(
+            std::vector<ModelDeviceMemoryRetention> *retention,
+            std::string *error = nullptr) const noexcept;
+
+        /**
+         * @brief Rebind the model registry from a canonical physical seal.
+         * @param seal Exact loader-allocation aliases produced after reader drain.
+         * @param error Receives missing-bank or atomic replacement diagnostics.
+         * @return True only after every process-local scope is rebound.
+         *
+         * Published participant banks may still name temporary shadow slots even
+         * after their logical owner map returns to the prepared placement.  Only
+         * the fabric's typed terminal seal is therefore a legal reuse source.
+         */
+        bool rebindModelRegistryFromReusableContextSeal(
+            const MoEOverlayReusableContextSeal &seal,
+            std::string *error = nullptr) noexcept;
 
         /**
          * @brief Validate TP/PP configuration against loaded model
@@ -596,6 +690,29 @@ namespace llaminar2
          * @return true always (warnings only, never fails)
          */
         bool validateContextLength();
+
+        /**
+         * @brief Refresh live GPU capacity in the rank inventory.
+         *
+         * Discovery-time free memory is valid only before persistent model
+         * allocations begin. A reused ModelContext observes free bytes after
+         * its certified weights and workspace are already resident, so final
+         * admission must replace the stale discovery value with one exact
+         * backend observation before applying retained-allocation credits.
+         * Capacity solving and final memory validation both use this method so
+         * they cannot drift onto different physical-memory authorities.
+         *
+         * Every selected context is initialized before any device is sampled;
+         * this preserves a common post-runtime-initialization observation
+         * boundary on backends with process-wide lazy state.
+         *
+         * @param devices Rank-local devices participating in the physical plan.
+         * @param purpose Stable diagnostic identity for the observation edge.
+         * @return True after every unique GPU has updated the rank inventory.
+         */
+        bool refreshRankLocalGPUCapacityObservations(
+            const std::vector<DeviceId> &devices,
+            std::string_view purpose);
 
         /**
          * @brief Validate that the model fits in device memory
@@ -896,6 +1013,22 @@ namespace llaminar2
         GenerationResult decodeStepMTP();
         void clearBatchedDecodeState();
         /**
+         * @brief Open this rank's ExpertOverlay demand bank at request admission.
+         *
+         * A coordinated heterogeneous prefill has one logical request boundary
+         * but two process-local entry points: the continuation rank enters
+         * @ref prefill while expert-only ranks enter the `PREFILL` worker
+         * command. Both must perform the same idempotent authority transition
+         * before any retained graph ticket executes. Keeping that transition in
+         * one helper prevents a follower from remaining in certification
+         * quarantine while the coordinator begins proposal publication.
+         *
+         * @return True when no host ExpertOverlay authority exists or its
+         *         request-boundary transition succeeded; false after publishing
+         *         a precise runner error.
+         */
+        bool activateMoEOverlayDemandAtRequestBoundary();
+        /**
          * @brief Return true when routed prefill uses current-batch least-loaded assignment.
          *
          * Least-loaded route planning is deliberately a current-window policy:
@@ -1104,8 +1237,8 @@ namespace llaminar2
         std::shared_ptr<MoEOverlayDistributedResidencyTransport>
             moe_expert_overlay_distributed_migration_transport_;
         /** Coordinator-to-peer immutable histogram publication lane. */
-        std::shared_ptr<MoEOverlayMPIHistogramPublisher>
-            moe_expert_overlay_histogram_publisher_;
+        std::shared_ptr<MoEOverlayMPIResidencyProposalPublisher>
+            moe_expert_overlay_proposal_publisher_;
         /** Sole host background scheduler for durable overlay movement. */
         std::unique_ptr<MoEOverlayResidencyMaintenanceService>
             moe_expert_overlay_maintenance_service_;
@@ -1145,6 +1278,15 @@ namespace llaminar2
         std::unique_ptr<MoEOverlayDeviceControllerGraphService>
             moe_overlay_device_controller_graph_service_;
         /**
+         * Successful terminal optimization state retained after maintenance
+         * resources are released. Reset-composition teardown clears it.
+         */
+        std::optional<MoEOptimizationStatus>
+            terminal_moe_optimization_status_;
+        /** Complete runner-lifetime movement identities after terminal drain. */
+        std::optional<MoEOptimizationMovementLedger>
+            terminal_moe_optimization_movement_ledger_;
+        /**
          * Continuation-authoritative retired prefill rows awaiting sideband.
          *
          * Remote retained graphs may execute a different capture/retirement
@@ -1168,6 +1310,13 @@ namespace llaminar2
             moe_overlay_pending_decode_progress_tokens_{0u};
         std::shared_ptr<ModelContext> model_ctx_;
         /**
+         * Stable backing-only execution storage carried by the prepared model
+         * contract. Each live graph owner holds an exclusive typed lease.
+         */
+        std::shared_ptr<ReusableExecutionWorkspaceRegistry>
+            reusable_execution_workspaces_ =
+                std::make_shared<ReusableExecutionWorkspaceRegistry>();
+        /**
          * @brief Plan that certified a caller-retained PreparedWeightStore.
          *
          * Present only for the explicit reuse constructor.  Initialization
@@ -1182,6 +1331,21 @@ namespace llaminar2
         std::string retained_routed_weight_authority_identity_;
         /** True only after the current plan passed the retained-plan comparison. */
         bool retained_prepared_weight_plan_validated_{false};
+        /** Model-owned prepared records counted when an imported plan was admitted. */
+        std::size_t retained_prepared_entry_count_{0u};
+        /** Serializes const contract export with terminal lifecycle publication. */
+        mutable std::mutex model_context_reuse_mutex_;
+        /** Shared one-runner/sealing authority copied into exported contracts. */
+        mutable std::shared_ptr<ModelContextReuseAuthority>
+            model_context_reuse_authority_;
+        /** Whether this runner acquired an imported reusable contract. */
+        bool imported_model_context_reuse_authority_{false};
+        /** Prevent repeated physical restoration when shutdown is re-entered. */
+        bool model_context_physical_state_sealed_{false};
+        /** Sticky terminal result consumed when publishing `Reusable`. */
+        bool model_context_reuse_seal_succeeded_{true};
+        /** First terminal seal failure retained until contract invalidation. */
+        std::string model_context_reuse_seal_error_;
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
         std::unique_ptr<ILocalPPContext> local_pp_ctx_;
 

@@ -1449,6 +1449,49 @@ namespace llaminar2
             return {};
         }
 
+        /**
+         * @brief Complete the retained-layer runtime image before controller use.
+         *
+         * The caller owns @p publication_stream and has already ordered it
+         * after every graph-build producer. Implementations publish only
+         * missing model-lifetime placement layers and must be idempotent.
+         * Non-overlay graph builders have no work and return true.
+         *
+         * @param device Exact local GPU participant.
+         * @param publication_stream Exact non-null publication stream.
+         * @return True when the complete retained family is queued for use.
+         */
+        virtual bool finalizeMoEOverlayDeviceControllerRuntime(
+            DeviceId device,
+            void *publication_stream)
+        {
+            (void)device;
+            (void)publication_stream;
+            return true;
+        }
+
+        /**
+         * @brief Retire model-owned references to borrowed execution streams.
+         *
+         * A device orchestrator calls this terminal lifecycle edge after all
+         * published inference work is complete and before it destroys native
+         * graph caches or the device contexts that own their streams. Concrete
+         * builders must join any internal producer DAGs while those exact
+         * streams remain valid, then erase the borrowed identities. Builders
+         * without such references have no work.
+         *
+         * This hook is terminal for @p device. It must not synchronize a whole
+         * device or create a substitute stream; a model-internal maintenance
+         * authority may take one exact terminal stream fence after inference
+         * admission has stopped.
+         *
+         * @param device Exact participant whose stream owners are retiring.
+         */
+        virtual void retireBorrowedExecutionStreams(DeviceId device)
+        {
+            (void)device;
+        }
+
         // =====================================================================
         // State Management
         // =====================================================================

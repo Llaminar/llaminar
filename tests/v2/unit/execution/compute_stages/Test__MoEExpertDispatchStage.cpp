@@ -417,6 +417,16 @@ TEST_F(
     params.residency_authority = authority;
     params.ticket_storage = ticket_storage;
     MoEExpertDispatchStage stage(params);
+    EXPECT_TRUE(stage.hasMoEOverlayCollectiveRuntimeParams());
+    stage.updateMoEOverlayCollectiveRuntimeParams({
+        .generation_id = 7u,
+        .step_id = 11u,
+        .execution_semantics =
+            IComputeStage::MoEOverlayCollectiveRuntimeParams::
+                ExecutionSemantics::GroupedVerifier,
+        .mtp_depth = 2,
+        .placement_epoch = 1u,
+    });
 
     ASSERT_TRUE(stage.execute(ctx_.get()));
     ASSERT_EQ(output.residency_epoch, 1u);
@@ -466,6 +476,12 @@ TEST_F(
     EXPECT_EQ(transport.publication_calls, 1);
     EXPECT_EQ(transport.retire_calls, 0);
 
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+    EXPECT_EQ(output.residency_epoch, 1u)
+        << "Every graph in one MTP sequence must retain its admitted epoch";
+    EXPECT_EQ(ticket.header->residency_epoch, 1u);
+    expectContributionExactlyOnce(output, 1, 0, 0, 2, 1.0f);
+
     output.residency_lease.reset();
     ASSERT_EQ(authority->activeTicketCount(), 0u);
     EXPECT_EQ(transport.retire_calls, 0)
@@ -475,6 +491,19 @@ TEST_F(
         MoEOverlayResidencyApplyStatus::Idle);
     EXPECT_EQ(transport.retire_calls, 1);
 
+    EXPECT_FALSE(stage.execute(ctx_.get()))
+        << "A retired pinned epoch must fail instead of falling forward to current";
+    EXPECT_EQ(authority->activeTicketCount(), 0u);
+
+    stage.updateMoEOverlayCollectiveRuntimeParams({
+        .generation_id = 7u,
+        .step_id = 12u,
+        .execution_semantics =
+            IComputeStage::MoEOverlayCollectiveRuntimeParams::
+                ExecutionSemantics::Decode,
+        .mtp_depth = -1,
+        .placement_epoch = 2u,
+    });
     ASSERT_TRUE(stage.execute(ctx_.get()));
     EXPECT_EQ(output.residency_epoch, 2u);
     EXPECT_EQ(ticket.header->residency_epoch, 2u);
@@ -591,6 +620,7 @@ TEST_F(Test__MoEExpertDispatchStage, CapturedTicketRoutesOnlyLogicalPrefixAndDec
     params.hidden_buffer_id = BufferId::NORMALIZED;
 
     MoEExpertDispatchStage stage(params);
+    EXPECT_FALSE(stage.hasMoEOverlayCollectiveRuntimeParams());
     ASSERT_TRUE(stage.execute(ctx_.get()));
 
     EXPECT_EQ(output.seq_len, bucket_rows);

@@ -23,6 +23,7 @@
 #include "MoEOverlayParticipantResidency.h"
 
 #include "backends/GPUDeviceContextPool.h"
+#include "backends/BackendManager.h"
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "execution/compute_stages/ComputeStageFactory.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
@@ -35,11 +36,13 @@
 #include "execution/local_execution/device/WorkspaceAllocator.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
+#include "execution/local_execution/graph/DeviceExecutionTimeline.h"
 #include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "execution/moe/MoEOverlayInferenceInterferenceProbe.h"
+#include "execution/moe/MoEOverlayActivationRendezvousDeadline.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
@@ -357,7 +360,8 @@ namespace llaminar2
      * inference stream.
      */
     struct MoEOverlayParticipantGraphRunner::ParticipantGpuRuntime final
-        : public IMoEOverlayDeviceInferenceBoundary
+        : public IMoEOverlayDeviceInferenceBoundary,
+          public IMoEOverlayDeviceInitialRuntimePublisher
     {
         int participant_id = -1;
         DeviceId device = DeviceId::invalid();
@@ -374,12 +378,106 @@ namespace llaminar2
         std::shared_ptr<DeviceMoEOverlayEpochArena> epoch_arena;
         std::unique_ptr<DeviceMoERuntimeTable> runtime_table;
         std::vector<std::uint8_t> initialized_layers;
+        /** Exact stream on which graph construction published initial banks. */
+        void *runtime_publication_stream = nullptr;
+        /** Preallocated join from graph-build publication to controller work. */
+        std::shared_ptr<void> initial_runtime_source_ready_event;
+        /** Durable completion edge for an idempotent replacement controller. */
+        std::shared_ptr<void> initial_runtime_published_event;
+        void *initial_runtime_finalization_stream = nullptr;
+        bool initial_runtime_published = false;
         /** Shared finite relay graph launched ahead of follower inference. */
         std::shared_ptr<MappedTransferProgressEpoch>
             transfer_progress_epoch;
 
         /** Exact serial submission/completion receipt for this follower. */
         MoEOverlayInferenceBoundaryReceipt inference_boundary_receipt;
+
+        /** @copydoc IMoEOverlayDeviceInitialRuntimePublisher::publishMoEOverlayDeviceInitialRuntime */
+        [[nodiscard]] bool publishMoEOverlayDeviceInitialRuntime(
+            void *controller_stream) override
+        {
+            if (!device.is_gpu() || !worker || !runtime_table ||
+                !runtime_publication_stream || !controller_stream ||
+                !initial_runtime_source_ready_event ||
+                !initial_runtime_published_event ||
+                initialized_layers.size() !=
+                    static_cast<std::size_t>(runtime_table->layerCount()) ||
+                std::any_of(
+                    initialized_layers.begin(),
+                    initialized_layers.end(),
+                    [](std::uint8_t initialized)
+                    {
+                        return initialized == 0u;
+                    }))
+            {
+                LOG_ERROR(
+                    "[MoEOverlayParticipantGraphRunner] Follower initial "
+                    "runtime publication is incomplete for participant "
+                    << participant_id);
+                return false;
+            }
+
+            IBackend *const backend = getBackendFor(device);
+            if (!backend)
+                return false;
+            const auto edge = DeviceEventEdge::at(
+                                  DeviceTimelinePoint::
+                                      MoEOverlayInitialRuntimeReady)
+                                  .from(
+                                      DeviceTimelineRole::
+                                          MoEOverlayRuntimePublication);
+            if (initial_runtime_published)
+            {
+                return initial_runtime_finalization_stream &&
+                    edge.to(DeviceTimelineRole::MoERebalanceMaintenance)
+                        .enqueueWait(
+                            *backend,
+                            device,
+                            initial_runtime_published_event.get(),
+                            initial_runtime_finalization_stream,
+                            controller_stream);
+            }
+
+            if (!edge.publish(
+                    *backend,
+                    device,
+                    initial_runtime_source_ready_event.get(),
+                    runtime_publication_stream) ||
+                !edge.to(DeviceTimelineRole::MoEOverlayRuntimePublication)
+                     .enqueueWait(
+                         *backend,
+                         device,
+                         initial_runtime_source_ready_event.get(),
+                         runtime_publication_stream,
+                         controller_stream) ||
+                !edge.publish(
+                    *backend,
+                    device,
+                    initial_runtime_published_event.get(),
+                    controller_stream))
+            {
+                LOG_ERROR(
+                    "[MoEOverlayParticipantGraphRunner] Follower could not "
+                    "order its complete initial runtime onto the controller stream for participant "
+                    << participant_id);
+                return false;
+            }
+
+            initial_runtime_finalization_stream = controller_stream;
+            initial_runtime_published = true;
+            PerfStatsCollector::addCounter(
+                "moe_overlay_controller",
+                "initial_runtime_publications",
+                1.0,
+                "model_setup",
+                device.toString(),
+                {{"participant", std::to_string(participant_id)},
+                 {"source", "mapped_follower_graph_family"},
+                 {"ordering", "event_wait"},
+                 {"blocking", "false"}});
+            return true;
+        }
 
         /** @copydoc IMoEOverlayDeviceInferenceBoundary::enqueueMoEOverlayDeviceInferenceBoundary */
         MoEOverlayInferenceBoundaryStatus
@@ -584,12 +682,14 @@ namespace llaminar2
             }
         }
 
-        if (plan.empty())
-        {
-            throw std::runtime_error(
-                "MoE overlay participant owns no routed-expert weight "
-                "requirements");
-        }
+        /*
+         * Current residency is data, not graph topology. An automatically
+         * filled higher-priority tier may leave this declared endpoint empty
+         * at epoch one, while a later economical promotion/demotion can still
+         * publish experts into its preallocated shadow bank. Return a valid
+         * empty plan so the caller can retain the endpoint graph without
+         * materializing nonexistent initial payloads.
+         */
         return plan;
     }
 
@@ -640,15 +740,20 @@ namespace llaminar2
                 "MoE overlay participant runner decode/MTP row capacity must "
                 "be positive and fit the planner-admitted graph capacity");
         }
-        if (config_.mtp_enabled && config_.max_mtp_draft_depth <= 0)
+        const bool retains_mtp_graph_family =
+            config_.mtp_graph_family_policy ==
+            MoEOverlayMTPGraphFamilyPolicy::RetainModelSidecars;
+        if (retains_mtp_graph_family &&
+            config_.max_mtp_draft_depth <= 0)
         {
             throw std::invalid_argument(
-                "MTP-enabled participant runner requires a positive admitted draft depth");
+                "MTP-capable participant runner requires a positive admitted draft depth");
         }
-        if (!config_.mtp_enabled && config_.max_mtp_draft_depth != 0)
+        if (!retains_mtp_graph_family &&
+            config_.max_mtp_draft_depth != 0)
         {
             throw std::invalid_argument(
-                "MTP-disabled participant runner cannot advertise a draft-depth capacity");
+                "Main-only participant runner cannot advertise an MTP draft capacity");
         }
         if (config_.max_request_count <= 0)
         {
@@ -1301,7 +1406,7 @@ namespace llaminar2
                 loader,
                 architecture_,
                 raw_layer_count,
-                config_.mtp_enabled,
+                config_.mtp_graph_family_policy,
                 /*graph_family_generation=*/1,
                 config_.max_graph_activation_rows,
                 config_.max_decode_activation_rows,
@@ -1371,10 +1476,12 @@ namespace llaminar2
      * decode/verifier packet transfers one hidden and one aggregate output row
      * rather than repeating both payloads for every selected expert.
      *
-     * Relay-only ranks intentionally produce no arena.  Any endpoint that
-     * owns at least one expert in the authenticated map must produce exactly
-     * one arena; later graph construction treats a missing entry as a fatal
-     * ownership violation rather than allocating a stage-private substitute.
+     * Relay-only ranks intentionally produce no arena. Every declared local
+     * endpoint produces exactly one arena even when its epoch-one resident
+     * mask is empty. Residency migration can make that endpoint live later,
+     * and captured topology may not be allocated or rebound at that point.
+     * Graph construction treats a missing entry as a fatal ownership
+     * violation rather than allocating a stage-private substitute.
      */
     void MoEOverlayParticipantGraphRunner::createSerialCompactBufferArenas()
     {
@@ -1409,22 +1516,6 @@ namespace llaminar2
             if (!participant)
                 throw std::logic_error(
                     "Participant serial compact arena received a null endpoint");
-
-            bool owns_selected_expert = false;
-            for (int layer = 0;
-                 layer < config_.model_context->totalBlockCount();
-                 ++layer)
-            {
-                if (!owner_map_->expertsForParticipant(
-                        layer, participant->participant_id)
-                         .empty())
-                {
-                    owns_selected_expert = true;
-                    break;
-                }
-            }
-            if (!owns_selected_expert)
-                continue;
 
             MoELocalExpertSerialBufferArena::Config arena_config;
             arena_config.device_id = participant->device;
@@ -1531,6 +1622,8 @@ namespace llaminar2
             reinterpret_cast<uint64_t>(config_.model_context.get())};
         strategy.devices = participantDevices(local_participants_);
         WeightPlan plan(std::move(strategy));
+        if (config_.prepared_weight_admission ==
+            PreparedWeightAdmission::AllocateCompleteSet)
         {
             ScopedWeightLoadDetailTimer timer(
                 "overlay.weights.build_plan");
@@ -1559,6 +1652,13 @@ namespace llaminar2
             prepared_store_ = weight_manager->preparedWeightStoreIfInitialized();
             if (!prepared_store_)
             {
+                if (config_.prepared_weight_admission ==
+                    PreparedWeightAdmission::ReuseCertifiedCompleteSet)
+                {
+                    throw std::runtime_error(
+                        "Certified participant-weight reuse lost the exact "
+                        "model-owned PreparedWeightStore");
+                }
                 prepared_store_ =
                     std::make_shared<PreparedWeightStore>(model_id);
                 weight_manager->setPreparedWeightStore(prepared_store_);
@@ -1570,12 +1670,15 @@ namespace llaminar2
             }
         }
 
-        if (plan.empty())
+        if (plan.empty() &&
+            config_.prepared_weight_admission ==
+                PreparedWeightAdmission::AllocateCompleteSet)
         {
             /* Relay ranks own protocol state but no expert weight authority. */
             return;
         }
 
+        if (!plan.empty())
         {
             ScopedWeightLoadDetailTimer timer(
                 "overlay.weights.materialize_plan");
@@ -1588,7 +1691,8 @@ namespace llaminar2
                     *runtime_plan_,
                     device,
                     frozen_weights_.get(),
-                    execution_plan_.get()))
+                    execution_plan_.get(),
+                    config_.prepared_weight_admission))
             {
                 throw std::runtime_error(
                     "Failed to prepare exact MoE overlay participant weights on " +
@@ -1790,6 +1894,34 @@ namespace llaminar2
             runtime->worker->submitAndWait(
                 [&]
                 {
+                    runtime->runtime_publication_stream =
+                        runtime->worker->defaultStream();
+                    IBackend *const backend = getBackendFor(
+                        participant->device);
+                    if (!backend || !runtime->runtime_publication_stream)
+                    {
+                        throw std::runtime_error(
+                            "Mapped follower runtime could not resolve its "
+                            "initial-publication backend or exact stream");
+                    }
+                    const int ordinal = participant->device.gpu_ordinal();
+                    const auto make_event =
+                        [backend, ordinal]() -> std::shared_ptr<void>
+                    {
+                        void *const event = backend->createEvent(ordinal);
+                        if (!event)
+                            return {};
+                        return std::shared_ptr<void>(
+                            event,
+                            [backend, ordinal](void *owned)
+                            {
+                                if (owned)
+                                    backend->destroyEvent(owned, ordinal);
+                            });
+                    };
+                    runtime->initial_runtime_source_ready_event =
+                        make_event();
+                    runtime->initial_runtime_published_event = make_event();
                     runtime->route_scratch = std::make_shared<
                         DeviceMoESerialRouteScratchArena>(
                         DeviceMoESerialRouteScratchArena::Config{
@@ -1838,7 +1970,10 @@ namespace llaminar2
                         });
                 });
             if (!runtime->route_scratch || !runtime->epoch_arena ||
-                !runtime->runtime_table)
+                !runtime->runtime_table ||
+                !runtime->runtime_publication_stream ||
+                !runtime->initial_runtime_source_ready_event ||
+                !runtime->initial_runtime_published_event)
             {
                 throw std::runtime_error(
                     "Mapped follower runtime allocation returned incomplete model-lifetime state");
@@ -3976,24 +4111,36 @@ namespace llaminar2
                       std::to_string(
                           cached.execution_plan.max_wave_width)},
                      {"allocation_policy", "setup_only"}});
+                const char *const evidence_phase =
+                    phase == SparseTransactionPhase::Decode
+                        ? "decode"
+                        : "prefill";
                 /*
-                 * One record represents the whole remote graph transaction,
-                 * not each layer's manual boundary.  Its key tags must match
-                 * the continuation-graph record emitted by
-                 * ForwardExecutionEngine for this same request chunk.
+                 * Fold identity into a bounded sequence witness; never retain
+                 * request generations or logical steps as aggregation keys.
                  */
+                PerfStatsCollector::recordOrderedSequenceStep(
+                    "forward_graph",
+                    "moe_overlay_collective_transaction_sequence",
+                    {overlay_collective_request_generation_,
+                     static_cast<uint64_t>(logical_step),
+                     static_cast<uint64_t>(seq_len),
+                     static_cast<uint64_t>(seq_len)},
+                    evidence_phase,
+                    participantDeviceList(local_participants_),
+                    {{"role", "expert_participant_graph"},
+                     {"identity_source", "orchestration_request_and_chunk"},
+                     {"logical_step_semantics", "monotonic_transaction"}});
                 PerfStatsCollector::addCounter(
                     "forward_graph",
                     "moe_overlay_collective_transaction",
                     1.0,
-                    phase == SparseTransactionPhase::Decode
-                        ? "decode"
-                        : "prefill",
+                    evidence_phase,
                     participantDeviceList(local_participants_),
                     {{"role", "expert_participant_graph"},
                      {"identity_source", "orchestration_request_and_chunk"},
-                     {"generation", std::to_string(overlay_collective_request_generation_)},
-                     {"logical_step", std::to_string(logical_step)}});
+                     {"logical_step_semantics", "monotonic_transaction"},
+                     {"logical_rows", std::to_string(seq_len)}});
             }
             PerfStatsCollector::addCounter(
                 "moe_overlay_participant_graph",
@@ -4001,11 +4148,10 @@ namespace llaminar2
                 1.0,
                 seq_len == 1 ? "decode" : "prefill",
                 participantDeviceList(local_participants_),
-                {
-                    {"participants", participantIdList(local_participants_)},
-                    {"logical_rows", std::to_string(seq_len)},
-                    {"logical_step", std::to_string(logical_step)},
-                });
+                    {
+                        {"participants", participantIdList(local_participants_)},
+                        {"logical_rows", std::to_string(seq_len)},
+                    });
             return ok;
         }
         catch (const std::exception &error)
@@ -4032,7 +4178,8 @@ namespace llaminar2
         uint64_t generation_id,
         uint64_t logical_step,
         SparseTransactionPhase phase,
-        int mtp_graph_depth)
+        int mtp_graph_depth,
+        uint64_t placement_epoch)
     {
         if (!cached.graph || generation_id == 0)
         {
@@ -4081,6 +4228,7 @@ namespace llaminar2
             .step_id = logical_step,
             .execution_semantics = execution_semantics,
             .mtp_depth = mtp_graph_depth,
+            .placement_epoch = placement_epoch,
         };
         size_t stamped_stages = 0;
         for (const auto &node_name : cached.graph->getExecutionOrder())
@@ -4205,21 +4353,19 @@ namespace llaminar2
         std::vector<ArmedLane> armed;
         armed.reserve(cached.mapped_lane_authorities.size());
 
-        const auto deadline =
-            std::chrono::steady_clock::now() +
-            std::chrono::milliseconds(
-                collective_timeout_policy::kDefaultCollectiveTimeoutMs);
-        const auto deadline_ns_signed =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                deadline.time_since_epoch())
-                .count();
-        if (deadline_ns_signed <= 0)
+        const auto timeout_eligibility =
+            MoEOverlayActivationRendezvousDeadline::begin(
+                MoEOverlayActivationRendezvousKind::EndpointCompletion,
+                std::chrono::milliseconds(
+                    collective_timeout_policy::
+                        kDefaultCollectiveTimeoutMs));
+        const auto timeout_not_before_ns =
+            timeout_eligibility.deadlineNanoseconds();
+        if (!timeout_not_before_ns)
         {
             return reject(
-                "Mapped ExpertOverlay follower could not derive a watchdog deadline");
+                "Mapped ExpertOverlay follower could not derive a watchdog timeout lower bound");
         }
-        const uint64_t deadline_ns =
-            static_cast<uint64_t>(deadline_ns_signed);
 
         const auto abort_armed = [&]() noexcept
         {
@@ -4251,7 +4397,10 @@ namespace llaminar2
             const uint64_t generation =
                 authority->next_epoch_generation;
             auto identity = authority->protocol->arm(
-                ticket, generation, deadline_ns, &arm_error);
+                ticket,
+                generation,
+                *timeout_not_before_ns,
+                &arm_error);
             if (!identity)
             {
                 abort_armed();
@@ -4594,7 +4743,19 @@ namespace llaminar2
                     moeOverlayActivationLeasedTimelineValue(
                         moeOverlayActivationBufferVisit(
                             layer.stage_ordinal));
-                while (std::chrono::steady_clock::now() < deadline &&
+                /*
+                 * Each routed layer is one collective rendezvous. Starting a
+                 * fresh deadline here prevents a healthy 48-layer transaction
+                 * from inheriting a wall-clock budget created before layer 0.
+                 */
+                const auto dispatch_rendezvous =
+                    MoEOverlayActivationRendezvousDeadline::begin(
+                        MoEOverlayActivationRendezvousKind::
+                            DispatchPublication,
+                        std::chrono::milliseconds(
+                            collective_timeout_policy::
+                                kDefaultCollectiveTimeoutMs));
+                while (dispatch_rendezvous.waitingAllowed() &&
                        protocol.dispatchTimeline(bank) < expected_timeline)
                 {
                     if (protocol.endpointState(
@@ -4620,9 +4781,7 @@ namespace llaminar2
                      */
                     const auto now = std::chrono::steady_clock::now();
                     const auto remaining_us =
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            deadline - now)
-                            .count();
+                        dispatch_rendezvous.remainingMicroseconds(now);
                     const auto active_identity = protocol.activeIdentity();
                     const auto continuation = protocol.endpointStatus(
                         MoEOverlayActivationEndpoint::Continuation);
@@ -5133,7 +5292,15 @@ namespace llaminar2
                     exception.what());
         }
 
-        while (std::chrono::steady_clock::now() < deadline)
+        /* Endpoint completion is a final independent rendezvous after all
+         * exact local work and GPU terminal events have retired. */
+        const auto completion_rendezvous =
+            MoEOverlayActivationRendezvousDeadline::begin(
+                MoEOverlayActivationRendezvousKind::EndpointCompletion,
+                std::chrono::milliseconds(
+                    collective_timeout_policy::
+                        kDefaultCollectiveTimeoutMs));
+        while (completion_rendezvous.waitingAllowed())
         {
             bool complete = true;
             for (const auto &lane : armed)
@@ -5261,9 +5428,16 @@ namespace llaminar2
                     MoEOverlayActivationEndpointState::Complete)
             {
                 std::string timeout_error;
+                const auto timeout_observation =
+                    completion_rendezvous.timeoutObservationNanoseconds();
+                if (!timeout_observation)
+                {
+                    return reject(
+                        "Mapped ExpertOverlay follower reached an incomplete endpoint outside a valid timeout observation");
+                }
                 (void)lane.authority->protocol->markTimedOut(
                     lane.identity.epoch_generation,
-                    deadline_ns,
+                    *timeout_observation,
                     &timeout_error);
                 return reject(
                     "Mapped ExpertOverlay follower timed out waiting for both endpoint-complete publications: " +
@@ -5351,13 +5525,7 @@ namespace llaminar2
             const PerfStatsCollector::Tags traffic_tags{
                 {"completion", "device_owned_epoch_complete"},
                 {"device_kind", device_kind},
-                {"epoch_generation",
-                 std::to_string(lane.identity.epoch_generation)},
-                {"generation",
-                 std::to_string(lane.identity.request_generation)},
                 {"identity_source", "device_owned_activation_epoch"},
-                {"logical_step",
-                 std::to_string(lane.identity.logical_step_id)},
                 {"participant",
                  std::to_string(authority.participant_id)},
                 {"stage_count",
@@ -5415,14 +5583,10 @@ namespace llaminar2
                     authority.device.to_string(),
                     {{"completion", "device_owned_epoch_complete"},
                      {"device_kind", device_kind},
-                     {"generation",
-                      std::to_string(lane.identity.request_generation)},
                      {"identity_source",
                       "device_owned_activation_epoch"},
                      {"input_rows",
                       std::to_string(traffic->dispatch_live_rows)},
-                     {"logical_step",
-                      std::to_string(lane.identity.logical_step_id)},
                      {"output_rows",
                       std::to_string(traffic->return_live_rows)},
                      {"participant",
@@ -5670,7 +5834,8 @@ namespace llaminar2
                 ticket.request_generation,
                 ticket.logical_step_id,
                 phase,
-                mtp_graph_depth))
+                mtp_graph_depth,
+                ticket.placement_epoch))
         {
             return fail(
                 "selected retained graph rejected its runtime wire namespace");
@@ -5707,10 +5872,6 @@ namespace llaminar2
         if (timing_enabled)
         {
             const PerfStatsCollector::Tags tags{
-                {"command_id", std::to_string(ticket.command_id)},
-                {"transaction_ordinal",
-                 std::to_string(ticket.transaction_ordinal)},
-                {"logical_step", std::to_string(ticket.logical_step_id)},
                 {"logical_rows", std::to_string(logical_rows)},
                 {"physical_rows", std::to_string(physical_rows)},
                 {"draft_depth", std::to_string(ticket.draft_depth)},
@@ -5775,29 +5936,33 @@ namespace llaminar2
                 execution_end);
         }
 
+        const char *const evidence_phase =
+            phase == SparseTransactionPhase::Prefill
+                ? "prefill"
+                : (phase == SparseTransactionPhase::Decode
+                       ? "decode"
+                       : role_name);
+        PerfStatsCollector::recordOrderedSequenceStep(
+            "forward_graph",
+            "moe_overlay_collective_transaction_sequence",
+            {ticket.request_generation,
+             ticket.logical_step_id,
+             logical_rows,
+             physical_rows},
+            evidence_phase,
+            participantDeviceList(local_participants_),
+            {{"role", "expert_participant_graph"},
+             {"identity_source", "orchestration_request_and_chunk"},
+             {"logical_step_semantics", "monotonic_transaction"}});
         PerfStatsCollector::addCounter(
             "moe_overlay_participant_graph",
             "ticket_selected_graphs",
             1.0,
             role_name,
             participantDeviceList(local_participants_),
-            {{"request_generation",
-              std::to_string(ticket.request_generation)},
-             {"command_id", std::to_string(ticket.command_id)},
-             {"transaction_ordinal",
-              std::to_string(ticket.transaction_ordinal)},
-             {"logical_step", std::to_string(ticket.logical_step_id)},
-             {"logical_step_semantics", "monotonic_transaction"},
+            {{"logical_step_semantics", "monotonic_transaction"},
              {"logical_rows", std::to_string(logical_rows)},
              {"physical_rows", std::to_string(physical_rows)},
-             {"prefill_schedule_real_rows",
-              std::to_string(ticket.prefill_schedule_real_rows)},
-             {"prefill_schedule_execution_rows",
-              std::to_string(ticket.prefill_schedule_execution_rows)},
-             {"prefill_schedule_transaction_count",
-              std::to_string(ticket.prefill_schedule_transaction_count)},
-             {"prefill_schedule_fingerprint",
-              std::to_string(ticket.prefill_schedule_fingerprint)},
              {"draft_depth", std::to_string(ticket.draft_depth)},
              {"sidecar_ordinal", std::to_string(ticket.sidecar_depth)},
              {"mtp_graph_depth", std::to_string(mtp_graph_depth)},
@@ -5973,6 +6138,11 @@ namespace llaminar2
         position_ = 0;
     }
 
+    bool MoEOverlayParticipantGraphRunner::purgePrefixCache()
+    {
+        return true;
+    }
+
     int MoEOverlayParticipantGraphRunner::get_position() const
     {
         return position_;
@@ -6085,8 +6255,11 @@ namespace llaminar2
                         ->deviceMaintenanceStatusAddress(),
                 .inference_boundary = const_cast<
                     ParticipantGpuRuntime *>(&runtime),
+                .initial_runtime_publisher = const_cast<
+                    ParticipantGpuRuntime *>(&runtime),
             };
-            if (!binding.backgroundPublicationValid())
+            if (!binding.backgroundPublicationValid() ||
+                !binding.initialRuntimePublicationValid())
             {
                 throw std::logic_error(
                     "Mapped follower produced an incomplete background-publication binding");

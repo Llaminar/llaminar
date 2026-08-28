@@ -22,8 +22,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -790,9 +792,13 @@ namespace llaminar2
          * A service may retain one maximum-capacity graph family while fixed
          * requests execute smaller depths, avoiding weight-placement changes
          * and graph recapture when only the requested speculative width
-         * changes.  A positive value must cover the fixed depth or adaptive
-         * policy ceiling; it never authorizes the depth controller to select
-         * additional drafts.
+         * changes. A positive value may also reserve that family while
+         * @ref enabled is false. That state means "MTP-capable but not executing
+         * MTP", which lets a long-lived model authority switch request policy
+         * without re-solving ExpertOverlay capacity or reloading weights. A
+         * positive value must cover the fixed depth or adaptive policy ceiling
+         * when execution is enabled; it never authorizes the depth controller
+         * to select additional drafts.
          */
         int graph_capacity_draft_tokens = 0;
         /**
@@ -863,6 +869,85 @@ namespace llaminar2
     }
 
     /**
+     * @brief Return whether setup must retain an MTP-capable graph envelope.
+     *
+     * Runtime execution and setup capacity are intentionally separate. An
+     * enabled policy always needs capacity; a disabled policy needs it only
+     * when the caller explicitly reserves a positive graph width.
+     */
+    inline bool retainsMTPGraphCapacity(
+        const MTPRuntimeConfig &config) noexcept
+    {
+        return config.enabled || config.graph_capacity_draft_tokens > 0;
+    }
+
+    /**
+     * @brief Resolve the retained draft width, or zero for an MTP-incapable setup.
+     *
+     * This is the canonical setup/admission identity. Execution code continues
+     * to consult @ref MTPRuntimeConfig::enabled before launching an MTP
+     * transaction.
+     */
+    inline int resolveMTPRetainedDraftCapacity(
+        const MTPRuntimeConfig &config)
+    {
+        return retainsMTPGraphCapacity(config)
+                   ? resolveMTPMaximumDraftDepth(config)
+                   : 0;
+    }
+
+    /**
+     * @brief Resolve the complete retained device-generation fragment family.
+     * @param maximum_draft_depth Largest graph-capacity draft depth.
+     * @return Native fragment slots required for every legal depth branch.
+     * @throws std::overflow_error when the inventory exceeds size_t.
+     *
+     * A dynamic SWITCH parent duplicates the common verifier/publication tail
+     * in every legal branch because a CUDA conditional graph cannot execute a
+     * common tail after an invalid selector. The largest branch also reserves
+     * the optional maintenance fragment and ExpertOverlay acquire/release pair,
+     * giving `sum(2*d + 9) = D * (D + 10)`. HIP uses the same semantic family
+     * as independently retained ticket-selected native fragments. Setup
+     * scratch planning and opaque-driver memory admission must call this one
+     * authority so neither can silently retain a larger family than the other.
+     */
+    inline std::size_t resolveMTPRetainedDeviceGenerationFragmentCapacity(
+        int maximum_draft_depth)
+    {
+        if (maximum_draft_depth <= 0)
+            return 0u;
+        const std::size_t depth =
+            static_cast<std::size_t>(maximum_draft_depth);
+        if (depth >
+            std::numeric_limits<std::size_t>::max() - std::size_t{10})
+        {
+            throw std::overflow_error(
+                "MTP retained fragment depth overflows size_t");
+        }
+        const std::size_t branch_factor = depth + std::size_t{10};
+        if (depth >
+            std::numeric_limits<std::size_t>::max() / branch_factor)
+        {
+            throw std::overflow_error(
+                "MTP retained fragment inventory overflows size_t");
+        }
+        return depth * branch_factor;
+    }
+
+    /**
+     * @brief Resolve compact verifier rows retained by setup, or zero when absent.
+     */
+    inline int resolveMTPRetainedTargetQueryRows(
+        const MTPRuntimeConfig &config)
+    {
+        if (!retainsMTPGraphCapacity(config))
+            return 0;
+        const int request_count = std::max(1, config.max_request_batch);
+        return request_count *
+               (resolveMTPRetainedDraftCapacity(config) + 1);
+    }
+
+    /**
      * @brief Resolve compact target-verifier row capacity for MTP graph buffers.
      *
      * A single request needs `maximum draft depth + 1` target rows: one row per
@@ -898,9 +983,11 @@ namespace llaminar2
         const MTPRuntimeConfig &config)
     {
         const int base_rows = std::max(1, prefill_rows);
-        if (!config.enabled)
+        if (!retainsMTPGraphCapacity(config))
             return base_rows;
-        return std::max(base_rows, resolveMTPMaxTargetQueryRows(config));
+        return std::max(
+            base_rows,
+            resolveMTPRetainedTargetQueryRows(config));
     }
 
     /**
@@ -1494,14 +1581,32 @@ namespace llaminar2
         uint64_t migration_payoff_horizon_tokens =
             moe_rebalance_policy::kDefaultMigrationPayoffHorizonTokens;
         /**
-         * @brief Maximum closed residency cycles staged in one async wave.
+         * @brief Independently runnable physical migration slots.
          *
-         * One is the conservative production default. Larger values allow the
-         * planner to fill independent endpoint/layer shadow capacity in one
-         * publication epoch; the physical capacity and staging BOM remain
-         * hard upper bounds and may admit fewer cycles.
+         * Setup materializes exactly this many transport lanes and prices
+         * their staging/shadow memory through capacity admission. This is a
+         * model-lifetime capacity identity: changing only the active scheduling
+         * cap below does not invalidate prepared weights or force automatic
+         * tier capacity to be solved again.
          */
-        uint32_t migration_max_cycles_per_wave = 1;
+        uint32_t migration_transfer_slots = 1;
+        /**
+         * @brief Optional active closed-cycle limit for one publication wave.
+         *
+         * An unset value uses every physical @ref migration_transfer_slots
+         * lane, preserving the ordinary one-knob production configuration.
+         * Setting a smaller positive value lets a request or test retain a
+         * wider preallocated fabric while deliberately admitting fewer
+         * economical cycles per wave. It may never exceed physical capacity.
+         */
+        std::optional<uint32_t> migration_cycles_per_wave;
+
+        /** @return Exact active cycle cap after applying the physical default. */
+        [[nodiscard]] uint32_t resolvedMigrationCyclesPerWave() const noexcept
+        {
+            return migration_cycles_per_wave.value_or(
+                migration_transfer_slots);
+        }
         uint32_t dynamic_imbalance_threshold_per_mille =
             moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille;
         uint32_t dynamic_min_improvement_per_mille =

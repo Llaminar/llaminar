@@ -19,6 +19,7 @@
 #include "transfer/MappedTransferProgressEpoch.h"
 #include "transfer/TransferEngine.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -110,6 +111,7 @@ namespace
         auto epoch = MappedTransferProgressEpoch::create({
             .device = device,
             .slot_capacity = 2u,
+            .execution_lane_capacity = 2u,
             .maximum_bytes = kTransferBytes,
             .name = "integration_repeated_generations_" + device.toString(),
             .perf_device = device.toString(),
@@ -340,6 +342,7 @@ namespace
         auto epoch = MappedTransferProgressEpoch::create({
             .device = device,
             .slot_capacity = 2u,
+            .execution_lane_capacity = 2u,
             .maximum_bytes = kLargeBytes,
             .name = "integration_inference_no_join_" + device.toString(),
             .perf_device = device.toString(),
@@ -444,6 +447,197 @@ namespace
         EXPECT_EQ(stats.command_failures, 0u);
     }
 
+    /**
+     * @brief Reproduce the four-GPU command BOM without per-slot GPU resources.
+     *
+     * One GPU in an all-host-relayed four-GPU topology participates in three
+     * incoming and three outgoing directed edges. Each edge has three expert
+     * projections and two pipeline slots for every configured migration cycle.
+     * The command directory must retain that complete topology identity, while
+     * the physical stream/event pool remains bounded by the cycle-slot budget.
+     */
+    void proveTopologySizedDirectoryUsesBoundedExecutionLanes(DeviceId device)
+    {
+        constexpr std::size_t kMigrationCycleSlots = 49u;
+        constexpr std::size_t kDirectedIncidentEdges = 6u;
+        constexpr std::size_t kExpertProjections = 3u;
+        constexpr std::size_t kPipelineSlots = 2u;
+        constexpr std::size_t kTopologyCommandSlots =
+            kMigrationCycleSlots * kDirectedIncidentEdges *
+            kExpertProjections * kPipelineSlots;
+
+        IBackend *const backend = getBackendFor(device);
+        ASSERT_NE(backend, nullptr);
+        if (backend->deviceCount() <= device.gpu_ordinal())
+            GTEST_SKIP() << device.toString() << " is unavailable";
+
+        auto epoch = MappedTransferProgressEpoch::create({
+            .device = device,
+            .slot_capacity = kTopologyCommandSlots,
+            .execution_lane_capacity = kMigrationCycleSlots,
+            .maximum_bytes = 4096u,
+            .name = "integration_topology_sized_directory_" +
+                    device.toString(),
+            .perf_device = device.toString(),
+        });
+        ASSERT_NE(epoch, nullptr);
+        EXPECT_EQ(epoch->slotCapacity(), kTopologyCommandSlots);
+        EXPECT_EQ(epoch->executionLaneCapacity(), kMigrationCycleSlots);
+        EXPECT_NE(epoch->executionStream(), nullptr);
+        EXPECT_GT(epoch->slotCapacity(), epoch->executionLaneCapacity());
+        EXPECT_EQ(epoch->stats().slots_reserved, 0u);
+    }
+
+    /**
+     * @brief Prove queued permanent commands drain through one execution lane.
+     *
+     * Four distinct mapped destinations deliberately exceed the one-lane
+     * physical pool. The first progress pass may submit exactly one DMA; later
+     * event-polled passes must preserve every command generation and byte while
+     * recycling that same stream/event pair.
+     */
+    void proveBoundedExecutionLaneQueueIsByteExact(DeviceId device)
+    {
+        constexpr std::size_t kCommandCount = 4u;
+        constexpr std::size_t kBytes = 64u * 1024u + 29u;
+
+        IBackend *const backend = getBackendFor(device);
+        ASSERT_NE(backend, nullptr);
+        if (backend->deviceCount() <= device.gpu_ordinal())
+            GTEST_SKIP() << device.toString() << " is unavailable";
+
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        TransferEngine transfer_engine;
+        auto device_source = transfer_engine.allocateDeviceTransferBuffer(
+            kBytes, device);
+        ASSERT_NE(device_source, nullptr);
+        const auto expected = makePattern(kBytes, 0xd3u);
+
+        void *setup_stream = nullptr;
+        context.submitAndWait(
+            [&]
+            {
+                setup_stream = context.getOrCreateAuxiliaryStream(
+                    "mapped_transfer_progress_queue_setup:" +
+                        device.toString(),
+                    GPUAuxiliaryStreamSchedulingClass::Normal);
+                if (!setup_stream ||
+                    !backend->hostToDevice(
+                        device_source->mutableDeviceData(),
+                        expected.data(),
+                        kBytes,
+                        device.gpu_ordinal(),
+                        setup_stream))
+                {
+                    throw std::runtime_error(
+                        "Could not initialize bounded-lane queue source");
+                }
+                context.synchronizeStream(setup_stream);
+            });
+
+        auto epoch = MappedTransferProgressEpoch::create({
+            .device = device,
+            .slot_capacity = kCommandCount,
+            .execution_lane_capacity = 1u,
+            .maximum_bytes = kBytes,
+            .name = "integration_bounded_lane_queue_" + device.toString(),
+            .perf_device = device.toString(),
+        });
+        const DeviceId mapped_devices[] = {device};
+        std::vector<std::shared_ptr<MappedHostTransferRegion>> destinations;
+        std::vector<MappedTransferProgressSlot> slots;
+        destinations.reserve(kCommandCount);
+        slots.reserve(kCommandCount);
+        for (std::size_t index = 0u; index < kCommandCount; ++index)
+        {
+            auto destination = transfer_engine.allocateMappedHostRegion(
+                kBytes, mapped_devices);
+            ASSERT_TRUE(destination && destination->isBound());
+            std::memset(destination->mutableHostData(), 0, kBytes);
+            slots.push_back(epoch->reserveSlot(
+                MappedTransferDirection::DeviceToHost,
+                destination,
+                "queued_d2h_" + std::to_string(index)));
+            destinations.push_back(std::move(destination));
+        }
+
+        for (auto &slot : slots)
+        {
+            EXPECT_EQ(
+                slot.publishDeviceToMappedHost(
+                    device_source->deviceData(), kBytes, 0u, kBytes),
+                1u);
+        }
+        ASSERT_TRUE(epoch->submitOutstandingProgress());
+        EXPECT_EQ(epoch->stats().dma_submissions, 1u)
+            << "One execution lane must not submit several commands at once";
+
+        std::vector<MappedTransferProgress> progress(
+            kCommandCount, MappedTransferProgress::Pending);
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(10);
+        while (std::any_of(
+                   progress.begin(), progress.end(),
+                   [](MappedTransferProgress value)
+                   { return value == MappedTransferProgress::Pending; }) &&
+               std::chrono::steady_clock::now() < deadline)
+        {
+            ASSERT_TRUE(epoch->submitOutstandingProgress());
+            for (std::size_t index = 0u; index < kCommandCount; ++index)
+            {
+                if (progress[index] == MappedTransferProgress::Pending)
+                    progress[index] = slots[index].poll();
+            }
+            std::this_thread::yield();
+        }
+
+        for (std::size_t index = 0u; index < kCommandCount; ++index)
+        {
+            EXPECT_EQ(progress[index], MappedTransferProgress::Ready)
+                << "slot=" << index;
+            EXPECT_EQ(
+                std::memcmp(
+                    destinations[index]->mutableHostData(),
+                    expected.data(),
+                    kBytes),
+                0)
+                << "slot=" << index;
+        }
+        const auto stats = epoch->stats();
+        EXPECT_EQ(stats.commands_published, kCommandCount);
+        EXPECT_EQ(stats.commands_completed, kCommandCount);
+        EXPECT_EQ(stats.dma_submissions, kCommandCount);
+        EXPECT_EQ(stats.command_failures, 0u);
+    }
+
+    TEST(MappedTransferProgressEpochIntegration,
+         InvalidExecutionLaneGeometryIsRejectedBeforeGPUSetup)
+    {
+#if defined(HAVE_CUDA)
+        const DeviceId device = DeviceId::cuda(0);
+#else
+        const DeviceId device = DeviceId::rocm(0);
+#endif
+        EXPECT_THROW(
+            (void)MappedTransferProgressEpoch::create({
+                .device = device,
+                .slot_capacity = 2u,
+                .execution_lane_capacity = 0u,
+                .maximum_bytes = 4096u,
+                .name = "invalid_zero_execution_lanes",
+            }),
+            std::invalid_argument);
+        EXPECT_THROW(
+            (void)MappedTransferProgressEpoch::create({
+                .device = device,
+                .slot_capacity = 2u,
+                .execution_lane_capacity = 3u,
+                .maximum_bytes = 4096u,
+                .name = "invalid_excess_execution_lanes",
+            }),
+            std::invalid_argument);
+    }
+
 #if defined(HAVE_CUDA)
     TEST(MappedTransferProgressEpochIntegration,
          CUDARepeatedGenerationsAreByteExact)
@@ -455,6 +649,19 @@ namespace
          CUDAInferenceDoesNotJoinMaintenance)
     {
         proveInferenceDoesNotJoinMaintenance(DeviceId::cuda(0));
+    }
+
+    TEST(MappedTransferProgressEpochIntegration,
+         CUDATopologySizedDirectoryHasBoundedExecutionLanePool)
+    {
+        proveTopologySizedDirectoryUsesBoundedExecutionLanes(
+            DeviceId::cuda(0));
+    }
+
+    TEST(MappedTransferProgressEpochIntegration,
+         CUDABoundedExecutionLanePoolQueuesWithoutLosingBytes)
+    {
+        proveBoundedExecutionLaneQueueIsByteExact(DeviceId::cuda(0));
     }
 #endif
 
@@ -469,6 +676,19 @@ namespace
          ROCmInferenceDoesNotJoinMaintenance)
     {
         proveInferenceDoesNotJoinMaintenance(DeviceId::rocm(0));
+    }
+
+    TEST(MappedTransferProgressEpochIntegration,
+         ROCmTopologySizedDirectoryHasBoundedExecutionLanePool)
+    {
+        proveTopologySizedDirectoryUsesBoundedExecutionLanes(
+            DeviceId::rocm(0));
+    }
+
+    TEST(MappedTransferProgressEpochIntegration,
+         ROCmBoundedExecutionLanePoolQueuesWithoutLosingBytes)
+    {
+        proveBoundedExecutionLaneQueueIsByteExact(DeviceId::rocm(0));
     }
 #endif
 } // namespace

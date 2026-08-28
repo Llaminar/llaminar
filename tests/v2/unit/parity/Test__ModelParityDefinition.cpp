@@ -9,6 +9,8 @@
  */
 
 #include "integration/parity/ModelParityDefinition.h"
+#include "integration/parity/ProductionParityModelPath.h"
+#include "integration/parity/qwen35moe/Qwen35MoEModelParityDefinitions.h"
 #include "integration/parity/qwen36/Qwen36ModelParityDefinitions.h"
 
 #include "config/OrchestrationConfig.h"
@@ -18,9 +20,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -109,13 +115,22 @@ namespace llaminar2::test::parity
             definition.topology = std::move(topology);
             definition.thresholds.cosine_threshold = 0.9999f;
             definition.thresholds.decode_cosine_threshold = 0.999f;
-            definition.dynamic_rebalance.window_size = 17;
-            definition.dynamic_rebalance.migration_max_cycles_per_wave = 3;
-            definition.dynamic_rebalance.device_maintenance_slack_tokens = 0;
-            definition.dynamic_rebalance
-                .device_min_maintenance_period_tokens = 1;
-            definition.dynamic_rebalance
+            MoERebalanceRuntimeConfig dynamic_policy;
+            dynamic_policy.window_size = 17;
+            dynamic_policy.migration_transfer_slots = 3;
+            dynamic_policy.device_maintenance_slack_tokens = 0;
+            dynamic_policy
+                .device_min_maintenance_period_tokens =
+                    maximum_mtp_depth >=
+                            kModelParityRequiredMaximumMTPDepth
+                        ? kModelParityRequiredMaximumMTPDepth + 1
+                        : 1;
+            dynamic_policy
                 .device_initial_maintenance_period_tokens = 1;
+            definition.dynamic_rebalance = {
+                .economic_movement = dynamic_policy,
+                .economic_movement_and_observed_speedup = dynamic_policy,
+            };
             return definition;
         }
 
@@ -222,7 +237,100 @@ namespace llaminar2::test::parity
         private:
             std::filesystem::path path_;
         };
+
+        /** @brief Restore one process environment variable at scope exit. */
+        class ScopedEnvironmentVariable final
+        {
+        public:
+            /**
+             * @brief Install or remove an environment value for one test.
+             * @param name Environment variable name.
+             * @param value Replacement value, or nullopt to remove it.
+             */
+            ScopedEnvironmentVariable(
+                std::string name,
+                std::optional<std::string> value)
+                : name_(std::move(name))
+            {
+                if (const char *previous = std::getenv(name_.c_str()))
+                    previous_ = previous;
+                if (value.has_value())
+                {
+                    if (setenv(name_.c_str(), value->c_str(), 1) != 0)
+                    {
+                        throw std::runtime_error(
+                            "failed to install unit-test environment variable " +
+                            name_);
+                    }
+                }
+                else
+                {
+                    if (unsetenv(name_.c_str()) != 0)
+                    {
+                        throw std::runtime_error(
+                            "failed to remove unit-test environment variable " +
+                            name_);
+                    }
+                }
+            }
+
+            /** Restore the exact environment state observed on construction. */
+            ~ScopedEnvironmentVariable()
+            {
+                if (previous_.has_value())
+                    static_cast<void>(
+                        setenv(name_.c_str(), previous_->c_str(), 1));
+                else
+                    static_cast<void>(unsetenv(name_.c_str()));
+            }
+
+            ScopedEnvironmentVariable(
+                const ScopedEnvironmentVariable &) = delete;
+            ScopedEnvironmentVariable &operator=(
+                const ScopedEnvironmentVariable &) = delete;
+
+        private:
+            std::string name_;                    ///< Variable being guarded.
+            std::optional<std::string> previous_; ///< Original optional value.
+        };
     } // namespace
+
+    TEST(ModelParityDefinition, ProcessCampaignRejectsMissingTmpfsAuthority)
+    {
+        ScopedEnvironmentVariable process_campaign(
+            std::string(kProductionParityProcessCampaignEnvironment),
+            std::string("1"));
+        ScopedEnvironmentVariable no_ramdisk(
+            std::string(kProductionParityModelRamdiskEnvironment),
+            std::nullopt);
+
+        try
+        {
+            static_cast<void>(productionParityResolvedModelPath(
+                "/models/must-not-be-opened.gguf"));
+            FAIL() << "A process campaign used its source GGUF without tmpfs";
+        }
+        catch (const std::runtime_error &error)
+        {
+            EXPECT_NE(
+                std::string(error.what()).find(
+                    "bypassed authenticated tmpfs model staging"),
+                std::string::npos);
+        }
+    }
+
+    TEST(ModelParityDefinition, FocusedDiagnosticMayUseExplicitModelPath)
+    {
+        ScopedEnvironmentVariable no_process_campaign(
+            std::string(kProductionParityProcessCampaignEnvironment),
+            std::nullopt);
+        ScopedEnvironmentVariable no_ramdisk(
+            std::string(kProductionParityModelRamdiskEnvironment),
+            std::nullopt);
+        const std::string configured = "/models/focused-diagnostic.gguf";
+
+        EXPECT_EQ(productionParityResolvedModelPath(configured), configured);
+    }
 
     TEST(ModelParityDefinition, SnapshotInventoryDefaultsToAuthenticatedCheckpoints)
     {
@@ -320,6 +428,17 @@ namespace llaminar2::test::parity
             EXPECT_EQ(test_case.model.mtp_checkpoint_surface, surface);
     }
 
+    TEST(ModelParityDefinition, Qwen36DynamicEconomicsAreProductionValid)
+    {
+        const auto economics = qwen36::qwen36MoEDynamicParityEconomics();
+
+        EXPECT_EQ(economics.mode, MoERebalanceRuntimeMode::Dynamic);
+        EXPECT_GE(economics.dynamic_imbalance_threshold_per_mille, 1000u);
+        EXPECT_EQ(
+            economics.device_min_maintenance_period_tokens,
+            kModelParityRequiredMaximumMTPDepth + 1);
+    }
+
     TEST(ModelParityDefinition, PlainDefinitionHasOneMandatoryPrefixLifecycleCell)
     {
         const auto cases = expandModelParityDefinition(
@@ -328,6 +447,7 @@ namespace llaminar2::test::parity
         ASSERT_EQ(cases.size(), 1u);
         EXPECT_FALSE(cases.front().expert_overlay.has_value());
         EXPECT_EQ(cases.front().mtp, ModelParityMTP::Off);
+        EXPECT_EQ(cases.front().retained_mtp_draft_capacity, 0);
         EXPECT_EQ(
             cases.front().prefix_cache_block_size,
             kModelParityPrefixRestoreProofBlockSize);
@@ -350,9 +470,14 @@ namespace llaminar2::test::parity
         ASSERT_EQ(cases.size(), 24u);
         std::set<std::string> names;
         std::set<std::tuple<int, int, int>> policies;
+        std::size_t economic_movement_cells = 0;
         for (const auto &test_case : cases)
         {
             ASSERT_TRUE(test_case.expert_overlay.has_value());
+            EXPECT_EQ(
+                test_case.retained_mtp_draft_capacity,
+                kModelParityRequiredMaximumMTPDepth)
+                << "every active and control cell must share one setup-capacity identity";
             EXPECT_EQ(
                 test_case.prefix_cache_block_size,
                 kModelParityPrefixRestoreProofBlockSize);
@@ -361,9 +486,167 @@ namespace llaminar2::test::parity
                 static_cast<int>(test_case.expert_overlay->owner_order),
                 static_cast<int>(test_case.expert_overlay->movement),
                 static_cast<int>(test_case.mtp));
+            economic_movement_cells +=
+                test_case.dynamic_evidence ==
+                        ModelParityDynamicEvidence::EconomicMovement
+                    ? 1u
+                    : 0u;
+            EXPECT_FALSE(test_case.requiresObservedConvergenceSpeedup())
+                << "a GPU-only topology has no CPU-tier convergence witness";
         }
         EXPECT_EQ(names.size(), 24u);
         EXPECT_EQ(policies.size(), 24u);
+        EXPECT_EQ(economic_movement_cells, 12u);
+    }
+
+    TEST(ModelParityDefinition,
+         CpuOverlayAssignsOneObservedSpeedupWitnessPerPrecisionAndOwnerOrder)
+    {
+        auto topology = makeOverlayTopology();
+        topology.test_id = "CUDA2_CPU2_NodeOverlay";
+        topology.participants = {
+            {GlobalDeviceAddress::cuda(0), 0},
+            {GlobalDeviceAddress::cuda(1), 0},
+            {GlobalDeviceAddress::cpu(0), 1},
+            {GlobalDeviceAddress::cpu(1), 1},
+        };
+        auto definition = makeDefinition(
+            std::move(topology), kModelParityRequiredMaximumMTPDepth);
+        definition.features.mtp = ModelParityAxisProfile::Standard;
+        definition.precisions.activation = {
+            ActivationPrecision::FP16,
+            ActivationPrecision::BF16,
+        };
+        definition.precisions.kv_cache = {
+            KVCachePrecision::FP16,
+            KVCachePrecision::Q8_1,
+        };
+        definition.dynamic_rebalance.economic_movement.window_size = 19;
+        definition.dynamic_rebalance.economic_movement.max_window_size = 4096;
+        definition.dynamic_rebalance.economic_movement
+            .migration_transfer_slots = 49;
+        definition.dynamic_rebalance.economic_movement
+            .migration_cycles_per_wave = 2;
+        definition.dynamic_rebalance
+            .economic_movement_and_observed_speedup.window_size = 640;
+        definition.dynamic_rebalance
+            .economic_movement_and_observed_speedup.max_window_size = 640;
+        definition.dynamic_rebalance
+            .economic_movement_and_observed_speedup
+            .migration_transfer_slots = 49;
+
+        const auto cases = expandModelParityDefinition(definition);
+
+        ASSERT_EQ(cases.size(), 96u);
+        std::size_t witnesses = 0;
+        std::size_t movement_only = 0;
+        for (const auto &test_case : cases)
+        {
+            if (!test_case.requiresPhysicalExpertMovement())
+            {
+                EXPECT_EQ(
+                    test_case.dynamic_evidence,
+                    ModelParityDynamicEvidence::NotApplicable);
+                EXPECT_EQ(test_case.dynamic_rebalance.window_size, 19);
+                EXPECT_EQ(
+                    test_case.dynamic_rebalance.migration_transfer_slots,
+                    49u);
+                EXPECT_EQ(
+                    test_case.dynamic_rebalance
+                        .resolvedMigrationCyclesPerWave(),
+                    2u);
+                continue;
+            }
+            if (test_case.requiresObservedConvergenceSpeedup())
+            {
+                ++witnesses;
+                EXPECT_EQ(test_case.mtp, ModelParityMTP::Off);
+                EXPECT_EQ(test_case.dynamic_rebalance.window_size, 640);
+                EXPECT_EQ(
+                    test_case.dynamic_rebalance.migration_transfer_slots,
+                    49u);
+                EXPECT_EQ(
+                    test_case.dynamic_rebalance
+                        .resolvedMigrationCyclesPerWave(),
+                    49u);
+            }
+            else
+            {
+                ++movement_only;
+                EXPECT_EQ(
+                    test_case.dynamic_evidence,
+                    ModelParityDynamicEvidence::EconomicMovement);
+                EXPECT_EQ(test_case.dynamic_rebalance.window_size, 19);
+                EXPECT_EQ(
+                    test_case.dynamic_rebalance.migration_transfer_slots,
+                    49u);
+                EXPECT_EQ(
+                    test_case.dynamic_rebalance
+                        .resolvedMigrationCyclesPerWave(),
+                    2u);
+            }
+        }
+        EXPECT_EQ(witnesses, 8u);
+        EXPECT_EQ(movement_only, 40u);
+    }
+
+    TEST(ModelParityDefinition,
+         Qwen35MoE35BSeparatesMovementAndObservedSpeedupHistogramPolicies)
+    {
+        const auto &spec =
+            qwen35moe::qwen35MoE35BOverlayTopologySpecs().front();
+        const auto cases = expandModelParityDefinition(
+            qwen35moe::qwen35MoE35BGraphNativeParityDefinition(spec));
+
+        const auto find_dynamic = [&cases](
+                                      RoutedExpertOwnerOrder owner_order,
+                                      ModelParityPrefillGraphMode prefill_mode)
+            -> const ModelParityCase &
+        {
+            const auto found = std::find_if(
+                cases.begin(), cases.end(),
+                [&](const ModelParityCase &test_case)
+                {
+                    return test_case.expert_overlay.has_value() &&
+                           test_case.expert_overlay->owner_order ==
+                               owner_order &&
+                           test_case.expert_overlay->movement ==
+                               ModelParityExpertMovement::Dynamic &&
+                           test_case.prefill_graph.mode == prefill_mode;
+                });
+            if (found == cases.end())
+            {
+                throw std::logic_error(
+                    "Generated Qwen3.5 MoE 35B Dynamic cell is missing");
+            }
+            return *found;
+        };
+
+        for (const auto owner_order : {
+                 RoutedExpertOwnerOrder::Ordinal,
+                 RoutedExpertOwnerOrder::Random})
+        {
+            const auto &speedup = find_dynamic(
+                owner_order, ModelParityPrefillGraphMode::Standard);
+            EXPECT_TRUE(speedup.requiresObservedConvergenceSpeedup());
+            EXPECT_EQ(
+                speedup.dynamic_rebalance.window_size,
+                qwen35moe::kQwen35MoEConvergenceHistogramWindowRows);
+            EXPECT_EQ(
+                speedup.dynamic_rebalance.max_window_size,
+                qwen35moe::kQwen35MoEConvergenceHistogramWindowRows);
+            EXPECT_GT(
+                static_cast<std::uint64_t>(
+                    speedup.dynamic_rebalance.window_size),
+                qwen35moe::qwen35MoEConvergenceTimingCohortRoutedRows());
+
+            const auto &movement = find_dynamic(
+                owner_order,
+                ModelParityPrefillGraphMode::SegmentedCaptured);
+            EXPECT_FALSE(movement.requiresObservedConvergenceSpeedup());
+            EXPECT_EQ(movement.dynamic_rebalance.window_size, 256);
+            EXPECT_EQ(movement.dynamic_rebalance.max_window_size, 256);
+        }
     }
 
     TEST(ModelParityDefinition, PrefixRestoreDoesNotMultiplyOverlayMTPMatrix)
@@ -387,6 +670,109 @@ namespace llaminar2::test::parity
         }
     }
 
+    TEST(ModelParityDefinition, PrefillGraphProfilesUseTheCentralCrossProduct)
+    {
+        auto definition = makeDefinition(
+            makeOverlayTopology(), kModelParityRequiredMaximumMTPDepth);
+        definition.features.mtp = ModelParityAxisProfile::Standard;
+        definition.features.prefill_graph = {
+            ModelParityPrefillGraphPolicy{},
+            ModelParityPrefillGraphPolicy{
+                .mode = ModelParityPrefillGraphMode::SegmentedCaptured,
+                .captured_rows = 4,
+            },
+        };
+
+        const auto cases = expandModelParityDefinition(definition);
+
+        ASSERT_EQ(cases.size(), 48u);
+        EXPECT_EQ(
+            std::count_if(
+                cases.begin(), cases.end(),
+                [](const ModelParityCase &test_case)
+                { return test_case.prefill_graph.isSegmentedCaptured(); }),
+            24);
+        const auto segmented = std::find_if(
+            cases.begin(), cases.end(),
+            [](const ModelParityCase &test_case)
+            { return test_case.prefill_graph.isSegmentedCaptured(); });
+        ASSERT_NE(segmented, cases.end());
+        EXPECT_EQ(segmented->prefill_graph.captured_rows, 4);
+        EXPECT_NE(
+            segmented->testName().find("SegmentedPrefillRows4"),
+            std::string::npos);
+    }
+
+    TEST(ModelParityDefinition, Qwen35GraphNativeHasNoPrivatePolicyCells)
+    {
+        const auto generic_multi_device =
+            qwen35moe::qwen35MoEMultiDeviceThresholds();
+        EXPECT_NE(
+            std::find(
+                generic_multi_device.excluded_stages.begin(),
+                generic_multi_device.excluded_stages.end(),
+                "MOE_EXPERT_OUTPUT"),
+            generic_multi_device.excluded_stages.end())
+            << "ordinary tensor-parallel snapshots remain branch-local";
+
+        std::vector<ModelParityCase> cases;
+        for (const auto &spec :
+             qwen35moe::qwen35MoE35BOverlayTopologySpecs())
+        {
+            auto topology_cases = expandModelParityDefinition(
+                qwen35moe::qwen35MoE35BGraphNativeParityDefinition(spec));
+            cases.insert(
+                cases.end(),
+                std::make_move_iterator(topology_cases.begin()),
+                std::make_move_iterator(topology_cases.end()));
+        }
+
+        ASSERT_EQ(cases.size(), 20u);
+        std::set<std::string> names;
+        std::set<std::string> topology_ids;
+        std::size_t segmented = 0;
+        std::size_t static_ordinal = 0;
+        std::size_t dynamic_ordinal = 0;
+        std::size_t static_random = 0;
+        std::size_t dynamic_random = 0;
+        for (const auto &test_case : cases)
+        {
+            EXPECT_EQ(
+                std::find(
+                    test_case.thresholds.excluded_stages.begin(),
+                    test_case.thresholds.excluded_stages.end(),
+                    "MOE_EXPERT_OUTPUT"),
+                test_case.thresholds.excluded_stages.end())
+                << "ExpertOverlay must compare its canonical sparse-return sum";
+            names.insert(test_case.testName());
+            topology_ids.insert(test_case.topology.test_id);
+            segmented +=
+                test_case.prefill_graph.isSegmentedCaptured() ? 1u : 0u;
+            ASSERT_TRUE(test_case.expert_overlay.has_value());
+            const bool dynamic =
+                test_case.expert_overlay->movement ==
+                ModelParityExpertMovement::Dynamic;
+            const bool random =
+                test_case.expert_overlay->owner_order ==
+                RoutedExpertOwnerOrder::Random;
+            if (dynamic && random)
+                ++dynamic_random;
+            else if (dynamic)
+                ++dynamic_ordinal;
+            else if (random)
+                ++static_random;
+            else
+                ++static_ordinal;
+        }
+        EXPECT_EQ(names.size(), cases.size());
+        EXPECT_EQ(topology_ids.size(), 4u);
+        EXPECT_EQ(segmented, 4u);
+        EXPECT_EQ(static_ordinal, 5u);
+        EXPECT_EQ(dynamic_ordinal, 5u);
+        EXPECT_EQ(static_random, 5u);
+        EXPECT_EQ(dynamic_random, 5u);
+    }
+
     TEST(ModelParityDefinition, PrecisionAxesUseTheSameCentralCrossProduct)
     {
         auto definition = makeDefinition(makeSingleDeviceTopology());
@@ -401,6 +787,7 @@ namespace llaminar2::test::parity
         };
         auto q8_thresholds = definition.thresholds;
         q8_thresholds.kl_threshold = 0.123f;
+        q8_thresholds.mtp_kl_threshold = 0.234f;
         definition.precisions.threshold_overrides = {
             {
                 .activation = ActivationPrecision::BF16,
@@ -431,6 +818,51 @@ namespace llaminar2::test::parity
             });
         ASSERT_NE(overridden, cases.end());
         EXPECT_FLOAT_EQ(overridden->thresholds.kl_threshold, 0.123f);
+        ASSERT_TRUE(overridden->thresholds.mtp_kl_threshold.has_value());
+        EXPECT_FLOAT_EQ(
+            *overridden->thresholds.mtp_kl_threshold,
+            0.234f);
+    }
+
+    TEST(ModelParityDefinition, MTPKLOverrideChangesOnlyItsTypedPolicy)
+    {
+        auto definition = makeDefinition(
+            makeOverlayTopology(), kModelParityRequiredMaximumMTPDepth);
+        definition.thresholds.mtp_kl_threshold = 0.05f;
+        definition.features.mtp = ModelParityAxisProfile::Standard;
+        definition.features.mtp_kl_threshold_overrides = {
+            {
+                .policy = ModelParityMTP::Depth15,
+                .maximum_kl_divergence = 0.06f,
+            },
+        };
+
+        const auto cases = expandModelParityDefinition(definition);
+        const auto &depth_three = findCase(
+            cases,
+            RoutedExpertOwnerOrder::Ordinal,
+            ModelParityExpertMovement::Static,
+            ModelParityMTP::Depth3);
+        const auto &depth_fifteen = findCase(
+            cases,
+            RoutedExpertOwnerOrder::Ordinal,
+            ModelParityExpertMovement::Static,
+            ModelParityMTP::Depth15);
+        const auto &dynamic_depth = findCase(
+            cases,
+            RoutedExpertOwnerOrder::Ordinal,
+            ModelParityExpertMovement::Static,
+            ModelParityMTP::DynamicDepth);
+
+        ASSERT_TRUE(depth_three.thresholds.mtp_kl_threshold.has_value());
+        ASSERT_TRUE(depth_fifteen.thresholds.mtp_kl_threshold.has_value());
+        ASSERT_TRUE(dynamic_depth.thresholds.mtp_kl_threshold.has_value());
+        EXPECT_FLOAT_EQ(*depth_three.thresholds.mtp_kl_threshold, 0.05f);
+        EXPECT_FLOAT_EQ(*depth_fifteen.thresholds.mtp_kl_threshold, 0.06f);
+        EXPECT_FLOAT_EQ(*dynamic_depth.thresholds.mtp_kl_threshold, 0.05f);
+        EXPECT_FLOAT_EQ(
+            *depth_fifteen.toTestConfig().thresholds.mtp_kl_threshold,
+            0.06f);
     }
 
     TEST(ModelParityDefinition, TypedCaseProjectsStaticPolicyWithoutMovement)
@@ -459,7 +891,10 @@ namespace llaminar2::test::parity
             legacy.mtp_expectation,
             ParityMTPExpectation::Disabled);
         EXPECT_EQ(legacy.mtp_expected_draft_depth, 0);
-        EXPECT_EQ(legacy.mtp_expected_graph_capacity, 0);
+        EXPECT_EQ(
+            legacy.mtp_expected_graph_capacity,
+            kModelParityRequiredMaximumMTPDepth)
+            << "The adapter must expose physical capacity independently of active MTP execution";
         EXPECT_FALSE(legacy.moe_rebalance_exercise.enabled);
         EXPECT_EQ(
             legacy.routed_expert_owner_order,
@@ -478,7 +913,10 @@ namespace llaminar2::test::parity
         OrchestrationConfig runtime;
         test_case.applyRuntimePolicy(runtime);
         EXPECT_FALSE(runtime.mtp.enabled);
-        EXPECT_EQ(runtime.mtp.graph_capacity_draft_tokens, 0);
+        EXPECT_EQ(
+            runtime.mtp.graph_capacity_draft_tokens,
+            kModelParityRequiredMaximumMTPDepth)
+            << "The execution-off control must retain the same setup envelope as enabled cells";
         EXPECT_TRUE(runtime.prefix_cache.enabled);
         EXPECT_EQ(
             runtime.prefix_cache.storage_mode,
@@ -530,11 +968,11 @@ namespace llaminar2::test::parity
         EXPECT_EQ(runtime.mtp.depth_policy.window_size, 1);
         EXPECT_EQ(runtime.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
         EXPECT_EQ(runtime.moe_rebalance.window_size, 17);
-        EXPECT_EQ(runtime.moe_rebalance.migration_max_cycles_per_wave, 3u);
+        EXPECT_EQ(runtime.moe_rebalance.migration_transfer_slots, 3u);
         EXPECT_EQ(runtime.moe_rebalance.device_maintenance_slack_tokens, 0);
         EXPECT_EQ(
             runtime.moe_rebalance.device_min_maintenance_period_tokens,
-            1);
+            kModelParityRequiredMaximumMTPDepth + 1);
         EXPECT_EQ(
             runtime.moe_rebalance.device_initial_maintenance_period_tokens,
             1);
@@ -574,8 +1012,8 @@ namespace llaminar2::test::parity
     TEST(ModelParityDefinition, ExpertOverlayRejectsEnvironmentOwnedMovementCadence)
     {
         auto definition = makeDefinition(makeOverlayTopology());
-        definition.dynamic_rebalance.device_initial_maintenance_period_tokens =
-            -1;
+        definition.dynamic_rebalance.economic_movement
+            .device_initial_maintenance_period_tokens = -1;
 
         EXPECT_THROW(
             (void)expandModelParityDefinition(definition),
@@ -683,10 +1121,62 @@ namespace llaminar2::test::parity
             static_cast<void>(expandModelParityDefinition(insufficient_mtp)),
             std::invalid_argument);
 
+        auto disabled_mtp_override =
+            makeDefinition(makeSingleDeviceTopology());
+        disabled_mtp_override.features.mtp_kl_threshold_overrides = {
+            {
+                .policy = ModelParityMTP::Depth15,
+                .maximum_kl_divergence = 0.06f,
+            },
+        };
+        EXPECT_THROW(
+            static_cast<void>(expandModelParityDefinition(
+                disabled_mtp_override)),
+            std::invalid_argument);
+
+        auto clipped_adaptive_mtp = makeDefinition(
+            makeOverlayTopology(),
+            kModelParityRequiredMaximumMTPDepth);
+        clipped_adaptive_mtp.features.mtp =
+            ModelParityAxisProfile::Standard;
+        clipped_adaptive_mtp.dynamic_rebalance.economic_movement
+            .device_min_maintenance_period_tokens =
+            kModelParityRequiredMaximumMTPDepth;
+        EXPECT_THROW(
+            static_cast<void>(expandModelParityDefinition(
+                clipped_adaptive_mtp)),
+            std::invalid_argument);
+
         auto empty_precision = makeDefinition(makeSingleDeviceTopology());
         empty_precision.precisions.activation.clear();
         EXPECT_THROW(
             static_cast<void>(expandModelParityDefinition(empty_precision)),
+            std::invalid_argument);
+
+        auto empty_prefill = makeDefinition(makeSingleDeviceTopology());
+        empty_prefill.features.prefill_graph.clear();
+        EXPECT_THROW(
+            static_cast<void>(expandModelParityDefinition(empty_prefill)),
+            std::invalid_argument);
+
+        auto invalid_segmented = makeDefinition(makeSingleDeviceTopology());
+        invalid_segmented.features.prefill_graph = {
+            ModelParityPrefillGraphPolicy{
+                .mode = ModelParityPrefillGraphMode::SegmentedCaptured,
+                .captured_rows = 0,
+            },
+        };
+        EXPECT_THROW(
+            static_cast<void>(expandModelParityDefinition(invalid_segmented)),
+            std::invalid_argument);
+
+        auto duplicate_prefill = makeDefinition(makeSingleDeviceTopology());
+        duplicate_prefill.features.prefill_graph = {
+            ModelParityPrefillGraphPolicy{},
+            ModelParityPrefillGraphPolicy{},
+        };
+        EXPECT_THROW(
+            static_cast<void>(expandModelParityDefinition(duplicate_prefill)),
             std::invalid_argument);
 
         auto invalid_identifier = makeDefinition(makeSingleDeviceTopology());

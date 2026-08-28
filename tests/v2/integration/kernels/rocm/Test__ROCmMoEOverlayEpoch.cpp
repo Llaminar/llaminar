@@ -353,7 +353,7 @@ namespace llaminar2::test
      * generation newer than the endpoint's retained grant.
      */
     TEST_F(ROCmMoEOverlayEpochTest,
-           PeerEpochAcquireAuthenticatesGenerationBeyondReusedTimeline)
+           PeerEpochAcquireAuthenticatesGenerationAndPinsPreparedCandidate)
     {
         MoEOverlayActivationEpochControl *host_control = nullptr;
         ASSERT_EQ(
@@ -425,6 +425,25 @@ namespace llaminar2::test
                 inference_stream_),
             hipSuccess);
 
+        /* Match CUDA's exact fan-out interleaving: E2 is globally prepared on
+         * this participant while its local selector remains on E1. */
+        ASSERT_TRUE(kernel_->reserveMoEOverlayEpochCandidate(
+            maintenanceLaunch(),
+            device_control_,
+            &device_epochs_[0],
+            &device_statuses_[0]));
+        ASSERT_TRUE(kernel_->markMoEOverlayEpochCandidateReady(
+            maintenanceLaunch(),
+            device_control_,
+            &device_epochs_[0],
+            &device_statuses_[1]));
+        ASSERT_EQ(
+            hipEventRecord(maintenance_event_, maintenance_stream_),
+            hipSuccess);
+        ASSERT_EQ(
+            hipStreamWaitEvent(inference_stream_, maintenance_event_, 0),
+            hipSuccess);
+
         ASSERT_TRUE(kernel_->acquireMoEOverlayEpoch(
             inferenceLaunch(),
             device_control_,
@@ -447,7 +466,7 @@ namespace llaminar2::test
             host_control->buffers[0].dispatch_descriptor;
         descriptor.digest = host_control->identity.digest;
         descriptor.timeline = moeOverlayActivationLeasedTimelineValue(1u);
-        descriptor.placement_epoch = 1u;
+        descriptor.placement_epoch = 2u;
         descriptor.stage_ordinal = 0u;
         std::atomic_thread_fence(std::memory_order_release);
         std::atomic_ref<std::uint64_t>(
@@ -471,11 +490,17 @@ namespace llaminar2::test
                 sizeof(status),
                 hipMemcpyDeviceToHost),
             hipSuccess);
-        EXPECT_EQ(ticket.epoch, 1u);
+        EXPECT_EQ(ticket.epoch, 2u);
+        EXPECT_EQ(ticket.bank(), 1u);
+        EXPECT_EQ(ticket.generation(), 2u);
         EXPECT_EQ(
             status.code,
             static_cast<std::uint32_t>(
                 DeviceMoEOverlayEpochStatusCode::Success));
+        EXPECT_EQ(
+            status.observed_state,
+            static_cast<std::uint32_t>(
+                DeviceMoEOverlayEpochBankState::Ready));
 
         ASSERT_TRUE(kernel_->releaseMoEOverlayEpoch(
             inferenceLaunch(),
@@ -901,6 +926,7 @@ namespace llaminar2::test
         plan.expert = 0u;
         plan.source_participant = 0u;
         plan.destination_participant = 1u;
+        plan.destination_overlay_participant = 1;
         plan.source_resident_mask = 0b01u;
         plan.flags = moe_rebalance_abi::kPlanFlagCurrentBatchLLEP;
 
@@ -1045,6 +1071,7 @@ namespace llaminar2::test
         plan.expert = 0u;
         plan.source_participant = 0u;
         plan.destination_participant = 1u;
+        plan.destination_overlay_participant = 1;
         plan.source_resident_mask = 0b01u;
 
         DeviceMoERebalanceCommandBufferHeader command_header{};

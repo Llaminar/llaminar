@@ -42,7 +42,6 @@ namespace llaminar2
         int layer_idx,
         int active_capacity,
         std::vector<ProjectionSpec> specs,
-        size_t vram_safety_margin_bytes,
         int transfer_capacity)
     {
         if (active_capacity <= 0)
@@ -53,7 +52,6 @@ namespace llaminar2
             throw std::invalid_argument("GpuExpertSlotPool requires at least one projection spec");
 
         auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
-        orchestrator->setVramPreflightSafetyMarginBytes(vram_safety_margin_bytes);
         orchestrator->addDevice(device_ordinal);
 
         auto plan_slot_family = [&](int count,

@@ -45,7 +45,12 @@ namespace llaminar2
         std::uint64_t publication_consensus_ready = 0;
         std::uint64_t publication_consensus_failed = 0;
         std::uint64_t local_publication_begin_failed = 0;
+        std::uint64_t retirement_admission_consensus_started = 0;
+        std::uint64_t retirement_admission_consensus_waiting = 0;
+        std::uint64_t retirement_admission_consensus_ready = 0;
+        std::uint64_t retirement_admission_consensus_failed = 0;
         std::uint64_t retirement_consensus_started = 0;
+        std::uint64_t retirement_consensus_waiting = 0;
         std::uint64_t retirement_consensus_ready = 0;
         std::uint64_t retirement_consensus_failed = 0;
         std::uint64_t waves_published = 0;
@@ -97,6 +102,10 @@ namespace llaminar2
         /** @return Race-free cumulative distributed control-plane evidence. */
         [[nodiscard]] MoEOverlayDistributedResidencyTransportStats stats()
             const noexcept;
+
+        /** @return Process-local physical bytes behind completed global waves. */
+        [[nodiscard]] std::uint64_t
+        completedPlacementPayloadBytes() const noexcept override;
 
     private:
         Config config_;

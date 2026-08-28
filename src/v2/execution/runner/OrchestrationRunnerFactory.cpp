@@ -1,9 +1,12 @@
 /**
  * @file OrchestrationRunnerFactory.cpp
- * @brief Implementation of OrchestrationRunnerFactory
+ * @brief Typed construction boundary for production orchestration runners.
  *
- * @author David Sanftenberg
- * @date January 2026
+ * The factory normalizes declarative topology and selects the concrete global
+ * or rank-local runner. A reusable prepared-model authority crosses this file
+ * as one indivisible ModelContextReuseContract: splitting that contract into
+ * parallel arguments can silently discard a newly added ownership field and
+ * turn the next process-campaign cell into a second device allocation.
  */
 
 #include "IOrchestrationRunnerFactory.h"
@@ -147,9 +150,7 @@ namespace llaminar2
             return createFromOrchestrationConfigImpl(
                 std::move(config),
                 nullptr,
-                std::nullopt,
-                nullptr,
-                {});
+                std::nullopt);
         }
 
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
@@ -166,9 +167,7 @@ namespace llaminar2
             return createFromOrchestrationConfigImpl(
                 std::move(config),
                 std::move(model_context),
-                std::nullopt,
-                nullptr,
-                {});
+                std::nullopt);
         }
 
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
@@ -182,19 +181,10 @@ namespace llaminar2
                     "non-null model authority");
                 return nullptr;
             }
-            auto model_context = std::move(reuse_contract.context);
-            auto prepared_weight_plan =
-                std::move(reuse_contract.prepared_weight_plan);
-            auto prepared_routed_weight_plan =
-                std::move(reuse_contract.prepared_routed_weight_plan);
-            auto routed_weight_authority_identity =
-                std::move(reuse_contract.routed_weight_authority_identity);
             return createFromOrchestrationConfigImpl(
                 std::move(config),
-                std::move(model_context),
-                std::move(prepared_weight_plan),
-                std::move(prepared_routed_weight_plan),
-                std::move(routed_weight_authority_identity));
+                nullptr,
+                std::move(reuse_contract));
         }
 
     private:
@@ -206,15 +196,31 @@ namespace llaminar2
          * named-domain and topology-tree runners compose multiple rank-specific
          * authorities and reject this overload until their builders accept a
          * typed context set.
+         *
+         * @param config Declarative production topology and runtime policy.
+         * @param model_context Optional metadata-only preloaded context.
+         * @param reuse_contract Optional complete prepared-model ownership
+         *        contract. It is never decomposed or reconstructed here.
+         * @return Selected runner, or null when normalization/topology rejects
+         *         the requested ownership form.
          */
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfigImpl(
             OrchestrationConfig config,
             std::shared_ptr<ModelContext> model_context,
-            std::optional<RankExecutionPlan> prepared_weight_plan,
-            std::shared_ptr<const MoERoutedExpertPlacementPlan>
-                prepared_routed_weight_plan,
-            std::string routed_weight_authority_identity)
+            std::optional<ModelContextReuseContract> reuse_contract)
         {
+            if (model_context && reuse_contract)
+            {
+                LOG_ERROR(
+                    "Runner construction cannot combine a metadata-only "
+                    "ModelContext with a prepared-model reuse contract");
+                return nullptr;
+            }
+            const bool has_model_context =
+                static_cast<bool>(model_context) ||
+                (reuse_contract &&
+                 static_cast<bool>(reuse_contract->context));
+
             auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(config);
             if (!normalize_errors.empty())
             {
@@ -226,7 +232,7 @@ namespace llaminar2
                 return nullptr;
             }
 
-            if (model_context &&
+            if (has_model_context &&
                 resolveRunnerModelAuthorityScope(config) ==
                     RunnerModelAuthorityScope::MultiRankSet)
             {
@@ -301,7 +307,7 @@ namespace llaminar2
                         "Selecting one ordinary OrchestrationRunner per MPI "
                         "rank; its RankExecutionPlan owns the cross-rank "
                         "collective edges");
-                    if (model_context)
+                    if (has_model_context)
                     {
                         LOG_DEBUG(
                             "Using the calling MPI rank's ModelContext in the "
@@ -315,20 +321,12 @@ namespace llaminar2
             // (each runner needs its own instance)
             auto runner_plan_builder = createExecutionPlanBuilder();
 
-            if (prepared_weight_plan)
+            if (reuse_contract)
             {
                 return std::make_unique<OrchestrationRunner>(
                     std::move(config),
                     std::move(runner_plan_builder),
-                    ModelContextReuseContract{
-                        .context = std::move(model_context),
-                        .prepared_weight_plan =
-                            std::move(*prepared_weight_plan),
-                        .prepared_routed_weight_plan =
-                            std::move(prepared_routed_weight_plan),
-                        .routed_weight_authority_identity =
-                            std::move(routed_weight_authority_identity),
-                    });
+                    std::move(*reuse_contract));
             }
             if (model_context)
             {

@@ -82,6 +82,22 @@ namespace llaminar2
             seen.begin(), seen.end(), [](bool value) { return value; });
     }
 
+    bool MoEOverlayReusableContextSeal::valid() const noexcept
+    {
+        if (source_epoch == 0 || local_banks.empty())
+            return false;
+        return std::all_of(
+            local_banks.begin(),
+            local_banks.end(),
+            [this](const MoEOverlayParticipantResidencyBank &bank)
+            {
+                return bank.epoch == source_epoch &&
+                       bank.participant_id >= 0 &&
+                       (bank.device.is_cpu() || bank.device.is_gpu()) &&
+                       !bank.layers.empty();
+            });
+    }
+
     std::vector<MoEOverlayLayerWeightManifest>
     buildMoEOverlayLayerWeightManifestFromGGUF(
         const GGUFModel &model,
@@ -1248,8 +1264,10 @@ namespace llaminar2
             /** Direction-specific data retained until completion or abort. */
             enum class Direction
             {
-                GpuToCpu,
-                CpuToGpu,
+                GpuToCpuRepacked,
+                CpuToGpuRepacked,
+                GpuToCpuContiguous,
+                CpuToGpuContiguous,
             };
 
             /**
@@ -1286,7 +1304,11 @@ namespace llaminar2
                   source_engine_(std::move(source_engine)),
                   destination_engine_(std::move(destination_engine))
             {
-                if (!lane_pool || !layout_.valid() || !source_engine_ ||
+                const bool repacked_direction =
+                    direction_ == Direction::GpuToCpuRepacked ||
+                    direction_ == Direction::CpuToGpuRepacked;
+                if (!lane_pool || !repacked_direction || !layout_.valid() ||
+                    !source_engine_ ||
                     !destination_engine_)
                 {
                     throw std::invalid_argument(
@@ -1297,6 +1319,63 @@ namespace llaminar2
                 {
                     throw std::runtime_error(
                         "ExpertOverlay admitted GPU/CPU wave exhausted its pre-materialized parallel lane pool");
+                }
+                owns_lane_ = true;
+            }
+
+            /**
+             * @brief Bind one raw floating matrix to an admitted GPU/CPU lane.
+             * @param lane_pool Admission-sized pool for the directed edge.
+             * @param direction Raw floating DMA direction.
+             * @param gpu_floating Exact GPU source or inactive destination.
+             * @param cpu_destination Final CPU bytes for GPU-to-CPU.
+             * @param cpu_source Final CPU bytes for CPU-to-GPU.
+             * @param source_readiness Installed old-epoch ordering proof.
+             * @param source_engine Pins the immutable source slot.
+             * @param destination_engine Pins the inactive destination slot.
+             *
+             * Floating representations are byte-identical on CPU and GPU, so
+             * this operation streams bounded chunks without a repack kernel.
+             * It still uses the same pre-materialized lane, event lifecycle,
+             * and publication rules as quantized transfers.
+             */
+            AdmittedWeightOperation(
+                std::shared_ptr<SharedWeightLanePool> lane_pool,
+                Direction direction,
+                ContiguousFloatingPointWeightDescriptor gpu_floating,
+                std::span<std::uint8_t> cpu_destination,
+                std::span<const std::uint8_t> cpu_source,
+                ExpertTierSourceReadiness source_readiness,
+                std::shared_ptr<ITensorGemm> source_engine,
+                std::shared_ptr<ITensorGemm> destination_engine)
+                : direction_(direction),
+                  cpu_destination_(cpu_destination),
+                  cpu_source_(cpu_source),
+                  gpu_floating_(gpu_floating),
+                  source_readiness_(source_readiness),
+                  source_engine_(std::move(source_engine)),
+                  destination_engine_(std::move(destination_engine))
+            {
+                const bool contiguous_direction =
+                    direction_ == Direction::GpuToCpuContiguous ||
+                    direction_ == Direction::CpuToGpuContiguous;
+                const auto cpu_bytes =
+                    direction_ == Direction::GpuToCpuContiguous
+                        ? cpu_destination_.size()
+                        : cpu_source_.size();
+                if (!lane_pool || !contiguous_direction ||
+                    !gpu_floating_.valid() ||
+                    cpu_bytes != gpu_floating_.bytes || !source_engine_ ||
+                    !destination_engine_)
+                {
+                    throw std::invalid_argument(
+                        "ExpertOverlay admitted floating GPU/CPU operation has incomplete ownership");
+                }
+                lane_ = lane_pool->tryAcquire(this);
+                if (!lane_)
+                {
+                    throw std::runtime_error(
+                        "ExpertOverlay admitted floating GPU/CPU wave exhausted its pre-materialized parallel lane pool");
                 }
                 owns_lane_ = true;
             }
@@ -1330,19 +1409,29 @@ namespace llaminar2
                 if (!started_)
                 {
                     std::string start_error;
-                    const bool started =
-                        direction_ == Direction::GpuToCpu
-                            ? lane_->lane()->startGpuToCpu(
-                                  layout_,
-                                  gpu_source_,
-                                  cpu_destination_,
-                                  source_readiness_,
-                                  &start_error)
-                            : lane_->lane()->startCpuToGpu(
-                                  layout_,
-                                  cpu_source_,
-                                  gpu_destination_,
-                                  &start_error);
+                    bool started = false;
+                    switch (direction_)
+                    {
+                    case Direction::GpuToCpuRepacked:
+                        started = lane_->lane()->startGpuToCpu(
+                            layout_, gpu_source_, cpu_destination_,
+                            source_readiness_, &start_error);
+                        break;
+                    case Direction::CpuToGpuRepacked:
+                        started = lane_->lane()->startCpuToGpu(
+                            layout_, cpu_source_, gpu_destination_,
+                            &start_error);
+                        break;
+                    case Direction::GpuToCpuContiguous:
+                        started = lane_->lane()->startGpuToCpuContiguous(
+                            gpu_floating_, cpu_destination_,
+                            source_readiness_, &start_error);
+                        break;
+                    case Direction::CpuToGpuContiguous:
+                        started = lane_->lane()->startCpuToGpuContiguous(
+                            cpu_source_, gpu_floating_, &start_error);
+                        break;
+                    }
                     if (!started)
                     {
                         failed_ = true;
@@ -1447,6 +1536,7 @@ namespace llaminar2
             std::span<std::uint8_t> cpu_destination_;
             std::span<const std::uint8_t> cpu_source_;
             ExpertTierGpuMutableProjectionView gpu_destination_;
+            ContiguousFloatingPointWeightDescriptor gpu_floating_;
             ExpertTierSourceReadiness source_readiness_;
             std::shared_ptr<ITensorGemm> source_engine_;
             std::shared_ptr<ITensorGemm> destination_engine_;
@@ -2280,6 +2370,26 @@ namespace llaminar2
             }
 
             /**
+             * @brief Test whether one resident already occupies this exact arena.
+             * @param expert_id Logical expert expected in the current bank.
+             * @return True when exactly one adopted slot owns that expert.
+             *
+             * Assignment identity is stronger than allocation shape.  A generic
+             * GPU shadow slot can expose the same payload size as a model format
+             * while still retaining unused minima arrays, so format comparison
+             * alone cannot decide whether the old shadow arena may be destroyed.
+             */
+            [[nodiscard]] bool ownsAssignment(int expert_id) const noexcept
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return std::count_if(
+                           slots_.begin(),
+                           slots_.end(),
+                           [expert_id](const Slot &slot)
+                           { return slot.expert_id == expert_id; }) == 1;
+            }
+
+            /**
              * @brief Release an initial non-lease assignment after ticket drain.
              * @param expert_id Expert that has departed this endpoint/layer.
              * @param retired_bank_epoch Globally drained bank that last exposed
@@ -2347,7 +2457,17 @@ namespace llaminar2
             /** @brief Token whose final alias returns one non-bootstrap slot. */
             struct LeaseToken
             {
-                std::weak_ptr<AdoptedInitialExpertSlotRecycler> pool;
+                /**
+                 * Keep the recycler and its loader-owned engine objects alive.
+                 *
+                 * A restored model registry may retain this alias after the
+                 * runner destroys its physical fabric. Weak ownership would
+                 * leave the alias pointing at an engine object owned only by
+                 * the recycler. The strong edge is acyclic: the recycler never
+                 * owns lease tokens, and final token destruction returns the
+                 * logical slot before releasing the recycler.
+                 */
+                std::shared_ptr<AdoptedInitialExpertSlotRecycler> pool;
                 int slot_index = -1;
                 int expert_id = -1;
                 std::uint64_t residency_epoch = 0;
@@ -2389,7 +2509,7 @@ namespace llaminar2
 
                 auto token = std::shared_ptr<LeaseToken>(
                     new LeaseToken{
-                        .pool = weak_from_this(),
+                        .pool = shared_from_this(),
                         .slot_index = selected,
                         .expert_id = expert_id,
                         .residency_epoch = residency_epoch,
@@ -2398,9 +2518,9 @@ namespace llaminar2
                     {
                         if (lease)
                         {
-                            if (auto pool = lease->pool.lock())
+                            if (lease->pool)
                             {
-                                pool->releaseLease(
+                                lease->pool->releaseLease(
                                     lease->slot_index,
                                     lease->expert_id,
                                     lease->residency_epoch);
@@ -3027,7 +3147,24 @@ namespace llaminar2
                                 allocation.has_emins)
                         {
                             throw std::runtime_error(
-                                "ExpertOverlay initial GPU expert lacks the exact reusable allocation charged by capacity admission");
+                                "ExpertOverlay initial GPU expert lacks the exact reusable allocation charged by capacity admission: device=" +
+                                device.to_string() +
+                                " expert=" + std::to_string(expert) +
+                                " projection=" + projectionName(projection) +
+                                " source_codebook=" +
+                                std::to_string(source.format.native_vnni.codebook_id) +
+                                " observed_payload_bytes_per_block=" +
+                                std::to_string(source.gpu_packed.allocation_payload_bytes_per_block) +
+                                " expected_payload_bytes_per_block=" +
+                                std::to_string(allocation.payload_bytes_per_block) +
+                                " observed_has_mins=" +
+                                std::to_string(source.gpu_packed.allocation_has_mins) +
+                                " expected_has_mins=" +
+                                std::to_string(allocation.has_mins) +
+                                " observed_has_emins=" +
+                                std::to_string(source.gpu_packed.allocation_has_emins) +
+                                " expected_has_emins=" +
+                                std::to_string(allocation.has_emins));
                         }
 
                         GpuExpertSlotPool::ProjectionSlot projection_slot;
@@ -3090,6 +3227,21 @@ namespace llaminar2
             };
         }
 
+        /** @brief Present one contiguous host matrix as a wire source. */
+        std::array<
+            std::span<const std::uint8_t>,
+            kMoEOverlayRemoteProjectionRegionCount>
+        remoteContiguousSourceRegions(
+            std::span<const std::uint8_t> source)
+        {
+            return {
+                source,
+                std::span<const std::uint8_t>{},
+                std::span<const std::uint8_t>{},
+                std::span<const std::uint8_t>{},
+            };
+        }
+
         /** @brief Present one final CPU slot allocation as a wire destination. */
         std::array<
             std::span<std::uint8_t>,
@@ -3104,11 +3256,27 @@ namespace llaminar2
             };
         }
 
+        /** @brief Present one contiguous host matrix as a wire destination. */
+        std::array<
+            std::span<std::uint8_t>,
+            kMoEOverlayRemoteProjectionRegionCount>
+        remoteContiguousDestinationRegions(
+            std::span<std::uint8_t> destination)
+        {
+            return {
+                destination,
+                std::span<std::uint8_t>{},
+                std::span<std::uint8_t>{},
+                std::span<std::uint8_t>{},
+            };
+        }
+
         /** @brief Derive one canonical cross-rank identity from the transaction. */
         MoEOverlayRemoteProjectionIdentity remoteProjectionIdentity(
             std::uint64_t expected_epoch,
             std::uint64_t candidate_epoch,
-            const MoEOverlayResidencyTransactionFingerprint &fingerprint,
+            const MoEOverlayResidencyExecutionFingerprint &
+                execution_fingerprint,
             const std::vector<MoEOverlayTierMigration> &migrations,
             std::size_t migration_index,
             ExpertTierWeightProjection projection)
@@ -3117,7 +3285,7 @@ namespace llaminar2
             return {
                 .expected_epoch = expected_epoch,
                 .candidate_epoch = candidate_epoch,
-                .transaction_fingerprint = fingerprint,
+                .execution_fingerprint = execution_fingerprint,
                 .migration_index = migration_index,
                 .layer_idx = migration.layer_idx,
                 .expert_id = migration.expert_id,
@@ -3138,6 +3306,15 @@ namespace llaminar2
     /** @brief Private materialized maps and lock-free evidence counters. */
     struct MoEOverlayPhysicalResidencyFabric::Impl
     {
+        /** Typed one-way lifecycle for terminal physical canonicalization. */
+        enum class ReusableSealState
+        {
+            Open,    ///< Ordinary migration may still use the fabric.
+            Sealing, ///< One terminal caller owns canonicalization.
+            Sealed,  ///< cached_reusable_seal is complete and immutable.
+            Failed,  ///< First terminal failure is sticky and unrecoverable.
+        };
+
         std::map<EndpointLayerKey, EndpointLayerPool> endpoint_pools;
         std::map<EdgeKey, std::shared_ptr<SharedWeightLanePool>> weight_lanes;
         std::map<EdgeKey, std::shared_ptr<SharedBlobLanePool>> blob_lanes;
@@ -3161,6 +3338,12 @@ namespace llaminar2
          */
         std::unique_ptr<MoEOverlayDevicePhysicalSlotLedger>
             device_slot_ledger;
+
+        /** Serializes the sole Open -> Sealing -> Sealed/Failed transition. */
+        std::mutex reusable_seal_mutex;
+        ReusableSealState reusable_seal_state = ReusableSealState::Open;
+        std::optional<MoEOverlayReusableContextSeal> cached_reusable_seal;
+        std::string reusable_seal_failure;
 
         std::atomic<std::uint64_t> endpoint_layer_pools{0};
         std::atomic<std::uint64_t> adopted_initial_slots{0};
@@ -3484,7 +3667,6 @@ namespace llaminar2
                             layer_idx,
                             static_cast<int>(capacity),
                             std::move(specs),
-                            config.gpu_vram_safety_margin_bytes,
                             /*transfer_capacity=*/0);
                         destination.pool = std::move(pool);
                         impl.gpu_shadow_slots.fetch_add(
@@ -3644,9 +3826,17 @@ namespace llaminar2
             }
             for (const auto &[device, slot_capacity] : progress_slot_demand)
             {
+                /* The command directory scales with directed edges,
+                 * projections, and double buffering. Physical GPU submission
+                 * concurrency instead follows the configured migration-cycle
+                 * budget. Commands beyond that bounded stream/event pool stay
+                 * queued under their permanent slot identities. */
+                const std::size_t execution_lane_capacity = std::min(
+                    slot_capacity, config.maximum_concurrent_cycles);
                 auto epoch = MappedTransferProgressEpoch::create({
                     .device = device,
                     .slot_capacity = slot_capacity,
+                    .execution_lane_capacity = execution_lane_capacity,
                     .maximum_bytes = config.staging_capacity_bytes,
                     .name = "expert_overlay_physical_relay:" +
                             device.to_string(),
@@ -3667,11 +3857,13 @@ namespace llaminar2
                     {
                         continue;
                     }
-                    if (source_device == destination_device &&
-                        source_multiplicity < 2)
-                    {
-                        continue;
-                    }
+                    /*
+                     * A same-device lane is required even for one logical
+                     * participant.  Ordinary migration never targets itself,
+                     * but terminal reusable-context sealing must compact a
+                     * returned expert from a shadow slot into a loader-era
+                     * allocation without synchronizing the device.
+                     */
                     const std::size_t lane_count = parallelLaneCount(
                         source_device == destination_device
                             ? source_multiplicity
@@ -3840,11 +4032,12 @@ namespace llaminar2
                                   destination_multiplicity] :
                      cpu_address_multiplicity)
                 {
-                    if (source_address == destination_address &&
-                        source_multiplicity < 2)
-                    {
-                        continue;
-                    }
+                    /*
+                     * Preserve one same-address worker family for terminal
+                     * context compaction.  It is setup-owned and remains idle
+                     * during inference unless two logical participants share
+                     * this address and an ordinary cycle legitimately uses it.
+                     */
                     const std::size_t lane_count = parallelLaneCount(
                         source_address == destination_address
                             ? source_multiplicity
@@ -4167,7 +4360,7 @@ namespace llaminar2
             transaction.purpose,
             transaction.expected_epoch,
             transaction.candidate->epoch,
-            fingerprintMoEOverlayResidencyTransaction(transaction),
+            fingerprintMoEOverlayResidencyExecutionPlan(transaction),
             transaction.migrations,
             transaction.migration_cycles,
             transaction.shadow_requirements,
@@ -4214,7 +4407,7 @@ namespace llaminar2
             MoEOverlayResidencyTransactionPurpose::PlacementChange,
             batch.base_epoch,
             batch.candidate_epoch,
-            batch.transaction_fingerprint,
+            batch.execution_fingerprint,
             batch.migrations,
             batch.migration_cycles,
             batch.shadow_requirements,
@@ -4238,7 +4431,7 @@ namespace llaminar2
         MoEOverlayResidencyTransactionPurpose purpose,
         std::uint64_t expected_epoch,
         std::uint64_t candidate_epoch,
-        const MoEOverlayResidencyTransactionFingerprint &fingerprint,
+        const MoEOverlayResidencyExecutionFingerprint &execution_fingerprint,
         const std::vector<MoEOverlayTierMigration> &migrations,
         const std::vector<MoEOverlayTierMigrationCycle> &migration_cycles,
         const std::vector<MoEOverlayTierShadowRequirement> &shadow_requirements,
@@ -4255,8 +4448,19 @@ namespace llaminar2
             return std::move(result);
         };
 
+        {
+            std::lock_guard<std::mutex> seal_lock(
+                impl_->reusable_seal_mutex);
+            if (impl_->reusable_seal_state !=
+                Impl::ReusableSealState::Open)
+            {
+                return fail(
+                    "ExpertOverlay physical movement is forbidden after reusable-context sealing begins");
+            }
+        }
+
         if (migrations.empty() || expected_epoch == 0u ||
-            candidate_epoch == 0u || !fingerprint.valid())
+            candidate_epoch == 0u || !execution_fingerprint.valid())
             return fail(
                 "ExpertOverlay physical fabric received incomplete physical movement identity");
 
@@ -4552,9 +4756,9 @@ namespace llaminar2
             remote_targets.reserve(remote_projection_count);
         }
 
-        const auto transaction_fingerprint = remote_transport
-            ? std::optional<MoEOverlayResidencyTransactionFingerprint>(
-                  fingerprint)
+        const auto remote_execution_fingerprint = remote_transport
+            ? std::optional<MoEOverlayResidencyExecutionFingerprint>(
+                  execution_fingerprint)
             : std::nullopt;
         const auto cpu_copy_wave_gate = local_cpu_copy_operation_count == 0
             ? std::shared_ptr<CpuCopyWaveGate>{}
@@ -4670,14 +4874,14 @@ namespace llaminar2
 
                     if (crosses_world_rank)
                     {
-                        if (!transaction_fingerprint)
+                        if (!remote_execution_fingerprint)
                             throw std::logic_error(
                                 "ExpertOverlay remote projection lost transaction fingerprint ownership");
 
                         const auto identity = remoteProjectionIdentity(
                             expected_epoch,
                             candidate_epoch,
-                            *transaction_fingerprint,
+                            *remote_execution_fingerprint,
                             migrations,
                             migration_index,
                             projection);
@@ -4709,10 +4913,34 @@ namespace llaminar2
 
                             if (migration.source.device.is_cpu())
                             {
-                                if (!source.cpu_packed)
+                                if (source.format.isFloating())
+                                {
+                                    const auto manifest =
+                                        makeMoEOverlayRemoteFloatingProjectionManifest(
+                                            identity,
+                                            source.floating,
+                                            static_cast<std::uint32_t>(
+                                                config_.staging_capacity_bytes));
+                                    binding.source = std::make_shared<
+                                        MoEOverlayHostRemoteProjectionSource>(
+                                        manifest,
+                                        remoteContiguousSourceRegions(
+                                            std::span<const std::uint8_t>(
+                                                static_cast<const std::uint8_t *>(
+                                                    source.floating.data),
+                                                source.floating.bytes)),
+                                        source_engine);
+                                    if (migration.destination.device.is_cpu())
+                                        ++local_remote_cpu_operations;
+                                    else
+                                        ++local_remote_gpu_cpu_operations;
+                                }
+                                else if (!source.cpu_packed)
+                                {
                                     throw std::runtime_error(
                                         "ExpertOverlay remote CPU source lost final NativeVNNI storage");
-                                if (migration.destination.device.is_cpu())
+                                }
+                                else if (migration.destination.device.is_cpu())
                                 {
                                     const auto manifest =
                                         makeMoEOverlayRemoteCpuProjectionManifest(
@@ -4784,13 +5012,21 @@ namespace llaminar2
                                         "ExpertOverlay remote GPU source exceeded its preflighted parallel lane pool");
 
                                 MoEOverlayRemoteProjectionManifest manifest;
-                                if (migration.destination.device.is_cpu())
+                                if (source.format.isFloating())
                                 {
-                                    if (source.format.isFloating())
-                                    {
-                                        throw std::runtime_error(
-                                            "Remote ExpertOverlay GPU-to-CPU floating protocol is not yet materialized");
-                                    }
+                                    manifest =
+                                        makeMoEOverlayRemoteFloatingProjectionManifest(
+                                            identity,
+                                            source.floating,
+                                            static_cast<std::uint32_t>(
+                                                config_.staging_capacity_bytes));
+                                    if (migration.destination.device.is_cpu())
+                                        ++local_remote_gpu_cpu_operations;
+                                    else
+                                        ++local_remote_gpu_blob_operations;
+                                }
+                                else if (migration.destination.device.is_cpu())
+                                {
                                     const auto *source_format =
                                         native_vnni_formats::forSourceIdentity(
                                             source.format.native_vnni
@@ -4829,16 +5065,6 @@ namespace llaminar2
                                             static_cast<std::uint32_t>(
                                                 config_.staging_capacity_bytes));
                                     ++local_remote_gpu_cpu_operations;
-                                }
-                                else if (source.format.isFloating())
-                                {
-                                    manifest =
-                                        makeMoEOverlayRemoteGpuFloatingProjectionManifest(
-                                            identity,
-                                            source.floating,
-                                            static_cast<std::uint32_t>(
-                                                config_.staging_capacity_bytes));
-                                    ++local_remote_gpu_blob_operations;
                                 }
                                 else
                                 {
@@ -4887,21 +5113,57 @@ namespace llaminar2
                                 const auto &destination = cpuProjection(
                                     lease, projection);
                                 auto destination_engine = destination.engine;
+                                ContiguousFloatingPointWeightDescriptor
+                                    destination_floating;
+                                const bool destination_is_floating =
+                                    destination_engine
+                                        ->exportContiguousFloatingPointWeights(
+                                            destination_floating);
                                 const auto *destination_packed =
                                     destination_engine
                                         ->exportCPUNativeVNNIPackedWeights();
-                                if (!destination_packed)
+                                if (destination_is_floating ==
+                                    (destination_packed != nullptr))
                                 {
                                     throw std::runtime_error(
-                                        "ExpertOverlay remote CPU destination cannot export final storage metadata");
+                                        "ExpertOverlay remote CPU destination must expose exactly one physical representation");
                                 }
 
                                 MoEOverlayRemoteProjectionManifest
                                     expected_manifest;
+                                std::array<
+                                    std::span<std::uint8_t>,
+                                    kMoEOverlayRemoteProjectionRegionCount>
+                                    destination_regions;
                                 auto match_policy =
                                     MoEOverlayRemoteProjectionManifestMatchPolicy::
                                         Exact;
-                                if (migration.source.device.is_cpu())
+                                if (destination_is_floating)
+                                {
+                                    if (!destination_floating.valid() ||
+                                        destination.destination_bytes.data() !=
+                                            destination_floating.data ||
+                                        destination.destination_bytes.size() !=
+                                            destination_floating.bytes)
+                                    {
+                                        throw std::runtime_error(
+                                            "ExpertOverlay remote floating CPU destination disagrees with its final slot");
+                                    }
+                                    expected_manifest =
+                                        makeMoEOverlayRemoteFloatingProjectionManifest(
+                                            identity,
+                                            destination_floating,
+                                            static_cast<std::uint32_t>(
+                                                config_.staging_capacity_bytes));
+                                    destination_regions =
+                                        remoteContiguousDestinationRegions(
+                                            destination.destination_bytes);
+                                    if (migration.source.device.is_cpu())
+                                        ++local_remote_cpu_operations;
+                                    else
+                                        ++local_remote_gpu_cpu_operations;
+                                }
+                                else if (migration.source.device.is_cpu())
                                 {
                                     expected_manifest =
                                         makeMoEOverlayRemoteCpuProjectionManifest(
@@ -4909,6 +5171,9 @@ namespace llaminar2
                                             *destination_packed,
                                             static_cast<std::uint32_t>(
                                                 config_.staging_capacity_bytes));
+                                    destination_regions =
+                                        remoteCpuDestinationRegions(
+                                            destination.destination_bytes);
                                     ++local_remote_cpu_operations;
                                 }
                                 else
@@ -4953,14 +5218,16 @@ namespace llaminar2
                                     match_policy =
                                         MoEOverlayRemoteProjectionManifestMatchPolicy::
                                             EquivalentGpuSourceForFinalCpuStorage;
+                                    destination_regions =
+                                        remoteCpuDestinationRegions(
+                                            destination.destination_bytes);
                                     ++local_remote_gpu_cpu_operations;
                                 }
 
                                 auto storage = std::make_shared<
                                     MoEOverlayHostRemoteProjectionDestination>(
                                     identity,
-                                    remoteCpuDestinationRegions(
-                                        destination.destination_bytes),
+                                    destination_regions,
                                     destination_engine,
                                     expected_manifest,
                                     match_policy);
@@ -5014,7 +5281,7 @@ namespace llaminar2
                                     {
                                         if (!output ||
                                             !manifest
-                                                 .carriesGpuFloatingBytes() ||
+                                                 .carriesFloatingBytes() ||
                                             manifest.N !=
                                                 destination_slot.spec.N ||
                                             manifest.K !=
@@ -5198,8 +5465,24 @@ namespace llaminar2
                             }
                             else
                             {
-                                throw std::runtime_error(
-                                    "ExpertOverlay GPU-to-CPU floating transfer lane is not yet materialized");
+                                const auto lane = impl_->weight_lanes.find(edge);
+                                if (lane == impl_->weight_lanes.end())
+                                    throw std::runtime_error(
+                                        "ExpertOverlay floating GPU-to-CPU edge has no persistent lane");
+                                physical_operation =
+                                    std::make_unique<AdmittedWeightOperation>(
+                                        lane->second,
+                                        AdmittedWeightOperation::Direction::
+                                            GpuToCpuContiguous,
+                                        source.floating,
+                                        destination.destination_bytes,
+                                        std::span<const std::uint8_t>{},
+                                        ExpertTierSourceReadiness::
+                                            publishedResidencyBank(
+                                                expected_epoch),
+                                        source_engine,
+                                        destination_engine);
+                                ++local_gpu_cpu_operations;
                             }
                         }
                         else
@@ -5266,7 +5549,8 @@ namespace llaminar2
                             physical_operation =
                                 std::make_unique<AdmittedWeightOperation>(
                                     lane->second,
-                                    AdmittedWeightOperation::Direction::GpuToCpu,
+                                    AdmittedWeightOperation::Direction::
+                                        GpuToCpuRepacked,
                                     manifest.deviceLayout(),
                                     gpuConstView(source.gpu_packed),
                                     destination.destination_bytes,
@@ -5300,10 +5584,31 @@ namespace llaminar2
                                     lease.lifetime);
                             if (migration.source.device.is_cpu())
                             {
-                                throw std::runtime_error(
-                                    "ExpertOverlay CPU-to-GPU floating transfer lane is not yet materialized");
+                                const auto cpu_source =
+                                    std::span<const std::uint8_t>(
+                                        static_cast<const std::uint8_t *>(
+                                            source.floating.data),
+                                        source.floating.bytes);
+                                const auto lane = impl_->weight_lanes.find(edge);
+                                if (lane == impl_->weight_lanes.end())
+                                    throw std::runtime_error(
+                                        "ExpertOverlay floating CPU-to-GPU edge has no persistent lane");
+                                physical_operation =
+                                    std::make_unique<AdmittedWeightOperation>(
+                                        lane->second,
+                                        AdmittedWeightOperation::Direction::
+                                            CpuToGpuContiguous,
+                                        destination_floating,
+                                        std::span<std::uint8_t>{},
+                                        cpu_source,
+                                        ExpertTierSourceReadiness::
+                                            publishedResidencyBank(
+                                                expected_epoch),
+                                        source_engine,
+                                        destination_engine);
+                                ++local_gpu_cpu_operations;
                             }
-                            if (const auto peer_lane =
+                            else if (const auto peer_lane =
                                     impl_->peer_lanes.find(edge);
                                 peer_lane != impl_->peer_lanes.end())
                             {
@@ -5389,7 +5694,8 @@ namespace llaminar2
                             physical_operation =
                                 std::make_unique<AdmittedWeightOperation>(
                                     lane->second,
-                                    AdmittedWeightOperation::Direction::CpuToGpu,
+                                    AdmittedWeightOperation::Direction::
+                                        CpuToGpuRepacked,
                                     layout,
                                     ExpertTierGpuConstProjectionView{},
                                     std::span<std::uint8_t>{},
@@ -5843,6 +6149,536 @@ namespace llaminar2
             }
         }
         return true;
+    }
+
+    std::optional<MoEOverlayReusableContextSeal>
+    MoEOverlayPhysicalResidencyFabric::sealReusableInitialPlacement(
+        std::uint64_t published_epoch,
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+
+        std::unique_lock<std::mutex> seal_lock(impl_->reusable_seal_mutex);
+        const auto fail = [&](std::string message)
+            -> std::optional<MoEOverlayReusableContextSeal>
+        {
+            impl_->reusable_seal_failure = std::move(message);
+            impl_->reusable_seal_state = Impl::ReusableSealState::Failed;
+            if (error)
+                *error = impl_->reusable_seal_failure;
+            return std::nullopt;
+        };
+
+        if (impl_->reusable_seal_state == Impl::ReusableSealState::Sealed)
+            return impl_->cached_reusable_seal;
+        if (impl_->reusable_seal_state == Impl::ReusableSealState::Failed)
+        {
+            if (error)
+                *error = impl_->reusable_seal_failure;
+            return std::nullopt;
+        }
+        if (impl_->reusable_seal_state != Impl::ReusableSealState::Open)
+        {
+            return fail(
+                "ExpertOverlay reusable-context seal was entered concurrently");
+        }
+        impl_->reusable_seal_state = Impl::ReusableSealState::Sealing;
+
+        try
+        {
+            if (published_epoch == 0 || !config_.registry ||
+                !config_.initial_snapshot ||
+                !config_.initial_snapshot->valid())
+            {
+                return fail(
+                    "ExpertOverlay reusable-context seal requires a positive published epoch and complete initial placement");
+            }
+
+            MoEOverlayReusableContextSeal result;
+            result.source_epoch = published_epoch;
+            const auto participant_ids =
+                config_.registry->localParticipantIds();
+            result.local_banks.reserve(participant_ids.size());
+
+            /*
+             * First take an immutable copy of every source bank and prove the
+             * complete logical placement before submitting a single byte copy.
+             * This preflight makes a partial physical seal impossible for an
+             * owner-map or adopted-capacity defect.
+             */
+            for (const int participant_id : participant_ids)
+            {
+                const auto endpoint = config_.registry->endpoint(participant_id);
+                const auto *participant =
+                    config_.initial_snapshot->owner_map.participantForId(
+                        participant_id);
+                auto bank = endpoint
+                    ? endpoint->acquire(published_epoch)
+                    : MoEOverlayParticipantBankLease{};
+                if (!endpoint || !participant || !bank ||
+                    !bank->valid(
+                        participant_id,
+                        endpoint->device(),
+                        endpoint->numLayers(),
+                        endpoint->numExperts()))
+                {
+                    return fail(
+                        "ExpertOverlay reusable-context seal cannot acquire a complete local participant bank");
+                }
+
+                MoEOverlayParticipantResidencyBank canonical = *bank;
+                for (int layer_idx = 0;
+                     layer_idx < endpoint->numLayers();
+                     ++layer_idx)
+                {
+                    auto &layer = canonical.layers.at(
+                        static_cast<std::size_t>(layer_idx));
+                    const auto expected_mask =
+                        config_.initial_snapshot->owner_map
+                            .expertMaskForParticipant(
+                                layer_idx,
+                                participant_id,
+                                endpoint->numExperts());
+                    if (layer.resident_mask != expected_mask)
+                    {
+                        return fail(
+                            "ExpertOverlay reusable-context seal was requested before the initial prepared owner map was restored");
+                    }
+
+                    auto &pool = requireEndpointPool(
+                        *impl_, participant_id, layer_idx);
+                    if (!pool.adopted_slots ||
+                        pool.adopted_slots->capacity() !=
+                            residentCount(layer))
+                    {
+                        return fail(
+                            "ExpertOverlay reusable-context seal found an adopted-slot capacity that disagrees with the prepared placement");
+                    }
+
+                    std::size_t needs_compaction = 0;
+                    for (int expert_id = 0;
+                         expert_id < endpoint->numExperts();
+                         ++expert_id)
+                    {
+                        if (!layer.resident_mask.at(
+                                static_cast<std::size_t>(expert_id)))
+                        {
+                            continue;
+                        }
+                        const auto &triplet = layer.experts.at(
+                            static_cast<std::size_t>(expert_id));
+                        if (!triplet.complete())
+                        {
+                            return fail(
+                                "ExpertOverlay reusable-context seal found an incomplete resident triplet");
+                        }
+                        if (!pool.adopted_slots->ownsAssignment(expert_id))
+                            ++needs_compaction;
+                    }
+                    if (pool.adopted_slots->availableSlots() <
+                        needs_compaction)
+                    {
+                        return fail(
+                            "ExpertOverlay reusable-context seal cannot fit every shadow resident into the prepared allocation arena");
+                    }
+                }
+                result.local_banks.push_back(std::move(canonical));
+            }
+
+            const auto completion_deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(30);
+
+            /*
+             * All operations below own setup-time lanes and persistent source/
+             * destination engines. Polling observes events or worker state only;
+             * it never synchronizes a device or an inference stream.
+             */
+            const auto complete_operations = [completion_deadline](
+                std::vector<std::unique_ptr<
+                    IMoEOverlayTierTransferOperation>> &operations,
+                std::string *operation_error) -> bool
+            {
+                std::vector<bool> ready(operations.size(), false);
+                std::size_t ready_count = 0;
+                std::string first_failure;
+                while (ready_count != operations.size())
+                {
+                    for (std::size_t index = 0;
+                         index < operations.size();
+                         ++index)
+                    {
+                        if (ready[index])
+                            continue;
+                        std::string poll_error;
+                        const auto progress =
+                            operations[index]->poll(&poll_error);
+                        if (progress ==
+                            MoEOverlayResidencyWaveProgress::Ready)
+                        {
+                            ready[index] = true;
+                            ++ready_count;
+                        }
+                        else if (progress ==
+                                 MoEOverlayResidencyWaveProgress::Failed)
+                        {
+                            first_failure = poll_error.empty()
+                                ? "ExpertOverlay reusable-context physical copy failed"
+                                : std::move(poll_error);
+                            break;
+                        }
+                    }
+                    if (!first_failure.empty() ||
+                        std::chrono::steady_clock::now() >=
+                            completion_deadline)
+                    {
+                        if (first_failure.empty())
+                        {
+                            first_failure =
+                                "ExpertOverlay reusable-context physical copy exceeded the canonical 30-second protocol deadline";
+                        }
+                        break;
+                    }
+                    if (ready_count != operations.size())
+                        std::this_thread::yield();
+                }
+                if (first_failure.empty())
+                    return true;
+
+                for (auto &operation : operations)
+                    operation->abort();
+                const auto abort_deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds(30);
+                for (;;)
+                {
+                    bool drained = true;
+                    for (auto &operation : operations)
+                    {
+                        std::string ignored;
+                        if (operation->pollAbort(&ignored) ==
+                            MoEOverlayResidencyWaveProgress::Pending)
+                        {
+                            drained = false;
+                        }
+                    }
+                    if (drained)
+                        break;
+                    if (std::chrono::steady_clock::now() >= abort_deadline)
+                    {
+                        /* Destruction with DMA or a CPU worker live is illegal. */
+                        std::terminate();
+                    }
+                    std::this_thread::yield();
+                }
+                if (operation_error)
+                    *operation_error = std::move(first_failure);
+                return false;
+            };
+
+            const auto set_projection = [](
+                MoEOverlayPreparedExpertTriplet &triplet,
+                ExpertTierWeightProjection projection,
+                std::shared_ptr<ITensorGemm> engine)
+            {
+                switch (projection)
+                {
+                case ExpertTierWeightProjection::Gate:
+                    triplet.gate = std::move(engine);
+                    return;
+                case ExpertTierWeightProjection::Up:
+                    triplet.up = std::move(engine);
+                    return;
+                case ExpertTierWeightProjection::Down:
+                    triplet.down = std::move(engine);
+                    return;
+                }
+                throw std::logic_error(
+                    "ExpertOverlay reusable-context seal received an unknown projection role");
+            };
+
+            for (auto &bank : result.local_banks)
+            {
+                const auto endpoint =
+                    config_.registry->endpoint(bank.participant_id);
+                const auto *participant =
+                    config_.initial_snapshot->owner_map.participantForId(
+                        bank.participant_id);
+                if (!endpoint || !participant)
+                {
+                    return fail(
+                        "ExpertOverlay reusable-context seal lost a preflighted participant");
+                }
+
+                for (int layer_idx = 0;
+                     layer_idx < endpoint->numLayers();
+                     ++layer_idx)
+                {
+                    auto &layer = bank.layers.at(
+                        static_cast<std::size_t>(layer_idx));
+                    auto &pool = requireEndpointPool(
+                        *impl_, bank.participant_id, layer_idx);
+                    for (int expert_id = 0;
+                         expert_id < endpoint->numExperts();
+                         ++expert_id)
+                    {
+                        if (!layer.resident_mask.at(
+                                static_cast<std::size_t>(expert_id)))
+                        {
+                            continue;
+                        }
+                        if (pool.adopted_slots->ownsAssignment(expert_id))
+                        {
+                            ++result.retained_canonical_experts;
+                            continue;
+                        }
+
+                        const auto source_triplet = layer.experts.at(
+                            static_cast<std::size_t>(expert_id));
+                        MoEOverlayPreparedExpertTriplet destination_triplet;
+                        std::vector<std::unique_ptr<
+                            IMoEOverlayTierTransferOperation>> operations;
+                        operations.reserve(kProjections.size());
+
+                        if (bank.device.is_cpu())
+                        {
+                            auto destination =
+                                pool.adopted_slots->acquireCpu(
+                                    expert_id, published_epoch);
+                            if (!destination)
+                            {
+                                return fail(
+                                    "ExpertOverlay reusable-context seal lost a preflighted CPU adopted slot");
+                            }
+                            auto gate = std::make_shared<CpuCopyWaveGate>(
+                                kProjections.size());
+                            for (const auto projection : kProjections)
+                            {
+                                auto source_engine = projectionEngine(
+                                    source_triplet, projection);
+                                MoEOverlayPreparedWeightSource source;
+                                std::string source_error;
+                                if (!resolveMoEOverlayPreparedWeightSource(
+                                        source_engine,
+                                        bank.device,
+                                        source,
+                                        &source_error))
+                                {
+                                    return fail(std::move(source_error));
+                                }
+                                const auto &target = cpuProjection(
+                                    *destination, projection);
+                                std::span<const std::uint8_t> source_bytes;
+                                if (source.format.isFloating())
+                                {
+                                    source_bytes = {
+                                        static_cast<const std::uint8_t *>(
+                                            source.floating.data),
+                                        source.floating.bytes,
+                                    };
+                                }
+                                else if (source.cpu_packed)
+                                {
+                                    source_bytes = {
+                                        source.cpu_packed
+                                            ->native_interleaved.data(),
+                                        source.cpu_packed
+                                            ->native_interleaved.size(),
+                                    };
+                                }
+                                if (source_bytes.empty() ||
+                                    source_bytes.size() !=
+                                        target.destination_bytes.size())
+                                {
+                                    return fail(
+                                        "ExpertOverlay reusable-context CPU source and prepared allocation disagree on byte size");
+                                }
+                                const CpuAddressEdgeKey edge{
+                                    .source = participant->address,
+                                    .destination = participant->address,
+                                    .projection = projection,
+                                };
+                                const auto lane =
+                                    impl_->cpu_copy_lanes.find(edge);
+                                if (lane == impl_->cpu_copy_lanes.end())
+                                {
+                                    return fail(
+                                        "ExpertOverlay reusable-context CPU compaction lane was not materialized at setup");
+                                }
+                                operations.push_back(
+                                    std::make_unique<
+                                        AdmittedCpuCopyOperation>(
+                                        lane->second,
+                                        source_bytes,
+                                        target.destination_bytes,
+                                        gate,
+                                        source_engine,
+                                        target.engine));
+                                set_projection(
+                                    destination_triplet,
+                                    projection,
+                                    target.engine);
+                            }
+                        }
+                        else
+                        {
+                            auto destination =
+                                pool.adopted_slots->acquireGpu(
+                                    expert_id, published_epoch);
+                            if (!destination)
+                            {
+                                return fail(
+                                    "ExpertOverlay reusable-context seal lost a preflighted GPU adopted slot");
+                            }
+                            for (const auto projection : kProjections)
+                            {
+                                auto source_engine = projectionEngine(
+                                    source_triplet, projection);
+                                MoEOverlayPreparedWeightSource source;
+                                std::string source_error;
+                                if (!resolveMoEOverlayPreparedWeightSource(
+                                        source_engine,
+                                        bank.device,
+                                        source,
+                                        &source_error))
+                                {
+                                    return fail(std::move(source_error));
+                                }
+                                const auto &target = gpuProjection(
+                                    *destination, projection);
+                                const EdgeKey edge{
+                                    .source = bank.device,
+                                    .destination = bank.device,
+                                    .projection = projection,
+                                };
+                                const auto lane = impl_->peer_lanes.find(edge);
+                                if (lane == impl_->peer_lanes.end())
+                                {
+                                    return fail(
+                                        "ExpertOverlay reusable-context GPU compaction lane was not materialized at setup");
+                                }
+
+                                std::shared_ptr<ITensorGemm> target_engine;
+                                if (source.format.isFloating())
+                                {
+                                    const auto descriptor =
+                                        makeGpuFloatingDestinationDescriptor(
+                                            target, source.format);
+                                    target_engine =
+                                        makeGpuFloatingDestinationEngine(
+                                            bank.device,
+                                            descriptor,
+                                            destination->lifetime);
+                                    operations.push_back(
+                                        std::make_unique<
+                                            AdmittedPeerOperation>(
+                                            lane->second,
+                                            source.floating,
+                                            descriptor,
+                                            ExpertTierSourceReadiness::
+                                                publishedResidencyBank(
+                                                    published_epoch),
+                                            source_engine,
+                                            target_engine));
+                                }
+                                else
+                                {
+                                    const auto descriptor =
+                                        makeGpuDestinationDescriptor(
+                                            target,
+                                            source.gpu_packed.n,
+                                            source.gpu_packed.k,
+                                            source.gpu_packed.codebook_id,
+                                            source.gpu_packed
+                                                .payload_bytes_per_block,
+                                            source.gpu_packed.is_asymmetric,
+                                            source.gpu_packed.has_emins,
+                                            source.format.native_vnni);
+                                    target_engine = makeGpuDestinationEngine(
+                                        bank.device,
+                                        descriptor,
+                                        destination->lifetime,
+                                        source.format.native_vnni);
+                                    operations.push_back(
+                                        std::make_unique<
+                                            AdmittedPeerOperation>(
+                                            lane->second,
+                                            source.gpu_packed,
+                                            descriptor,
+                                            ExpertTierSourceReadiness::
+                                                publishedResidencyBank(
+                                                    published_epoch),
+                                            source_engine,
+                                            target_engine));
+                                }
+                                set_projection(
+                                    destination_triplet,
+                                    projection,
+                                    std::move(target_engine));
+                            }
+                        }
+
+                        std::string operation_error;
+                        if (!destination_triplet.complete() ||
+                            !complete_operations(
+                                operations, &operation_error))
+                        {
+                            return fail(
+                                operation_error.empty()
+                                    ? "ExpertOverlay reusable-context compaction produced an incomplete destination triplet"
+                                    : std::move(operation_error));
+                        }
+                        layer.experts.at(
+                            static_cast<std::size_t>(expert_id)) =
+                            std::move(destination_triplet);
+                        ++result.compacted_shadow_experts;
+                    }
+                }
+                if (!bank.valid(
+                        bank.participant_id,
+                        bank.device,
+                        endpoint->numLayers(),
+                        endpoint->numExperts()))
+                {
+                    return fail(
+                        "ExpertOverlay reusable-context seal produced an invalid canonical bank");
+                }
+            }
+
+            if (!result.valid())
+            {
+                return fail(
+                    "ExpertOverlay reusable-context seal produced an incomplete terminal value");
+            }
+            impl_->cached_reusable_seal = std::move(result);
+            impl_->reusable_seal_state = Impl::ReusableSealState::Sealed;
+            PerfStatsCollector::addCounter(
+                "moe_overlay_residency",
+                "reusable_context_physical_seals",
+                1.0,
+                "model_teardown",
+                config_.perf_device,
+                {{"epoch", std::to_string(published_epoch)},
+                 {"canonical_experts",
+                  std::to_string(
+                      impl_->cached_reusable_seal
+                          ->retained_canonical_experts)},
+                 {"compacted_shadow_experts",
+                  std::to_string(
+                      impl_->cached_reusable_seal
+                          ->compacted_shadow_experts)}});
+            return impl_->cached_reusable_seal;
+        }
+        catch (const std::exception &exception)
+        {
+            return fail(exception.what());
+        }
+        catch (...)
+        {
+            return fail(
+                "ExpertOverlay reusable-context seal raised a non-standard exception");
+        }
     }
 
     MoEOverlayPhysicalResidencyFabricStats

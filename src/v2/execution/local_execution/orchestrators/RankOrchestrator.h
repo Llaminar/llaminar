@@ -70,6 +70,7 @@
 // Forward declaration for fromPlan() factory method
 namespace llaminar2
 {
+    class ReusableExecutionWorkspaceRegistry;
     class MoEOverlayNodeLocalRouteExchange;
     struct RankExecutionPlan;
 }
@@ -97,6 +98,7 @@ namespace llaminar2
     struct MoERoutedExpertPlacementPlan;
     struct PlacementPlan;
     struct PPActivationContract;
+    class PipelineGraphExecutionPlan;
 
     namespace rank_orchestrator_detail
     {
@@ -309,6 +311,10 @@ namespace llaminar2
              */
             PreparedWeightAdmission prepared_weight_admission =
                 PreparedWeightAdmission::AllocateCompleteSet;
+
+            /** Model-context-owned backing leases propagated to child graphs. */
+            std::shared_ptr<ReusableExecutionWorkspaceRegistry>
+                reusable_execution_workspaces;
 
             /// Optional same-layer MoE expert overlay plan propagated to child graph runners.
             std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;
@@ -1223,6 +1229,8 @@ namespace llaminar2
          */
         void resetInferenceState(const InferenceStateResetRequest &request) override;
         void clear_cache() override;
+        /** @copydoc IInferenceRunner::purgePrefixCache */
+        bool purgePrefixCache() override;
         bool maybeApplyDecodeBoundaryMaintenance(
             uint64_t committed_tokens) override;
 
@@ -1299,7 +1307,11 @@ namespace llaminar2
 
         PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
         bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
-        bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
+        /** @copydoc IInferenceRunner::harvestPrefix */
+        bool harvestPrefix(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            int prompt_token_count) override;
         bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
         PrefixStateSnapshot captureLivePrefixCheckpoint(
@@ -1621,6 +1633,43 @@ namespace llaminar2
         void initializePPDeviceRunners();
 
         /**
+         * @brief Freeze the participant-local graph order for LocalPP.
+         *
+         * Every stage declares either a host-owned graph or a retained native
+         * executable family. The resulting immutable plan becomes the sole
+         * authority for setup cardinality, legal heterogeneous segmentation,
+         * and complete transaction traversal.
+         *
+         * @throws std::runtime_error when a stage has no concrete graph owner.
+         */
+        void initializePPGraphExecutionPlan();
+
+        /**
+         * @brief Validate the frozen graph owners before a pipeline transaction.
+         * @param operation Stable operation name for precise diagnostics.
+         * @return True when identities remain unchanged and every required
+         *         native executable family has been materialized.
+         */
+        [[nodiscard]] bool validatePPGraphTransactionReady(
+            const char *operation) const noexcept;
+
+        /**
+         * @brief Publish evidence after an exact complete pipeline traversal.
+         *
+         * The typed execution plan validates completion first. PerfStats is
+         * emitted only after that authority accepts the transition and is
+         * therefore observation rather than runtime control state.
+         *
+         * @param phase Stable inference phase (`prefill` or `decode`).
+         * @param completed_segments Segments completed by each transaction.
+         * @param transaction_count Identical complete transactions represented.
+         */
+        void recordCompletedPPGraphTransactions(
+            const char *phase,
+            std::size_t completed_segments,
+            std::size_t transaction_count = 1u) const;
+
+        /**
          * @brief Initialize PP context for inter-stage transfers
          *
          * Creates HierarchicalPPContext with appropriate stage types
@@ -1828,6 +1877,16 @@ namespace llaminar2
         std::unique_ptr<PPActivationContract> pp_activation_contract_;
 
         /**
+         * @brief Immutable LocalPP graph and transfer-boundary lifecycle.
+         *
+         * Child runners retain their participant-local graph executables. This
+         * rank-owned plan joins those owners into one ordered transaction
+         * without creating a nested multi-device graph.
+         */
+        std::unique_ptr<PipelineGraphExecutionPlan>
+            pp_graph_execution_plan_;
+
+        /**
          * @brief LOCAL TP context for collective operations (TP mode).
          *
          * This member must remain declared before `device_runners_` and
@@ -1946,8 +2005,7 @@ namespace llaminar2
 
         /// Flag indicating if stats need re-aggregation
         mutable bool stats_dirty_ = true;
-        bool host_resident_released_ = false; ///< Whether host-resident weight data has been released after first prefill
-        bool mmap_dontneed_advised_ = false;  ///< Whether mmap pages were advised away after first prefill
+        bool host_resident_released_ = false; ///< Whether the first-prefill host-release boundary was published
 
         /// Stage type → sharding mode map from the model's schema factory.
         /// Initialized at construction from SchemaFactoryRegistry::getStageShardingConfig().

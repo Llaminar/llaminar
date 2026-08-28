@@ -141,13 +141,28 @@ namespace llaminar2
         TransientAssignment = 3u,
     };
 
+    /**
+     * @brief Policy objective carried by one immutable device command.
+     *
+     * This is a wire-level spelling of the authority-owned movement axis. It
+     * occupies the command's `flags` word so adding the semantic identity does
+     * not change fixed arena geometry. The host follower authenticates and
+     * translates it but never reconstructs it from endpoint priorities.
+     */
+    enum class MoEOverlayDeviceMovementAxis : std::uint32_t
+    {
+        TierResidency = 1u,
+        ParticipantPlacement = 2u,
+        Combined = 3u,
+    };
+
     /** Per-entry binary identity (`MOEM`). */
     inline constexpr std::uint32_t kMoEOverlayDeviceMovementCommandMagic =
         0x4d454f4du;
 
     /** Version of @ref MoEOverlayDeviceMovementCommand. */
     inline constexpr std::uint32_t kMoEOverlayDeviceMovementCommandVersion =
-        2u;
+        3u;
 
     /** Sentinel used when an action has no physical source or destination slot. */
     inline constexpr std::uint32_t kMoEOverlayDeviceInvalidSlot =
@@ -179,6 +194,7 @@ namespace llaminar2
         std::uint32_t source_participant = 0u;
         std::uint32_t destination_participant = 0u;
         std::uint32_t payload_slot = kMoEOverlayDeviceInvalidSlot;
+        /** Encoded @ref MoEOverlayDeviceMovementAxis authored by policy. */
         std::uint32_t flags = 0u;
         std::uint64_t payload_bytes = 0u;
         /** Durable source epoch, or pinned durable epoch for transient LLEP. */

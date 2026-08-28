@@ -14,6 +14,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <thread>
+
 #include "mocks/MockWeightManager.h"
 #include "tensors/Tensors.h"
 
@@ -470,10 +472,59 @@ TEST(Test__MockWeightManager, TrackMissingRequests)
     mock->getWeightForDevice("does_not_exist");
     mock->getWeightForDevice("also_missing");
 
-    auto &missing = mock->missingWeightRequests();
+    const auto missing = mock->missingWeightRequests();
     EXPECT_EQ(missing.size(), 2);
     EXPECT_EQ(missing[0], "does_not_exist");
     EXPECT_EQ(missing[1], "also_missing");
+}
+
+/**
+ * @brief Prove local-TP-style concurrent readers cannot corrupt observations.
+ *
+ * Production rank construction deliberately materializes participant graphs
+ * in parallel while they share one immutable model context. This regression
+ * exercises both the present and missing lookup lanes because the latter used
+ * to append concurrently to an unguarded vector and corrupt the heap.
+ */
+TEST(Test__MockWeightManager, ConcurrentParticipantReadsKeepObservationsCoherent)
+{
+    constexpr size_t kParticipantCount = 8;
+    constexpr size_t kReadsPerParticipant = 1000;
+    auto mock = MockWeightManagerBuilder()
+                    .addFP32RandomWeight("present", {8, 8})
+                    .build();
+
+    std::vector<std::thread> participants;
+    participants.reserve(kParticipantCount);
+    for (size_t participant = 0; participant < kParticipantCount; ++participant)
+    {
+        participants.emplace_back([mock, participant]()
+        {
+            const std::string missing_name = "missing_" + std::to_string(participant);
+            for (size_t read = 0; read < kReadsPerParticipant; ++read)
+            {
+                EXPECT_NE(mock->getWeightForDevice("present"), nullptr);
+                EXPECT_EQ(mock->getWeightForDevice(missing_name), nullptr);
+            }
+        });
+    }
+    for (auto &participant : participants)
+        participant.join();
+
+    EXPECT_EQ(
+        mock->getWeightCallCount(),
+        2 * kParticipantCount * kReadsPerParticipant);
+    const auto missing = mock->missingWeightRequests();
+    EXPECT_EQ(missing.size(), kParticipantCount * kReadsPerParticipant);
+    for (size_t participant = 0; participant < kParticipantCount; ++participant)
+    {
+        EXPECT_EQ(
+            std::count(
+                missing.begin(),
+                missing.end(),
+                "missing_" + std::to_string(participant)),
+            kReadsPerParticipant);
+    }
 }
 
 TEST(Test__MockWeightManager, ResetCounters)

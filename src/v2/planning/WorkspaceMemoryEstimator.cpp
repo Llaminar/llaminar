@@ -10,6 +10,8 @@
 
 #include "planning/WorkspaceMemoryEstimator.h"
 
+#include "config/GDNHeadAssignment.h"
+#include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
@@ -19,6 +21,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <set>
 #include <string>
 #include <stdexcept>
 #include <string_view>
@@ -82,6 +85,31 @@ bool hasHybridRecurrentLayer(
                    tensor.layer_index <= last_layer &&
                    tensor.name.find(".ssm_out.weight") != std::string::npos;
         });
+}
+
+/**
+ * @brief Count logical GDN layers whose rollback slots coexist in one verifier.
+ *
+ * One `.ssm_out.weight` marker is sufficient to identify a GDN layer and is
+ * already part of the metadata-only tensor inventory.  A set protects the
+ * admission result from aliases or additional prepared views of that tensor.
+ */
+std::size_t hybridRecurrentLayerCount(
+    const ModelMemoryProfile& profile,
+    int first_layer,
+    int last_layer)
+{
+    std::set<int> layers;
+    for (const auto& tensor : profile.tensors)
+    {
+        if (tensor.layer_index >= first_layer &&
+            tensor.layer_index <= last_layer &&
+            tensor.name.ends_with(".ssm_out.weight"))
+        {
+            layers.insert(tensor.layer_index);
+        }
+    }
+    return layers.size();
 }
 
 /**
@@ -181,6 +209,102 @@ size_t alignedWorkspaceBytes(size_t bytes)
             "Workspace byte overflow while applying buffer alignment");
     }
     return (bytes + alignment - 1) & ~(alignment - 1);
+}
+
+/**
+ * @brief Price every persistent GDN rollback buffer in a grouped verifier.
+ *
+ * Transient main/verifier workspaces are event-ordered and can share the
+ * serial-family allocation.  State snapshots cannot: each logical GDN layer
+ * retains one independently addressable row bank until verification commits.
+ * The stage-level byte arithmetic comes from GDNSpeculativeWorkspaceContract;
+ * this function only applies TP geometry, layer multiplicity, and per-buffer
+ * alignment.
+ */
+size_t exactHybridVerifierStateWorkspaceBytes(
+    const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry)
+{
+    if (geometry.mtp_target_query_rows <= 0)
+        return 0;
+
+    const std::size_t layer_count = hybridRecurrentLayerCount(
+        profile, geometry.first_layer, geometry.last_layer);
+    if (layer_count == 0u)
+        return 0;
+    if (profile.gdn_state_size <= 0 ||
+        profile.gdn_group_count <= 0 ||
+        profile.gdn_time_step_rank <= 0 ||
+        profile.gdn_conv_kernel_size <= 1 ||
+        profile.n_heads <= 0 || geometry.total_shards <= 0)
+    {
+        throw std::runtime_error(
+            "Hybrid MTP workspace admission requires complete GDN metadata");
+    }
+
+    const int local_query_heads =
+        geometry.local_query_heads > 0
+            ? geometry.local_query_heads
+            : profile.n_heads / geometry.total_shards;
+    const int local_query_head_start =
+        geometry.total_shards > 1
+            ? geometry.local_query_head_start
+            : 0;
+    const auto assignment = GDNHeadAssignment::fromPartition(
+        profile.gdn_group_count,
+        profile.gdn_time_step_rank,
+        local_query_head_start,
+        local_query_heads,
+        profile.n_heads);
+
+    const std::size_t expected_inner = checkedMultiply(
+        static_cast<std::size_t>(profile.gdn_time_step_rank),
+        static_cast<std::size_t>(profile.gdn_state_size),
+        "global GDN value geometry");
+    if (profile.gdn_inner_size > 0 &&
+        static_cast<std::size_t>(profile.gdn_inner_size) != expected_inner)
+    {
+        throw std::runtime_error(
+            "Hybrid MTP workspace cannot represent GDN inner_size as value heads times state_size");
+    }
+
+    const std::size_t local_channels = assignment.localFusedRows(
+        profile.gdn_state_size);
+    if (local_channels >
+        static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    {
+        throw std::runtime_error(
+            "Participant-local GDN fused width exceeds int");
+    }
+    const auto recurrence = gdn_workspace::recurrenceStateFootprint(
+        geometry.mtp_target_query_rows,
+        std::max(1, geometry.batch_size),
+        assignment.localValueHeads(),
+        profile.gdn_state_size,
+        profile.gdn_state_size);
+    const auto short_conv = gdn_workspace::shortConvStateFootprint(
+        geometry.mtp_target_query_rows,
+        std::max(1, geometry.batch_size),
+        static_cast<int>(local_channels),
+        profile.gdn_conv_kernel_size);
+
+    const std::size_t per_layer_slots = checkedAdd(
+        alignedWorkspaceBytes(recurrence.slot_bytes),
+        alignedWorkspaceBytes(short_conv.slot_bytes),
+        "per-layer GDN verifier slots");
+    size_t bytes = checkedMultiply(
+        layer_count,
+        per_layer_slots,
+        "GDN layer count and verifier slots");
+    bytes = checkedAdd(
+        bytes,
+        alignedWorkspaceBytes(recurrence.work_bytes),
+        "shared GDN recurrence verifier work");
+    bytes = checkedAdd(
+        bytes,
+        alignedWorkspaceBytes(short_conv.work_bytes),
+        "shared GDN short-convolution verifier work");
+    return bytes;
 }
 
 /** @brief Whether a source tensor selects the floating GEMM implementation. */
@@ -594,10 +718,34 @@ size_t WorkspaceMemoryEstimator::estimate(
         mtp_geometry.resident_graph_rows =
             std::max(1, geometry.mtp_target_query_rows);
         mtp_geometry.mtp_target_query_rows = 0;
-        bytes = checkedAdd(
-            bytes,
-            estimate(profile, mtp_geometry),
-            "retained compact MTP graph family");
+        const size_t compact_family_bytes = estimate(profile, mtp_geometry);
+        const size_t persistent_hybrid_snapshot_bytes =
+            exactHybridVerifierStateWorkspaceBytes(profile, geometry);
+        if (persistent_hybrid_snapshot_bytes > 0)
+        {
+            /*
+             * Main and compact graph participants are serial and therefore
+             * share the larger transient envelope. Per-layer rollback slots
+             * remain live across that participant and are added exactly once.
+             */
+            bytes = std::max(bytes, compact_family_bytes);
+            bytes = checkedAdd(
+                bytes,
+                persistent_hybrid_snapshot_bytes,
+                "retained hybrid MTP rollback state");
+        }
+        else
+        {
+            /*
+             * Non-hybrid families retain the historical conservative sum;
+             * they have no typed per-layer state contract that proves a more
+             * aggressive alias relationship.
+             */
+            bytes = checkedAdd(
+                bytes,
+                compact_family_bytes,
+                "retained compact MTP graph family");
+        }
     }
 
     return bytes;

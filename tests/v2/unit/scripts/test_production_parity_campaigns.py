@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -16,6 +17,9 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = REPO_ROOT / "scripts" / "ci" / "run_production_parity_campaigns.py"
+TMPFS_SETUP_SCRIPT = (
+    REPO_ROOT / "scripts" / "ci" / "setup_production_parity_tmpfs.sh"
+)
 SPEC = importlib.util.spec_from_file_location("production_parity_campaigns", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 campaigns = importlib.util.module_from_spec(SPEC)
@@ -40,7 +44,7 @@ def ctest_document(*names: str) -> str:
                                 "Campaign",
                                 "ProductionPath",
                                 "AllPrecisions",
-                                "WholeMatrixOneHourTarget",
+                                "WholeMatrix75MinuteTarget",
                             ],
                         },
                         {
@@ -68,6 +72,33 @@ def ctest_document(*names: str) -> str:
     )
 
 
+def preflight_ctest_document(*names: str) -> str:
+    """Build a model-free Integration registration for preflight discovery."""
+
+    return json.dumps(
+        {
+            "tests": [
+                {
+                    "name": name,
+                    "properties": [
+                        {
+                            "name": "LABELS",
+                            "value": [
+                                "V2",
+                                "Integration",
+                                campaigns.PRODUCTION_PARITY_PREFLIGHT_LABEL,
+                            ],
+                        },
+                        {"name": "TIMEOUT", "value": 30.0},
+                    ],
+                    "command": ["fake_integration_test"],
+                }
+                for name in names
+            ]
+        }
+    )
+
+
 class ProductionParityCampaignTest(unittest.TestCase):
     @staticmethod
     def write_canonical_artifacts(directory: Path) -> None:
@@ -81,6 +112,158 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     "value" for _ in next(campaigns.csv.reader([header]))
                 ) + "\n"
             (directory / filename).write_text(payload, encoding="utf-8")
+
+    @mock.patch.object(campaigns.subprocess, "run")
+    def test_preflight_inventory_is_discovered_from_model_free_integration_label(
+        self,
+        run: mock.Mock,
+    ) -> None:
+        run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=preflight_ctest_document(
+                "V2_Integration_ParityCellLifecycle_MPI2",
+                "V2_Integration_ParityCellLifecycle_MPI1",
+            ),
+            stderr="",
+        )
+
+        discovered = campaigns.discover_production_parity_preflight_tests(
+            Path("build")
+        )
+
+        self.assertEqual(
+            discovered,
+            (
+                "V2_Integration_ParityCellLifecycle_MPI1",
+                "V2_Integration_ParityCellLifecycle_MPI2",
+            ),
+        )
+        command = run.call_args.args[0]
+        self.assertIn("--show-only=json-v1", command)
+        self.assertIn(
+            f"^{campaigns.PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
+            command,
+        )
+
+    @mock.patch.object(campaigns.subprocess, "run")
+    def test_preflight_inventory_rejects_model_fixture_dependency(
+        self,
+        run: mock.Mock,
+    ) -> None:
+        document = json.loads(
+            preflight_ctest_document("V2_Integration_InvalidPreflight")
+        )
+        document["tests"][0]["properties"].append(
+            {"name": "FIXTURES_REQUIRED", "value": ["V2_Models"]}
+        )
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(document), stderr=""
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires a fixture"):
+            campaigns.discover_production_parity_preflight_tests(Path("build"))
+
+    @mock.patch.object(campaigns, "_run_process", return_value=0)
+    @mock.patch.object(
+        campaigns,
+        "discover_production_parity_preflight_tests",
+        return_value=("V2_Integration_ParityCellLifecycle_MPI1",),
+    )
+    def test_preflight_executes_the_ctest_label_before_campaign_admission(
+        self,
+        discover: mock.Mock,
+        run_process: mock.Mock,
+    ) -> None:
+        return_code, _, tests = campaigns.run_production_parity_preflight(
+            Path("build"), 60.0
+        )
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(
+            tests,
+            ("V2_Integration_ParityCellLifecycle_MPI1",),
+        )
+        discover.assert_called_once_with(Path("build"))
+        command = run_process.call_args.args[0]
+        self.assertIn("--parallel", command)
+        self.assertIn("--no-tests=error", command)
+        self.assertIn(
+            f"^{campaigns.PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
+            command,
+        )
+
+    def test_main_orders_preflight_before_model_fixture_and_staging(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        main = source[source.index("def main(") :]
+        preflight = main.index("run_production_parity_preflight(")
+        fixture = main.index("prepare_model_fixture(")
+        staging = main.index("stage_models_in_ramdisk(")
+        self.assertLess(preflight, fixture)
+        self.assertLess(fixture, staging)
+
+    def test_every_production_parity_source_uses_the_typed_definition_expander(
+        self,
+    ) -> None:
+        """Prevent model fixtures from rebuilding a private stringly matrix."""
+
+        parity_root = REPO_ROOT / "tests" / "v2" / "integration" / "parity"
+        offenders: list[str] = []
+        for source in sorted(parity_root.rglob("*.cpp")):
+            contents = source.read_text(encoding="utf-8")
+            if "ProductionParity" not in contents:
+                continue
+            if (
+                "ModelParityDefinition" not in contents
+                or "expandModelParityDefinition" not in contents
+            ):
+                offenders.append(str(source.relative_to(REPO_ROOT)))
+
+        self.assertEqual(
+            offenders,
+            [],
+            "ProductionParity sources must declare and expand the canonical "
+            "typed model/topology matrix: " + ", ".join(offenders),
+        )
+
+    def test_every_production_parity_body_is_parameterized(self) -> None:
+        """Forbid fixed TEST/TEST_F cells beside the typed case expander."""
+
+        parity_root = REPO_ROOT / "tests" / "v2" / "integration" / "parity"
+        offenders: list[str] = []
+        fixed_test = re.compile(r"\bTEST(?:_F)?\s*\(")
+        for source in sorted(parity_root.rglob("*.cpp")):
+            contents = source.read_text(encoding="utf-8")
+            for match in fixed_test.finditer(contents):
+                declaration = contents[match.start() : match.start() + 512]
+                declaration = declaration.split("{", maxsplit=1)[0]
+                if "ProductionParity" in declaration:
+                    line = contents.count("\n", 0, match.start()) + 1
+                    offenders.append(
+                        f"{source.relative_to(REPO_ROOT)}:{line}"
+                    )
+
+        self.assertEqual(
+            offenders,
+            [],
+            "ProductionParity bodies must be TEST_P cases generated from "
+            "ModelParityCase: " + ", ".join(offenders),
+        )
+
+    def test_persistent_tmpfs_setup_has_a_device_free_help_path(self) -> None:
+        """Keep the privileged mount boundary explicit and inspectable."""
+
+        result = subprocess.run(
+            ["bash", str(TMPFS_SETUP_SCRIPT), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--status", result.stdout)
+        self.assertIn("--unmount", result.stdout)
+        self.assertIn("/mnt/llaminar-production-parity", result.stdout)
 
     def test_classifies_single_backend_and_kv_precision(self) -> None:
         group = campaigns.classify_campaign(
@@ -241,6 +424,74 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertNotRegex("x" + cell.name, regex)
         self.assertNotIn("?:", regex)
 
+    def test_exact_cell_watch_kills_stuck_process_group_and_names_cell(self) -> None:
+        """A silent generated cell must fail in its own bounded lifetime."""
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            progress = Path(raw_directory) / "cell" / "test_log.txt"
+            case = "MatrixSuite.ProductionParity/StuckCell"
+            script = (
+                "from pathlib import Path; import time; "
+                f"p=Path({str(progress)!r}); p.parent.mkdir(parents=True); "
+                "p.write_text('started'); time.sleep(30)"
+            )
+            evidence = campaigns.ProcessTimeoutEvidence()
+            started = campaigns.time.monotonic()
+
+            return_code = campaigns._run_process(
+                [sys.executable, "-c", script],
+                5.0,
+                exact_cell_watch=campaigns.ExactCellTimeoutWatch(
+                    timeout_seconds=0.2,
+                    progress_files=((case, progress),),
+                    not_before_wall_time_ns=campaigns.time.time_ns(),
+                ),
+                timeout_evidence=evidence,
+            )
+
+        self.assertEqual(return_code, 124)
+        self.assertLess(campaigns.time.monotonic() - started, 2.0)
+        self.assertEqual(
+            evidence.kind,
+            campaigns.ProcessTimeoutKind.EXACT_CELL,
+        )
+        self.assertEqual(evidence.exact_gtest_case, case)
+
+    def test_exact_cell_watch_renews_deadline_only_on_next_cell(self) -> None:
+        """Sequential cells may exceed one cell budget in aggregate."""
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            first = Path(raw_directory) / "first" / "test_log.txt"
+            second = Path(raw_directory) / "second" / "test_log.txt"
+            script = (
+                "from pathlib import Path; import time; "
+                f"a=Path({str(first)!r}); b=Path({str(second)!r}); "
+                "a.parent.mkdir(parents=True); a.write_text('started'); "
+                "time.sleep(0.3); "
+                "b.parent.mkdir(parents=True); b.write_text('started'); "
+                "time.sleep(0.3)"
+            )
+            evidence = campaigns.ProcessTimeoutEvidence()
+            started = campaigns.time.monotonic()
+
+            return_code = campaigns._run_process(
+                [sys.executable, "-c", script],
+                5.0,
+                exact_cell_watch=campaigns.ExactCellTimeoutWatch(
+                    timeout_seconds=0.5,
+                    progress_files=(
+                        ("MatrixSuite.ProductionParity/First", first),
+                        ("MatrixSuite.ProductionParity/Second", second),
+                    ),
+                    not_before_wall_time_ns=campaigns.time.time_ns(),
+                ),
+                timeout_evidence=evidence,
+            )
+
+        self.assertEqual(return_code, 0)
+        self.assertGreater(campaigns.time.monotonic() - started, 0.5)
+        self.assertEqual(evidence.kind, campaigns.ProcessTimeoutKind.NONE)
+
     @mock.patch.object(campaigns, "_run_process")
     def test_campaign_receives_only_the_completion_timeout_remaining(
         self, run_process: mock.Mock
@@ -286,6 +537,15 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertEqual(
             run_process.call_args.kwargs["environment_overrides"],
             environment,
+        )
+        self.assertIsNone(run_process.call_args.kwargs["exact_cell_watch"])
+        self.assertIsInstance(
+            run_process.call_args.kwargs["timeout_evidence"],
+            campaigns.ProcessTimeoutEvidence,
+        )
+        self.assertEqual(
+            result.exact_cell_timeout_seconds,
+            campaigns.EXACT_CELL_TIMEOUT_SECONDS,
         )
 
     def test_campaign_artifacts_must_be_fresh_complete_and_schema_exact(self) -> None:
@@ -354,6 +614,10 @@ class ProductionParityCampaignTest(unittest.TestCase):
             columns = next(
                 campaigns.csv.reader([campaigns.MTP_TRANSACTIONS_HEADER])
             )
+            self.assertIn("dynamic_policy_witness_executed", columns)
+            self.assertIn(
+                "dynamic_policy_witness_serial_oracle_tokens", columns
+            )
             (result_directory / "mtp_transactions.csv").write_text(
                 campaigns.MTP_TRANSACTIONS_HEADER
                 + "\n"
@@ -393,6 +657,50 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertEqual(result.outcome, "artifact_contract_failed")
         self.assertFalse(result.artifact_contract_passed)
         self.assertEqual(result.validated_artifact_file_count, 6)
+
+    @mock.patch.object(
+        campaigns,
+        "validate_campaign_artifacts",
+        return_value=(0, (), ()),
+    )
+    @mock.patch.object(campaigns, "_run_process")
+    def test_campaign_reports_exact_timed_out_cell(
+        self,
+        run_process: mock.Mock,
+        _validate: mock.Mock,
+    ) -> None:
+        """The report must distinguish one cell timeout from the global guard."""
+
+        case = "MatrixSuite.ProductionParity/Depth1"
+        cell = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CUDA_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CUDA", "ALL"),
+            gtest_cases=(case,),
+        )
+
+        def expire_cell(*_args: object, **kwargs: object) -> int:
+            evidence = kwargs["timeout_evidence"]
+            assert isinstance(evidence, campaigns.ProcessTimeoutEvidence)
+            evidence.kind = campaigns.ProcessTimeoutKind.EXACT_CELL
+            evidence.exact_gtest_case = case
+            return 124
+
+        run_process.side_effect = expire_cell
+
+        result = campaigns.run_campaign(
+            Path("build"),
+            cell,
+            21600.0,
+            artifact_results_root=Path("artifacts"),
+        )
+
+        self.assertEqual(result.return_code, 124)
+        self.assertEqual(result.outcome, "exact_cell_timeout")
+        self.assertEqual(result.timed_out_gtest_case, case)
+        self.assertEqual(
+            result.exact_cell_timeout_seconds,
+            campaigns.EXACT_CELL_TIMEOUT_SECONDS,
+        )
 
     @mock.patch.object(campaigns, "_run_process", return_value=0)
     def test_soft_target_never_becomes_the_process_timeout(
@@ -589,7 +897,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     f"-DTEST_EXECUTABLE={executable}",
                     f"-DCTEST_FILE={generated}",
                     "-DTEST_PREFIX=V2_Integration_Parity_Fake",
-                    "-DLABELS=V2;Integration;Parity;CPU;CUDA",
+                    "-DLABELS=V2;Integration;Parity;CPU;CUDA;ROCm;NCCL;RCCL",
                     "-DMPI_PROCS=1",
                     "-DNUM_SOCKETS=1",
                     "-DCORES_PER_SOCKET=4",
@@ -663,6 +971,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertIn(f'REQUIRED_FILES "{model};{cpu_model}"', cpu_campaign)
         self.assertIn("LLAMINAR_FORCE_CPU_ONLY_STARTUP=1", cpu_campaign)
         self.assertNotIn("LLAMINAR_SKIP_ROCM_STARTUP=1", cpu_campaign)
+        self.assertNotIn("NCCL", cpu_campaign)
+        self.assertNotIn("RCCL", cpu_campaign)
+        self.assertNotIn("HSA_OVERRIDE_GFX_VERSION", cpu_campaign)
         self.assertIn("LLAMINAR_LOG_LEVEL=INFO", cuda_campaign)
         self.assertIn(
             f"{campaigns.MODEL_MANIFEST_ENV}={model}|{cuda_model}",
@@ -671,6 +982,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertIn(f'REQUIRED_FILES "{model};{cuda_model}"', cuda_campaign)
         self.assertIn("LLAMINAR_SKIP_ROCM_STARTUP=1", cuda_campaign)
         self.assertNotIn("LLAMINAR_FORCE_CPU_ONLY_STARTUP=1", cuda_campaign)
+        self.assertIn("NCCL", cuda_campaign)
+        self.assertNotIn("RCCL", cuda_campaign)
+        self.assertNotIn("HSA_OVERRIDE_GFX_VERSION", cuda_campaign)
         self.assertIn("LLAMINAR_LOG_LEVEL=INFO", hybrid_campaign)
         self.assertIn(
             f"{campaigns.MODEL_MANIFEST_ENV}="
@@ -684,6 +998,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertNotIn("LLAMINAR_FORCE_CPU_ONLY_STARTUP=1", hybrid_campaign)
         self.assertNotIn("LLAMINAR_SKIP_CUDA_STARTUP=1", hybrid_campaign)
         self.assertNotIn("LLAMINAR_SKIP_ROCM_STARTUP=1", hybrid_campaign)
+        self.assertIn("NCCL", hybrid_campaign)
+        self.assertIn("RCCL", hybrid_campaign)
+        self.assertIn("HSA_OVERRIDE_GFX_VERSION=9.0.6", hybrid_campaign)
         self.assertIn(
             f'TIMEOUT "{campaigns.REGISTERED_TIMEOUT_SECONDS:g}"',
             registration,
@@ -913,7 +1230,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             "set_tests_properties", 1
         )[1].split(")\n\n", 1)[0]
         self.assertIn("UnfinishedPolicy", llep_properties)
-        self.assertNotIn("WholeMatrixOneHourTarget", llep_properties)
+        self.assertNotIn("WholeMatrix75MinuteTarget", llep_properties)
         self.assertNotRegex(llep_properties, r'LABELS "[^"]*Campaign')
 
     def test_cmake_discovery_isolates_declared_application_lifetimes(self) -> None:
@@ -1168,17 +1485,72 @@ class ProductionParityCampaignTest(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             ramdisk = Path(raw_directory)
-            with campaigns.model_staging_workspace(
-                ramdisk,
-                Path("stable-parity-cache"),
-                campaigns.time.monotonic() + 30.0,
-            ) as workspace:
-                marker = workspace.root / "operator-owned-marker"
-                marker.write_text("retained", encoding="utf-8")
-                self.assertTrue(workspace.persistent)
-                self.assertEqual(workspace.mode, "persistent")
+            root = ramdisk / "stable-parity-cache"
+            try:
+                with campaigns.model_staging_workspace(
+                    ramdisk,
+                    Path("stable-parity-cache"),
+                    campaigns.time.monotonic() + 30.0,
+                ) as workspace:
+                    marker = workspace.root / "operator-owned-marker"
+                    marker.write_text("retained", encoding="utf-8")
+                    self.assertTrue(workspace.persistent)
+                    self.assertEqual(workspace.mode, "persistent")
 
-            self.assertEqual(marker.read_text(encoding="utf-8"), "retained")
+                self.assertEqual(marker.read_text(encoding="utf-8"), "retained")
+                self.assertEqual(root.stat().st_mode & 0o777, 0o500)
+            finally:
+                if root.exists():
+                    campaigns._set_persistent_cache_write_access(
+                        root,
+                        writable=True,
+                    )
+
+    @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
+    def test_persistent_workspace_seals_models_while_digests_remain_writable(
+        self, _: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            ramdisk = Path(raw_directory)
+            root = ramdisk / "stable-parity-cache"
+            try:
+                with campaigns.model_staging_workspace(
+                    ramdisk,
+                    Path("stable-parity-cache"),
+                    campaigns.time.monotonic() + 30.0,
+                ) as workspace:
+                    workspace.models.mkdir()
+                    workspace.digests.mkdir()
+                    published_model = workspace.models / "model.gguf"
+                    published_model.write_bytes(b"published-model")
+
+                    workspace.protect_published_models()
+
+                    self.assertEqual(workspace.root.stat().st_mode & 0o777, 0o500)
+                    self.assertEqual(workspace.models.stat().st_mode & 0o777, 0o500)
+                    self.assertEqual(workspace.digests.stat().st_mode & 0o777, 0o700)
+                    if os.geteuid() != 0:
+                        with self.assertRaises(PermissionError):
+                            published_model.unlink()
+                    digest = workspace.digests / "model.sha256"
+                    digest.write_text("authenticated", encoding="utf-8")
+                    self.assertEqual(
+                        digest.read_text(encoding="utf-8"),
+                        "authenticated",
+                    )
+
+                self.assertEqual(root.stat().st_mode & 0o777, 0o500)
+                self.assertEqual((root / "models").stat().st_mode & 0o777, 0o500)
+                self.assertEqual((root / "digests").stat().st_mode & 0o777, 0o500)
+                if os.geteuid() != 0:
+                    with self.assertRaises(PermissionError):
+                        published_model.unlink()
+            finally:
+                if root.exists():
+                    campaigns._set_persistent_cache_write_access(
+                        root,
+                        writable=True,
+                    )
 
     @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
     def test_persistent_workspace_reclaims_only_interrupted_transactions(
@@ -1187,33 +1559,43 @@ class ProductionParityCampaignTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_directory:
             ramdisk = Path(raw_directory)
             root = ramdisk / "stable-parity-cache"
-            models = root / "models"
-            models.mkdir(parents=True)
-            interrupted_copy = models / ".model.gguf.copying-4242"
-            interrupted_copy.write_bytes(b"partial-model")
-            interrupted_manifest = (
-                root
-                / ".model-cache-manifest.json.publishing-4242-123456789"
-            )
-            interrupted_manifest.write_text("partial", encoding="utf-8")
-            published_model = models / "model.gguf"
-            published_model.write_bytes(b"published-model")
-            operator_marker = root / "operator-owned-marker"
-            operator_marker.write_text("retained", encoding="utf-8")
-
-            with campaigns.model_staging_workspace(
-                ramdisk,
-                Path("stable-parity-cache"),
-                campaigns.time.monotonic() + 30.0,
-            ) as workspace:
-                self.assertEqual(workspace.root, root)
-                self.assertFalse(interrupted_copy.exists())
-                self.assertFalse(interrupted_manifest.exists())
-                self.assertEqual(published_model.read_bytes(), b"published-model")
-                self.assertEqual(
-                    operator_marker.read_text(encoding="utf-8"),
-                    "retained",
+            try:
+                models = root / "models"
+                models.mkdir(parents=True)
+                interrupted_copy = models / ".model.gguf.copying-4242"
+                interrupted_copy.write_bytes(b"partial-model")
+                interrupted_manifest = (
+                    root
+                    / ".model-cache-manifest.json.publishing-4242-123456789"
                 )
+                interrupted_manifest.write_text("partial", encoding="utf-8")
+                published_model = models / "model.gguf"
+                published_model.write_bytes(b"published-model")
+                operator_marker = root / "operator-owned-marker"
+                operator_marker.write_text("retained", encoding="utf-8")
+
+                with campaigns.model_staging_workspace(
+                    ramdisk,
+                    Path("stable-parity-cache"),
+                    campaigns.time.monotonic() + 30.0,
+                ) as workspace:
+                    self.assertEqual(workspace.root, root)
+                    self.assertFalse(interrupted_copy.exists())
+                    self.assertFalse(interrupted_manifest.exists())
+                    self.assertEqual(
+                        published_model.read_bytes(),
+                        b"published-model",
+                    )
+                    self.assertEqual(
+                        operator_marker.read_text(encoding="utf-8"),
+                        "retained",
+                    )
+            finally:
+                if root.exists():
+                    campaigns._set_persistent_cache_write_access(
+                        root,
+                        writable=True,
+                    )
 
     @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
     def test_persistent_workspace_rejects_transaction_directory(
@@ -1221,24 +1603,27 @@ class ProductionParityCampaignTest(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             ramdisk = Path(raw_directory)
-            transaction = (
-                ramdisk
-                / "stable-parity-cache"
-                / "models"
-                / ".model.gguf.copying-4242"
-            )
-            transaction.mkdir(parents=True)
+            root = ramdisk / "stable-parity-cache"
+            try:
+                transaction = root / "models" / ".model.gguf.copying-4242"
+                transaction.mkdir(parents=True)
 
-            with self.assertRaisesRegex(
-                campaigns.ModelStagingError,
-                "transaction path is unexpectedly a directory",
-            ):
-                with campaigns.model_staging_workspace(
-                    ramdisk,
-                    Path("stable-parity-cache"),
-                    campaigns.time.monotonic() + 30.0,
+                with self.assertRaisesRegex(
+                    campaigns.ModelStagingError,
+                    "transaction path is unexpectedly a directory",
                 ):
-                    self.fail("corrupt transaction directory was accepted")
+                    with campaigns.model_staging_workspace(
+                        ramdisk,
+                        Path("stable-parity-cache"),
+                        campaigns.time.monotonic() + 30.0,
+                    ):
+                        self.fail("corrupt transaction directory was accepted")
+            finally:
+                if root.exists():
+                    campaigns._set_persistent_cache_write_access(
+                        root,
+                        writable=True,
+                    )
 
     def test_persistent_cache_cli_is_explicit(self) -> None:
         args = campaigns.parse_args(
@@ -1249,6 +1634,91 @@ class ProductionParityCampaignTest(unittest.TestCase):
             args.persistent_model_cache_dir,
             Path("/dev/shm/llaminar-parity-cache"),
         )
+
+    @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
+    def test_persistent_workspace_rejects_session_ipc_tmpfs(
+        self, _: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            session_ipc = Path(raw_directory)
+            with mock.patch.object(
+                campaigns,
+                "SESSION_IPC_RAMDISK_ROOT",
+                session_ipc,
+            ):
+                with self.assertRaisesRegex(
+                    campaigns.ModelStagingError,
+                    "requires a dedicated tmpfs mount outside",
+                ):
+                    with campaigns.model_staging_workspace(
+                        session_ipc,
+                        Path("persistent-cache"),
+                        campaigns.time.monotonic() + 30.0,
+                    ):
+                        self.fail("session IPC was accepted as persistent storage")
+
+    def test_stage_models_only_requires_a_persistent_cache(self) -> None:
+        with self.assertRaises(SystemExit):
+            campaigns.parse_args(["--stage-models-only"])
+
+    def test_stage_models_only_and_list_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(SystemExit):
+            campaigns.parse_args(
+                [
+                    "--stage-models-only",
+                    "--persistent-model-cache-dir",
+                    "stable-cache",
+                    "--list",
+                ]
+            )
+
+    @mock.patch.object(campaigns, "prepare_model_fixture", return_value=(0, 0.5))
+    @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
+    def test_stage_models_only_uses_the_persistent_campaign_lifecycle(
+        self,
+        _: mock.Mock,
+        prepare_fixture: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            ramdisk = Path(raw_directory)
+            source = ramdisk / "source.gguf"
+            source.write_bytes(b"real-weights")
+            cell = campaigns.CampaignCell(
+                "cell_ProductionCampaign_CPU_ALL_PRECISIONS",
+                campaigns.CampaignGroup("CPU", "ALL"),
+                model_files=(str(source),),
+            )
+            args = campaigns.parse_args(
+                [
+                    "--stage-models-only",
+                    "--model-ramdisk-root",
+                    str(ramdisk),
+                    "--persistent-model-cache-dir",
+                    "stable-cache",
+                ]
+            )
+            cache = ramdisk / "stable-cache"
+            try:
+                self.assertEqual(
+                    campaigns.stage_selected_models_only(args, (cell,)),
+                    0,
+                )
+                prepare_fixture.assert_called_once()
+                self.assertEqual(
+                    (cache / "models" / source.name).read_bytes(),
+                    b"real-weights",
+                )
+                self.assertEqual(cache.stat().st_mode & 0o777, 0o500)
+                self.assertEqual(
+                    (cache / "models").stat().st_mode & 0o777,
+                    0o500,
+                )
+            finally:
+                if cache.exists():
+                    campaigns._set_persistent_cache_write_access(
+                        cache,
+                        writable=True,
+                    )
 
     @mock.patch.object(campaigns, "_filesystem_type", return_value="ext4")
     def test_ramdisk_staging_rejects_non_memory_filesystem(

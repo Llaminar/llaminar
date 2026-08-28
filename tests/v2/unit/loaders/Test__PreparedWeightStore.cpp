@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "loaders/PreparedWeightStore.h"
+#include "loaders/PreparedDeviceAllocationLedger.h"
 #include "tensors/TensorSlice.h"
 #include "tensors/Tensors.h"
 #include "../../utils/PreparedWeightTestHarness.h"
@@ -91,6 +92,41 @@ TEST(Test__PreparedWeightStore, BindModelIdIfUnsetBindsOnce)
     EXPECT_TRUE(store.bindModelIdIfUnset(ModelContextId{77}));
     EXPECT_FALSE(store.bindModelIdIfUnset(ModelContextId{78}));
     EXPECT_EQ(store.modelId().value, 77u);
+}
+
+TEST(Test__PreparedDeviceAllocationLedger, CountsOnlyUniqueLiveOwners)
+{
+    PreparedDeviceAllocationLedger ledger;
+    auto first = std::make_shared<int>(1);
+    auto second = std::make_shared<int>(2);
+
+    ledger.registerAllocation(DeviceId::rocm(0), first, 128u);
+    ledger.registerAllocation(DeviceId::rocm(0), first, 128u);
+    ledger.registerAllocation(DeviceId::rocm(0), second, 256u);
+    EXPECT_EQ(ledger.liveBytes(DeviceId::rocm(0)), 384u);
+    EXPECT_EQ(ledger.liveBytes(DeviceId::rocm(1)), 0u);
+
+    first.reset();
+    EXPECT_EQ(ledger.liveBytes(DeviceId::rocm(0)), 256u)
+        << "Weak accounting must shed runner-only pools at teardown";
+    EXPECT_THROW(
+        ledger.registerAllocation(DeviceId::rocm(0), second, 512u),
+        std::logic_error);
+    EXPECT_THROW(
+        ledger.registerAllocation(DeviceId::cpu(), second, 256u),
+        std::invalid_argument);
+}
+
+TEST(Test__PreparedDeviceAllocationLedger, DistinguishesReusedRawAddressesByOwnership)
+{
+    PreparedDeviceAllocationLedger ledger;
+    auto first = std::make_shared<int>(1);
+    ledger.registerAllocation(DeviceId::cuda(0), first, 64u);
+    first.reset();
+
+    auto replacement = std::make_shared<int>(2);
+    ledger.registerAllocation(DeviceId::cuda(0), replacement, 96u);
+    EXPECT_EQ(ledger.liveBytes(DeviceId::cuda(0)), 96u);
 }
 
 TEST(Test__PreparedWeightStore, BindModelIdIfUnsetRejectsZeroAgainstBoundStore)
@@ -428,6 +464,35 @@ TEST(Test__PreparedWeightStore, ResolvesPreparedEmbeddingRefsByBinding)
     auto stored = store.binding(ref);
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ(stored->identity.role, WeightRole::Embedding);
+}
+
+TEST(Test__PreparedWeightStore, CountsUniquePreparedEmbeddingAllocationBytes)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto tensor = makeQ8_0Tensor(64, 96);
+    auto first_binding = makeStoreBinding(
+        101, "token_embd.weight", DeviceId::rocm(0));
+    first_binding.identity.role = WeightRole::Embedding;
+    first_binding.tensor = tensor.get();
+
+    auto handle = makeEmbeddingHandle(tensor.get(), DeviceId::rocm(0));
+    handle.weights->byte_size = 4096u;
+    store.registerPreparedEmbeddingFromPipeline(
+        first_binding, DeviceId::rocm(0), &handle);
+
+    auto alias_binding = makeStoreBinding(
+        102, "token_embd.weight", DeviceId::rocm(0));
+    alias_binding.identity.role = WeightRole::Embedding;
+    alias_binding.tensor = tensor.get();
+    store.registerPreparedEmbeddingFromPipeline(
+        alias_binding, DeviceId::rocm(0), &handle);
+
+    EXPECT_EQ(
+        store.preparedEmbeddingAllocationBytesForDevice(DeviceId::rocm(0)),
+        4096u);
+    EXPECT_EQ(
+        store.preparedEmbeddingAllocationBytesForDevice(DeviceId::rocm(1)),
+        0u);
 }
 
 TEST(Test__PreparedWeightStore, TypedEmbeddingAdoptionSurvivesGemmBindingIdCollision)

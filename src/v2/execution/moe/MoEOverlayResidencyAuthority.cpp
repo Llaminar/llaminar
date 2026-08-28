@@ -16,6 +16,8 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <map>
@@ -63,54 +65,41 @@ namespace llaminar2
             return "unknown";
         }
 
-        /**
-         * @brief Independent placement objective advanced by a closed cycle.
-         *
-         * Tier residency chooses the integer-priority tier that owns an
-         * expert. Participant placement balances owners inside an unchanged
-         * apportioned tier. A closed physical cycle can advance both when its
-         * endpoint permutation contains tier-crossing and within-tier edges.
-         */
-        enum class MigrationCycleAxis
+        /** @return Stable diagnostic spelling for one typed movement axis. */
+        const char *movementAxisName(MoEOptimizationMovementAxis axis)
         {
-            TierResidency,
-            ParticipantPlacement,
-            Combined,
-        };
+            switch (axis)
+            {
+            case MoEOptimizationMovementAxis::TierResidency:
+                return "tier_residency";
+            case MoEOptimizationMovementAxis::ParticipantPlacement:
+                return "participant_placement";
+            case MoEOptimizationMovementAxis::Combined:
+                return "combined";
+            }
+            return "unknown";
+        }
 
         /** @return The placement objective(s) represented by @p cycle. */
-        MigrationCycleAxis migrationCycleAxis(
+        MoEOptimizationMovementAxis migrationCycleAxis(
             const MoEOverlayResidencyTransaction &transaction,
             const MoEOverlayTierMigrationCycle &cycle)
         {
-            bool crosses_tier = false;
-            bool stays_in_tier = false;
+            bool advances_tier = false;
+            bool advances_participant = false;
             for (const std::size_t migration_index : cycle.migration_indices)
             {
                 const auto &migration =
                     transaction.migrations.at(migration_index);
-                crosses_tier |= migration.crossesTier();
-                stays_in_tier |= !migration.crossesTier();
+                advances_tier |= advancesTierResidency(migration.axis);
+                advances_participant |=
+                    advancesParticipantPlacement(migration.axis);
             }
-            if (crosses_tier && stays_in_tier)
-                return MigrationCycleAxis::Combined;
-            return crosses_tier
-                       ? MigrationCycleAxis::TierResidency
-                       : MigrationCycleAxis::ParticipantPlacement;
-        }
-
-        /** @return Whether @p axis makes progress on tier assignment. */
-        bool advancesTierResidency(MigrationCycleAxis axis) noexcept
-        {
-            return axis == MigrationCycleAxis::TierResidency ||
-                   axis == MigrationCycleAxis::Combined;
-        }
-
-        /** @return Whether @p axis makes progress on within-tier ownership. */
-        bool advancesParticipantPlacement(MigrationCycleAxis axis) noexcept
-        {
-            return axis == MigrationCycleAxis::ParticipantPlacement ||
-                   axis == MigrationCycleAxis::Combined;
+            if (advances_tier && advances_participant)
+                return MoEOptimizationMovementAxis::Combined;
+            return advances_tier
+                       ? MoEOptimizationMovementAxis::TierResidency
+                       : MoEOptimizationMovementAxis::ParticipantPlacement;
         }
 
         /** @brief Compact PerfStats accounting for independent cycle axes. */
@@ -121,12 +110,33 @@ namespace llaminar2
             std::size_t combined = 0;
 
             /** @brief Account one classified cycle exactly once. */
-            void add(MigrationCycleAxis axis) noexcept
+            void add(MoEOptimizationMovementAxis axis) noexcept
             {
-                tier_residency += advancesTierResidency(axis) ? 1u : 0u;
-                participant_placement +=
-                    advancesParticipantPlacement(axis) ? 1u : 0u;
-                combined += axis == MigrationCycleAxis::Combined ? 1u : 0u;
+                /*
+                 * These are exclusive telemetry coordinates.  Combined
+                 * means that one physical cycle advances both objectives; it
+                 * must not also inflate the two pure-axis buckets.  The
+                 * advances* predicates above answer scheduling questions and
+                 * therefore intentionally have inclusive semantics.
+                 */
+                switch (axis)
+                {
+                case MoEOptimizationMovementAxis::TierResidency:
+                    ++tier_residency;
+                    break;
+                case MoEOptimizationMovementAxis::ParticipantPlacement:
+                    ++participant_placement;
+                    break;
+                case MoEOptimizationMovementAxis::Combined:
+                    ++combined;
+                    break;
+                }
+            }
+
+            /** @return Number of cycles classified across exclusive axes. */
+            [[nodiscard]] std::size_t total() const noexcept
+            {
+                return tier_residency + participant_placement + combined;
             }
         };
 
@@ -235,13 +245,13 @@ namespace llaminar2
         ParticipantRebalancePlan planOverlayParticipantRebalance(
             const MoERoutedExpertPlacementPlan &plan,
             const MoEExpertOwnerMap &base_owner_map,
-            const DecodeExpertHistogramWindow &window,
+            const ValidatedDecodeExpertHistogramWindowView &window,
             const MoEOverlayParticipantRebalancePolicy &policy)
         {
             ParticipantRebalancePlan result{
                 .ownership = base_owner_map.layeredOwnership(
-                    window.num_layers,
-                    window.num_experts),
+                    window.numLayers(),
+                    window.numExperts()),
             };
             if (!policy.enabled)
                 return result;
@@ -252,7 +262,7 @@ namespace llaminar2
             {
                 uint64_t routed_window_activations = 0u;
                 for (int expert_id = 0;
-                     expert_id < window.num_experts;
+                     expert_id < window.numExperts();
                      ++expert_id)
                 {
                     const uint64_t count = window.activationCount(
@@ -304,7 +314,7 @@ namespace llaminar2
                     std::vector<uint64_t> participant_load(
                         participant_ids.size(), 0u);
                     for (int expert_id = 0;
-                         expert_id < window.num_experts;
+                         expert_id < window.numExperts();
                          ++expert_id)
                     {
                         if (placement.routed_expert_tier[
@@ -598,6 +608,72 @@ namespace llaminar2
                projected_net_benefit_ns > minimum_net_benefit_ns;
     }
 
+    bool MoEOverlayAuthoritativeResidencyEntry::valid() const noexcept
+    {
+        const bool valid_axis =
+            axis == MoEOptimizationMovementAxis::TierResidency ||
+            axis == MoEOptimizationMovementAxis::ParticipantPlacement ||
+            axis == MoEOptimizationMovementAxis::Combined;
+        return candidate_tier_idx >= 0 &&
+               candidate_owner_participant >= 0 && valid_axis &&
+               (changed ||
+                (activation_count == 0 && estimated_weight_bytes == 0));
+    }
+
+    bool MoEOverlayAuthoritativeResidencyPlan::valid() const noexcept
+    {
+        if (expected_epoch == 0 || num_layers <= 0 || num_experts <= 0 ||
+            !histogram_window || !histogram_window->valid() ||
+            histogram_window->num_layers != num_layers ||
+            histogram_window->num_experts != num_experts)
+        {
+            return false;
+        }
+        const auto layers = static_cast<size_t>(num_layers);
+        const auto experts = static_cast<size_t>(num_experts);
+        if (layers > std::numeric_limits<size_t>::max() / experts ||
+            entries.size() != layers * experts)
+        {
+            return false;
+        }
+        for (size_t index = 0; index < entries.size(); ++index)
+        {
+            const auto &entry = entries[index];
+            if (!entry.valid())
+                return false;
+
+            /*
+             * The dense entry and histogram are one authenticated semantic
+             * value, not merely two independently well-formed payloads. A
+             * follower reconstructs the migration economy from this exact
+             * evidence, so accepting a different count here would postpone a
+             * coordinator defect until after publication.
+             */
+            if (entry.changed &&
+                entry.activation_count !=
+                    histogram_window->expert_counts[index])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    size_t MoEOverlayAuthoritativeResidencyPlan::offset(
+        int layer_idx,
+        int expert_id) const
+    {
+        if (layer_idx < 0 || layer_idx >= num_layers || expert_id < 0 ||
+            expert_id >= num_experts)
+        {
+            throw std::out_of_range(
+                "ExpertOverlay authoritative plan coordinate is out of range");
+        }
+        return static_cast<size_t>(layer_idx) *
+                   static_cast<size_t>(num_experts) +
+               static_cast<size_t>(expert_id);
+    }
+
     bool MoEOverlayTierMigrationCycle::valid(
         const std::vector<MoEOverlayTierMigration> &migrations) const noexcept
     {
@@ -700,6 +776,9 @@ namespace llaminar2
         const bool calibration =
             purpose ==
             MoEOverlayResidencyTransactionPurpose::EconomyCalibration;
+        const bool restoration =
+            purpose ==
+            MoEOverlayResidencyTransactionPurpose::PreparedContextRestoration;
         if (calibration)
         {
             /*
@@ -708,7 +787,8 @@ namespace llaminar2
              * exercised, and the transport makes commit unrepresentable.
              */
             if (calibration_sequence == 0 || histogram_window ||
-                histogram_generation != 0 || economy.enabled ||
+                histogram_generation != 0 || host_admission ||
+                economy.enabled ||
                 previous->placement_plan.get() !=
                     candidate->placement_plan.get() ||
                 previous->layered_ownership !=
@@ -718,6 +798,12 @@ namespace llaminar2
             }
         }
         else if (calibration_sequence != 0)
+        {
+            return false;
+        }
+        if (restoration &&
+            (histogram_window || histogram_generation != 0 ||
+             host_admission || economy.enabled))
         {
             return false;
         }
@@ -731,8 +817,21 @@ namespace llaminar2
         if (!economy.valid(!migrations.empty()))
             return false;
 
+        if (host_admission &&
+            (!host_admission->valid() || !candidate ||
+             host_admission->transaction != candidate->epoch ||
+             host_admission->candidate_epoch != candidate->epoch ||
+             host_admission->admitted_physical_cycles !=
+                 migration_cycles.size()))
+        {
+            return false;
+        }
+
         if (migrations.empty())
-            return migration_cycles.empty() && shadow_requirements.empty();
+        {
+            return migration_cycles.empty() && shadow_requirements.empty() &&
+                   !host_admission;
+        }
 
         if (!analyzeMoEOverlayMigrationCapacity(migrations)
                  .capacityPreserved())
@@ -769,6 +868,29 @@ namespace llaminar2
                 migration.source.tier_idx < 0 ||
                 migration.destination.tier_idx < 0 ||
                 migration.destination.owner_participant < 0)
+            {
+                return false;
+            }
+            if (histogram_window)
+            {
+                if (migration.layer_idx >= histogram_window->num_layers ||
+                    migration.expert_id >= histogram_window->num_experts)
+                {
+                    return false;
+                }
+                const size_t histogram_index =
+                    static_cast<size_t>(migration.layer_idx) *
+                        static_cast<size_t>(histogram_window->num_experts) +
+                    static_cast<size_t>(migration.expert_id);
+                if (migration.activation_count !=
+                    histogram_window->expert_counts[histogram_index])
+                {
+                    return false;
+                }
+            }
+            if (migration.axis ==
+                    MoEOptimizationMovementAxis::ParticipantPlacement &&
+                migration.crossesTier())
             {
                 return false;
             }
@@ -884,8 +1006,17 @@ namespace llaminar2
     /** @brief Published old epoch waiting for its final inference lease to drain. */
     struct MoEOverlayResidencyAuthority::PendingRetirement
     {
+        /** @brief Typed process-local RCU grace-period progression. */
+        enum class LocalGracePeriodState : std::uint8_t
+        {
+            AdmissionOpen = 0, ///< Old captured tickets may still claim E.
+            AdmissionClosed,     ///< No new E ticket can enter; readers drain only.
+        };
+
         std::shared_ptr<PublishedEpochState> previous;
         std::unique_ptr<IMoEOverlayResidencyWave> work;
+        LocalGracePeriodState local_grace_period =
+            LocalGracePeriodState::AdmissionOpen;
     };
 
     /** @brief Unpublished wave retained until all abort event edges quiesce. */
@@ -913,6 +1044,8 @@ namespace llaminar2
             kAllExpertHistogramProductionSources;
         std::vector<const MoERoutedTierLayerPhaseServiceCost *>
             service_cost_rows;
+        std::vector<const MoERoutedParticipantLayerPhaseServiceCost *>
+            participant_service_cost_rows;
         std::vector<const MoEOverlayParticipantLayerMigrationCost *>
             migration_cost_rows;
         std::optional<DecodeExpertHistogramWindow> last_input_window;
@@ -926,6 +1059,17 @@ namespace llaminar2
         {
             return *service_cost_rows.at(
                 static_cast<std::size_t>(tier) *
+                    static_cast<std::size_t>(num_layers) +
+                static_cast<std::size_t>(layer));
+        }
+
+        /** @brief Return one prevalidated participant/layer service row. */
+        const MoERoutedParticipantLayerPhaseServiceCost &participantServiceCost(
+            int participant,
+            int layer) const
+        {
+            return *participant_service_cost_rows.at(
+                static_cast<std::size_t>(participant) *
                     static_cast<std::size_t>(num_layers) +
                 static_cast<std::size_t>(layer));
         }
@@ -1095,6 +1239,55 @@ namespace llaminar2
                 "ExpertOverlay service profile is not total for live residency geometry");
         }
 
+        const std::size_t participant_service_rows = checkedSizeProduct(
+            static_cast<std::size_t>(state->participant_count),
+            static_cast<std::size_t>(state->num_layers),
+            "participant service-profile geometry");
+        state->participant_service_cost_rows.assign(
+            participant_service_rows, nullptr);
+        for (const auto &row : service_profile.participant_costs)
+        {
+            if (row.participant_id < 0 ||
+                row.participant_id >= state->participant_count ||
+                row.layer < 0 || row.layer >= state->num_layers)
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay participant service profile row is outside live residency geometry");
+            }
+            const std::size_t offset =
+                static_cast<std::size_t>(row.participant_id) *
+                    static_cast<std::size_t>(state->num_layers) +
+                static_cast<std::size_t>(row.layer);
+            if (state->participant_service_cost_rows[offset])
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay participant service profile repeats a participant/layer row");
+            }
+            for (std::size_t phase = 0;
+                 phase < kExpertHistogramProductionSourceCount;
+                 ++phase)
+            {
+                const bool has_cost =
+                    row.nanoseconds_per_activation[phase] != 0u;
+                if (has_cost != state->active_sources[phase])
+                {
+                    throw std::invalid_argument(
+                        "ExpertOverlay participant service profile is inconsistent with active runtime phases");
+                }
+            }
+            state->participant_service_cost_rows[offset] = &row;
+        }
+        if (state->participant_service_cost_rows.size() !=
+                service_profile.participant_costs.size() ||
+            std::any_of(
+                state->participant_service_cost_rows.begin(),
+                state->participant_service_cost_rows.end(),
+                [](const auto *row) { return row == nullptr; }))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay participant service profile is not total for live residency geometry");
+        }
+
         const std::size_t participants =
             static_cast<std::size_t>(state->participant_count);
         const std::size_t participant_pairs = checkedSizeProduct(
@@ -1239,6 +1432,23 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Observe or Dynamic ExpertOverlay maintenance requires a DecodeExpertHistogram");
         }
+        if (config_.histogram)
+        {
+            const int initial_window = config_.histogram->windowSize();
+            if (!std::isfinite(
+                    config_.histogram_window_growth_factor) ||
+                config_.histogram_window_growth_factor <= 0.0 ||
+                (config_.histogram_max_window_tokens != 0u &&
+                 config_.histogram_max_window_tokens <
+                     static_cast<std::uint64_t>(initial_window)) ||
+                config_.histogram_max_window_tokens >
+                    static_cast<std::uint64_t>(
+                        std::numeric_limits<int>::max()))
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay histogram growth requires a finite positive factor and a ceiling no smaller than its initial window");
+            }
+        }
         if (!config_.participant_rebalance_policy.valid())
         {
             throw std::invalid_argument(
@@ -1312,9 +1522,14 @@ namespace llaminar2
             nullptr);
 
         economy_state_ = buildEconomyState(config_, *initial_snapshot);
-        economy_certified_.store(
-            economy_state_ != nullptr,
+        if (economy_state_ && config_.histogram)
+            config_.histogram->activatePrecertifiedOptimizationDemand();
+        economy_activation_state_.store(
+            economy_state_
+                ? EconomyActivationState::Active
+                : EconomyActivationState::CollectingEvidence,
             std::memory_order_release);
+        initial_snapshot_ = initial_snapshot;
         published_epoch_.store(
             std::make_shared<PublishedEpochState>(std::move(initial_snapshot)),
             std::memory_order_release);
@@ -1324,6 +1539,21 @@ namespace llaminar2
 
     std::optional<MoEOverlayResidencyAuthority::TicketLease>
     MoEOverlayResidencyAuthority::tryAcquireTicketSnapshot()
+    {
+        return tryAcquireCurrentSnapshot(
+            TicketLeasePurpose::InferenceDispatch);
+    }
+
+    std::optional<MoEOverlayResidencyAuthority::TicketLease>
+    MoEOverlayResidencyAuthority::tryAcquireGraphSequenceSnapshot()
+    {
+        return tryAcquireCurrentSnapshot(
+            TicketLeasePurpose::InferenceGraphSequence);
+    }
+
+    std::optional<MoEOverlayResidencyAuthority::TicketLease>
+    MoEOverlayResidencyAuthority::tryAcquireCurrentSnapshot(
+        TicketLeasePurpose purpose)
     {
         for (;;)
         {
@@ -1345,10 +1575,22 @@ namespace llaminar2
             if (published_epoch_.load(std::memory_order_acquire) == candidate)
             {
                 active_ticket_count_.fetch_add(1, std::memory_order_acq_rel);
-                return TicketLease(
+                TicketLease lease(
                     this,
                     std::move(candidate),
-                    TicketLeasePurpose::InferenceDispatch);
+                    purpose);
+                if (purpose == TicketLeasePurpose::InferenceGraphSequence)
+                {
+                    PerfStatsCollector::addCounter(
+                        "moe_overlay_residency",
+                        "graph_sequence_epoch_leases",
+                        1.0,
+                        "inference",
+                        config_.perf_device,
+                        {{"action", "acquire"},
+                         {"epoch", std::to_string(lease.epoch())}});
+                }
+                return lease;
             }
 
             const uint64_t previous =
@@ -1583,6 +1825,12 @@ namespace llaminar2
             throw std::logic_error(
                 "ExpertOverlay economy certification must precede the first dynamic proposal");
         }
+        if (economy_activation_state_.load(std::memory_order_acquire) !=
+            EconomyActivationState::ReadyForCertification)
+        {
+            throw std::logic_error(
+                "ExpertOverlay economy certification requires a completed calibration-demand rebase");
+        }
         if (economy_state_ || config_.phase_service_profile ||
             config_.migration_cost_profile ||
             config_.migration_economy_policy)
@@ -1622,7 +1870,9 @@ namespace llaminar2
             std::move(candidate_config.migration_cost_profile);
         config_.migration_economy_policy = policy;
         economy_state_ = std::move(candidate_state);
-        economy_certified_.store(true, std::memory_order_release);
+        economy_activation_state_.store(
+            EconomyActivationState::CertifiedAwaitingRequestBoundary,
+            std::memory_order_release);
 
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
@@ -1633,23 +1883,82 @@ namespace llaminar2
             {{"service_profile", config_.phase_service_profile->identity},
              {"migration_profile", config_.migration_cost_profile->identity},
              {"immutable", "true"},
-             {"blocking_inference", "false"}});
+             {"blocking_inference", "false"},
+             {"demand_activation", "next_request_boundary"}});
     }
 
     bool MoEOverlayResidencyAuthority::hasEconomyCertification() const noexcept
     {
-        return economy_certified_.load(std::memory_order_acquire);
+        const auto state =
+            economy_activation_state_.load(std::memory_order_acquire);
+        return state ==
+                   EconomyActivationState::CertifiedAwaitingRequestBoundary ||
+               state == EconomyActivationState::Active;
+    }
+
+    bool MoEOverlayResidencyAuthority::optimizationDemandActive() const noexcept
+    {
+        return economy_activation_state_.load(std::memory_order_acquire) ==
+               EconomyActivationState::Active;
+    }
+
+    MoEOverlayDemandActivationResult
+    MoEOverlayResidencyAuthority::activateOptimizationDemandAtRequestBoundary()
+    {
+        if (!migrationEnabled())
+            return MoEOverlayDemandActivationResult::NotReady;
+
+        std::lock_guard<std::mutex> lock(economy_mutex_);
+        const auto state =
+            economy_activation_state_.load(std::memory_order_acquire);
+        if (state == EconomyActivationState::Active)
+            return MoEOverlayDemandActivationResult::AlreadyActive;
+        if (state !=
+            EconomyActivationState::CertifiedAwaitingRequestBoundary)
+        {
+            return MoEOverlayDemandActivationResult::NotReady;
+        }
+        if (!economy_state_ || !config_.histogram)
+        {
+            throw std::logic_error(
+                "Request-boundary economy activation requires an installed policy and route histogram");
+        }
+
+        config_.histogram->activateOptimizationDemand();
+        economy_activation_state_.store(
+            EconomyActivationState::Active,
+            std::memory_order_release);
+        PerfStatsCollector::addCounter(
+            "moe_overlay_residency",
+            "optimization_demand_activations",
+            1.0,
+            "request_admission",
+            config_.perf_device,
+            {{"authority", "host"},
+             {"blocking", "false"},
+             {"boundary", "prefill"}});
+        return MoEOverlayDemandActivationResult::Activated;
     }
 
     bool MoEOverlayResidencyAuthority::maintenanceWindowReady() const noexcept
     {
+        const auto drain_state =
+            histogram_drain_state_.load(std::memory_order_acquire);
         return migrationEnabled() &&
                config_.initial_plan.authority_execution !=
                    MoEOverlayAuthorityExecutionKind::
                        DeviceResident &&
                config_.histogram &&
-               (histogram_drain_active_.load(std::memory_order_acquire) ||
+               (drain_state == HistogramDrainState::ProposalWindow ||
                 config_.histogram->windowFull());
+    }
+
+    MoEOptimizationDemandWindow
+    MoEOverlayResidencyAuthority::optimizationDemandWindow() const noexcept
+    {
+        return config_.histogram
+                   ? config_.histogram->optimizationDemandWindow()
+                   : MoEOptimizationDemandWindow{};
     }
 
     MoEOverlayHistogramWindowResult
@@ -1662,14 +1971,126 @@ namespace llaminar2
             throw std::logic_error(
                 "Only Dynamic ExpertOverlay maintenance may prepare a routing window");
         }
+        return progressHistogramDrain(HistogramDrainState::ProposalWindow);
+    }
 
-        bool drain_active =
-            histogram_drain_active_.load(std::memory_order_acquire);
-        if (!drain_active)
+    MoEOverlayHistogramRebaseProgress
+    MoEOverlayResidencyAuthority::progressEconomyEvidenceRebase()
+    {
+        requireHostDynamicPublicationAuthority(
+            "Host ExpertOverlay economy-evidence rebase");
+        if (!migrationEnabled() || !config_.histogram)
         {
-            if (!config_.histogram->windowFull())
+            throw std::logic_error(
+                "Economy-evidence rebase requires one uncertified Dynamic host authority");
+        }
+        auto activation = economy_activation_state_.load(
+            std::memory_order_acquire);
+        if (activation == EconomyActivationState::ReadyForCertification)
+            return MoEOverlayHistogramRebaseProgress::Complete;
+        if (activation != EconomyActivationState::CollectingEvidence &&
+            activation !=
+                EconomyActivationState::RebasingRoutingEvidence)
+        {
+            throw std::logic_error(
+                "Economy-evidence rebase requires one uncertified Dynamic host authority");
+        }
+        if (activation == EconomyActivationState::CollectingEvidence)
+        {
+            EconomyActivationState expected =
+                EconomyActivationState::CollectingEvidence;
+            if (!economy_activation_state_.compare_exchange_strong(
+                    expected,
+                    EconomyActivationState::RebasingRoutingEvidence,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire) &&
+                expected !=
+                    EconomyActivationState::RebasingRoutingEvidence)
+            {
+                throw std::logic_error(
+                    "ExpertOverlay economy activation changed before its routing-evidence rebase");
+            }
+            try
+            {
+                config_.histogram->beginOptimizationDemandRebase();
+            }
+            catch (...)
+            {
+                economy_activation_state_.store(
+                    EconomyActivationState::CollectingEvidence,
+                    std::memory_order_release);
+                throw;
+            }
+        }
+
+        if (config_.histogram->admissionState() !=
+            RuntimeExpertHistogramAdmission::CertificationQuarantine)
+        {
+            throw std::logic_error(
+                "Economy-evidence rebase lost its route-admission quarantine");
+        }
+
+        try
+        {
+            const auto result = progressHistogramDrain(
+                HistogramDrainState::CertificationRebase);
+            if (result.progress !=
+                MoEOverlayHistogramWindowProgress::Ready)
+            {
+                return MoEOverlayHistogramRebaseProgress::Pending;
+            }
+            economy_activation_state_.store(
+                EconomyActivationState::ReadyForCertification,
+                std::memory_order_release);
+            return MoEOverlayHistogramRebaseProgress::Complete;
+        }
+        catch (...)
+        {
+            economy_activation_state_.store(
+                EconomyActivationState::CollectingEvidence,
+                std::memory_order_release);
+            throw;
+        }
+    }
+
+    MoEOverlayHistogramWindowResult
+    MoEOverlayResidencyAuthority::progressHistogramDrain(
+        HistogramDrainState requested_state)
+    {
+        if (requested_state != HistogramDrainState::ProposalWindow &&
+            requested_state != HistogramDrainState::CertificationRebase)
+        {
+            throw std::logic_error(
+                "ExpertOverlay histogram drain requires one explicit purpose");
+        }
+
+        auto current =
+            histogram_drain_state_.load(std::memory_order_acquire);
+        if (current == HistogramDrainState::Idle)
+        {
+            if (requested_state == HistogramDrainState::ProposalWindow &&
+                !config_.histogram->windowFull())
+            {
                 return {};
-            histogram_drain_active_.store(true, std::memory_order_release);
+            }
+            HistogramDrainState expected = HistogramDrainState::Idle;
+            if (!histogram_drain_state_.compare_exchange_strong(
+                    expected,
+                    requested_state,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+            {
+                current = expected;
+            }
+            else
+            {
+                current = requested_state;
+            }
+        }
+        if (current != requested_state)
+        {
+            throw std::logic_error(
+                "ExpertOverlay histogram drain purpose changed while a drain was active");
         }
 
         const auto drain =
@@ -1684,7 +2105,8 @@ namespace llaminar2
         if (drain.progress ==
             RuntimeExpertHistogramDrainProgress::Failed)
         {
-            histogram_drain_active_.store(false, std::memory_order_release);
+            histogram_drain_state_.store(
+                HistogramDrainState::Idle, std::memory_order_release);
             throw std::runtime_error(
                 drain.error.empty()
                     ? "Failed to drain runtime expert histograms at the overlay maintenance boundary"
@@ -1692,7 +2114,8 @@ namespace llaminar2
         }
         if (!config_.histogram->syncRuntimeHistograms())
         {
-            histogram_drain_active_.store(false, std::memory_order_release);
+            histogram_drain_state_.store(
+                HistogramDrainState::Idle, std::memory_order_release);
             throw std::runtime_error(
                 "Failed to merge synchronous runtime expert histograms at the overlay maintenance boundary");
         }
@@ -1700,18 +2123,70 @@ namespace llaminar2
         auto window =
             std::make_shared<DecodeExpertHistogramWindow>(
                 config_.histogram->freezeAndRotateWindow());
-        histogram_drain_active_.store(false, std::memory_order_release);
         if (!window->valid() ||
             window->num_layers != config_.model_metadata.num_layers ||
             window->num_experts != config_.model_metadata.num_experts)
         {
+            /* The completed drain has no resumable work once its bank has
+             * rotated.  Return the typed lifecycle to Idle, but never advance
+             * the adaptive policy from malformed evidence. */
+            histogram_drain_state_.store(
+                HistogramDrainState::Idle, std::memory_order_release);
             throw std::runtime_error(
                 "Frozen ExpertOverlay histogram does not match model geometry");
         }
+        if (requested_state == HistogramDrainState::ProposalWindow)
+            growHistogramWindowAfterProposalRotation();
+        histogram_drain_state_.store(
+            HistogramDrainState::Idle, std::memory_order_release);
         return {
             .progress = MoEOverlayHistogramWindowProgress::Ready,
             .window = std::move(window),
         };
+    }
+
+    void MoEOverlayResidencyAuthority::
+        growHistogramWindowAfterProposalRotation()
+    {
+        if (!config_.histogram ||
+            config_.histogram_max_window_tokens == 0u ||
+            config_.histogram_window_growth_factor <= 1.0)
+        {
+            return;
+        }
+
+        const std::uint64_t current = static_cast<std::uint64_t>(
+            config_.histogram->windowSize());
+        const std::uint64_t maximum =
+            config_.histogram_max_window_tokens;
+        if (current >= maximum)
+            return;
+
+        const long double scaled =
+            static_cast<long double>(current) *
+            static_cast<long double>(
+                config_.histogram_window_growth_factor);
+        const std::uint64_t next =
+            scaled >= static_cast<long double>(maximum)
+                ? maximum
+                : std::max<std::uint64_t>(
+                      current + 1u,
+                      static_cast<std::uint64_t>(std::ceil(scaled)));
+        config_.histogram->setWindowSize(static_cast<int>(next));
+        PerfStatsCollector::addCounter(
+            "moe_overlay_residency",
+            "histogram_window_growth",
+            1.0,
+            "maintenance",
+            config_.perf_device,
+            {{"previous_tokens", std::to_string(current)},
+             {"next_tokens", std::to_string(next)},
+             {"maximum_tokens", std::to_string(maximum)},
+             {"growth_factor",
+              std::to_string(
+                  config_.histogram_window_growth_factor)},
+             {"policy_owner", "host"},
+             {"blocking_inference", "false"}});
     }
 
     MoEOverlayResidencyTransaction
@@ -1738,9 +2213,216 @@ namespace llaminar2
             transaction.candidate = std::move(unchanged);
             return transaction;
         }
+        if (hasEconomyCertification() && !optimizationDemandActive())
+        {
+            throw std::logic_error(
+                "ExpertOverlay cannot propose from a sealed economy profile before request-boundary demand activation");
+        }
 
         return proposeFromFrozenHistogramWindow(
             freezeAndRotateHistogramWindow());
+    }
+
+    bool MoEOverlayResidencyAuthority::initialPreparedPlacementPublished()
+        const
+    {
+        const auto current = snapshot();
+        if (!current || !current->valid() || !initial_snapshot_ ||
+            !initial_snapshot_->valid() ||
+            current->layered_ownership !=
+                initial_snapshot_->layered_ownership)
+        {
+            return false;
+        }
+
+        const auto &current_placements =
+            current->placement_plan->placements;
+        const auto &initial_placements =
+            initial_snapshot_->placement_plan->placements;
+        if (current_placements.size() != initial_placements.size())
+            return false;
+        for (std::size_t index = 0; index < current_placements.size(); ++index)
+        {
+            if (current_placements[index].layer !=
+                    initial_placements[index].layer ||
+                current_placements[index].routed_expert_tier !=
+                    initial_placements[index].routed_expert_tier)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    MoEOverlayResidencyTransaction
+    MoEOverlayResidencyAuthority::
+        proposeInitialPreparedPlacementRestoration()
+    {
+        requireHostDynamicPublicationAuthority(
+            "Host ExpertOverlay prepared-context restoration proposal");
+        if (!migrationEnabled())
+        {
+            throw std::logic_error(
+                "Prepared-context restoration requires Dynamic ExpertOverlay maintenance");
+        }
+
+        const auto previous = snapshot();
+        if (!previous || !previous->valid() || !initial_snapshot_ ||
+            !initial_snapshot_->valid())
+        {
+            throw std::logic_error(
+                "Prepared-context restoration requires valid current and initial snapshots");
+        }
+
+        const auto build_transaction =
+            [&](std::shared_ptr<const MoEOverlayResidencySnapshot> candidate)
+        {
+            MoEOverlayResidencyTransaction result;
+            result.purpose = MoEOverlayResidencyTransactionPurpose::
+                PreparedContextRestoration;
+            result.expected_epoch = previous->epoch;
+            result.previous = previous;
+            result.candidate = std::move(candidate);
+            result.migrations = buildMigrations(
+                *previous,
+                *result.candidate,
+                nullptr,
+                /*estimated_weight_bytes=*/0u);
+            result.migration_cycles = buildMigrationCycles(
+                result.migrations);
+            result.shadow_requirements = buildShadowRequirements(
+                result.migrations);
+            if (!result.valid())
+            {
+                throw std::logic_error(
+                    "Prepared-context restoration produced an invalid residency transaction");
+            }
+            return result;
+        };
+
+        auto target = buildSnapshot(
+            previous->epoch + 1u,
+            *initial_snapshot_->placement_plan,
+            config_.model_metadata,
+            &previous->owner_map,
+            &initial_snapshot_->layered_ownership);
+        requireCapacityPreserving(*previous, *target);
+        auto full = build_transaction(target);
+        if (full.empty())
+            return full;
+
+        const auto fits_wave_budget =
+            [&](const MoEOverlayResidencyTransaction &candidate)
+        {
+            if (config_.max_concurrent_cycles != 0u &&
+                candidate.migration_cycles.size() >
+                    config_.max_concurrent_cycles)
+            {
+                return false;
+            }
+            return std::all_of(
+                candidate.shadow_requirements.begin(),
+                candidate.shadow_requirements.end(),
+                [&](const auto &requirement)
+                {
+                    return config_.shadow_slots_per_endpoint_layer == 0u ||
+                           requirement.slot_count <=
+                               config_.shadow_slots_per_endpoint_layer;
+                });
+        };
+        if (fits_wave_budget(full))
+            return full;
+
+        /*
+         * A restoration is decomposed only at closed-cycle boundaries. Start
+         * from the live state and add deterministic target cycles until the
+         * exact preallocated wave BOM is full. Rebuilding the candidate after
+         * each addition is intentional: overlapping logical cycles may merge
+         * into a different physical cycle set, and the transport must be
+         * admitted against that recomposed reality.
+         */
+        std::vector<std::size_t> selected_cycles;
+        std::optional<MoEOverlayResidencyTransaction> bounded;
+        for (std::size_t cycle_index = 0;
+             cycle_index < full.migration_cycles.size();
+             ++cycle_index)
+        {
+            auto trial_cycles = selected_cycles;
+            trial_cycles.push_back(cycle_index);
+
+            MoERoutedExpertPlacementPlan trial_plan =
+                *initial_snapshot_->placement_plan;
+            trial_plan.placements = previous->placement_plan->placements;
+            MoELayeredExpertOwnership trial_ownership =
+                previous->layered_ownership;
+            for (const std::size_t selected : trial_cycles)
+            {
+                const auto &cycle = full.migration_cycles.at(selected);
+                for (const std::size_t migration_index :
+                     cycle.migration_indices)
+                {
+                    const auto &migration =
+                        full.migrations.at(migration_index);
+                    const auto placement = std::find_if(
+                        trial_plan.placements.begin(),
+                        trial_plan.placements.end(),
+                        [&](const auto &entry)
+                        { return entry.layer == migration.layer_idx; });
+                    if (placement == trial_plan.placements.end() ||
+                        migration.expert_id < 0 ||
+                        migration.expert_id >= static_cast<int>(
+                            placement->routed_expert_tier.size()))
+                    {
+                        throw std::logic_error(
+                            "Prepared-context restoration cycle references invalid placement geometry");
+                    }
+                    placement->routed_expert_tier[
+                        static_cast<std::size_t>(migration.expert_id)] =
+                        migration.destination.tier_idx;
+                    trial_ownership.assignOwner(
+                        migration.layer_idx,
+                        migration.expert_id,
+                        migration.destination.owner_participant);
+                }
+            }
+
+            auto trial_snapshot = buildSnapshot(
+                previous->epoch + 1u,
+                std::move(trial_plan),
+                config_.model_metadata,
+                &previous->owner_map,
+                &trial_ownership);
+            requireCapacityPreserving(*previous, *trial_snapshot);
+            auto trial = build_transaction(std::move(trial_snapshot));
+            if (trial.empty() || !fits_wave_budget(trial))
+                continue;
+            selected_cycles = std::move(trial_cycles);
+            bounded = std::move(trial);
+            if (config_.max_concurrent_cycles != 0u &&
+                bounded->migration_cycles.size() >=
+                    config_.max_concurrent_cycles)
+            {
+                break;
+            }
+        }
+
+        if (!bounded)
+        {
+            throw std::runtime_error(
+                "Prepared-context restoration cannot express one closed cycle within the configured shadow-slot and concurrency BOM");
+        }
+        PerfStatsCollector::addCounter(
+            "moe_overlay_residency",
+            "prepared_context_restoration_bounded_waves",
+            1.0,
+            "model_teardown",
+            config_.perf_device,
+            {{"target_cycles", std::to_string(full.migration_cycles.size())},
+             {"admitted_cycles",
+              std::to_string(bounded->migration_cycles.size())},
+             {"max_concurrent_cycles",
+              std::to_string(config_.max_concurrent_cycles)}});
+        return std::move(*bounded);
     }
 
     std::shared_ptr<const DecodeExpertHistogramWindow>
@@ -1769,6 +2451,7 @@ namespace llaminar2
             throw std::runtime_error(
                 "Frozen ExpertOverlay histogram does not match model geometry");
         }
+        growHistogramWindowAfterProposalRotation();
         return window;
     }
 
@@ -1782,6 +2465,11 @@ namespace llaminar2
         {
             throw std::logic_error(
                 "ExpertOverlay histogram proposals require Dynamic maintenance");
+        }
+        if (hasEconomyCertification() && !optimizationDemandActive())
+        {
+            throw std::logic_error(
+                "ExpertOverlay cannot propose from a sealed economy profile before request-boundary demand activation");
         }
         if (!window || !window->valid() ||
             window->num_layers != config_.model_metadata.num_layers ||
@@ -1910,6 +2598,28 @@ namespace llaminar2
             planning_window = &*state.smoothed_window;
         }
 
+        /*
+         * Materialize the exact evidence which will travel with the transaction.
+         * After generation one, the economy policy's deterministic smoothing
+         * window differs from the raw RCU bank. Publishing the raw bank while
+         * retaining migration counts derived from the smoothed window creates
+         * two authorities for one activation count and makes peers reject the
+         * otherwise authenticated proposal. The raw input has already been
+         * retained in `last_input_window`; only the effective planning evidence
+         * belongs to the executable transaction.
+         */
+        if (planning_window != transaction.histogram_window.get())
+        {
+            transaction.histogram_window =
+                std::make_shared<const DecodeExpertHistogramWindow>(
+                    *planning_window);
+        }
+        planning_window = transaction.histogram_window.get();
+
+        /* Authenticate the redundant aggregate/phase representation once, then
+         * give every planner and economy hot loop the typed constant-time view. */
+        const auto planning_evidence = planning_window->validatedView();
+
         MoERoutedExpertPlacementPlannerOptions options;
         options.decode_histogram_window = planning_window;
         options.phase_service_profile =
@@ -1928,8 +2638,12 @@ namespace llaminar2
             config_.model_metadata,
             &previous->owner_map);
 
+        std::vector<MoELayeredExpertOwnershipChange> participant_changes;
         const auto build_transaction =
-            [&](std::shared_ptr<const MoEOverlayResidencySnapshot> candidate)
+            [&](
+                std::shared_ptr<const MoEOverlayResidencySnapshot> candidate,
+                std::span<const MoELayeredExpertOwnershipChange>
+                    movement_objectives)
         {
             MoEOverlayResidencyTransaction result;
             result.expected_epoch = previous->epoch;
@@ -1940,8 +2654,9 @@ namespace llaminar2
             result.migrations = buildMigrations(
                 *previous,
                 *result.candidate,
-                result.histogram_window.get(),
-                planned.memory.routed_expert_bytes_per_expert);
+                &planning_evidence,
+                planned.memory.routed_expert_bytes_per_expert,
+                movement_objectives);
             result.migration_cycles = buildMigrationCycles(
                 result.migrations);
             result.shadow_requirements = buildShadowRequirements(
@@ -1955,7 +2670,7 @@ namespace llaminar2
         };
 
         const auto tier_target_transaction =
-            build_transaction(tier_target_candidate);
+            build_transaction(tier_target_candidate, {});
 
         /*
          * Participant makespan is a property of the epoch this bounded wave
@@ -1972,16 +2687,35 @@ namespace llaminar2
         if (!tier_target_transaction.empty() &&
             config_.max_concurrent_cycles > 1u)
         {
+            struct BoundedTierCycleScore
+            {
+                bool eligible = true;
+                uint64_t projected_service_gain_ns = 0;
+                uint64_t projected_net_benefit_ns = 0;
+                long double priority_weighted_demand = 0.0L;
+            };
+
             std::vector<std::size_t> tier_cycle_order(
                 tier_target_transaction.migration_cycles.size());
             std::iota(
                 tier_cycle_order.begin(),
                 tier_cycle_order.end(),
                 0u);
-            const auto priority_service_score =
+
+            /*
+             * Candidate search must use the same endpoint critical path that
+             * ultimately gates admission. A raw activation winner can live on
+             * a non-gating CPU participant; selecting it here and discarding
+             * every other tier cycle makes the later economy gate correctly
+             * reject the only candidate it is allowed to see. Score every
+             * alternative once before applying the bounded-wave cut. The
+             * complete transaction gate below remains the publication
+             * authority and rechecks interactions with participant movement.
+             */
+            const auto bounded_tier_cycle_score =
                 [&](const std::size_t cycle_index)
             {
-                long double score = 0.0L;
+                BoundedTierCycleScore score;
                 const auto &cycle =
                     tier_target_transaction.migration_cycles.at(
                         cycle_index);
@@ -1997,22 +2731,263 @@ namespace llaminar2
                     const int destination_priority = tierPriority(
                         *tier_target_candidate->placement_plan,
                         migration.destination.tier_idx);
-                    score +=
+                    score.priority_weighted_demand +=
                         static_cast<long double>(
                             migration.activation_count) *
                         static_cast<long double>(
                             source_priority - destination_priority);
                 }
+
+                if (!config_.migration_economy_policy)
+                    return score;
+                if (!economy_state_ || planning_evidence.tokenCount() == 0)
+                {
+                    throw std::logic_error(
+                        "ExpertOverlay bounded tier selection requires complete non-zero economy evidence");
+                }
+
+                const auto &state = *economy_state_;
+                const auto &policy = *config_.migration_economy_policy;
+                const std::size_t participant_count =
+                    previous->owner_map.participants().size();
+                WideCost service_gain_one_window = 0;
+                bool phase_safe = true;
+                for (std::size_t phase = 0;
+                     phase < kProductionHistogramSources.size();
+                     ++phase)
+                {
+                    std::vector<WideCost> before_work(
+                        participant_count, 0);
+                    std::vector<WideCost> after_work(
+                        participant_count, 0);
+                    for (const auto &owner : previous->owner_map.owners())
+                    {
+                        if (owner.layer_idx != cycle.layer_idx)
+                            continue;
+                        int after_participant = owner.owner_participant;
+                        for (const std::size_t migration_index :
+                             cycle.migration_indices)
+                        {
+                            const auto &migration =
+                                tier_target_transaction.migrations.at(
+                                    migration_index);
+                            if (migration.layer_idx == owner.layer_idx &&
+                                migration.expert_id == owner.expert_id)
+                            {
+                                if (migration.source.owner_participant !=
+                                    owner.owner_participant)
+                                {
+                                    throw std::logic_error(
+                                        "ExpertOverlay bounded tier candidate source disagrees with the published owner map");
+                                }
+                                after_participant =
+                                    migration.destination.owner_participant;
+                                break;
+                            }
+                        }
+                        if (owner.owner_participant < 0 ||
+                            after_participant < 0 ||
+                            owner.owner_participant >=
+                                static_cast<int>(participant_count) ||
+                            after_participant >=
+                                static_cast<int>(participant_count))
+                        {
+                            throw std::logic_error(
+                                "ExpertOverlay bounded tier candidate references an invalid participant");
+                        }
+
+                        const uint64_t demand =
+                            planning_evidence.activationCount(
+                                kProductionHistogramSources[phase],
+                                owner.layer_idx,
+                                owner.expert_id);
+                        if (!state.active_sources[phase])
+                        {
+                            if (demand != 0)
+                            {
+                                throw std::logic_error(
+                                    "ExpertOverlay bounded tier candidate observed demand in a disabled phase");
+                            }
+                            continue;
+                        }
+                        const auto &before_cost =
+                            state.participantServiceCost(
+                                owner.owner_participant,
+                                owner.layer_idx);
+                        const auto &after_cost =
+                            state.participantServiceCost(
+                                after_participant,
+                                owner.layer_idx);
+                        checkedAddWide(
+                            &before_work[static_cast<std::size_t>(
+                                owner.owner_participant)],
+                            checkedMultiplyWide(
+                                demand,
+                                before_cost
+                                    .nanoseconds_per_activation[phase],
+                                "bounded tier participant service cost"),
+                            "bounded tier participant work");
+                        checkedAddWide(
+                            &after_work[static_cast<std::size_t>(
+                                after_participant)],
+                            checkedMultiplyWide(
+                                demand,
+                                after_cost
+                                    .nanoseconds_per_activation[phase],
+                                "bounded tier candidate service cost"),
+                            "bounded tier candidate work");
+                    }
+
+                    const WideCost before = *std::max_element(
+                        before_work.begin(), before_work.end());
+                    const WideCost after = *std::max_element(
+                        after_work.begin(), after_work.end());
+                    if (after > before)
+                    {
+                        phase_safe = false;
+                        continue;
+                    }
+                    checkedAddWide(
+                        &service_gain_one_window,
+                        before - after,
+                        "bounded tier critical-path gain");
+                }
+
+                WideCost transfer = 0;
+                WideCost interference = 0;
+                bool residency_eligible = true;
+                const bool paired_wave_calibrated =
+                    cycle.migration_indices.size() == 2u &&
+                    [&]
+                    {
+                        const auto &first =
+                            tier_target_transaction.migrations.at(
+                                cycle.migration_indices[0]);
+                        const auto &second =
+                            tier_target_transaction.migrations.at(
+                                cycle.migration_indices[1]);
+                        return first.layer_idx == second.layer_idx &&
+                               first.source.owner_participant ==
+                                   second.destination.owner_participant &&
+                               first.destination.owner_participant ==
+                                   second.source.owner_participant;
+                    }();
+                for (const std::size_t migration_index :
+                     cycle.migration_indices)
+                {
+                    const auto &migration =
+                        tier_target_transaction.migrations.at(
+                            migration_index);
+                    const auto &movement = state.migrationCost(
+                        migration.source.owner_participant,
+                        migration.destination.owner_participant,
+                        migration.layer_idx);
+                    if (paired_wave_calibrated)
+                    {
+                        transfer = std::max<WideCost>(
+                            transfer, movement.transfer_and_repack_ns);
+                        interference = std::max<WideCost>(
+                            interference,
+                            movement.inference_interference_ns);
+                    }
+                    else
+                    {
+                        checkedAddWide(
+                            &transfer,
+                            movement.transfer_and_repack_ns,
+                            "bounded tier transfer cost");
+                        checkedAddWide(
+                            &interference,
+                            movement.inference_interference_ns,
+                            "bounded tier interference cost");
+                    }
+
+                    const uint64_t last_moved =
+                        state.last_moved_generation[state.expertOffset(
+                            migration.layer_idx,
+                            migration.expert_id)];
+                    if (last_moved !=
+                        std::numeric_limits<uint64_t>::max())
+                    {
+                        if (transaction.histogram_generation < last_moved)
+                        {
+                            throw std::logic_error(
+                                "ExpertOverlay committed hysteresis generation exceeds bounded tier evidence");
+                        }
+                        residency_eligible = residency_eligible &&
+                            transaction.histogram_generation - last_moved >=
+                                policy.minimum_residency_generations;
+                    }
+                }
+
+                const WideCost projected_gain = checkedMultiplyWide(
+                    service_gain_one_window,
+                    policy.payoff_horizon_tokens,
+                    "bounded tier projected service gain") /
+                    planning_evidence.tokenCount();
+                WideCost measured_cost = transfer;
+                checkedAddWide(
+                    &measured_cost,
+                    interference,
+                    "bounded tier measured movement cost");
+                const WideCost net_benefit =
+                    projected_gain > measured_cost
+                        ? projected_gain - measured_cost
+                        : 0;
+                score.projected_service_gain_ns = checkedCostToU64(
+                    projected_gain,
+                    "bounded tier projected service gain");
+                score.projected_net_benefit_ns = checkedCostToU64(
+                    net_benefit,
+                    "bounded tier projected net benefit");
+                score.eligible = phase_safe && residency_eligible &&
+                                 net_benefit >
+                                     policy.minimum_net_benefit_ns;
                 return score;
             };
+
+            std::vector<BoundedTierCycleScore> tier_cycle_scores;
+            tier_cycle_scores.reserve(tier_cycle_order.size());
+            for (const std::size_t cycle_index : tier_cycle_order)
+            {
+                tier_cycle_scores.push_back(
+                    bounded_tier_cycle_score(cycle_index));
+            }
             std::stable_sort(
                 tier_cycle_order.begin(),
                 tier_cycle_order.end(),
                 [&](const std::size_t lhs, const std::size_t rhs)
                 {
-                    return priority_service_score(lhs) >
-                           priority_service_score(rhs);
+                    const auto &left = tier_cycle_scores.at(lhs);
+                    const auto &right = tier_cycle_scores.at(rhs);
+                    if (left.eligible != right.eligible)
+                        return left.eligible;
+                    if (left.projected_net_benefit_ns !=
+                        right.projected_net_benefit_ns)
+                    {
+                        return left.projected_net_benefit_ns >
+                               right.projected_net_benefit_ns;
+                    }
+                    if (left.projected_service_gain_ns !=
+                        right.projected_service_gain_ns)
+                    {
+                        return left.projected_service_gain_ns >
+                               right.projected_service_gain_ns;
+                    }
+                    return left.priority_weighted_demand >
+                           right.priority_weighted_demand;
                 });
+            /*
+             * Keep individually ineligible cycles behind the profitable
+             * alternatives instead of deleting them. Participant makespan is
+             * a max reduction: moving work off one of two co-critical
+             * endpoints can have zero standalone gain yet be a necessary
+             * member of a profitable bounded cohort. The complete
+             * transaction economy below is the sole admission authority and
+             * rejects a cohort that never becomes profitable. This ordering
+             * therefore improves search without mistaking a marginal score
+             * for a publication decision.
+             */
 
             const std::size_t tier_cycle_budget =
                 static_cast<std::size_t>(
@@ -2081,7 +3056,7 @@ namespace llaminar2
                 trial_cycles.push_back(cycle_index);
                 auto trial_candidate = build_tier_subset(trial_cycles);
                 const auto trial_transaction =
-                    build_transaction(trial_candidate);
+                    build_transaction(trial_candidate, {});
                 const bool shadow_safe = std::all_of(
                     trial_transaction.shadow_requirements.begin(),
                     trial_transaction.shadow_requirements.end(),
@@ -2104,9 +3079,11 @@ namespace llaminar2
                 selected_tier_cycles.size();
         }
 
-        MoEOverlayParticipantRebalancePolicy participant_policy =
+        MoEOverlayParticipantRebalancePolicy participant_search_policy =
             config_.participant_rebalance_policy;
-        if (participant_policy.enabled &&
+        std::uint32_t participant_admission_entry_limit =
+            participant_search_policy.maximum_plan_entries_per_wave;
+        if (participant_search_policy.enabled &&
             !tier_target_transaction.empty() &&
             config_.max_concurrent_cycles != 0u)
         {
@@ -2119,24 +3096,44 @@ namespace llaminar2
                  * the next epoch can then use its sole slot for participant
                  * placement if skew remains.
                  */
-                participant_policy.enabled = false;
+                participant_search_policy.enabled = false;
+                participant_admission_entry_limit = 0u;
             }
             else
             {
+                /*
+                 * One participant cycle is admitted beside the layer-parallel
+                 * tier cohort, but it must not also be the candidate-search
+                 * limit. A raw-count winner can be phase-regressive or
+                 * uneconomical after measured endpoint costs are applied. Keep
+                 * every configured alternative available to the economy
+                 * scheduler, then enforce this two-edge admission budget while
+                 * composing the actual wave below.
+                 */
                 constexpr std::uint64_t participant_entry_limit = 2u;
-                participant_policy.maximum_plan_entries_per_wave =
+                participant_admission_entry_limit =
                     static_cast<std::uint32_t>(
                         std::min<std::uint64_t>(
-                            participant_policy
+                            participant_search_policy
                                 .maximum_plan_entries_per_wave,
                             participant_entry_limit));
+                /*
+                 * Search one self-contained swap per layer. A second greedy
+                 * swap in the same layer is defined on the first swap's
+                 * provisional owner map, so collapsing both into final owner
+                 * deltas does not leave two independently admissible
+                 * alternatives. Later layers are independent candidates and
+                 * provide the breadth needed when the first layer is rejected
+                 * by phase-aware economics.
+                 */
+                participant_search_policy.maximum_swaps_per_layer = 1u;
             }
         }
         const auto participant_plan = planOverlayParticipantRebalance(
             *participant_base_candidate->placement_plan,
             participant_base_candidate->owner_map,
-            *planning_window,
-            participant_policy);
+            planning_evidence,
+            participant_search_policy);
         participant_rebalance_checks_.fetch_add(
             participant_plan.evidence.size(),
             std::memory_order_relaxed);
@@ -2197,9 +3194,8 @@ namespace llaminar2
             tier_target_candidate;
         if (participant_plan.ownerChanges() != 0u)
         {
-            const auto participant_changes =
-                participant_plan.ownership.changesFrom(
-                    participant_base_candidate->layered_ownership);
+            participant_changes = participant_plan.ownership.changesFrom(
+                participant_base_candidate->layered_ownership);
 
             /*
              * The base already contains the exact tier subset reserved for
@@ -2237,7 +3233,9 @@ namespace llaminar2
         }
         requireCapacityPreserving(*previous, *full_candidate);
 
-        auto full_transaction = build_transaction(full_candidate);
+        auto full_transaction = build_transaction(
+            full_candidate,
+            participant_changes);
         const auto fits_wave_budget = [&](
                                           const MoEOverlayResidencyTransaction &candidate)
         {
@@ -2272,7 +3270,207 @@ namespace llaminar2
             }
         };
 
-        const auto score_economy_cycle = [&]
+        /** Exact before/after routed-service critical path for one window. */
+        struct ParticipantMakespanScore
+        {
+            std::array<WideCost, kExpertHistogramProductionSourceCount>
+                service_before_by_phase_ns{};
+            std::array<WideCost, kExpertHistogramProductionSourceCount>
+                service_after_by_phase_ns{};
+        };
+
+        /** Reject phase cross-subsidy before considering aggregate payoff. */
+        const auto phases_do_not_regress = [&]
+            (const ParticipantMakespanScore &score)
+        {
+            for (std::size_t phase = 0;
+                 phase < kProductionHistogramSources.size();
+                 ++phase)
+            {
+                if (score.service_after_by_phase_ns[phase] >
+                    score.service_before_by_phase_ns[phase])
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        /** Sum phase-pure costs only after their independent gate passes. */
+        const auto aggregate_makespan = [&]
+            (const std::array<
+                 WideCost,
+                 kExpertHistogramProductionSourceCount> &by_phase,
+             const char *description)
+        {
+            WideCost total = 0;
+            for (const WideCost phase_cost : by_phase)
+            {
+                checkedAddWide(
+                    &total,
+                    phase_cost,
+                    description);
+            }
+            return total;
+        };
+
+        /*
+         * Score every selected owner change through one participant-level
+         * objective. Expert kernels for one layer run in parallel across the
+         * participants and the collective cannot advance until the slowest
+         * participant completes, so an individual CPU-to-GPU delta is not a
+         * benefit unless it reduces that layer's actual critical path. Applying
+         * tier and participant moves to the same owner map also prevents the two
+         * axes from double-counting one another.
+         */
+        const auto score_participant_makespan = [&]
+            (const MoEOverlayResidencyTransaction &candidate,
+             const std::vector<std::size_t> &before_migration_indices,
+             const std::vector<std::size_t> &after_migration_indices)
+        {
+            ParticipantMakespanScore score;
+            if (after_migration_indices.empty())
+                return score;
+
+            const auto &state = *economy_state_;
+            const std::size_t participant_count =
+                candidate.previous->owner_map.participants().size();
+            std::vector<int> affected_layers;
+            affected_layers.reserve(
+                before_migration_indices.size() +
+                after_migration_indices.size());
+            for (const auto *indices : {
+                     &before_migration_indices,
+                     &after_migration_indices})
+            {
+                for (const std::size_t migration_index : *indices)
+                {
+                    const auto &migration =
+                        candidate.migrations.at(migration_index);
+                    affected_layers.push_back(migration.layer_idx);
+                }
+            }
+            std::sort(affected_layers.begin(), affected_layers.end());
+            affected_layers.erase(
+                std::unique(affected_layers.begin(), affected_layers.end()),
+                affected_layers.end());
+
+            for (const int layer_idx : affected_layers)
+            {
+                for (std::size_t phase = 0;
+                     phase < kProductionHistogramSources.size();
+                     ++phase)
+                {
+                    std::vector<WideCost> before_work(
+                        participant_count, 0);
+                    std::vector<WideCost> after_work(
+                        participant_count, 0);
+                    for (const auto &owner :
+                         candidate.previous->owner_map.owners())
+                    {
+                        if (owner.layer_idx != layer_idx)
+                            continue;
+                        const auto owner_after = [&]
+                            (const std::vector<std::size_t> &indices)
+                        {
+                            for (const std::size_t migration_index : indices)
+                            {
+                                const auto &migration =
+                                    candidate.migrations.at(migration_index);
+                                if (migration.layer_idx == owner.layer_idx &&
+                                    migration.expert_id == owner.expert_id)
+                                {
+                                    if (migration.source.owner_participant !=
+                                        owner.owner_participant)
+                                    {
+                                        throw std::logic_error(
+                                            "ExpertOverlay economy migration source disagrees with the published owner map");
+                                    }
+                                    return migration.destination
+                                        .owner_participant;
+                                }
+                            }
+                            return owner.owner_participant;
+                        };
+                        const int before_participant = owner_after(
+                            before_migration_indices);
+                        const int after_participant = owner_after(
+                            after_migration_indices);
+                        if (before_participant < 0 ||
+                            after_participant < 0 ||
+                            before_participant >=
+                                static_cast<int>(participant_count) ||
+                            after_participant >=
+                                static_cast<int>(participant_count))
+                        {
+                            throw std::logic_error(
+                                "ExpertOverlay participant economy references an invalid owner");
+                        }
+
+                        const uint64_t demand =
+                            planning_evidence.activationCount(
+                                kProductionHistogramSources[phase],
+                                layer_idx,
+                                owner.expert_id);
+                        if (!state.active_sources[phase])
+                        {
+                            if (demand != 0)
+                            {
+                                throw std::logic_error(
+                                    "ExpertOverlay participant economy observed routed demand in a runtime-disabled inference phase");
+                            }
+                            continue;
+                        }
+                        const auto &before_cost =
+                            state.participantServiceCost(
+                                before_participant, layer_idx);
+                        const auto &after_cost =
+                            state.participantServiceCost(
+                                after_participant, layer_idx);
+                        checkedAddWide(
+                            &before_work[static_cast<std::size_t>(
+                                before_participant)],
+                            checkedMultiplyWide(
+                                demand,
+                                before_cost
+                                    .nanoseconds_per_activation[phase],
+                                "participant critical-path service cost"),
+                            "participant critical-path work");
+                        checkedAddWide(
+                            &after_work[static_cast<std::size_t>(
+                                after_participant)],
+                            checkedMultiplyWide(
+                                demand,
+                                after_cost
+                                    .nanoseconds_per_activation[phase],
+                                "candidate participant critical-path service cost"),
+                            "candidate participant critical-path work");
+                    }
+                    checkedAddWide(
+                        &score.service_before_by_phase_ns[phase],
+                        *std::max_element(
+                            before_work.begin(), before_work.end()),
+                        "window participant critical path before movement");
+                    checkedAddWide(
+                        &score.service_after_by_phase_ns[phase],
+                        *std::max_element(
+                            after_work.begin(), after_work.end()),
+                        "window participant critical path after movement");
+                }
+            }
+            return score;
+        };
+
+        /**
+         * Price physical movement and hysteresis without rescoring service.
+         *
+         * Transaction scoring already evaluates its complete before/after
+         * participant makespan once. Re-entering the service scorer for every
+         * constituent cycle was both redundant and asymptotically disastrous:
+         * a large model paid the complete layer/expert scan once per cycle for
+         * every bounded candidate prefix.
+         */
+        const auto score_cycle_physical_cost = [&]
             (const MoEOverlayResidencyTransaction &candidate,
              const MoEOverlayTierMigrationCycle &cycle)
         {
@@ -2282,45 +3480,8 @@ namespace llaminar2
 
             const auto &policy = *config_.migration_economy_policy;
             const auto &state = *economy_state_;
-            WideCost service_savings_one_window = 0;
-            WideCost service_penalties_one_window = 0;
             WideCost transfer = 0;
             WideCost interference = 0;
-
-            /*
-             * Tier placement and participant placement are dependent axes. A
-             * same-tier swap leaves aggregate tier work unchanged, so it must
-             * be priced by its parallel makespan reduction. Establish the
-             * baseline after every tier-crossing edge in this candidate, then
-             * apply only this cycle's within-tier edges. Pricing against the
-             * old epoch would incorrectly reject a CPU skew correction when
-             * the old bottleneck is being promoted by the same transaction.
-             * Mixed cycles receive both the additive tier delta below and the
-             * distinct within-tier makespan delta; those terms represent
-             * different work and do not double count one another.
-             */
-            std::vector<std::size_t> same_tier_migration_indices;
-            std::vector<std::pair<int, int>> same_tier_coordinates;
-            for (const std::size_t migration_index :
-                 cycle.migration_indices)
-            {
-                const auto &migration =
-                    candidate.migrations.at(migration_index);
-                if (migration.crossesTier())
-                    continue;
-                same_tier_migration_indices.push_back(migration_index);
-                same_tier_coordinates.emplace_back(
-                    migration.layer_idx,
-                    migration.source.tier_idx);
-            }
-            std::sort(
-                same_tier_coordinates.begin(),
-                same_tier_coordinates.end());
-            same_tier_coordinates.erase(
-                std::unique(
-                    same_tier_coordinates.begin(),
-                    same_tier_coordinates.end()),
-                same_tier_coordinates.end());
             const bool paired_wave_calibrated =
                 cycle.migration_indices.size() == 2u &&
                 [&]
@@ -2335,181 +3496,11 @@ namespace llaminar2
                            first.destination.owner_participant ==
                                second.source.owner_participant;
                 }();
-            for (const auto &[layer_idx, tier_idx] :
-                 same_tier_coordinates)
-            {
-                const std::size_t participant_count =
-                    candidate.previous->owner_map.participants().size();
-                const auto &service_cost = state.serviceCost(
-                    tier_idx, layer_idx);
-
-                for (std::size_t phase = 0;
-                     phase < kProductionHistogramSources.size();
-                     ++phase)
-                {
-                    std::vector<uint64_t> before_load(
-                        participant_count, 0u);
-                    std::vector<uint64_t> after_load(
-                        participant_count, 0u);
-                    for (const auto &owner :
-                         candidate.candidate->owner_map.owners())
-                    {
-                        if (owner.layer_idx != layer_idx ||
-                            owner.tier_idx != tier_idx)
-                        {
-                            continue;
-                        }
-                        if (owner.owner_participant < 0 ||
-                            owner.owner_participant >=
-                                static_cast<int>(participant_count))
-                        {
-                            throw std::logic_error(
-                                "ExpertOverlay same-tier economy references an invalid participant");
-                        }
-                        int before_participant = owner.owner_participant;
-                        int after_participant = owner.owner_participant;
-                        const auto migration_it = std::lower_bound(
-                            candidate.migrations.begin(),
-                            candidate.migrations.end(),
-                            std::pair<int, int>{
-                                owner.layer_idx, owner.expert_id},
-                            [](const auto &migration, const auto &coordinate)
-                            {
-                                return std::pair<int, int>{
-                                           migration.layer_idx,
-                                           migration.expert_id} < coordinate;
-                            });
-                        if (migration_it != candidate.migrations.end() &&
-                            migration_it->layer_idx == owner.layer_idx &&
-                            migration_it->expert_id == owner.expert_id &&
-                            !migration_it->crossesTier())
-                        {
-                            before_participant =
-                                migration_it->source.owner_participant;
-                            const std::size_t migration_index =
-                                static_cast<std::size_t>(std::distance(
-                                    candidate.migrations.begin(),
-                                    migration_it));
-                            if (std::find(
-                                    same_tier_migration_indices.begin(),
-                                    same_tier_migration_indices.end(),
-                                    migration_index) ==
-                                same_tier_migration_indices.end())
-                            {
-                                after_participant = before_participant;
-                            }
-                        }
-                        const uint64_t demand =
-                            planning_window->activationCount(
-                                kProductionHistogramSources[phase],
-                                layer_idx,
-                                owner.expert_id);
-                        if (!state.active_sources[phase])
-                        {
-                            if (demand != 0)
-                            {
-                                throw std::logic_error(
-                                    "ExpertOverlay participant economy observed routed demand in a runtime-disabled inference phase");
-                            }
-                            continue;
-                        }
-                        if (before_participant < 0 ||
-                            after_participant < 0 ||
-                            before_participant >=
-                                static_cast<int>(participant_count) ||
-                            after_participant >=
-                                static_cast<int>(participant_count))
-                        {
-                            throw std::logic_error(
-                                "ExpertOverlay participant economy references an invalid owner");
-                        }
-                        before_load[static_cast<std::size_t>(
-                            before_participant)] += demand;
-                        after_load[static_cast<std::size_t>(
-                            after_participant)] += demand;
-                    }
-                    const uint64_t before_maximum = *std::max_element(
-                        before_load.begin(), before_load.end());
-                    const uint64_t after_maximum = *std::max_element(
-                        after_load.begin(), after_load.end());
-                    const uint64_t nanoseconds_per_activation =
-                        service_cost.nanoseconds_per_activation[phase];
-                    if (before_maximum > after_maximum)
-                    {
-                        checkedAddWide(
-                            &service_savings_one_window,
-                            checkedMultiplyWide(
-                                before_maximum - after_maximum,
-                                nanoseconds_per_activation,
-                                "same-tier participant makespan saving"),
-                            "per-cycle service savings");
-                    }
-                    else if (after_maximum > before_maximum)
-                    {
-                        checkedAddWide(
-                            &service_penalties_one_window,
-                            checkedMultiplyWide(
-                                after_maximum - before_maximum,
-                                nanoseconds_per_activation,
-                                "same-tier participant makespan penalty"),
-                            "per-cycle service penalties");
-                    }
-                }
-            }
             for (const std::size_t migration_index :
                  cycle.migration_indices)
             {
                 const auto &migration =
                     candidate.migrations.at(migration_index);
-                const auto &source_cost = state.serviceCost(
-                    migration.source.tier_idx,
-                    migration.layer_idx);
-                const auto &destination_cost = state.serviceCost(
-                    migration.destination.tier_idx,
-                    migration.layer_idx);
-                for (std::size_t phase = 0;
-                     phase < kProductionHistogramSources.size();
-                     ++phase)
-                {
-                    const uint64_t demand = planning_window->activationCount(
-                        kProductionHistogramSources[phase],
-                        migration.layer_idx,
-                        migration.expert_id);
-                    if (!state.active_sources[phase])
-                    {
-                        if (demand != 0)
-                        {
-                            throw std::logic_error(
-                                "ExpertOverlay economy observed routed demand in a runtime-disabled inference phase");
-                        }
-                        continue;
-                    }
-                    const uint64_t source_ns =
-                        source_cost.nanoseconds_per_activation[phase];
-                    const uint64_t destination_ns =
-                        destination_cost.nanoseconds_per_activation[phase];
-                    if (source_ns > destination_ns)
-                    {
-                        checkedAddWide(
-                            &service_savings_one_window,
-                            checkedMultiplyWide(
-                                demand,
-                                source_ns - destination_ns,
-                                "per-phase service saving"),
-                            "per-cycle service savings");
-                    }
-                    else if (destination_ns > source_ns)
-                    {
-                        checkedAddWide(
-                            &service_penalties_one_window,
-                            checkedMultiplyWide(
-                                demand,
-                                destination_ns - source_ns,
-                                "per-phase service penalty"),
-                            "per-cycle service penalties");
-                    }
-                }
-
                 const auto &movement = state.migrationCost(
                     migration.source.owner_participant,
                     migration.destination.owner_participant,
@@ -2565,12 +3556,72 @@ namespace llaminar2
                 }
             }
 
+            score.transfer_and_repack_ns = checkedCostToU64(
+                transfer,
+                "projected transfer/repack cost");
+            score.inference_interference_ns = checkedCostToU64(
+                interference,
+                "projected inference interference");
+            return score;
+        };
+
+        const auto score_economy_cycle = [&]
+            (const MoEOverlayResidencyTransaction &candidate,
+             const MoEOverlayTierMigrationCycle &cycle)
+        {
+            CycleEconomyScore score =
+                score_cycle_physical_cost(candidate, cycle);
+            if (!config_.migration_economy_policy)
+                return score;
+
+            const auto &policy = *config_.migration_economy_policy;
+            const bool advances_tier = std::any_of(
+                cycle.migration_indices.begin(),
+                cycle.migration_indices.end(),
+                [&](const std::size_t migration_index)
+                {
+                    return candidate.migrations.at(migration_index)
+                        .crossesTier();
+                });
+            std::vector<std::size_t> baseline_migration_indices;
+            if (!advances_tier)
+            {
+                for (std::size_t migration_index = 0;
+                     migration_index < candidate.migrations.size();
+                     ++migration_index)
+                {
+                    if (candidate.migrations[migration_index].crossesTier())
+                        baseline_migration_indices.push_back(migration_index);
+                }
+            }
+            auto candidate_migration_indices = baseline_migration_indices;
+            candidate_migration_indices.insert(
+                candidate_migration_indices.end(),
+                cycle.migration_indices.begin(),
+                cycle.migration_indices.end());
+            const auto makespan = score_participant_makespan(
+                candidate,
+                baseline_migration_indices,
+                candidate_migration_indices);
+
+            if (!phases_do_not_regress(makespan))
+            {
+                score.payoff_eligible = false;
+                return score;
+            }
+            const WideCost service_before_ns =
+                aggregate_makespan(
+                    makespan.service_before_by_phase_ns,
+                    "aggregate participant critical path before movement");
+            const WideCost service_after_ns =
+                aggregate_makespan(
+                    makespan.service_after_by_phase_ns,
+                    "aggregate participant critical path after movement");
             const WideCost service_gain_one_window =
-                service_savings_one_window > service_penalties_one_window
-                    ? service_savings_one_window -
-                          service_penalties_one_window
+                service_before_ns > service_after_ns
+                    ? service_before_ns - service_after_ns
                     : 0;
-            if (planning_window->token_count == 0)
+            if (planning_evidence.tokenCount() == 0)
             {
                 throw std::logic_error(
                     "ExpertOverlay cannot score migration economy from a zero-token histogram window");
@@ -2585,20 +3636,14 @@ namespace llaminar2
              * benefit can never make a migration eligible.
              */
             const WideCost projected_gain =
-                projected_gain_numerator / planning_window->token_count;
+                projected_gain_numerator / planning_evidence.tokenCount();
             score.projected_service_gain_ns = checkedCostToU64(
                 projected_gain,
                 "projected service gain");
-            score.transfer_and_repack_ns = checkedCostToU64(
-                transfer,
-                "projected transfer/repack cost");
-            score.inference_interference_ns = checkedCostToU64(
-                interference,
-                "projected inference interference");
-            WideCost measured_cost = transfer;
+            WideCost measured_cost = score.transfer_and_repack_ns;
             checkedAddWide(
                 &measured_cost,
-                interference,
+                score.inference_interference_ns,
                 "projected measured migration cost");
             if (projected_gain > measured_cost)
             {
@@ -2615,11 +3660,12 @@ namespace llaminar2
         /**
          * Score the selected transaction as one dependent two-axis plan.
          *
-         * Tier service deltas remain additive per expert. All within-tier
-         * edges, however, are applied together to one post-tier baseline so
-         * multiple participant swaps cannot double-count the same reduction
-         * in maximum parallel load. Transfer and interference prices remain
-         * conservative sums of independently certified closed-cycle waves.
+         * Promotion/demotion and within-tier changes are applied together to
+         * the published owner map before measuring the participant critical
+         * path. This is deliberately one objective: a faster expert endpoint
+         * has no value when another participant still gates the same layer.
+         * Transfer and interference prices remain conservative sums of
+         * independently certified closed-cycle waves.
          */
         const auto score_economy_transaction = [&]
             (const MoEOverlayResidencyTransaction &candidate)
@@ -2629,94 +3675,21 @@ namespace llaminar2
                 return score;
 
             const auto &policy = *config_.migration_economy_policy;
-            const auto &state = *economy_state_;
-            WideCost tier_savings_one_window = 0;
-            WideCost tier_penalties_one_window = 0;
             WideCost transfer = 0;
             WideCost interference = 0;
-            std::vector<std::size_t> same_tier_migration_indices;
-
-            for (std::size_t migration_index = 0;
-                 migration_index < candidate.migrations.size();
-                 ++migration_index)
-            {
-                const auto &migration =
-                    candidate.migrations[migration_index];
-                if (!migration.crossesTier())
-                {
-                    same_tier_migration_indices.push_back(migration_index);
-                    continue;
-                }
-                const auto &source_cost = state.serviceCost(
-                    migration.source.tier_idx,
-                    migration.layer_idx);
-                const auto &destination_cost = state.serviceCost(
-                    migration.destination.tier_idx,
-                    migration.layer_idx);
-                for (std::size_t phase = 0;
-                     phase < kProductionHistogramSources.size();
-                     ++phase)
-                {
-                    const uint64_t demand =
-                        planning_window->activationCount(
-                            kProductionHistogramSources[phase],
-                            migration.layer_idx,
-                            migration.expert_id);
-                    if (!state.active_sources[phase])
-                    {
-                        if (demand != 0)
-                        {
-                            throw std::logic_error(
-                                "ExpertOverlay transaction economy observed routed demand in a runtime-disabled inference phase");
-                        }
-                        continue;
-                    }
-                    const uint64_t source_ns =
-                        source_cost.nanoseconds_per_activation[phase];
-                    const uint64_t destination_ns =
-                        destination_cost.nanoseconds_per_activation[phase];
-                    if (source_ns > destination_ns)
-                    {
-                        checkedAddWide(
-                            &tier_savings_one_window,
-                            checkedMultiplyWide(
-                                demand,
-                                source_ns - destination_ns,
-                                "transaction tier-service saving"),
-                            "transaction tier-service savings");
-                    }
-                    else if (destination_ns > source_ns)
-                    {
-                        checkedAddWide(
-                            &tier_penalties_one_window,
-                            checkedMultiplyWide(
-                                demand,
-                                destination_ns - source_ns,
-                                "transaction tier-service penalty"),
-                            "transaction tier-service penalties");
-                    }
-                }
-            }
-
-            WideCost participant_projected_gain = 0;
-            if (!same_tier_migration_indices.empty())
-            {
-                MoEOverlayTierMigrationCycle all_participant_edges;
-                all_participant_edges.layer_idx =
-                    candidate.migrations[same_tier_migration_indices.front()]
-                        .layer_idx;
-                all_participant_edges.migration_indices =
-                    same_tier_migration_indices;
-                const auto participant_score = score_economy_cycle(
-                    candidate, all_participant_edges);
-                participant_projected_gain =
-                    participant_score.projected_service_gain_ns;
-            }
+            std::vector<std::size_t> all_migration_indices(
+                candidate.migrations.size());
+            std::iota(
+                all_migration_indices.begin(),
+                all_migration_indices.end(),
+                std::size_t{0});
+            const auto makespan = score_participant_makespan(
+                candidate, {}, all_migration_indices);
 
             for (const auto &cycle : candidate.migration_cycles)
             {
                 const auto cycle_score =
-                    score_economy_cycle(candidate, cycle);
+                    score_cycle_physical_cost(candidate, cycle);
                 score.residency_eligible &=
                     cycle_score.residency_eligible;
                 checkedAddWide(
@@ -2729,27 +3702,34 @@ namespace llaminar2
                     "transaction inference interference");
             }
 
-            if (planning_window->token_count == 0)
+            if (planning_evidence.tokenCount() == 0)
             {
                 throw std::logic_error(
                     "ExpertOverlay cannot score transaction economy from a zero-token histogram window");
             }
-            const WideCost tier_gain_one_window =
-                tier_savings_one_window > tier_penalties_one_window
-                    ? tier_savings_one_window -
-                          tier_penalties_one_window
+            if (!phases_do_not_regress(makespan))
+            {
+                score.payoff_eligible = false;
+                return score;
+            }
+            const WideCost service_before_ns =
+                aggregate_makespan(
+                    makespan.service_before_by_phase_ns,
+                    "aggregate participant critical path before movement");
+            const WideCost service_after_ns =
+                aggregate_makespan(
+                    makespan.service_after_by_phase_ns,
+                    "aggregate participant critical path after movement");
+            const WideCost service_gain_one_window =
+                service_before_ns > service_after_ns
+                    ? service_before_ns - service_after_ns
                     : 0;
-            const WideCost projected_tier_gain =
+            const WideCost projected_service_gain =
                 checkedMultiplyWide(
-                    tier_gain_one_window,
+                    service_gain_one_window,
                     policy.payoff_horizon_tokens,
-                    "transaction token-horizon tier gain") /
-                planning_window->token_count;
-            WideCost projected_service_gain = projected_tier_gain;
-            checkedAddWide(
-                &projected_service_gain,
-                participant_projected_gain,
-                "transaction participant makespan gain");
+                    "transaction token-horizon service gain") /
+                planning_evidence.tokenCount();
             WideCost measured_cost = transfer;
             checkedAddWide(
                 &measured_cost,
@@ -3121,7 +4101,7 @@ namespace llaminar2
                  * arrival slots; a later candidate can still be physically
                  * independent and must get an admission opportunity.
                  */
-                if (first_axis != MigrationCycleAxis::Combined)
+                if (first_axis != MoEOptimizationMovementAxis::Combined)
                 {
                     for (const std::size_t cycle_index : cycle_order)
                     {
@@ -3156,8 +4136,13 @@ namespace llaminar2
                 full_transaction.migration_cycles[cycle_index]));
         }
         const auto record_axis_admission = [&]
-            (const MoEOverlayResidencyTransaction &admitted,
-             bool capacity_bounded)
+            (MoEOverlayResidencyTransaction &admitted,
+             const std::vector<std::size_t> &admitted_candidate_indices,
+             bool capacity_bounded,
+             bool policy_bounded,
+             std::uint64_t dependent_payoff_rejections,
+             std::size_t capacity_rejected_cycles,
+             std::size_t participant_axis_budget_rejected_cycles)
         {
             MigrationCycleAxisCounts admitted_axis_counts;
             for (const auto &cycle : admitted.migration_cycles)
@@ -3165,6 +4150,102 @@ namespace llaminar2
                 admitted_axis_counts.add(
                     migrationCycleAxis(admitted, cycle));
             }
+            MigrationCycleAxisCounts admitted_candidate_axis_counts;
+            for (const std::size_t cycle_index :
+                 admitted_candidate_indices)
+            {
+                if (cycle_index >=
+                    full_transaction.migration_cycles.size())
+                {
+                    throw std::logic_error(
+                        "ExpertOverlay cycle-admission evidence references an unknown candidate cycle");
+                }
+                admitted_candidate_axis_counts.add(migrationCycleAxis(
+                    full_transaction,
+                    full_transaction.migration_cycles[cycle_index]));
+            }
+
+            if (eligible_axis_counts.total() != cycle_order.size() ||
+                admitted_axis_counts.total() !=
+                    admitted.migration_cycles.size() ||
+                admitted_candidate_axis_counts.total() !=
+                    admitted_candidate_indices.size())
+            {
+                throw std::logic_error(
+                    "ExpertOverlay cycle-axis classification is not total and exclusive");
+            }
+
+            const auto typed_axis_counts = [](
+                                                const MigrationCycleAxisCounts
+                                                    &counts)
+            {
+                return MoEOptimizationCycleAxisCounts{
+                    .tier_residency = static_cast<std::uint64_t>(
+                        counts.tier_residency),
+                    .participant_placement = static_cast<std::uint64_t>(
+                        counts.participant_placement),
+                    .combined = static_cast<std::uint64_t>(counts.combined),
+                };
+            };
+            const auto candidate_cycles = static_cast<std::uint64_t>(
+                full_transaction.migration_cycles.size());
+            const auto policy_eligible_cycles =
+                static_cast<std::uint64_t>(cycle_order.size());
+            MoEOptimizationHostMovementAdmission admission{
+                .authority = MoEOptimizationAuthority::Host,
+                .transaction = admitted.candidate->epoch,
+                .candidate_epoch = admitted.candidate->epoch,
+                .cycle_capacity_kind =
+                    config_.max_concurrent_cycles == 0u
+                        ? MoEOptimizationCycleCapacityKind::Unbounded
+                        : MoEOptimizationCycleCapacityKind::Bounded,
+                .maximum_concurrent_cycles = static_cast<std::uint64_t>(
+                    config_.max_concurrent_cycles),
+                .candidate_cycles = candidate_cycles,
+                .policy_eligible_cycles = policy_eligible_cycles,
+                .policy_eligible_axes =
+                    typed_axis_counts(eligible_axis_counts),
+                .admitted_candidate_cycles =
+                    static_cast<std::uint64_t>(
+                        admitted_candidate_indices.size()),
+                .admitted_candidate_axes =
+                    typed_axis_counts(admitted_candidate_axis_counts),
+                .admitted_physical_cycles = static_cast<std::uint64_t>(
+                    admitted.migration_cycles.size()),
+                .admitted_physical_axes =
+                    typed_axis_counts(admitted_axis_counts),
+                .individual_policy_rejected_cycles =
+                    candidate_cycles - policy_eligible_cycles,
+                .dependent_payoff_rejected_cycles =
+                    dependent_payoff_rejections,
+                .capacity_rejected_cycles = static_cast<std::uint64_t>(
+                    capacity_rejected_cycles),
+                .participant_axis_budget_rejected_cycles =
+                    static_cast<std::uint64_t>(
+                        participant_axis_budget_rejected_cycles),
+                .physical_cycle_recomposition =
+                    admitted.migration_cycles.size() !=
+                    admitted_candidate_indices.size(),
+                .capacity_bounded = capacity_bounded,
+                .policy_bounded = policy_bounded,
+            };
+            if (!admission.valid())
+            {
+                throw std::logic_error(
+                    "ExpertOverlay host cycle-admission proof is internally inconsistent");
+            }
+            admitted.host_admission = admission;
+
+            /*
+             * Candidate cycles and physical transfer cycles are deliberately
+             * distinct coordinate systems. Applying several overlapping
+             * multi-tier candidates to one placement can cause
+             * build_transaction() to merge or split the final closed transfer
+             * cycles. Rejection accounting belongs to the original candidate
+             * set; transport capacity belongs to the recomposed physical set.
+             * Publishing both prevents a valid recomposition from appearing
+             * as an unclassified policy/capacity rejection.
+             */
             PerfStatsCollector::addCounter(
                 "moe_overlay_residency",
                 "cycle_axis_admission",
@@ -3188,32 +4269,131 @@ namespace llaminar2
                          admitted_axis_counts.participant_placement)},
                     {"admitted_combined_cycles",
                      std::to_string(admitted_axis_counts.combined)},
+                    {"admitted_candidate_tier_residency_cycles",
+                     std::to_string(
+                         admitted_candidate_axis_counts.tier_residency)},
+                    {"admitted_candidate_participant_placement_cycles",
+                     std::to_string(
+                         admitted_candidate_axis_counts
+                             .participant_placement)},
+                    {"admitted_candidate_combined_cycles",
+                     std::to_string(
+                         admitted_candidate_axis_counts.combined)},
+                    {"candidate_cycles",
+                     std::to_string(
+                         full_transaction.migration_cycles.size())},
+                    {"policy_eligible_cycles",
+                     std::to_string(cycle_order.size())},
+                    {"admitted_cycles",
+                     std::to_string(admitted.migration_cycles.size())},
+                    {"admitted_candidate_cycles",
+                     std::to_string(
+                         admitted_candidate_indices.size())},
+                    {"physical_cycle_recomposition",
+                     admitted.migration_cycles.size() !=
+                             admitted_candidate_indices.size()
+                         ? "true"
+                         : "false"},
+                    {"individual_policy_rejected_cycles",
+                     std::to_string(
+                         full_transaction.migration_cycles.size() -
+                         cycle_order.size())},
+                    {"dependent_payoff_rejected_cycles",
+                     std::to_string(dependent_payoff_rejections)},
+                    {"capacity_rejected_cycles",
+                     std::to_string(capacity_rejected_cycles)},
+                    {"participant_axis_budget_rejected_cycles",
+                     std::to_string(
+                         participant_axis_budget_rejected_cycles)},
                     {"independent_axis_reservation_active",
                      independent_axis_reservation_active ? "true" : "false"},
                     {"capacity_bounded",
                      capacity_bounded ? "true" : "false"},
+                    {"policy_bounded",
+                     policy_bounded ? "true" : "false"},
                 });
         };
 
         if (cycle_order.size() ==
                 full_transaction.migration_cycles.size() &&
+            participant_changes.size() <=
+                participant_admission_entry_limit &&
             fits_wave_budget(full_transaction) &&
             (!config_.migration_economy_policy ||
              score_economy_transaction(full_transaction).eligible()))
         {
-            record_axis_admission(full_transaction, false);
+            record_axis_admission(
+                full_transaction,
+                cycle_order,
+                false,
+                false,
+                0u,
+                0u,
+                0u);
             return finalize_economy(std::move(full_transaction));
         }
 
         std::vector<std::size_t> selected_cycles;
         std::optional<MoEOverlayResidencyTransaction> bounded;
         std::optional<CycleEconomyScore> bounded_economy_score;
-        bool capacity_limited = false;
         bool economy_limited = false;
         std::uint64_t dependent_payoff_rejections = 0;
         std::uint64_t bounded_snapshot_builds = 0;
-        for (const std::size_t cycle_index : cycle_order)
+        std::set<std::size_t> capacity_rejected_cycle_indices;
+        std::set<std::size_t>
+            participant_axis_budget_rejected_cycle_indices;
+        std::uint32_t selected_participant_objective_entries = 0u;
+
+        /*
+         * A recomposed cycle can contain tier-only edges as well as the two
+         * exact owner changes selected by the participant planner. Count those
+         * objective identities, not every edge tagged Combined, so a
+         * promotion/demotion path does not consume fictitious participant
+         * budget.
+         */
+        const auto participant_objective_entries = [&]
+            (const std::size_t cycle_index)
         {
+            std::uint32_t entries = 0u;
+            const auto &cycle =
+                full_transaction.migration_cycles.at(cycle_index);
+            for (const std::size_t migration_index :
+                 cycle.migration_indices)
+            {
+                const auto &migration =
+                    full_transaction.migrations.at(migration_index);
+                const bool is_participant_objective = std::any_of(
+                    participant_changes.begin(),
+                    participant_changes.end(),
+                    [&](const auto &change)
+                    {
+                        return change.layer_idx == migration.layer_idx &&
+                               change.expert_id == migration.expert_id &&
+                               change.current_participant ==
+                                   migration.destination.owner_participant;
+                    });
+                if (is_participant_objective)
+                    ++entries;
+            }
+            return entries;
+        };
+        for (std::size_t order_position = 0u;
+             order_position < cycle_order.size();
+             ++order_position)
+        {
+            const std::size_t cycle_index = cycle_order[order_position];
+            const std::uint32_t cycle_participant_entries =
+                participant_objective_entries(cycle_index);
+            if (cycle_participant_entries >
+                    participant_admission_entry_limit -
+                        std::min(
+                            participant_admission_entry_limit,
+                            selected_participant_objective_entries))
+            {
+                participant_axis_budget_rejected_cycle_indices.insert(
+                    cycle_index);
+                continue;
+            }
             auto trial_cycles = selected_cycles;
             trial_cycles.push_back(cycle_index);
 
@@ -3269,12 +4449,14 @@ namespace llaminar2
                 &previous->owner_map,
                 &trial_ownership);
             requireCapacityPreserving(*previous, *trial_snapshot);
-            auto trial = build_transaction(std::move(trial_snapshot));
+            auto trial = build_transaction(
+                std::move(trial_snapshot),
+                participant_changes);
             if (trial.empty())
                 continue;
             if (!fits_wave_budget(trial))
             {
-                capacity_limited = true;
+                capacity_rejected_cycle_indices.insert(cycle_index);
                 continue;
             }
             std::optional<CycleEconomyScore> trial_economy_score;
@@ -3313,6 +4495,8 @@ namespace llaminar2
             selected_cycles = std::move(trial_cycles);
             bounded = std::move(trial);
             bounded_economy_score = std::move(trial_economy_score);
+            selected_participant_objective_entries +=
+                cycle_participant_entries;
 
             /*
              * Cycles are already ordered by descending economic benefit. Once
@@ -3326,6 +4510,19 @@ namespace llaminar2
                 bounded->migration_cycles.size() >=
                     config_.max_concurrent_cycles)
             {
+                /*
+                 * Every unexamined policy-eligible cycle is omitted solely
+                 * because the concurrent pool is now full.  Preserve those
+                 * identities separately from marginal-payoff rejections so
+                 * capacity telemetry never mislabels an economical decision.
+                 */
+                for (std::size_t remaining = order_position + 1u;
+                     remaining < cycle_order.size();
+                     ++remaining)
+                {
+                    capacity_rejected_cycle_indices.insert(
+                        cycle_order[remaining]);
+                }
                 break;
             }
         }
@@ -3348,54 +4545,55 @@ namespace llaminar2
                     config_.model_metadata,
                     &previous->owner_map);
                 return finalize_economy(
-                    build_transaction(std::move(unchanged)));
+                    build_transaction(std::move(unchanged), {}));
             }
             throw std::runtime_error(
                 "ExpertOverlay cannot express one capacity-preserving migration cycle within the configured shadow-slot and concurrency BOM");
         }
 
-        std::size_t eligible_migrations = 0;
-        for (const std::size_t cycle_index : cycle_order)
+        std::size_t capacity_omitted_migrations = 0u;
+        for (const std::size_t cycle_index :
+             capacity_rejected_cycle_indices)
         {
-            eligible_migrations += full_transaction
-                                       .migration_cycles[cycle_index]
-                                       .migration_indices.size();
+            capacity_omitted_migrations +=
+                full_transaction.migration_cycles[cycle_index]
+                    .migration_indices.size();
         }
-        const std::uint64_t omitted_migrations =
-            static_cast<std::uint64_t>(eligible_migrations >
-                                               bounded->migrations.size()
-                                           ? eligible_migrations -
-                                                 bounded->migrations.size()
-                                           : 0);
-        const std::uint64_t omitted_cycles =
+        const std::uint64_t capacity_omitted_cycles =
             static_cast<std::uint64_t>(
-                cycle_order.size() > bounded->migration_cycles.size()
-                    ? cycle_order.size() -
-                          bounded->migration_cycles.size()
-                    : 0);
-        if (capacity_limited || omitted_cycles != 0 ||
-            omitted_migrations != 0)
+                capacity_rejected_cycle_indices.size());
+        const std::uint64_t capacity_omitted_migration_count =
+            static_cast<std::uint64_t>(capacity_omitted_migrations);
+        if (capacity_omitted_cycles != 0u)
         {
             capacity_bounded_proposals_.fetch_add(
                 1, std::memory_order_relaxed);
             target_migrations_omitted_.fetch_add(
-                omitted_migrations, std::memory_order_relaxed);
+                capacity_omitted_migration_count,
+                std::memory_order_relaxed);
             target_cycles_omitted_.fetch_add(
-                omitted_cycles, std::memory_order_relaxed);
+                capacity_omitted_cycles,
+                std::memory_order_relaxed);
             PerfStatsCollector::addCounter(
                 "moe_overlay_residency",
                 "capacity_bounded_proposals",
                 1.0,
                 "maintenance",
                 config_.perf_device,
-                {{"eligible_migrations",
-                  std::to_string(eligible_migrations)},
+                {{"policy_eligible_migrations",
+                  std::to_string(
+                      bounded->migrations.size() +
+                      capacity_omitted_migration_count)},
                  {"admitted_migrations",
                   std::to_string(bounded->migrations.size())},
-                 {"eligible_cycles",
+                 {"policy_eligible_cycles",
                   std::to_string(cycle_order.size())},
                  {"admitted_cycles",
                   std::to_string(bounded->migration_cycles.size())},
+                 {"capacity_omitted_migrations",
+                  std::to_string(capacity_omitted_migration_count)},
+                 {"capacity_omitted_cycles",
+                  std::to_string(capacity_omitted_cycles)},
                  {"shadow_slots_per_endpoint_layer",
                   std::to_string(
                       config_.shadow_slots_per_endpoint_layer)},
@@ -3407,7 +4605,8 @@ namespace llaminar2
                 static_cast<double>(bounded_snapshot_builds),
                 "maintenance",
                 config_.perf_device,
-                {{"eligible_cycles", std::to_string(cycle_order.size())},
+                {{"policy_eligible_cycles",
+                  std::to_string(cycle_order.size())},
                  {"admitted_cycles",
                   std::to_string(bounded->migration_cycles.size())},
                  {"max_concurrent_cycles",
@@ -3424,8 +4623,319 @@ namespace llaminar2
                 {{"histogram_generation",
                   std::to_string(transaction.histogram_generation)}});
         }
-        record_axis_admission(*bounded, true);
+        if (!participant_axis_budget_rejected_cycle_indices.empty())
+        {
+            PerfStatsCollector::addCounter(
+                "moe_overlay_residency",
+                "participant_axis_budget_rejected_cycles",
+                static_cast<double>(
+                    participant_axis_budget_rejected_cycle_indices.size()),
+                "maintenance",
+                config_.perf_device,
+                {{"histogram_generation",
+                  std::to_string(transaction.histogram_generation)},
+                 {"participant_admission_entry_limit",
+                  std::to_string(participant_admission_entry_limit)}});
+        }
+        const bool policy_bounded =
+            cycle_order.size() !=
+                full_transaction.migration_cycles.size() ||
+            dependent_payoff_rejections != 0u ||
+            !participant_axis_budget_rejected_cycle_indices.empty();
+        record_axis_admission(
+            *bounded,
+            selected_cycles,
+            capacity_omitted_cycles != 0u,
+            policy_bounded,
+            dependent_payoff_rejections,
+            capacity_rejected_cycle_indices.size(),
+            participant_axis_budget_rejected_cycle_indices.size());
         return finalize_economy(std::move(*bounded));
+    }
+
+    MoEOverlayAuthoritativeResidencyPlan
+    MoEOverlayResidencyAuthority::exportAuthoritativeResidencyPlan(
+        const MoEOverlayResidencyTransaction &transaction) const
+    {
+        if (!transaction.valid() ||
+            transaction.purpose !=
+                MoEOverlayResidencyTransactionPurpose::PlacementChange ||
+            !transaction.histogram_window)
+        {
+            throw std::invalid_argument(
+                "Only a valid live ExpertOverlay placement transaction can be published as an authoritative plan");
+        }
+        if (transaction.previous->epoch != transaction.expected_epoch ||
+            transaction.candidate->epoch != transaction.expected_epoch + 1u)
+        {
+            throw std::logic_error(
+                "ExpertOverlay authoritative plan has invalid epoch progression");
+        }
+
+        MoEOverlayAuthoritativeResidencyPlan plan{
+            .expected_epoch = transaction.expected_epoch,
+            .num_layers = config_.model_metadata.num_layers,
+            .num_experts = config_.model_metadata.num_experts,
+            .histogram_window = transaction.histogram_window,
+        };
+        const size_t entry_count =
+            static_cast<size_t>(plan.num_layers) *
+            static_cast<size_t>(plan.num_experts);
+        plan.entries.resize(entry_count);
+
+        std::map<std::pair<int, int>, const MoEOverlayTierMigration *>
+            migration_by_coordinate;
+        for (const auto &migration : transaction.migrations)
+        {
+            if (!migration_by_coordinate
+                     .emplace(
+                         std::pair{migration.layer_idx, migration.expert_id},
+                         &migration)
+                     .second)
+            {
+                throw std::logic_error(
+                    "ExpertOverlay authoritative transaction repeats a migration coordinate");
+            }
+        }
+
+        size_t changed_entries = 0;
+        for (int layer_idx = 0; layer_idx < plan.num_layers; ++layer_idx)
+        {
+            const auto placement = std::find_if(
+                transaction.candidate->placement_plan->placements.begin(),
+                transaction.candidate->placement_plan->placements.end(),
+                [&](const auto &candidate)
+                { return candidate.layer == layer_idx; });
+            if (placement ==
+                    transaction.candidate->placement_plan->placements.end() ||
+                placement->routed_expert_tier.size() !=
+                    static_cast<size_t>(plan.num_experts))
+            {
+                throw std::logic_error(
+                    "ExpertOverlay authoritative candidate lacks complete layer placement geometry");
+            }
+            for (int expert_id = 0; expert_id < plan.num_experts; ++expert_id)
+            {
+                const auto *previous_owner =
+                    transaction.previous->owner_map.ownerFor(
+                        layer_idx, expert_id);
+                const auto *candidate_owner =
+                    transaction.candidate->owner_map.ownerFor(
+                        layer_idx, expert_id);
+                if (!previous_owner || !candidate_owner)
+                {
+                    throw std::logic_error(
+                        "ExpertOverlay authoritative candidate has incomplete owner maps");
+                }
+
+                auto &entry = plan.entries[plan.offset(layer_idx, expert_id)];
+                entry.candidate_tier_idx =
+                    placement->routed_expert_tier[
+                        static_cast<size_t>(expert_id)];
+                entry.candidate_owner_participant =
+                    candidate_owner->owner_participant;
+
+                const auto migration = migration_by_coordinate.find(
+                    {layer_idx, expert_id});
+                const bool snapshot_changed =
+                    previous_owner->tier_idx != candidate_owner->tier_idx ||
+                    previous_owner->owner_participant !=
+                        candidate_owner->owner_participant ||
+                    previous_owner->domain_name !=
+                        candidate_owner->domain_name;
+                if (migration == migration_by_coordinate.end())
+                {
+                    if (snapshot_changed)
+                    {
+                        throw std::logic_error(
+                            "ExpertOverlay authoritative migration set does not cover its candidate snapshot delta");
+                    }
+                    continue;
+                }
+                if (!snapshot_changed ||
+                    migration->second->destination.tier_idx !=
+                        entry.candidate_tier_idx ||
+                    migration->second->destination.owner_participant !=
+                        entry.candidate_owner_participant)
+                {
+                    throw std::logic_error(
+                        "ExpertOverlay authoritative migration disagrees with its candidate snapshot");
+                }
+                entry.changed = true;
+                entry.axis = migration->second->axis;
+                entry.activation_count =
+                    migration->second->activation_count;
+                entry.estimated_weight_bytes =
+                    migration->second->estimated_weight_bytes;
+                ++changed_entries;
+            }
+        }
+        if (changed_entries != transaction.migrations.size() || !plan.valid())
+        {
+            throw std::logic_error(
+                "ExpertOverlay authoritative plan did not encode one exact dense transaction");
+        }
+        return plan;
+    }
+
+    MoEOverlayResidencyTransaction
+    MoEOverlayResidencyAuthority::adoptAuthoritativeResidencyPlan(
+        const MoEOverlayAuthoritativeResidencyPlan &plan)
+    {
+        requireHostDynamicPublicationAuthority(
+            "Host ExpertOverlay authoritative-plan adoption");
+        if (!migrationEnabled())
+        {
+            throw std::logic_error(
+                "Only Dynamic ExpertOverlay maintenance may adopt an authoritative plan");
+        }
+        if (!plan.valid() ||
+            plan.num_layers != config_.model_metadata.num_layers ||
+            plan.num_experts != config_.model_metadata.num_experts)
+        {
+            throw std::invalid_argument(
+                "Distributed ExpertOverlay authoritative plan has invalid model geometry");
+        }
+        const auto histogram_evidence =
+            plan.histogram_window->validatedView();
+
+        const auto previous = snapshot();
+        if (!previous || !previous->valid() ||
+            previous->epoch != plan.expected_epoch)
+        {
+            throw std::logic_error(
+                "Distributed ExpertOverlay authoritative plan references a stale local epoch");
+        }
+
+        MoERoutedExpertPlacementPlan candidate_plan =
+            *previous->placement_plan;
+        MoELayeredExpertOwnership candidate_ownership =
+            previous->layered_ownership;
+        for (int layer_idx = 0; layer_idx < plan.num_layers; ++layer_idx)
+        {
+            const auto placement = std::find_if(
+                candidate_plan.placements.begin(),
+                candidate_plan.placements.end(),
+                [&](const auto &candidate)
+                { return candidate.layer == layer_idx; });
+            if (placement == candidate_plan.placements.end() ||
+                placement->routed_expert_tier.size() !=
+                    static_cast<size_t>(plan.num_experts))
+            {
+                throw std::logic_error(
+                    "Distributed ExpertOverlay local topology lacks authoritative layer geometry");
+            }
+            for (int expert_id = 0; expert_id < plan.num_experts; ++expert_id)
+            {
+                const auto &entry =
+                    plan.entries[plan.offset(layer_idx, expert_id)];
+                placement->routed_expert_tier[
+                    static_cast<size_t>(expert_id)] =
+                    entry.candidate_tier_idx;
+                candidate_ownership.assignOwner(
+                    layer_idx,
+                    expert_id,
+                    entry.candidate_owner_participant);
+            }
+        }
+
+        auto candidate = buildSnapshot(
+            previous->epoch + 1u,
+            std::move(candidate_plan),
+            config_.model_metadata,
+            &previous->owner_map,
+            &candidate_ownership);
+        requireCapacityPreserving(*previous, *candidate);
+
+        MoEOverlayResidencyTransaction transaction;
+        transaction.expected_epoch = previous->epoch;
+        transaction.histogram_generation =
+            plan.histogram_window->generation;
+        transaction.histogram_window = plan.histogram_window;
+        transaction.previous = previous;
+        transaction.candidate = std::move(candidate);
+
+        for (int layer_idx = 0; layer_idx < plan.num_layers; ++layer_idx)
+        {
+            for (int expert_id = 0; expert_id < plan.num_experts; ++expert_id)
+            {
+                const auto &entry =
+                    plan.entries[plan.offset(layer_idx, expert_id)];
+                const auto *source = previous->owner_map.ownerFor(
+                    layer_idx, expert_id);
+                const auto *destination =
+                    transaction.candidate->owner_map.ownerFor(
+                        layer_idx, expert_id);
+                if (!source || !destination)
+                {
+                    throw std::logic_error(
+                        "Distributed ExpertOverlay authoritative plan resolved an incomplete owner map");
+                }
+                const bool changed =
+                    source->tier_idx != destination->tier_idx ||
+                    source->owner_participant !=
+                        destination->owner_participant ||
+                    source->domain_name != destination->domain_name;
+                if (changed != entry.changed)
+                {
+                    throw std::logic_error(
+                        "Distributed ExpertOverlay authoritative change mask disagrees with local topology");
+                }
+                if (!changed)
+                    continue;
+
+                const uint64_t expected_activation_count =
+                    histogram_evidence.activationCount(
+                        layer_idx, expert_id);
+                if (entry.activation_count != expected_activation_count)
+                {
+                    std::ostringstream diagnostic;
+                    diagnostic
+                        << "Distributed ExpertOverlay authoritative activation count disagrees with its histogram"
+                        << " layer=" << layer_idx
+                        << " expert=" << expert_id
+                        << " entry_count=" << entry.activation_count
+                        << " histogram_count=" << expected_activation_count
+                        << " histogram_generation="
+                        << plan.histogram_window->generation
+                        << " expected_epoch=" << plan.expected_epoch;
+                    throw std::invalid_argument(diagnostic.str());
+                }
+                const int source_priority = tierPriority(
+                    *previous->placement_plan, source->tier_idx);
+                const int destination_priority = tierPriority(
+                    *transaction.candidate->placement_plan,
+                    destination->tier_idx);
+                transaction.migrations.push_back({
+                    .layer_idx = layer_idx,
+                    .expert_id = expert_id,
+                    .activation_count = entry.activation_count,
+                    .estimated_weight_bytes =
+                        entry.estimated_weight_bytes,
+                    .direction =
+                        destination_priority < source_priority
+                            ? MoEOverlayTierMigrationDirection::Promotion
+                            : (destination_priority > source_priority
+                                   ? MoEOverlayTierMigrationDirection::Demotion
+                                   : MoEOverlayTierMigrationDirection::
+                                         SamePriority),
+                    .axis = entry.axis,
+                    .source = *source,
+                    .destination = *destination,
+                });
+            }
+        }
+        transaction.migration_cycles = buildMigrationCycles(
+            transaction.migrations);
+        transaction.shadow_requirements = buildShadowRequirements(
+            transaction.migrations);
+        if (!transaction.valid())
+        {
+            throw std::logic_error(
+                "Distributed ExpertOverlay authoritative plan reconstructed an invalid transaction");
+        }
+        checks_.fetch_add(1, std::memory_order_relaxed);
+        return transaction;
     }
 
     MoEOverlayResidencyApplyResult MoEOverlayResidencyAuthority::beginApply(
@@ -3436,16 +4946,20 @@ namespace llaminar2
             "Host ExpertOverlay residency apply");
         MoEOverlayResidencyApplyResult result;
         const bool static_policy = !migrationEnabled();
-        if (!transaction.valid() ||
-            transaction.purpose !=
-                MoEOverlayResidencyTransactionPurpose::PlacementChange)
+        const bool publishable_purpose =
+            transaction.purpose ==
+                MoEOverlayResidencyTransactionPurpose::PlacementChange ||
+            transaction.purpose ==
+                MoEOverlayResidencyTransactionPurpose::
+                    PreparedContextRestoration;
+        if (!transaction.valid() || !publishable_purpose)
         {
             result.status = MoEOverlayResidencyApplyStatus::Stale;
-            result.error =
-                transaction.purpose ==
-                        MoEOverlayResidencyTransactionPurpose::EconomyCalibration
-                    ? "Economy calibration transactions cannot enter residency publication"
-                    : "Residency transaction is structurally invalid";
+            result.error = transaction.purpose ==
+                                   MoEOverlayResidencyTransactionPurpose::
+                                       EconomyCalibration
+                               ? "Economy calibration transactions cannot enter residency publication"
+                               : "Residency transaction is structurally invalid or has a non-publishable purpose";
             stale_rejections_.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
@@ -3926,6 +5440,15 @@ namespace llaminar2
                 committed_migrations_.load(std::memory_order_relaxed),
             .committed_cycles =
                 committed_cycles_.load(std::memory_order_relaxed),
+            .prepared_context_restoration_waves =
+                prepared_context_restoration_waves_.load(
+                    std::memory_order_relaxed),
+            .prepared_context_restoration_migrations =
+                prepared_context_restoration_migrations_.load(
+                    std::memory_order_relaxed),
+            .prepared_context_restoration_cycles =
+                prepared_context_restoration_cycles_.load(
+                    std::memory_order_relaxed),
             .promotions = promotions_.load(std::memory_order_relaxed),
             .demotions = demotions_.load(std::memory_order_relaxed),
             .same_priority_moves =
@@ -3960,6 +5483,20 @@ namespace llaminar2
             .current_batch_llep_lease_rejections =
                 current_batch_llep_lease_rejections_.load(
                     std::memory_order_relaxed),
+        };
+    }
+
+    MoEOptimizationMovementLedger
+    MoEOverlayResidencyAuthority::movementLedger() const
+    {
+        std::lock_guard<std::mutex> lock(movement_ledger_mutex_);
+        return {
+            .edges = movement_ledger_,
+            .discarded_edges = 0u,
+            .economy = movement_economy_,
+            .discarded_economy_records = 0u,
+            .host_admissions = movement_host_admissions_,
+            .discarded_host_admission_records = 0u,
         };
     }
 
@@ -4041,9 +5578,36 @@ namespace llaminar2
     MoEOverlayResidencyAuthority::buildMigrations(
         const MoEOverlayResidencySnapshot &previous,
         const MoEOverlayResidencySnapshot &candidate,
-        const DecodeExpertHistogramWindow *histogram_window,
-        size_t estimated_weight_bytes)
+        const ValidatedDecodeExpertHistogramWindowView *histogram_window,
+        size_t estimated_weight_bytes,
+        std::span<const MoELayeredExpertOwnershipChange>
+            participant_changes)
     {
+        using ExpertKey = std::pair<int, int>;
+        std::map<ExpertKey, int> participant_destinations;
+        for (const auto &change : participant_changes)
+        {
+            if (change.layer_idx < 0 || change.expert_id < 0 ||
+                change.previous_participant < 0 ||
+                change.current_participant < 0 ||
+                change.previous_participant == change.current_participant ||
+                change.layer_idx >=
+                    candidate.layered_ownership.layerCount() ||
+                change.expert_id >=
+                    candidate.layered_ownership.expertCount() ||
+                change.current_participant >=
+                    candidate.layered_ownership.participantCount() ||
+                !participant_destinations
+                     .emplace(
+                         ExpertKey{change.layer_idx, change.expert_id},
+                         change.current_participant)
+                     .second)
+            {
+                throw std::logic_error(
+                    "ExpertOverlay participant objective does not name one unique candidate owner change");
+            }
+        }
+
         std::vector<MoEOverlayTierMigration> migrations;
         for (const auto &destination : candidate.owner_map.owners())
         {
@@ -4073,6 +5637,20 @@ namespace llaminar2
                                        : (destination_priority > source_priority
                                               ? MoEOverlayTierMigrationDirection::Demotion
                                               : MoEOverlayTierMigrationDirection::SamePriority);
+            const auto participant_destination =
+                participant_destinations.find({
+                    destination.layer_idx,
+                    destination.expert_id,
+                });
+            const bool advances_participant =
+                participant_destination != participant_destinations.end() &&
+                participant_destination->second ==
+                    destination.owner_participant;
+            const auto axis = advances_participant
+                                  ? (source->tier_idx != destination.tier_idx
+                                         ? MoEOptimizationMovementAxis::Combined
+                                         : MoEOptimizationMovementAxis::ParticipantPlacement)
+                                  : MoEOptimizationMovementAxis::TierResidency;
             migrations.push_back({
                 .layer_idx = destination.layer_idx,
                 .expert_id = destination.expert_id,
@@ -4083,6 +5661,7 @@ namespace llaminar2
                                         : 0,
                 .estimated_weight_bytes = estimated_weight_bytes,
                 .direction = direction,
+                .axis = axis,
                 .source = *source,
                 .destination = destination,
             });
@@ -4102,7 +5681,7 @@ namespace llaminar2
 
     std::vector<MoEOverlayTierMigrationCycle>
     MoEOverlayResidencyAuthority::buildMigrationCycles(
-        const std::vector<MoEOverlayTierMigration> &migrations)
+        std::vector<MoEOverlayTierMigration> &migrations)
     {
         std::vector<MoEOverlayTierMigrationCycle> cycles;
         std::vector<bool> consumed(migrations.size(), false);
@@ -4194,6 +5773,27 @@ namespace llaminar2
                 throw std::logic_error(
                     "MoE overlay produced an invalid migration cycle");
             }
+            bool advances_tier = false;
+            bool advances_participant = false;
+            for (const std::size_t migration_index :
+                 cycle.migration_indices)
+            {
+                advances_tier |= advancesTierResidency(
+                    migrations[migration_index].axis);
+                advances_participant |= advancesParticipantPlacement(
+                    migrations[migration_index].axis);
+            }
+            const auto cycle_axis =
+                advances_tier && advances_participant
+                    ? MoEOptimizationMovementAxis::Combined
+                    : (advances_tier
+                           ? MoEOptimizationMovementAxis::TierResidency
+                           : MoEOptimizationMovementAxis::ParticipantPlacement);
+            for (const std::size_t migration_index :
+                 cycle.migration_indices)
+            {
+                migrations[migration_index].axis = cycle_axis;
+            }
             cycles.push_back(std::move(cycle));
         }
 
@@ -4276,6 +5876,20 @@ namespace llaminar2
                                      ? epoch_state->snapshot->epoch
                                      : 0)}});
         }
+        else if (purpose == TicketLeasePurpose::InferenceGraphSequence)
+        {
+            PerfStatsCollector::addCounter(
+                "moe_overlay_residency",
+                "graph_sequence_epoch_leases",
+                1.0,
+                "inference",
+                config_.perf_device,
+                {{"action", "release"},
+                 {"epoch",
+                  std::to_string(epoch_state->snapshot
+                                     ? epoch_state->snapshot->epoch
+                                     : 0)}});
+        }
     }
 
     bool MoEOverlayResidencyAuthority::reapReadyRetirementsLocked(
@@ -4287,21 +5901,34 @@ namespace llaminar2
         while (retirement != pending_retirements_.end())
         {
             auto &pending = **retirement;
-            if (pending.previous->active_tickets.load(std::memory_order_acquire) != 0)
-            {
-                ++retirement;
-                continue;
-            }
+
+            const bool admission_open =
+                pending.local_grace_period ==
+                PendingRetirement::LocalGracePeriodState::AdmissionOpen;
+            const bool local_readers_drained =
+                pending.previous->active_tickets.load(
+                    std::memory_order_acquire) == 0;
+            const MoEOverlayLocalRetirementState local_state{
+                .admission =
+                    admission_open
+                        ? MoEOverlayRetirementAdmissionState::Open
+                        : MoEOverlayRetirementAdmissionState::Closed,
+                .readers =
+                    local_readers_drained
+                        ? MoEOverlayRetirementReaderState::Drained
+                        : MoEOverlayRetirementReaderState::Active,
+            };
 
             std::string fence_error;
             const auto fence_progress =
-                pending.work->pollRetirementFence(&fence_error);
-            if (fence_progress == MoEOverlayResidencyWaveProgress::Pending)
+                pending.work->pollRetirementFence(
+                    local_state, &fence_error);
+            if (fence_progress == MoEOverlayRetirementFenceProgress::Pending)
             {
                 ++retirement;
                 continue;
             }
-            if (fence_progress == MoEOverlayResidencyWaveProgress::Failed)
+            if (fence_progress == MoEOverlayRetirementFenceProgress::Failed)
             {
                 if (error)
                 {
@@ -4312,20 +5939,51 @@ namespace llaminar2
                 return false;
             }
 
-            /*
-             * The physical/device fence proves that no captured producer still
-             * owns an unclaimed epoch ticket.  Close lock-free exact admission,
-             * then make one final host-lease observation.  An acquirer that
-             * raced the close either appears in this count or observes the gate
-             * and removes its provisional increment.
-             */
-            pending.previous->accepting_exact_tickets.store(
-                false, std::memory_order_release);
-            if (pending.previous->active_tickets.load(
+            if (fence_progress ==
+                MoEOverlayRetirementFenceProgress::ReadyToCloseAdmission)
+            {
+                if (!admission_open || !local_readers_drained)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay retirement-admission fence became ready from an invalid local grace-period state";
+                    }
+                    return false;
+                }
+
+                /* Closing admission is the only inference-visible edge in
+                 * retirement. An acquisition racing this store either owns a
+                 * counted reader or drops its provisional pin after observing
+                 * the closed gate; the phase-6 drain covers both outcomes. */
+                pending.previous->accepting_exact_tickets.store(
+                    false, std::memory_order_release);
+                pending.local_grace_period =
+                    PendingRetirement::LocalGracePeriodState::AdmissionClosed;
+                continue;
+            }
+
+            if (fence_progress !=
+                MoEOverlayRetirementFenceProgress::ReadyToRetire)
+            {
+                if (error)
+                    *error = "ExpertOverlay retirement fence returned an unknown state";
+                return false;
+            }
+
+            /* Closed admission makes zero readers stable. Re-read the source
+             * counter before reclaiming so a racing pre-close acquisition must
+             * have completed its final release. */
+            if (admission_open ||
+                pending.previous->active_tickets.load(
                     std::memory_order_acquire) != 0)
             {
-                ++retirement;
-                continue;
+                if (error)
+                {
+                    *error =
+                        "ExpertOverlay retirement fence became ready before exact admission closed and readers drained";
+                }
+                return false;
             }
 
             auto retiring_state = pending.previous;
@@ -4528,6 +6186,9 @@ namespace llaminar2
     void MoEOverlayResidencyAuthority::recordCommitted(
         const MoEOverlayResidencyTransaction &transaction)
     {
+        const bool prepared_context_restoration =
+            transaction.purpose ==
+            MoEOverlayResidencyTransactionPurpose::PreparedContextRestoration;
         if (transaction.economy.enabled)
         {
             std::lock_guard<std::mutex> economy_lock(economy_mutex_);
@@ -4550,6 +6211,57 @@ namespace llaminar2
         uint64_t cross_rank = 0;
         uint64_t cross_backend = 0;
         size_t estimated_bytes = 0;
+        std::vector<MoEOptimizationMovementEdge> committed_edges;
+        std::optional<MoEOptimizationMovementEconomy> committed_economy;
+        std::optional<MoEOptimizationHostMovementAdmission>
+            committed_host_admission;
+        if (!prepared_context_restoration)
+        {
+            committed_edges.reserve(transaction.migrations.size());
+            if (transaction.host_admission)
+            {
+                committed_host_admission = *transaction.host_admission;
+                if (!committed_host_admission->valid() ||
+                    committed_host_admission->transaction !=
+                        transaction.candidate->epoch ||
+                    committed_host_admission->admitted_physical_cycles !=
+                        transaction.migration_cycles.size())
+                {
+                    /* Policy admission is operational evidence owned by the
+                     * coordinator. Telemetry cannot repair it at commit. */
+                    std::terminate();
+                }
+            }
+            if (transaction.economy.enabled)
+            {
+                committed_economy = MoEOptimizationMovementEconomy{
+                    .authority = MoEOptimizationAuthority::Host,
+                    .transaction = transaction.candidate->epoch,
+                    .candidate_epoch = transaction.candidate->epoch,
+                    .command_count = static_cast<std::uint64_t>(
+                        transaction.migrations.size()),
+                    .cycle_count = static_cast<std::uint64_t>(
+                        transaction.migration_cycles.size()),
+                    .projected_service_gain_ns =
+                        transaction.economy.projected_service_gain_ns,
+                    .projected_transfer_and_repack_ns =
+                        transaction.economy
+                            .projected_transfer_and_repack_ns,
+                    .projected_inference_interference_ns =
+                        transaction.economy
+                            .projected_inference_interference_ns,
+                    .projected_net_benefit_ns =
+                        transaction.economy.projected_net_benefit_ns,
+                };
+                if (!committed_economy->valid())
+                {
+                    /* A committed Dynamic policy decision must retain the
+                     * exact arithmetic that admitted it. Optional telemetry
+                     * cannot repair a malformed authority-owned proof. */
+                    std::terminate();
+                }
+            }
+        }
 
         const auto capacity_evidence =
             analyzeMoEOverlayMigrationCapacity(transaction.migrations);
@@ -4619,12 +6331,74 @@ namespace llaminar2
             cross_backend += migration.crossesBackend() ? 1u : 0u;
             estimated_bytes += migration.estimated_weight_bytes;
 
-            LOG_INFO(
+            if (!prepared_context_restoration)
+            {
+                MoEOptimizationMovementDirection typed_direction =
+                    MoEOptimizationMovementDirection::SamePriority;
+                if (migration.direction ==
+                    MoEOverlayTierMigrationDirection::Promotion)
+                {
+                    typed_direction =
+                        MoEOptimizationMovementDirection::Promotion;
+                }
+                else if (migration.direction ==
+                         MoEOverlayTierMigrationDirection::Demotion)
+                {
+                    typed_direction =
+                        MoEOptimizationMovementDirection::Demotion;
+                }
+                committed_edges.push_back({
+                    .authority = MoEOptimizationAuthority::Host,
+                    .transaction = transaction.candidate->epoch,
+                    .candidate_epoch = transaction.candidate->epoch,
+                    .layer = migration.layer_idx,
+                    .expert = migration.expert_id,
+                    .cycle_index =
+                        cycle_index_by_migration[migration_index],
+                    .cycle_size =
+                        cycle_size_by_migration[migration_index],
+                    .direction = typed_direction,
+                    .axis = migration.axis,
+                    .source_participant =
+                        migration.source.owner_participant,
+                    .destination_participant =
+                        migration.destination.owner_participant,
+                    .source_priority = source_priority,
+                    .destination_priority = destination_priority,
+                    .source_device = migration.source.device,
+                    .destination_device = migration.destination.device,
+                    .source_world_rank =
+                        migration.source.owner_world_rank,
+                    .destination_world_rank =
+                        migration.destination.owner_world_rank,
+                    .source_world_rank_known =
+                        migration.source.owner_world_rank_known,
+                    .destination_world_rank_known =
+                        migration.destination.owner_world_rank_known,
+                    .estimated_weight_bytes =
+                        static_cast<std::uint64_t>(
+                            migration.estimated_weight_bytes),
+                    .activation_count = migration.activation_count,
+                    .blocking_inference = false,
+                });
+            }
+
+            // A committed wave may contain hundreds of edges on every rank.
+            // Keep individual edges available for deep diagnosis without
+            // making formatting and terminal I/O part of ordinary inference.
+            // The typed committed-edge evidence above and the wave-level INFO
+            // summary remain the production authorities.
+            LOG_TRACE(
                 "[ExpertOverlay][Residency] committed edge epoch="
                 << transaction.candidate->epoch
+                << " purpose="
+                << (prepared_context_restoration
+                        ? "prepared_context_restoration"
+                        : "live_placement_change")
                 << " layer=" << migration.layer_idx
                 << " expert=" << migration.expert_id
                 << " direction=" << directionName(migration.direction)
+                << " movement_axis=" << movementAxisName(migration.axis)
                 << " source_priority=" << source_priority
                 << " destination_priority=" << destination_priority
                 << " source_participant="
@@ -4646,9 +6420,12 @@ namespace llaminar2
 
             PerfStatsCollector::addCounter(
                 "moe_overlay_residency",
-                "expert_migration_edges",
+                prepared_context_restoration
+                    ? "prepared_context_restoration_edges"
+                    : "expert_migration_edges",
                 1.0,
-                "maintenance",
+                prepared_context_restoration ? "model_teardown"
+                                             : "maintenance",
                 config_.perf_device,
                 {
                     {"epoch", std::to_string(transaction.candidate->epoch)},
@@ -4663,6 +6440,7 @@ namespace llaminar2
                     {"layer", std::to_string(migration.layer_idx)},
                     {"expert", std::to_string(migration.expert_id)},
                     {"direction", directionName(migration.direction)},
+                    {"movement_axis", movementAxisName(migration.axis)},
                     {"source_tier", migration.source.tier_name},
                     {"destination_tier", migration.destination.tier_name},
                     {"source_priority", std::to_string(source_priority)},
@@ -4693,72 +6471,148 @@ namespace llaminar2
                     {"activation_count", std::to_string(migration.activation_count)},
                     {"blocking_inference", "false"},
                     {"policy_owner", "host"},
+                    {"transaction_purpose",
+                     prepared_context_restoration
+                         ? "prepared_context_restoration"
+                         : "live_placement_change"},
                 });
         }
 
-        committed_waves_.fetch_add(1, std::memory_order_relaxed);
-        committed_migrations_.fetch_add(
-            transaction.migrations.size(),
-            std::memory_order_relaxed);
-        committed_cycles_.fetch_add(
-            transaction.migration_cycles.size(),
-            std::memory_order_relaxed);
-        promotions_.fetch_add(promotions, std::memory_order_relaxed);
-        demotions_.fetch_add(demotions, std::memory_order_relaxed);
-        same_priority_moves_.fetch_add(same_priority, std::memory_order_relaxed);
-        cross_domain_migrations_.fetch_add(cross_domain, std::memory_order_relaxed);
-        cross_rank_migrations_.fetch_add(cross_rank, std::memory_order_relaxed);
-        cross_backend_migrations_.fetch_add(cross_backend, std::memory_order_relaxed);
+        if (!committed_edges.empty() || committed_economy ||
+            committed_host_admission)
+        {
+            /* Publish edge identities and coordinator-owned economics in one
+             * critical section. Readers can never observe a movement without
+             * the admitting proof on its policy-authority rank. */
+            std::lock_guard<std::mutex> ledger_lock(
+                movement_ledger_mutex_);
+            movement_ledger_.insert(
+                movement_ledger_.end(),
+                committed_edges.begin(),
+                committed_edges.end());
+            if (committed_economy)
+                movement_economy_.push_back(*committed_economy);
+            if (committed_host_admission)
+            {
+                movement_host_admissions_.push_back(
+                    *committed_host_admission);
+            }
+        }
+
+        if (prepared_context_restoration)
+        {
+            prepared_context_restoration_waves_.fetch_add(
+                1, std::memory_order_relaxed);
+            prepared_context_restoration_migrations_.fetch_add(
+                transaction.migrations.size(), std::memory_order_relaxed);
+            prepared_context_restoration_cycles_.fetch_add(
+                transaction.migration_cycles.size(),
+                std::memory_order_relaxed);
+        }
+        else
+        {
+            committed_waves_.fetch_add(1, std::memory_order_relaxed);
+            committed_migrations_.fetch_add(
+                transaction.migrations.size(),
+                std::memory_order_relaxed);
+            committed_cycles_.fetch_add(
+                transaction.migration_cycles.size(),
+                std::memory_order_relaxed);
+            promotions_.fetch_add(promotions, std::memory_order_relaxed);
+            demotions_.fetch_add(demotions, std::memory_order_relaxed);
+            same_priority_moves_.fetch_add(
+                same_priority, std::memory_order_relaxed);
+            cross_domain_migrations_.fetch_add(
+                cross_domain, std::memory_order_relaxed);
+            cross_rank_migrations_.fetch_add(
+                cross_rank, std::memory_order_relaxed);
+            cross_backend_migrations_.fetch_add(
+                cross_backend, std::memory_order_relaxed);
+        }
 
         auto tags = baseTags(
             config_.initial_plan.residency_policy,
             transaction.candidate->epoch);
+        tags.emplace(
+            "transaction_purpose",
+            prepared_context_restoration
+                ? "prepared_context_restoration"
+                : "live_placement_change");
         const auto add = [&](const char *name, double value)
         {
             PerfStatsCollector::addCounter(
                 "moe_overlay_residency",
                 name,
                 value,
-                "maintenance",
+                prepared_context_restoration ? "model_teardown"
+                                             : "maintenance",
                 config_.perf_device,
                 tags);
         };
-        add("committed_waves", 1.0);
-        add("committed_expert_migrations",
-            static_cast<double>(transaction.migrations.size()));
-        add("committed_migration_cycles",
-            static_cast<double>(transaction.migration_cycles.size()));
-        add("promotions", static_cast<double>(promotions));
-        add("demotions", static_cast<double>(demotions));
-        add("same_priority_moves", static_cast<double>(same_priority));
-        add("cross_domain_migrations", static_cast<double>(cross_domain));
-        add("cross_rank_migrations", static_cast<double>(cross_rank));
-        add("cross_backend_migrations", static_cast<double>(cross_backend));
-        add("estimated_weight_bytes", static_cast<double>(estimated_bytes));
+        if (prepared_context_restoration)
+        {
+            add("prepared_context_restoration_waves", 1.0);
+            add("prepared_context_restoration_migrations",
+                static_cast<double>(transaction.migrations.size()));
+            add("prepared_context_restoration_cycles",
+                static_cast<double>(transaction.migration_cycles.size()));
+            add("prepared_context_restoration_estimated_weight_bytes",
+                static_cast<double>(estimated_bytes));
+        }
+        else
+        {
+            add("committed_waves", 1.0);
+            add("committed_expert_migrations",
+                static_cast<double>(transaction.migrations.size()));
+            add("committed_migration_cycles",
+                static_cast<double>(transaction.migration_cycles.size()));
+            add("promotions", static_cast<double>(promotions));
+            add("demotions", static_cast<double>(demotions));
+            add("same_priority_moves", static_cast<double>(same_priority));
+            add("cross_domain_migrations", static_cast<double>(cross_domain));
+            add("cross_rank_migrations", static_cast<double>(cross_rank));
+            add("cross_backend_migrations", static_cast<double>(cross_backend));
+            add("estimated_weight_bytes", static_cast<double>(estimated_bytes));
+        }
+        auto capacity_tags = tags;
+        capacity_tags.emplace(
+            "edges_checked",
+            std::to_string(capacity_evidence.edges_checked));
+        capacity_tags.emplace(
+            "closed_cycles",
+            std::to_string(transaction.migration_cycles.size()));
+        capacity_tags.emplace(
+            "participant_coordinates_checked",
+            std::to_string(
+                capacity_evidence.participant_coordinates_checked));
+        capacity_tags.emplace(
+            "tier_coordinates_checked",
+            std::to_string(capacity_evidence.tier_coordinates_checked));
+        capacity_tags.emplace(
+            "malformed_edges",
+            std::to_string(capacity_evidence.malformed_edges));
+        capacity_tags.emplace(
+            "participant_flow_violations",
+            std::to_string(capacity_evidence.participant_flow_violations));
+        capacity_tags.emplace(
+            "tier_flow_violations",
+            std::to_string(capacity_evidence.tier_flow_violations));
+        capacity_tags.emplace(
+            "direction_counts_are_capacity_proof",
+            "false");
+        /* Restoration still carries a full capacity proof, but it is a
+         * teardown transaction rather than a live optimization wave. Keep its
+         * evidence under a distinct name so diagnostics cannot inflate the
+         * production movement/certification contract. */
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
-            "capacity_conservation_certifications",
+            prepared_context_restoration
+                ? "prepared_context_restoration_capacity_conservation_certifications"
+                : "capacity_conservation_certifications",
             1.0,
-            "maintenance",
+            prepared_context_restoration ? "model_teardown" : "maintenance",
             config_.perf_device,
-            {{"epoch", std::to_string(transaction.candidate->epoch)},
-             {"edges_checked",
-              std::to_string(capacity_evidence.edges_checked)},
-             {"closed_cycles",
-              std::to_string(transaction.migration_cycles.size())},
-             {"participant_coordinates_checked",
-              std::to_string(
-                  capacity_evidence.participant_coordinates_checked)},
-             {"tier_coordinates_checked",
-              std::to_string(capacity_evidence.tier_coordinates_checked)},
-             {"malformed_edges",
-              std::to_string(capacity_evidence.malformed_edges)},
-             {"participant_flow_violations",
-              std::to_string(
-                  capacity_evidence.participant_flow_violations)},
-             {"tier_flow_violations",
-              std::to_string(capacity_evidence.tier_flow_violations)},
-             {"direction_counts_are_capacity_proof", "false"}});
+            std::move(capacity_tags));
         if (transaction.economy.enabled)
         {
             add("committed_projected_service_gain_ns",

@@ -24,7 +24,7 @@
 
 namespace llaminar2
 {
-    /** @brief Stable 128-bit digest of one complete residency transaction. */
+    /** @brief Stable 128-bit digest of one complete root policy decision. */
     struct MoEOverlayResidencyTransactionFingerprint
     {
         std::uint64_t low = 0;
@@ -38,6 +38,30 @@ namespace llaminar2
 
         bool operator==(
             const MoEOverlayResidencyTransactionFingerprint &) const = default;
+    };
+
+    /**
+     * @brief Stable 128-bit digest of only the executable residency plan.
+     *
+     * This is deliberately a different C++ type from
+     * @ref MoEOverlayResidencyTransactionFingerprint.  Physical transfer and
+     * consensus lanes must never accept the root-only economy/policy digest:
+     * followers reproduce the selected execution plan, not the measurements
+     * that caused the root to select it.
+     */
+    struct MoEOverlayResidencyExecutionFingerprint
+    {
+        std::uint64_t low = 0;
+        std::uint64_t high = 0;
+
+        /** @return Whether both independently mixed digest lanes are present. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return low != 0 && high != 0;
+        }
+
+        bool operator==(
+            const MoEOverlayResidencyExecutionFingerprint &) const = default;
     };
 
     /**
@@ -55,6 +79,23 @@ namespace llaminar2
      */
     [[nodiscard]] MoEOverlayResidencyTransactionFingerprint
     fingerprintMoEOverlayResidencyTransaction(
+        const MoEOverlayResidencyTransaction &transaction);
+
+    /**
+     * @brief Fingerprint only the executable residency transaction state.
+     *
+     * The digest covers epochs, topology, candidate ownership, histogram,
+     * migrations, cycles, and shadow requirements, but deliberately excludes
+     * root-owned economy evidence. Distributed followers execute one
+     * root-selected plan and therefore must agree on this identity without
+     * pretending to own or reproduce the root's physical measurements.
+     *
+     * @param transaction Structurally valid residency transaction.
+     * @return Stable executable-plan fingerprint.
+     * @throws std::invalid_argument When @p transaction is invalid.
+     */
+    [[nodiscard]] MoEOverlayResidencyExecutionFingerprint
+    fingerprintMoEOverlayResidencyExecutionPlan(
         const MoEOverlayResidencyTransaction &transaction);
 
     /** @brief Fixed header preceding one coordinator-published histogram bank. */
@@ -138,6 +179,101 @@ namespace llaminar2
         DecodeExpertHistogramWindow *window,
         std::string *error = nullptr);
 
+    /**
+     * @brief Root-authored plan plus separate execution and policy identities.
+     *
+     * `execution_fingerprint` is independently reproducible by every follower
+     * after topology validation. `policy_fingerprint` names the root's complete
+     * transaction, including its economy evidence, and is retained as an audit
+     * identity rather than used to confer policy authority on followers.
+     */
+    struct MoEOverlayDistributedResidencyProposal
+    {
+        MoEOverlayAuthoritativeResidencyPlan plan;
+        MoEOverlayResidencyExecutionFingerprint execution_fingerprint;
+        MoEOverlayResidencyTransactionFingerprint policy_fingerprint;
+
+        /** @return Whether the plan and both independent identities are valid. */
+        [[nodiscard]] bool valid() const noexcept;
+    };
+
+    /** @brief Fixed header preceding one canonical distributed proposal. */
+    struct MoEOverlayDistributedResidencyProposalHeader
+    {
+        static constexpr std::uint32_t kMagic = 0x504F4F4Du; // "MOOP"
+        static constexpr std::uint32_t kABIVersion = 1u;
+        static constexpr std::size_t kWireBytes = 96u;
+
+        std::uint32_t magic = kMagic;
+        std::uint32_t abi_version = kABIVersion;
+        std::uint64_t expected_epoch = 0;
+        std::uint64_t candidate_epoch = 0;
+        std::int32_t num_layers = 0;
+        std::int32_t num_experts = 0;
+        std::uint64_t entry_count = 0;
+        std::uint64_t changed_entry_count = 0;
+        MoEOverlayResidencyExecutionFingerprint execution_fingerprint;
+        MoEOverlayResidencyTransactionFingerprint policy_fingerprint;
+        std::uint64_t plan_fingerprint = 0;
+        std::uint64_t reserved = 0;
+
+        /** @return Whether ABI, epochs, geometry, and identities are coherent. */
+        [[nodiscard]] bool valid() const noexcept;
+    };
+
+    static_assert(
+        std::is_trivially_copyable_v<
+            MoEOverlayDistributedResidencyProposalHeader>);
+    static_assert(
+        sizeof(MoEOverlayDistributedResidencyProposalHeader) ==
+        MoEOverlayDistributedResidencyProposalHeader::kWireBytes);
+
+    /**
+     * @brief Build the canonical publication envelope for a root transaction.
+     * @param plan Dense plan exported by the transaction's owning authority.
+     * @param transaction Complete valid root-owned transaction.
+     * @return Authenticated proposal with execution and policy identities.
+     * @throws std::invalid_argument When either input is invalid or mismatched.
+     */
+    [[nodiscard]] MoEOverlayDistributedResidencyProposal
+    makeMoEOverlayDistributedResidencyProposal(
+        MoEOverlayAuthoritativeResidencyPlan plan,
+        const MoEOverlayResidencyTransaction &transaction);
+
+    /** @return Exact fixed packet bytes for one proposal model geometry. */
+    [[nodiscard]] std::size_t
+    moeOverlayDistributedResidencyProposalWireBytes(
+        int num_layers,
+        int num_experts);
+
+    /**
+     * @brief Encode one canonical proposal into exact little-endian storage.
+     * @param proposal Valid root-authored proposal.
+     * @param destination Exact-size persistent packet storage.
+     * @param error Optional validation diagnostic.
+     * @return True only when every byte was written and authenticated.
+     */
+    bool encodeMoEOverlayDistributedResidencyProposal(
+        const MoEOverlayDistributedResidencyProposal &proposal,
+        std::span<std::uint8_t> destination,
+        std::string *error = nullptr);
+
+    /**
+     * @brief Decode and authenticate one root-authored proposal packet.
+     * @param packet Complete fixed-size little-endian packet.
+     * @param expected_layers Model-owned layer geometry.
+     * @param expected_experts Model-owned expert geometry.
+     * @param proposal Receives the canonical plan and identities.
+     * @param error Optional malformed-packet diagnostic.
+     * @return True only after complete size, geometry, and digest validation.
+     */
+    bool decodeMoEOverlayDistributedResidencyProposal(
+        std::span<const std::uint8_t> packet,
+        int expected_layers,
+        int expected_experts,
+        MoEOverlayDistributedResidencyProposal *proposal,
+        std::string *error = nullptr);
+
     /** @brief Fixed-layout identity shared by every rank in one migration wave. */
     struct MoEOverlayDistributedResidencyWaveIdentity
     {
@@ -151,7 +287,7 @@ namespace llaminar2
         std::uint64_t histogram_generation = 0;
         std::uint64_t migration_count = 0;
         std::uint64_t cycle_count = 0;
-        MoEOverlayResidencyTransactionFingerprint transaction_fingerprint;
+        MoEOverlayResidencyExecutionFingerprint execution_fingerprint;
 
         /** @return Whether ABI, epoch progression, counts, and digest are valid. */
         [[nodiscard]] bool valid() const noexcept;
@@ -181,7 +317,8 @@ namespace llaminar2
         Staged = 2,   ///< Physical arrivals are complete and authenticated.
         InactivePrepared = 3, ///< Candidate banks are locally installed and ready.
         RuntimePublished = 4, ///< Every local device selector names the candidate.
-        LeaseDrained = 5, ///< Every rank released all old-epoch dispatches.
+        RetirementAdmissionReady = 5, ///< Old-epoch producers/readers are quiescent.
+        LeaseDrained = 6, ///< Closed-admission readers drained on every rank.
     };
 
     /** @brief Rank-local outcome contributed to one global barrier. */
@@ -190,6 +327,7 @@ namespace llaminar2
         Ready = 1,  ///< This rank completed the named phase.
         Failed = 2, ///< This rank rejects the unpublished candidate.
         Deferred = 3, ///< This rank lacks transient stage capacity; all retry.
+        Waiting = 4, ///< A published old-epoch grace period remains in flight.
     };
 
     /**
@@ -203,7 +341,7 @@ namespace llaminar2
     struct MoEOverlayDistributedResidencyVote
     {
         static constexpr std::uint32_t kMagic = 0x56574F4Du; // "MOWV"
-        static constexpr std::uint32_t kABIVersion = 4u;
+        static constexpr std::uint32_t kABIVersion = 6u;
 
         std::uint32_t magic = kMagic;
         std::uint32_t abi_version = kABIVersion;
@@ -288,6 +426,9 @@ namespace llaminar2
         Deferred,
         Failed,
         Published,
+        AwaitingRetirementAdmissionConsensus,
+        ReadyToCloseRetirementAdmission,
+        RetirementAdmissionClosed,
         AwaitingRetirementConsensus,
         ReadyToRetire,
         Retired,
@@ -333,9 +474,10 @@ namespace llaminar2
 
         /**
          * @brief Record this rank's terminal result for the currently due phase.
-         * @param decision Ready or Failed.
-         * @param error_code Zero for Ready; positive for Failed.
-         * @param diagnostic Empty for Ready; precise local failure for Failed.
+         * @param decision Ready, Failed, phase-capacity Deferred, or
+         *        retirement-only Waiting.
+         * @param error_code Zero except for a positive Failed code.
+         * @param diagnostic Empty except for a precise local Failed diagnostic.
          * @return Fixed-layout vote to exchange exactly once.
          * @throws std::logic_error When the local phase is not awaiting a vote.
          * @throws std::invalid_argument For inconsistent diagnostics.
@@ -354,9 +496,13 @@ namespace llaminar2
          * Unanimous reservation permits physical staging, unanimous staging
          * permits inactive-bank preparation, unanimous preparation permits
          * selector publication, unanimous selector publication becomes
-         * ReadyForAuthorityPublication, and the later lease-drain vote makes
-         * the previous epoch ReadyToRetire. Any malformed or failed generation
-         * is terminal.
+         * ReadyForAuthorityPublication. A retirement-admission generation
+         * containing a Waiting vote returns to Published for another aligned
+         * poll; unanimous readiness permits every authority to close exact
+         * old-epoch admission. A second lease-drain generation waits for any
+         * acquisition racing that close and only unanimous readiness makes the
+         * previous epoch ReadyToRetire. Any malformed or failed generation is
+         * terminal.
          */
         bool acceptConsensus(
             const std::vector<MoEOverlayDistributedResidencyVote> &votes,
@@ -367,6 +513,17 @@ namespace llaminar2
          * @throws std::logic_error Unless state is ReadyForAuthorityPublication.
          */
         void markAuthorityPublished();
+
+        /**
+         * @brief Record that this rank closed exact old-epoch host admission.
+         * @throws std::logic_error Unless every rank first reached the
+         *         retirement-admission-ready barrier.
+         *
+         * This is a local lifecycle edge, not another collective. All ranks
+         * have already completed the ordered phase-5 exchange, so each may
+         * close its source-owned admission gate before entering phase 6.
+         */
+        void markRetirementAdmissionClosed();
 
         /**
          * @brief Mark the globally lease-drained old epoch physically retired.

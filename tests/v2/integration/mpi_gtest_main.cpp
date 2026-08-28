@@ -5,7 +5,13 @@
  * Integration binaries use the same MPI_THREAD_MULTIPLE contract as the
  * production runtime. This permits real tests of maintenance/progress threads
  * while remaining compatible with tests that make MPI calls only on main.
+ * Process-wide collective and GPU context owners are retired before MPI so a
+ * passing test cannot defer device-thread or communicator teardown to static
+ * destruction.
  */
+
+#include "backends/GPUDeviceContextPool.h"
+#include "collective/BackendRouter.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -26,6 +32,11 @@ int main(int argc, char **argv)
 
     // Run all tests
     const int result = RUN_ALL_TESTS();
+
+    /* Match production parity teardown: context workers and any collective
+     * communicator owners must be joined while MPI and GPU runtimes are live. */
+    llaminar2::GlobalBackendRouter::shutdown();
+    llaminar2::GPUDeviceContextPool::instance().shutdown();
 
     // Finalize MPI
     if (MPI_Finalize() != MPI_SUCCESS)

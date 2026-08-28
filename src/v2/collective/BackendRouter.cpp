@@ -924,6 +924,39 @@ namespace llaminar2
         return instance_.get();
     }
 
+    CollectiveRuntimeRetirementReceipt
+    GlobalBackendRouter::retireForExclusiveDeviceRuntimeReset(
+        DeviceId device)
+    {
+        CollectiveRuntimeRetirementReceipt receipt;
+        receipt.device = device;
+        if (!device.is_gpu())
+        {
+            receipt.state =
+                CollectiveRuntimeRetirementState::InvalidDevice;
+            receipt.diagnostic =
+                "collective runtime retirement requires one exact GPU";
+            return receipt;
+        }
+
+        /* The singleton may own a lazily initialized copy communicator that
+         * is not reachable from the already-destroyed model runner. Retire it
+         * before consulting vendor pools so every resulting coordinator is
+         * first parked, then joined while its native context is still valid. */
+        instance_.reset();
+
+#ifdef HAVE_RCCL
+        if (device.is_rocm())
+            return RCCLBackend::retireRuntimeGenerationResources(device);
+#endif
+
+        /* NCCL coordinators are owned directly by their backend and have no
+         * process-retained pool. Destroying the singleton above therefore
+         * completes the process-global CUDA collective edge. */
+        receipt.state = CollectiveRuntimeRetirementState::Complete;
+        return receipt;
+    }
+
     void GlobalBackendRouter::shutdown()
     {
         instance_.reset();

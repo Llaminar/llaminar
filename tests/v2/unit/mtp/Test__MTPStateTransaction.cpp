@@ -1,8 +1,21 @@
+/**
+ * @file Test__MTPStateTransaction.cpp
+ * @brief Adversarial unit proofs for MTP and prefix-replay state transactions.
+ *
+ * These tests keep the persistent-state comparison rules independent of a
+ * model or accelerator.  In particular, they prove which bytes must remain
+ * exact across prefix restore and which bounded floating-point payload may use
+ * numerical equivalence after an authenticated ExpertOverlay placement change.
+ */
+
 #include <gtest/gtest.h>
 
 #include "execution/mtp/MTPStateTransaction.h"
+#include "tensors/FP16Utils.h"
 
 #include <algorithm>
+#include <cstring>
+#include <initializer_list>
 #include <utility>
 #include <vector>
 
@@ -88,6 +101,97 @@ namespace
         gdn.conv_sample_values = {4.0f, 5.0f};
         snapshot.gdn_layers.push_back(gdn);
         return snapshot;
+    }
+
+    /**
+     * @brief Encode logical floating values exactly as one KV precision stores them.
+     * @param values Source values used by the state-machine proof.
+     * @param precision Native KV payload precision.
+     * @return Canonical byte sequence consumed by the production comparator.
+     */
+    std::vector<uint8_t> encodeKVValues(
+        std::initializer_list<float> values,
+        ActivationPrecision precision)
+    {
+        const size_t element_bytes =
+            precision == ActivationPrecision::FP32 ? sizeof(float)
+                                                   : sizeof(uint16_t);
+        std::vector<uint8_t> payload(values.size() * element_bytes);
+        size_t index = 0;
+        for (float value : values)
+        {
+            if (precision == ActivationPrecision::FP32)
+            {
+                std::memcpy(
+                    payload.data() + index * sizeof(float),
+                    &value,
+                    sizeof(value));
+            }
+            else
+            {
+                uint16_t word = 0;
+                if (precision == ActivationPrecision::FP16)
+                {
+                    word = fp32_to_fp16(value);
+                }
+                else
+                {
+                    uint32_t bits = 0;
+                    std::memcpy(&bits, &value, sizeof(bits));
+                    word = static_cast<uint16_t>(bits >> 16u);
+                }
+                std::memcpy(
+                    payload.data() + index * sizeof(uint16_t),
+                    &word,
+                    sizeof(word));
+            }
+            ++index;
+        }
+        return payload;
+    }
+
+    /**
+     * @brief Install exact-prefix and retained-suffix evidence on a snapshot.
+     * @param snapshot Snapshot whose one main-KV layer receives the evidence.
+     * @param precision Native K/V precision under test.
+     * @param k_payload Complete logical values for the one-token K suffix.
+     * @param v_payload Complete logical values for the one-token V suffix.
+     */
+    void installPartialPrefixKVEvidence(
+        PrefixRuntimeStateSnapshot *snapshot,
+        ActivationPrecision precision,
+        std::vector<uint8_t> k_payload,
+        std::vector<uint8_t> v_payload)
+    {
+        ASSERT_NE(snapshot, nullptr);
+        PrefixKVCacheProbe &cache = snapshot->kv_caches.front();
+        PrefixKVLayerProbe &layer = cache.layers.front();
+        cache.k_precision = precision;
+        cache.v_precision = precision;
+
+        const size_t row_k_bytes = k_payload.size();
+        const size_t row_v_bytes = v_payload.size();
+        layer.k_payload_bytes = 7u * row_k_bytes;
+        layer.v_payload_bytes = 7u * row_v_bytes;
+        layer.leading_segment_hash_available = true;
+        layer.leading_segment_tokens = 6;
+        layer.leading_k_payload_bytes = 6u * row_k_bytes;
+        layer.leading_v_payload_bytes = 6u * row_v_bytes;
+        layer.leading_k_payload_hash = 0xabc001;
+        layer.leading_v_payload_hash = 0xabc002;
+
+        PrefixKVSegmentProbe suffix;
+        suffix.name = "recomputed_suffix";
+        suffix.token_start = 6;
+        suffix.token_count = 1;
+        suffix.hash_available = true;
+        suffix.k_payload_bytes = row_k_bytes;
+        suffix.v_payload_bytes = row_v_bytes;
+        suffix.k_payload_hash = 0xdef001;
+        suffix.v_payload_hash = 0xdef002;
+        suffix.k_payload = std::move(k_payload);
+        suffix.v_payload = std::move(v_payload);
+        layer.segments = {std::move(suffix)};
     }
 
 } // namespace
@@ -310,6 +414,176 @@ TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceRejectsTerminalPayload
     EXPECT_NE(result.reason.find("terminal hidden payload"), std::string::npos);
 }
 
+TEST(Test__MTPStateTransaction,
+     RuntimeSnapshotPlacementAwareTerminalHiddenStillRequiresExactSameEpoch)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 4;
+    candidate.moe_runtime_movement_epoch = 4;
+    oracle.terminal_hidden_values.assign(64, 1.0f);
+    candidate.terminal_hidden_values = oracle.terminal_hidden_values;
+    candidate.terminal_hidden_values.front() += 1.0e-4f;
+    candidate.terminal_hidden_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.terminal_hidden_policy =
+        MTPTerminalPayloadComparisonPolicy::
+            ExactUnlessMoEPlacementChanged;
+    const auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_FALSE(result.terminal_hidden_numerical.compared);
+    EXPECT_NE(result.reason.find("moe_movement_epoch=4/4"), std::string::npos)
+        << result.reason;
+}
+
+TEST(Test__MTPStateTransaction,
+     RuntimeSnapshotPlacementAwareTerminalHiddenAcceptsFullNumericalEvidence)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 4;
+    candidate.moe_runtime_movement_epoch = 5;
+    oracle.terminal_hidden_values.assign(64, 1.0f);
+    candidate.terminal_hidden_values = oracle.terminal_hidden_values;
+    candidate.terminal_hidden_values.front() += 1.0e-3f;
+    candidate.terminal_hidden_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.terminal_hidden_policy =
+        MTPTerminalPayloadComparisonPolicy::
+            ExactUnlessMoEPlacementChanged;
+    options.terminal_hidden_min_cosine =
+        kDefaultPlacementAwareTerminalPayloadMinimumCosine;
+    const auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_TRUE(result) << result.reason;
+    EXPECT_TRUE(result.terminal_hidden_numerical.compared);
+    EXPECT_TRUE(result.terminal_hidden_numerical.passed);
+    EXPECT_EQ(result.terminal_hidden_numerical.elements, 64u);
+    EXPECT_GE(
+        result.terminal_hidden_numerical.cosine,
+        kDefaultPlacementAwareTerminalPayloadMinimumCosine);
+    EXPECT_GT(result.terminal_hidden_numerical.max_abs, 0.0);
+}
+
+TEST(Test__MTPStateTransaction,
+     RuntimeSnapshotPlacementAwareTerminalHiddenRejectsMissingOrBadEvidence)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 4;
+    candidate.moe_runtime_movement_epoch = 5;
+    candidate.terminal_hidden_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.terminal_hidden_policy =
+        MTPTerminalPayloadComparisonPolicy::
+            ExactUnlessMoEPlacementChanged;
+    options.terminal_hidden_min_cosine =
+        kDefaultPlacementAwareTerminalPayloadMinimumCosine;
+    auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("complete retained values"), std::string::npos)
+        << result.reason;
+
+    oracle.terminal_hidden_values.assign(64, 1.0f);
+    candidate.terminal_hidden_values.assign(64, -1.0f);
+    result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_TRUE(result.terminal_hidden_numerical.compared);
+    EXPECT_FALSE(result.terminal_hidden_numerical.passed);
+    EXPECT_NE(result.reason.find("numerical mismatch"), std::string::npos)
+        << result.reason;
+}
+
+TEST(Test__MTPStateTransaction,
+     RuntimeSnapshotPlacementAwareTerminalLogitsStillRequiresExactSameEpoch)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 9;
+    candidate.moe_runtime_movement_epoch = 9;
+    oracle.terminal_logits_values.assign(128, 1.0f);
+    candidate.terminal_logits_values = oracle.terminal_logits_values;
+    candidate.terminal_logits_values.front() += 1.0e-4f;
+    candidate.terminal_logits_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.terminal_logits_policy =
+        MTPTerminalPayloadComparisonPolicy::
+            ExactUnlessMoEPlacementChanged;
+    const auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_FALSE(result.terminal_logits_numerical.compared);
+    EXPECT_NE(result.reason.find("moe_movement_epoch=9/9"), std::string::npos)
+        << result.reason;
+}
+
+TEST(Test__MTPStateTransaction,
+     RuntimeSnapshotPlacementAwareTerminalLogitsAcceptsFullNumericalEvidence)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 9;
+    candidate.moe_runtime_movement_epoch = 10;
+    oracle.terminal_logits_values.assign(128, 1.0f);
+    candidate.terminal_logits_values = oracle.terminal_logits_values;
+    candidate.terminal_logits_values.front() += 1.0e-3f;
+    candidate.terminal_logits_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.terminal_logits_policy =
+        MTPTerminalPayloadComparisonPolicy::
+            ExactUnlessMoEPlacementChanged;
+    options.terminal_logits_min_cosine =
+        kDefaultPlacementAwareTerminalPayloadMinimumCosine;
+    const auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_TRUE(result) << result.reason;
+    EXPECT_TRUE(result.terminal_logits_numerical.compared);
+    EXPECT_TRUE(result.terminal_logits_numerical.passed);
+    EXPECT_EQ(result.terminal_logits_numerical.elements, 128u);
+    EXPECT_GE(
+        result.terminal_logits_numerical.cosine,
+        kDefaultPlacementAwareTerminalPayloadMinimumCosine);
+    EXPECT_GT(result.terminal_logits_numerical.max_abs, 0.0);
+}
+
+TEST(Test__MTPStateTransaction,
+     RuntimeSnapshotPlacementAwareTerminalLogitsRejectsMissingOrBadEvidence)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 9;
+    candidate.moe_runtime_movement_epoch = 10;
+    candidate.terminal_logits_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.terminal_logits_policy =
+        MTPTerminalPayloadComparisonPolicy::
+            ExactUnlessMoEPlacementChanged;
+    options.terminal_logits_min_cosine =
+        kDefaultPlacementAwareTerminalPayloadMinimumCosine;
+    auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("complete retained values"), std::string::npos)
+        << result.reason;
+
+    oracle.terminal_logits_values.assign(128, 1.0f);
+    candidate.terminal_logits_values.assign(128, -1.0f);
+    result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_TRUE(result.terminal_logits_numerical.compared);
+    EXPECT_FALSE(result.terminal_logits_numerical.passed);
+    EXPECT_NE(result.reason.find("numerical mismatch"), std::string::npos)
+        << result.reason;
+}
+
 TEST(Test__MTPStateTransaction, RuntimeSnapshotSerialOracleCanIgnoreShiftedMTPKV)
 {
     PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
@@ -345,6 +619,160 @@ TEST(Test__MTPStateTransaction, RuntimeSnapshotSerialOracleCanIgnoreMainKVPayloa
     EXPECT_NE(
         result.reason.find("main KV layer metadata mismatch"),
         std::string::npos)
+        << result.reason;
+}
+
+TEST(Test__MTPStateTransaction,
+     PlacementAwareMainKVStillRequiresExactBytesWithoutMovement)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    installPartialPrefixKVEvidence(
+        &oracle,
+        ActivationPrecision::FP32,
+        encodeKVValues({1.0f, 2.0f, 3.0f, 4.0f}, ActivationPrecision::FP32),
+        encodeKVValues({5.0f, 6.0f, 7.0f, 8.0f}, ActivationPrecision::FP32));
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 4;
+    candidate.moe_runtime_movement_epoch = 4;
+    candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.main_kv_payload_policy =
+        MTPMainKVPayloadComparisonPolicy::
+            ExactPrefixNumericalSuffixAfterMoEPlacementChange;
+    options.main_kv_exact_prefix_tokens = 6;
+    const auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+
+    ASSERT_FALSE(result);
+    EXPECT_FALSE(result.main_kv_numerical.compared);
+    EXPECT_NE(result.reason.find("main KV payload hash mismatch"), std::string::npos)
+        << result.reason;
+}
+
+TEST(Test__MTPStateTransaction,
+     PlacementAwareMainKVAcceptsExactPrefixAndNumericalSuffixForAllFloatingFormats)
+{
+    for (const ActivationPrecision precision : {
+             ActivationPrecision::FP16,
+             ActivationPrecision::BF16,
+             ActivationPrecision::FP32})
+    {
+        PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+        installPartialPrefixKVEvidence(
+            &oracle,
+            precision,
+            encodeKVValues({1.0f, 2.0f, 3.0f, 4.0f}, precision),
+            encodeKVValues({5.0f, 6.0f, 7.0f, 8.0f}, precision));
+        PrefixRuntimeStateSnapshot candidate = oracle;
+        installPartialPrefixKVEvidence(
+            &candidate,
+            precision,
+            encodeKVValues({1.1f, 2.0f, 3.0f, 4.0f}, precision),
+            encodeKVValues({5.1f, 6.0f, 7.0f, 8.0f}, precision));
+        oracle.moe_runtime_movement_epoch = 4;
+        candidate.moe_runtime_movement_epoch = 5;
+        candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
+        candidate.kv_caches.front().layers.front().v_payload_hash ^= 0x2;
+        candidate.kv_caches.front().layers.front()
+            .segments.front().k_payload_hash ^= 0x1;
+        candidate.kv_caches.front().layers.front()
+            .segments.front().v_payload_hash ^= 0x2;
+
+        MTPRuntimeSnapshotComparisonOptions options;
+        options.main_kv_payload_policy =
+            MTPMainKVPayloadComparisonPolicy::
+                ExactPrefixNumericalSuffixAfterMoEPlacementChange;
+        options.main_kv_exact_prefix_tokens = 6;
+        options.main_kv_suffix_min_cosine = 0.99;
+        const auto result =
+            compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+
+        ASSERT_TRUE(result)
+            << "precision=" << activationPrecisionToString(precision)
+            << " reason=" << result.reason;
+        EXPECT_TRUE(result.main_kv_numerical.compared);
+        EXPECT_TRUE(result.main_kv_numerical.passed);
+        EXPECT_EQ(result.main_kv_numerical.exact_prefix_segments, 1u);
+        EXPECT_EQ(result.main_kv_numerical.numerical_suffix_payloads, 2u);
+        EXPECT_EQ(result.main_kv_numerical.elements, 8u);
+        EXPECT_GE(result.main_kv_numerical.minimum_cosine, 0.99);
+        EXPECT_GT(result.main_kv_numerical.maximum_abs, 0.0);
+    }
+}
+
+TEST(Test__MTPStateTransaction,
+     PlacementAwareMainKVRejectsAnyCachedPrefixByteDrift)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    installPartialPrefixKVEvidence(
+        &oracle,
+        ActivationPrecision::FP32,
+        encodeKVValues({1.0f, 2.0f, 3.0f, 4.0f}, ActivationPrecision::FP32),
+        encodeKVValues({5.0f, 6.0f, 7.0f, 8.0f}, ActivationPrecision::FP32));
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 4;
+    candidate.moe_runtime_movement_epoch = 5;
+    candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
+    candidate.kv_caches.front().layers.front().leading_k_payload_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.main_kv_payload_policy =
+        MTPMainKVPayloadComparisonPolicy::
+            ExactPrefixNumericalSuffixAfterMoEPlacementChange;
+    options.main_kv_exact_prefix_tokens = 6;
+    const auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+
+    ASSERT_FALSE(result);
+    EXPECT_FALSE(result.main_kv_numerical.compared);
+    EXPECT_NE(result.reason.find("cached-prefix bytes changed"), std::string::npos)
+        << result.reason;
+}
+
+TEST(Test__MTPStateTransaction,
+     PlacementAwareMainKVRejectsMissingOrNumericallyBadSuffixEvidence)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    installPartialPrefixKVEvidence(
+        &oracle,
+        ActivationPrecision::FP32,
+        encodeKVValues({1.0f, 2.0f, 3.0f, 4.0f}, ActivationPrecision::FP32),
+        encodeKVValues({5.0f, 6.0f, 7.0f, 8.0f}, ActivationPrecision::FP32));
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 4;
+    candidate.moe_runtime_movement_epoch = 5;
+    candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.main_kv_payload_policy =
+        MTPMainKVPayloadComparisonPolicy::
+            ExactPrefixNumericalSuffixAfterMoEPlacementChange;
+    options.main_kv_exact_prefix_tokens = 6;
+    options.main_kv_suffix_min_cosine = 0.99;
+
+    candidate.kv_caches.front().layers.front()
+        .segments.front().k_payload.clear();
+    auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("complete retained suffix bytes"), std::string::npos)
+        << result.reason;
+
+    candidate = oracle;
+    candidate.moe_runtime_movement_epoch = 5;
+    candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
+    PrefixKVSegmentProbe &bad_suffix =
+        candidate.kv_caches.front().layers.front().segments.front();
+    bad_suffix.k_payload = encodeKVValues(
+        {-1.0f, -2.0f, -3.0f, -4.0f},
+        ActivationPrecision::FP32);
+    bad_suffix.k_payload_hash ^= 0x1;
+    result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_TRUE(result.main_kv_numerical.compared);
+    EXPECT_FALSE(result.main_kv_numerical.passed);
+    EXPECT_NE(result.reason.find("suffix numerical mismatch"), std::string::npos)
         << result.reason;
 }
 

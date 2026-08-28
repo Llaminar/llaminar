@@ -314,6 +314,28 @@ namespace llaminar2
                         throw std::runtime_error(
                             "Host-authority GPU bank publisher could not retain an exact background stream/event");
                     }
+
+                    /*
+                     * The epoch protocol owns one bank selector for the whole
+                     * retained runtime family.  A dormant auxiliary layer
+                     * (for example the NextN source retained while MTP is off)
+                     * may not have been visited by the selected inference
+                     * graph, so graph construction alone does not prove that
+                     * every layer starts in the protocol's published bank.
+                     * Join the graph-build producer and finalize that complete
+                     * family on this exact maintenance stream before the first
+                     * transaction can prepare an inactive bank.  The typed
+                     * publisher is idempotent and event-ordered; no inference
+                     * stream is synchronized here.
+                     */
+                    if (!endpoint.binding.initial_runtime_publisher ||
+                        !endpoint.binding.initial_runtime_publisher
+                             ->publishMoEOverlayDeviceInitialRuntime(
+                                 endpoint.stream))
+                    {
+                        throw std::runtime_error(
+                            "Host-authority GPU bank publisher could not order a complete retained-layer runtime image");
+                    }
                 });
         }
 

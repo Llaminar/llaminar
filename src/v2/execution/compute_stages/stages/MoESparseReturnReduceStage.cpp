@@ -106,6 +106,11 @@ namespace llaminar2
         const bool protocol_participant =
             params_.inbound_consumer_role ==
             InboundConsumerRole::ProtocolParticipant;
+        const bool canonical_ticket_completion =
+            params_.inbound_consumer_role ==
+            InboundConsumerRole::CanonicalRouteTicketCompletion;
+        const bool skips_dense_scatter =
+            protocol_participant || canonical_ticket_completion;
 
         if (!validateHostStagedStage(ctx, params_.device_id, "MoESparseReturnReduceStage"))
             return false;
@@ -226,8 +231,15 @@ namespace llaminar2
             return false;
         }
         MoEOverlayDispatchTicket *ticket = nullptr;
+        if (params_.ticket_storage &&
+            params_.canonical_route_ticket_storage)
+        {
+            LOG_ERROR("[MoESparseReturnReduceStage] One return boundary cannot own both dense and canonical tickets");
+            return false;
+        }
         if (protocol_participant &&
             (params_.dense_output || params_.ticket_storage ||
+             params_.canonical_route_ticket_storage ||
              params_.dense_output_buffer_id ||
              params_.clear_output_before_scatter ||
              params_.broadcast_after_scatter ||
@@ -238,6 +250,28 @@ namespace llaminar2
             LOG_ERROR("[MoESparseReturnReduceStage] Protocol-only participant "
                       "cannot own dense output, a captured ticket, broadcast, "
                       "or residency-lease retirement");
+            return false;
+        }
+        if (canonical_ticket_completion)
+        {
+            const auto &canonical =
+                params_.canonical_route_ticket_storage;
+            if (!canonical || !canonical->hasValidBoundIdentity() ||
+                canonical->layerIndex() != params_.key.layer_idx ||
+                canonical->dModel() != params_.d_model ||
+                params_.dense_output || params_.ticket_storage ||
+                params_.dense_output_buffer_id ||
+                params_.clear_output_before_scatter ||
+                params_.broadcast_after_scatter ||
+                params_.publish_ticket_completion)
+            {
+                LOG_ERROR("[MoESparseReturnReduceStage] Canonical-route completion requires one matching sparse ticket and no dense authority");
+                return false;
+            }
+        }
+        else if (params_.canonical_route_ticket_storage)
+        {
+            LOG_ERROR("[MoESparseReturnReduceStage] Canonical-route ticket storage requires its typed completion role");
             return false;
         }
         if (params_.ticket_storage)
@@ -253,7 +287,7 @@ namespace llaminar2
                 return false;
             }
         }
-        else if (!protocol_participant && !validateDenseOutput(
+        else if (!skips_dense_scatter && !validateDenseOutput(
                      params_.dense_output,
                      params_.seq_len,
                      params_.d_model))
@@ -299,6 +333,13 @@ namespace llaminar2
                       "received continuation-owned return rows");
             return false;
         }
+        if (canonical_ticket_completion &&
+            !params_.canonical_route_ticket_storage->payloadReadyFor(
+                params_.outbound_rows->residency_epoch))
+        {
+            LOG_ERROR("[MoESparseReturnReduceStage] Colocated CPU canonical ticket is not complete for the returned residency epoch");
+            return false;
+        }
 
         if (params_.dispatch_output_lifetime)
         {
@@ -317,16 +358,16 @@ namespace llaminar2
         const int logical_seq_len = ticket
                                         ? ticket->header->logical_row_count
                                         : params_.seq_len;
-        float *dense = protocol_participant
+        float *dense = skips_dense_scatter
                            ? nullptr
                            : (ticket
                                   ? ticket->return_rows_fp32
                                   : params_.dense_output->mutable_data());
-        const size_t dense_count = protocol_participant
+        const size_t dense_count = skips_dense_scatter
                                        ? 0u
                                        : static_cast<size_t>(params_.seq_len) *
                                              static_cast<size_t>(params_.d_model);
-        if (!protocol_participant && params_.clear_output_before_scatter)
+        if (!skips_dense_scatter && params_.clear_output_before_scatter)
             std::fill_n(dense, dense_count, 0.0f);
 
         std::chrono::steady_clock::time_point t_scatter_start;
@@ -334,7 +375,7 @@ namespace llaminar2
             t_scatter_start = std::chrono::steady_clock::now();
 
         for (size_t compact_row = 0;
-             !protocol_participant &&
+             !skips_dense_scatter &&
              compact_row < params_.inbound_rows->live_row_count;
              ++compact_row)
         {
@@ -407,16 +448,17 @@ namespace llaminar2
         {
             const size_t compact_bytes = compactMoEOverlayReturnBytes(*params_.outbound_rows);
             const size_t dense_bytes =
-                protocol_participant
+                skips_dense_scatter
                     ? 0u
                     : denseMoEOverlayReturnBytes(
                           params_.seq_len, params_.d_model);
             MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
                 params_.key.layer_idx,
                 runtime_key.tier_idx,
-                runtime_key.toString(),
-                params_.source_participant,
-                params_.target_participant,
+                MoEOverlayProfileEdge{
+                    .source_participant = params_.source_participant,
+                    .target_participant = params_.target_participant,
+                },
                 outbound.live_row_count,
                 params_.inbound_rows->live_row_count,
                 compact_bytes,
@@ -514,7 +556,14 @@ namespace llaminar2
             "protocol_participant",
             params_.inbound_consumer_role ==
                 InboundConsumerRole::ProtocolParticipant);
+        info.addScalarBool(
+            "canonical_route_ticket_completion",
+            params_.inbound_consumer_role ==
+                InboundConsumerRole::CanonicalRouteTicketCompletion);
         info.addScalarBool("captured_return_ticket", params_.ticket_storage != nullptr);
+        info.addScalarBool(
+            "canonical_route_ticket",
+            params_.canonical_route_ticket_storage != nullptr);
         info.addScalarBool("publish_ticket_completion",
                            params_.publish_ticket_completion);
         info.addScalarBool("release_residency_lease_on_completion",

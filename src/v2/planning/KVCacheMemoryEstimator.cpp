@@ -391,6 +391,106 @@ namespace llaminar2
         throw std::logic_error("Unreachable KV-cache storage format");
     }
 
+    GPULogicalKVBlockEstimate
+    KVCacheMemoryEstimator::estimateGPULogicalBlock(
+        int token_count,
+        int n_kv_heads,
+        int head_dim,
+        const std::string &kv_precision,
+        DeviceId device)
+    {
+        if (!device.is_cuda() && !device.is_rocm())
+        {
+            throw std::invalid_argument(
+                "Logical GPU KV-block planning requires CUDA or ROCm");
+        }
+        if (token_count <= 0 || n_kv_heads <= 0 || head_dim <= 0)
+        {
+            throw std::invalid_argument(
+                "Logical GPU KV-block geometry must be positive");
+        }
+
+        const KVStorageFormat format = parseFormat(kv_precision);
+        const std::size_t tokens = static_cast<std::size_t>(token_count);
+        const std::size_t heads = static_cast<std::size_t>(n_kv_heads);
+        const std::size_t dimensions = static_cast<std::size_t>(head_dim);
+        const std::size_t kv_dim = checkedMultiply(
+            heads, dimensions, "logical-block KV dimension");
+
+        GPULogicalKVBlockEstimate result;
+        switch (format)
+        {
+        case KVStorageFormat::FP32:
+        case KVStorageFormat::BF16:
+        case KVStorageFormat::FP16:
+        {
+            const std::size_t element_bytes =
+                format == KVStorageFormat::FP32
+                    ? sizeof(float)
+                    : sizeof(std::uint16_t);
+            const std::size_t row_bytes = checkedMultiply(
+                kv_dim, element_bytes, "logical linear row bytes");
+            result.k_bytes = checkedMultiply(
+                tokens, row_bytes, "logical linear key bytes");
+            result.v_bytes = checkedMultiply(
+                tokens, row_bytes, "logical linear value bytes");
+            break;
+        }
+        case KVStorageFormat::Q8_1:
+        case KVStorageFormat::TQ4:
+        case KVStorageFormat::TQ8:
+        {
+            const std::size_t key_position_bytes = checkedMultiply(
+                heads,
+                aq8KeyBlockBytes(head_dim),
+                "logical AQ8 key-position bytes");
+            std::size_t value_head_bytes = 0;
+            if (format == KVStorageFormat::Q8_1)
+            {
+                value_head_bytes = checkedMultiply(
+                    ceilDivide(dimensions, Q8_1Block::BLOCK_SIZE),
+                    sizeof(Q8_1Block),
+                    "logical Q8_1 value-head bytes");
+            }
+            else if (format == KVStorageFormat::TQ4)
+            {
+                value_head_bytes = tq4BlockBytes(head_dim);
+            }
+            else
+            {
+                value_head_bytes = tq8BlockBytes(head_dim);
+            }
+
+            const std::size_t anchor_bytes = checkedMultiply(
+                kv_dim, sizeof(float), "logical AQ8 anchor bytes");
+            result.k_bytes = checkedAdd(
+                anchor_bytes,
+                checkedMultiply(
+                    tokens,
+                    key_position_bytes,
+                    "logical AQ8 key payload bytes"),
+                "logical AQ8 key payload plus anchor");
+            result.v_bytes = checkedMultiply(
+                tokens,
+                checkedMultiply(
+                    heads,
+                    value_head_bytes,
+                    "logical compressed value-position bytes"),
+                "logical compressed value payload bytes");
+            break;
+        }
+        case KVStorageFormat::Q16_1:
+            throw std::invalid_argument(
+                "Q16_1 has no CUDA/ROCm KV-cache implementation");
+        }
+
+        (void)checkedAdd(
+            result.k_bytes,
+            result.v_bytes,
+            "logical GPU K/V block bytes");
+        return result;
+    }
+
     std::size_t KVCacheMemoryEstimator::estimate(
         int n_layers,
         int batch_size,

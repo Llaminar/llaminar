@@ -32,6 +32,7 @@ struct WorkspaceMemoryGeometry
     int resident_graph_rows = 1; ///< Largest token-row capture bucket.
     int max_context_rows = 1; ///< Stable KV-cache capacity in token rows.
     int local_d_ff = 0; ///< Dense FFN output width owned locally.
+    int local_query_head_start = 0; ///< First global query head owned locally.
     int local_query_heads = 0; ///< Exact participant-local query heads.
     int first_layer = 0; ///< First model layer owned by this participant.
     int last_layer = -1; ///< Last model layer owned by this participant.
@@ -79,8 +80,10 @@ public:
      * A positive `mtp_target_query_rows` also reserves a second compact graph
      * envelope. Main prefill and grouped-verifier/MTP graphs are event-ordered,
      * but their stable workspace names and initialize-once publications are not
-     * fully aliasable; summing the two independently valid envelopes is the
-     * setup-time upper bound used before exact graph-family interval planning.
+     * fully aliasable. Hybrid models use the same exact GDN rollback-state
+     * contract as their graph stages, add every per-layer slot bank, and share
+     * only the larger serial transient envelope. Non-hybrid models retain the
+     * conservative sum of independently complete envelopes.
      * Declared MoE models with incomplete routing geometry are rejected because
      * silently returning a dense-only estimate would permit a late VRAM failure.
      *

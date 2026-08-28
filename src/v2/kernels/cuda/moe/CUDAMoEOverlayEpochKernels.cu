@@ -481,7 +481,8 @@ namespace
 
         std::uint64_t required_epoch = 0u;
         bool resolved = true;
-        if (peer_placement_epoch.valid())
+        const bool exact_prepared_peer = peer_placement_epoch.valid();
+        if (exact_prepared_peer)
         {
             resolved = !external_admission_epoch &&
                        !admission_barrier.record &&
@@ -508,12 +509,7 @@ namespace
                                        &control->bank_epochs[published_bank]);
         }
         const std::uint32_t bank = findEpochBank(control, required_epoch);
-        const std::uint64_t ticket_generation =
-            bank == published_bank
-                ? generation
-                : (generation > 1u ? generation - 1u : 0u);
-        if (!resolved || required_epoch == 0u || bank >= kBankCount ||
-            ticket_generation == 0u)
+        if (!resolved || required_epoch == 0u || bank >= kBankCount)
         {
             atomicAdd(
                 reinterpret_cast<unsigned long long *>(
@@ -539,8 +535,21 @@ namespace
             atomicLoad32(&control->bank_states[bank]);
         const std::uint64_t epoch =
             atomicLoad64(&control->bank_epochs[bank]);
+        /*
+         * Parallel heterogeneous publication has one deliberate intermediate
+         * state: every participant has globally prepared E+1, but selectors
+         * flip independently. An authenticated activation descriptor may name
+         * that exact Ready bank after its peer has flipped. Pinning it here is
+         * safe because preparation consensus made the bank complete and the
+         * host authority treats any subsequent publication failure as fatal.
+         * Ordinary/local admission never consumes Ready state.
+         */
+        const bool exact_prepared =
+            exact_prepared_peer &&
+            state == rawState(DeviceMoEOverlayEpochBankState::Ready);
         if (epoch == 0u || epoch != required_epoch ||
-            (state != rawState(DeviceMoEOverlayEpochBankState::Published) &&
+            (!exact_prepared &&
+             state != rawState(DeviceMoEOverlayEpochBankState::Published) &&
              state != rawState(DeviceMoEOverlayEpochBankState::Retiring)))
         {
             atomicAdd(
@@ -557,6 +566,34 @@ namespace
                 DeviceMoEOverlayEpochOperation::Acquire,
                 DeviceMoEOverlayEpochStatusCode::InvalidControl,
                 epoch,
+                selector,
+                bank,
+                state);
+            return;
+        }
+
+        const std::uint64_t ticket_generation =
+            bank == published_bank
+                ? generation
+                : exact_prepared
+                      ? (generation < UINT64_MAX ? generation + 1u : 0u)
+                      : (generation > 1u ? generation - 1u : 0u);
+        if (ticket_generation == 0u)
+        {
+            atomicAdd(
+                reinterpret_cast<unsigned long long *>(
+                    &control->acquisitions_in_flight),
+                ~0ull);
+            reportBoundaryFailure(
+                "acquire_generation_overflow",
+                control,
+                ticket,
+                required_epoch);
+            finishStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Acquire,
+                DeviceMoEOverlayEpochStatusCode::GenerationOverflow,
+                required_epoch,
                 selector,
                 bank,
                 state);

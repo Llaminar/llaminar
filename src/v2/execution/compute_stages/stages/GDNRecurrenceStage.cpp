@@ -23,6 +23,7 @@
  */
 
 #include "GDNRecurrenceStage.h"
+#include "GDNSpeculativeWorkspaceContract.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
@@ -102,20 +103,21 @@ namespace llaminar2
         if (speculative_slot_rows > 0)
         {
             const int rows = std::min(speculative_slot_rows, max_seq_len);
-            const size_t state_floats =
-                static_cast<size_t>(params_.n_heads) *
-                static_cast<size_t>(params_.d_k) *
-                static_cast<size_t>(params_.d_v);
+            const auto footprint =
+                gdn_workspace::recurrenceStateFootprint(
+                    rows,
+                    std::max(1, params_.request_count),
+                    params_.n_heads,
+                    params_.d_k,
+                    params_.d_v);
             reqs.buffers.push_back({speculativeStateSlotsBufferName(),
-                                    static_cast<size_t>(rows) * state_floats * sizeof(float),
+                                    footprint.slot_bytes,
                                     256,
                                     true});
             if (params_.device_id.is_gpu())
             {
-                const int work_slots =
-                    std::max(1, params_.request_count > 1 ? params_.request_count : 1);
                 reqs.buffers.push_back({speculativeStateWorkBufferName(),
-                                        static_cast<size_t>(work_slots) * state_floats * sizeof(float),
+                                        footprint.work_bytes,
                                         256,
                                         true});
             }

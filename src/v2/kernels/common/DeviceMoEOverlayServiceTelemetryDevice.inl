@@ -63,8 +63,15 @@ namespace llaminar2::moe_overlay_service_device
                 __builtin_trap();
 #endif
             }
-            const std::uint32_t bank = *active;
-            if (bank > 1u)
+            /*
+             * The device scalar is a complete writer state, not a bare bank
+             * ordinal.  Its quarantine bit deliberately remains visible to
+             * inference so route writers can discard calibration-tail rows.
+             * Telemetry is observation-only: it must read the physical bank
+             * selected by that state even while row admission is closed.
+             */
+            const std::uint32_t writer_state = *active;
+            if (!moe_runtime_abi::validHistogramWriterState(writer_state))
             {
 #if defined(__CUDA_ARCH__)
                 asm("trap;");
@@ -72,6 +79,8 @@ namespace llaminar2::moe_overlay_service_device
                 __builtin_trap();
 #endif
             }
+            const std::uint32_t bank =
+                moe_runtime_abi::histogramWriterBank(writer_state);
             return banks[bank].local[phase];
         }
         return inlineLocalHistogram(runtime, phase);

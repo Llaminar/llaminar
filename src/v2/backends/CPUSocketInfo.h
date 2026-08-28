@@ -34,13 +34,13 @@ namespace llaminar2
         std::vector<int> ht_threads;     ///< HyperThreading sibling threads (sorted, empty if no HT)
         size_t memory_bytes = 0;         ///< Total NUMA-local memory in bytes.
         /**
-         * Memory immediately allocatable on this NUMA node at discovery.
+         * Memory conservatively allocatable on this NUMA node at discovery.
          *
          * This is deliberately distinct from `memory_bytes`: tmpfs/ramdisk
-         * pages, model mappings, and unrelated processes already consume the
-         * latter. Capacity admission must use this value (or a smaller
-         * explicit limit) so two socket-local CPU tiers cannot each claim the
-         * machine's nominal RAM.
+         * pages and unrelated anonymous allocations consume the latter, while
+         * inactive ordinary file cache may be reclaimed. Capacity admission
+         * must use this value (or a smaller explicit limit) so two socket-local
+         * CPU tiers cannot each claim the machine's nominal RAM.
          */
         size_t available_memory_bytes = 0;
 

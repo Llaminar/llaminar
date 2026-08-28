@@ -97,7 +97,7 @@ namespace llaminar2::test
                 .participant_count = 2u,
                 .num_layers = 1u,
                 .num_experts = 8u,
-                .transaction_fingerprint = {
+                .execution_fingerprint = {
                     .low = 0xa5a50000u + transaction,
                     .high = 0x5a5a0000u + transaction,
                 },
@@ -251,7 +251,7 @@ namespace llaminar2::test
         stale.transaction_id += 1u;
         stale.base_epoch = 2u;
         stale.candidate_epoch = 3u;
-        stale.transaction_fingerprint.low += 1u;
+        stale.execution_fingerprint.low += 1u;
         EXPECT_FALSE(slots.begin(stale, &error));
         EXPECT_EQ(slots.currentEpoch(), 1u);
         EXPECT_EQ(slots.activeSlotCount(), 2u);

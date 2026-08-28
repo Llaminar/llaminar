@@ -1098,10 +1098,47 @@ namespace llaminar2
             errors.push_back(
                 "MoE migration payoff horizon tokens must be > 0");
         }
-        if (moe_rebalance.migration_max_cycles_per_wave == 0)
+        if (moe_rebalance.migration_transfer_slots == 0)
         {
             errors.push_back(
-                "MoE migration max cycles per wave must be > 0");
+                "MoE migration transfer slots must be > 0");
+        }
+        if (moe_rebalance.resolvedMigrationCyclesPerWave() == 0)
+        {
+            errors.push_back(
+                "MoE migration cycles per wave must be > 0");
+        }
+        if (moe_rebalance.resolvedMigrationCyclesPerWave() >
+            moe_rebalance.migration_transfer_slots)
+        {
+            errors.push_back(
+                "MoE migration cycles per wave cannot exceed physical transfer slots");
+        }
+        if (moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
+        {
+            /*
+             * Dynamic ownership compares max/min load as a per-mille ratio.
+             * Its mathematical floor is 1.0; reject an impossible threshold
+             * at configuration admission instead of deferring the same error
+             * until the residency authority has allocated its dependencies.
+             */
+            if (moe_rebalance.dynamic_imbalance_threshold_per_mille <
+                moe_rebalance_policy::
+                    kMinimumDynamicImbalanceThresholdPerMille)
+            {
+                errors.push_back(
+                    "MoE Dynamic imbalance threshold must be >= 1000 per-mille");
+            }
+            if (moe_rebalance.dynamic_max_swaps_per_layer == 0u)
+            {
+                errors.push_back(
+                    "MoE Dynamic maximum swaps per layer must be > 0");
+            }
+            if (moe_rebalance.dynamic_max_plan_entries_per_wave < 2u)
+            {
+                errors.push_back(
+                    "MoE Dynamic plan entries per wave must admit at least one paired swap (>= 2)");
+            }
         }
         if (moe_routed_prefill.assignment_window_tokens < 0)
         {
@@ -1181,6 +1218,11 @@ namespace llaminar2
         {
             errors.push_back("Prefix cache block size must be > 0");
         }
+        if (mtp.graph_capacity_draft_tokens < 0)
+        {
+            errors.push_back(
+                "MTP graph capacity draft tokens must be >= 0");
+        }
         if (mtp.enabled)
         {
             if (mtp.draft_tokens <= 0)
@@ -1191,12 +1233,6 @@ namespace llaminar2
             {
                 errors.push_back("MTP max request batch must be > 0");
             }
-            if (mtp.graph_capacity_draft_tokens < 0)
-            {
-                errors.push_back(
-                    "MTP graph capacity draft tokens must be >= 0");
-            }
-
             const auto &depth_policy = mtp.depth_policy;
             if (depth_policy.min_depth < 0)
             {
@@ -1355,8 +1391,10 @@ namespace llaminar2
             << moe_rebalance.window_growth_factor << "\n";
         oss << "    migration_payoff_horizon_tokens: "
             << moe_rebalance.migration_payoff_horizon_tokens << "\n";
-        oss << "    migration_max_cycles_per_wave: "
-            << moe_rebalance.migration_max_cycles_per_wave << "\n";
+        oss << "    migration_transfer_slots: "
+            << moe_rebalance.migration_transfer_slots << "\n";
+        oss << "    migration_cycles_per_wave: "
+            << moe_rebalance.resolvedMigrationCyclesPerWave() << "\n";
         oss << "    routed_prefill_assignment_window_tokens: "
             << moe_routed_prefill.assignment_window_tokens << "\n";
         oss << "    overlay_prefill_segment_rows: "

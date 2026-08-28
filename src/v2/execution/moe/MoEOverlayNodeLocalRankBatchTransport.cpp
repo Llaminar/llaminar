@@ -808,6 +808,10 @@ namespace llaminar2
             rows.entry_offsets_host = at<int32_t>(layout.entry_offsets);
             rows.expert_ids_host = at<int32_t>(layout.expert_ids);
             rows.route_weights_host = at<float>(layout.route_weights);
+            rows.original_route_slots_host =
+                at<int32_t>(layout.original_route_slots);
+            rows.compact_route_slots_host =
+                at<int32_t>(layout.compact_route_slots);
             rows.hidden_rows_fp32 = at<float>(layout.hidden_rows);
             return rows;
         }
@@ -922,6 +926,10 @@ namespace llaminar2
                    rows.entry_offsets_host == expected.entry_offsets_host &&
                    rows.expert_ids_host == expected.expert_ids_host &&
                    rows.route_weights_host == expected.route_weights_host &&
+                   rows.original_route_slots_host ==
+                       expected.original_route_slots_host &&
+                   rows.compact_route_slots_host ==
+                       expected.compact_route_slots_host &&
                    rows.hidden_rows_fp32 == expected.hidden_rows_fp32;
         }
 
@@ -1845,10 +1853,10 @@ namespace llaminar2
                     dispatch_rows.route_weights_host,
                     entry_weight_bytes)),
                 .original_route_slots = static_cast<std::int32_t *>(alias(
-                    mapping_->originalRouteSlots(target_participant_id),
+                    dispatch_rows.original_route_slots_host,
                     entry_route_slot_bytes)),
                 .compact_route_slots = static_cast<std::int32_t *>(alias(
-                    mapping_->compactRouteSlots(target_participant_id),
+                    dispatch_rows.compact_route_slots_host,
                     entry_route_slot_bytes)),
                 .hidden_rows_fp32 = static_cast<float *>(alias(
                     dispatch_rows.hidden_rows_fp32, activation_bytes)),

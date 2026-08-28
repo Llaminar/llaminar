@@ -134,6 +134,8 @@ namespace llaminar2
         const IInferenceRunner *lastLocalRunner() const;
 
         void clearCacheAll();
+        /** @return True after every local stage retires reusable prefix state. */
+        bool purgePrefixCacheAll();
         /**
          * @brief Admit one immutable stop-token policy into every local runner.
          *
@@ -267,6 +269,7 @@ namespace llaminar2
          * @return True after every child publishes its stage-owned payload.
          */
         bool harvestPrefixAll(
+            const PrefixLookupResult &admission,
             const std::vector<int32_t> &tokens,
             int prompt_token_count);
         /**
@@ -418,6 +421,8 @@ namespace llaminar2
         const float *logits() const override;
         int vocab_size() const override;
         void clear_cache() override;
+        /** @copydoc IInferenceRunner::purgePrefixCache */
+        bool purgePrefixCache() override;
         int get_position() const override;
         ExecutionPath executionPath() const override;
         const char *architecture() const override;
@@ -517,6 +522,7 @@ namespace llaminar2
             int seq_idx = 0) override;
         /** @brief Harvest one prefix payload from every local stage. */
         bool harvestPrefix(
+            const PrefixLookupResult &admission,
             const std::vector<int32_t> &tokens,
             int prompt_token_count) override;
         /** @brief Restore typed terminal state on every local stage. */

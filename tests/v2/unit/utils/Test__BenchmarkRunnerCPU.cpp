@@ -500,6 +500,54 @@ namespace
         int drain_calls_ = 0;
     };
 
+    /** Runtime owner whose typed totals deliberately disagree with telemetry. */
+    class MockTypedOptimizationStatusRunner final
+        : public MockOrchestratedDecodeRunner
+    {
+    public:
+        bool maybeApplyDecodeBoundaryMaintenance(
+            uint64_t committed_tokens) override
+        {
+            if (!MockOrchestratedDecodeRunner::
+                    maybeApplyDecodeBoundaryMaintenance(committed_tokens))
+            {
+                return false;
+            }
+            ++status_.published_movement_waves;
+            ++status_.completed_movement.transactions;
+            status_.completed_movement.commands += 2u;
+            status_.completed_movement.physical_bytes += 64u;
+            ++status_.completed_movement.promotions;
+            ++status_.completed_movement.demotions;
+
+            /* If BenchmarkRunner regresses to ledger authority, this inflated
+             * value makes the focused assertion fail unambiguously. */
+            PerfStatsCollector::addCounter(
+                "moe_overlay_controller",
+                "dynamic_movement_transactions",
+                100.0,
+                "maintenance",
+                "cpu");
+            return true;
+        }
+
+        uint64_t moeRuntimeMovementEpoch() const override
+        {
+            return status_.published_movement_waves;
+        }
+
+        MoEOptimizationStatus moeOptimizationStatus() const override
+        {
+            return status_;
+        }
+
+    private:
+        MoEOptimizationStatus status_{
+            .authority = MoEOptimizationAuthority::Host,
+            .state = MoEOptimizationLifecycleState::Active,
+        };
+    };
+
     class MockBatchedOrchestratedDecodeRunner : public MockCPUInferenceRunner
     {
     public:
@@ -1610,6 +1658,47 @@ TEST(Test__BenchmarkRunnerCPU, PerfStatsResetDropsPostWarmupMoEStatsBeforeMeasur
     PerfStatsCollector::reset();
 }
 
+TEST(Test__BenchmarkRunnerCPU,
+     MovementAttributionUsesTypedOwnerInsteadOfPerfStatsLedger)
+{
+    ScopedEnv perf_stats_enabled("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    auto runner = std::make_shared<MockTypedOptimizationStatusRunner>();
+    BenchmarkRunner benchmark(runner, createMockTokenizer());
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 4;
+    config.mtp.enabled = true;
+
+    const auto result = benchmark.run(config);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    ASSERT_FALSE(result.iterations.empty());
+    for (const auto &iteration : result.iterations)
+    {
+        EXPECT_GT(iteration.dynamic_movement_transactions, 0u);
+        EXPECT_LT(iteration.dynamic_movement_transactions, 100u)
+            << "Inflated PerfStats telemetry became benchmark authority";
+        EXPECT_EQ(
+            iteration.dynamic_movement_commands,
+            iteration.dynamic_movement_transactions * 2u);
+        EXPECT_EQ(
+            iteration.dynamic_physical_bytes,
+            iteration.dynamic_movement_transactions * 64u);
+        EXPECT_EQ(
+            iteration.dynamic_promotions,
+            iteration.dynamic_movement_transactions);
+        EXPECT_EQ(
+            iteration.dynamic_demotions,
+            iteration.dynamic_movement_transactions);
+        EXPECT_EQ(iteration.dynamic_same_priority_moves, 0u);
+        EXPECT_GT(
+            iteration.moe_runtime_movement_epoch,
+            iteration.moe_runtime_movement_epoch_start);
+    }
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__BenchmarkRunnerCPU, StaticWarmupRearmsPrefillGraphAfterDecodeWorkspaceGrowth)
 {
     ScopedGpuGraphsSetting force_gpu_graph_warmup(true);
@@ -1848,6 +1937,31 @@ TEST(Test__BenchmarkRunnerCPU, AdapterForwardsRequestBatchedDecodeContract)
         .WillOnce(::testing::Return(DeviceId::cuda(1)));
     EXPECT_EQ(adapter.primaryDeviceId(), DeviceId::cuda(1))
         << "BenchmarkRunner relies on the adapter preserving GPU identity to skip full logits gathers";
+
+    EXPECT_CALL(orch, moeRuntimeMovementEpoch())
+        .WillOnce(::testing::Return(7u));
+    EXPECT_EQ(adapter.moeRuntimeMovementEpoch(), 7u);
+    const MoEOptimizationStatus optimization{
+        .authority = MoEOptimizationAuthority::Device,
+        .state = MoEOptimizationLifecycleState::Active,
+        .published_movement_waves = 5u,
+        .completed_movement = {
+            .transactions = 5u,
+            .commands = 11u,
+            .physical_bytes = 4096u,
+            .promotions = 2u,
+            .demotions = 2u,
+            .same_priority_moves = 7u,
+        },
+    };
+    EXPECT_CALL(orch, moeOptimizationStatus())
+        .WillOnce(::testing::Return(optimization));
+    const auto adapted_optimization = adapter.moeOptimizationStatus();
+    EXPECT_EQ(
+        adapted_optimization.authority,
+        MoEOptimizationAuthority::Device);
+    EXPECT_EQ(adapted_optimization.published_movement_waves, 5u);
+    EXPECT_EQ(adapted_optimization.completed_movement.commands, 11u);
 
     EXPECT_CALL(orch, supportsDecodeStepBatch(3))
         .WillOnce(::testing::Return(true));

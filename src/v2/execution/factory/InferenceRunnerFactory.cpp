@@ -6,6 +6,7 @@
  */
 
 #include "InferenceRunnerFactory.h"
+#include "backends/HostMemoryCapacity.h"
 #include "loaders/GPUHostLoadPreflight.h"
 #include "EagerWeightValidator.h"
 #include "../../backends/DeviceId.h"
@@ -88,6 +89,16 @@ namespace llaminar2
         const WeightPlan &weight_plan,
         const char *context)
     {
+        if (config.prepared_weight_admission ==
+                PreparedWeightAdmission::ReuseCertifiedCompleteSet &&
+            !config.prepared_weight_store)
+        {
+            LOG_ERROR(
+                context
+                << " certified prepared-weight reuse has no exact "
+                   "model-owned PreparedWeightStore");
+            return nullptr;
+        }
         const ModelContextId model_id = weight_plan.strategy().model_id;
         const auto installed_store =
             weight_mgr.preparedWeightStoreIfInitialized();
@@ -847,32 +858,16 @@ namespace llaminar2
         // =====================================================================
         // Host RAM preflight check
         // =====================================================================
-        // Reads /proc/meminfo MemAvailable to determine if the system has
-        // enough free RAM to hold the model weights during loading.
+        // Uses the canonical system observation to determine if the system has
+        // enough allocatable RAM to hold model weights during loading.
         // For GPU: weights are staged in host RAM temporarily before H2D transfer.
         // For CPU: weights remain in host RAM for the entire inference session.
         // Returns 0 on error (check skipped).
         size_t getAvailableHostRAM()
         {
 #ifdef __linux__
-            FILE *meminfo = fopen("/proc/meminfo", "r");
-            if (!meminfo)
-                return 0;
-
-            size_t available_bytes = 0;
-            char line[256];
-            while (fgets(line, sizeof(line), meminfo))
-            {
-                if (strncmp(line, "MemAvailable:", 13) == 0)
-                {
-                    unsigned long kb = 0;
-                    if (sscanf(line + 13, "%lu", &kb) == 1)
-                        available_bytes = static_cast<size_t>(kb) * 1024ULL;
-                    break;
-                }
-            }
-            fclose(meminfo);
-            return available_bytes;
+            return observeSystemMemoryCapacity()
+                .admission_available_bytes;
 #else
             return 0; // Cannot check on non-Linux — skip preflight
 #endif
@@ -939,17 +934,10 @@ namespace llaminar2
                 return true;
             }
 
-            // Safety margin: max(2 GB, 10% of required)
-            const size_t safety_margin = std::max<size_t>(
-                2ULL * 1024 * 1024 * 1024,
-                required_bytes / 10);
-
-            const size_t needed_with_margin = required_bytes + safety_margin;
-
             const double required_gb = static_cast<double>(required_bytes) / (1024.0 * 1024.0 * 1024.0);
             const double available_gb = static_cast<double>(available_bytes) / (1024.0 * 1024.0 * 1024.0);
 
-            if (needed_with_margin <= available_bytes)
+            if (required_bytes <= available_bytes)
             {
                 LOG_DEBUG("[HostRAM] Preflight passed: need "
                           << std::fixed << std::setprecision(1) << required_gb
@@ -963,11 +951,9 @@ namespace llaminar2
             }
 
             // Failure — construct helpful error message
-            const double margin_gb = static_cast<double>(safety_margin) / (1024.0 * 1024.0 * 1024.0);
             LOG_ERROR("[HostRAM] Insufficient host memory for weight loading.\n"
                       << "  Required:  " << std::fixed << std::setprecision(1) << required_gb << " GB (model weights)\n"
-                      << "  Margin:    " << margin_gb << " GB (safety headroom)\n"
-                      << "  Available: " << available_gb << " GB (system MemAvailable)\n"
+                      << "  Available: " << available_gb << " GB (canonical host-memory observation)\n"
                       << "  Device:    " << device.to_string()
                       << (bounded_gpu_load
                               ? " (bounded mmap-to-GPU staging)"
@@ -1006,13 +992,13 @@ namespace llaminar2
             WeightValidationResult &validation,
             const std::string &log_prefix)
         {
-            if (!config.mtp.enabled)
+            if (!retainsMTPGraphCapacity(config.mtp))
                 return true;
 
             auto loader = model_ctx.loader();
             if (!loader)
             {
-                LOG_ERROR(log_prefix << " MTP was requested, but model loader is unavailable");
+                LOG_ERROR(log_prefix << " retained MTP capacity was requested, but model loader is unavailable");
                 return false;
             }
 
@@ -1291,7 +1277,8 @@ namespace llaminar2
         const int raw_layer_count =
             std::max(model_ctx.totalBlockCount(), model_ctx.blockCount());
         const bool has_inactive_trailing_sidecar =
-            !config.mtp.enabled && metadata.num_layers < raw_layer_count;
+            !retainsMTPGraphCapacity(config.mtp) &&
+            metadata.num_layers < raw_layer_count;
         bool needs_runtime_view = false;
         for (const auto &placement : plan->placements)
         {
@@ -1362,6 +1349,7 @@ namespace llaminar2
         const int raw_layer_count =
             std::max(model_ctx.totalBlockCount(), model_ctx.blockCount());
         metadata.num_layers = raw_layer_count;
+        metadata.main_inference_layer_count = raw_layer_count;
         if (loader)
         {
             const int main_layer_count = mainLayerCountExcludingMTP(
@@ -1369,8 +1357,9 @@ namespace llaminar2
                 arch,
                 raw_layer_count);
             metadata.num_layers = main_layer_count;
+            metadata.main_inference_layer_count = main_layer_count;
 
-            if (mtp.enabled)
+            if (retainsMTPGraphCapacity(mtp))
             {
                 const MTPWeightManifest manifest = discoverMTPWeightManifest(
                     *loader,
@@ -1380,7 +1369,7 @@ namespace llaminar2
                 if (!manifest.available)
                 {
                     throw std::invalid_argument(
-                        "MTP-enabled routed-expert placement could not resolve "
+                        "MTP-capable routed-expert placement could not resolve "
                         "the model's NextN weight manifest: " +
                         manifest.diagnostic);
                 }
@@ -1622,7 +1611,7 @@ namespace llaminar2
         const GraphConfig &graph_config,
         const FactoryPPStageConfig *pp_config)
     {
-        return graph_config.mtp.enabled &&
+        return retainsMTPGraphCapacity(graph_config.mtp) &&
                pp_config != nullptr &&
                pp_config->has_lm_head;
     }
@@ -1890,12 +1879,19 @@ namespace llaminar2
      * page faults, packed GEMM registration, and the graph participant mask
      * describe the same ownership without causing one graph to materialize a
      * sibling device's experts.
+     *
+     * A certified reusable context removes every routed parent without adding
+     * source slices. Its terminal seal has already rebound the exact
+     * participant/domain engines, and setup validates that registry through
+     * `prepareMoEExpertOverlayWeights`. Re-reading GGUF selections would create
+     * a second physical authority and can misinterpret migrated slot identity.
      */
     static WeightPlan includeGraphLocalOverlayParticipantWeights(
         WeightPlan base_plan,
         const ModelContext &model_ctx,
         const GraphConfig &graph_config,
-        DeviceId graph_device)
+        DeviceId graph_device,
+        PreparedWeightAdmission admission)
     {
         const auto &placement = graph_config.moe.routed_expert_plan;
         const auto &execution =
@@ -1944,6 +1940,17 @@ namespace llaminar2
                     : requirement.role;
             if (!isRoutedExpertRole(role))
                 combined.add(requirement);
+        }
+
+        if (admission ==
+            PreparedWeightAdmission::ReuseCertifiedCompleteSet)
+        {
+            LOG_DEBUG(
+                "[InferenceRunner] Removed generic routed parents for "
+                "certified ExpertOverlay registry reuse on "
+                << graph_device.to_string() << ": requirements="
+                << combined.size());
+            return combined;
         }
 
         std::sort(
@@ -3013,43 +3020,27 @@ namespace llaminar2
         std::unique_ptr<DeviceGraphOrchestrator> orchestrator;
         {
             ScopedWeightLoadDetailTimer timer("graph.build.create_orchestrator");
-            auto graph_builder = GraphBuilderRegistry::create(architecture, graph_config, mpi_ctx);
-            graph_builder->setModelContext(model_ctx);
+            DeviceGraphOrchestrator::Dependencies deps;
+            deps.model_ctx = model_ctx;
+            deps.graph_builder =
+                GraphBuilderRegistry::create(architecture, graph_config, mpi_ctx);
+            deps.graph_builder->setModelContext(model_ctx);
+            deps.mpi_ctx = mpi_ctx;
+            deps.domain_tp_contexts = std::move(owned_domain_tp_contexts);
+            deps.turboquant_ctx = std::move(turboquant_ctx);
+            deps.kv_rotation = std::move(kv_rotation);
+            deps.pp_stage_config = config.pp_stage_config;
+            deps.reusable_execution_workspaces =
+                config.reusable_execution_workspaces;
+            deps.weight_manager = weight_mgr;
             orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-                std::move(graph_builder), mpi_ctx);
-            if (auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx))
-            {
-                orchestrator->retainModelContext(model_ctx);
-                orchestrator->setWeightManager(concrete_model_ctx->concreteWeightManager());
-            }
-        }
-
-        if (!owned_domain_tp_contexts.empty())
-        {
-            orchestrator->setDomainTPContexts(std::move(owned_domain_tp_contexts));
-        }
-
-        // Transfer TurboQuant context ownership to orchestrator
-        if (turboquant_ctx)
-        {
-            orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
-        }
-
-        // Transfer KV rotation ownership to orchestrator
-        if (kv_rotation)
-        {
-            orchestrator->setKVRotation(std::move(kv_rotation));
+                std::move(deps));
         }
 
         // Transfer GlobalTPContext ownership to orchestrator
         if (global_tp_ctx)
         {
             orchestrator->setGlobalTPContext(std::move(global_tp_ctx));
-        }
-
-        if (config.pp_stage_config.has_value())
-        {
-            orchestrator->setPPStageConfig(config.pp_stage_config.value());
         }
 
         // Initialize graph cache
@@ -3614,7 +3605,8 @@ namespace llaminar2
             std::move(weight_plan),
             *model_ctx,
             graph_config,
-            device);
+            device,
+            config.prepared_weight_admission);
         if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[InferenceRunner]"))
             return false;
         LOG_DEBUG("[InferenceRunner] SingleDevice WeightPlan built with "
@@ -3672,7 +3664,8 @@ namespace llaminar2
                     *overlay_runtime_plan_for_weight_prep,
                     device,
                     &frozen_weights,
-                    overlay_execution_plan_for_weight_prep))
+                    overlay_execution_plan_for_weight_prep,
+                    config.prepared_weight_admission))
             {
                 LOG_ERROR(
                     "[InferenceRunner] Failed to prepare MoE expert "
@@ -3855,9 +3848,10 @@ namespace llaminar2
         {
             return false;
         }
-        else if (config.mtp.enabled && !pp_config.has_lm_head)
+        else if (retainsMTPGraphCapacity(config.mtp) &&
+                 !pp_config.has_lm_head)
         {
-            LOG_DEBUG("[PPStageRunner] MTP enabled, but this non-terminal PP stage does not own sidecar weights");
+            LOG_DEBUG("[PPStageRunner] MTP capacity retained, but this non-terminal PP stage does not own sidecar weights");
         }
 
         // Load global weights this stage owns.
@@ -3923,7 +3917,9 @@ namespace llaminar2
             nullptr,
             &pp_config,
             SingleDeviceWeightPlanOptions{
-                .include_terminal_mtp_embedding = config.mtp.enabled && pp_config.has_lm_head,
+                .include_terminal_mtp_embedding =
+                    retainsMTPGraphCapacity(config.mtp) &&
+                    pp_config.has_lm_head,
             });
         if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[PPStageRunner]"))
             return false;
@@ -4161,6 +4157,8 @@ namespace llaminar2
         deps.graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
         deps.graph_builder->setModelContext(model_ctx);
         deps.pipeline_config = pipeline_config;
+        deps.reusable_execution_workspaces =
+            config.reusable_execution_workspaces;
 
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(deps));
@@ -4337,22 +4335,19 @@ namespace llaminar2
         // Create DeviceGraphOrchestrator
         // Note: No MPI context for PP stages - inter-stage comm handled externally
         // =====================================================================
-        auto graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
-        graph_builder->setModelContext(model_ctx);
+        DeviceGraphOrchestrator::Dependencies deps;
+        deps.model_ctx = model_ctx;
+        deps.graph_builder =
+            GraphBuilderRegistry::create(architecture, graph_config, nullptr);
+        deps.graph_builder->setModelContext(model_ctx);
+        deps.pp_stage_config = pp_config;
+        deps.turboquant_ctx = std::move(turboquant_ctx);
+        deps.kv_rotation = std::move(kv_rotation);
+        deps.reusable_execution_workspaces =
+            config.reusable_execution_workspaces;
+        deps.weight_manager = model_ctx->concreteWeightManager();
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-            std::move(graph_builder), nullptr /* no mpi_ctx */);
-
-        if (turboquant_ctx)
-            orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
-        if (kv_rotation)
-            orchestrator->setKVRotation(std::move(kv_rotation));
-
-        // =====================================================================
-        // Set PP stage configuration - CRITICAL for correct graph building
-        // This tells executeForward() to use buildPartialForwardGraph() instead
-        // of buildFullForwardGraph()
-        // =====================================================================
-        orchestrator->setPPStageConfig(pp_config);
+            std::move(deps));
 
         // =====================================================================
         // Initialize graph cache for ONLY this stage's layers
@@ -4386,12 +4381,6 @@ namespace llaminar2
             LOG_ERROR("[PPStageRunner] Failed to configure PP stage weights");
             return nullptr;
         }
-
-        // =====================================================================
-        // Retain ModelContext to keep the shared ModelLoader and WeightManager
-        // alive for the lifetime of this PP stage runner.
-        // =====================================================================
-        orchestrator->retainModelContext(model_ctx);
 
         // =====================================================================
         // Note: No GPU collective setup for PP stages
@@ -4618,6 +4607,8 @@ namespace llaminar2
         deps.turboquant_ctx = std::move(turboquant_ctx);
         deps.kv_rotation = std::move(kv_rotation);
         deps.domain_tp_contexts = std::move(owned_domain_tp_contexts);
+        deps.reusable_execution_workspaces =
+            config.reusable_execution_workspaces;
         if (config.pp_stage_config.has_value())
             deps.pp_stage_config = config.pp_stage_config.value();
         if (auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx))
@@ -4711,9 +4702,10 @@ namespace llaminar2
             {
                 return nullptr;
             }
-            else if (config.mtp.enabled && !pp_cfg.has_lm_head)
+            else if (retainsMTPGraphCapacity(config.mtp) &&
+                     !pp_cfg.has_lm_head)
             {
-                LOG_DEBUG("[InferenceRunner] PP stage skips MTP sidecar weights because it is non-terminal");
+                LOG_DEBUG("[InferenceRunner] PP stage skips retained MTP sidecar weights because it is non-terminal");
             }
 
             auto weight_plan = buildSingleDeviceWeightPlan(
@@ -4724,7 +4716,9 @@ namespace llaminar2
                 graph_config.tp_config.get(),
                 &pp_cfg,
                 SingleDeviceWeightPlanOptions{
-                    .include_terminal_mtp_embedding = config.mtp.enabled && pp_cfg.has_lm_head,
+                    .include_terminal_mtp_embedding =
+                        retainsMTPGraphCapacity(config.mtp) &&
+                        pp_cfg.has_lm_head,
                     .tp_rank_override = graph_config.tp_config ? graph_config.local_rank : -1,
                     .replicate_routed_experts =
                         needsReplicatedRoutedExpertWeights(graph_config),
@@ -4895,7 +4889,8 @@ namespace llaminar2
                         std::move(weight_plan),
                         *concrete_model_ctx,
                         graph_config,
-                        device);
+                        device,
+                        config.prepared_weight_admission);
                     if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] LocalTP"))
                         return nullptr;
                     auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
@@ -4935,7 +4930,8 @@ namespace llaminar2
                                 *graph_config.moe.expert_overlay_runtime_plan,
                                 device,
                                 &frozen_weights,
-                                execution_plan))
+                                execution_plan,
+                                config.prepared_weight_admission))
                         {
                             LOG_ERROR("[InferenceRunner] LocalTP failed to prepare MoE expert overlay weights for device "
                                       << device.to_string());
@@ -5064,7 +5060,8 @@ namespace llaminar2
                                 *graph_config.moe.expert_overlay_runtime_plan,
                                 device,
                                 orchestrator->frozenWeightSet(),
-                                execution_plan))
+                                execution_plan,
+                                config.prepared_weight_admission))
                         {
                             LOG_ERROR("[InferenceRunner] Full-weight path failed to prepare MoE expert overlay weights for device "
                                       << device.to_string());

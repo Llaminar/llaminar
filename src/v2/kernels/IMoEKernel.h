@@ -1460,6 +1460,23 @@ namespace llaminar2
         }
 
         /**
+         * @brief Materialize a colocated CPU ticket into canonical GPU slots.
+         *
+         * Implementations acquire the next setup-owned mapped publication
+         * sequence on the exact caller stream, copy each preweighted compact
+         * row to its authenticated original route slot, perform no reduction,
+         * and release-acknowledge that sequence only after materialization.
+         */
+        virtual bool consumeMoEOverlayCanonicalRouteTicket(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayCanonicalRouteTicketConsumeLaunch &ticket)
+        {
+            (void)launch;
+            (void)ticket;
+            return false;
+        }
+
+        /**
          * @brief Pack one direct-mapped row and publish it in one graph node.
          *
          * The fixed one-row geometry lets one cooperative block preserve the
@@ -2013,11 +2030,23 @@ namespace llaminar2
          * @brief Graph-capturable device-side MoE rebalance publish/apply.
          *
          * Backends consume a device-resident gathered histogram buffer with
-         * layout [participant][layer][expert] and mutate the stable
-         * DeviceMoELayerRuntime placement banks in-place. This intentionally
-         * performs only assignment publication; any expert payload movement
-         * must already have populated resident slots and resident masks before
-         * the captured graph observes them.
+         * layout [participant][layer][expert]. Immediate resident-only policy
+         * may publish directly into the inactive durable runtime bank. A
+         * deferred movement policy must instead derive its candidate into
+         * @p placement_plan_scratch, emit immutable commands, and leave both
+         * durable banks untouched until the arrival/apply transaction has
+         * completed. This separation is the device-side RCU guarantee: active
+         * readers cannot observe a merely planned placement and the inactive
+         * bank remains available to clone the next committed epoch.
+         *
+         * Expert payload movement is never performed by this call. Arrival
+         * kernels must first populate the preallocated directory slots named by
+         * the commands; the later apply kernel validates those leases, copies
+         * changed rows from scratch, clones unchanged rows from the active
+         * bank, and only then makes the candidate eligible for publication.
+         *
+         * @param placement_plan_scratch Required graph-owned candidate storage
+         *        when `DeferRuntimeApply` is set; ignored by immediate policy.
          */
         virtual bool runDeviceRebalanceController(
             const MoEKernelLaunchContext &launch,
@@ -2035,7 +2064,8 @@ namespace llaminar2
             uint32_t command_buffer_count = 1,
             const DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr,
             uint32_t local_transfer_slot_count = 0,
-            DeviceMoELLEPLayerPlanScratch *llep_layer_plans = nullptr)
+            DeviceMoELLEPLayerPlanScratch *llep_layer_plans = nullptr,
+            DeviceMoEPlacementBank *placement_plan_scratch = nullptr)
         {
             (void)launch;
             (void)runtime_layers;
@@ -2053,6 +2083,7 @@ namespace llaminar2
             (void)local_transfer_slots;
             (void)local_transfer_slot_count;
             (void)llep_layer_plans;
+            (void)placement_plan_scratch;
             return false;
         }
 

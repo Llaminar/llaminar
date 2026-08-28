@@ -105,12 +105,35 @@ namespace llaminar2
     std::optional<DeviceMoEOverlayEpochTicket>
     MoEOverlayDeviceEpochProtocol::tryAcquirePublished() noexcept
     {
-        return tryAcquireAdmitted(/*admission_epoch=*/0u);
+        return tryAcquire(
+            /*epoch=*/0u,
+            AdmissionPolicy::PublishedFloor);
     }
 
     std::optional<DeviceMoEOverlayEpochTicket>
     MoEOverlayDeviceEpochProtocol::tryAcquireAdmitted(
         std::uint64_t admission_epoch) noexcept
+    {
+        return tryAcquire(
+            admission_epoch,
+            AdmissionPolicy::PublishedFloor);
+    }
+
+    std::optional<DeviceMoEOverlayEpochTicket>
+    MoEOverlayDeviceEpochProtocol::tryAcquirePreparedExact(
+        std::uint64_t exact_epoch) noexcept
+    {
+        if (exact_epoch == 0u)
+            return std::nullopt;
+        return tryAcquire(
+            exact_epoch,
+            AdmissionPolicy::ExactPreparedPeer);
+    }
+
+    std::optional<DeviceMoEOverlayEpochTicket>
+    MoEOverlayDeviceEpochProtocol::tryAcquire(
+        std::uint64_t requested_epoch,
+        AdmissionPolicy policy) noexcept
     {
         if (!control_)
             return std::nullopt;
@@ -139,9 +162,9 @@ namespace llaminar2
         }
 
         const std::uint64_t required_epoch =
-            admission_epoch == 0u
+            requested_epoch == 0u
                 ? bankEpoch(published_bank)
-                : admission_epoch;
+                : requested_epoch;
         const auto admitted_bank = bankForEpoch(required_epoch);
         if (!admitted_bank.has_value())
         {
@@ -153,8 +176,12 @@ namespace llaminar2
 
         const auto state = bankState(bank);
         const std::uint64_t epoch = bankEpoch(bank);
+        const bool exact_prepared =
+            policy == AdmissionPolicy::ExactPreparedPeer &&
+            state == DeviceMoEOverlayEpochBankState::Ready;
         if (epoch == 0u || epoch != required_epoch ||
-            (state != DeviceMoEOverlayEpochBankState::Published &&
+            (!exact_prepared &&
+             state != DeviceMoEOverlayEpochBankState::Published &&
              state != DeviceMoEOverlayEpochBankState::Retiring))
         {
             atomic64(control_->acquisitions_in_flight).fetch_sub(
@@ -169,7 +196,12 @@ namespace llaminar2
         const std::uint64_t ticket_generation =
             bank == published_bank
                 ? generation
-                : (generation > 1u ? generation - 1u : 0u);
+                : exact_prepared
+                      ? (generation <
+                                 std::numeric_limits<std::uint64_t>::max()
+                             ? generation + 1u
+                             : 0u)
+                      : (generation > 1u ? generation - 1u : 0u);
         if (ticket_generation == 0u)
         {
             atomic64(control_->bank_readers[bank]).fetch_sub(

@@ -15,6 +15,7 @@
 #include "HIPGraphCapture.h"
 #include "HIPGraphTimelineKernels.h"
 #include "../../utils/Logger.h"
+#include "../../utils/VramBillOfMaterials.h"
 
 #include <algorithm>
 #include <limits>
@@ -851,6 +852,20 @@ namespace llaminar2
             free_bytes_before > free_bytes_after
                 ? free_bytes_before - free_bytes_after
                 : 0u;
+        if (vramBomEnabled())
+        {
+            logVramBomLine(
+                "hip_graph_executable",
+                "action=instantiate device=" +
+                    std::to_string(device_ordinal_) +
+                    " nodes=" + std::to_string(node_count_) +
+                    " resident_delta_bytes=" +
+                    std::to_string(resident_delta_bytes) +
+                    " free_before_bytes=" +
+                    std::to_string(free_bytes_before) +
+                    " free_after_bytes=" +
+                    std::to_string(free_bytes_after));
+        }
         LOG_DEBUG(
             "[HIPGraphCapture] Instantiated graph executable ("
             << node_count_
@@ -1073,6 +1088,18 @@ namespace llaminar2
             LOG_ERROR("[HIPGraphCapture] Cannot release graph resources without their immutable ROCm owner");
             std::terminate();
         }
+
+        const bool account_vram = vramBomEnabled() && (exec_ || graph_);
+        const std::size_t released_node_count = node_count_;
+        std::size_t free_bytes_before = 0u;
+        std::size_t total_bytes_before = 0u;
+        hipError_t memory_before_status = hipSuccess;
+        if (account_vram)
+        {
+            memory_before_status = hipMemGetInfo(
+                &free_bytes_before,
+                &total_bytes_before);
+        }
         if (exec_)
         {
             HIP_WARN_IF_FAIL(hipGraphExecDestroy(exec_));
@@ -1082,6 +1109,37 @@ namespace llaminar2
         {
             HIP_WARN_IF_FAIL(hipGraphDestroy(graph_));
             graph_ = nullptr;
+        }
+
+        if (account_vram)
+        {
+            std::size_t free_bytes_after = 0u;
+            std::size_t total_bytes_after = 0u;
+            const hipError_t memory_after_status = hipMemGetInfo(
+                &free_bytes_after,
+                &total_bytes_after);
+            const std::size_t released_resident_bytes =
+                memory_before_status == hipSuccess &&
+                        memory_after_status == hipSuccess &&
+                        total_bytes_before == total_bytes_after &&
+                        free_bytes_after > free_bytes_before
+                    ? free_bytes_after - free_bytes_before
+                    : 0u;
+            logVramBomLine(
+                "hip_graph_executable",
+                "action=reset device=" +
+                    std::to_string(device_ordinal_) +
+                    " nodes=" + std::to_string(released_node_count) +
+                    " released_resident_bytes=" +
+                    std::to_string(released_resident_bytes) +
+                    " free_before_bytes=" +
+                    std::to_string(free_bytes_before) +
+                    " free_after_bytes=" +
+                    std::to_string(free_bytes_after) +
+                    " memory_before_status=" +
+                    std::to_string(static_cast<int>(memory_before_status)) +
+                    " memory_after_status=" +
+                    std::to_string(static_cast<int>(memory_after_status)));
         }
         node_count_ = 0;
     }

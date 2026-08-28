@@ -16,6 +16,7 @@
 #include "planning/ActivationMemoryEstimator.h"
 #include "planning/CollectiveMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "planning/CapturedGraphMemoryEstimator.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "utils/Logger.h"
 
@@ -305,7 +306,6 @@ MemoryPlan MemoryPlanner::plan(
         dev_plan.device = cfg.device;
         dev_plan.device_total_bytes = cfg.device_total_bytes;
         dev_plan.device_free_bytes = cfg.device_free_bytes;
-        dev_plan.headroom_bytes = cfg.headroom_bytes;
 
         int last_layer = cfg.last_layer >= 0 ? cfg.last_layer : profile.n_layers - 1;
         int max_seq = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
@@ -336,6 +336,28 @@ MemoryPlan MemoryPlanner::plan(
 
         dev_plan.max_seq_len = max_seq;
         dev_plan.activation_seq_len = activation_seq;
+
+        if (cfg.device.is_gpu() && cfg.captured_serving_graphs.enabled())
+        {
+            const std::size_t prefill_executable_count =
+                prefillGraphBucketsAtOrBelowCapacity(
+                    cfg.captured_serving_graphs.prefill_bucket_rows,
+                    activation_seq)
+                    .size();
+            const std::size_t executable_count = checkedAdd(
+                prefill_executable_count,
+                cfg.captured_serving_graphs.fixed_executable_count,
+                "captured serving graph executable count");
+            const int planned_model_layers = std::max(
+                1,
+                std::min(profile.n_layers - 1, last_layer) -
+                        std::max(0, cfg.first_layer) +
+                    1);
+            dev_plan.captured_graph_bytes =
+                estimateCapturedGraphExecutableBytes(
+                    planned_model_layers,
+                    executable_count);
+        }
 
         // If TP sharded, divide KV heads
         if (cfg.total_shards > 1 && cfg.local_kv_heads <= 0 &&
@@ -532,6 +554,124 @@ MemoryPlan MemoryPlanner::plan(
                 persistent_state.checkpoint_state_bytes;
             dev_plan.persistent_state_bytes =
                 persistent_state.stateBytes();
+
+            /*
+             * Prefix restore owns a second, concurrent GPU memory surface:
+             * one native K/V archive slot per cache family, the serialized
+             * main-model GDN state, and (when eligible) a bounded device-hot
+             * LRU. These allocations survive graph capture and must be priced
+             * before routed experts consume the remaining capacity.
+             */
+            const bool prefix_enabled =
+                cfg.device.is_gpu() &&
+                cfg.prefix_cache.enabled &&
+                cfg.prefix_cache.storage_mode !=
+                    PrefixCacheStorageMode::Disabled &&
+                cfg.prefix_cache.storage_mode !=
+                    PrefixCacheStorageMode::Device &&
+                persistent_state.main_full_attention_layers > 0;
+            if (prefix_enabled)
+            {
+                const int prefix_block_tokens =
+                    std::max(1, cfg.prefix_cache.block_size);
+                const auto logical_block =
+                    KVCacheMemoryEstimator::estimateGPULogicalBlock(
+                        prefix_block_tokens,
+                        local_kv_heads,
+                        profile.head_dim,
+                        cfg.kv_precision,
+                        cfg.device);
+                const size_t one_fa_layer_bytes = checkedAdd(
+                    logical_block.k_bytes,
+                    logical_block.v_bytes,
+                    "prefix logical K/V layer");
+
+                dev_plan.prefix_cache_staging_bytes = checkedAdd(
+                    one_fa_layer_bytes,
+                    persistent_state.prefix_hybrid_device_state_bytes,
+                    "prefix main archive staging");
+                if (cfg.mtp_enabled &&
+                    persistent_state.mtp_full_attention_layers > 0)
+                {
+                    dev_plan.prefix_cache_staging_bytes = checkedAdd(
+                        dev_plan.prefix_cache_staging_bytes,
+                        one_fa_layer_bytes,
+                        "prefix shifted-MTP archive staging");
+                }
+
+                size_t prefix_block_bytes = checkedAdd(
+                    checkedMultiply(
+                        static_cast<size_t>(
+                            persistent_state.main_full_attention_layers),
+                        one_fa_layer_bytes,
+                        "prefix main full-attention payload"),
+                    persistent_state.prefix_hybrid_device_state_bytes,
+                    "prefix main KV and hybrid payload");
+                if (cfg.mtp_enabled &&
+                    persistent_state.mtp_full_attention_layers > 0)
+                {
+                    prefix_block_bytes = checkedAdd(
+                        prefix_block_bytes,
+                        checkedMultiply(
+                            static_cast<size_t>(
+                                persistent_state.mtp_full_attention_layers),
+                            one_fa_layer_bytes,
+                            "prefix shifted-MTP payload"),
+                        "prefix main and shifted-MTP payload");
+                }
+
+                if (cfg.prefix_cache.terminal_state !=
+                    PrefixCacheTerminalStateMode::Off)
+                {
+                    if (cfg.mtp_enabled)
+                    {
+                        prefix_block_bytes = checkedAdd(
+                            prefix_block_bytes,
+                            checkedMultiply(
+                                static_cast<size_t>(
+                                    std::max(0, profile.d_model)),
+                                sizeof(float),
+                                "prefix terminal hidden state"),
+                            "prefix payload plus terminal hidden state");
+                    }
+
+                    size_t terminal_vocab = static_cast<size_t>(
+                        std::max(0, profile.vocab_size));
+                    if (cfg.mtp_terminal_logits_layout ==
+                        MTPTerminalLogitsLayout::VocabularyShardPerParticipant)
+                    {
+                        terminal_vocab =
+                            cfg.tensor_parallel_assignment.has_value()
+                                ? static_cast<size_t>(
+                                      cfg.tensor_parallel_assignment
+                                          ->vocab_count)
+                                : (terminal_vocab +
+                                   static_cast<size_t>(
+                                       std::max(1, cfg.total_shards)) -
+                                   1u) /
+                                      static_cast<size_t>(
+                                          std::max(1, cfg.total_shards));
+                    }
+                    prefix_block_bytes = checkedAdd(
+                        prefix_block_bytes,
+                        checkedMultiply(
+                            terminal_vocab,
+                            sizeof(float),
+                            "prefix terminal logits"),
+                        "prefix payload plus terminal logits");
+                }
+
+                if (cfg.prefix_cache.storage_mode ==
+                        PrefixCacheStorageMode::Tiered &&
+                    cfg.prefix_cache.ram_budget_bytes >=
+                        prefix_block_bytes &&
+                    cfg.prefix_cache.device_budget_bytes >=
+                        prefix_block_bytes)
+                {
+                    dev_plan.prefix_cache_device_hot_bytes =
+                        cfg.prefix_cache.device_budget_bytes;
+                }
+            }
             if (cfg.total_shards > 1)
             {
                 dev_plan.collective_bytes =
@@ -614,6 +754,10 @@ MemoryPlan MemoryPlanner::plan(
                     .resident_graph_rows = activation_seq,
                     .max_context_rows = max_seq,
                     .local_d_ff = local_d_ff,
+                    .local_query_head_start =
+                        cfg.tensor_parallel_assignment.has_value()
+                            ? cfg.tensor_parallel_assignment->head_start
+                            : cfg.shard_index * local_n_heads,
                     .local_query_heads = local_n_heads,
                     .first_layer = cfg.first_layer,
                     .last_layer = last_layer,
@@ -625,6 +769,9 @@ MemoryPlan MemoryPlanner::plan(
                             ? cfg.mtp_target_query_rows
                             : 0,
                 });
+            dev_plan.retained_workspace_bytes = std::min(
+                dev_plan.workspace_bytes,
+                cfg.retained_workspace_bytes);
         }
         else
         {
@@ -648,12 +795,19 @@ MemoryPlan MemoryPlanner::plan(
                         .resident_graph_rows = participant_graph_rows,
                         .max_context_rows = max_seq,
                         .local_d_ff = local_d_ff,
+                        .local_query_head_start =
+                            cfg.tensor_parallel_assignment.has_value()
+                                ? cfg.tensor_parallel_assignment->head_start
+                                : cfg.shard_index * local_n_heads,
                         .local_query_heads = local_n_heads,
                         .first_layer = cfg.first_layer,
                         .last_layer = last_layer,
                         .total_shards = cfg.total_shards,
                         .apportioned_routed_experts = true,
                     });
+            dev_plan.retained_workspace_bytes = std::min(
+                dev_plan.workspace_bytes,
+                cfg.retained_workspace_bytes);
         }
 
         // Diagnostics
@@ -661,7 +815,7 @@ MemoryPlan MemoryPlanner::plan(
         {
             std::ostringstream msg;
             msg << cfg.device.to_string() << ": need "
-                << formatMB(dev_plan.incremental_bytes() + dev_plan.headroom_bytes)
+                << formatMB(dev_plan.incremental_bytes())
                 << " of new allocation but only "
                 << formatMB(dev_plan.device_free_bytes) << " available"
                 << " (deficit: " << formatMB(dev_plan.deficit()) << ")";
@@ -671,7 +825,7 @@ MemoryPlan MemoryPlanner::plan(
         {
             std::ostringstream msg;
             msg << cfg.device.to_string() << ": tight fit — only "
-                << formatMB(dev_plan.remaining()) << " remaining after headroom";
+                << formatMB(dev_plan.remaining()) << " unallocated";
             result.diagnostics.push_back(msg.str());
         }
 
@@ -785,17 +939,18 @@ std::string MemoryPlan::renderTable() const
     // Header
     table << fort::header
           << "Device" << "Context" << "Act.Seq" << "Weights" << "Retained"
-          << "KV Cache" << "State" << "Collect." << "Activ." << "Wkspace" << "Total"
-          << "New" << "Avail." << "OK"
+          << "KV Cache" << "State" << "Prefix Stage" << "Prefix Hot"
+          << "Graphs" << "Collect." << "Activ." << "Wkspace" << "Ret.Wksp"
+          << "Total" << "New" << "Avail." << "OK"
           << fort::endr;
 
     // Column alignments
     table.column(0).set_cell_text_align(fort::text_align::left);
-    for (int c = 1; c <= 12; ++c)
+    for (int c = 1; c <= 16; ++c)
     {
         table.column(c).set_cell_text_align(fort::text_align::right);
     }
-    table.column(13).set_cell_text_align(fort::text_align::center);
+    table.column(17).set_cell_text_align(fort::text_align::center);
 
     // Data rows
     for (const auto& d : devices)
@@ -807,9 +962,13 @@ std::string MemoryPlan::renderTable() const
               << formatMB(d.retained_weight_bytes)
               << formatMB(d.kv_cache_bytes)
               << formatMB(d.persistent_state_bytes)
+              << formatMB(d.prefix_cache_staging_bytes)
+              << formatMB(d.prefix_cache_device_hot_bytes)
+              << formatMB(d.captured_graph_bytes)
               << formatMB(d.collective_bytes)
               << formatMB(d.activation_bytes)
               << formatMB(d.workspace_bytes)
+              << formatMB(d.retained_workspace_bytes)
               << formatMB(d.total_bytes())
               << formatMB(d.incremental_bytes())
               << formatMB(d.device_free_bytes)

@@ -21,6 +21,7 @@
 
 #include "MoEOverlayInferenceInterferenceProbe.h"
 #include "MoEOverlayInferenceTransaction.h"
+#include "MoEOverlayResidencyAuthority.h"
 
 #include <mpi.h>
 
@@ -30,6 +31,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -380,6 +382,121 @@ namespace llaminar2
         }
     };
 
+    /** @brief Role owned by one process-local segment of a global transaction. */
+    enum class MoEOverlayInferenceCoordinatorSegmentRole : std::uint8_t
+    {
+        Continuation = 0, ///< Dense continuation graph group and ticket authority.
+        ExpertFollower,  ///< Remote retained sparse-expert transaction follower.
+    };
+
+    /**
+     * @brief Sealed serving-family representation owned by one rank segment.
+     *
+     * There is deliberately no unresolved value. A segment may enter the
+     * coordinator plan only after the rank-synchronized serving-family phase
+     * has either materialized every native executable or certified every eager
+     * host endpoint. This keeps setup capability discovery out of inference.
+     */
+    enum class MoEOverlayInferenceSegmentMaterializationKind : std::uint8_t
+    {
+        NativeDeviceExecutable = 0, ///< CUDA/HIP executable family is resident.
+        EagerHostGraph,             ///< CPU declarative endpoints are certified.
+    };
+
+    /**
+     * @brief Immutable global segment plan for one heterogeneous graph family.
+     *
+     * A transaction ticket selects one complete process-local retained graph,
+     * not an individual MoE layer. Consequently the plan contains one
+     * continuation-rank segment and one segment per remote expert-follower
+     * rank. `local_participant_count` records the native/CPU endpoints composed
+     * by that process-local transaction without pretending they are independent
+     * cross-rank ticket boundaries.
+     *
+     * The plan can be created only through
+     * @ref sealAfterSynchronizedMaterialization. The caller must have completed
+     * the rank-synchronized serving-family phase first; construction then binds
+     * that proof to the exact graph-family generation consumed by every ticket
+     * publisher. Runtime PerfStats merely mirrors this production authority.
+     */
+    class MoEOverlayInferenceCoordinatorGraphPlan final
+    {
+    public:
+        /** @brief One process-local graph transaction in the global schedule. */
+        struct Segment
+        {
+            MoEOverlayInferenceCoordinatorSegmentRole role =
+                MoEOverlayInferenceCoordinatorSegmentRole::Continuation;
+            MoEOverlayInferenceSegmentMaterializationKind materialization =
+                MoEOverlayInferenceSegmentMaterializationKind::
+                    NativeDeviceExecutable;
+            int world_rank = -1; ///< Exact MPI rank executing this segment.
+            std::size_t local_participant_count = 0; ///< Endpoints composed locally.
+
+            bool operator==(const Segment &) const = default;
+        };
+
+        /**
+         * @brief Seal a complete deterministic plan after graph-family consensus.
+         * @param graph_family_generation Exact generation embedded in tickets.
+         * @param segments One continuation plus every remote follower rank.
+         * @return Valid immutable plan in deterministic role/rank order.
+         * @throws std::invalid_argument when the plan is incomplete or aliases a
+         *         rank, continuation authority, or follower boundary.
+         */
+        static MoEOverlayInferenceCoordinatorGraphPlan
+        sealAfterSynchronizedMaterialization(
+            std::uint64_t graph_family_generation,
+            std::vector<Segment> segments);
+
+        /** @return Whether this value contains one complete global plan. */
+        [[nodiscard]] bool valid() const noexcept;
+
+        /** @return Exact graph-family generation represented by the plan. */
+        [[nodiscard]] std::uint64_t graphFamilyGeneration() const noexcept
+        {
+            return graph_family_generation_;
+        }
+
+        /** @return Number of process-local segments in one global replay. */
+        [[nodiscard]] std::size_t segmentCount() const noexcept
+        {
+            return segments_.size();
+        }
+
+        /** @return Number of remote expert-follower rank segments. */
+        [[nodiscard]] std::size_t followerSegmentCount() const noexcept;
+
+        /** @return Number of segments backed by native device executables. */
+        [[nodiscard]] std::size_t nativeSegmentCount() const noexcept;
+
+        /** @return Number of segments backed by certified eager host graphs. */
+        [[nodiscard]] std::size_t eagerHostSegmentCount() const noexcept;
+
+        /** @return Total local endpoints composed by all native segments. */
+        [[nodiscard]] std::size_t nativeParticipantCount() const noexcept;
+
+        /** @return Exact continuation authority rank, or -1 when invalid. */
+        [[nodiscard]] int continuationWorldRank() const noexcept;
+
+        /**
+         * @brief Find the unique segment owned by @p world_rank.
+         * @return Stable plan-owned pointer, or null when the rank is absent.
+         */
+        [[nodiscard]] const Segment *segmentForWorldRank(
+            int world_rank) const noexcept;
+
+        /** @return Deterministically ordered immutable segment inventory. */
+        [[nodiscard]] const std::vector<Segment> &segments() const noexcept
+        {
+            return segments_;
+        }
+
+    private:
+        std::uint64_t graph_family_generation_ = 0;
+        std::vector<Segment> segments_;
+    };
+
     /**
      * @brief Publish one control ticket for a symmetric continuation rank.
      *
@@ -403,6 +520,8 @@ namespace llaminar2
             std::vector<
                 std::shared_ptr<IMoEOverlayInferenceTransactionPublisher>>
                 publishers; ///< One direct lane per remote follower rank.
+            MoEOverlayInferenceCoordinatorGraphPlan
+                graph_plan; ///< Sealed complete heterogeneous transaction plan.
             int continuation_participant_count = 0; ///< Symmetric local graph count.
             int ticket_authority_participant_index = -1; ///< Planner-resolved LocalTP child owning the remote packet parent.
             std::vector<MoEOverlayInferenceCompletionBoundaryKind>
@@ -412,6 +531,14 @@ namespace llaminar2
             /** Optional process-local device-controller wake sideband. */
             MoEOverlayRetiredPrefillProgressSink
                 retired_prefill_progress_sink;
+            /**
+             * Host RCU authority whose current epoch is pinned per sequence.
+             * Device-resident homogeneous controllers leave this empty because
+             * their captured epoch arena owns the equivalent lease entirely on
+             * device.
+             */
+            std::shared_ptr<MoEOverlayResidencyAuthority>
+                residency_authority;
         };
 
         /** @brief Validate topology and allocate every command-local slot. */
@@ -660,6 +787,13 @@ namespace llaminar2
         /** @return Controller-selected MTP width, or -1 before declaration. */
         [[nodiscard]] int activeMTPDraftDepth() const noexcept;
 
+        /** @return Immutable global graph plan governing every command. */
+        [[nodiscard]] const MoEOverlayInferenceCoordinatorGraphPlan &
+        graphPlan() const noexcept
+        {
+            return config_.graph_plan;
+        }
+
     private:
         /** @brief Preallocated poll-only fence aggregating participant events. */
         class CompletionFenceSet;
@@ -691,6 +825,9 @@ namespace llaminar2
             int next_graph_ordinal = 0;
             std::uint64_t placement_epoch = 0;
             std::uint64_t sequence_id = 0;
+            /** Host RCU lifetime matching @ref placement_epoch. */
+            std::optional<MoEOverlayResidencyAuthority::TicketLease>
+                placement_epoch_lease;
 
             /** @return Whether a sequence currently owns lifecycle state. */
             [[nodiscard]] bool active() const noexcept
@@ -718,6 +855,7 @@ namespace llaminar2
                 next_graph_ordinal = 0;
                 placement_epoch = 0;
                 sequence_id = 0;
+                placement_epoch_lease.reset();
             }
         };
 

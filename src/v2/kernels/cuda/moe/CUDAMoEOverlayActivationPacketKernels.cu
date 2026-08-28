@@ -150,6 +150,32 @@ extern "C" bool cudaMoEOverlayActivationConsumeReturn(
     return launchAccepted();
 }
 
+extern "C" bool cudaMoEOverlayConsumeCanonicalRouteTicket(
+    const llaminar2::MoEOverlayCanonicalRouteTicketConsumeLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const std::size_t capacity_elements =
+        launch->route_capacity * static_cast<std::size_t>(launch->d_model);
+    const unsigned int blocks = std::min(
+        kSparseRoutePayloadBlocks, blocksFor(capacity_elements));
+    const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    llaminar2::moe_activation_packet_device::
+        materializeCanonicalRouteTicketKernel
+        <<<blocks, kThreads, 0u, cuda_stream>>>(*launch);
+    /* A separate one-thread node cannot race the materialization blocks. Its
+     * exact-stream release is the sole authority permitting host payload reuse. */
+    llaminar2::moe_activation_packet_device::
+        acknowledgeCanonicalRouteTicketKernel
+        <<<1u, 1u, 0u, cuda_stream>>>(*launch);
+    return launchAccepted();
+}
+
 extern "C" bool cudaMoEOverlayActivationPackSingleRowDispatch(
     const llaminar2::MoEOverlayActivationSingleRowDispatchPackLaunch *launch,
     int device_ordinal,

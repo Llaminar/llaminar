@@ -58,8 +58,8 @@ namespace llaminar2
         {
             hashScalar(hash, identity.expected_epoch);
             hashScalar(hash, identity.candidate_epoch);
-            hashScalar(hash, identity.transaction_fingerprint.low);
-            hashScalar(hash, identity.transaction_fingerprint.high);
+            hashScalar(hash, identity.execution_fingerprint.low);
+            hashScalar(hash, identity.execution_fingerprint.high);
             hashScalar(hash, identity.migration_index);
             hashScalar(hash, identity.layer_idx);
             hashScalar(hash, identity.expert_id);
@@ -286,7 +286,7 @@ namespace llaminar2
     {
         return expected_epoch > 0 &&
                candidate_epoch == expected_epoch + 1 &&
-               transaction_fingerprint.valid() && layer_idx >= 0 &&
+               execution_fingerprint.valid() && layer_idx >= 0 &&
                expert_id >= 0 &&
                static_cast<std::uint8_t>(projection) <=
                    static_cast<std::uint8_t>(
@@ -358,7 +358,7 @@ namespace llaminar2
                 "Remote ExpertOverlay projection region byte totals are invalid");
         }
 
-        if (carriesGpuFloatingBytes())
+        if (carriesFloatingBytes())
         {
             const ExpertWeightFormat format{.kind = format_kind};
             const auto element_bytes = format.floatingElementBytes();
@@ -368,9 +368,7 @@ namespace llaminar2
                 n <= std::numeric_limits<std::uint64_t>::max() / k &&
                 n * k <= std::numeric_limits<std::uint64_t>::max() /
                              element_bytes;
-            if (!identity.source_device.is_gpu() ||
-                !identity.destination_device.is_gpu() ||
-                !format.isFloating() || N_padded != N ||
+            if (!format.isFloating() || N_padded != N ||
                 blocks_per_row != 0 || source_codebook_id != 0 ||
                 source_is_superblock != 0 || cpu_codebook_id != 0 ||
                 gpu_codebook_id != 0 ||
@@ -384,7 +382,7 @@ namespace llaminar2
             {
                 return reject(
                     error,
-                    "GPU floating remote projection disagrees with its precision, geometry, or byte extent");
+                    "Contiguous floating remote projection disagrees with its precision, geometry, or byte extent");
             }
         }
         else
@@ -662,24 +660,23 @@ namespace llaminar2
     }
 
     MoEOverlayRemoteProjectionManifest
-    makeMoEOverlayRemoteGpuFloatingProjectionManifest(
+    makeMoEOverlayRemoteFloatingProjectionManifest(
         const MoEOverlayRemoteProjectionIdentity &identity,
         const ContiguousFloatingPointWeightDescriptor &source,
         std::uint32_t maximum_chunk_bytes)
     {
         const auto format = ExpertWeightFormat::floating(source.type);
         if (!source.valid() || !format.valid() ||
-            !identity.source_device.is_gpu() ||
-            !identity.destination_device.is_gpu() ||
+            !identity.valid() ||
             maximum_chunk_bytes == 0u)
         {
             throw std::invalid_argument(
-                "Remote floating GPU projection requires valid GPU endpoints, storage, precision, and capacity");
+                "Remote floating projection requires valid endpoints, storage, precision, and capacity");
         }
 
         MoEOverlayRemoteProjectionManifest manifest;
         manifest.packing = MoEOverlayRemoteProjectionPacking::
-            GpuContiguousFloating;
+            ContiguousFloating;
         manifest.format_kind = format.kind;
         manifest.identity = identity;
         manifest.N = source.n;
@@ -794,9 +791,9 @@ namespace llaminar2
         writeLittleEndian(destination, offset, identity.expected_epoch);
         writeLittleEndian(destination, offset, identity.candidate_epoch);
         writeLittleEndian(
-            destination, offset, identity.transaction_fingerprint.low);
+            destination, offset, identity.execution_fingerprint.low);
         writeLittleEndian(
-            destination, offset, identity.transaction_fingerprint.high);
+            destination, offset, identity.execution_fingerprint.high);
         writeLittleEndian(destination, offset, identity.migration_index);
         writeLittleEndian(destination, offset, identity.layer_idx);
         writeLittleEndian(destination, offset, identity.expert_id);
@@ -869,9 +866,9 @@ namespace llaminar2
             readLittleEndian<std::uint64_t>(packet, offset);
         identity.candidate_epoch =
             readLittleEndian<std::uint64_t>(packet, offset);
-        identity.transaction_fingerprint.low =
+        identity.execution_fingerprint.low =
             readLittleEndian<std::uint64_t>(packet, offset);
-        identity.transaction_fingerprint.high =
+        identity.execution_fingerprint.high =
             readLittleEndian<std::uint64_t>(packet, offset);
         identity.migration_index =
             readLittleEndian<std::uint64_t>(packet, offset);

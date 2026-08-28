@@ -155,6 +155,16 @@ namespace llaminar2
         position_ = 0;
     }
 
+    bool PipelineRunner::purgePrefixCache()
+    {
+        if (my_stage_index_ < 0 ||
+            !stages_[my_stage_index_].runner)
+        {
+            return true;
+        }
+        return stages_[my_stage_index_].runner->purgePrefixCache();
+    }
+
     int PipelineRunner::get_position() const
     {
         // Return position from our stage runner if available

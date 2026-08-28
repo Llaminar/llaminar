@@ -126,8 +126,7 @@ namespace llaminar2
             int device_ordinal,
             uint32_t participant_id,
             uint32_t slot_count,
-            FormatProfile format_profile,
-            size_t vram_safety_margin_bytes);
+            FormatProfile format_profile);
 
         ~DeviceMoETransferSlotDirectory();
 

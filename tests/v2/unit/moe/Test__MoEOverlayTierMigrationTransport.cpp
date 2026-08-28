@@ -517,6 +517,33 @@ namespace llaminar2::test
                     });
             return fixture;
         }
+
+        /** @brief Drive one already-started host wave through retirement. */
+        bool advanceAuthorityToIdle(
+            MoEOverlayResidencyAuthority &authority,
+            std::string *error = nullptr)
+        {
+            for (std::size_t poll = 0; poll < 32u; ++poll)
+            {
+                const auto progress = authority.advanceBackground();
+                if (!progress.ok())
+                {
+                    if (error)
+                        *error = progress.error;
+                    return false;
+                }
+                if (progress.status == MoEOverlayResidencyApplyStatus::Idle &&
+                    !authority.hasActiveBackgroundWave() &&
+                    authority.pendingRetirementCount() == 0u &&
+                    authority.pendingAbortCount() == 0u)
+                {
+                    return true;
+                }
+            }
+            if (error)
+                *error = "scripted residency wave did not become idle";
+            return false;
+        }
     } // namespace
 
     TEST(
@@ -533,7 +560,9 @@ namespace llaminar2::test
         ASSERT_EQ(transaction.migrations.size(), 3u);
         ASSERT_EQ(transaction.migration_cycles.size(), 1u);
 
-        ScriptedWaveFactory factory(ScriptedWaveFactory::Mode::Exact);
+        ScriptedWaveFactory factory(
+            ScriptedWaveFactory::Mode::Exact,
+            true);
         MoEOverlayTierMigrationTransport transport({
             .factory = &factory,
             .projections_per_expert = 3,
@@ -577,6 +606,8 @@ namespace llaminar2::test
         EXPECT_EQ(stats.waves_started, 1u);
         EXPECT_EQ(stats.transfer_operations_started, 9u);
         EXPECT_EQ(stats.transfer_operations_completed, 9u);
+        EXPECT_EQ(stats.placement_transfer_operations_completed, 9u);
+        EXPECT_EQ(stats.placement_transfer_payload_bytes_completed, 9'252u);
         EXPECT_EQ(stats.commits_started, 1u);
         EXPECT_EQ(stats.commits_completed, 1u);
         EXPECT_EQ(stats.inference_stream_waits, 0u);
@@ -610,6 +641,67 @@ namespace llaminar2::test
         EXPECT_EQ(factory.observations->transfer_aborts, 8u);
         EXPECT_EQ(factory.observations->bank_aborts, 1u);
         EXPECT_EQ(transport.stats().waves_failed_to_prepare, 1u);
+    }
+
+    TEST(
+        MoEOverlayTierMigrationTransport,
+        PreparedContextRestorationPublishesButCannotCertifyLiveOptimization)
+    {
+        auto fixture = makeAuthority();
+        ScriptedWaveFactory live_factory(
+            ScriptedWaveFactory::Mode::Exact,
+            true);
+        MoEOverlayTierMigrationTransport live_transport({
+            .factory = &live_factory,
+            .projections_per_expert = 3,
+            .perf_device = "heterogeneous-test",
+        });
+
+        const auto live = fixture.authority->proposeFromHistogram();
+        ASSERT_EQ(
+            fixture.authority->beginApply(live, live_transport).status,
+            MoEOverlayResidencyApplyStatus::Started);
+        std::string error;
+        ASSERT_TRUE(advanceAuthorityToIdle(*fixture.authority, &error))
+            << error;
+        ASSERT_EQ(fixture.authority->snapshot()->epoch, 2u);
+        ASSERT_FALSE(
+            fixture.authority->initialPreparedPlacementPublished());
+
+        const auto restoration = fixture.authority
+                                     ->proposeInitialPreparedPlacementRestoration();
+        ASSERT_TRUE(restoration.valid());
+        ASSERT_EQ(
+            restoration.purpose,
+            MoEOverlayResidencyTransactionPurpose::
+                PreparedContextRestoration);
+        ASSERT_EQ(restoration.migrations.size(), 3u);
+
+        ScriptedWaveFactory restoration_factory(
+            ScriptedWaveFactory::Mode::Exact,
+            true);
+        MoEOverlayTierMigrationTransport restoration_transport({
+            .factory = &restoration_factory,
+            .projections_per_expert = 3,
+            .perf_device = "heterogeneous-test",
+        });
+        ASSERT_EQ(
+            fixture.authority
+                ->beginApply(restoration, restoration_transport)
+                .status,
+            MoEOverlayResidencyApplyStatus::Started);
+        ASSERT_TRUE(advanceAuthorityToIdle(*fixture.authority, &error))
+            << error;
+
+        EXPECT_EQ(fixture.authority->snapshot()->epoch, 3u);
+        EXPECT_TRUE(
+            fixture.authority->initialPreparedPlacementPublished());
+        const auto stats = restoration_transport.stats();
+        EXPECT_EQ(stats.transfer_operations_completed, 9u);
+        EXPECT_EQ(stats.placement_transfer_operations_completed, 0u)
+            << "Teardown restoration is physical work, not live optimization evidence";
+        EXPECT_EQ(stats.placement_transfer_payload_bytes_completed, 0u);
+        EXPECT_EQ(stats.commits_completed, 1u);
     }
 
     TEST(
@@ -909,7 +1001,9 @@ namespace llaminar2::test
             calibration.previous->layered_ownership,
             calibration.candidate->layered_ownership);
 
-        ScriptedWaveFactory factory(ScriptedWaveFactory::Mode::Exact);
+        ScriptedWaveFactory factory(
+            ScriptedWaveFactory::Mode::Exact,
+            true);
         MoEOverlayTierMigrationTransport transport({
             .factory = &factory,
             .projections_per_expert = 3,
@@ -937,6 +1031,17 @@ namespace llaminar2::test
             start.wave->pollStage(&error),
             MoEOverlayResidencyWaveProgress::Ready)
             << error;
+        const auto calibration_transport_stats = transport.stats();
+        EXPECT_EQ(
+            calibration_transport_stats
+                .placement_transfer_operations_completed,
+            0u)
+            << "Calibration transfer operations must not certify runtime placement";
+        EXPECT_EQ(
+            calibration_transport_stats
+                .placement_transfer_payload_bytes_completed,
+            0u)
+            << "Calibration payload bytes must not certify runtime placement";
         const auto interval = start.wave->completedStageInterval();
         ASSERT_TRUE(interval.has_value());
         EXPECT_TRUE(interval->valid());

@@ -370,7 +370,14 @@ namespace llaminar2
          */
         bool usesMTPGroupedDecodeEquivalentRows() const
         {
-            return mtp.enabled &&
+            /*
+             * Graph construction follows retained capacity, not the request's
+             * current execution switch.  A capacity-only model context must
+             * declare the exact grouped verifier and live-condition kernels
+             * that an enabled lease will later capture; the runtime still
+             * consults `mtp.enabled` before launching either transaction.
+             */
+            return retainsMTPGraphCapacity(mtp) &&
                    (compute_all_position_logits ||
                     live_mtp_request_batch_condition);
         }

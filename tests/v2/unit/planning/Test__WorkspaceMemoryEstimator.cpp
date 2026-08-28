@@ -11,7 +11,10 @@
 #include <gtest/gtest.h>
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "backends/DeviceId.h"
+#include "config/GDNHeadAssignment.h"
+#include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include <algorithm>
 #include <stdexcept>
 
 using namespace llaminar2;
@@ -43,6 +46,12 @@ ModelMemoryProfile qwen35MoEProfile(bool hybrid)
 
     if (hybrid)
     {
+        profile.gdn_conv_kernel_size = 4;
+        profile.gdn_state_size = 128;
+        profile.gdn_inner_size = 4096;
+        profile.gdn_group_count = 16;
+        profile.gdn_time_step_rank = 32;
+
         TensorSizeInfo recurrent_marker;
         recurrent_marker.name = "blk.0.ssm_out.weight";
         recurrent_marker.layer_index = 0;
@@ -63,6 +72,42 @@ ModelMemoryProfile qwen35MoEProfile(bool hybrid)
         profile.tensors.push_back(std::move(gate));
     }
     return profile;
+}
+
+/**
+ * @brief Expand a small hybrid profile to the 122B model's 36 main GDN layers.
+ *
+ * Qwen3.5 122B has 48 main blocks with every fourth block using full
+ * attention, plus one trailing MTP block in the model inventory. The grouped
+ * verifier retains rollback slots for the 36 recurrent main blocks only.
+ */
+void installQwen122HybridLayerInventory(ModelMemoryProfile& profile)
+{
+    profile.n_layers = 49;
+    profile.full_attention_interval = 4;
+    profile.gdn_conv_kernel_size = 4;
+    profile.gdn_state_size = 128;
+    profile.gdn_inner_size = 8192;
+    profile.gdn_group_count = 16;
+    profile.gdn_time_step_rank = 64;
+    profile.tensors.erase(
+        std::remove_if(
+            profile.tensors.begin(),
+            profile.tensors.end(),
+            [](const TensorSizeInfo& tensor)
+            {
+                return tensor.name.ends_with(".ssm_out.weight");
+            }),
+        profile.tensors.end());
+    for (int layer = 0; layer < 48; ++layer)
+    {
+        if ((layer + 1) % profile.full_attention_interval == 0)
+            continue;
+        TensorSizeInfo marker;
+        marker.name = "blk." + std::to_string(layer) + ".ssm_out.weight";
+        marker.layer_index = layer;
+        profile.tensors.push_back(std::move(marker));
+    }
 }
 
 /** @brief Build complete physical geometry for one device-free planner test. */
@@ -251,7 +296,7 @@ TEST(Test__WorkspaceMemoryEstimator,
     profile.n_kv_heads = 2;
     profile.head_dim = 256;
     profile.expert_feed_forward_length = 1024;
-    profile.full_attention_interval = 4;
+    installQwen122HybridLayerInventory(profile);
 
     TensorSizeInfo full_attention_q_gate;
     full_attention_q_gate.name = "blk.3.attn_q.weight";
@@ -299,7 +344,7 @@ TEST(Test__WorkspaceMemoryEstimator,
     profile.n_kv_heads = 2;
     profile.head_dim = 256;
     profile.expert_feed_forward_length = 1024;
-    profile.full_attention_interval = 4;
+    installQwen122HybridLayerInventory(profile);
 
     TensorSizeInfo full_attention_q_gate;
     full_attention_q_gate.name = "blk.3.attn_q.weight";
@@ -313,6 +358,10 @@ TEST(Test__WorkspaceMemoryEstimator,
         DeviceId::cuda(0), /*local_d_ff=*/512, /*total_shards=*/2);
     geometry.resident_graph_rows = 16;
     geometry.mtp_target_query_rows = 16;
+    geometry.local_query_head_start = 0;
+    geometry.local_query_heads = 16;
+    geometry.first_layer = 0;
+    geometry.last_layer = 47;
 
     const size_t bytes = WorkspaceMemoryEstimator::estimate(
         profile, geometry);
@@ -320,6 +369,86 @@ TEST(Test__WorkspaceMemoryEstimator,
         2288657668ULL;
     EXPECT_GE(bytes, kObservedExactDepth15SerialFamilyBytes)
         << "Depth-fifteen admission must price the retained main, grouped-verifier, and MTP namespaces before loading experts.";
+}
+
+/**
+ * @brief Prove admission and graph stages share exact rollback bytes on both GPUs.
+ *
+ * Every rank of TP1/2/4/8 is included because GDN Q/K and value heads use a
+ * linked modular assignment. A rank- or backend-specific approximation would
+ * recreate the late allocation failure on a different topology.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     Qwen122Depth15GDNStateContractIsExactForCUDAAndROCmTP1ThroughTP8)
+{
+    auto profile = qwen35MoEProfile(true);
+    profile.d_model = 3072;
+    profile.d_ff = 1024;
+    profile.n_heads = 32;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 256;
+    profile.expert_feed_forward_length = 1024;
+    installQwen122HybridLayerInventory(profile);
+
+    constexpr std::size_t kGDNLayerCount = 36;
+    for (const DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        for (const int tp : {1, 2, 4, 8})
+        {
+            for (int rank = 0; rank < tp; ++rank)
+            {
+                auto geometry = graphGeometry(
+                    device,
+                    /*local_d_ff=*/std::max(1, 1024 / tp),
+                    tp);
+                geometry.resident_graph_rows = 16;
+                geometry.first_layer = 0;
+                geometry.last_layer = 47;
+                geometry.local_query_head_start = rank * (32 / tp);
+                geometry.local_query_heads = 32 / tp;
+
+                const std::size_t ordinary =
+                    WorkspaceMemoryEstimator::estimate(profile, geometry);
+                geometry.mtp_target_query_rows = 16;
+                const std::size_t retained =
+                    WorkspaceMemoryEstimator::estimate(profile, geometry);
+
+                const auto assignment = GDNHeadAssignment::fromPartition(
+                    /*global_key_heads=*/16,
+                    /*global_value_heads=*/64,
+                    geometry.local_query_head_start,
+                    geometry.local_query_heads,
+                    /*partition_total=*/32);
+                const auto recurrence =
+                    gdn_workspace::recurrenceStateFootprint(
+                        /*slot_rows=*/16,
+                        /*request_count=*/1,
+                        assignment.localValueHeads(),
+                        /*key_width=*/128,
+                        /*value_width=*/128);
+                const auto short_conv =
+                    gdn_workspace::shortConvStateFootprint(
+                        /*slot_rows=*/16,
+                        /*request_count=*/1,
+                        static_cast<int>(assignment.localFusedRows(128)),
+                        /*kernel_size=*/4);
+                const auto align256 = [](std::size_t bytes)
+                {
+                    return (bytes + 255u) & ~std::size_t{255u};
+                };
+                const std::size_t expected =
+                    kGDNLayerCount *
+                        (align256(recurrence.slot_bytes) +
+                         align256(short_conv.slot_bytes)) +
+                    align256(recurrence.work_bytes) +
+                    align256(short_conv.work_bytes);
+
+                EXPECT_EQ(retained - ordinary, expected)
+                    << "device=" << device.toString()
+                    << " tp=" << tp << " rank=" << rank;
+            }
+        }
+    }
 }
 
 TEST(Test__WorkspaceMemoryEstimator,

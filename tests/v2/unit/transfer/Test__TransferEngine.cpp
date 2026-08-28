@@ -25,7 +25,9 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <utility>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -174,6 +176,285 @@ TEST(Test__TransferEngine_Plan, DescribeTransferPlan_HostResident)
 
     EXPECT_NE(desc.find("HOST_RESIDENT"), std::string::npos);
     EXPECT_NE(desc.find("NOOP"), std::string::npos);
+}
+
+namespace
+{
+    /** @brief Device-free backend spy for reclamation receipt semantics. */
+    class ReclamationBackendSpy final : public MockBackend
+    {
+    public:
+        ReclamationBackendSpy() : MockBackend(DeviceType::CUDA) {}
+
+        /** @brief Return the configured raw backend result and record identity. */
+        DeviceMemoryCacheReclamationResult
+        trimUnusedDeviceMemoryCaches(int device_id) override
+        {
+            ++calls;
+            last_device_id = device_id;
+            return result;
+        }
+
+        /** @brief Return exact injected canonical allocation ownership. */
+        DeviceAllocationAccounting
+        deviceAllocationAccounting(int device_id) const override
+        {
+            ++allocation_accounting_calls;
+            last_allocation_accounting_device_id = device_id;
+            return allocation_accounting;
+        }
+
+        /** @brief Model one exact successful runtime-generation reset. */
+        DeviceRuntimeGenerationRetirementResult
+        retireExclusiveDeviceRuntimeGeneration(
+            const DeviceRuntimeGenerationRetirementRequest &request) override
+        {
+            ++runtime_reset_calls;
+            last_runtime_reset_device_id = request.deviceOrdinal();
+            DeviceRuntimeGenerationRetirementResult receipt;
+            receipt.supported = true;
+            receipt.success = runtime_reset_succeeds;
+            receipt.reset_invoked = runtime_reset_succeeds;
+            receipt.retired_generation = runtime_generation;
+            receipt.active_generation = runtime_reset_succeeds
+                                            ? runtime_generation + 1u
+                                            : 0u;
+            receipt.driver_free_bytes_before = driver_free_bytes;
+            receipt.driver_free_bytes_after =
+                runtime_driver_free_bytes_after;
+            receipt.diagnostic = runtime_reset_succeeds
+                                     ? "injected runtime reset"
+                                     : "injected runtime reset failure";
+            if (runtime_reset_succeeds)
+                ++runtime_generation;
+            return receipt;
+        }
+
+        /** @brief Return the pre-owner-release observation used by a ticket. */
+        size_t deviceMemoryFree(int device_id) const override
+        {
+            ++free_memory_calls;
+            last_free_memory_device_id = device_id;
+            return driver_free_bytes;
+        }
+
+        DeviceMemoryCacheReclamationResult result; ///< Injected backend evidence.
+        DeviceAllocationAccounting allocation_accounting{
+            .supported = true,
+            .active_allocations = 1u,
+            .active_bytes = 384u,
+        }; ///< Exact pre-release canonical ownership.
+        size_t driver_free_bytes = 1000u; ///< Injected ticket baseline.
+        size_t runtime_driver_free_bytes_after = 1384u; ///< Reset diagnostic.
+        int calls = 0; ///< Number of public-authority invocations.
+        int last_device_id = -1; ///< Exact ordinal forwarded by TransferEngine.
+        bool runtime_reset_succeeds = true; ///< Injected reset outcome.
+        std::uint64_t runtime_generation = 1u; ///< Current fake runtime identity.
+        int runtime_reset_calls = 0; ///< Exclusive runtime-reset invocations.
+        int last_runtime_reset_device_id = -1; ///< Exact reset ordinal.
+        mutable int free_memory_calls = 0; ///< Ticket baseline observations.
+        mutable int last_free_memory_device_id = -1; ///< Observed GPU ordinal.
+        mutable int allocation_accounting_calls = 0; ///< Ledger observations.
+        mutable int last_allocation_accounting_device_id = -1; ///< Ledger GPU.
+    };
+
+    ReclamationBackendSpy *reclamation_backend_spy = nullptr;
+
+    /** @return Active device-free backend used by the function-pointer resolver. */
+    IBackend *resolveReclamationBackend(DeviceId)
+    {
+        return reclamation_backend_spy;
+    }
+
+    /** @return A complete successful raw receipt for test mutation. */
+    DeviceMemoryCacheReclamationResult successfulRawReclamationResult()
+    {
+        DeviceMemoryCacheReclamationResult result;
+        result.supported = true;
+        result.success = true;
+        result.graph_trim_invoked = true;
+        result.async_pool_trim_invoked = true;
+        result.before = {
+            .driver_free_bytes = 1000u,
+            .graph_used_bytes = 64u,
+            .graph_reserved_bytes = 128u,
+            .async_pool_used_bytes = 32u,
+            .async_pool_reserved_bytes = 256u,
+            .graph_accounting_available = true,
+            .async_pool_accounting_available = true,
+        };
+        result.after = {
+            .driver_free_bytes = 1384u,
+            .graph_used_bytes = 0u,
+            .graph_reserved_bytes = 0u,
+            .async_pool_used_bytes = 0u,
+            .async_pool_reserved_bytes = 0u,
+            .graph_accounting_available = true,
+            .async_pool_accounting_available = true,
+        };
+        return result;
+    }
+} // namespace
+
+TEST(Test__TransferEngine_Reclamation, RequestFactoriesRejectInvalidOwnership)
+{
+    EXPECT_THROW(
+        (void)DeviceMemoryReclamationRequest::retiredExecutionTopology(
+            DeviceId::cpu()),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)DeviceMemoryReclamationRequest::retiredExecutionTopology(
+            DeviceId::invalid()),
+        std::invalid_argument);
+
+    ReclamationBackendSpy backend;
+    reclamation_backend_spy = &backend;
+    TransferEngine engine(&resolveReclamationBackend);
+    EXPECT_THROW(
+        (void)engine.beginExclusiveModelRetirement(
+            ModelDeviceMemoryRetention{
+                .device = DeviceId::cpu(),
+                .prepared_weight_bytes = 1u,
+            }),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)engine.beginExclusiveModelRetirement(
+            ModelDeviceMemoryRetention{
+                .device = DeviceId::cuda(0),
+            }),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)engine.beginExclusiveModelRetirement(
+            ModelDeviceMemoryRetention{
+                .device = DeviceId::cuda(0),
+                .prepared_weight_bytes =
+                    std::numeric_limits<size_t>::max(),
+                .reusable_workspace_bytes = 1u,
+            }),
+        std::invalid_argument);
+    EXPECT_EQ(backend.free_memory_calls, 0);
+    reclamation_backend_spy = nullptr;
+}
+
+TEST(Test__TransferEngine_Reclamation, PublicAuthorityReturnsCompleteReceipt)
+{
+    ReclamationBackendSpy backend;
+    backend.result = successfulRawReclamationResult();
+    reclamation_backend_spy = &backend;
+    TransferEngine engine(&resolveReclamationBackend);
+
+    const DeviceMemoryReclamationReceipt receipt =
+        engine.reclaimDeviceMemory(
+            DeviceMemoryReclamationRequest::retiredExecutionTopology(
+                DeviceId::cuda(3)));
+
+    EXPECT_EQ(backend.calls, 1);
+    EXPECT_EQ(backend.last_device_id, 3);
+    EXPECT_EQ(receipt.device, DeviceId::cuda(3));
+    EXPECT_EQ(receipt.reclaimedDriverBytes(), 384u);
+    EXPECT_EQ(receipt.graph_reserved_bytes_before, 128u);
+    EXPECT_EQ(receipt.graph_reserved_bytes_after, 0u);
+    EXPECT_EQ(receipt.async_pool_reserved_bytes_before, 256u);
+    EXPECT_EQ(receipt.async_pool_reserved_bytes_after, 0u);
+    EXPECT_TRUE(receipt.graph_trim_invoked);
+    EXPECT_TRUE(receipt.async_pool_trim_invoked);
+    reclamation_backend_spy = nullptr;
+}
+
+TEST(Test__TransferEngine_Reclamation, BackendFailureCannotForgeReceipt)
+{
+    ReclamationBackendSpy backend;
+    backend.result.diagnostic = "injected trim failure";
+    reclamation_backend_spy = &backend;
+    TransferEngine engine(&resolveReclamationBackend);
+
+    EXPECT_THROW(
+        (void)engine.reclaimDeviceMemory(
+            DeviceMemoryReclamationRequest::retiredExecutionTopology(
+                DeviceId::cuda(0))),
+        std::runtime_error);
+    reclamation_backend_spy = nullptr;
+}
+
+TEST(Test__TransferEngine_Reclamation,
+     ExclusiveRetirementRejectsBOMBeyondCanonicalOwnership)
+{
+    ReclamationBackendSpy backend;
+    backend.result = successfulRawReclamationResult();
+    reclamation_backend_spy = &backend;
+    TransferEngine engine(&resolveReclamationBackend);
+
+    EXPECT_THROW(
+        (void)engine.beginExclusiveModelRetirement(
+            ModelDeviceMemoryRetention{
+                .device = DeviceId::cuda(0),
+                .prepared_weight_bytes = 300u,
+                .reusable_workspace_bytes = 85u,
+            }),
+        std::runtime_error);
+
+    auto exact_ticket = engine.beginExclusiveModelRetirement(
+        ModelDeviceMemoryRetention{
+            .device = DeviceId::cuda(0),
+            .prepared_weight_bytes = 300u,
+            .reusable_workspace_bytes = 84u,
+        });
+    EXPECT_NO_THROW(
+        (void)engine.completeExclusiveModelRetirement(
+            std::move(exact_ticket)));
+    EXPECT_EQ(backend.free_memory_calls, 1);
+    EXPECT_EQ(backend.last_free_memory_device_id, 0);
+    EXPECT_EQ(backend.allocation_accounting_calls, 2);
+    EXPECT_EQ(backend.last_allocation_accounting_device_id, 0);
+    EXPECT_EQ(backend.runtime_reset_calls, 1);
+    EXPECT_EQ(backend.last_runtime_reset_device_id, 0);
+    EXPECT_EQ(backend.calls, 0);
+    reclamation_backend_spy = nullptr;
+}
+
+TEST(Test__TransferEngine_Reclamation,
+     ExclusiveTicketUsesCanonicalLedgerInsteadOfDriverDelta)
+{
+    ReclamationBackendSpy backend;
+    backend.driver_free_bytes = 1000u;
+    backend.result = successfulRawReclamationResult();
+    backend.result.before.driver_free_bytes = 1300u;
+    backend.result.after.driver_free_bytes = 1384u;
+    backend.runtime_driver_free_bytes_after = 1040u;
+    reclamation_backend_spy = &backend;
+    TransferEngine engine(&resolveReclamationBackend);
+
+    auto ticket = engine.beginExclusiveModelRetirement(
+        ModelDeviceMemoryRetention{
+            .device = DeviceId::cuda(4),
+            .prepared_weight_bytes = 320u,
+            .reusable_workspace_bytes = 64u,
+        });
+    EXPECT_EQ(ticket.driverFreeBytesBeforeOwnerRelease(), 1000u);
+    EXPECT_EQ(ticket.expectedRetiredBytes(), 384u);
+    EXPECT_EQ(ticket.canonicalAllocationsBeforeOwnerRelease(), 1u);
+    EXPECT_EQ(ticket.canonicalAllocationBytesBeforeOwnerRelease(), 384u);
+
+    const auto receipt = engine.completeExclusiveModelRetirement(
+        std::move(ticket));
+    EXPECT_EQ(receipt.reclaimedDriverBytes(), 40u);
+    EXPECT_EQ(receipt.driverBytesVisibleSinceOwnerRelease(), 40u);
+    EXPECT_EQ(receipt.releasedCanonicalBytes(), 384u);
+    EXPECT_EQ(receipt.expected_retired_bytes, 384u);
+    EXPECT_EQ(receipt.canonical_allocations_before_owner_release, 1u);
+    EXPECT_EQ(receipt.canonical_allocations_before_runtime_reset, 0u);
+    EXPECT_EQ(receipt.driver_free_bytes_before_owner_release, 1000u);
+    EXPECT_TRUE(receipt.runtime_reset_invoked);
+    EXPECT_EQ(receipt.retired_runtime_generation, 1u);
+    EXPECT_EQ(receipt.active_runtime_generation, 2u);
+    EXPECT_EQ(backend.last_runtime_reset_device_id, 4);
+    EXPECT_EQ(backend.calls, 0);
+    EXPECT_FALSE(ticket.valid());
+    EXPECT_THROW(
+        (void)engine.completeExclusiveModelRetirement(
+            std::move(ticket)),
+        std::logic_error);
+    reclamation_backend_spy = nullptr;
 }
 
 // ============================================================================

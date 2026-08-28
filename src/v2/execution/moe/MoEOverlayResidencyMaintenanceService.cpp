@@ -5,6 +5,7 @@
 
 #include "MoEOverlayResidencyMaintenanceService.h"
 
+#include "interfaces/IMPIContext.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -45,7 +46,7 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay maintenance requires a migration transport");
         }
-        if (config_.histogram_publisher &&
+        if (config_.proposal_publisher &&
             !config_.authority->migrationEnabled())
         {
             throw std::invalid_argument(
@@ -79,9 +80,9 @@ namespace llaminar2
         }
 
         /* Peer publishers guarantee their first exact-size receive is armed. */
-        histogram_exchange_active_ =
-            config_.histogram_publisher &&
-            !config_.histogram_publisher->isCoordinator();
+        proposal_exchange_active_ =
+            config_.proposal_publisher &&
+            !config_.proposal_publisher->isCoordinator();
 
     }
 
@@ -90,7 +91,8 @@ namespace llaminar2
     {
         try
         {
-            stopAndDrain();
+            stopAndDrain(
+                MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
         }
         catch (...)
         {
@@ -143,7 +145,9 @@ namespace llaminar2
     void MoEOverlayResidencyMaintenanceService::
         notifyMaintenanceProgress() noexcept
     {
-        notifications_.fetch_add(1, std::memory_order_relaxed);
+        /* Publish the generation before the wake. Status readers can now
+         * reject a stale Waiting state even if the worker has not run yet. */
+        notifications_.fetch_add(1, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(wake_mutex_);
             wake_requested_ = true;
@@ -151,9 +155,64 @@ namespace llaminar2
         wake_cv_.notify_one();
     }
 
-    void MoEOverlayResidencyMaintenanceService::stopAndDrain()
+    void MoEOverlayResidencyMaintenanceService::stopAndDrain(
+        MoEOverlayMaintenanceDrainScope scope)
     {
         std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+        if (state_.load(std::memory_order_acquire) ==
+            MoEOverlayMaintenanceState::Stopped)
+        {
+            return;
+        }
+
+        const bool distributed =
+            config_.proposal_publisher && config_.distributed_context &&
+            config_.distributed_context->world_size() > 1;
+        if (scope ==
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition)
+        {
+            if (distributed && worker_.joinable())
+            {
+                throw std::logic_error(
+                    "A live distributed ExpertOverlay maintenance worker requires a topology drain");
+            }
+            stopLocalAndDrainLocked();
+            return;
+        }
+
+        if (!distributed)
+        {
+            stopLocalAndDrainLocked();
+            return;
+        }
+
+        /*
+         * Closing inference admission is process-local, whereas proposal
+         * publication is topology-wide. Keep every follower worker alive
+         * until the arbitrary coordinator has retired the last generation it
+         * could have admitted before shutdown. This is the same leader-first
+         * drain shape used by the device-resident controller service.
+         *
+         * Barrier 1: every rank has closed inference and still owns a live
+         * worker. Barrier 2: the coordinator can no longer publish. Barrier 3:
+         * followers have drained/cancelled only passive receives, so prepared-
+         * context restoration may begin symmetrically on every rank.
+         */
+        const bool coordinator =
+            config_.proposal_publisher->isCoordinator();
+        config_.distributed_context->barrier();
+        if (coordinator)
+            stopLocalAndDrainLocked();
+        config_.distributed_context->barrier();
+        if (!coordinator)
+            stopLocalAndDrainLocked();
+        config_.distributed_context->barrier();
+        recordPerfCounter("maintenance_distributed_topology_drains");
+    }
+
+    void MoEOverlayResidencyMaintenanceService::
+        stopLocalAndDrainLocked()
+    {
         if (!worker_.joinable())
         {
             const auto current = state_.load(std::memory_order_acquire);
@@ -236,14 +295,14 @@ namespace llaminar2
                 dynamic_no_movement_.load(std::memory_order_relaxed),
             .static_no_movement =
                 static_no_movement_.load(std::memory_order_relaxed),
-            .histogram_windows_published =
-                histogram_windows_published_.load(
+            .proposals_published =
+                proposals_published_.load(
                     std::memory_order_relaxed),
-            .histogram_windows_received =
-                histogram_windows_received_.load(
+            .proposals_received =
+                proposals_received_.load(
                     std::memory_order_relaxed),
-            .histogram_receives_rearmed =
-                histogram_receives_rearmed_.load(
+            .proposal_receives_rearmed =
+                proposal_receives_rearmed_.load(
                     std::memory_order_relaxed),
             .fatal_failures = fatal_failures_.load(std::memory_order_relaxed),
         };
@@ -268,13 +327,147 @@ namespace llaminar2
         return config_.economy_certification->measurementReadiness();
     }
 
+    MoEOptimizationStatus
+    MoEOverlayResidencyMaintenanceService::optimizationStatus() const
+    {
+        MoEOptimizationStatus status{
+            .authority = MoEOptimizationAuthority::Host,
+            .state = MoEOptimizationLifecycleState::MovementDisabled,
+            .activity = MoEOptimizationActivityState::Dormant,
+        };
+        if (config_.authority)
+        {
+            const auto authority_stats = config_.authority->stats();
+            status.published_movement_waves = authority_stats.committed_waves;
+            status.completed_movement = {
+                .transactions = authority_stats.committed_waves,
+                .commands = authority_stats.committed_migrations,
+                .physical_bytes = config_.transport
+                                      ? config_.transport
+                                            ->completedPlacementPayloadBytes()
+                                      : 0u,
+                .promotions = authority_stats.promotions,
+                .demotions = authority_stats.demotions,
+                .same_priority_moves = authority_stats.same_priority_moves,
+            };
+        }
+
+        /* Only the coordinator (or a process-local authority) reconciles
+         * demand. Distributed followers own a passive preposted mailbox and
+         * therefore retain the normalized zero/zero generation pair. Load the
+         * reconciled edge first so a concurrent producer can only make the
+         * resulting snapshot conservatively non-quiescent. */
+        const bool owns_demand_reconciliation =
+            !config_.proposal_publisher ||
+            config_.proposal_publisher->isCoordinator();
+        if (owns_demand_reconciliation)
+        {
+            status.reconciled_progress_generation =
+                reconciled_progress_generation_.load(
+                    std::memory_order_acquire);
+            status.published_progress_generation =
+                notifications_.load(std::memory_order_acquire);
+            /* The acquire above makes routed-row writes preceding the matching
+             * inference notification visible before we snapshot the active RCU
+             * bank. Distributed followers do not own this admission fact. */
+            status.demand_window =
+                config_.authority->optimizationDemandWindow();
+        }
+
+        if (!healthy())
+        {
+            status.state = MoEOptimizationLifecycleState::Failed;
+            status.activity = MoEOptimizationActivityState::Failed;
+            status.diagnostic = failureMessage().empty()
+                                    ? "ExpertOverlay host maintenance failed"
+                                    : failureMessage();
+            return status;
+        }
+        if (!config_.authority ||
+            config_.authority->maintenanceMode() !=
+                MoERebalanceRuntimeMode::Dynamic)
+        {
+            return status;
+        }
+
+        /*
+         * The residency authority owns the installed certificate. Observe it
+         * before the helper controller so the brief release-publication edge
+         * between installation and controller completion cannot make policy
+         * appear less ready than it really is.
+         */
+        if (config_.authority->hasEconomyCertification())
+        {
+            status.state = MoEOptimizationLifecycleState::Active;
+            status.activity = moeOptimizationActivityState(state());
+            return status;
+        }
+        if (!config_.economy_certification)
+        {
+            status.state = MoEOptimizationLifecycleState::Failed;
+            status.activity = MoEOptimizationActivityState::Failed;
+            status.diagnostic =
+                "Dynamic ExpertOverlay host authority has no economy certification owner";
+            return status;
+        }
+
+        switch (config_.economy_certification->state())
+        {
+        case MoEOverlayEconomyCertificationState::Failed:
+        case MoEOverlayEconomyCertificationState::Stopped:
+            status.state = MoEOptimizationLifecycleState::Failed;
+            status.activity = MoEOptimizationActivityState::Failed;
+            status.diagnostic =
+                config_.economy_certification->failureMessage();
+            if (status.diagnostic.empty())
+            {
+                status.diagnostic =
+                    "Dynamic ExpertOverlay economy certification stopped before activation";
+            }
+            break;
+        case MoEOverlayEconomyCertificationState::Complete:
+            status.state = MoEOptimizationLifecycleState::Failed;
+            status.diagnostic =
+                "Completed ExpertOverlay economy certification was not installed in its host authority";
+            break;
+        case MoEOverlayEconomyCertificationState::CalibratingMovement:
+        case MoEOverlayEconomyCertificationState::AwaitingServiceEvidence:
+        case MoEOverlayEconomyCertificationState::ExchangingServiceReadiness:
+        case MoEOverlayEconomyCertificationState::ExchangingServiceEvidence:
+        case MoEOverlayEconomyCertificationState::RebasingRoutingEvidence:
+            status.state = MoEOptimizationLifecycleState::LearningEconomy;
+            status.activity = MoEOptimizationActivityState::LearningEconomy;
+            break;
+        }
+        return status;
+    }
+
+    void MoEOverlayResidencyMaintenanceService::
+        publishReconciledWaitingState(
+            std::uint64_t observed_progress_generation) noexcept
+    {
+        /* The generation is published before Waiting. A status reader that
+         * observes Waiting therefore also observes this reconciliation. Any
+         * producer racing either store increments `notifications_`, making the
+         * two public generations unequal until the next authoritative poll. */
+        reconciled_progress_generation_.store(
+            observed_progress_generation,
+            std::memory_order_release);
+        state_.store(
+            MoEOverlayMaintenanceState::Waiting,
+            std::memory_order_release);
+    }
+
     void MoEOverlayResidencyMaintenanceService::run(
         std::stop_token stop_token) noexcept
     {
         worker_starts_.fetch_add(1, std::memory_order_relaxed);
         recordPerfCounter("maintenance_worker_starts");
+        /* Enter through reconciliation. `Waiting` is reserved for a poll that
+         * actually observed no complete histogram window; publishing it here
+         * would expose a false between-wave boundary before the first poll. */
         state_.store(
-            MoEOverlayMaintenanceState::Waiting,
+            MoEOverlayMaintenanceState::ReconcilingDemand,
             std::memory_order_release);
 
         while (true)
@@ -296,10 +489,11 @@ namespace llaminar2
                  * coordinator must finish that exact generation before the
                  * runner releases remote worker loops.
                  */
-                if (!config_.histogram_publisher)
+                if (!config_.proposal_publisher)
                 {
                     retained_transaction_ = {};
-                    has_retained_transaction_ = false;
+                    retained_transaction_state_ =
+                        MoEOverlayRetainedTransactionState::Empty;
                 }
                 if (config_.economy_certification)
                     config_.economy_certification->requestStop();
@@ -324,12 +518,12 @@ namespace llaminar2
             }
 
             const bool distributed_coordinator_drained =
-                !config_.histogram_publisher ||
-                !config_.histogram_publisher->isCoordinator() ||
-                (!histogram_exchange_active_ &&
-                 !publishing_histogram_window_);
-            if (stopping && !active_wave_ &&
-                !has_retained_transaction_ &&
+                !config_.proposal_publisher ||
+                !config_.proposal_publisher->isCoordinator() ||
+                (!proposal_exchange_active_ && !publishing_proposal_);
+            if (stopping &&
+                retained_transaction_state_ ==
+                    MoEOverlayRetainedTransactionState::Empty &&
                 distributed_coordinator_drained &&
                 !config_.authority->hasActiveBackgroundWave() &&
                 config_.authority->pendingAbortCount() == 0 &&
@@ -467,7 +661,23 @@ namespace llaminar2
             }
         }
 
-        if (active_wave_)
+        if (config_.authority->hasEconomyCertification() &&
+            !config_.authority->optimizationDemandActive())
+        {
+            /*
+             * Installation may occur during an admitted request, but movement
+             * demand begins only at the next public prefill boundary. Keep the
+             * worker passive while CPU and device histogram writers remain in
+             * their shared quarantine; no proposal may consume that bank.
+             */
+            state_.store(
+                MoEOverlayMaintenanceState::AwaitingDemandActivation,
+                std::memory_order_release);
+            return;
+        }
+
+        if (retained_transaction_state_ ==
+            MoEOverlayRetainedTransactionState::Active)
         {
             handleActiveWaveResult(config_.authority->advanceBackground());
             return;
@@ -490,7 +700,8 @@ namespace llaminar2
             return;
         }
 
-        if (has_retained_transaction_)
+        if (retained_transaction_state_ ==
+            MoEOverlayRetainedTransactionState::ReadyToStage)
         {
             tryBeginRetainedTransaction();
             return;
@@ -504,16 +715,16 @@ namespace llaminar2
              * drained hold at most a passive preposted receive, which their
              * publisher cancels during runner teardown.
              */
-            if (config_.histogram_publisher &&
-                config_.histogram_publisher->isCoordinator() &&
-                histogram_exchange_active_)
+            if (config_.proposal_publisher &&
+                config_.proposal_publisher->isCoordinator() &&
+                proposal_exchange_active_)
             {
                 progressDistributedProposal();
             }
             return;
         }
 
-        if (config_.histogram_publisher)
+        if (config_.proposal_publisher)
         {
             progressDistributedProposal();
             return;
@@ -523,14 +734,15 @@ namespace llaminar2
         std::shared_ptr<const DecodeExpertHistogramWindow> local_window;
         if (dynamic)
         {
+            const std::uint64_t observed_progress_generation =
+                notifications_.load(std::memory_order_acquire);
             const auto window_result =
                 config_.authority->progressHistogramWindow();
             if (window_result.progress ==
                 MoEOverlayHistogramWindowProgress::Waiting)
             {
-                state_.store(
-                    MoEOverlayMaintenanceState::Waiting,
-                    std::memory_order_release);
+                publishReconciledWaitingState(
+                    observed_progress_generation);
                 return;
             }
             if (window_result.progress ==
@@ -558,12 +770,16 @@ namespace llaminar2
             return;
         }
 
+        state_.store(
+            MoEOverlayMaintenanceState::PlanningProposal,
+            std::memory_order_release);
         retained_transaction_ = dynamic
                                     ? config_.authority
                                           ->proposeFromFrozenHistogramWindow(
                                               std::move(local_window))
                                     : config_.authority->proposeFromHistogram();
-        has_retained_transaction_ = true;
+        retained_transaction_state_ =
+            MoEOverlayRetainedTransactionState::ReadyToStage;
         proposals_.fetch_add(1, std::memory_order_relaxed);
         recordPerfCounter("maintenance_proposals");
 
@@ -571,7 +787,8 @@ namespace llaminar2
         if (shutdown_requested_.load(std::memory_order_acquire))
         {
             retained_transaction_ = {};
-            has_retained_transaction_ = false;
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::Empty;
             return;
         }
         tryBeginRetainedTransaction();
@@ -579,17 +796,18 @@ namespace llaminar2
 
     void MoEOverlayResidencyMaintenanceService::progressDistributedProposal()
     {
-        auto &publisher = *config_.histogram_publisher;
-        if (publisher.isCoordinator() && !histogram_exchange_active_)
+        auto &publisher = *config_.proposal_publisher;
+        if (publisher.isCoordinator() && !proposal_exchange_active_)
         {
+            const std::uint64_t observed_progress_generation =
+                notifications_.load(std::memory_order_acquire);
             const auto window_result =
                 config_.authority->progressHistogramWindow();
             if (window_result.progress ==
                 MoEOverlayHistogramWindowProgress::Waiting)
             {
-                state_.store(
-                    MoEOverlayMaintenanceState::Waiting,
-                    std::memory_order_release);
+                publishReconciledWaitingState(
+                    observed_progress_generation);
                 return;
             }
             if (window_result.progress ==
@@ -602,48 +820,91 @@ namespace llaminar2
                 return;
             }
 
-            publishing_histogram_window_ = window_result.window;
-            if (!publishing_histogram_window_ ||
-                !publishing_histogram_window_->valid())
+            if (!window_result.window || !window_result.window->valid())
             {
                 fail(
                     "ExpertOverlay coordinator froze an invalid histogram window");
                 return;
             }
+
+            /*
+             * The continuation root is the sole distributed policy authority.
+             * It performs smoothing, placement, skew, wave bounding, and
+             * economy once, then publishes the selected executable candidate.
+             * Peers never repeat this decision from rank-local measurements.
+             */
+            state_.store(
+                MoEOverlayMaintenanceState::PlanningProposal,
+                std::memory_order_release);
+            auto transaction =
+                config_.authority->proposeFromFrozenHistogramWindow(
+                    std::move(window_result.window));
+            auto proposal =
+                std::make_shared<MoEOverlayDistributedResidencyProposal>(
+                    makeMoEOverlayDistributedResidencyProposal(
+                        config_.authority
+                            ->exportAuthoritativeResidencyPlan(transaction),
+                        transaction));
             std::string error;
-            if (!publisher.beginPublish(
-                    *publishing_histogram_window_, &error))
+            if (!publisher.beginPublish(*proposal, &error))
             {
                 fail(
                     error.empty()
-                        ? "ExpertOverlay coordinator failed to begin histogram publication"
+                        ? "ExpertOverlay coordinator failed to begin proposal publication"
                         : std::move(error));
                 return;
             }
-            histogram_exchange_active_ = true;
+
+            retained_transaction_ = std::move(transaction);
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::PublishingProposal;
+            publishing_proposal_ = std::move(proposal);
+            proposals_.fetch_add(1, std::memory_order_relaxed);
+            proposal_exchange_active_ = true;
             state_.store(
-                MoEOverlayMaintenanceState::PublishingEvidence,
+                MoEOverlayMaintenanceState::PublishingProposal,
                 std::memory_order_release);
-            recordPerfCounter("maintenance_histogram_publications_started");
+            recordPerfCounter("maintenance_distributed_proposals");
+            recordPerfCounter("maintenance_proposal_publications_started");
+            LOG_INFO(
+                "[ExpertOverlay][Residency] Authored distributed proposal"
+                << " device=" << config_.perf_device
+                << " histogram_generation="
+                << retained_transaction_.histogram_generation
+                << " expected_epoch="
+                << retained_transaction_.expected_epoch
+                << " migrations="
+                << retained_transaction_.migrations.size()
+                << " cycles="
+                << retained_transaction_.migration_cycles.size()
+                << " service_profile="
+                << (retained_transaction_.economy.enabled
+                        ? retained_transaction_.economy
+                              .service_profile_identity
+                        : std::string{"disabled"})
+                << " projected_net_benefit_ns="
+                << retained_transaction_.economy
+                       .projected_net_benefit_ns);
             return;
         }
 
-        if (!histogram_exchange_active_)
+        if (!proposal_exchange_active_)
         {
             fail(
-                "ExpertOverlay peer has no armed authoritative histogram receive");
+                "ExpertOverlay peer has no armed authoritative proposal receive");
             return;
         }
 
-        std::shared_ptr<const DecodeExpertHistogramWindow> received_window;
+        std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+            received_proposal;
         std::string error;
-        const auto progress = publisher.poll(&received_window, &error);
+        const auto progress = publisher.poll(&received_proposal, &error);
         if (progress == MoEOverlayResidencyWaveProgress::Pending)
         {
             state_.store(
                 publisher.isCoordinator()
-                    ? MoEOverlayMaintenanceState::PublishingEvidence
-                    : MoEOverlayMaintenanceState::ReceivingEvidence,
+                    ? MoEOverlayMaintenanceState::PublishingProposal
+                    : MoEOverlayMaintenanceState::ReceivingProposal,
                 std::memory_order_release);
             return;
         }
@@ -651,76 +912,149 @@ namespace llaminar2
         {
             fail(
                 error.empty()
-                    ? "ExpertOverlay authoritative histogram publication failed"
+                    ? "ExpertOverlay authoritative proposal publication failed"
                     : std::move(error));
             return;
         }
 
         if (publisher.isCoordinator())
         {
-            histogram_exchange_active_ = false;
-            histogram_windows_published_.fetch_add(
+            proposal_exchange_active_ = false;
+            proposals_published_.fetch_add(
                 1,
                 std::memory_order_relaxed);
-            recordPerfCounter("maintenance_histogram_windows_published");
-            auto window = std::move(publishing_histogram_window_);
-            if (!window || received_window)
+            recordPerfCounter("maintenance_proposals_published");
+            auto proposal = std::move(publishing_proposal_);
+            if (!proposal || received_proposal ||
+                retained_transaction_state_ !=
+                    MoEOverlayRetainedTransactionState::
+                        PublishingProposal)
             {
                 fail(
-                    "ExpertOverlay coordinator publication returned invalid window ownership");
+                    "ExpertOverlay coordinator publication returned invalid proposal ownership");
                 return;
             }
-            retainDistributedProposal(std::move(window));
+
+            /*
+             * Peer acknowledgement is the irrevocability edge. Every rank now
+             * owns the same authenticated plan, so this exact retained root
+             * transaction must reach a terminal distributed result.
+             */
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::ReadyToStage;
+            tryBeginRetainedTransaction();
             return;
         }
 
-        if (!received_window || !received_window->valid())
+        if (received_proposal)
         {
-            fail(
-                "ExpertOverlay peer received no valid authoritative histogram window");
+            retainDistributedProposal(std::move(received_proposal));
             return;
         }
 
         /*
-         * Decoding copied the packet into immutable transaction-owned storage,
-         * so the fixed MPI wire buffer can immediately receive generation N+1.
-         * This keeps the coordinator independent of peer maintenance latency.
+         * The second Ready edge is the completion of an acknowledgement that
+         * could only be posted after semantic adoption and fingerprint proof.
+         * Rearm the fixed receive before staging so generation N+1 has a mailbox,
+         * but do not let bytes alone make the transaction executable.
          */
+        if (retained_transaction_state_ !=
+            MoEOverlayRetainedTransactionState::PublishingProposal)
+        {
+            fail(
+                "ExpertOverlay peer proposal acknowledgement completed without an adopted transaction");
+            return;
+        }
         if (!publisher.armReceive(&error))
         {
             fail(
                 error.empty()
-                    ? "ExpertOverlay peer failed to arm its next histogram receive"
+                    ? "ExpertOverlay peer failed to arm its next proposal receive"
                     : std::move(error));
             return;
         }
-        histogram_exchange_active_ = true;
-        histogram_windows_received_.fetch_add(1, std::memory_order_relaxed);
-        histogram_receives_rearmed_.fetch_add(1, std::memory_order_relaxed);
-        recordPerfCounter("maintenance_histogram_windows_received");
-        recordPerfCounter("maintenance_histogram_receives_rearmed");
-        retainDistributedProposal(std::move(received_window));
+        proposal_exchange_active_ = true;
+        proposal_receives_rearmed_.fetch_add(1, std::memory_order_relaxed);
+        recordPerfCounter("maintenance_proposal_receives_rearmed");
+        retained_transaction_state_ =
+            MoEOverlayRetainedTransactionState::ReadyToStage;
+        tryBeginRetainedTransaction();
     }
 
     void MoEOverlayResidencyMaintenanceService::retainDistributedProposal(
-        std::shared_ptr<const DecodeExpertHistogramWindow> window)
+        std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+            proposal)
     {
-        if (!window || !window->valid() || has_retained_transaction_ ||
-            active_wave_)
+        const std::uint64_t generation =
+            proposal && proposal->plan.histogram_window
+                ? proposal->plan.histogram_window->generation
+                : 0u;
+        const auto reject = [&](std::string diagnostic)
         {
-            fail(
-                "ExpertOverlay maintenance cannot retain the published histogram in its current state");
+            retained_transaction_ = {};
+            config_.proposal_publisher->rejectReceivedProposal(
+                generation, diagnostic);
+            /* Device-free adversarial publishers return so unit tests can
+             * observe the exact failure. Production MPI rejection is fatal. */
+            fail(std::move(diagnostic));
+        };
+
+        if (!proposal || !proposal->valid() ||
+            retained_transaction_state_ !=
+                MoEOverlayRetainedTransactionState::Empty)
+        {
+            reject(
+                "ExpertOverlay maintenance cannot retain the published proposal in its current state");
             return;
         }
 
-        retained_transaction_ =
-            config_.authority->proposeFromFrozenHistogramWindow(
-                std::move(window));
-        has_retained_transaction_ = true;
+        try
+        {
+            retained_transaction_ =
+                config_.authority->adoptAuthoritativeResidencyPlan(
+                    proposal->plan);
+        }
+        catch (const std::exception &error)
+        {
+            reject(std::string{
+                       "ExpertOverlay peer rejected authoritative plan: "} +
+                   error.what());
+            return;
+        }
+        catch (...)
+        {
+            reject(
+                "ExpertOverlay peer rejected authoritative plan with a non-standard exception");
+            return;
+        }
+        const auto reconstructed_fingerprint =
+            fingerprintMoEOverlayResidencyExecutionPlan(
+                retained_transaction_);
+        if (reconstructed_fingerprint !=
+            proposal->execution_fingerprint)
+        {
+            reject(
+                "ExpertOverlay peer topology reconstructed a different execution plan from the root proposal");
+            return;
+        }
+        std::string acknowledgement_error;
+        if (!config_.proposal_publisher->acceptReceivedProposal(
+                generation, &acknowledgement_error))
+        {
+            reject(
+                acknowledgement_error.empty()
+                    ? "ExpertOverlay peer failed to acknowledge its adopted authoritative plan"
+                    : std::move(acknowledgement_error));
+            return;
+        }
+        retained_transaction_state_ =
+            MoEOverlayRetainedTransactionState::PublishingProposal;
         proposals_.fetch_add(1, std::memory_order_relaxed);
+        proposals_received_.fetch_add(1, std::memory_order_relaxed);
         recordPerfCounter("maintenance_distributed_proposals");
+        recordPerfCounter("maintenance_proposals_received");
         LOG_INFO(
-            "[ExpertOverlay][Residency] Derived distributed proposal"
+            "[ExpertOverlay][Residency] Adopted distributed proposal"
             << " device=" << config_.perf_device
             << " histogram_generation="
             << retained_transaction_.histogram_generation
@@ -730,27 +1064,20 @@ namespace llaminar2
             << retained_transaction_.migrations.size()
             << " cycles="
             << retained_transaction_.migration_cycles.size()
-            << " service_profile="
-            << (retained_transaction_.economy.enabled
-                    ? retained_transaction_.economy
-                          .service_profile_identity
-                    : std::string{"disabled"})
-            << " projected_net_benefit_ns="
-            << retained_transaction_.economy
-                   .projected_net_benefit_ns);
+            << " root_policy_fingerprint_low="
+            << proposal->policy_fingerprint.low
+            << " root_policy_fingerprint_high="
+            << proposal->policy_fingerprint.high);
 
-        /*
-         * Histogram acknowledgement is the distributed irrevocability edge.
-         * Even if shutdown raced this local callback, every rank must now
-         * derive and finish the same transaction before resources are freed.
-         */
-        tryBeginRetainedTransaction();
+        /* The transaction remains non-executable until the async semantic
+         * acknowledgement itself reaches its terminal Ready edge. */
     }
 
     void MoEOverlayResidencyMaintenanceService::
         tryBeginRetainedTransaction()
     {
-        if (!has_retained_transaction_)
+        if (retained_transaction_state_ !=
+            MoEOverlayRetainedTransactionState::ReadyToStage)
         {
             fail(
                 "ExpertOverlay maintenance attempted to stage a missing transaction");
@@ -764,7 +1091,8 @@ namespace llaminar2
         switch (result.status)
         {
         case MoEOverlayResidencyApplyStatus::Started:
-            active_wave_ = true;
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::Active;
             waves_started_.fetch_add(1, std::memory_order_relaxed);
             recordPerfCounter("maintenance_waves_started");
             state_.store(
@@ -790,9 +1118,12 @@ namespace llaminar2
             dynamic_no_movement_.fetch_add(1, std::memory_order_relaxed);
             recordPerfCounter("maintenance_dynamic_no_movement");
             retained_transaction_ = {};
-            has_retained_transaction_ = false;
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::Empty;
+            /* A second completed window may already be queued. Reconcile it
+             * on the next poll before advertising an idle demand boundary. */
             state_.store(
-                MoEOverlayMaintenanceState::Waiting,
+                MoEOverlayMaintenanceState::ReconcilingDemand,
                 std::memory_order_release);
             return;
 
@@ -807,7 +1138,8 @@ namespace llaminar2
             static_no_movement_.fetch_add(1, std::memory_order_relaxed);
             recordPerfCounter("maintenance_static_no_movement");
             retained_transaction_ = {};
-            has_retained_transaction_ = false;
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::Empty;
             state_.store(
                 MoEOverlayMaintenanceState::Waiting,
                 std::memory_order_release);
@@ -843,17 +1175,20 @@ namespace llaminar2
                 std::memory_order_release);
             return;
         case MoEOverlayResidencyApplyStatus::Published:
-            active_wave_ = false;
             retained_transaction_ = {};
-            has_retained_transaction_ = false;
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::Empty;
             committed_waves_.fetch_add(1, std::memory_order_relaxed);
             recordPerfCounter("maintenance_waves_committed");
+            /* Publication completes one wave, not the decision that no later
+             * frozen window exists. The following poll owns that observation. */
             state_.store(
-                MoEOverlayMaintenanceState::Waiting,
+                MoEOverlayMaintenanceState::ReconcilingDemand,
                 std::memory_order_release);
             return;
         case MoEOverlayResidencyApplyStatus::Deferred:
-            active_wave_ = false;
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::ReadyToStage;
             deferred_attempts_.fetch_add(1, std::memory_order_relaxed);
             recordPerfCounter("maintenance_deferred_attempts");
             state_.store(
@@ -861,7 +1196,8 @@ namespace llaminar2
                 std::memory_order_release);
             return;
         default:
-            active_wave_ = false;
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::Empty;
             fail(
                 result.error.empty()
                     ? "ExpertOverlay active migration returned an invalid state"
@@ -894,10 +1230,12 @@ namespace llaminar2
          * second submission. An active wave remains owned by the authority and
          * is still polled through its asynchronous abort/retirement edges.
          */
-        if (!active_wave_)
+        if (retained_transaction_state_ !=
+            MoEOverlayRetainedTransactionState::Active)
         {
             retained_transaction_ = {};
-            has_retained_transaction_ = false;
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::Empty;
         }
         {
             std::lock_guard<std::mutex> lock(failure_mutex_);

@@ -61,8 +61,9 @@ namespace llaminar2
             }
 
             /** @brief Return non-zero lanes even for an extremely rare zero digest. */
-            [[nodiscard]] MoEOverlayResidencyTransactionFingerprint finish()
-                const noexcept
+            template <typename Fingerprint =
+                          MoEOverlayResidencyTransactionFingerprint>
+            [[nodiscard]] Fingerprint finish() const noexcept
             {
                 return {
                     .low = low_ == 0 ? 0x9e3779b97f4a7c15ull : low_,
@@ -305,105 +306,189 @@ namespace llaminar2
         }
     } // namespace
 
+    namespace
+    {
+        /** @brief Hash common execution state and optional root policy evidence. */
+        template <typename Fingerprint>
+        Fingerprint fingerprintTransaction(
+            const MoEOverlayResidencyTransaction &transaction,
+            bool include_economy)
+        {
+            if (!transaction.valid())
+            {
+                throw std::invalid_argument(
+                    "Cannot fingerprint an invalid ExpertOverlay residency transaction");
+            }
+
+            StableDigestBuilder digest;
+            digest.addString(
+                include_economy
+                    ? "MoEOverlayResidencyTransaction/v4"
+                    : "MoEOverlayResidencyExecutionPlan/v1");
+            digest.addScalar(transaction.purpose);
+            digest.addScalar(transaction.calibration_sequence);
+            digest.addScalar(transaction.expected_epoch);
+            digest.addScalar(transaction.histogram_generation);
+            addSnapshot(digest, *transaction.previous);
+            addSnapshot(digest, *transaction.candidate);
+
+            digest.addScalar(transaction.histogram_window != nullptr);
+            if (transaction.histogram_window)
+            {
+                const auto &window = *transaction.histogram_window;
+                digest.addScalar(window.generation);
+                digest.addScalar(window.token_count);
+                for (const std::uint64_t count : window.source_token_counts)
+                    digest.addScalar(count);
+                digest.addScalar(window.num_layers);
+                digest.addScalar(window.num_experts);
+                digest.addScalar(static_cast<std::uint64_t>(
+                    window.expert_counts.size()));
+                for (const std::uint64_t count : window.expert_counts)
+                    digest.addScalar(count);
+                digest.addScalar(static_cast<std::uint64_t>(
+                    window.source_expert_counts.size()));
+                for (const std::uint64_t count :
+                     window.source_expert_counts)
+                {
+                    digest.addScalar(count);
+                }
+            }
+
+            digest.addScalar(
+                static_cast<std::uint64_t>(transaction.migrations.size()));
+            for (const auto &migration : transaction.migrations)
+            {
+                digest.addScalar(migration.layer_idx);
+                digest.addScalar(migration.expert_id);
+                digest.addScalar(migration.activation_count);
+                digest.addScalar(static_cast<std::uint64_t>(
+                    migration.estimated_weight_bytes));
+                digest.addScalar(migration.direction);
+                digest.addScalar(migration.axis);
+                addOwner(digest, migration.source);
+                addOwner(digest, migration.destination);
+            }
+
+            digest.addScalar(static_cast<std::uint64_t>(
+                transaction.migration_cycles.size()));
+            for (const auto &cycle : transaction.migration_cycles)
+            {
+                digest.addScalar(cycle.layer_idx);
+                digest.addScalar(static_cast<std::uint64_t>(
+                    cycle.migration_indices.size()));
+                for (const std::size_t migration_idx :
+                     cycle.migration_indices)
+                {
+                    digest.addScalar(
+                        static_cast<std::uint64_t>(migration_idx));
+                }
+            }
+
+            digest.addScalar(static_cast<std::uint64_t>(
+                transaction.shadow_requirements.size()));
+            for (const auto &requirement :
+                 transaction.shadow_requirements)
+            {
+                digest.addScalar(requirement.layer_idx);
+                digest.addScalar(requirement.tier_idx);
+                digest.addScalar(requirement.destination_participant);
+                digest.addScalar(
+                    static_cast<std::uint64_t>(requirement.slot_count));
+            }
+
+            if (include_economy)
+            {
+                digest.addScalar(transaction.host_admission.has_value());
+                if (transaction.host_admission)
+                {
+                    const auto &admission = *transaction.host_admission;
+                    digest.addScalar(admission.authority);
+                    digest.addScalar(admission.transaction);
+                    digest.addScalar(admission.candidate_epoch);
+                    digest.addScalar(admission.cycle_capacity_kind);
+                    digest.addScalar(admission.maximum_concurrent_cycles);
+                    digest.addScalar(admission.candidate_cycles);
+                    digest.addScalar(admission.policy_eligible_cycles);
+                    digest.addScalar(admission.policy_eligible_axes.tier_residency);
+                    digest.addScalar(
+                        admission.policy_eligible_axes.participant_placement);
+                    digest.addScalar(admission.policy_eligible_axes.combined);
+                    digest.addScalar(admission.admitted_candidate_cycles);
+                    digest.addScalar(
+                        admission.admitted_candidate_axes.tier_residency);
+                    digest.addScalar(
+                        admission.admitted_candidate_axes
+                            .participant_placement);
+                    digest.addScalar(
+                        admission.admitted_candidate_axes.combined);
+                    digest.addScalar(admission.admitted_physical_cycles);
+                    digest.addScalar(
+                        admission.admitted_physical_axes.tier_residency);
+                    digest.addScalar(
+                        admission.admitted_physical_axes
+                            .participant_placement);
+                    digest.addScalar(
+                        admission.admitted_physical_axes.combined);
+                    digest.addScalar(
+                        admission.individual_policy_rejected_cycles);
+                    digest.addScalar(
+                        admission.dependent_payoff_rejected_cycles);
+                    digest.addScalar(admission.capacity_rejected_cycles);
+                    digest.addScalar(
+                        admission.participant_axis_budget_rejected_cycles);
+                    digest.addScalar(admission.physical_cycle_recomposition);
+                    digest.addScalar(admission.capacity_bounded);
+                    digest.addScalar(admission.policy_bounded);
+                }
+                digest.addScalar(transaction.economy.enabled);
+                digest.addString(
+                    transaction.economy.service_profile_identity);
+                digest.addString(
+                    transaction.economy.migration_profile_identity);
+                digest.addScalar(
+                    transaction.economy.smoothed_through_generation);
+                digest.addScalar(
+                    transaction.economy.historical_window_weight);
+                digest.addScalar(
+                    transaction.economy.current_window_weight);
+                digest.addScalar(
+                    transaction.economy.payoff_horizon_tokens);
+                digest.addScalar(
+                    transaction.economy.minimum_net_benefit_ns);
+                digest.addScalar(
+                    transaction.economy.minimum_residency_generations);
+                digest.addScalar(
+                    transaction.economy.projected_service_gain_ns);
+                digest.addScalar(
+                    transaction.economy.projected_transfer_and_repack_ns);
+                digest.addScalar(
+                    transaction.economy.projected_inference_interference_ns);
+                digest.addScalar(
+                    transaction.economy.projected_net_benefit_ns);
+                digest.addScalar(
+                    transaction.economy.payoff_rejected_cycles);
+                digest.addScalar(
+                    transaction.economy.residency_rejected_cycles);
+            }
+            return digest.finish<Fingerprint>();
+        }
+    } // namespace
+
     MoEOverlayResidencyTransactionFingerprint
     fingerprintMoEOverlayResidencyTransaction(
         const MoEOverlayResidencyTransaction &transaction)
     {
-        if (!transaction.valid())
-        {
-            throw std::invalid_argument(
-                "Cannot fingerprint an invalid ExpertOverlay residency transaction");
-        }
+        return fingerprintTransaction<
+            MoEOverlayResidencyTransactionFingerprint>(transaction, true);
+    }
 
-        StableDigestBuilder digest;
-        digest.addString("MoEOverlayResidencyTransaction/v3");
-        digest.addScalar(transaction.purpose);
-        digest.addScalar(transaction.calibration_sequence);
-        digest.addScalar(transaction.expected_epoch);
-        digest.addScalar(transaction.histogram_generation);
-        addSnapshot(digest, *transaction.previous);
-        addSnapshot(digest, *transaction.candidate);
-
-        digest.addScalar(transaction.histogram_window != nullptr);
-        if (transaction.histogram_window)
-        {
-            const auto &window = *transaction.histogram_window;
-            digest.addScalar(window.generation);
-            digest.addScalar(window.token_count);
-            for (const std::uint64_t count : window.source_token_counts)
-                digest.addScalar(count);
-            digest.addScalar(window.num_layers);
-            digest.addScalar(window.num_experts);
-            digest.addScalar(
-                static_cast<std::uint64_t>(window.expert_counts.size()));
-            for (const std::uint64_t count : window.expert_counts)
-                digest.addScalar(count);
-            digest.addScalar(static_cast<std::uint64_t>(
-                window.source_expert_counts.size()));
-            for (const std::uint64_t count : window.source_expert_counts)
-                digest.addScalar(count);
-        }
-
-        digest.addScalar(
-            static_cast<std::uint64_t>(transaction.migrations.size()));
-        for (const auto &migration : transaction.migrations)
-        {
-            digest.addScalar(migration.layer_idx);
-            digest.addScalar(migration.expert_id);
-            digest.addScalar(migration.activation_count);
-            digest.addScalar(static_cast<std::uint64_t>(
-                migration.estimated_weight_bytes));
-            digest.addScalar(migration.direction);
-            addOwner(digest, migration.source);
-            addOwner(digest, migration.destination);
-        }
-
-        digest.addScalar(static_cast<std::uint64_t>(
-            transaction.migration_cycles.size()));
-        for (const auto &cycle : transaction.migration_cycles)
-        {
-            digest.addScalar(cycle.layer_idx);
-            digest.addScalar(static_cast<std::uint64_t>(
-                cycle.migration_indices.size()));
-            for (const std::size_t migration_idx : cycle.migration_indices)
-            {
-                digest.addScalar(
-                    static_cast<std::uint64_t>(migration_idx));
-            }
-        }
-
-        digest.addScalar(static_cast<std::uint64_t>(
-            transaction.shadow_requirements.size()));
-        for (const auto &requirement : transaction.shadow_requirements)
-        {
-            digest.addScalar(requirement.layer_idx);
-            digest.addScalar(requirement.tier_idx);
-            digest.addScalar(requirement.destination_participant);
-            digest.addScalar(
-                static_cast<std::uint64_t>(requirement.slot_count));
-        }
-
-        digest.addScalar(transaction.economy.enabled);
-        digest.addString(transaction.economy.service_profile_identity);
-        digest.addString(transaction.economy.migration_profile_identity);
-        digest.addScalar(
-            transaction.economy.smoothed_through_generation);
-        digest.addScalar(
-            transaction.economy.historical_window_weight);
-        digest.addScalar(transaction.economy.current_window_weight);
-        digest.addScalar(transaction.economy.payoff_horizon_tokens);
-        digest.addScalar(transaction.economy.minimum_net_benefit_ns);
-        digest.addScalar(
-            transaction.economy.minimum_residency_generations);
-        digest.addScalar(transaction.economy.projected_service_gain_ns);
-        digest.addScalar(
-            transaction.economy.projected_transfer_and_repack_ns);
-        digest.addScalar(
-            transaction.economy.projected_inference_interference_ns);
-        digest.addScalar(transaction.economy.projected_net_benefit_ns);
-        digest.addScalar(transaction.economy.payoff_rejected_cycles);
-        digest.addScalar(transaction.economy.residency_rejected_cycles);
-        return digest.finish();
+    MoEOverlayResidencyExecutionFingerprint
+    fingerprintMoEOverlayResidencyExecutionPlan(
+        const MoEOverlayResidencyTransaction &transaction)
+    {
+        return fingerprintTransaction<
+            MoEOverlayResidencyExecutionFingerprint>(transaction, false);
     }
 
     bool MoEOverlayDistributedHistogramHeader::valid() const noexcept
@@ -663,6 +748,421 @@ namespace llaminar2
         return true;
     }
 
+    namespace
+    {
+        constexpr std::size_t kAuthoritativeEntryWireBytes =
+            sizeof(std::int32_t) + sizeof(std::int32_t) +
+            sizeof(std::uint32_t) + sizeof(std::uint64_t) +
+            sizeof(std::uint64_t);
+
+        /** @brief Hash one canonical dense proposal independently of its packet. */
+        std::uint64_t fingerprintAuthoritativeResidencyPlan(
+            const MoEOverlayAuthoritativeResidencyPlan &plan)
+        {
+            if (!plan.valid())
+            {
+                throw std::invalid_argument(
+                    "Cannot fingerprint an invalid authoritative ExpertOverlay plan");
+            }
+            StableDigestBuilder digest;
+            digest.addString("MoEOverlayAuthoritativeResidencyPlan/v1");
+            digest.addScalar(plan.expected_epoch);
+            digest.addScalar(plan.num_layers);
+            digest.addScalar(plan.num_experts);
+            digest.addScalar(
+                fingerprintDecodeExpertHistogramWindow(
+                    *plan.histogram_window));
+            digest.addScalar(
+                static_cast<std::uint64_t>(plan.entries.size()));
+            for (const auto &entry : plan.entries)
+            {
+                digest.addScalar(entry.candidate_tier_idx);
+                digest.addScalar(entry.candidate_owner_participant);
+                digest.addScalar(entry.changed);
+                digest.addScalar(entry.axis);
+                digest.addScalar(entry.activation_count);
+                digest.addScalar(static_cast<std::uint64_t>(
+                    entry.estimated_weight_bytes));
+            }
+            return digest.finish().low;
+        }
+    } // namespace
+
+    bool MoEOverlayDistributedResidencyProposal::valid() const noexcept
+    {
+        return plan.valid() && execution_fingerprint.valid() &&
+               policy_fingerprint.valid();
+    }
+
+    bool MoEOverlayDistributedResidencyProposalHeader::valid() const noexcept
+    {
+        if (magic != kMagic || abi_version != kABIVersion ||
+            expected_epoch == 0 ||
+            expected_epoch == std::numeric_limits<std::uint64_t>::max() ||
+            candidate_epoch != expected_epoch + 1u || num_layers <= 0 ||
+            num_experts <= 0 || !execution_fingerprint.valid() ||
+            !policy_fingerprint.valid() || plan_fingerprint == 0 ||
+            reserved != 0)
+        {
+            return false;
+        }
+        const auto layers = static_cast<std::uint64_t>(num_layers);
+        const auto experts = static_cast<std::uint64_t>(num_experts);
+        return layers <=
+                   std::numeric_limits<std::uint64_t>::max() / experts &&
+               entry_count == layers * experts &&
+               changed_entry_count <= entry_count;
+    }
+
+    MoEOverlayDistributedResidencyProposal
+    makeMoEOverlayDistributedResidencyProposal(
+        MoEOverlayAuthoritativeResidencyPlan plan,
+        const MoEOverlayResidencyTransaction &transaction)
+    {
+        if (!plan.valid() || !transaction.valid() ||
+            transaction.purpose !=
+                MoEOverlayResidencyTransactionPurpose::PlacementChange ||
+            transaction.expected_epoch != plan.expected_epoch ||
+            !transaction.histogram_window ||
+            fingerprintDecodeExpertHistogramWindow(
+                *transaction.histogram_window) !=
+                fingerprintDecodeExpertHistogramWindow(
+                    *plan.histogram_window))
+        {
+            throw std::invalid_argument(
+                "Authoritative ExpertOverlay plan does not match its root transaction");
+        }
+        const auto changed_entries = static_cast<std::size_t>(std::count_if(
+            plan.entries.begin(),
+            plan.entries.end(),
+            [](const auto &entry) { return entry.changed; }));
+        if (changed_entries != transaction.migrations.size())
+        {
+            throw std::invalid_argument(
+                "Authoritative ExpertOverlay plan has a different movement cardinality from its root transaction");
+        }
+
+        MoEOverlayDistributedResidencyProposal proposal{
+            .plan = std::move(plan),
+            .execution_fingerprint =
+                fingerprintMoEOverlayResidencyExecutionPlan(transaction),
+            .policy_fingerprint =
+                fingerprintMoEOverlayResidencyTransaction(transaction),
+        };
+        if (!proposal.valid())
+        {
+            throw std::logic_error(
+                "Root ExpertOverlay transaction produced an invalid distributed proposal");
+        }
+        return proposal;
+    }
+
+    std::size_t moeOverlayDistributedResidencyProposalWireBytes(
+        int num_layers,
+        int num_experts)
+    {
+        if (num_layers <= 0 || num_experts <= 0)
+        {
+            throw std::invalid_argument(
+                "Distributed ExpertOverlay proposal requires positive geometry");
+        }
+        const auto layers = static_cast<std::size_t>(num_layers);
+        const auto experts = static_cast<std::size_t>(num_experts);
+        if (layers > std::numeric_limits<std::size_t>::max() / experts)
+        {
+            throw std::overflow_error(
+                "Distributed ExpertOverlay proposal geometry overflows size_t");
+        }
+        const std::size_t entries = layers * experts;
+        const std::size_t histogram_bytes =
+            moeOverlayDistributedHistogramWireBytes(
+                num_layers, num_experts);
+        constexpr std::size_t header_bytes =
+            MoEOverlayDistributedResidencyProposalHeader::kWireBytes;
+        if (entries >
+            (std::numeric_limits<std::size_t>::max() - header_bytes -
+             histogram_bytes) /
+                kAuthoritativeEntryWireBytes)
+        {
+            throw std::overflow_error(
+                "Distributed ExpertOverlay proposal packet size overflows size_t");
+        }
+        return header_bytes + histogram_bytes +
+               entries * kAuthoritativeEntryWireBytes;
+    }
+
+    bool encodeMoEOverlayDistributedResidencyProposal(
+        const MoEOverlayDistributedResidencyProposal &proposal,
+        std::span<std::uint8_t> destination,
+        std::string *error)
+    {
+        if (!proposal.valid())
+        {
+            setError(
+                error,
+                "Cannot encode an invalid distributed ExpertOverlay proposal");
+            return false;
+        }
+        const std::size_t required =
+            moeOverlayDistributedResidencyProposalWireBytes(
+                proposal.plan.num_layers,
+                proposal.plan.num_experts);
+        if (destination.size() != required)
+        {
+            setError(
+                error,
+                "ExpertOverlay proposal destination has the wrong fixed packet size");
+            return false;
+        }
+
+        const auto changed_entries = static_cast<std::uint64_t>(std::count_if(
+            proposal.plan.entries.begin(),
+            proposal.plan.entries.end(),
+            [](const auto &entry) { return entry.changed; }));
+        const MoEOverlayDistributedResidencyProposalHeader header{
+            .expected_epoch = proposal.plan.expected_epoch,
+            .candidate_epoch = proposal.plan.expected_epoch + 1u,
+            .num_layers = proposal.plan.num_layers,
+            .num_experts = proposal.plan.num_experts,
+            .entry_count = static_cast<std::uint64_t>(
+                proposal.plan.entries.size()),
+            .changed_entry_count = changed_entries,
+            .execution_fingerprint = proposal.execution_fingerprint,
+            .policy_fingerprint = proposal.policy_fingerprint,
+            .plan_fingerprint =
+                fingerprintAuthoritativeResidencyPlan(proposal.plan),
+            .reserved = 0,
+        };
+        if (!header.valid())
+        {
+            setError(
+                error,
+                "ExpertOverlay proposal produced an invalid wire header");
+            return false;
+        }
+
+        std::size_t offset = 0;
+        writeLittleEndian(destination, offset, header.magic);
+        writeLittleEndian(destination, offset, header.abi_version);
+        writeLittleEndian(destination, offset, header.expected_epoch);
+        writeLittleEndian(destination, offset, header.candidate_epoch);
+        writeLittleEndian(destination, offset, header.num_layers);
+        writeLittleEndian(destination, offset, header.num_experts);
+        writeLittleEndian(destination, offset, header.entry_count);
+        writeLittleEndian(destination, offset, header.changed_entry_count);
+        writeLittleEndian(
+            destination, offset, header.execution_fingerprint.low);
+        writeLittleEndian(
+            destination, offset, header.execution_fingerprint.high);
+        writeLittleEndian(
+            destination, offset, header.policy_fingerprint.low);
+        writeLittleEndian(
+            destination, offset, header.policy_fingerprint.high);
+        writeLittleEndian(destination, offset, header.plan_fingerprint);
+        writeLittleEndian(destination, offset, header.reserved);
+        if (offset !=
+            MoEOverlayDistributedResidencyProposalHeader::kWireBytes)
+        {
+            throw std::logic_error(
+                "ExpertOverlay proposal header wire-size constant is stale");
+        }
+
+        const std::size_t histogram_bytes =
+            moeOverlayDistributedHistogramWireBytes(
+                proposal.plan.num_layers,
+                proposal.plan.num_experts);
+        if (!encodeMoEOverlayDistributedHistogramWindow(
+                *proposal.plan.histogram_window,
+                destination.subspan(offset, histogram_bytes),
+                error))
+        {
+            return false;
+        }
+        offset += histogram_bytes;
+        for (const auto &entry : proposal.plan.entries)
+        {
+            writeLittleEndian(
+                destination, offset, entry.candidate_tier_idx);
+            writeLittleEndian(
+                destination,
+                offset,
+                entry.candidate_owner_participant);
+            const std::uint32_t axis_code =
+                entry.changed
+                    ? static_cast<std::uint32_t>(entry.axis) + 1u
+                    : 0u;
+            writeLittleEndian(destination, offset, axis_code);
+            writeLittleEndian(
+                destination, offset, entry.activation_count);
+            writeLittleEndian(
+                destination,
+                offset,
+                static_cast<std::uint64_t>(
+                    entry.estimated_weight_bytes));
+        }
+        if (offset != destination.size())
+        {
+            throw std::logic_error(
+                "ExpertOverlay proposal encoder did not fill its exact packet");
+        }
+        if (error)
+            error->clear();
+        return true;
+    }
+
+    bool decodeMoEOverlayDistributedResidencyProposal(
+        std::span<const std::uint8_t> packet,
+        int expected_layers,
+        int expected_experts,
+        MoEOverlayDistributedResidencyProposal *proposal,
+        std::string *error)
+    {
+        if (!proposal || expected_layers <= 0 || expected_experts <= 0)
+        {
+            setError(
+                error,
+                "ExpertOverlay proposal decoder requires output and positive model geometry");
+            return false;
+        }
+        *proposal = {};
+        const std::size_t expected_size =
+            moeOverlayDistributedResidencyProposalWireBytes(
+                expected_layers, expected_experts);
+        if (packet.size() != expected_size)
+        {
+            setError(
+                error,
+                "ExpertOverlay proposal packet has the wrong fixed size");
+            return false;
+        }
+
+        std::size_t offset = 0;
+        MoEOverlayDistributedResidencyProposalHeader header;
+        header.magic = readLittleEndian<std::uint32_t>(packet, offset);
+        header.abi_version =
+            readLittleEndian<std::uint32_t>(packet, offset);
+        header.expected_epoch =
+            readLittleEndian<std::uint64_t>(packet, offset);
+        header.candidate_epoch =
+            readLittleEndian<std::uint64_t>(packet, offset);
+        header.num_layers =
+            readLittleEndian<std::int32_t>(packet, offset);
+        header.num_experts =
+            readLittleEndian<std::int32_t>(packet, offset);
+        header.entry_count =
+            readLittleEndian<std::uint64_t>(packet, offset);
+        header.changed_entry_count =
+            readLittleEndian<std::uint64_t>(packet, offset);
+        header.execution_fingerprint.low =
+            readLittleEndian<std::uint64_t>(packet, offset);
+        header.execution_fingerprint.high =
+            readLittleEndian<std::uint64_t>(packet, offset);
+        header.policy_fingerprint.low =
+            readLittleEndian<std::uint64_t>(packet, offset);
+        header.policy_fingerprint.high =
+            readLittleEndian<std::uint64_t>(packet, offset);
+        header.plan_fingerprint =
+            readLittleEndian<std::uint64_t>(packet, offset);
+        header.reserved =
+            readLittleEndian<std::uint64_t>(packet, offset);
+        if (!header.valid() || header.num_layers != expected_layers ||
+            header.num_experts != expected_experts)
+        {
+            setError(
+                error,
+                "ExpertOverlay proposal header or model geometry is invalid");
+            return false;
+        }
+
+        const std::size_t histogram_bytes =
+            moeOverlayDistributedHistogramWireBytes(
+                expected_layers, expected_experts);
+        auto histogram =
+            std::make_shared<DecodeExpertHistogramWindow>();
+        if (!decodeMoEOverlayDistributedHistogramWindow(
+                packet.subspan(offset, histogram_bytes),
+                expected_layers,
+                expected_experts,
+                histogram.get(),
+                error))
+        {
+            return false;
+        }
+        offset += histogram_bytes;
+
+        MoEOverlayAuthoritativeResidencyPlan plan{
+            .expected_epoch = header.expected_epoch,
+            .num_layers = header.num_layers,
+            .num_experts = header.num_experts,
+            .histogram_window = std::move(histogram),
+        };
+        plan.entries.resize(static_cast<std::size_t>(header.entry_count));
+        std::uint64_t changed_entries = 0;
+        for (auto &entry : plan.entries)
+        {
+            entry.candidate_tier_idx =
+                readLittleEndian<std::int32_t>(packet, offset);
+            entry.candidate_owner_participant =
+                readLittleEndian<std::int32_t>(packet, offset);
+            const std::uint32_t axis_code =
+                readLittleEndian<std::uint32_t>(packet, offset);
+            if (axis_code > 3u)
+            {
+                setError(
+                    error,
+                    "ExpertOverlay proposal contains an invalid movement-axis code");
+                return false;
+            }
+            entry.changed = axis_code != 0u;
+            entry.axis = entry.changed
+                             ? static_cast<MoEOptimizationMovementAxis>(
+                                   axis_code - 1u)
+                             : MoEOptimizationMovementAxis::TierResidency;
+            entry.activation_count =
+                readLittleEndian<std::uint64_t>(packet, offset);
+            const std::uint64_t weight_bytes =
+                readLittleEndian<std::uint64_t>(packet, offset);
+            if (weight_bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max()))
+            {
+                setError(
+                    error,
+                    "ExpertOverlay proposal weight size exceeds local size_t");
+                return false;
+            }
+            entry.estimated_weight_bytes =
+                static_cast<std::size_t>(weight_bytes);
+            changed_entries += entry.changed ? 1u : 0u;
+        }
+        if (offset != packet.size() ||
+            changed_entries != header.changed_entry_count || !plan.valid() ||
+            fingerprintAuthoritativeResidencyPlan(plan) !=
+                header.plan_fingerprint)
+        {
+            setError(
+                error,
+                "ExpertOverlay proposal packet failed plan authentication");
+            return false;
+        }
+
+        proposal->plan = std::move(plan);
+        proposal->execution_fingerprint =
+            header.execution_fingerprint;
+        proposal->policy_fingerprint = header.policy_fingerprint;
+        if (!proposal->valid())
+        {
+            *proposal = {};
+            setError(
+                error,
+                "ExpertOverlay proposal packet decoded to an invalid proposal");
+            return false;
+        }
+        if (error)
+            error->clear();
+        return true;
+    }
+
     bool MoEOverlayDistributedResidencyWaveIdentity::valid() const noexcept
     {
         return magic == kMagic && abi_version == kABIVersion &&
@@ -670,7 +1170,7 @@ namespace llaminar2
                expected_epoch < std::numeric_limits<std::uint64_t>::max() &&
                candidate_epoch == expected_epoch + 1 &&
                migration_count > 0 && cycle_count > 0 &&
-               transaction_fingerprint.valid();
+               execution_fingerprint.valid();
     }
 
     MoEOverlayDistributedResidencyWaveIdentity
@@ -699,8 +1199,8 @@ namespace llaminar2
                 transaction.migrations.size()),
             .cycle_count = static_cast<std::uint64_t>(
                 transaction.migration_cycles.size()),
-            .transaction_fingerprint =
-                fingerprintMoEOverlayResidencyTransaction(transaction),
+            .execution_fingerprint =
+                fingerprintMoEOverlayResidencyExecutionPlan(transaction),
         };
         if (!identity.valid())
         {
@@ -727,6 +1227,9 @@ namespace llaminar2
             phase ==
                 MoEOverlayDistributedResidencyVotePhase::RuntimePublished ||
             phase ==
+                MoEOverlayDistributedResidencyVotePhase::
+                    RetirementAdmissionReady ||
+            phase ==
                 MoEOverlayDistributedResidencyVotePhase::LeaseDrained;
         if (!phase_valid)
             return false;
@@ -742,6 +1245,13 @@ namespace llaminar2
                         MoEOverlayDistributedResidencyVotePhase::Reserved ||
                     phase ==
                         MoEOverlayDistributedResidencyVotePhase::Staged) &&
+                   error_code == 0 && detail_fingerprint == 0;
+        case MoEOverlayDistributedResidencyVoteDecision::Waiting:
+            return (phase ==
+                        MoEOverlayDistributedResidencyVotePhase::
+                            RetirementAdmissionReady ||
+                    phase ==
+                        MoEOverlayDistributedResidencyVotePhase::LeaseDrained) &&
                    error_code == 0 && detail_fingerprint == 0;
         }
         return false;
@@ -789,6 +1299,12 @@ namespace llaminar2
             return MoEOverlayDistributedResidencyVotePhase::RuntimePublished;
         case MoEOverlayDistributedResidencyProtocolState::Published:
         case MoEOverlayDistributedResidencyProtocolState::
+            AwaitingRetirementAdmissionConsensus:
+            return MoEOverlayDistributedResidencyVotePhase::
+                RetirementAdmissionReady;
+        case MoEOverlayDistributedResidencyProtocolState::
+            RetirementAdmissionClosed:
+        case MoEOverlayDistributedResidencyProtocolState::
             AwaitingRetirementConsensus:
             return MoEOverlayDistributedResidencyVotePhase::LeaseDrained;
         default:
@@ -815,11 +1331,15 @@ namespace llaminar2
         const bool awaiting_publication =
             state_ == MoEOverlayDistributedResidencyProtocolState::
                           AwaitingLocalPublication;
-        const bool awaiting_retirement =
+        const bool awaiting_retirement_admission =
             state_ ==
             MoEOverlayDistributedResidencyProtocolState::Published;
+        const bool awaiting_retirement =
+            state_ == MoEOverlayDistributedResidencyProtocolState::
+                          RetirementAdmissionClosed;
         if (!awaiting_reservation && !awaiting_stage && !awaiting_prepare &&
-            !awaiting_publication && !awaiting_retirement)
+            !awaiting_publication && !awaiting_retirement_admission &&
+            !awaiting_retirement)
         {
             throw std::logic_error(
                 "Distributed ExpertOverlay protocol is not awaiting a local vote");
@@ -847,6 +1367,14 @@ namespace llaminar2
             {
                 throw std::invalid_argument(
                     "Deferred ExpertOverlay vote is valid only for reservation/staging and carries no failure diagnostic");
+            }
+            break;
+        case MoEOverlayDistributedResidencyVoteDecision::Waiting:
+            if ((!awaiting_retirement_admission && !awaiting_retirement) ||
+                error_code != 0 || !diagnostic.empty())
+            {
+                throw std::invalid_argument(
+                    "Waiting ExpertOverlay vote is valid only during an old-epoch retirement grace period and carries no failure diagnostic");
             }
             break;
         default:
@@ -885,8 +1413,11 @@ namespace llaminar2
                                    : (awaiting_publication
                                           ? MoEOverlayDistributedResidencyProtocolState::
                                                 AwaitingPublicationConsensus
-                                          : MoEOverlayDistributedResidencyProtocolState::
-                                                AwaitingRetirementConsensus)));
+                                          : (awaiting_retirement_admission
+                                                 ? MoEOverlayDistributedResidencyProtocolState::
+                                                       AwaitingRetirementAdmissionConsensus
+                                                 : MoEOverlayDistributedResidencyProtocolState::
+                                                       AwaitingRetirementConsensus))));
         return vote;
     }
 
@@ -917,11 +1448,15 @@ namespace llaminar2
         const bool awaiting_publication =
             state_ == MoEOverlayDistributedResidencyProtocolState::
                           AwaitingPublicationConsensus;
+        const bool awaiting_retirement_admission =
+            state_ == MoEOverlayDistributedResidencyProtocolState::
+                          AwaitingRetirementAdmissionConsensus;
         const bool awaiting_retirement =
             state_ == MoEOverlayDistributedResidencyProtocolState::
                           AwaitingRetirementConsensus;
         if (!awaiting_reservation && !awaiting_stage && !awaiting_prepare &&
-            !awaiting_publication && !awaiting_retirement)
+            !awaiting_publication && !awaiting_retirement_admission &&
+            !awaiting_retirement)
         {
             fail(
                 {.phase =
@@ -949,6 +1484,7 @@ namespace llaminar2
             static_cast<std::size_t>(config_.world_size), false);
         std::optional<MoEOverlayDistributedResidencyFailure> first_failure;
         bool any_deferred = false;
+        bool any_waiting = false;
         bool local_vote_seen = false;
         for (const auto &vote : votes)
         {
@@ -1021,6 +1557,11 @@ namespace llaminar2
             {
                 any_deferred = true;
             }
+            else if (vote.decision ==
+                     MoEOverlayDistributedResidencyVoteDecision::Waiting)
+            {
+                any_waiting = true;
+            }
         }
 
         if (!local_vote_seen)
@@ -1051,7 +1592,11 @@ namespace llaminar2
                                              MoEOverlayDistributedResidencyVotePhase::
                                                  RuntimePublished
                                          ? "runtime publication"
-                                         : "old-epoch lease drain")));
+                                         : (phase ==
+                                                    MoEOverlayDistributedResidencyVotePhase::
+                                                        RetirementAdmissionReady
+                                                ? "old-epoch retirement admission"
+                                                : "old-epoch lease drain"))));
             message << "Distributed ExpertOverlay " << phase_name
                     << " failed on world rank "
                     << first_failure->world_rank << " with code "
@@ -1071,6 +1616,21 @@ namespace llaminar2
             return false;
         }
 
+        if (any_waiting)
+        {
+            /* A waiting grace-period generation is retryable. Return to the
+             * exact source state for this phase so every rank enters the next
+             * ordered collective generation with the same phase identity. */
+            local_vote_.reset();
+            state_ = awaiting_retirement_admission
+                         ? MoEOverlayDistributedResidencyProtocolState::Published
+                         : MoEOverlayDistributedResidencyProtocolState::
+                               RetirementAdmissionClosed;
+            if (error)
+                error->clear();
+            return false;
+        }
+
         local_vote_.reset();
         state_ = awaiting_reservation
                      ? MoEOverlayDistributedResidencyProtocolState::
@@ -1084,8 +1644,11 @@ namespace llaminar2
                                    : (awaiting_publication
                                           ? MoEOverlayDistributedResidencyProtocolState::
                                                 ReadyForAuthorityPublication
-                                          : MoEOverlayDistributedResidencyProtocolState::
-                                                ReadyToRetire)));
+                                          : (awaiting_retirement_admission
+                                                 ? MoEOverlayDistributedResidencyProtocolState::
+                                                       ReadyToCloseRetirementAdmission
+                                                 : MoEOverlayDistributedResidencyProtocolState::
+                                                       ReadyToRetire))));
         if (error)
             error->clear();
         return true;
@@ -1103,6 +1666,19 @@ namespace llaminar2
         state_ = MoEOverlayDistributedResidencyProtocolState::Published;
     }
 
+    void MoEOverlayDistributedResidencyProtocol::
+        markRetirementAdmissionClosed()
+    {
+        if (state_ != MoEOverlayDistributedResidencyProtocolState::
+                          ReadyToCloseRetirementAdmission)
+        {
+            throw std::logic_error(
+                "Distributed ExpertOverlay old-epoch admission cannot close before unanimous retirement quiescence");
+        }
+        state_ = MoEOverlayDistributedResidencyProtocolState::
+            RetirementAdmissionClosed;
+    }
+
     void MoEOverlayDistributedResidencyProtocol::markRetired()
     {
         if (state_ !=
@@ -1117,6 +1693,12 @@ namespace llaminar2
     bool MoEOverlayDistributedResidencyProtocol::abort() noexcept
     {
         if (state_ == MoEOverlayDistributedResidencyProtocolState::Published ||
+            state_ == MoEOverlayDistributedResidencyProtocolState::
+                          AwaitingRetirementAdmissionConsensus ||
+            state_ == MoEOverlayDistributedResidencyProtocolState::
+                          ReadyToCloseRetirementAdmission ||
+            state_ == MoEOverlayDistributedResidencyProtocolState::
+                          RetirementAdmissionClosed ||
             state_ == MoEOverlayDistributedResidencyProtocolState::
                           AwaitingRetirementConsensus ||
             state_ ==

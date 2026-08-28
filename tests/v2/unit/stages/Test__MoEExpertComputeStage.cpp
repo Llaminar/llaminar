@@ -46,6 +46,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef _OPENMP
@@ -2923,6 +2924,67 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_TypeAndName)
 }
 
 /**
+ * @brief Only a materialized single-participant route bank is a final output.
+ *
+ * The mapped heterogeneous continuation receives remote rows directly into
+ * its canonical bank before the ordered reducer. Snapshot capture must observe
+ * that completed bank at the reducer boundary. A deferred dense merge has not
+ * completed those rows yet and therefore must not advertise the same output.
+ */
+TEST_F(
+    MoEExpertComputeStageTest,
+    CanonicalReducerPublishesOnlyCompleteMappedRouteBank)
+{
+    FP32Tensor route_contributions({2, 4});
+    FP32Tensor routed_output({1, 4});
+
+    MoECanonicalRouteReduceStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.canonical_route_contributions = &route_contributions;
+    params.output = &routed_output;
+    params.seq_len = 1;
+    params.top_k = 2;
+    params.d_model = 4;
+    params.canonical_route_arithmetic =
+        MoECanonicalRouteArithmeticPolicy::
+            PreweightedContributionThenOrderedAdd;
+    params.canonical_route_layout =
+        MoECanonicalRoutePublicationLayout::DenseOriginalRouteSlots;
+    params.reduction_role = MoECanonicalRouteReductionRole::RootOwner;
+    params.external_route_source =
+        MoEExternalCanonicalRouteSource::RootCanonicalRouteBank;
+
+    const auto has_named_output = [](
+                                      const StageDumpInfo &dump,
+                                      const std::string_view name)
+    {
+        return std::any_of(
+            dump.outputs.begin(),
+            dump.outputs.end(),
+            [&](const StageDumpInfo::OutputBuffer &output)
+            {
+                return output.name && name == output.name;
+            });
+    };
+
+    MoECanonicalRouteReduceStage complete_stage(params);
+    const StageDumpInfo complete_dump =
+        complete_stage.getDumpInfoSnapshot();
+    EXPECT_TRUE(has_named_output(
+        complete_dump, "canonical_route_contributions"));
+    EXPECT_TRUE(has_named_output(complete_dump, "output"));
+
+    params.external_route_source =
+        MoEExternalCanonicalRouteSource::DeferredDenseMerge;
+    MoECanonicalRouteReduceStage deferred_stage(std::move(params));
+    const StageDumpInfo deferred_dump =
+        deferred_stage.getDumpInfoSnapshot();
+    EXPECT_FALSE(has_named_output(
+        deferred_dump, "canonical_route_contributions"));
+    EXPECT_TRUE(has_named_output(deferred_dump, "output"));
+}
+
+/**
  * @brief A graph-native overlay can be GPU-capable without raw tensor views.
  *
  * CPU and GPU tier participants may bind different packed slices under the
@@ -3241,26 +3303,38 @@ TEST_F(MoEExpertComputeStageTest, GpuGroupedVerifierRequiresAcceptedStateHistogr
     params.top_k = 2;
     params.force_grouped_verifier_prefill_for_decode = true;
     params.force_decode_equivalent_verifier_prefill = false;
-    params.defer_grouped_verifier_histogram_publication = true;
+    params.grouped_verifier_histogram_role =
+        MoEGroupedVerifierHistogramRole::DeferredAcceptedRows;
 
     MoEExpertComputeStage stage(params);
-    EXPECT_TRUE(
-        stage.requiresCommittedGroupedVerifierHistogramPublication())
-        << "The real CUDA/ROCm grouped-verifier graph flag must require "
+    EXPECT_EQ(
+        stage.groupedVerifierHistogramRole(),
+        MoEGroupedVerifierHistogramRole::DeferredAcceptedRows)
+        << "The real CUDA/ROCm grouped-verifier graph role must require "
            "accepted-state routing-history publication.";
 
-    params.defer_grouped_verifier_histogram_publication = false;
+    params.grouped_verifier_histogram_role =
+        MoEGroupedVerifierHistogramRole::StaticNoPublication;
+    MoEExpertComputeStage static_verifier(params);
+    EXPECT_EQ(
+        static_verifier.groupedVerifierHistogramRole(),
+        MoEGroupedVerifierHistogramRole::StaticNoPublication)
+        << "Static grouped verification must name its history boundary without "
+           "advertising a deferred publication transaction.";
+
+    params.grouped_verifier_histogram_role =
+        MoEGroupedVerifierHistogramRole::NotOwner;
     MoEExpertComputeStage grouped_sidecar(params);
-    EXPECT_FALSE(
-        grouped_sidecar
-            .requiresCommittedGroupedVerifierHistogramPublication())
+    EXPECT_EQ(
+        grouped_sidecar.groupedVerifierHistogramRole(),
+        MoEGroupedVerifierHistogramRole::NotOwner)
         << "Grouped sidecars must never publish main-model decode history.";
 
     params.force_grouped_verifier_prefill_for_decode = false;
     MoEExpertComputeStage ordinary_prefill(params);
-    EXPECT_FALSE(
-        ordinary_prefill
-            .requiresCommittedGroupedVerifierHistogramPublication())
+    EXPECT_EQ(
+        ordinary_prefill.groupedVerifierHistogramRole(),
+        MoEGroupedVerifierHistogramRole::NotOwner)
         << "Ordinary prefill is not an accepted decode-demand boundary.";
 }
 

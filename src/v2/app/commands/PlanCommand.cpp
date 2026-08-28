@@ -39,7 +39,6 @@ namespace llaminar2
             std::string kv_precision = "fp16";
             int max_seq_len = 0; // 0 = use model default
             int batch_size = 1;
-            int headroom_mb = 128;
             // MPI bootstrap control
             bool no_mpi_bootstrap = false;
             std::string hostfile;
@@ -96,13 +95,6 @@ namespace llaminar2
                 .value_label = "<type>",
                 .description = "KV cache precision: fp16, fp32, q8_1, auto",
                 .setter = setters::assignString(&PlanConfig::kv_precision),
-            });
-            spec.add({
-                .long_name = "--headroom",
-                .category = "Strategy",
-                .value_label = "<mb>",
-                .description = "Reserved headroom per device in MB (default: 128)",
-                .setter = setters::parseInt(&PlanConfig::headroom_mb, "headroom"),
             });
             spec.add({
                 .short_name = "-o",
@@ -176,7 +168,7 @@ namespace llaminar2
                      << "  workspace_mb: " << mb(d.workspace_bytes) << "\n"
                      << "  total_mb: " << mb(d.total_bytes()) << "\n"
                      << "  device_free_mb: " << mb(d.device_free_bytes) << "\n"
-                     << "  headroom_mb: " << mb(d.remaining()) << "\n";
+                     << "  unallocated_mb: " << mb(d.remaining()) << "\n";
             }
             else
             {
@@ -212,7 +204,6 @@ namespace llaminar2
             dc.batch_size = cfg.batch_size;
             dc.max_seq_len = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
             dc.kv_precision = cfg.kv_precision;
-            dc.headroom_bytes = static_cast<size_t>(cfg.headroom_mb) * 1024ULL * 1024;
             return dc;
         }
 
@@ -238,7 +229,6 @@ namespace llaminar2
                 dc.batch_size = cfg.batch_size;
                 dc.max_seq_len = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
                 dc.kv_precision = cfg.kv_precision;
-                dc.headroom_bytes = static_cast<size_t>(cfg.headroom_mb) * 1024ULL * 1024;
                 configs.push_back(dc);
             }
             return configs;
@@ -268,7 +258,6 @@ namespace llaminar2
                 dc.batch_size = cfg.batch_size;
                 dc.max_seq_len = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
                 dc.kv_precision = cfg.kv_precision;
-                dc.headroom_bytes = static_cast<size_t>(cfg.headroom_mb) * 1024ULL * 1024;
                 configs.push_back(dc);
                 layer_offset += stage_layers;
             }
@@ -289,7 +278,6 @@ namespace llaminar2
             dc.batch_size = cfg.batch_size;
             dc.max_seq_len = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
             dc.kv_precision = cfg.kv_precision;
-            dc.headroom_bytes = static_cast<size_t>(cfg.headroom_mb) * 1024ULL * 1024;
             return dc;
         }
 

@@ -725,6 +725,204 @@ namespace llaminar2::cpu::native_vnni
     }
 
     /**
+     * @brief Decode Expanded-INT8 source blocks directly into final VNNI bytes.
+     *
+     * The historical preparation path first materialized an `N x K` INT8
+     * matrix and three matrix-sized metadata arrays, then reread those
+     * temporaries to construct `native_interleaved`.  ExpertOverlay prepares
+     * thousands of independently owned projections, so that extra traffic and
+     * transient resident set materially increased both cold-start time and
+     * allocator pressure.
+     *
+     * This pass owns one `(64 output columns, up to eight K blocks)` tile per
+     * OpenMP iteration.  A tile reads every source block once and writes every
+     * byte of its disjoint final destination.  Group bytes, compensation,
+     * FP16 scales, and optional FP16 minima retain exactly the same arithmetic
+     * and byte order as the former two-pass implementation.  Eight-block tiles
+     * preserve the format-specific superblock decoder, so K-quant and IQuant
+     * codebooks do not regress to eight redundant header decodes.
+     *
+     * @param unpackable Source-codebook decode authority.
+     * @param out Fully initialized Expanded-INT8 layout metadata and final
+     *        storage owner.
+     * @param row_start First source row represented by destination row zero.
+     * @param N Number of source rows to pack.
+     * @param blocks_per_row Number of logical 32-value K blocks per row.
+     * @param N_chunks Number of 64-column destination chunks.
+     * @param use_superblock Whether one source decoder call produces eight
+     *        consecutive logical K blocks.
+     */
+    inline void packExpandedInt8Direct(
+        const IINT8Unpackable &unpackable,
+        CPUNativeVNNIPackedWeights &out,
+        int row_start,
+        int N,
+        int blocks_per_row,
+        int N_chunks,
+        bool use_superblock)
+    {
+        if (!out.usesExpandedInt8() || out.data_stride != 2048)
+        {
+            throw std::invalid_argument(
+                "Direct Expanded-INT8 packing requires the complete 2048-byte data layout");
+        }
+
+        const size_t interleaved_total =
+            static_cast<size_t>(N_chunks) * blocks_per_row *
+            static_cast<size_t>(out.interleaved_block_stride);
+        out.native_interleaved.resize_uninitialized(interleaved_total);
+
+        constexpr int kBlocksPerTile = 8;
+        constexpr int kColumnsPerChunk = 64;
+        constexpr int kValuesPerBlock = 32;
+        constexpr int kValuesPerGroup = 4;
+        constexpr int kGroups = kValuesPerBlock / kValuesPerGroup;
+        const int block_tiles =
+            (blocks_per_row + kBlocksPerTile - 1) / kBlocksPerTile;
+
+#pragma omp parallel for schedule(static) collapse(2)
+        for (int chunk = 0; chunk < N_chunks; ++chunk)
+        {
+            for (int block_tile = 0; block_tile < block_tiles; ++block_tile)
+            {
+                const int first_kb = block_tile * kBlocksPerTile;
+                const int block_count = std::min(
+                    kBlocksPerTile, blocks_per_row - first_kb);
+                const int valid_columns = std::min(
+                    kColumnsPerChunk, N - chunk * kColumnsPerChunk);
+
+                // One stack tile is reused for each column.  It is small
+                // enough to remain in L1 while the eight final blocks are hot.
+                alignas(64) int8_t decoded[
+                    kBlocksPerTile * kValuesPerBlock]{};
+                alignas(64) float scales[kBlocksPerTile]{};
+                alignas(64) float mins[kBlocksPerTile]{};
+
+                for (int column = 0; column < kColumnsPerChunk; ++column)
+                {
+                    const bool source_column_valid = column < valid_columns;
+                    if (source_column_valid)
+                    {
+                        const int source_row =
+                            row_start + chunk * kColumnsPerChunk + column;
+                        if (use_superblock &&
+                            block_count == kBlocksPerTile)
+                        {
+                            // One call decodes the source header and all eight
+                            // logical blocks.  Scale/min conversion remains
+                            // below so it follows the historical FP32->FP16 edge.
+                            unpackable.unpack_superblock_to_int8(
+                                static_cast<size_t>(source_row),
+                                static_cast<size_t>(block_tile),
+                                decoded,
+                                scales,
+                                mins);
+                        }
+                        else
+                        {
+                            for (int local_kb = 0;
+                                 local_kb < block_count;
+                                 ++local_kb)
+                            {
+                                const int kb = first_kb + local_kb;
+                                unpackable.unpack_block_to_int8(
+                                    static_cast<size_t>(source_row),
+                                    static_cast<size_t>(kb),
+                                    decoded + local_kb * kValuesPerBlock);
+                                scales[local_kb] =
+                                    unpackable.get_block_scale(
+                                        static_cast<size_t>(source_row),
+                                        static_cast<size_t>(kb));
+                                mins[local_kb] =
+                                    unpackable.get_block_min(
+                                        static_cast<size_t>(source_row),
+                                        static_cast<size_t>(kb));
+                            }
+                        }
+                    }
+
+                    for (int local_kb = 0;
+                         local_kb < block_count;
+                         ++local_kb)
+                    {
+                        const int kb = first_kb + local_kb;
+                        const size_t block_offset =
+                            (static_cast<size_t>(chunk) * blocks_per_row +
+                             static_cast<size_t>(kb)) *
+                            static_cast<size_t>(out.interleaved_block_stride);
+                        uint8_t *const destination =
+                            out.native_interleaved.data() + block_offset;
+
+                        const int zmm = column / 16;
+                        const int lane = column % 16;
+                        const int8_t *const values =
+                            decoded + local_kb * kValuesPerBlock;
+                        for (int group = 0; group < kGroups; ++group)
+                        {
+                            uint8_t *const group_destination =
+                                destination + group * 256 + zmm * 64 +
+                                lane * kValuesPerGroup;
+                            if (source_column_valid)
+                            {
+                                std::memcpy(
+                                    group_destination,
+                                    values + group * kValuesPerGroup,
+                                    kValuesPerGroup);
+                            }
+                            else
+                            {
+                                std::memset(
+                                    group_destination,
+                                    0,
+                                    kValuesPerGroup);
+                            }
+                        }
+
+                        auto *const compensation =
+                            reinterpret_cast<int16_t *>(
+                                destination + out.data_stride);
+                        auto *const inline_scales =
+                            reinterpret_cast<uint16_t *>(
+                                destination + out.data_stride + 128);
+                        if (source_column_valid)
+                        {
+                            int32_t sum = 0;
+                            // Fixed scalar order is the byte-deterministic
+                            // preparation contract shared by all codebooks.
+                            for (int value = 0;
+                                 value < kValuesPerBlock;
+                                 ++value)
+                            {
+                                sum += values[value];
+                            }
+                            compensation[column] =
+                                static_cast<int16_t>(sum);
+                            inline_scales[column] =
+                                fp32_to_fp16(scales[local_kb]);
+                        }
+                        else
+                        {
+                            compensation[column] = 0;
+                            inline_scales[column] = 0;
+                        }
+
+                        if (out.is_asymmetric)
+                        {
+                            auto *const inline_mins =
+                                reinterpret_cast<uint16_t *>(
+                                    destination + out.data_stride + 256);
+                            inline_mins[column] = source_column_valid
+                                                      ? fp32_to_fp16(
+                                                            mins[local_kb])
+                                                      : 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * @brief Pack tensor weights into CPUNativeVNNIPackedWeights.
      *
      * Uses the IINT8Unpackable interface to extract native block data
@@ -812,12 +1010,12 @@ namespace llaminar2::cpu::native_vnni
         out.interleaved_block_stride = preparedInterleavedBlockStride(
             out.encoding, out.is_asymmetric);
 
-        // Temporary per-column metadata arrays used during packing.
-        // These get copied inline into native_interleaved during the interleaving pass.
+        // Temporary metadata is allocated only by layouts that still need a
+        // distinct source-oriented pass.  Expanded-INT8 preparation writes
+        // directly to final storage and therefore owns no matrix-sized shadow.
         size_t total_blocks = (size_t)N_chunks * blocks_per_row * 64;
-        std::vector<uint16_t> temp_scales(total_blocks, 0);
-        std::vector<uint16_t> temp_mins(total_blocks, 0);
-        std::vector<int16_t> temp_comp(total_blocks, 0);
+        std::vector<uint16_t> temp_scales;
+        std::vector<uint16_t> temp_mins;
 
         bool use_superblock = (unpackable->superblock_size() == 256);
 
@@ -839,6 +1037,7 @@ namespace llaminar2::cpu::native_vnni
             // distributes outliers evenly, centering the distribution).
             // =================================================================
 
+            temp_scales.assign(total_blocks, 0);
             size_t int8_total = (size_t)N_chunks * blocks_per_row * 64 * 32;
             out.int8_flat.resize(int8_total, 0);
 
@@ -1138,6 +1337,8 @@ namespace llaminar2::cpu::native_vnni
             // Memory: 0.5 byte/element (half of INT8).
             // =================================================================
 
+            temp_scales.assign(total_blocks, 0);
+            temp_mins.assign(total_blocks, 0);
             out.payload.resize(total_blocks * fmt->payload_bytes, 0);
 
 // Pass 1: Extract scales/mins from superblocks
@@ -1306,68 +1507,28 @@ namespace llaminar2::cpu::native_vnni
             // =================================================================
             // INT8 PRE-DECODED PATH (Q5_0, Q5_1, Q6_K, Q3_K, Q2_K, IQ2/3/1*)
             //
-            // Decode to INT8 at pack time, store in VNNI-interleaved layout
-            // with 8 groups. The GEMV kernel loads pre-decoded INT8 directly.
-            // Memory: 1.0 byte/element.
+            // Decode directly into the final eight-group VNNI layout.  The
+            // GEMV kernel loads these pre-decoded INT8 values directly.
+            // Memory: 1.0 byte/element, with no transient full INT8 matrix.
             // =================================================================
-
-            size_t int8_total = (size_t)N_chunks * blocks_per_row * 64 * 32;
-            out.int8_flat.resize(int8_total, 0);
-
-// Single pass: extract scales/mins AND decoded INT8 values
-#pragma omp parallel for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                int src_row = row_start + n;
-                int chunk = n / 64;
-                int n_local = n % 64;
-                int kb = 0;
-
-                if (use_superblock)
-                {
-                    int K_superblocks = blocks_per_row / 8;
-                    for (int sb = 0; sb < K_superblocks; ++sb)
-                    {
-                        int8_t sb_vals[256];
-                        float sb_scales[8];
-                        float sb_mins[8];
-                        unpackable->unpack_superblock_to_int8(src_row, sb, sb_vals, sb_scales, sb_mins);
-
-                        for (int i = 0; i < 8; ++i)
-                        {
-                            size_t idx = (size_t)chunk * blocks_per_row * 64 + (size_t)(kb + i) * 64 + n_local;
-                            temp_scales[idx] = fp32_to_fp16(sb_scales[i]);
-                            temp_mins[idx] = fp32_to_fp16(sb_mins[i]);
-
-                            // Store decoded INT8 values
-                            size_t flat_offset = idx * 32;
-                            std::memcpy(out.int8_flat.data() + flat_offset, sb_vals + i * 32, 32);
-                        }
-                        kb += 8;
-                    }
-                }
-
-                // Process remaining blocks individually
-                for (; kb < blocks_per_row; ++kb)
-                {
-                    size_t idx = (size_t)chunk * blocks_per_row * 64 + (size_t)kb * 64 + n_local;
-                    temp_scales[idx] = fp32_to_fp16(unpackable->get_block_scale(src_row, kb));
-                    temp_mins[idx] = fp32_to_fp16(unpackable->get_block_min(src_row, kb));
-
-                    // Decode to INT8
-                    size_t flat_offset = idx * 32;
-                    unpackable->unpack_block_to_int8(src_row, kb, out.int8_flat.data() + flat_offset);
-                }
-            }
+            packExpandedInt8Direct(
+                *unpackable,
+                out,
+                row_start,
+                N,
+                blocks_per_row,
+                N_chunks,
+                use_superblock);
         }
 
         // =================================================================
         // INT8 INTERLEAVING (shared by rotation path and INT8 pre-decoded path)
         //
         // Build VNNI-interleaved INT8 buffer (8 groups) + inline comp/scales/mins.
-        // Both paths populate int8_flat + temp_scales before reaching here.
+        // Rotation still needs a complete row before its FWHT.  It is the only
+        // Expanded-INT8 producer that retains a temporary decoded matrix.
         // =================================================================
-        if (out.usesExpandedInt8())
+        if (use_rotated_path)
         {
             size_t interleaved_total = (size_t)N_chunks * blocks_per_row * out.interleaved_block_stride;
             // The following parallel pass writes every byte. Avoid a

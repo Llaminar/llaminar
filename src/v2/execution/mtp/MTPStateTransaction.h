@@ -1,3 +1,15 @@
+/**
+ * @file MTPStateTransaction.h
+ * @brief Typed validation contracts for persistent MTP and prefix-replay state.
+ *
+ * The declarations in this file define the legal equivalence boundaries for
+ * MTP publication, rollback, and prefix restoration.  Exact payload identity
+ * is the default.  A caller may request placement-aware numerical comparison
+ * only when the snapshots themselves prove that an ExpertOverlay movement
+ * epoch occurred and retain every native-precision value needed to certify the
+ * result.
+ */
+
 #pragma once
 
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
@@ -43,12 +55,112 @@ namespace llaminar2
         bool ok = false;
         std::string reason;
 
+        /**
+         * @brief Numerical evidence for one placement-aware terminal payload.
+         *
+         * Exact byte comparisons leave @ref compared false.  A true value
+         * means full retained FP32 payloads were compared after the snapshots
+         * proved that their MoE placement epochs differ.
+         */
+        struct TerminalPayloadNumericalEvidence
+        {
+            bool compared = false;
+            bool passed = false;
+            size_t elements = 0;
+            double cosine = 0.0;
+            double relative_l2 = 0.0;
+            double max_abs = 0.0;
+        };
+
+        /**
+         * @brief Aggregate proof for recomputed main-KV suffix payloads.
+         *
+         * A partial prefix hit restores its cached prefix byte-for-byte but
+         * recomputes the uncached suffix.  If ExpertOverlay changed the
+         * executing device type between the serial oracle and replay, only
+         * that suffix may differ numerically.  This record aggregates the
+         * strict prefix hashes and full suffix-value comparisons across every
+         * affected layer and both K/V payloads.
+         */
+        struct MainKVNumericalEvidence
+        {
+            bool compared = false;
+            bool passed = false;
+            size_t exact_prefix_segments = 0;
+            size_t numerical_suffix_payloads = 0;
+            size_t elements = 0;
+            double minimum_cosine = 1.0;
+            double maximum_relative_l2 = 0.0;
+            double maximum_abs = 0.0;
+        };
+
+        /// Evidence for the persistent final hidden row.
+        TerminalPayloadNumericalEvidence terminal_hidden_numerical;
+
+        /// Evidence for the persistent final logits row.
+        TerminalPayloadNumericalEvidence terminal_logits_numerical;
+
+        /// Evidence for placement-aware main-KV suffix recomputation.
+        MainKVNumericalEvidence main_kv_numerical;
+
         explicit operator bool() const { return ok; }
 
         static MTPStateValidationResult success();
         static MTPStateValidationResult failure(std::string reason);
     };
 
+    /**
+     * @brief Contract used to compare a persistent FP32 terminal payload.
+     */
+    enum class MTPTerminalPayloadComparisonPolicy
+    {
+        /** Require identical byte counts and hashes in every circumstance. */
+        ExactBytes,
+
+        /**
+         * Require exact bytes while placement is unchanged; after a proven
+         * MoE movement epoch, require full-payload numerical equivalence.
+         */
+        ExactUnlessMoEPlacementChanged,
+    };
+
+    /**
+     * @brief Legal comparison policies for persistent main-model KV payloads.
+     */
+    enum class MTPMainKVPayloadComparisonPolicy
+    {
+        /** Require the complete canonical K/V payload to be byte-identical. */
+        ExactBytes,
+
+        /**
+         * Require the restored prefix segment to remain byte-identical.  After
+         * a proven ExpertOverlay movement epoch only, allow the bounded
+         * recomputed suffix segment to satisfy a full-value numerical gate.
+         */
+        ExactPrefixNumericalSuffixAfterMoEPlacementChange,
+    };
+
+    /**
+     * @brief Default full-row cosine floor after a cross-device expert move.
+     *
+     * Callers may require a stricter model-specific threshold, but a
+     * placement-aware state comparison must never silently inherit a loose
+     * token-level gate.
+     */
+    inline constexpr double
+        kDefaultPlacementAwareTerminalPayloadMinimumCosine = 0.99;
+
+    /** Strict default cosine floor for a recomputed KV suffix row. */
+    inline constexpr double
+        kDefaultPlacementAwareMainKVSuffixMinimumCosine = 0.99;
+
+    /**
+     * @brief Options for comparing two authenticated runtime-state snapshots.
+     *
+     * Every terminal payload defaults to exact identity.  Hidden and logits
+     * policies are independent because MTP transactions may publish a hidden
+     * mailbox while an ordinary partial-prefix suffix only recomputes logits.
+     */
     struct MTPRuntimeSnapshotComparisonOptions
     {
         /**
@@ -61,9 +173,36 @@ namespace llaminar2
          * remains decode-equivalent.
          */
         bool compare_main_kv_payload_hashes = true;
+
+        /** Comparison contract used when main KV payload hashing is enabled. */
+        MTPMainKVPayloadComparisonPolicy main_kv_payload_policy =
+            MTPMainKVPayloadComparisonPolicy::ExactBytes;
+
+        /**
+         * Number of leading logical tokens that must remain byte-identical.
+         *
+         * A non-negative value is mandatory for the placement-aware policy;
+         * the remaining live tokens form the numerically compared suffix.
+         */
+        int main_kv_exact_prefix_tokens = -1;
+
+        /** Minimum cosine for every recomputed K and V suffix payload. */
+        double main_kv_suffix_min_cosine =
+            kDefaultPlacementAwareMainKVSuffixMinimumCosine;
+
         bool compare_shifted_mtp_kv = true;
         bool compare_gdn_hashes = true;
         bool compare_gdn_values_if_available = false;
+        MTPTerminalPayloadComparisonPolicy terminal_hidden_policy =
+            MTPTerminalPayloadComparisonPolicy::ExactBytes;
+        /** Minimum full-row cosine after a proven MoE placement change. */
+        double terminal_hidden_min_cosine =
+            kDefaultPlacementAwareTerminalPayloadMinimumCosine;
+        MTPTerminalPayloadComparisonPolicy terminal_logits_policy =
+            MTPTerminalPayloadComparisonPolicy::ExactBytes;
+        /** Minimum full-logits-row cosine after a proven placement change. */
+        double terminal_logits_min_cosine =
+            kDefaultPlacementAwareTerminalPayloadMinimumCosine;
         double gdn_relative_l2_tolerance = 1e-4;
         double gdn_max_abs_tolerance = 1e-4;
         double gdn_min_cosine = 0.999999;

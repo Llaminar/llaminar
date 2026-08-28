@@ -45,6 +45,8 @@ namespace llaminar2
         AwaitingServiceEvidence,
         ExchangingServiceReadiness,
         ExchangingServiceEvidence,
+        /** Profiles exist, but calibration-era routing demand is still draining. */
+        RebasingRoutingEvidence,
         Complete,
         Failed,
         Stopped,
@@ -59,6 +61,8 @@ namespace llaminar2
         std::uint64_t service_snapshot_contentions = 0;
         std::uint64_t incomplete_service_snapshots = 0;
         std::uint64_t profiles_composed = 0;
+        std::uint64_t routing_evidence_rebase_polls = 0;
+        std::uint64_t routing_evidence_rebases = 0;
         std::uint64_t certifications_installed = 0;
         std::uint64_t detached_profiles_completed = 0;
         std::uint64_t fatal_failures = 0;
@@ -208,16 +212,31 @@ namespace llaminar2
         void beginServiceReadinessRound(
             MoEOverlayServiceEvidenceReadiness local_readiness);
 
-        /** @brief Compose and install one complete canonical service matrix. */
-        void installCompleteEvidence(
+        /** @brief Compose one complete canonical profile bundle. */
+        void composeCompleteEvidence(
             std::vector<MoEOverlayParticipantLayerServiceTotals> rows);
 
         /**
-         * @brief Publish exact phase/backend crossovers without rejecting them.
-         * @param profile Complete measured tier/layer service matrix.
+         * @brief Release-publish successful terminal certification.
+         *
+         * Host profiles reach this edge only after calibration-era demand was
+         * asynchronously drained and discarded. Detached device profiles
+         * instead rely on the device controller's captured rebase epoch.
+         */
+        void markComplete();
+
+        /**
+         * @brief Publish the certified participant matrix and tier crossovers.
+         *
+         * Exact participant rows make every later placement decision
+         * reproducible from PerfStats evidence. Tier-priority crossovers remain
+         * diagnostics rather than rejection rules because measured service is
+         * the live economy authority.
+         *
+         * @param profile Complete measured participant/tier/layer matrix.
          * @param plan Immutable integer-priority and capacity authority.
          */
-        void recordServicePriorityCrossovers(
+        void recordCertifiedServiceEconomy(
             const MoERoutedTierServiceProfile &profile,
             const MoERoutedExpertPlacementPlan &plan) const;
 
@@ -240,6 +259,15 @@ namespace llaminar2
         mutable std::mutex detached_profiles_mutex_;
         std::optional<MoEOverlayCertifiedEconomyProfiles>
             detached_profiles_;
+        /**
+         * Complete host profiles withheld until the routing histogram rebase.
+         *
+         * The maintenance worker is the sole reader/writer. Keeping this value
+         * separate from the authority makes it impossible for Dynamic policy
+         * to consume the service-calibration request distribution.
+         */
+        std::optional<MoEOverlayCertifiedEconomyProfiles>
+            pending_host_profiles_;
         std::optional<MoEOverlaySealedMigrationMeasurements>
             expanded_migration_measurements_;
         /** Snapshot retained across the readiness vote and service all-gather. */
@@ -259,6 +287,8 @@ namespace llaminar2
         std::atomic<std::uint64_t> service_snapshot_contentions_{0};
         std::atomic<std::uint64_t> incomplete_service_snapshots_{0};
         std::atomic<std::uint64_t> profiles_composed_{0};
+        std::atomic<std::uint64_t> routing_evidence_rebase_polls_{0};
+        std::atomic<std::uint64_t> routing_evidence_rebases_{0};
         std::atomic<std::uint64_t> certifications_installed_{0};
         std::atomic<std::uint64_t> detached_profiles_completed_{0};
         std::atomic<std::uint64_t> fatal_failures_{0};

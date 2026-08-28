@@ -26,6 +26,55 @@ namespace llaminar2
     {
     }
 
+    bool MTPSpeculativeStatePublicationStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!stream)
+        {
+            LOG_ERROR(
+                "[MTPSpeculativeStatePublicationStage] Graph preparation "
+                "requires an exact non-null producer stream");
+            return false;
+        }
+        if (!params_.moe_histogram_publishers.empty() &&
+            stream != params_.moe_histogram_publication_stream)
+        {
+            LOG_ERROR(
+                "[MTPSpeculativeStatePublicationStage] Graph preparation "
+                "received a foreign histogram publication stream"
+                << " stream=" << stream
+                << " expected="
+                << params_.moe_histogram_publication_stream);
+            return false;
+        }
+        setGPUStream(stream);
+        for (IMoEGroupedVerifierHistogramPublisher *publisher :
+            params_.moe_histogram_publishers)
+        {
+            if (!publisher ||
+                publisher->groupedVerifierHistogramRole() !=
+                    MoEGroupedVerifierHistogramRole::DeferredAcceptedRows ||
+                !publisher->prepareGroupedVerifierHistogramProducer(stream))
+            {
+                LOG_ERROR(
+                    "[MTPSpeculativeStatePublicationStage] Failed to prepare "
+                    "a deferred MoE histogram producer"
+                    << " publisher="
+                    << (publisher
+                            ? publisher->groupedVerifierHistogramPublisherName()
+                            : std::string_view{"null"})
+                    << " layer="
+                    << (publisher
+                            ? publisher->groupedVerifierHistogramLayerIndex()
+                            : -1));
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool MTPSpeculativeStatePublicationStage::validate() const
     {
         if (!params_.device_id.is_gpu() || !params_.backend)
@@ -124,6 +173,13 @@ namespace llaminar2
             LOG_ERROR("[MTPSpeculativeStatePublicationStage] Publication graph contains a null verifier stage binding");
             return false;
         }
+        if (params_.moe_histogram_publishers.empty() !=
+            (params_.moe_histogram_publication_stream == nullptr))
+        {
+            LOG_ERROR(
+                "[MTPSpeculativeStatePublicationStage] Deferred MoE publishers and their table-owned stream must be bound together");
+            return false;
+        }
         return true;
     }
 
@@ -133,7 +189,8 @@ namespace llaminar2
         for (IMoEGroupedVerifierHistogramPublisher *publisher :
              params_.moe_histogram_publishers)
         {
-            if (!publisher->requiresCommittedGroupedVerifierHistogramPublication() ||
+            if (publisher->groupedVerifierHistogramRole() !=
+                    MoEGroupedVerifierHistogramRole::DeferredAcceptedRows ||
                 !publisher->enqueueCommittedGroupedVerifierHistograms(
                     params_.accepted_state_counts_device,
                     params_.publication_ok_flags_device,
@@ -572,6 +629,8 @@ namespace llaminar2
                    other.max_state_commit_rows &&
                self.moe_histogram_publishers ==
                    other.moe_histogram_publishers &&
+               self.moe_histogram_publication_stream ==
+                   other.moe_histogram_publication_stream &&
                self.main_kv_bindings == other.main_kv_bindings &&
                self.publish_shifted_kv == other.publish_shifted_kv &&
                self.shifted_kv_caches == other.shifted_kv_caches &&

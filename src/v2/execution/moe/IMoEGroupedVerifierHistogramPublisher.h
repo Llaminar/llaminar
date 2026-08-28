@@ -18,6 +18,28 @@
 namespace llaminar2
 {
     /**
+     * @brief Explicit lifecycle role at a grouped-verifier history boundary.
+     *
+     * Every routed MoE layer in a main verifier graph selects exactly one
+     * router or expert stage as its history boundary.  Static placement still
+     * declares that boundary, but deliberately performs no history update.
+     * Dynamic/Observe placement retains physical verifier routes there and
+     * publishes only rows accepted by the later state transaction.  Keeping
+     * `NotOwner` distinct from `StaticNoPublication` lets graph validation
+     * reject a missing Dynamic publisher without pretending that Static needs
+     * an unused stream or histogram bank.
+     */
+    enum class MoEGroupedVerifierHistogramRole : std::uint8_t
+    {
+        /** This stage is not the selected per-layer history boundary. */
+        NotOwner,
+        /** This is the boundary, but Static placement owns no route history. */
+        StaticNoPublication,
+        /** This boundary defers production history until acceptance is known. */
+        DeferredAcceptedRows,
+    };
+
+    /**
      * @brief Device-ledger owner participating in accepted MTP publication.
      *
      * Exactly one implementation must be selected for each routed MoE layer in
@@ -33,13 +55,18 @@ namespace llaminar2
         virtual ~IMoEGroupedVerifierHistogramPublisher() = default;
 
         /**
-         * @brief Return whether this concrete graph stage owns deferred demand.
+         * @brief Return this stage's explicit per-layer history role.
          *
-         * @return true only for a main grouped-verifier stage whose retained
-         *         ledger must be consumed by accepted-state publication.
+         * Exactly one router or expert stage per routed verifier layer must
+         * return a role other than @ref MoEGroupedVerifierHistogramRole::NotOwner.
+         * A deferred role requires a complete table-owned publication stream;
+         * a static role forbids one and makes the accepted-state transaction a
+         * deliberate no-op for MoE demand.
+         *
+         * @return Typed ownership/publication role for this concrete stage.
          */
-        [[nodiscard]] virtual bool
-        requiresCommittedGroupedVerifierHistogramPublication() const noexcept = 0;
+        [[nodiscard]] virtual MoEGroupedVerifierHistogramRole
+        groupedVerifierHistogramRole() const noexcept = 0;
 
         /**
          * @brief Return the model layer represented by this retained ledger.
@@ -58,6 +85,33 @@ namespace llaminar2
         groupedVerifierHistogramPublisherName() const noexcept = 0;
 
         /**
+         * @brief Return the sole model-lifetime accepted-publication stream.
+         *
+         * The runtime-table authority creates and admits this stream before
+         * asynchronous histogram maintenance can seal its producer topology.
+         * Every accepted-state graph identity must borrow the returned stream;
+         * creating an identity-local replacement is an invalid lifecycle.
+         *
+         * @return Exact non-null CUDA/HIP stream for an active publisher.
+         */
+        [[nodiscard]] virtual void *
+        groupedVerifierHistogramPublicationStream() const = 0;
+
+        /**
+         * @brief Admit the exact accepted-state producer before graph capture.
+         *
+         * The stream must equal @ref groupedVerifierHistogramPublicationStream.
+         * Model setup has already allocated its reusable events and installed
+         * the initialization edge, so this call is an allocation-free identity
+         * certification at the enclosing graph's `prepareGraphLaunch()` edge.
+         *
+         * @param producer_stream Exact non-null CUDA/HIP capture/replay stream.
+         * @return true when the producer identity is permanently admitted.
+         */
+        virtual bool prepareGroupedVerifierHistogramProducer(
+            void *producer_stream) = 0;
+
+        /**
          * @brief Enqueue accepted-row histogram publication on the exact stream.
          *
          * The implementation joins its immutable-address route ledger with the
@@ -69,6 +123,10 @@ namespace llaminar2
          * @param request_count Number of request-major verifier groups.
          * @param rows_per_request Physical verifier rows in each request group.
          * @param producer_stream Exact CUDA/HIP accepted-publication stream.
+         * The implementation must also validate that @p producer_stream was
+         * admitted by @ref prepareGroupedVerifierHistogramProducer; that
+         * validation performs no backend operation and is capture-safe.
+         *
          * @return true after the graph-capturable commit was enqueued.
          */
         virtual bool enqueueCommittedGroupedVerifierHistograms(

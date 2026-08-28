@@ -17,6 +17,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -27,6 +28,265 @@
 // Forward declarations
 namespace llaminar2
 {
+
+    /**
+     * @brief Ownership boundary certified by a device-memory reclaim request.
+     *
+     * RetiredExecutionTopology keeps model weights resident while releasing
+     * graph/arena/runtime caches. ExclusiveModelRetirement additionally proves
+     * that the caller dropped the final model allocation owners by comparing
+     * the exact canonical allocator ledger before release with the empty
+     * ledger required immediately before native runtime reset.
+     */
+    enum class DeviceMemoryReclamationIntent : std::uint8_t
+    {
+        RetiredExecutionTopology,
+        ExclusiveModelRetirement,
+    };
+
+    /** @return Stable diagnostic spelling for a reclamation intent. */
+    [[nodiscard]] const char *to_string(
+        DeviceMemoryReclamationIntent intent) noexcept;
+
+    /**
+     * @brief Exact model-lifetime allocation BOM for one physical GPU.
+     *
+     * These are allocations whose owners survive ordinary graph teardown and
+     * are released only when the final reusable model contract is destroyed.
+     * Admission publishes this value; allocator telemetry and a generic safety
+     * reserve are deliberately not authorities for it.
+     */
+    struct ModelDeviceMemoryRetention
+    {
+        DeviceId device = DeviceId::invalid(); ///< Exact physical endpoint.
+        /** Model-owned prepared weights; zero for a workspace-only owner. */
+        size_t prepared_weight_bytes = 0u;
+        /** Sealed workspace backing; zero for a weights-only participant. */
+        size_t reusable_workspace_bytes = 0u;
+
+        /**
+         * @return Checked total bytes owned across the two disjoint classes.
+         * @throws std::overflow_error when the BOM cannot be represented.
+         */
+        [[nodiscard]] size_t totalBytes() const;
+
+        /**
+         * @return Whether this names one GPU and a positive representable BOM.
+         * Either disjoint allocation class may be zero; their sum may not be.
+         */
+        [[nodiscard]] bool valid() const noexcept;
+
+        friend bool operator==(
+            const ModelDeviceMemoryRetention &,
+            const ModelDeviceMemoryRetention &) = default;
+    };
+
+    /**
+     * @brief Move-only proof that an exclusive model retirement has begun.
+     *
+     * TransferEngine captures the canonical backend allocation count and exact
+     * byte sum while the final model owner is still live. Driver-visible free
+     * memory is captured alongside it only for diagnostics because fresh
+     * runtime metadata makes that value unsuitable as byte-exact authority.
+     * The owner must then be destroyed before the ticket is consumed by
+     * `completeExclusiveModelRetirement()`. Keeping construction private
+     * prevents callers from inventing a baseline after allocations disappear.
+     */
+    class ExclusiveModelRetirementTicket final
+    {
+    public:
+        ExclusiveModelRetirementTicket(const ExclusiveModelRetirementTicket &) = delete;
+        ExclusiveModelRetirementTicket &operator=(const ExclusiveModelRetirementTicket &) = delete;
+
+        /** @brief Transfer the one pending completion obligation. */
+        ExclusiveModelRetirementTicket(
+            ExclusiveModelRetirementTicket &&other) noexcept
+            : retention_(other.retention_),
+              driver_free_bytes_before_owner_release_(
+                  other.driver_free_bytes_before_owner_release_),
+              canonical_allocations_before_owner_release_(
+                  other.canonical_allocations_before_owner_release_),
+              canonical_allocation_bytes_before_owner_release_(
+                  other.canonical_allocation_bytes_before_owner_release_),
+              valid_(std::exchange(other.valid_, false))
+        {
+        }
+
+        /* A pending proof cannot be overwritten by move-assignment. */
+        ExclusiveModelRetirementTicket &operator=(
+            ExclusiveModelRetirementTicket &&) = delete;
+
+        /** @return Exact GPU whose final model owner must be destroyed. */
+        [[nodiscard]] DeviceId device() const noexcept
+        {
+            return retention_.device;
+        }
+
+        /** @return Exact admitted bytes that completion must make free. */
+        [[nodiscard]] size_t expectedRetiredBytes() const
+        {
+            return retention_.totalBytes();
+        }
+
+        /** @return Driver-visible free bytes observed before owner release. */
+        [[nodiscard]] size_t driverFreeBytesBeforeOwnerRelease() const noexcept
+        {
+            return driver_free_bytes_before_owner_release_;
+        }
+
+        /** @return Canonical allocation owners observed before model release. */
+        [[nodiscard]] size_t
+        canonicalAllocationsBeforeOwnerRelease() const noexcept
+        {
+            return canonical_allocations_before_owner_release_;
+        }
+
+        /** @return Exact canonical allocation bytes before model release. */
+        [[nodiscard]] size_t
+        canonicalAllocationBytesBeforeOwnerRelease() const noexcept
+        {
+            return canonical_allocation_bytes_before_owner_release_;
+        }
+
+        /** @return Whether the ticket still names a pending completion. */
+        [[nodiscard]] bool valid() const noexcept { return valid_; }
+
+    private:
+        friend class TransferEngine;
+
+        /** @brief Construct only from a live backend observation. */
+        ExclusiveModelRetirementTicket(
+            ModelDeviceMemoryRetention retention,
+            size_t driver_free_bytes_before_owner_release,
+            size_t canonical_allocations_before_owner_release,
+            size_t canonical_allocation_bytes_before_owner_release) noexcept
+            : retention_(std::move(retention)),
+              driver_free_bytes_before_owner_release_(
+                  driver_free_bytes_before_owner_release),
+              canonical_allocations_before_owner_release_(
+                  canonical_allocations_before_owner_release),
+              canonical_allocation_bytes_before_owner_release_(
+                  canonical_allocation_bytes_before_owner_release),
+              valid_(true)
+        {
+        }
+
+        ModelDeviceMemoryRetention retention_; ///< Exact admission-owned BOM.
+        size_t driver_free_bytes_before_owner_release_ = 0u; ///< Diagnostic.
+        size_t canonical_allocations_before_owner_release_ = 0u; ///< Owners.
+        size_t canonical_allocation_bytes_before_owner_release_ = 0u; ///< Bytes.
+        bool valid_ = false; ///< False after move or completion.
+    };
+
+    /**
+     * @brief Typed request for scoped CUDA/HIP cache reclamation.
+     *
+     * Factory construction makes a CPU endpoint or invalid device
+     * unrepresentable. This request never resets a runtime generation or
+     * claims model ownership; exclusive model retirement uses the distinct
+     * move-only ticket above so the two lifecycles cannot be confused.
+     */
+    class DeviceMemoryReclamationRequest final
+    {
+    public:
+        /** @return A request made after all execution-only owners retire. */
+        [[nodiscard]] static DeviceMemoryReclamationRequest
+        retiredExecutionTopology(DeviceId device);
+
+        /** @return Exact target GPU. */
+        [[nodiscard]] DeviceId device() const noexcept { return device_; }
+
+        /** @return Scoped cache-reclamation ownership boundary. */
+        [[nodiscard]] DeviceMemoryReclamationIntent intent() const noexcept
+        {
+            return DeviceMemoryReclamationIntent::RetiredExecutionTopology;
+        }
+
+    private:
+        /** @brief Construct only through the validating named factories. */
+        explicit DeviceMemoryReclamationRequest(DeviceId device) noexcept
+            : device_(device)
+        {
+        }
+
+        DeviceId device_; ///< Exact cache/model allocation endpoint.
+    };
+
+    /**
+     * @brief Immutable proof emitted after scoped CUDA/HIP cache reclamation.
+     *
+     * A receipt is returned only when every required backend operation
+     * succeeds. Exclusive model retirement additionally carries the canonical
+     * allocator release and native runtime-generation reset proofs. Driver
+     * free-memory and runtime cache observations remain diagnostics; they are
+     * deliberately not used as byte-exact ownership authority.
+     */
+    struct DeviceMemoryReclamationReceipt
+    {
+        DeviceId device = DeviceId::invalid(); ///< Exact reclaimed endpoint.
+        DeviceMemoryReclamationIntent intent =
+            DeviceMemoryReclamationIntent::RetiredExecutionTopology;
+        size_t expected_retired_bytes = 0u; ///< Exact admitted allocation BOM.
+        size_t driver_free_bytes_before_owner_release = 0u; ///< Diagnostic.
+        size_t canonical_allocations_before_owner_release = 0u; ///< Owners before.
+        size_t canonical_allocation_bytes_before_owner_release = 0u; ///< Bytes before.
+        size_t canonical_allocations_before_runtime_reset = 0u; ///< Owners after.
+        size_t canonical_allocation_bytes_before_runtime_reset = 0u; ///< Bytes after.
+        size_t driver_free_bytes_before = 0u; ///< Driver free bytes before trim.
+        size_t driver_free_bytes_after = 0u; ///< Driver free bytes after trim.
+        size_t graph_used_bytes_before = 0u; ///< Live graph allocation bytes.
+        size_t graph_used_bytes_after = 0u; ///< Live graph bytes after trim.
+        size_t graph_reserved_bytes_before = 0u; ///< Graph backing before trim.
+        size_t graph_reserved_bytes_after = 0u; ///< Graph backing after trim.
+        size_t async_pool_used_bytes_before = 0u; ///< Live pool bytes before.
+        size_t async_pool_used_bytes_after = 0u; ///< Live pool bytes after.
+        size_t async_pool_reserved_bytes_before = 0u; ///< Pool backing before.
+        size_t async_pool_reserved_bytes_after = 0u; ///< Pool backing after.
+        bool graph_accounting_available = false; ///< Graph attributes were read.
+        bool async_pool_accounting_available = false; ///< Pool attributes were read.
+        bool graph_trim_invoked = false; ///< Runtime graph trim was executed.
+        bool async_pool_trim_invoked = false; ///< Runtime pool trim was executed.
+        std::uint64_t retired_context_generation = 0u; ///< Destroyed worker generation.
+        bool runtime_reset_invoked = false; ///< Native device reset was executed.
+        std::uint64_t retired_runtime_generation = 0u; ///< Invalidated runtime generation.
+        std::uint64_t active_runtime_generation = 0u; ///< Fresh runtime generation.
+        size_t runtime_driver_free_bytes_before = 0u; ///< Free bytes before reset.
+        size_t runtime_driver_free_bytes_after = 0u; ///< Free bytes after reset.
+
+        /** @return Non-negative driver-visible free-memory increase. */
+        [[nodiscard]] size_t reclaimedDriverBytes() const noexcept
+        {
+            return driver_free_bytes_after > driver_free_bytes_before
+                       ? driver_free_bytes_after - driver_free_bytes_before
+                       : 0u;
+        }
+
+        /** @return Diagnostic driver-free delta since owner release. */
+        [[nodiscard]] size_t
+        driverBytesVisibleSinceOwnerRelease() const noexcept
+        {
+            if (intent !=
+                DeviceMemoryReclamationIntent::ExclusiveModelRetirement)
+            {
+                return reclaimedDriverBytes();
+            }
+            return driver_free_bytes_after >
+                           driver_free_bytes_before_owner_release
+                       ? driver_free_bytes_after -
+                             driver_free_bytes_before_owner_release
+                       : 0u;
+        }
+
+        /** @return Exact canonical bytes released between ticket and reset. */
+        [[nodiscard]] size_t releasedCanonicalBytes() const noexcept
+        {
+            return canonical_allocation_bytes_before_owner_release >
+                           canonical_allocation_bytes_before_runtime_reset
+                       ? canonical_allocation_bytes_before_owner_release -
+                             canonical_allocation_bytes_before_runtime_reset
+                       : 0u;
+        }
+    };
     class IBackend;
     class IGPUGraphCapture;
     class ITensor;
@@ -572,6 +832,61 @@ namespace llaminar2
         /// (for testing with MockBackend).
         using BackendResolver = IBackend *(*)(DeviceId);
         explicit TransferEngine(BackendResolver resolver) : resolve_(resolver) {}
+
+        /**
+         * @brief Trim unused GPU runtime caches and certify the memory delta.
+         *
+         * The caller must first complete the ownership transition named by
+         * @p request.  No stream/device synchronization or whole-device reset
+         * is performed.  The method throws rather than returning a partial
+         * receipt when the backend cannot account for or trim its caches.
+         *
+         * @throws std::runtime_error for missing/unsupported backend, trim
+         * failure, or internally inconsistent accounting.
+         */
+        [[nodiscard]] DeviceMemoryReclamationReceipt reclaimDeviceMemory(
+            const DeviceMemoryReclamationRequest &request) const;
+
+        /**
+         * @brief Capture exact canonical allocator ownership before teardown.
+         *
+         * The caller must own the final reusable model contract exclusively.
+         * No owner is released by this method; it binds the admitted BOM to a
+         * canonical allocation-ledger observation that cannot be forged later.
+         * Driver free memory is retained only as supporting diagnostics.
+         *
+         * @param retention Exact per-device model-lifetime allocation BOM.
+         * @return Move-only obligation to release owners and certify recovery.
+         * @throws std::invalid_argument for a malformed or zero-byte BOM.
+         * @throws std::runtime_error when no backend can observe the device.
+         */
+        [[nodiscard]] ExclusiveModelRetirementTicket
+        beginExclusiveModelRetirement(
+            const ModelDeviceMemoryRetention &retention) const;
+
+        /**
+         * @brief Retire the worker generation and prove a released model BOM.
+         *
+         * The final model and reusable-workspace owners must be gone before
+         * this call. Exclusive generation retirement destroys completed
+         * streams, events, and library handles before certification. It then
+         * performs an exclusive native runtime-generation reset, which is the
+         * only reliable way to release HIP direct-dispatch handler references
+         * retained after `hipFree`. CUDA implements the same contract for
+         * backend symmetry and reliable JIT model replacement. Success requires
+         * that the pre-release canonical byte total cover the exact admitted
+         * BOM and that the same ledger be empty immediately before reset.
+         * Native reset subsumes cache trimming; the exclusive path therefore
+         * does not create a fresh runtime merely to trim it again.
+         *
+         * @param ticket Live ticket captured before owner release.
+         * @return Complete backend and driver-memory receipt.
+         * @throws std::logic_error for a moved or already consumed ticket.
+         * @throws std::runtime_error for incomplete reclamation.
+         */
+        [[nodiscard]] DeviceMemoryReclamationReceipt
+        completeExclusiveModelRetirement(
+            ExclusiveModelRetirementTicket &&ticket) const;
 
         /**
          * @brief Declare an immutable pinned-buffer identity without GPU work.

@@ -1244,11 +1244,11 @@ namespace llaminar2
             }
 
             auto gate_engine = KernelFactory::prepareExpertGemmLocal(
-                ctx.expert_gate_views[e].get(), ctx.device_id);
+                ctx.expert_gate_views[e], ctx.device_id);
             auto up_engine = KernelFactory::prepareExpertGemmLocal(
-                ctx.expert_up_views[e].get(), ctx.device_id);
+                ctx.expert_up_views[e], ctx.device_id);
             auto down_engine = KernelFactory::prepareExpertGemmLocal(
-                ctx.expert_down_views[e].get(), ctx.device_id);
+                ctx.expert_down_views[e], ctx.device_id);
 
             if (!gate_engine || !up_engine || !down_engine)
             {
@@ -3767,7 +3767,6 @@ namespace llaminar2
                     layer_idx,
                     capacity,
                     std::move(*specs),
-                    gpuDirectRebalanceVramSafetyMarginBytes(),
                     /*transfer_capacity=*/0);
             }
             catch (const std::exception &ex)
@@ -3826,8 +3825,7 @@ namespace llaminar2
                         dst_ctx.device_id,
                         dst_gpu_ordinal,
                         capacity,
-                        *specs,
-                        gpuDirectRebalanceVramSafetyMarginBytes());
+                        *specs);
                     transfer_staging_pools->push_back(pool);
                     allocation_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                Clock::now() - pool_start)
@@ -4614,7 +4612,6 @@ namespace llaminar2
                     layer_idx,
                     capacity,
                     std::move(*specs),
-                    gpuDirectRebalanceVramSafetyMarginBytes(),
                     GpuExpertSlotPool::recommendedTransferCapacity(
                         dst_ctx.num_experts,
                         experts_to_copy.size()));
@@ -4877,8 +4874,6 @@ namespace llaminar2
             {
                 const auto alloc_start = Clock::now();
                 expert_orchestrator = std::make_shared<LoadOrchestrator>(backend);
-                expert_orchestrator->setVramPreflightSafetyMarginBytes(
-                    gpuDirectRebalanceVramSafetyMarginBytes());
                 expert_orchestrator->addDevice(dst_gpu_ordinal);
 
                 for (const auto &grp : groups)

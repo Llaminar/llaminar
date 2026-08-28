@@ -22,6 +22,7 @@
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
 #include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
+#include "tensors/TensorKernels.h"
 #include "tensors/VnniPackContext.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
@@ -33,6 +34,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +44,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 extern "C"
@@ -1031,6 +1034,261 @@ namespace llaminar2
         }
 
         /**
+         * @test A shared maintenance thread restores the lane's exact CUDA device.
+         *
+         * The source arrays and auxiliary stream belong to device one, while
+         * the calling thread is deliberately switched back to device zero
+         * immediately before submission.  This is the production shape when a
+         * rank progresses several GPU participants.  The remote projection
+         * lane must select its own device without synchronizing and emit the
+         * same final CPU bytes as the device-free packer.
+         */
+        TEST_F(
+            CUDAExpertTierWeightKernelsTest,
+            SecondaryDeviceRemoteProjectionRestoresOwningDeviceBeforeRepack)
+        {
+            int device_count = 0;
+            ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+            if (device_count < 2)
+                GTEST_SKIP() << "Secondary-device projection requires two CUDA devices";
+
+            constexpr int device_ordinal = 1;
+            constexpr int N = 70;
+            constexpr int K = 96;
+            constexpr std::uint32_t units_per_chunk = 2;
+            ASSERT_EQ(cudaSetDevice(device_ordinal), cudaSuccess);
+
+            const auto &format = test::quantizedVerifierFormats().at(18);
+            ASSERT_STREQ(format.label, "Q8_0");
+            auto tensor = format.create({N, K}, 0xc0da51ecu);
+            ASSERT_NE(tensor, nullptr);
+            const HostGpuExpertPackedProjection source =
+                packProductionGpuProjection(*tensor);
+            cpu::native_vnni::CPUNativeVNNIPackedWeights expected_cpu;
+            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+                tensor.get(), expected_cpu));
+            const auto *source_format =
+                native_vnni_formats::forSourceIdentity(
+                    source.source_codebook_id,
+                    source.is_superblock);
+            ASSERT_NE(source_format, nullptr);
+            const auto manifest = makeGpuToCpuExpertTierWeightStreamManifest(
+                *source_format,
+                N,
+                K,
+                /*epoch=*/7701,
+                /*layer_idx=*/4,
+                /*expert_id=*/9,
+                ExpertTierWeightProjection::Up,
+                units_per_chunk);
+            const auto layout = manifest.deviceLayout();
+            ASSERT_TRUE(layout.valid());
+
+            TestCUDABuffer<std::uint8_t> source_payload(source.payload.size());
+            TestCUDABuffer<std::uint16_t> source_scales(source.scales.size());
+            TestCUDABuffer<std::uint16_t> source_mins(source.mins.size());
+            TestCUDABuffer<std::uint32_t> source_emins(source.emins.size());
+            ASSERT_EQ(source_payload.upload(source.payload), cudaSuccess);
+            ASSERT_EQ(source_scales.upload(source.scales), cudaSuccess);
+            ASSERT_EQ(source_mins.upload(source.mins), cudaSuccess);
+            ASSERT_EQ(source_emins.upload(source.emins), cudaSuccess);
+            const ExpertTierGpuConstProjectionView source_view{
+                .payload = source_payload.data(),
+                .scales = source_scales.data(),
+                .mins = source_mins.data(),
+                .emins = source_emins.data(),
+                .payload_bytes = source_payload.bytes(),
+                .scales_bytes = source_scales.bytes(),
+                .mins_bytes = source_mins.bytes(),
+                .emins_bytes = source_emins.bytes(),
+            };
+            ASSERT_TRUE(source_view.validFor(layout));
+
+            auto lane = std::make_shared<MoEOverlayGpuRemoteProjectionLane>(
+                MoEOverlayGpuRemoteProjectionLane::Config{
+                    .device = DeviceId::cuda(device_ordinal),
+                    .staging_capacity_bytes =
+                        layout.chunkBytes(units_per_chunk),
+                    .lane_name = "cuda_secondary_device_remote_projection",
+                    .perf_device = "cuda:1",
+                });
+            std::string error;
+            ASSERT_TRUE(lane->materialize(&error)) << error;
+            const int owner = 1;
+            ASSERT_TRUE(lane->tryAcquire(&owner));
+            ASSERT_TRUE(lane->bindSourceReadiness(
+                &owner,
+                ExpertTierSourceReadiness::publishedResidencyBank(7701),
+                &error)) << error;
+
+            /* Reproduce a maintenance thread last used by another device. */
+            ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+            const std::uint32_t unit_count = std::min<std::uint32_t>(
+                units_per_chunk, layout.unit_count);
+            const std::size_t bytes = layout.chunkBytes(unit_count);
+            EXPECT_TRUE(lane->submitGpuToCpuRepack(
+                &owner,
+                layout,
+                source_view,
+                /*first_unit=*/0,
+                unit_count,
+                &error)) << error;
+
+            auto progress = MoEOverlayGpuRemoteLaneProgress::Pending;
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (progress == MoEOverlayGpuRemoteLaneProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                progress = lane->poll(&owner, &error);
+                std::this_thread::yield();
+            }
+            EXPECT_EQ(progress, MoEOverlayGpuRemoteLaneProgress::Ready)
+                << error;
+            if (progress == MoEOverlayGpuRemoteLaneProgress::Ready)
+            {
+                const auto observed = lane->pinnedOutput(&owner, bytes);
+                ASSERT_EQ(observed.size(), bytes);
+                EXPECT_TRUE(std::equal(
+                    observed.begin(),
+                    observed.end(),
+                    expected_cpu.native_interleaved.begin()));
+            }
+            int selected_device = -1;
+            ASSERT_EQ(cudaGetDevice(&selected_device), cudaSuccess);
+            EXPECT_EQ(selected_device, device_ordinal);
+            EXPECT_TRUE(lane->release(&owner, &error)) << error;
+
+            const auto stats = lane->stats();
+            EXPECT_EQ(stats.gpu_to_cpu_repack_chunks, 1u);
+            EXPECT_EQ(stats.inference_stream_waits, 0u);
+            EXPECT_EQ(stats.blocking_synchronizations, 0u);
+        }
+
+        /**
+         * @test Every floating precision uses the event-polled contiguous lane.
+         *
+         * An awkward 257-byte staging capacity forces multiple chunks for
+         * FP16, BF16, and FP32. The producer upload is ordered by an explicit
+         * event on a different non-default stream; both directions must retain
+         * every source byte and publish production PerfStats evidence.
+         */
+        TEST_F(
+            CUDAExpertTierWeightKernelsTest,
+            ContiguousFloatingLaneRoundTripsAllPrecisionsWithoutInferenceWaits)
+        {
+            ScopedPerfStats perf_stats;
+            constexpr int n = 19;
+            constexpr int k = 23;
+            constexpr std::size_t staging_bytes = 257;
+            const std::array<std::pair<TensorType, std::size_t>, 3> formats{
+                std::pair{TensorType::FP16, sizeof(std::uint16_t)},
+                std::pair{TensorType::BF16, sizeof(std::uint16_t)},
+                std::pair{TensorType::FP32, sizeof(float)},
+            };
+
+            IBackend *backend = getCUDABackend();
+            ASSERT_NE(backend, nullptr);
+            ExpertTierWeightTransferLane lane({
+                .device = DeviceId::cuda(0),
+                .staging_capacity_bytes = staging_bytes,
+                .lane_name = "cuda_floating_tier_round_trip",
+                .perf_device = "cuda:0",
+            });
+            std::string error;
+            ASSERT_TRUE(lane.materialize(&error)) << error;
+
+            for (const auto [type, element_bytes] : formats)
+            {
+                const std::size_t bytes =
+                    static_cast<std::size_t>(n) * k * element_bytes;
+                std::vector<std::uint8_t> source(bytes);
+                for (std::size_t byte = 0; byte < source.size(); ++byte)
+                {
+                    source[byte] = static_cast<std::uint8_t>(
+                        (byte * 131u + element_bytes * 17u) & 0xffu);
+                }
+
+                TestCUDABuffer<std::uint8_t> gpu_source(bytes);
+                TestCUDAStream producer_stream;
+                ASSERT_EQ(
+                    cudaMemcpyAsync(
+                        gpu_source.data(),
+                        source.data(),
+                        bytes,
+                        cudaMemcpyHostToDevice,
+                        producer_stream.native()),
+                    cudaSuccess);
+                void *source_ready = backend->createEvent(0);
+                ASSERT_NE(source_ready, nullptr);
+                ASSERT_TRUE(backend->recordEvent(
+                    source_ready, 0, producer_stream.opaque()));
+
+                const ContiguousFloatingPointWeightDescriptor
+                    source_descriptor{
+                        .data = gpu_source.data(),
+                        .type = type,
+                        .n = n,
+                        .k = k,
+                        .bytes = bytes,
+                    };
+                std::vector<std::uint8_t> observed_cpu(bytes);
+                ASSERT_TRUE(lane.startGpuToCpuContiguous(
+                    source_descriptor,
+                    observed_cpu,
+                    ExpertTierSourceReadiness::producerEvent(source_ready),
+                    &error)) << error;
+                ASSERT_EQ(
+                    pollLaneToCompletion(lane),
+                    ExpertTierWeightTransferProgress::Ready);
+                EXPECT_EQ(observed_cpu, source);
+                backend->destroyEvent(source_ready, 0);
+
+                TestCUDABuffer<std::uint8_t> gpu_destination(bytes);
+                const ContiguousFloatingPointWeightDescriptor
+                    destination_descriptor{
+                        .data = gpu_destination.data(),
+                        .type = type,
+                        .n = n,
+                        .k = k,
+                        .bytes = bytes,
+                    };
+                ASSERT_TRUE(lane.startCpuToGpuContiguous(
+                    source, destination_descriptor, &error)) << error;
+                ASSERT_EQ(
+                    pollLaneToCompletion(lane),
+                    ExpertTierWeightTransferProgress::Ready);
+                std::vector<std::uint8_t> observed_gpu;
+                ASSERT_EQ(
+                    gpu_destination.download(observed_gpu), cudaSuccess);
+                EXPECT_EQ(observed_gpu, source);
+            }
+
+            const auto stats = lane.stats();
+            EXPECT_EQ(stats.transfers_started, 6u);
+            EXPECT_EQ(stats.transfers_completed, 6u);
+            EXPECT_GT(stats.chunks_submitted, stats.transfers_completed);
+            EXPECT_EQ(stats.inference_stream_waits, 0u);
+            EXPECT_EQ(stats.blocking_synchronizations, 0u);
+
+            const auto records = PerfStatsCollector::snapshot(
+                {"moe_overlay_residency.tier_transfers_completed"});
+            const auto observed_direction = [&](const char *direction)
+            {
+                return std::any_of(
+                    records.begin(),
+                    records.end(),
+                    [&](const PerfStatRecord &record)
+                    {
+                        return perfTag(record, "direction") == direction &&
+                               record.value == 3.0;
+                    });
+            };
+            EXPECT_TRUE(observed_direction("gpu_to_cpu"));
+            EXPECT_TRUE(observed_direction("cpu_to_gpu"));
+        }
+
+        /**
          * @test Promoted asymmetric CPU weights remain executable on CUDA.
          *
          * Q5_1 loses its compact 5-bit representation in the CPU cold tier.
@@ -1072,7 +1330,7 @@ namespace llaminar2
             const MoEOverlayRemoteProjectionIdentity promotion_identity{
                 .expected_epoch = promoted_epoch - 1,
                 .candidate_epoch = promoted_epoch,
-                .transaction_fingerprint = {
+                .execution_fingerprint = {
                     .low = 0xc0da5101u,
                     .high = 0xc0da5102u,
                 },
@@ -1252,7 +1510,7 @@ namespace llaminar2
             const MoEOverlayRemoteProjectionIdentity demotion_identity{
                 .expected_epoch = promoted_epoch,
                 .candidate_epoch = promoted_epoch + 1,
-                .transaction_fingerprint = {
+                .execution_fingerprint = {
                     .low = 0xc0da5201u,
                     .high = 0xc0da5202u,
                 },
@@ -1867,7 +2125,6 @@ namespace llaminar2
                     .format = ExpertWeightFormat::nativeVnni(
                         source_identity),
                 }},
-                /*vram_safety_margin_bytes=*/0,
                 /*transfer_capacity=*/0);
             ASSERT_NE(pool, nullptr);
             auto lease = pool->acquire(/*expert_id=*/123, candidate_epoch);

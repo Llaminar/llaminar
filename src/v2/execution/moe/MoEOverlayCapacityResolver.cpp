@@ -179,8 +179,6 @@ namespace llaminar2
             used = checkedAdd(used, resource.fixed_bytes, "physical fixed");
             used = checkedAdd(
                 used, resource.transfer_staging_bytes, "physical staging");
-            used = checkedAdd(
-                used, resource.safety_reserve_bytes, "physical reserve");
             used = checkedAdd(used, resource.shadow_bytes, "physical shadows");
             used = checkedAdd(
                 used, resource.live_expert_bytes, "physical live experts");
@@ -352,14 +350,14 @@ namespace llaminar2
             const TierState &tier,
             int layer_idx,
             int requested_quota,
+            const char *demand,
             const std::vector<MoEOverlayPreparedExpertFootprint> &footprints,
             const std::unordered_map<std::string, std::size_t> &resource_index,
             const std::vector<ResourceState> &resources)
         {
             std::ostringstream error;
             error << "ExpertOverlay tier '" << tier.request->tier_name
-                  << "' cannot admit its "
-                  << (tier.request->fallback ? "fallback remainder" : "fixed live quota")
+                  << "' cannot admit its " << demand
                   << " for layer " << layer_idx << ": requested "
                   << requested_quota << " experts under the complete physical BOM";
 
@@ -377,7 +375,7 @@ namespace llaminar2
              * Report the exact next-copy charge against every affected
              * physical authority. Capacity failures happen before a result
              * plan exists, so this is the only place an operator can see
-             * whether fixed graph state, live experts, or another reserved
+             * whether fixed graph state, live experts, or another concrete
              * category consumed the limiting bytes.
              */
             const auto charges = nextLiveCharges(
@@ -402,8 +400,6 @@ namespace llaminar2
                       << " usable_bytes=" << resource.usable_budget_bytes
                       << " fixed_bytes=" << resource.fixed_bytes
                       << " staging_bytes=" << resource.transfer_staging_bytes
-                      << " safety_reserve_bytes="
-                      << resource.safety_reserve_bytes
                       << " shadow_bytes=" << resource.shadow_bytes
                       << " live_expert_bytes=" << resource.live_expert_bytes;
             }
@@ -575,6 +571,15 @@ namespace llaminar2
     {
         if (input.num_experts <= 0)
             throw std::invalid_argument("ExpertOverlay capacity requires a positive expert count");
+        if (input.initial_residency_policy !=
+                MoEOverlayInitialResidencyPolicy::PriorityFillOnly &&
+            input.initial_residency_policy !=
+                MoEOverlayInitialResidencyPolicy::
+                    MigrationSourcePerParticipant)
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay capacity received an unknown initial-residency policy");
+        }
         const auto footprints = preparedFootprints(
             input.layer_weight_manifest);
         const std::size_t layer_count = footprints.size();
@@ -605,21 +610,19 @@ namespace llaminar2
             state.output.fixed_bytes = budget.fixed_bytes;
             state.output.transfer_staging_bytes =
                 budget.transfer_staging_bytes;
-            state.output.safety_reserve_bytes = budget.safety_reserve_bytes;
             state.output.live_copies_per_layer.assign(layer_count, 0);
             state.output.shadow_copies_per_layer.assign(layer_count, 0);
             if (resourceUsed(state.output) > budget.usable_budget_bytes)
             {
                 std::ostringstream error;
                 error
-                    << "ExpertOverlay fixed/staging/reserve BOM already exceeds "
+                    << "ExpertOverlay fixed/staging BOM already exceeds "
                        "physical resource '"
                     << budget.resource_id << "': used="
                     << resourceUsed(state.output) << " usable="
                     << budget.usable_budget_bytes << " fixed="
                     << state.output.fixed_bytes << " staging="
-                    << state.output.transfer_staging_bytes << " reserve="
-                    << state.output.safety_reserve_bytes;
+                    << state.output.transfer_staging_bytes;
                 throw std::invalid_argument(error.str());
             }
             resources.push_back(std::move(state));
@@ -775,7 +778,7 @@ namespace llaminar2
 
         /*
          * Fixed quotas are exact constraints, so reserve and charge them before
-         * any automatic tier consumes headroom. This prevents a more-preferred
+         * any automatic tier consumes remaining capacity. This prevents a more-preferred
          * automatic tier from shrinking an explicitly requested later tier.
          */
         for (auto &tier : tiers)
@@ -808,12 +811,106 @@ namespace llaminar2
                             tier,
                             static_cast<int>(layer),
                             quota,
+                            "fixed live quota",
                             footprints,
                             resource_index,
                             resources);
                     }
                 }
                 unassigned[layer] -= quota;
+            }
+        }
+
+        if (input.initial_residency_policy ==
+            MoEOverlayInitialResidencyPolicy::
+                MigrationSourcePerParticipant)
+        {
+            /*
+             * Economy certification measures every directed edge with a real
+             * closed transfer cycle. Reserve only the topology-derived source
+             * minimum before ordinary priority fill so no declared endpoint is
+             * empty at certification time. This is initial data, not durable
+             * topology: the published runtime authority may later migrate the
+             * final source away when doing so is economical.
+             */
+            for (auto &tier : tiers)
+            {
+                const std::size_t participant_count =
+                    tier.request->participants.size();
+                if (tier.request->copy_policy ==
+                        MoEOverlayTierCopyPolicy::Apportioned &&
+                    participant_count >
+                        static_cast<std::size_t>(input.num_experts))
+                {
+                    std::ostringstream error;
+                    error << "ExpertOverlay tier '"
+                          << tier.request->tier_name
+                          << "' has " << participant_count
+                          << " migration participants but the model has only "
+                          << input.num_experts
+                          << " experts per layer";
+                    throw std::invalid_argument(error.str());
+                }
+                const int source_quota =
+                    tier.request->copy_policy ==
+                            MoEOverlayTierCopyPolicy::Replicated
+                        ? 1
+                        : static_cast<int>(participant_count);
+
+                for (std::size_t layer = 0; layer < layer_count; ++layer)
+                {
+                    if (tier.request->quota_mode ==
+                        MoEOverlayLiveQuotaMode::FixedPerLayer)
+                    {
+                        if (tier.output.live_experts_per_layer[layer] <
+                            source_quota)
+                        {
+                            std::ostringstream error;
+                            error << "ExpertOverlay fixed tier '"
+                                  << tier.request->tier_name
+                                  << "' provides "
+                                  << tier.output.live_experts_per_layer[layer]
+                                  << " experts for layer " << layer
+                                  << " but migration certification requires "
+                                  << source_quota
+                                  << " to seed every participant";
+                            throw std::invalid_argument(error.str());
+                        }
+                        continue;
+                    }
+
+                    while (tier.output.live_experts_per_layer[layer] <
+                           source_quota)
+                    {
+                        if (unassigned[layer] == 0)
+                        {
+                            std::ostringstream error;
+                            error << "ExpertOverlay cannot seed every migration "
+                                     "participant for tier '"
+                                  << tier.request->tier_name << "' layer "
+                                  << layer << ": all " << input.num_experts
+                                  << " model experts are already assigned";
+                            throw std::invalid_argument(error.str());
+                        }
+                        if (!addOneLiveExpert(
+                                tier,
+                                static_cast<int>(layer),
+                                footprints,
+                                resource_index,
+                                resources))
+                        {
+                            throwTierCapacityFailure(
+                                tier,
+                                static_cast<int>(layer),
+                                source_quota,
+                                "initial migration-source seed",
+                                footprints,
+                                resource_index,
+                                resources);
+                        }
+                        --unassigned[layer];
+                    }
+                }
             }
         }
 
@@ -885,6 +982,7 @@ namespace llaminar2
                             *fallback,
                             static_cast<int>(layer),
                             remainder,
+                            "fallback remainder",
                             footprints,
                             resource_index,
                             resources);

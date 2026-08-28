@@ -39,6 +39,15 @@ namespace llaminar2
         static constexpr int ordered_k_partitions = 16;
 
         /**
+         * Number of ordered FP32 lanes in every movable floating projection.
+         *
+         * A CPU tier emulates these logical lanes; CUDA and ROCm map one lane
+         * to one thread. The value is arithmetic identity rather than launch
+         * tuning because changing it changes every dot-product parenthesis.
+         */
+        static constexpr int floating_ordered_k_partitions = 256;
+
+        /**
          * @brief Report whether a source policy has a certified heterogeneous tree.
          *
          * Every source format accepted by the movable-expert registry uses the

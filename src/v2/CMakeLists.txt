@@ -1378,6 +1378,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Interfaces
     interfaces/IMPIContext.cpp
     backends/ComputeBackend.cpp
+    backends/HostMemoryCapacity.cpp
     backends/HardwareInventory.cpp
     backends/InventoryPrinter.cpp
     backends/PCIeEnumeration.cpp
@@ -1487,7 +1488,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.cpp
     execution/moe/MoEOverlayDistributedResidencyTransport.cpp
     execution/moe/MoEOverlayMPIResidencyConsensus.cpp
-    execution/moe/MoEOverlayMPIHistogramPublisher.cpp
+    execution/moe/MoEOverlayMPIResidencyProposalPublisher.cpp
     execution/moe/MoEOverlayResidencyMaintenanceService.cpp
     execution/moe/MoEOverlayTierMigrationTransport.cpp
     execution/moe/MoEOverlayParticipantMigration.cpp

@@ -2467,6 +2467,128 @@ namespace llaminar2::moe_activation_packet_device
     }
 
     /**
+     * @brief Acquire and materialize one colocated CPU canonical-route ticket.
+     *
+     * The CPU has already authenticated the sparse packet, computed one raw
+     * expert result per compact route, multiplied each row by its router
+     * weight, and release-published a new sequence. Every block waits for
+     * exactly one sequence beyond the GPU-owned consumed cursor before reading
+     * mapped payload bytes. The kernel performs only a route-slot permutation
+     * into continuation VRAM; the following canonical reducer remains the sole
+     * floating-point fold authority.
+     */
+    static __global__ void materializeCanonicalRouteTicketKernel(
+        MoEOverlayCanonicalRouteTicketConsumeLaunch launch)
+    {
+        __shared__ std::uint64_t block_live_entries;
+        __shared__ std::uint32_t block_ticket_valid;
+        if (threadIdx.x == 0u)
+        {
+            std::uint64_t published = 0u;
+            std::uint64_t consumed = 0u;
+            do
+            {
+                consumed = loadSystemAcquire64(
+                    &launch.control->consumed_sequence);
+                published = loadSystemAcquire64(
+                    &launch.control->published_sequence);
+                if (published > consumed && published - consumed == 1u)
+                    break;
+#if defined(__CUDA_ARCH__)
+                __nanosleep(64u);
+#elif defined(__HIP_DEVICE_COMPILE__)
+                __builtin_amdgcn_s_sleep(1u);
+#endif
+            } while (true);
+            const auto control = snapshotPeerPublished(launch.control);
+            block_ticket_valid =
+                control.valid() && control.publicationPending() &&
+                        control.residency_epoch != 0u &&
+                        control.route_capacity ==
+                            static_cast<std::int32_t>(
+                                launch.route_capacity) &&
+                        control.d_model == launch.d_model &&
+                        control.live_entry_count <= launch.route_capacity
+                    ? 1u
+                    : 0u;
+            block_live_entries = control.live_entry_count;
+        }
+        __syncthreads();
+        if (block_ticket_valid == 0u)
+            return;
+
+        const std::size_t element_count =
+            static_cast<std::size_t>(block_live_entries) *
+            static_cast<std::size_t>(launch.d_model);
+        for (std::size_t element =
+                 static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                 threadIdx.x;
+             element < element_count;
+             element += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+        {
+            const std::size_t compact_entry =
+                element / static_cast<std::size_t>(launch.d_model);
+            const std::size_t column =
+                element % static_cast<std::size_t>(launch.d_model);
+            const std::int32_t original_slot = loadPeerPublished(
+                launch.original_route_slots + compact_entry);
+            const std::int32_t compact_slot = loadPeerPublished(
+                launch.compact_route_slots + compact_entry);
+            if (original_slot < 0 || compact_slot < 0 ||
+                static_cast<std::size_t>(original_slot) >=
+                    launch.route_capacity ||
+                static_cast<std::size_t>(compact_slot) >=
+                    launch.route_capacity)
+            {
+                continue;
+            }
+            const std::size_t source =
+                static_cast<std::size_t>(compact_slot) *
+                    static_cast<std::size_t>(launch.d_model) +
+                column;
+            const std::size_t destination =
+                static_cast<std::size_t>(original_slot) *
+                    static_cast<std::size_t>(launch.d_model) +
+                column;
+            launch.canonical_route_contributions_fp32[destination] =
+                loadPeerPublished(
+                    launch.compact_preweighted_contributions_fp32 + source);
+        }
+    }
+
+    /**
+     * @brief Release-acknowledge a completely materialized CPU route payload.
+     *
+     * Backends enqueue this one-thread kernel immediately after every
+     * @ref materializeCanonicalRouteTicketKernel launch on the same exact
+     * stream. The stream edge guarantees every block has finished reading the
+     * mapped payload and writing continuation VRAM before the acknowledgement
+     * becomes system-visible. Only then may the CPU producer arm and overwrite
+     * the single reusable ticket for another retained graph replay.
+     */
+    static __global__ void acknowledgeCanonicalRouteTicketKernel(
+        MoEOverlayCanonicalRouteTicketConsumeLaunch launch)
+    {
+        if (blockIdx.x != 0u || threadIdx.x != 0u)
+            return;
+        const auto control = snapshotPeerPublished(launch.control);
+        if (!control.valid() || !control.publicationPending() ||
+            control.residency_epoch == 0u ||
+            control.route_capacity !=
+                static_cast<std::int32_t>(launch.route_capacity) ||
+            control.d_model != launch.d_model ||
+            control.live_entry_count > launch.route_capacity)
+        {
+            return;
+        }
+        storeSystemRelease64(
+            MoEOverlayActivationTimelinePublishDeviceBinding{
+                .signal = &launch.control->consumed_sequence,
+                .value = control.published_sequence,
+            });
+    }
+
+    /**
      * @brief Authenticate independent multi-row lanes and build dense row maps.
      *
      * One block owns one lane, so descriptor arrival and validation never

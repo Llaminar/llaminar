@@ -14,6 +14,7 @@
 
 #include <memory>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -34,6 +35,48 @@ namespace llaminar2
             GATE = 0,
             UP = 1,
             DOWN = 2
+        };
+
+        /**
+         * @brief One participant/layer whose complete resident set is replaced.
+         *
+         * Context-reuse sealing supplies every process-local scope, including
+         * an empty layer, so stale expert keys cannot survive a migration. The
+         * exact participant identity mirrors the keys used by graph lowering.
+         */
+        struct ParticipantLayerScope
+        {
+            std::string domain_name;
+            DeviceId device = DeviceId::invalid();
+            int participant_world_rank = -1;
+            int participant_index = -1;
+            int layer = -1;
+
+            /** @brief Compare the complete participant/layer key. */
+            bool operator==(const ParticipantLayerScope &) const = default;
+        };
+
+        /**
+         * @brief Complete prepared engine triplet for one restored resident.
+         *
+         * Shared pointers may be aliases whose control block owns a recyclable
+         * CPU/GPU slot. Retaining those exact pointers in this registry makes
+         * the prepared model context the post-run lifetime authority without
+         * copying or repacking weights again.
+         */
+        struct ParticipantExpertBinding
+        {
+            ParticipantLayerScope scope;
+            int expert = -1;
+            std::shared_ptr<ITensorGemm> gate;
+            std::shared_ptr<ITensorGemm> up;
+            std::shared_ptr<ITensorGemm> down;
+
+            /** @return Whether the binding names all three prepared roles. */
+            [[nodiscard]] bool complete() const noexcept
+            {
+                return gate != nullptr && up != nullptr && down != nullptr;
+            }
         };
 
         ExpertGemmRegistry() = default;
@@ -202,6 +245,30 @@ namespace llaminar2
                             std::vector<ITensorGemm *> &gate_out,
                             std::vector<ITensorGemm *> &up_out,
                             std::vector<ITensorGemm *> &down_out) const;
+
+        /**
+         * @brief Atomically replace process-local ExpertOverlay residency keys.
+         *
+         * Every supplied scope is first removed from a private copy of the
+         * registry, then rebuilt from @p bindings. Domain aliases are rebuilt
+         * from the same triplets so setup-time format discovery and
+         * participant graph lowering observe one identity. The live map is
+         * swapped only after complete validation and allocation succeed; a
+         * caller can never observe a partially rebound model context.
+         *
+         * This is a terminal model-lifecycle operation. Inference and graph
+         * construction must already be quiescent, although ordinary readers
+         * remain protected by the registry mutex.
+         *
+         * @param scopes Complete local participant/layer replacement surface.
+         * @param bindings Exact resident triplets contained by those scopes.
+         * @param error Optional precise validation/allocation diagnostic.
+         * @return True after one atomic replacement, false without mutation.
+         */
+        [[nodiscard]] bool replaceParticipantResidency(
+            std::span<const ParticipantLayerScope> scopes,
+            std::span<const ParticipantExpertBinding> bindings,
+            std::string *error = nullptr) noexcept;
 
         /// Replace an existing engine (for dynamic rebalancing arrival).
         /// If no existing engine, equivalent to registerEngine.

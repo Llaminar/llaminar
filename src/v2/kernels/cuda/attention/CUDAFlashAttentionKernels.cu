@@ -26,7 +26,10 @@
 #include <cfloat>
 #include <cstdio>
 #include <atomic>
+#include <mutex>
+#include <unordered_map>
 
+#include "../../../backends/BackendManager.h"
 #include "../../../backends/cuda/CUDAGraphCapture.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include "CUDAFlashAttentionLaunchPolicy.h"
@@ -2409,12 +2412,32 @@ namespace
     // TQ codebooks (compile-time Lloyd-Max centroids for N(0,1))
     __constant__ float d_tq8_attn_cents[256];
     __constant__ float d_tq4_attn_cents[16];
-    static std::atomic<bool> s_tq_attn_codebooks_uploaded{false};
+    static std::mutex s_tq_attn_codebooks_mutex;
+    static std::unordered_map<int, std::uint64_t>
+        s_tq_attn_codebook_generations;
 
-    void upload_tq_attn_codebooks()
+    /** @return True when this device/runtime generation owns live constants. */
+    bool upload_tq_attn_codebooks()
     {
-        if (s_tq_attn_codebooks_uploaded.load(std::memory_order_acquire))
-            return;
+        int device_id = -1;
+        if (cudaGetDevice(&device_id) != cudaSuccess)
+            return false;
+        llaminar2::IBackend *const backend = llaminar2::getCUDABackend();
+        const std::uint64_t runtime_generation = backend
+                                                     ? backend->deviceRuntimeGeneration(
+                                                           device_id)
+                                                     : 0u;
+        if (runtime_generation == 0u)
+            return false;
+
+        std::lock_guard<std::mutex> lock(s_tq_attn_codebooks_mutex);
+        const auto existing =
+            s_tq_attn_codebook_generations.find(device_id);
+        if (existing != s_tq_attn_codebook_generations.end() &&
+            existing->second == runtime_generation)
+        {
+            return true;
+        }
         // TQ4: 16-level Lloyd-Max centroids for N(0,1)
         static constexpr float TQ4_C[16] = {
             -2.732897f, -2.069364f, -1.618400f, -1.256565f,
@@ -2459,8 +2482,11 @@ namespace
         cudaMemcpyToSymbol(d_tq4_attn_cents, TQ4_C, sizeof(TQ4_C));
         if (cudaGetLastError() == cudaSuccess)
         {
-            s_tq_attn_codebooks_uploaded.store(true, std::memory_order_release);
+            s_tq_attn_codebook_generations[device_id] =
+                runtime_generation;
+            return true;
         }
+        return false;
     }
 } // anonymous namespace
 
@@ -4488,7 +4514,8 @@ extern "C"
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         // Ensure TQ codebooks are in constant memory
-        upload_tq_attn_codebooks();
+        if (!upload_tq_attn_codebooks())
+            return -1;
 
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 

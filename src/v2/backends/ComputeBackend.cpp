@@ -19,6 +19,7 @@
 
 #include "ComputeBackend.h"
 #include "HardwareInventory.h"
+#include "HostMemoryCapacity.h"
 #include "GPUEnumeration.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -92,68 +93,16 @@ namespace llaminar2
         dev.compute_capability = 0;
         dev.numa_node = numa_node;
 
-        // Get memory info - prefer NUMA-local memory if node specified
+        // Use the same typed observation as inventory, CPUBackend, and
+        // preflight so automatic capacity cannot disagree across lifecycle
+        // boundaries as page-cache and tmpfs residency change.
 #ifdef __linux__
-        if (numa_node >= 0 && numa_available() >= 0)
-        {
-            // Get NUMA-local memory for this node
-            long long numa_size = numa_node_size64(numa_node, nullptr);
-            if (numa_size > 0)
-            {
-                dev.total_memory_bytes = static_cast<size_t>(numa_size);
-                // Free memory approximation: assume ~90% available
-                long long numa_free = 0;
-                numa_node_size64(numa_node, &numa_free);
-                dev.free_memory_bytes = (numa_free > 0) ? static_cast<size_t>(numa_free) : dev.total_memory_bytes;
-            }
-            else
-            {
-                // Fallback to system memory divided by NUMA nodes
-                int num_nodes = numa_num_configured_nodes();
-                FILE *meminfo = fopen("/proc/meminfo", "r");
-                if (meminfo)
-                {
-                    char line[256];
-                    while (fgets(line, sizeof(line), meminfo))
-                    {
-                        if (strncmp(line, "MemAvailable:", 13) == 0)
-                        {
-                            unsigned long kb = 0;
-                            if (sscanf(line + 13, "%lu", &kb) == 1)
-                            {
-                                dev.total_memory_bytes = static_cast<size_t>(kb) * 1024 / (num_nodes > 0 ? num_nodes : 1);
-                                dev.free_memory_bytes = dev.total_memory_bytes;
-                            }
-                            break;
-                        }
-                    }
-                    fclose(meminfo);
-                }
-            }
-        }
-        else
-        {
-            // No NUMA node specified, get total system memory
-            FILE *meminfo = fopen("/proc/meminfo", "r");
-            if (meminfo)
-            {
-                char line[256];
-                while (fgets(line, sizeof(line), meminfo))
-                {
-                    if (strncmp(line, "MemAvailable:", 13) == 0)
-                    {
-                        unsigned long kb = 0;
-                        if (sscanf(line + 13, "%lu", &kb) == 1)
-                        {
-                            dev.total_memory_bytes = static_cast<size_t>(kb) * 1024;
-                            dev.free_memory_bytes = dev.total_memory_bytes;
-                        }
-                        break;
-                    }
-                }
-                fclose(meminfo);
-            }
-        }
+        const auto memory =
+            numa_node >= 0
+                ? observeNUMAMemoryCapacity(numa_node)
+                : observeSystemMemoryCapacity();
+        dev.total_memory_bytes = memory.total_bytes;
+        dev.free_memory_bytes = memory.admission_available_bytes;
 #else
         // Fallback: assume 16 GB
         dev.total_memory_bytes = 16ULL * 1024 * 1024 * 1024;

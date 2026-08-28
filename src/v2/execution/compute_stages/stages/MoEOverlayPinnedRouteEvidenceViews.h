@@ -47,7 +47,7 @@ namespace llaminar2
         };
 
         /**
-         * @brief Bind five pure-device tensor views without copying any value.
+         * @brief Bind seven pure-device tensor views without copying any value.
          *
          * @param params Exact route-slot geometry and request-pinned authority.
          * @throws std::invalid_argument when any pointer, device, or capacity is
@@ -97,8 +97,12 @@ namespace llaminar2
         std::unique_ptr<ITensor> runtime_route_weights_device_view_;
         /** Durable global expert-placement bank zero. */
         std::unique_ptr<ITensor> overlay_route_participants_bank0_device_view_;
+        /** Epoch carried by durable placement bank zero. */
+        std::unique_ptr<ITensor> overlay_route_bank0_epoch_device_view_;
         /** Durable global expert-placement bank one. */
         std::unique_ptr<ITensor> overlay_route_participants_bank1_device_view_;
+        /** Epoch carried by durable placement bank one. */
+        std::unique_ptr<ITensor> overlay_route_bank1_epoch_device_view_;
         /** Bank acquired by this request's immutable device ticket. */
         std::unique_ptr<ITensor> overlay_route_selected_bank_device_view_;
     };

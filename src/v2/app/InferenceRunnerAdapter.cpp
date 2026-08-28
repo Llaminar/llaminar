@@ -70,6 +70,11 @@ namespace llaminar2
         position_ = 0;
     }
 
+    bool InferenceRunnerAdapter::purgePrefixCache()
+    {
+        return orch_runner_ && orch_runner_->purgePrefixCache();
+    }
+
     int InferenceRunnerAdapter::get_position() const
     {
         return position_;
@@ -233,6 +238,18 @@ namespace llaminar2
     PrefixRuntimeStateSnapshot InferenceRunnerAdapter::prefixStateProbe() const
     {
         return orch_runner_ ? orch_runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+    }
+
+    uint64_t InferenceRunnerAdapter::moeRuntimeMovementEpoch() const
+    {
+        return orch_runner_ ? orch_runner_->moeRuntimeMovementEpoch() : 0u;
+    }
+
+    MoEOptimizationStatus
+    InferenceRunnerAdapter::moeOptimizationStatus() const
+    {
+        return orch_runner_ ? orch_runner_->moeOptimizationStatus()
+                            : MoEOptimizationStatus{};
     }
 
     bool InferenceRunnerAdapter::configureMTPRequestStopTokens(

@@ -15,6 +15,7 @@
 #include "CUDAMoEOverlayDeviceControllerKernels.h"
 #include "CUDAMoEOverlayEpochKernels.h"
 
+#include "../../../backends/BackendManager.h"
 #include "../gemm/CUDADeviceWorkspace.h"
 #include "../gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "../gemm/CUDAMoEProductionPrefillOverlayGenerated.inc"
@@ -40,7 +41,9 @@
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
-#include <unordered_set>
+#include <unordered_map>
+
+extern "C" bool cudaNativeVNNIInitIQGridTables_tuned();
 
 namespace
 {
@@ -1014,6 +1017,65 @@ namespace
         return false;
     }
 
+    /**
+     * @brief Publish CUDA MoE IQ constants once per native runtime generation.
+     *
+     * `cudaDeviceReset()` invalidates translation-unit constant memory while
+     * leaving host statics intact. Keying only by ordinal would therefore make
+     * the next JIT-loaded model launch with an uninitialized codebook. The
+     * backend generation is the exact primary-context identity that owns these
+     * tables and is shared by every supported IQ codebook (11 through 17).
+     */
+    bool ensureCudaMoEIQGridTablesInitialized(int device_ordinal)
+    {
+        static std::mutex iq_table_mutex;
+        static std::unordered_map<int, std::uint64_t>
+            iq_grid_runtime_generations;
+
+        std::lock_guard<std::mutex> lock(iq_table_mutex);
+        llaminar2::IBackend *const backend =
+            llaminar2::getCUDABackend();
+        const std::uint64_t runtime_generation = backend
+                                                     ? backend->deviceRuntimeGeneration(
+                                                           device_ordinal)
+                                                     : 0u;
+        if (runtime_generation == 0u)
+        {
+            LOG_ERROR(
+                "[CUDAMoEKernel] IQ grid initialization has no live CUDA "
+                "runtime generation for device "
+                << device_ordinal);
+            return false;
+        }
+
+        const auto initialized =
+            iq_grid_runtime_generations.find(device_ordinal);
+        if (initialized != iq_grid_runtime_generations.end() &&
+            initialized->second == runtime_generation)
+        {
+            return true;
+        }
+        if (!backend->setDevice(device_ordinal))
+        {
+            LOG_ERROR(
+                "[CUDAMoEKernel] Could not select CUDA device "
+                << device_ordinal
+                << " before IQ grid table publication");
+            return false;
+        }
+        if (!cudaNativeVNNIInitIQGridTables_tuned())
+        {
+            LOG_ERROR(
+                "[CUDAMoEKernel] IQ grid table publication failed for CUDA:"
+                << device_ordinal << " runtime_generation="
+                << runtime_generation);
+            return false;
+        }
+
+        iq_grid_runtime_generations[device_ordinal] = runtime_generation;
+        return true;
+    }
+
     bool validateCudaGroupedDesc(
         const llaminar2::DeviceNativeVNNIMatrixDesc &desc,
         int n,
@@ -1074,8 +1136,6 @@ namespace
 
 extern "C"
 {
-    bool cudaNativeVNNIInitIQGridTables_tuned();
-
     /**
      * @brief Query the capture-time CUDA production-MoE prefill policy.
      *
@@ -1213,6 +1273,7 @@ extern "C"
         void *wave_state,
         void *controller_state,
         void *llep_layer_plans,
+        void *placement_plan_scratch,
         uint32_t command_buffer_count,
         const void *local_transfer_slots,
         uint32_t local_transfer_slot_count,
@@ -2008,6 +2069,21 @@ namespace llaminar2
         }
         return cudaMoEOverlayActivationConsumeReturn(
             &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::consumeMoEOverlayCanonicalRouteTicket(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayCanonicalRouteTicketConsumeLaunch &ticket)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "consumeMoEOverlayCanonicalRouteTicket");
+        if (!stream || !ticket.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::consumeMoEOverlayCanonicalRouteTicket] complete mapped ticket binding and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayConsumeCanonicalRouteTicket(
+            &ticket, device_ordinal_, stream);
     }
 
     bool CUDAMoEKernel::packSingleRowMoEOverlayActivationDispatch(
@@ -5337,16 +5413,22 @@ namespace llaminar2
         uint32_t command_buffer_count,
         const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
         uint32_t local_transfer_slot_count,
-        DeviceMoELLEPLayerPlanScratch *llep_layer_plans)
+        DeviceMoELLEPLayerPlanScratch *llep_layer_plans,
+        DeviceMoEPlacementBank *placement_plan_scratch)
     {
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] invalid device rebalance config");
             return false;
         }
-        if (!runtime_layers || !gathered_histograms || !status || !controller_state)
+        const bool deferred_planning = hasDeviceMoERebalanceFlag(
+            config.flags,
+            DeviceMoERebalanceFlags::DeferRuntimeApply);
+        if (!runtime_layers || !gathered_histograms || !status ||
+            !controller_state ||
+            (deferred_planning && !placement_plan_scratch))
         {
-            LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, status, and persistent controller state must be non-null");
+            LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, status, controller state, and placement planner scratch must be non-null");
             return false;
         }
         if (config.routed_assignment_policy ==
@@ -5375,6 +5457,7 @@ namespace llaminar2
             wave_state,
             controller_state,
             llep_layer_plans,
+            placement_plan_scratch,
             command_buffer_count,
             local_transfer_slots,
             local_transfer_slot_count,
@@ -7190,17 +7273,10 @@ namespace llaminar2
 
         if (cudaGroupedPrefillMaskNeedsIQTables(codebook_mask))
         {
-            static std::mutex iq_table_mutex;
-            static std::unordered_set<int> iq_init_devices;
-            std::lock_guard<std::mutex> lock(iq_table_mutex);
-            if (!iq_init_devices.count(device_ordinal_))
+            if (!ensureCudaMoEIQGridTablesInitialized(device_ordinal_))
             {
-                if (!cudaNativeVNNIInitIQGridTables_tuned())
-                {
-                    LOG_ERROR("[CUDAMoEKernel::uploadGroupedExpertDownDescriptorTable] IQ grid table init failed");
-                    return -1;
-                }
-                iq_init_devices.insert(device_ordinal_);
+                LOG_ERROR("[CUDAMoEKernel::uploadGroupedExpertDownDescriptorTable] IQ grid table init failed");
+                return -1;
             }
         }
 
@@ -7351,17 +7427,10 @@ namespace llaminar2
 
         if (cudaGroupedPrefillMaskNeedsIQTables(codebook_mask))
         {
-            static std::mutex iq_table_mutex;
-            static std::unordered_set<int> iq_init_devices;
-            std::lock_guard<std::mutex> lock(iq_table_mutex);
-            if (!iq_init_devices.count(device_ordinal_))
+            if (!ensureCudaMoEIQGridTablesInitialized(device_ordinal_))
             {
-                if (!cudaNativeVNNIInitIQGridTables_tuned())
-                {
-                    LOG_ERROR("[CUDAMoEKernel::uploadGroupedExpertGateUpDescriptorTables] IQ grid table init failed");
-                    return -1;
-                }
-                iq_init_devices.insert(device_ordinal_);
+                LOG_ERROR("[CUDAMoEKernel::uploadGroupedExpertGateUpDescriptorTables] IQ grid table init failed");
+                return -1;
             }
         }
 

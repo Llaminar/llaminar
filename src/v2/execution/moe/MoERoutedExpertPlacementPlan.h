@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -159,6 +160,26 @@ namespace llaminar2
             return participants.size() > 1;
         }
 
+        /**
+         * @brief Resolve the domain's primary MPI rank across both legal encodings.
+         *
+         * Inventory-bound collective domains carry a participant-indexed rank
+         * vector. A rank-local/AUTO single-owner domain may instead retain only
+         * owner_rank. Consumers that need the domain authority must use this
+         * method rather than assuming one representation is populated.
+         *
+         * @return First participant rank, explicit owner rank, or nullopt when
+         *         neither representation names a valid rank.
+         */
+        std::optional<int> primaryWorldRank() const
+        {
+            if (!world_ranks.empty() && world_ranks.front() >= 0)
+                return world_ranks.front();
+            if (owner_rank >= 0)
+                return owner_rank;
+            return std::nullopt;
+        }
+
         bool supportsRoutedExpertTensorSharding() const
         {
             return isCollectiveDomain() && hasMultipleParticipants();
@@ -273,6 +294,22 @@ namespace llaminar2
         std::vector<int> routed_expert_tier;
     };
 
+    /**
+     * @brief Setup-time complete expert permutation for one routed layer.
+     *
+     * Automatic capacity is resolved from the live physical BOM before this
+     * order is consumed. The placement planner then fills integer-priority
+     * tiers in this exact order, so callers may declare a deterministic warm
+     * start without guessing hardware-dependent tier quotas. The order is a
+     * permutation of every model expert and is removed once concrete
+     * placements have been frozen.
+     */
+    struct RoutedExpertInitialLayerOrder
+    {
+        int layer = -1; ///< Model-global routed layer receiving this order.
+        std::vector<int> expert_ids; ///< Complete first-to-last fill order.
+    };
+
     struct MoERoutedExpertPlacementPlan
     {
         bool enabled = false;
@@ -305,6 +342,17 @@ namespace llaminar2
 
         std::vector<RoutedExpertDomain> domains;
         std::vector<RoutedExpertTier> routed_tiers;
+        /**
+         * Setup-only per-layer order overrides consumed after quota resolution.
+         * Every supplied row is a complete permutation; omitted layers use the
+         * deterministic expert-id order. This lets model-authenticated main
+         * layers coexist with trailing MTP layers discovered only while loading
+         * the GGUF, without guessing that auxiliary topology at configuration
+         * time. Supplying overrides and concrete placements together remains
+         * invalid because that would create two epoch-one authorities.
+         */
+        std::vector<RoutedExpertInitialLayerOrder>
+            initial_layer_order_overrides;
         std::vector<RoutedExpertLayerPlacement> placements;
 
         bool isTieredOverlay() const
@@ -370,6 +418,47 @@ namespace llaminar2
                 capacity = std::max(capacity, placement.layer + 1);
             }
             return capacity;
+        }
+
+        /**
+         * @brief Find the final routed layer in a semantic layer interval.
+         *
+         * Placement storage may retain auxiliary NextN/MTP layers after the
+         * ordinary decoder.  Histogram windows, request boundaries, and other
+         * main-inference lifecycles must therefore select a routed layer inside
+         * the main interval explicitly instead of using the greatest resident
+         * placement identity.
+         *
+         * @param exclusive_layer_limit First layer outside the interval.
+         * @return Greatest declared placement below the limit, or no value
+         *         when the interval contains no routed placement.
+         * @throws std::invalid_argument for a non-positive limit or a negative
+         *         placement identity.
+         */
+        [[nodiscard]] std::optional<int> lastPlacementLayerBefore(
+            int exclusive_layer_limit) const
+        {
+            if (exclusive_layer_limit <= 0)
+            {
+                throw std::invalid_argument(
+                    "routed expert main-inference layer limit must be positive");
+            }
+
+            std::optional<int> result;
+            for (const auto &placement : placements)
+            {
+                if (placement.layer < 0)
+                {
+                    throw std::invalid_argument(
+                        "routed expert placement interval cannot include a negative layer index");
+                }
+                if (placement.layer < exclusive_layer_limit &&
+                    (!result || placement.layer > *result))
+                {
+                    result = placement.layer;
+                }
+            }
+            return result;
         }
 
         std::string effectiveBaseModelDomain() const
@@ -1249,6 +1338,93 @@ namespace llaminar2
                          std::to_string(options.routed_expert_count) +
                          " routed experts; increase routed tier capacity or configure one fallback tier");
             }
+        }
+
+        if (!plan.initial_layer_order_overrides.empty())
+        {
+            if (!plan.placements.empty())
+            {
+                addError(
+                    "routed expert plan cannot declare both deferred initial "
+                    "orders and concrete placements");
+            }
+            if (plan.residency_policy ==
+                    RoutedExpertResidencyPolicy::ExplicitMasks ||
+                plan.residency_policy ==
+                    RoutedExpertResidencyPolicy::Disabled)
+            {
+                addError(
+                    "deferred initial expert orders require a planner-owned "
+                    "residency policy");
+            }
+
+            std::unordered_set<int> ordered_layers;
+            for (const auto &order : plan.initial_layer_order_overrides)
+            {
+                if (order.layer < 0)
+                {
+                    addError(
+                        "deferred initial expert order has invalid negative "
+                        "layer index");
+                    continue;
+                }
+                if (options.layer_count > 0 &&
+                    order.layer >= options.layer_count)
+                {
+                    addError(
+                        "deferred initial expert order references layer "
+                        "outside validation range: " +
+                        std::to_string(order.layer));
+                }
+                if (!ordered_layers.insert(order.layer).second)
+                {
+                    addError(
+                        "duplicate deferred initial expert order for layer: " +
+                        std::to_string(order.layer));
+                }
+                if (order.expert_ids.empty())
+                {
+                    addError(
+                        "deferred initial expert order for layer " +
+                        std::to_string(order.layer) +
+                        " must contain at least one expert");
+                    continue;
+                }
+                if (options.routed_expert_count > 0 &&
+                    static_cast<int>(order.expert_ids.size()) !=
+                        options.routed_expert_count)
+                {
+                    addError(
+                        "deferred initial expert order for layer " +
+                        std::to_string(order.layer) +
+                        " does not contain every routed expert");
+                }
+
+                std::unordered_set<int> ordered_experts;
+                for (const int expert_id : order.expert_ids)
+                {
+                    if (expert_id < 0 ||
+                        (options.routed_expert_count > 0 &&
+                         expert_id >= options.routed_expert_count))
+                    {
+                        addError(
+                            "deferred initial expert order for layer " +
+                            std::to_string(order.layer) +
+                            " references expert outside validation range: " +
+                            std::to_string(expert_id));
+                        continue;
+                    }
+                    if (!ordered_experts.insert(expert_id).second)
+                    {
+                        addError(
+                            "deferred initial expert order for layer " +
+                            std::to_string(order.layer) +
+                            " repeats expert " +
+                            std::to_string(expert_id));
+                    }
+                }
+            }
+
         }
 
         if (!plan.placements.empty())

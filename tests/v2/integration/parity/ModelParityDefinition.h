@@ -93,12 +93,109 @@ namespace llaminar2::test::parity
         Standard,
     };
 
+    /** Production prefill graph schedule exercised by one generated cell. */
+    enum class ModelParityPrefillGraphMode : std::uint8_t
+    {
+        /** Use the ordinary production bucket selection for the prompt. */
+        Standard,
+        /** Replay the prompt through one fixed captured segment bucket. */
+        SegmentedCaptured,
+    };
+
+    /**
+     * @brief Typed prefill graph profile crossed by the central expander.
+     *
+     * A segmented profile names the exact physical row bucket retained by the
+     * production graph cache.  Keeping this value in the generated case makes
+     * graph scheduling policy independent of GoogleTest names and lets focused
+     * heterogeneous graph proofs use the same declarative machinery as every
+     * ordinary production-parity cell.
+     */
+    struct ModelParityPrefillGraphPolicy
+    {
+        ModelParityPrefillGraphMode mode =
+            ModelParityPrefillGraphMode::Standard;
+        int captured_rows = 0;
+
+        /** @return Stable optional name fragment for generated diagnostics. */
+        [[nodiscard]] std::string testNameFragment() const
+        {
+            return mode == ModelParityPrefillGraphMode::Standard
+                       ? std::string{}
+                       : "SegmentedPrefillRows" +
+                             std::to_string(captured_rows);
+        }
+
+        /** @return Whether this profile requires fixed segmented replay. */
+        [[nodiscard]] constexpr bool isSegmentedCaptured() const noexcept
+        {
+            return mode ==
+                   ModelParityPrefillGraphMode::SegmentedCaptured;
+        }
+
+        friend bool operator==(
+            const ModelParityPrefillGraphPolicy &,
+            const ModelParityPrefillGraphPolicy &) = default;
+    };
+
     /** Request-time movement evidence required from PerfStats. */
     enum class ModelParityMovementEvidence : std::uint8_t
     {
         NotApplicable,
         NoMovement,
         MovementRequired,
+    };
+
+    /**
+     * End-to-end economy evidence owned by a generated Dynamic cell.
+     *
+     * Every Dynamic cell must certify production economics and publish real
+     * movement.  One centrally selected cell per topology, precision pair,
+     * and owner order additionally owns the costly matched before/after speed
+     * proof.  MTP depth and alternate prefill schedules remain independent
+     * numerical axes and therefore must not repeat that identical proof.
+     */
+    enum class ModelParityDynamicEvidence : std::uint8_t
+    {
+        NotApplicable,
+        EconomicMovement,
+        EconomicMovementAndObservedSpeedup,
+    };
+
+    /**
+     * @brief Runtime policies selected by the Dynamic evidence a cell owns.
+     *
+     * Movement-only cells prove one real economically admitted publication and
+     * then preserve that epoch for numerical parity.  The designated speed
+     * witness may deliberately use a wider, longer observation horizon to
+     * measure convergence.  Keeping both policies in the canonical definition
+     * prevents fixtures from silently rewriting controller geometry after
+     * capacity admission.
+     */
+    struct ModelParityDynamicRuntimePolicies
+    {
+        MoERebalanceRuntimeConfig economic_movement;
+        MoERebalanceRuntimeConfig economic_movement_and_observed_speedup;
+
+        /**
+         * @brief Select the exact policy owned by a generated evidence cell.
+         *
+         * Static and non-overlay cells use the movement policy as their stable
+         * configuration identity; @ref ModelParityCase::applyRuntimePolicy
+         * disables its controller mode before execution.
+         *
+         * @param evidence Evidence assigned by the canonical matrix expander.
+         * @return Definition-owned immutable runtime policy.
+         */
+        [[nodiscard]] const MoERebalanceRuntimeConfig &policyFor(
+            ModelParityDynamicEvidence evidence) const noexcept
+        {
+            return evidence ==
+                           ModelParityDynamicEvidence::
+                               EconomicMovementAndObservedSpeedup
+                       ? economic_movement_and_observed_speedup
+                       : economic_movement;
+        }
     };
 
     /** MTP execution evidence required from PerfStats and numerical artifacts. */
@@ -235,10 +332,32 @@ namespace llaminar2::test::parity
             threshold_overrides;
     };
 
+    /** One MTP-policy-specific override of the recursive logit KL budget. */
+    struct ModelParityMTPKLThresholdOverride
+    {
+        ModelParityMTP policy = ModelParityMTP::Off;
+        float maximum_kl_divergence = 0.0f;
+    };
+
     /** Optional standard feature axes for one model/topology definition. */
     struct ModelParityFeatureMatrix
     {
         ModelParityAxisProfile mtp = ModelParityAxisProfile::Disabled;
+        /**
+         * Prefill graph schedules crossed with precision and execution policy.
+         * One ordinary profile preserves the historical matrix by default.
+         */
+        std::vector<ModelParityPrefillGraphPolicy> prefill_graph = {
+            ModelParityPrefillGraphPolicy{},
+        };
+        /**
+         * Policy-local recursive KL budgets applied after precision overrides.
+         *
+         * Keeping this keyed by the typed MTP policy prevents a deep-recursion
+         * tolerance from weakening shallower fixed depths or adaptive depth.
+         */
+        std::vector<ModelParityMTPKLThresholdOverride>
+            mtp_kl_threshold_overrides;
     };
 
     /**
@@ -256,7 +375,7 @@ namespace llaminar2::test::parity
         ModelParityFeatureMatrix features;
         MoEHotExpertCacheConfig moe_hot_expert_cache;
         RoutedExpertPrefillRuntimeConfig moe_routed_prefill;
-        MoERebalanceRuntimeConfig dynamic_rebalance;
+        ModelParityDynamicRuntimePolicies dynamic_rebalance;
         ParityGraphSnapshotPolicy graph_snapshot_policy;
         std::optional<ParityCollectiveEvidenceSource>
             collective_evidence_source;
@@ -314,7 +433,19 @@ namespace llaminar2::test::parity
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
         KVCachePrecision kv_cache_precision = KVCachePrecision::FP16;
         ModelParityMTP mtp = ModelParityMTP::Off;
+        /**
+         * Setup-time MTP envelope shared by every cell in this definition.
+         *
+         * Zero means the definition has no MTP axis. A positive value is kept
+         * even by the MTPOff execution cell so one process-resident model and
+         * ExpertOverlay placement authority can serve the entire generated
+         * matrix without changing its physical capacity solution.
+         */
+        int retained_mtp_draft_capacity = 0;
         std::optional<ModelParityExpertOverlayPolicy> expert_overlay;
+        ModelParityDynamicEvidence dynamic_evidence =
+            ModelParityDynamicEvidence::NotApplicable;
+        ModelParityPrefillGraphPolicy prefill_graph;
         int prefix_cache_block_size =
             kModelParityPrefixRestoreProofBlockSize;
         MoEHotExpertCacheConfig moe_hot_expert_cache;
@@ -390,13 +521,27 @@ namespace llaminar2::test::parity
                    ModelParityMovementEvidence::MovementRequired;
         }
 
+        /** @return Whether this cell owns the matched convergence speed gate. */
+        [[nodiscard]] constexpr bool
+        requiresObservedConvergenceSpeedup() const noexcept
+        {
+            return dynamic_evidence ==
+                   ModelParityDynamicEvidence::
+                       EconomicMovementAndObservedSpeedup;
+        }
+
         /** @return Stable GoogleTest-safe full matrix identity. */
         [[nodiscard]] std::string testName() const
         {
+            const std::string prefill_name =
+                prefill_graph.testNameFragment();
             return model.test_id + "_" + topology.test_id + "_" +
                    (expert_overlay
                         ? expert_overlay->testName() + "_"
                         : std::string{}) +
+                   (prefill_name.empty()
+                        ? std::string{}
+                        : prefill_name + "_") +
                    activationName() + "_" + kvCacheName() + "_" +
                    mtpName();
         }
@@ -408,7 +553,8 @@ namespace llaminar2::test::parity
          * fixtures. New policy-aware bodies should retain `ModelParityCase` as
          * their GoogleTest parameter and use @ref applyRuntimePolicy for MTP
          * and the mandatory prefix lifecycle rather than extending legacy
-         * `TestConfig`.
+         * `TestConfig`. Setup capacity remains distinct from the active MTP
+         * evidence expected by the legacy adapter.
          */
         [[nodiscard]] TestConfig toTestConfig() const
         {
@@ -496,7 +642,7 @@ namespace llaminar2::test::parity
                           : ParityMTPExpectation::FixedDepth;
             config.mtp_expected_draft_depth = requestedMTPDraftDepth();
             config.mtp_expected_graph_capacity =
-                mtpEnabled() ? model.maximum_mtp_draft_depth : 0;
+                retained_mtp_draft_capacity;
             return config;
         }
 
@@ -505,8 +651,9 @@ namespace llaminar2::test::parity
          *
          * Call this after model/topology-specific defaults have been installed.
          * Economic Dynamic scalars are retained; only the matrix-owned mode is
-         * replaced.  Every enabled MTP cell shares the model's depth-15 graph
-         * envelope while selecting its independent logical depth.
+         * replaced. Every cell in an MTP-capable definition, including the
+         * execution-off control, shares the model's depth-15 setup envelope
+         * while selecting its independent logical depth.
          *
          * @param config Production configuration used by the live runner.
          */
@@ -528,7 +675,7 @@ namespace llaminar2::test::parity
             config.mtp.draft_tokens =
                 std::max(1, requestedMTPDraftDepth());
             config.mtp.graph_capacity_draft_tokens =
-                mtpEnabled() ? model.maximum_mtp_draft_depth : 0;
+                retained_mtp_draft_capacity;
             config.mtp.verify_mode = MTPVerifyMode::Greedy;
             config.mtp.depth_policy = MTPDepthPolicyConfig{};
             if (usesDynamicMTPDepth())
@@ -1058,10 +1205,11 @@ namespace llaminar2::test::parity
                 "model parity requires a named topology, participants, and positive MPI size");
         }
         if (definition.precisions.activation.empty() ||
-            definition.precisions.kv_cache.empty())
+            definition.precisions.kv_cache.empty() ||
+            definition.features.prefill_graph.empty())
         {
             throw std::invalid_argument(
-                "model parity precision axes must not be empty");
+                "model parity precision and prefill graph axes must not be empty");
         }
         if (std::set<ActivationPrecision>(
                 definition.precisions.activation.begin(),
@@ -1112,6 +1260,36 @@ namespace llaminar2::test::parity
                     "model parity precision threshold overrides must be unique by activation/KV pair");
             }
         }
+        for (std::size_t index = 0;
+             index < definition.features.prefill_graph.size(); ++index)
+        {
+            const auto &profile =
+                definition.features.prefill_graph[index];
+            const bool valid_standard =
+                profile.mode == ModelParityPrefillGraphMode::Standard &&
+                profile.captured_rows == 0;
+            const bool valid_segmented =
+                profile.mode ==
+                    ModelParityPrefillGraphMode::SegmentedCaptured &&
+                profile.captured_rows > 0;
+            if (!valid_standard && !valid_segmented)
+            {
+                throw std::invalid_argument(
+                    "model parity prefill graph profile requires zero rows for Standard or positive rows for SegmentedCaptured");
+            }
+            const auto duplicate = std::find(
+                definition.features.prefill_graph.begin(),
+                definition.features.prefill_graph.begin() +
+                    static_cast<std::ptrdiff_t>(index),
+                profile);
+            if (duplicate !=
+                definition.features.prefill_graph.begin() +
+                    static_cast<std::ptrdiff_t>(index))
+            {
+                throw std::invalid_argument(
+                    "model parity prefill graph profiles must be unique");
+            }
+        }
         if (definition.features.mtp == ModelParityAxisProfile::Standard &&
             model.maximum_mtp_draft_depth <
                 kModelParityRequiredMaximumMTPDepth)
@@ -1119,30 +1297,88 @@ namespace llaminar2::test::parity
             throw std::invalid_argument(
                 "standard model parity MTP profile requires depth-15 model/reference capacity");
         }
+        if (!definition.features.mtp_kl_threshold_overrides.empty() &&
+            definition.features.mtp != ModelParityAxisProfile::Standard)
+        {
+            throw std::invalid_argument(
+                "model parity MTP KL overrides require the standard MTP axis");
+        }
+        for (std::size_t index = 0;
+             index < definition.features.mtp_kl_threshold_overrides.size();
+             ++index)
+        {
+            const auto &override =
+                definition.features.mtp_kl_threshold_overrides[index];
+            if (override.policy == ModelParityMTP::Off ||
+                !std::isfinite(override.maximum_kl_divergence) ||
+                !(override.maximum_kl_divergence > 0.0f))
+            {
+                throw std::invalid_argument(
+                    "model parity MTP KL override requires an enabled policy and finite positive budget");
+            }
+            const auto duplicate = std::find_if(
+                definition.features.mtp_kl_threshold_overrides.begin(),
+                definition.features.mtp_kl_threshold_overrides.begin() +
+                    static_cast<std::ptrdiff_t>(index),
+                [&](const ModelParityMTPKLThresholdOverride &candidate)
+                { return candidate.policy == override.policy; });
+            if (duplicate !=
+                definition.features.mtp_kl_threshold_overrides.begin() +
+                    static_cast<std::ptrdiff_t>(index))
+            {
+                throw std::invalid_argument(
+                    "model parity MTP KL overrides must be unique by policy");
+            }
+        }
         if (topology.isExpertOverlay() &&
             !topology.expert_overlay_plan->enabled)
         {
             throw std::invalid_argument(
                 "ExpertOverlay parity topology supplied a disabled placement plan");
         }
-        if (topology.isExpertOverlay() &&
-            (definition.dynamic_rebalance.device_maintenance_slack_tokens < 0 ||
-             definition.dynamic_rebalance
-                     .device_min_maintenance_period_tokens <= 0 ||
-             definition.dynamic_rebalance
-                     .device_initial_maintenance_period_tokens <= 0))
+        if (topology.isExpertOverlay())
         {
-            /*
-             * Dynamic cells promise physical movement, so their device-owned
-             * decision clock must be part of the typed case identity. Letting
-             * any cadence field fall through to DebugEnv would make the same
-             * registered cell observe 1/1-token histogram windows but retain
-             * the production 321/512-token ticket schedule. That split policy
-             * is valid for a deployment, but cannot prove movement in a short,
-             * deterministic parity request.
-             */
-            throw std::invalid_argument(
-                "ExpertOverlay parity requires an explicit non-negative maintenance slack and positive initial/recurring device cadence");
+            const auto validate_dynamic_policy =
+                [&](const MoERebalanceRuntimeConfig &policy,
+                    const char *evidence_name)
+            {
+                if (policy.device_maintenance_slack_tokens < 0 ||
+                    policy.device_min_maintenance_period_tokens <= 0 ||
+                    policy.device_initial_maintenance_period_tokens <= 0)
+                {
+                    /*
+                     * Dynamic cells promise physical movement, so their
+                     * device-owned decision clock is part of typed identity.
+                     * An environment-owned cadence would make one registered
+                     * case execute a different lifecycle on another host.
+                     */
+                    throw std::invalid_argument(
+                        std::string("ExpertOverlay ") + evidence_name +
+                        " policy requires an explicit non-negative maintenance slack and positive initial/recurring device cadence");
+                }
+                if (definition.features.mtp ==
+                            ModelParityAxisProfile::Standard &&
+                    policy.device_min_maintenance_period_tokens <
+                        model.maximum_mtp_draft_depth + 1)
+                {
+                    /*
+                     * The initial cadence may force an early publication.
+                     * Recurring maintenance must still admit one complete
+                     * maximum-width predictor-plus-verifier transaction.
+                     */
+                    throw std::invalid_argument(
+                        std::string("ExpertOverlay standard MTP ") +
+                        evidence_name +
+                        " policy requires a recurring maintenance cadence at least as wide as the maximum predictor-plus-verifier transaction");
+                }
+            };
+            validate_dynamic_policy(
+                definition.dynamic_rebalance.economic_movement,
+                "economic-movement");
+            validate_dynamic_policy(
+                definition.dynamic_rebalance
+                    .economic_movement_and_observed_speedup,
+                "observed-speedup");
         }
         if (topology.kind == ModelParityTopologyKind::SingleDevice &&
             topology.participants.size() != 1u)
@@ -1342,12 +1578,17 @@ namespace llaminar2::test::parity
                                    : std::vector<std::optional<
                                          ModelParityExpertOverlayPolicy>>{
                                          std::nullopt};
+        const bool topology_has_cpu = std::any_of(
+            topology.participants.begin(), topology.participants.end(),
+            [](const ModelParityParticipant &participant)
+            { return participant.address.isCPU(); });
 
         std::vector<ModelParityCase> cases;
         cases.reserve(
             definition.precisions.activation.size() *
             definition.precisions.kv_cache.size() * mtp_policies.size() *
-            overlay_policies.size());
+            overlay_policies.size() *
+            definition.features.prefill_graph.size());
         std::set<std::string> names;
         for (const auto activation : definition.precisions.activation)
         {
@@ -1355,53 +1596,92 @@ namespace llaminar2::test::parity
             {
                 for (const auto &overlay : overlay_policies)
                 {
-                    for (const auto mtp : mtp_policies)
+                    for (const auto &prefill_graph :
+                         definition.features.prefill_graph)
                     {
-                        BackendThresholds thresholds =
-                            definition.thresholds;
-                        const auto precision_override = std::find_if(
-                            definition.precisions.threshold_overrides.begin(),
-                            definition.precisions.threshold_overrides.end(),
-                            [&](const ModelParityPrecisionThresholdOverride &candidate)
+                        for (const auto mtp : mtp_policies)
+                        {
+                            BackendThresholds thresholds =
+                                definition.thresholds;
+                            const auto precision_override = std::find_if(
+                                definition.precisions.threshold_overrides.begin(),
+                                definition.precisions.threshold_overrides.end(),
+                                [&](const ModelParityPrecisionThresholdOverride &candidate)
+                                {
+                                    return candidate.activation == activation &&
+                                           candidate.kv_cache == kv_cache;
+                                });
+                            if (precision_override !=
+                                definition.precisions.threshold_overrides.end())
                             {
-                                return candidate.activation == activation &&
-                                       candidate.kv_cache == kv_cache;
-                            });
-                        if (precision_override !=
-                            definition.precisions.threshold_overrides.end())
-                        {
-                            thresholds = precision_override->thresholds;
+                                thresholds = precision_override->thresholds;
+                            }
+                            const auto mtp_kl_override = std::find_if(
+                                definition.features.mtp_kl_threshold_overrides.begin(),
+                                definition.features.mtp_kl_threshold_overrides.end(),
+                                [&](const ModelParityMTPKLThresholdOverride &candidate)
+                                { return candidate.policy == mtp; });
+                            if (mtp_kl_override !=
+                                definition.features.mtp_kl_threshold_overrides.end())
+                            {
+                                // Alter only recursive-logit KL; every other
+                                // precision-specific numerical contract survives.
+                                thresholds.mtp_kl_threshold =
+                                    mtp_kl_override->maximum_kl_divergence;
+                            }
+                            const ModelParityDynamicEvidence dynamic_evidence =
+                                !overlay ||
+                                        overlay->movement !=
+                                            ModelParityExpertMovement::Dynamic
+                                    ? ModelParityDynamicEvidence::NotApplicable
+                                    : topology_has_cpu &&
+                                              mtp == ModelParityMTP::Off &&
+                                              prefill_graph ==
+                                                  definition.features
+                                                      .prefill_graph.front()
+                                          ? ModelParityDynamicEvidence::
+                                                EconomicMovementAndObservedSpeedup
+                                          : ModelParityDynamicEvidence::
+                                                EconomicMovement;
+                            ModelParityCase test_case{
+                                .model = model,
+                                .topology = topology,
+                                .thresholds = std::move(thresholds),
+                                .activation_precision = activation,
+                                .kv_cache_precision = kv_cache,
+                                .mtp = mtp,
+                                .retained_mtp_draft_capacity =
+                                    definition.features.mtp ==
+                                            ModelParityAxisProfile::Standard
+                                        ? model.maximum_mtp_draft_depth
+                                        : 0,
+                                .expert_overlay = overlay,
+                                .dynamic_evidence = dynamic_evidence,
+                                .prefill_graph = prefill_graph,
+                                .prefix_cache_block_size =
+                                    kModelParityPrefixRestoreProofBlockSize,
+                                .moe_hot_expert_cache =
+                                    definition.moe_hot_expert_cache,
+                                .moe_routed_prefill =
+                                    definition.moe_routed_prefill,
+                                .dynamic_rebalance =
+                                    definition.dynamic_rebalance.policyFor(
+                                        dynamic_evidence),
+                                .graph_snapshot_policy =
+                                    definition.graph_snapshot_policy,
+                                .collective_evidence_source =
+                                    definition.collective_evidence_source,
+                                .tp_allreduce_precision_override =
+                                    definition.tp_allreduce_precision_override,
+                            };
+                            if (!names.insert(test_case.testName()).second)
+                            {
+                                throw std::invalid_argument(
+                                    "model parity definition generated duplicate case '" +
+                                    test_case.testName() + "'");
+                            }
+                            cases.push_back(std::move(test_case));
                         }
-                        ModelParityCase test_case{
-                            .model = model,
-                            .topology = topology,
-                            .thresholds = std::move(thresholds),
-                            .activation_precision = activation,
-                            .kv_cache_precision = kv_cache,
-                            .mtp = mtp,
-                            .expert_overlay = overlay,
-                            .prefix_cache_block_size =
-                                kModelParityPrefixRestoreProofBlockSize,
-                            .moe_hot_expert_cache =
-                                definition.moe_hot_expert_cache,
-                            .moe_routed_prefill =
-                                definition.moe_routed_prefill,
-                            .dynamic_rebalance =
-                                definition.dynamic_rebalance,
-                            .graph_snapshot_policy =
-                                definition.graph_snapshot_policy,
-                            .collective_evidence_source =
-                                definition.collective_evidence_source,
-                            .tp_allreduce_precision_override =
-                                definition.tp_allreduce_precision_override,
-                        };
-                        if (!names.insert(test_case.testName()).second)
-                        {
-                            throw std::invalid_argument(
-                                "model parity definition generated duplicate case '" +
-                                test_case.testName() + "'");
-                        }
-                        cases.push_back(std::move(test_case));
                     }
                 }
             }

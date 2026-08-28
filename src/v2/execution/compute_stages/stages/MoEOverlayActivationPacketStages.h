@@ -124,11 +124,14 @@ namespace llaminar2
      * @brief Own one layer's immutable continuation-to-follower lane transaction.
      *
      * Decode uses a fused direct-mapped kernel and therefore needs no auxiliary
-     * resources. Wider prefill/verifier rows fork every lane from one exact
-     * continuation stream, keep dispatch/return acquisition on context-owned
-     * auxiliary streams, and join those streams only after continuation-local
-     * expert work. Events are layer-owned because native graph nodes retain event
-     * identity; streams are topology-bounded and shared by lane ordinal.
+     * resources. Wider prefill/verifier rows fork every outbound lane from one
+     * exact continuation stream and keep dispatch publication on context-owned
+     * auxiliary streams. The consumer later acquires each immutable mapped
+     * return timeline directly on its own graph stream. The mapped timeline is
+     * therefore the sole return-completion authority across both complete and
+     * heterogeneously segmented graphs; no backend event crosses a native
+     * executable lifetime. Streams are topology-bounded and shared by lane
+     * ordinal.
      *
      * This object is the only mutable ordering authority shared by the fork and
      * join stages. It stores no host mirror of packet progress and performs no
@@ -207,8 +210,6 @@ namespace llaminar2
         }
         /** @return Context-owned auxiliary stream for canonical lane @p index. */
         [[nodiscard]] void *laneStream(std::size_t index) const;
-        /** @return Layer-owned return-import completion event for lane @p index. */
-        [[nodiscard]] void *laneReturnReadyEvent(std::size_t index) const;
         /** @return Number of distinct shared physical dispatch publications. */
         [[nodiscard]] std::size_t sharedDispatchPayloadGroupCount() const noexcept
         {
@@ -258,7 +259,6 @@ namespace llaminar2
         int event_device_ordinal_ = -1;
         void *producer_ready_event_ = nullptr;
         std::vector<void *> lane_streams_;
-        std::vector<void *> lane_return_ready_events_;
         /** Per-lane group index, or -1 for a direct compact packet. */
         std::vector<std::int32_t> lane_shared_dispatch_payload_groups_;
         /** Unique groups in first-canonical-lane order. */
@@ -271,10 +271,11 @@ namespace llaminar2
      *
      * Exact one-row direct mappings retain the single-grid decode fast path.
      * Wider rows publish the physical activation matrix once per rank-pair,
-     * then compact lane metadata, publication, return acquisition, and direct
-     * mapped return writes proceed independently on persistent lane streams.
-     * The public graph stream does not wait here, allowing continuation-local
-     * experts to overlap the complete remote transaction.
+     * then compact lane metadata and publication proceed independently on
+     * persistent lane streams. The public graph stream does not wait here,
+     * allowing continuation-local experts to overlap the complete remote
+     * transaction. Return acquisition belongs exclusively to the later
+     * consumer so a backend event never crosses a native executable boundary.
      */
     class MoEOverlayActivationDispatchPackBatchStage final
         : public IComputeStage
@@ -539,10 +540,13 @@ namespace llaminar2
      * @brief Join independent lane returns and materialize canonical slots.
      *
      * Exact one-row decode retains the topology-sized gather kernel. Wider-row
-     * transactions wait only for the layer-owned import events already queued
-     * by the fork stage, validate/index all lanes in one topology-parallel
-     * kernel, then fold them in planner order with one writer per output
-     * element. Completion timing therefore cannot perturb FP32 arithmetic.
+     * transactions acquire every lane's immutable mapped return timeline on
+     * the exact consumer stream, validate/index all lanes in one
+     * topology-parallel kernel, then fold them in planner order with one writer
+     * per output element. The peer's return publication is transitively after
+     * dispatch DMA and remote compute, so this one authority orders the whole
+     * transaction without a cross-executable backend event. Completion timing
+     * therefore cannot perturb FP32 arithmetic.
      */
     class MoEOverlayActivationReturnConsumeBatchStage final
         : public IComputeStage

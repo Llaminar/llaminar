@@ -98,6 +98,81 @@ namespace llaminar2
         return true;
     }
 
+    ValidatedDecodeExpertHistogramWindowView
+    DecodeExpertHistogramWindow::validatedView() const
+    {
+        if (!valid())
+        {
+            throw std::invalid_argument(
+                "Cannot authenticate a malformed frozen expert histogram window");
+        }
+        return ValidatedDecodeExpertHistogramWindowView(*this);
+    }
+
+    ValidatedDecodeExpertHistogramWindowView::
+        ValidatedDecodeExpertHistogramWindowView(
+            const DecodeExpertHistogramWindow &window) noexcept
+        : window_(&window)
+    {
+    }
+
+    int ValidatedDecodeExpertHistogramWindowView::numLayers() const noexcept
+    {
+        return window_->num_layers;
+    }
+
+    int ValidatedDecodeExpertHistogramWindowView::numExperts() const noexcept
+    {
+        return window_->num_experts;
+    }
+
+    std::uint64_t
+    ValidatedDecodeExpertHistogramWindowView::generation() const noexcept
+    {
+        return window_->generation;
+    }
+
+    std::uint64_t
+    ValidatedDecodeExpertHistogramWindowView::tokenCount() const noexcept
+    {
+        return window_->token_count;
+    }
+
+    std::uint64_t ValidatedDecodeExpertHistogramWindowView::activationCount(
+        int layer_idx,
+        int expert_id) const
+    {
+        if (layer_idx < 0 || layer_idx >= window_->num_layers ||
+            expert_id < 0 || expert_id >= window_->num_experts)
+        {
+            throw std::out_of_range(
+                "Validated frozen expert histogram index is outside its geometry");
+        }
+        return window_->expert_counts[
+            static_cast<std::size_t>(layer_idx) *
+                static_cast<std::size_t>(window_->num_experts) +
+            static_cast<std::size_t>(expert_id)];
+    }
+
+    std::uint64_t ValidatedDecodeExpertHistogramWindowView::activationCount(
+        ExpertHistogramSource source,
+        int layer_idx,
+        int expert_id) const
+    {
+        if (layer_idx < 0 || layer_idx >= window_->num_layers ||
+            expert_id < 0 || expert_id >= window_->num_experts)
+        {
+            throw std::out_of_range(
+                "Validated frozen expert histogram phase index is outside its geometry");
+        }
+        return window_->source_expert_counts[sourceCountOffset(
+            querySourceIndex(source),
+            layer_idx,
+            expert_id,
+            window_->num_layers,
+            window_->num_experts)];
+    }
+
     uint64_t DecodeExpertHistogramWindow::activationCount(
         int layer_idx,
         int expert_id) const
@@ -297,12 +372,36 @@ namespace llaminar2
         }
     }
 
+    DecodeExpertHistogram::BankLease
+    DecodeExpertHistogram::acquireAdmittedBank() const noexcept
+    {
+        if (!admitsRuntimeExpertHistogramRows(
+                admission_state_.load(std::memory_order_acquire)))
+        {
+            return {};
+        }
+
+        auto lease = acquireActiveBank();
+        if (!admitsRuntimeExpertHistogramRows(
+                admission_state_.load(std::memory_order_acquire)))
+        {
+            return {};
+        }
+        return lease;
+    }
+
     // ── DecodeExpertHistogram ─────────────────────────
 
     DecodeExpertHistogram::DecodeExpertHistogram(DecodeExpertHistogramConfig config)
         : config_(std::move(config)),
+          active_window_size_(config_.window_size),
           ownership_(config_.ownership)
     {
+        if (config_.window_size <= 0)
+        {
+            throw std::invalid_argument(
+                "DecodeExpertHistogram requires a positive window size");
+        }
         if (ownership_.layerCount() != config_.num_layers ||
             ownership_.expertCount() != config_.num_experts ||
             ownership_.participantCount() != static_cast<int>(config_.sockets.size()))
@@ -337,7 +436,9 @@ namespace llaminar2
         const float *expert_weights,
         int top_k)
     {
-        auto bank_lease = acquireActiveBank();
+        auto bank_lease = acquireAdmittedBank();
+        if (!bank_lease)
+            return;
         auto &bank = bank_lease.mutableBank();
         auto &layer = bank.layers[layer_idx];
         const int k = std::min(top_k, static_cast<int>(MAX_TOP_K));
@@ -384,7 +485,9 @@ namespace llaminar2
             return;
         if (isTokenBoundaryLayer(layer_idx))
         {
-            auto bank_lease = acquireActiveBank();
+            auto bank_lease = acquireAdmittedBank();
+            if (!bank_lease)
+                return;
             bank_lease.mutableBank().token_count.fetch_add(
                 token_count,
                 std::memory_order_relaxed);
@@ -404,7 +507,9 @@ namespace llaminar2
         if (!expert_counts || layer_idx < 0 || layer_idx >= config_.num_layers || num_experts <= 0)
             return;
 
-        auto bank_lease = acquireActiveBank();
+        auto bank_lease = acquireAdmittedBank();
+        if (!bank_lease)
+            return;
         auto &bank = bank_lease.mutableBank();
         auto &layer = bank.layers[layer_idx];
         const std::size_t source_index = ingestionSourceIndex(source);
@@ -480,6 +585,7 @@ namespace llaminar2
         }
 
         std::vector<uint64_t> counts(static_cast<size_t>(config_.num_experts), 0);
+        uint64_t candidate_activations = 0;
         for (int token = 0; token < merge.real_token_count; ++token)
         {
             const int *row = expert_indices + static_cast<size_t>(token) * static_cast<size_t>(route_stride);
@@ -492,11 +598,16 @@ namespace llaminar2
                     return result;
                 }
                 counts[static_cast<size_t>(expert_id)] += 1;
-                result.activations_merged += 1;
+                candidate_activations += 1;
             }
         }
 
-        auto bank_lease = acquireActiveBank();
+        auto bank_lease = acquireAdmittedBank();
+        if (!bank_lease)
+        {
+            result.ok = true;
+            return result;
+        }
         auto &bank = bank_lease.mutableBank();
         auto &layer = bank.layers[static_cast<size_t>(merge.layer_idx)];
         const std::size_t source_index = ingestionSourceIndex(merge.source);
@@ -527,6 +638,7 @@ namespace llaminar2
             result.tokens_counted = static_cast<uint64_t>(merge.real_token_count);
         }
 
+        result.activations_merged = candidate_activations;
         result.ok = true;
         return result;
     }
@@ -621,6 +733,97 @@ namespace llaminar2
 
         runtime_drain_generation_active_ = false;
         return RuntimeExpertHistogramDrainResult::ready();
+    }
+
+    void DecodeExpertHistogram::registerRuntimeHistogramAdmission(
+        RuntimeHistogramAdmissionCallback callback)
+    {
+        if (!callback)
+            return;
+        std::lock_guard<std::mutex> lock(runtime_sync_mutex_);
+        if (runtime_drain_generation_active_ ||
+            admission_state_.load(std::memory_order_acquire) ==
+                RuntimeExpertHistogramAdmission::CertificationQuarantine)
+        {
+            throw std::logic_error(
+                "Runtime histogram admission publishers must be registered before certification rebase begins");
+        }
+        runtime_admission_callbacks_.push_back(std::move(callback));
+    }
+
+    void DecodeExpertHistogram::beginOptimizationDemandRebase()
+    {
+        std::lock_guard<std::mutex> lock(runtime_sync_mutex_);
+        if (runtime_drain_generation_active_)
+        {
+            throw std::logic_error(
+                "Optimization-demand quarantine must precede its runtime histogram drain");
+        }
+        auto current = admission_state_.load(std::memory_order_acquire);
+        if (current ==
+            RuntimeExpertHistogramAdmission::CertificationQuarantine)
+        {
+            return;
+        }
+        if (current !=
+            RuntimeExpertHistogramAdmission::CalibrationEvidence)
+        {
+            throw std::logic_error(
+                "Optimization-demand quarantine may begin exactly once from calibration evidence");
+        }
+        admission_state_.store(
+            RuntimeExpertHistogramAdmission::CertificationQuarantine,
+            std::memory_order_release);
+    }
+
+    void DecodeExpertHistogram::activateOptimizationDemand()
+    {
+        std::lock_guard<std::mutex> lock(runtime_sync_mutex_);
+        if (runtime_drain_generation_active_)
+        {
+            throw std::logic_error(
+                "Optimization demand cannot activate while a runtime histogram drain is active");
+        }
+        if (admission_state_.load(std::memory_order_acquire) !=
+            RuntimeExpertHistogramAdmission::CertificationQuarantine)
+        {
+            throw std::logic_error(
+                "Optimization demand requires a completed certification quarantine");
+        }
+        for (const auto &callback : runtime_admission_callbacks_)
+        {
+            if (!callback(
+                    RuntimeExpertHistogramAdmission::OptimizationDemand))
+            {
+                throw std::runtime_error(
+                    "A runtime histogram source rejected request-boundary optimization-demand activation");
+            }
+        }
+        admission_state_.store(
+            RuntimeExpertHistogramAdmission::OptimizationDemand,
+            std::memory_order_release);
+    }
+
+    void DecodeExpertHistogram::activatePrecertifiedOptimizationDemand()
+    {
+        std::lock_guard<std::mutex> lock(runtime_sync_mutex_);
+        if (runtime_drain_generation_active_ ||
+            !runtime_admission_callbacks_.empty() ||
+            admission_state_.load(std::memory_order_acquire) !=
+                RuntimeExpertHistogramAdmission::CalibrationEvidence)
+        {
+            throw std::logic_error(
+                "Pre-certified optimization demand must activate before runtime histogram setup");
+        }
+        admission_state_.store(
+            RuntimeExpertHistogramAdmission::OptimizationDemand,
+            std::memory_order_release);
+    }
+
+    RuntimeExpertHistogramAdmission
+    DecodeExpertHistogram::admissionState() const noexcept
+    {
+        return admission_state_.load(std::memory_order_acquire);
     }
 
     // ── Queries ───────────────────────────────────────
@@ -846,13 +1049,55 @@ namespace llaminar2
 
     bool DecodeExpertHistogram::windowFull() const
     {
-        return windowTokenCount() >= static_cast<uint64_t>(config_.window_size);
+        return windowTokenCount() >=
+               static_cast<uint64_t>(windowSize());
+    }
+
+    int DecodeExpertHistogram::windowSize() const noexcept
+    {
+        return active_window_size_.load(std::memory_order_acquire);
+    }
+
+    void DecodeExpertHistogram::setWindowSize(int new_size)
+    {
+        if (new_size <= 0)
+        {
+            throw std::invalid_argument(
+                "DecodeExpertHistogram window size must be positive");
+        }
+        active_window_size_.store(new_size, std::memory_order_release);
     }
 
     uint64_t DecodeExpertHistogram::windowGeneration() const
     {
         const auto bank_lease = acquireActiveBank();
         return bank_lease.bank().generation;
+    }
+
+    MoEOptimizationDemandWindow
+    DecodeExpertHistogram::optimizationDemandWindow() const noexcept
+    {
+        for (;;)
+        {
+            const auto bank_lease = acquireActiveBank();
+            const auto &bank = bank_lease.bank();
+            const MoEOptimizationDemandWindow snapshot{
+                .generation = bank.generation,
+                .collected_routed_rows =
+                    bank.token_count.load(std::memory_order_relaxed),
+                .capacity_routed_rows =
+                    static_cast<std::uint64_t>(windowSize()),
+            };
+
+            /* Rotation publishes the complete monotonically increasing epoch.
+             * Rechecking it after the count prevents an ABA on the two physical
+             * banks and ensures an old pinned bank is never reported as active. */
+            if (active_bank_epoch_.load(std::memory_order_acquire) ==
+                snapshot.generation)
+            {
+                return snapshot;
+            }
+        }
     }
 
     // ── Window management ─────────────────────────────

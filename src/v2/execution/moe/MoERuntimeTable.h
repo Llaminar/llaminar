@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -307,6 +308,15 @@ namespace llaminar2
          * embedded child bank only after a successful transient apply.
          */
         const DeviceMoEPlacementBank *overlay_placement_banks = nullptr;
+        /**
+         * @brief Device-owned result of the most recent epoch boundary operation.
+         *
+         * Production kernels consult this pointer only while reporting an already
+         * fatal ticket contract. Keeping it beside the stable ticket lets CUDA and
+         * ROCm attribute a zeroed ticket to its actual acquire/release boundary
+         * without a host copy, synchronization, or shadow lifecycle.
+         */
+        const DeviceMoEOverlayEpochStatus *overlay_epoch_status = nullptr;
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceMoEExpertDescriptor>);
@@ -372,6 +382,8 @@ namespace llaminar2
                   moe_runtime_abi::kOverlayEpochTicketOffset);
     static_assert(offsetof(DeviceMoELayerRuntime, overlay_placement_banks) ==
                   moe_runtime_abi::kOverlayPlacementBanksOffset);
+    static_assert(offsetof(DeviceMoELayerRuntime, overlay_epoch_status) ==
+                  moe_runtime_abi::kOverlayEpochStatusOffset);
 
     /**
      * @brief Count active experts backed by graph-owned transient transfer slots.
@@ -734,7 +746,36 @@ namespace llaminar2
          * @param stream Exact non-null producer stream for mirrored GPU tables.
          */
         virtual void recordDecodeHistogramProducerStream(void *stream) = 0;
+        /**
+         * @brief Retire every graph-borrowed histogram producer stream.
+         *
+         * The graph owner calls this terminal transition after inference
+         * submission has stopped but before destroying the contexts that own
+         * producer streams. Implementations join the exact producer DAG onto
+         * their maintenance authority and take one terminal fence. After this
+         * method returns, later resource destruction must not dereference a
+         * borrowed stream identity.
+         *
+         * CPU tables perform only the typed lifecycle transition. Repeated
+         * calls are idempotent; producer admission or histogram progress after
+         * retirement is invalid.
+         */
+        virtual void retireRuntimeHistogramProducerStreams() = 0;
         virtual void *decodeHistogramProducerStream() const = 0;
+        /**
+         * @brief Return the model-lifetime accepted-verifier publication stream.
+         *
+         * A mirrored table whose asynchronous source mask includes grouped
+         * verification creates and admits this stream while installing its
+         * histogram banks.  Accepted-state graph families borrow this exact
+         * identity, so their first lazy materialization cannot introduce a new
+         * producer after maintenance has sealed the topology.  The table owns
+         * the stream; callers must neither replace nor destroy it.
+         *
+         * @return Exact non-null CUDA/HIP stream for grouped-verifier
+         *         publication, or nullptr when this table owns no such source.
+         */
+        virtual void *groupedVerifierHistogramPublicationStream() const = 0;
         virtual bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
                                                void *stream = nullptr,
                                                bool reset_runtime_counts = true) = 0;
@@ -757,6 +798,18 @@ namespace llaminar2
         virtual RuntimeExpertHistogramDrainResult
         progressAsyncDecodeHistogramDrain(
             DecodeExpertHistogram &histogram) = 0;
+        /**
+         * @brief Publish a request-boundary route-admission phase.
+         *
+         * Mirrored tables join every exact producer into their one persistent
+         * maintenance stream, publish one immutable writer state there, then
+         * make every producer wait on that exact publication event. The method
+         * never waits for a stream or device on the host.
+         * CPU tables accept the phase without device work because their shared
+         * @ref DecodeExpertHistogram is the direct authority.
+         */
+        virtual bool publishAsyncDecodeHistogramAdmission(
+            RuntimeExpertHistogramAdmission admission) = 0;
         virtual bool captureDecodeHistogramCounts(std::vector<uint64_t> &selected_counts,
                                                   std::vector<uint64_t> &local_counts,
                                                   void *stream = nullptr) = 0;
@@ -940,7 +993,11 @@ namespace llaminar2
         void prepareDecodeHistogramProducerStream(void *stream) override;
         /** @copydoc IMoERuntimeTable::recordDecodeHistogramProducerStream */
         void recordDecodeHistogramProducerStream(void *stream) override;
+        /** @copydoc IMoERuntimeTable::retireRuntimeHistogramProducerStreams */
+        void retireRuntimeHistogramProducerStreams() override;
         void *decodeHistogramProducerStream() const override;
+        /** @copydoc IMoERuntimeTable::groupedVerifierHistogramPublicationStream */
+        void *groupedVerifierHistogramPublicationStream() const override;
         bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
                                        void *stream = nullptr,
                                        bool reset_runtime_counts = true) override;
@@ -951,6 +1008,9 @@ namespace llaminar2
         RuntimeExpertHistogramDrainResult
         progressAsyncDecodeHistogramDrain(
             DecodeExpertHistogram &histogram) override;
+        /** @copydoc IMoERuntimeTable::publishAsyncDecodeHistogramAdmission */
+        bool publishAsyncDecodeHistogramAdmission(
+            RuntimeExpertHistogramAdmission admission) override;
         bool captureDecodeHistogramCounts(std::vector<uint64_t> &selected_counts,
                                           std::vector<uint64_t> &local_counts,
                                           void *stream = nullptr) override;
@@ -969,6 +1029,35 @@ namespace llaminar2
          */
         void resetDecodeRuntimeState(void *stream = nullptr) override;
         bool hasInitialRuntimeState() const noexcept;
+        /**
+         * @brief Return whether every retained layer owns a published baseline.
+         *
+         * @ref hasInitialRuntimeState answers whether any layer captured a
+         * reset template, which remains useful for partial graph construction.
+         * A topology-wide controller needs this stronger model-family
+         * invariant: dormant MTP/NextN layers count exactly like active main
+         * layers and may not remain at epoch zero.
+         */
+        [[nodiscard]] bool hasCompleteInitialRuntimeState() const noexcept;
+        /**
+         * @brief Seal and publish the complete setup-time runtime family.
+         *
+         * Graph construction may prepare a retained layer without ever
+         * launching the graph that first references it. This one-shot typed
+         * transition freezes the final complete host recipe as the immutable
+         * baseline, uploads it to its device template, then publishes that
+         * template to the live table on @p stream. Earlier per-layer captures
+         * are construction checkpoints and may not substitute for this final
+         * family snapshot. The stream's owner must publish the consumer event;
+         * this method never synchronizes or allocates.
+         *
+         * @param stream Exact non-null controller publication stream.
+         * @throws std::invalid_argument for a CPU table or null stream.
+         * @throws std::logic_error when any retained layer lacks a baseline or
+         *         the runtime family has already been published.
+         * @throws std::runtime_error when a backend copy cannot be enqueued.
+         */
+        void sealAndPublishCompleteInitialRuntimeState(void *stream);
         /**
          * @brief Restore immutable model placement using one ordered D2D copy.
          *
@@ -1134,12 +1223,46 @@ namespace llaminar2
         DeviceMoEOverlayServiceTelemetrySample
             *device_overlay_service_samples_ = nullptr;
         void *decode_histogram_producer_stream_ = nullptr;
+        /**
+         * @brief Table-owned stream for accepted grouped-verifier publication.
+         *
+         * This stream is allocated and admitted atomically with the persistent
+         * histogram banks whenever the GroupedVerifier source is selected. It
+         * deliberately outlives every accepted-state graph identity and is
+         * retired only after inference has stopped and borrowed graph caches
+         * have released their native executables.
+         */
+        void *grouped_verifier_histogram_publication_stream_ = nullptr;
 
-        /** Exact stream plus its reusable flip-arrival event. */
+        /**
+         * @brief Exact producer stream and its two-phase bank-rotation fences.
+         *
+         * The arrival closes all work submitted before a rotation request.
+         * The departure is recorded after the producer has consumed the sole
+         * writer-state publication. Maintenance joins both phases before it
+         * snapshots or clears the frozen bank, so graph launches submitted by
+         * another host thread cannot fall through a one-sided event gap.
+         */
         struct RuntimeHistogramProducerStream
         {
+            /**
+             * @brief Declare which object owns the producer stream lifetime.
+             *
+             * Borrowed streams belong to graph/device contexts and must be
+             * forgotten at the explicit producer-retirement edge. The grouped
+             * verifier publication stream belongs to this table and remains
+             * available for destruction after borrowed contexts are gone.
+             */
+            enum class Ownership : uint8_t
+            {
+                BorrowedExecutionStream = 0,
+                TableOwnedStream,
+            };
+
             void *stream = nullptr;
             void *flip_arrival_event = nullptr;
+            void *flip_departure_event = nullptr;
+            Ownership ownership = Ownership::BorrowedExecutionStream;
         };
 
         mutable std::mutex runtime_histogram_drain_mutex_;
@@ -1151,7 +1274,8 @@ namespace llaminar2
         uint32_t *device_runtime_histogram_active_bank_ = nullptr;
         DeviceMoERuntimeHistogramBank *host_runtime_histogram_snapshot_ =
             nullptr;
-        uint32_t *host_runtime_histogram_bank_indices_ = nullptr;
+        /** Pinned identity table for admitted/quarantined states of both banks. */
+        uint32_t *host_runtime_histogram_writer_states_ = nullptr;
         void *runtime_histogram_maintenance_stream_ = nullptr;
         /**
          * @brief Model-setup fence consumed by every exact producer stream.
@@ -1162,12 +1286,45 @@ namespace llaminar2
          * synchronization.
          */
         void *runtime_histogram_initialization_event_ = nullptr;
+        /**
+         * @brief Reusable fence for the sole device writer-state publication.
+         *
+         * The maintenance stream is the only stream allowed to mutate the
+         * active-bank/admission scalar. Every producer waits on this event
+         * before it may read the newly published state, preventing concurrent
+         * DMA writes or a graph reader racing an unordered state transition.
+         */
+        void *runtime_histogram_writer_state_published_event_ = nullptr;
         void *runtime_histogram_drain_complete_event_ = nullptr;
         uint32_t runtime_histogram_active_bank_host_ = 0;
         uint32_t runtime_histogram_frozen_bank_host_ = 0;
         bool runtime_histogram_drain_enabled_ = false;
         bool runtime_histogram_drain_in_flight_ = false;
-        bool runtime_histogram_producers_sealed_ = false;
+        /** Typed producer-set transition enforced by the first bank rotation. */
+        enum class RuntimeHistogramProducerTopology : uint8_t
+        {
+            Open = 0, ///< Model setup may still admit exact producer streams.
+            Sealed,   ///< Every future writer must already be in the set.
+        };
+        RuntimeHistogramProducerTopology runtime_histogram_producer_topology_ =
+            RuntimeHistogramProducerTopology::Open;
+        /**
+         * @brief Terminal ownership lifecycle for producer stream identities.
+         *
+         * This state prevents resource teardown from touching a graph-borrowed
+         * stream after its device context has been destroyed. Producer
+         * retirement closes and fences the DAG while all streams are live;
+         * resource release later destroys only table-owned handles.
+         */
+        enum class RuntimeHistogramProducerLifecycle : uint8_t
+        {
+            CollectingProducers = 0,
+            ProducersRetired,
+            ResourcesReleased,
+        };
+        RuntimeHistogramProducerLifecycle
+            runtime_histogram_producer_lifecycle_ =
+                RuntimeHistogramProducerLifecycle::CollectingProducers;
 
         std::shared_ptr<DeviceMoESerialRouteScratchArena>
             serial_route_scratch_arena_;
@@ -1182,6 +1339,22 @@ namespace llaminar2
         int32_t *deferred_verifier_route_expert_ids_ = nullptr;
         int32_t *deferred_verifier_route_participant_ids_ = nullptr;
         uint32_t deferred_verifier_route_capacity_ = 0;
+
+        /**
+         * @brief Setup-only authority handoff for the retained runtime family.
+         *
+         * Collecting permits graph builders to capture each immutable layer
+         * recipe. Published means one exact controller stream has made every
+         * recipe device-visible; later placement changes are device-owned.
+         */
+        enum class InitialRuntimeFamilyLifecycle : uint8_t
+        {
+            Collecting = 0,
+            Published,
+        };
+
+        InitialRuntimeFamilyLifecycle initial_runtime_family_lifecycle_ =
+            InitialRuntimeFamilyLifecycle::Collecting;
 
         void validateLayerIndex(int layer_idx) const;
         void validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const;
@@ -1210,7 +1383,9 @@ namespace llaminar2
          * outside a CUDA/HIP capture interval. Event allocation and the wait on
          * uncaptured model-setup work are intentionally confined to this method.
          */
-        void registerRuntimeHistogramProducerStreamLocked(void *stream);
+        void registerRuntimeHistogramProducerStreamLocked(
+            void *stream,
+            RuntimeHistogramProducerStream::Ownership ownership);
         /**
          * @brief Test whether an exact stream has completed producer admission.
          *
@@ -1221,7 +1396,49 @@ namespace llaminar2
          */
         [[nodiscard]] bool isRuntimeHistogramProducerStreamRegisteredLocked(
             void *stream) const noexcept;
-        /** Drain/destroy histogram resources during model teardown. */
+        /**
+         * @brief Close the producer DAG while every stream owner is alive.
+         *
+         * The caller holds @ref runtime_histogram_drain_mutex_. The method
+         * records each producer's reusable arrival event, joins those events on
+         * the maintenance stream, and takes the sole terminal stream fence.
+         * Borrowed stream pointers are then erased while their table-owned
+         * event handles remain available for later resource destruction.
+         *
+         * @throws std::logic_error for incomplete producer resources.
+         * @throws std::runtime_error when an event edge or terminal fence fails.
+         */
+        void retireRuntimeHistogramProducerStreamsLocked();
+        /**
+         * @brief Publish one writer state through the sole maintenance stream.
+         *
+         * @param writer_state Valid encoded bank/admission state.
+         * @param failure Receives the exact failed event edge or copy.
+         * @return true when the complete asynchronous producer/publication DAG
+         *         was enqueued successfully.
+         *
+         * The caller holds @ref runtime_histogram_drain_mutex_. Each producer
+         * first records an arrival after all prior graph work. The maintenance
+         * stream joins those arrivals, performs the only H2D scalar write, and
+         * records @ref runtime_histogram_writer_state_published_event_. Every
+         * producer waits on that publication and records its departure. The
+         * maintenance stream then joins every departure before returning, so
+         * its caller may snapshot/reset the frozen bank without racing work
+         * interleaved by another host submission thread. No host or device
+         * synchronization is introduced.
+         */
+        [[nodiscard]] bool publishRuntimeHistogramWriterStateLocked(
+            uint32_t writer_state,
+            std::string &failure);
+        /**
+         * @brief Destroy already-retired histogram resources at teardown.
+         *
+         * Borrowed producer streams must have crossed
+         * @ref retireRuntimeHistogramProducerStreams before this method runs.
+         * Constructor-failure cleanup may retire a set containing only
+         * table-owned streams internally. Reaching normal destruction with an
+         * unretired borrowed stream is a fatal lifetime violation.
+         */
         void releaseRuntimeHistogramDrainResources() noexcept;
         /** Merge one completed pinned generation into the host RCU histogram. */
         bool mergeRuntimeHistogramSnapshot(

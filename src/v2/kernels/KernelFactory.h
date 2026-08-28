@@ -1361,19 +1361,38 @@ namespace llaminar
                     size_t total_vocab = 0);
 
                 /**
-                 * @brief Prepare GEMM weights for an expert view WITHOUT global registry registration.
+                 * @brief Prepare repacked GEMM weights for a borrowed expert view.
                  *
-                 * Performs local VNNI repacking / kernel binding and returns a
-                 * shared_ptr that the caller owns. Lifetime is managed by the caller
-                 * (PreparedWeightStore expert slab).
+                 * This pointer overload is restricted to source-independent
+                 * packed formats. Floating-point engines execute from their source
+                 * tensor and must use the shared-ownership overload below.
                  *
-                 * @param tensor Expert view tensor (2D slice of 3D parent)
+                 * @param tensor Borrowed quantized expert view (2D slice of a 3D parent).
                  * @param target_device Target device for preparation
                  * @param prep_kind Preparation kind (AUTO resolves to CPU_PACKED for CPU)
-                 * @return shared_ptr to ITensorGemm — caller owns lifetime. Returns nullptr on failure.
+                 * @return Caller-owned prepared engine, or nullptr when the
+                 *         format cannot safely use borrowed source ownership.
                  */
                 static std::shared_ptr<llaminar2::ITensorGemm> prepareExpertGemmLocal(
                     const llaminar2::TensorBase *tensor,
+                    llaminar2::DeviceId target_device,
+                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
+
+                /**
+                 * @brief Prepare a caller-owned expert GEMM with explicit source lifetime.
+                 *
+                 * Floating-point CPU engines copy exact native bytes into their
+                 * engine-owned execution slot. Shared ownership keeps the source
+                 * alive for that preparation transaction. Quantized CPU engines
+                 * likewise repack into engine-owned storage.
+                 *
+                 * @param tensor Shared expert view (2D slice of a 3D parent).
+                 * @param target_device Exact preparation device.
+                 * @param prep_kind Requested preparation representation.
+                 * @return Prepared engine with a complete source-lifetime contract.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm> prepareExpertGemmLocal(
+                    std::shared_ptr<llaminar2::TensorBase> tensor,
                     llaminar2::DeviceId target_device,
                     GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
 

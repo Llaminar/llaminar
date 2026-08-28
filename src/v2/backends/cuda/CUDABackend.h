@@ -12,6 +12,7 @@
 
 #include "../IBackend.h"
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace llaminar2
@@ -82,6 +83,25 @@ namespace llaminar2
         std::string deviceName(int device_id) const override;
         size_t deviceMemoryTotal(int device_id) const override;
         size_t deviceMemoryFree(int device_id) const override;
+        [[nodiscard]] DeviceAllocationAccounting
+        deviceAllocationAccounting(int device_id) const override;
+
+        /**
+         * @brief Trim unused CUDA graph/default-pool reservations without reset.
+         * @param device_id CUDA device ordinal whose retired caches are trimmed.
+         * @return Driver and allocator accounting before and after the trim.
+         */
+        DeviceMemoryCacheReclamationResult
+        trimUnusedDeviceMemoryCaches(int device_id) override;
+
+        /** @copydoc IBackend::retireExclusiveDeviceRuntimeGeneration */
+        DeviceRuntimeGenerationRetirementResult
+        retireExclusiveDeviceRuntimeGeneration(
+            const DeviceRuntimeGenerationRetirementRequest &request) override;
+
+        /** @copydoc IBackend::deviceRuntimeGeneration */
+        [[nodiscard]] std::uint64_t
+        deviceRuntimeGeneration(int device_id) const override;
 
         // Host memory pinning for async DMA
         bool pinHostMemory(void *ptr, size_t bytes, int device_id) override;
@@ -963,6 +983,16 @@ namespace llaminar2
             bool publication_valid = false;
         };
         std::vector<PenaltyDeviceBuffers> penalty_buffers_;
+
+        /** Serializes publication of CUDA runtime-generation identities. */
+        mutable std::mutex runtime_generation_mutex_;
+
+        /**
+         * Monotonic runtime generation per CUDA ordinal. Generation one is the
+         * initial primary-context lifetime; a successful cudaDeviceReset
+         * publishes the next value.
+         */
+        std::vector<std::uint64_t> runtime_generations_;
     };
 
 } // namespace llaminar2

@@ -823,6 +823,26 @@ namespace
         return hasBufferBinding(contract.allWrites(), id);
     }
 
+    /**
+     * @brief Assert that no stage in a production graph writes one arena buffer.
+     * @param graph Declarative production graph under inspection.
+     * @param id Buffer whose read-only ownership must survive graph execution.
+     * @return true when every complete graph node preserves the buffer.
+     */
+    bool graphNeverWrites(const ComputeGraph &graph, BufferId id)
+    {
+        for (const std::string &node_name : graph.getExecutionOrder())
+        {
+            const ComputeNode *node = graph.getNode(node_name);
+            if (!node || !node->stage ||
+                contractWrites(node->stage->bufferContract(), id))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     int dumpScalarInt(const StageDumpInfo &info, const char *name)
     {
         auto it = std::find_if(
@@ -1879,6 +1899,8 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     const auto norm_hidden_contract = graph.getNode("mtp0_norm_hidden")->stage->bufferContract();
     EXPECT_TRUE(contractReads(norm_hidden_contract, BufferId::PREFIX_TERMINAL_HIDDEN));
     EXPECT_TRUE(contractWrites(norm_hidden_contract, BufferId::MTP_NORM_HIDDEN));
+    EXPECT_TRUE(graphNeverWrites(graph, BufferId::PREFIX_TERMINAL_HIDDEN))
+        << "Dense MTP sidecars must preserve their persistent terminal-hidden input.";
 
     const auto qkv_contract = graph.getNode("MTP0_qkv_proj")->stage->bufferContract();
     EXPECT_TRUE(contractReads(qkv_contract, BufferId::MTP_NORM_HIDDEN));
@@ -3968,6 +3990,9 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
     ASSERT_NE(graph.getNode("MTP0_ffn_residual"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_final_norm"), nullptr);
 
+    EXPECT_TRUE(graphNeverWrites(graph, BufferId::PREFIX_TERMINAL_HIDDEN))
+        << "MoE MTP sidecars must preserve their persistent terminal-hidden input.";
+
     EXPECT_EQ(graph.getNode("MTP0_moe_routing")->stage->type(), ComputeStageType::MOE_ROUTER);
     EXPECT_EQ(graph.getNode("MTP0_moe_expert_ffn")->stage->type(), ComputeStageType::MOE_EXPERT_FFN);
 
@@ -4005,6 +4030,70 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
     EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "MTP0_ffn_residual"));
 }
 
+/**
+ * @brief A sealed ExpertOverlay sidecar must not retain raw expert parents.
+ *
+ * Process-campaign reuse keeps prepared expert engines in the model-owned
+ * registry after the first runner retires. The next graph therefore receives
+ * the ordinary router/shared bindings but no raw 3-D routed parents. This
+ * regression proves that the production MoE builder accepts that exact
+ * ownership state while the non-overlay incomplete-weight test above remains
+ * a hard failure.
+ */
+TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarFromRegistryWithoutRawExpertParents)
+{
+    DenseMTPGraphFixture fixture;
+    fixture.config.moe.num_experts = 4;
+    fixture.config.moe.top_k = 2;
+    fixture.config.moe.intermediate_size = 32;
+    fixture.config.moe.routed_compute_policy =
+        RoutedExpertComputePolicy::Replicated;
+    fixture.config.moe.has_shared_expert = false;
+    fixture.config.moe.routed_expert_plan =
+        makeMTPOverlayPlanForLayer(64);
+
+    Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
+    auto frozen = makeMoEMTPFrozenWeightSet(fixture);
+    auto bindings = makeModelWeightBindings(*frozen);
+    graph_builder.setWeightBindings(bindings);
+    graph_builder.setWeights(toLegacyModelWeights(bindings));
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*frozen, store);
+    graph_builder.setPreparedWeightStore(&store);
+    auto model_ctx = prepareMTPOverlayCPUExpertRegistry(fixture, store);
+    ASSERT_NE(model_ctx, nullptr);
+    graph_builder.setModelContext(model_ctx);
+
+    ASSERT_FALSE(bindings.mtp.depths.empty());
+    MTPDepthWeightBindings registry_only_depth =
+        bindings.mtp.depths.front();
+    registry_only_depth.fa_block.moe_gate_exps = nullptr;
+    registry_only_depth.fa_block.moe_up_exps = nullptr;
+    registry_only_depth.fa_block.moe_down_exps = nullptr;
+
+    auto input = fixture.input();
+    auto output = fixture.output();
+    ComputeGraph graph = graph_builder.buildMTPGraph(
+        /*depth_idx=*/0,
+        registry_only_depth,
+        input,
+        output);
+
+    ASSERT_GT(graph.size(), 0u);
+    ASSERT_NE(firstStageOfType<MoESparseDispatchStage>(graph), nullptr);
+    ASSERT_NE(firstStageOfType<MoESparseReturnReduceStage>(graph), nullptr);
+    const auto *local_expert =
+        firstStageOfType<MoELocalExpertStage>(graph);
+    ASSERT_NE(local_expert, nullptr);
+    EXPECT_EQ(local_expert->params().gate_exps, nullptr);
+    EXPECT_EQ(local_expert->params().up_exps, nullptr);
+    EXPECT_EQ(local_expert->params().down_exps, nullptr);
+    EXPECT_EQ(
+        local_expert->params().expert_weight_resolution_policy,
+        MoELocalExpertStage::ExpertWeightResolutionPolicy::RegistryOnly);
+}
+
 TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespace)
 {
     DenseMTPGraphFixture fixture;
@@ -4038,6 +4127,8 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     const auto *return_stage = firstStageOfType<MoESparseReturnReduceStage>(graph);
     ASSERT_NE(dispatch_stage, nullptr);
     ASSERT_NE(return_stage, nullptr);
+    EXPECT_TRUE(graphNeverWrites(graph, BufferId::PREFIX_TERMINAL_HIDDEN))
+        << "ExpertOverlay MTP sidecars must preserve their persistent terminal-hidden input.";
 
     const auto &dispatch_key = dispatch_stage->params().key;
     const auto &return_key = return_stage->params().key;
@@ -5366,6 +5457,10 @@ TEST(Test__MTPGraphConstruction, PrefixHarvestPersistsAndRestoresShiftedMTPKVPay
 
     const std::vector<int> prompt_tokens = {1, 2, 3, 4};
     const std::vector<int32_t> prefix_tokens(prompt_tokens.begin(), prompt_tokens.end());
+    const PrefixLookupResult admission =
+        orchestrator.lookupPrefix(prefix_tokens);
+    ASSERT_TRUE(admission.supported) << admission.bypass_reason;
+    ASSERT_NE(admission.fingerprint_key, 0u);
     ASSERT_NE(orchestrator.forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size()), 1), nullptr);
 
     PrefixStateSnapshot before = orchestrator.captureLivePrefixState();
@@ -5374,7 +5469,10 @@ TEST(Test__MTPGraphConstruction, PrefixHarvestPersistsAndRestoresShiftedMTPKVPay
     ASSERT_NE(before.mtp_blocks[0].kv_storage, nullptr);
     EXPECT_EQ(before.mtp_blocks[0].key.token_count, static_cast<int>(prompt_tokens.size()) - 1);
 
-    ASSERT_TRUE(orchestrator.harvestPrefix(prefix_tokens, static_cast<int>(prefix_tokens.size())));
+    ASSERT_TRUE(orchestrator.harvestPrefix(
+        admission,
+        prefix_tokens,
+        static_cast<int>(prefix_tokens.size())));
     orchestrator.clear_cache();
 
     PrefixLookupResult hit = orchestrator.lookupPrefix(prefix_tokens);
@@ -5437,6 +5535,10 @@ TEST(Test__MTPGraphConstruction, PartialTerminalBlockRestoresShiftedMTPKVPayload
     const std::vector<int> first_prompt = {1, 2, 3};
     const std::vector<int32_t> first_prefix(
         first_prompt.begin(), first_prompt.end());
+    const PrefixLookupResult admission =
+        orchestrator.lookupPrefix(first_prefix);
+    ASSERT_TRUE(admission.supported) << admission.bypass_reason;
+    ASSERT_NE(admission.fingerprint_key, 0u);
     ASSERT_NE(
         orchestrator.forward(
             first_prompt.data(),
@@ -5449,6 +5551,7 @@ TEST(Test__MTPGraphConstruction, PartialTerminalBlockRestoresShiftedMTPKVPayload
     ASSERT_EQ(before.mtp_blocks.size(), 1u);
     ASSERT_NE(before.mtp_blocks[0].kv_storage, nullptr);
     ASSERT_TRUE(orchestrator.harvestPrefix(
+        admission,
         first_prefix,
         static_cast<int>(first_prefix.size())));
 

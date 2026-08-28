@@ -32,6 +32,8 @@
 #include "backends/DeviceId.h"
 #include "utils/DebugEnv.h"
 #include "../../../../mocks/MockLocalTPContext.h"
+#include "../../../../mocks/MockMPIContext.h"
+#include "../../../../mocks/MockMPITopology.h"
 #include "../../../../mocks/MockModelContext.h"
 #include "../../../../mocks/MockComputeStage.h"
 
@@ -172,6 +174,28 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, NullModelCtx_Throws)
     deps.model_ctx = nullptr;
 
     EXPECT_THROW(DeviceGraphOrchestrator(std::move(deps)), std::invalid_argument);
+}
+
+/**
+ * @brief One graph cannot consume two distributed-rank authorities.
+ *
+ * The concrete MPI context supplies collectives and rank identity for ordinary
+ * production global TP, while IMPITopology is the injectable interface used by
+ * topology-driven construction. Accepting both would make executor rank and
+ * collective ownership dependent on caller ordering.
+ */
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction,
+       ConcreteMPIAndInjectedTopologyAreMutuallyExclusive)
+{
+    auto deps = minimalDeps();
+    deps.mpi_ctx =
+        std::make_shared<llaminar2::test::MockMPIContext>(0, 2);
+    deps.topology =
+        llaminar2::test::MockMPITopology::createSimple(0, 2);
+
+    EXPECT_THROW(
+        DeviceGraphOrchestrator(std::move(deps)),
+        std::invalid_argument);
 }
 
 // =============================================================================

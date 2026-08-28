@@ -200,12 +200,27 @@ namespace llaminar2
             envEnabled("LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS");
         policy.default_kv_segment_split_tokens =
             envIntOrDefault("LLAMINAR_PREFIX_PROBE_KV_SEGMENT_SPLIT", 4);
-        if (policy.hash_default_kv_segments)
+        policy.capture_requested_kv_segment_payloads =
+            envEnabled(
+                "LLAMINAR_PREFIX_PROBE_CAPTURE_KV_SEGMENT_PAYLOADS");
+        if (policy.hash_default_kv_segments ||
+            policy.capture_requested_kv_segment_payloads)
             policy.requested_kv_segments = parseRequestedKVSegments();
         policy.hash_gdn_device_state =
             envEnabled("LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE");
         policy.hash_terminal_state =
             envEnabled("LLAMINAR_PREFIX_PROBE_HASH_TERMINAL_STATE");
+        policy.capture_terminal_hidden_values =
+            envEnabled(
+                "LLAMINAR_PREFIX_PROBE_CAPTURE_TERMINAL_HIDDEN_VALUES");
+        policy.capture_terminal_logits_values =
+            envEnabled(
+                "LLAMINAR_PREFIX_PROBE_CAPTURE_TERMINAL_LOGITS_VALUES");
+        /* Raw values and their digest must describe one materialization. */
+        policy.hash_terminal_state =
+            policy.hash_terminal_state ||
+            policy.capture_terminal_hidden_values ||
+            policy.capture_terminal_logits_values;
         policy.capture_gdn_values =
             envEnabled("LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES");
         policy.capture_device_logical_state =
@@ -312,7 +327,9 @@ namespace llaminar2
                             size_t *k_bytes_out,
                             size_t *v_bytes_out,
                             uint64_t *k_hash_out,
-                            uint64_t *v_hash_out) -> void
+                            uint64_t *v_hash_out,
+                            std::vector<uint8_t> *retained_k,
+                            std::vector<uint8_t> *retained_v) -> void
                     {
                         if (token_start < 0 ||
                             token_count <= 0 ||
@@ -352,6 +369,10 @@ namespace llaminar2
                         *v_hash_out = hashByteBufferForPrefixProbe(
                             v_bytes.data(),
                             v_bytes.size());
+                        if (retained_k)
+                            *retained_k = std::move(k_bytes);
+                        if (retained_v)
+                            *retained_v = std::move(v_bytes);
                     };
 
                     auto capture_named_segment =
@@ -364,7 +385,13 @@ namespace llaminar2
                             &segment.k_payload_bytes,
                             &segment.v_payload_bytes,
                             &segment.k_payload_hash,
-                            &segment.v_payload_hash);
+                            &segment.v_payload_hash,
+                            capture_policy.capture_requested_kv_segment_payloads
+                                ? &segment.k_payload
+                                : nullptr,
+                            capture_policy.capture_requested_kv_segment_payloads
+                                ? &segment.v_payload
+                                : nullptr);
                         return segment;
                     };
 
@@ -383,7 +410,9 @@ namespace llaminar2
                             &layer_probe.leading_k_payload_bytes,
                             &layer_probe.leading_v_payload_bytes,
                             &layer_probe.leading_k_payload_hash,
-                            &layer_probe.leading_v_payload_hash);
+                            &layer_probe.leading_v_payload_hash,
+                            nullptr,
+                            nullptr);
 
                         layer_probe.trailing_segment_start = split_tokens;
                         layer_probe.trailing_segment_tokens =
@@ -395,7 +424,9 @@ namespace llaminar2
                             &layer_probe.trailing_k_payload_bytes,
                             &layer_probe.trailing_v_payload_bytes,
                             &layer_probe.trailing_k_payload_hash,
-                            &layer_probe.trailing_v_payload_hash);
+                            &layer_probe.trailing_v_payload_hash,
+                            nullptr,
+                            nullptr);
                     }
 
                     for (const auto &requested_segment :

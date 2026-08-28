@@ -15,6 +15,7 @@
 #include "../../../loaders/PreparedWeightStore.h"
 
 #include <algorithm>
+#include <array>
 
 namespace llaminar2
 {
@@ -508,6 +509,16 @@ namespace llaminar2
 
         mergeFrom(params_.prepared_ref_gate.value(), params_.n_gate);
         mergeFrom(params_.prepared_ref_up.value(), params_.n_up);
+        const std::array<int, 2> fused_columns = {
+            params_.n_gate > 0 ? params_.n_gate : n,
+            params_.n_up > 0 ? params_.n_up : n};
+        if (auto *anchor = dynamic_cast<IWorkspaceConsumer *>(
+                params_.prepared_store->gemmKernel(
+                    params_.prepared_ref_gate.value())))
+        {
+            anchor->appendFusedProjectionWorkspaceRequirements(
+                combined, workspace_m, fused_columns, workspace_k);
+        }
         addCudaConcurrentDecodeGemvSideStreamWorkspace(
             combined, params_.device_id, workspace_m, /*projection_count=*/2);
         return combined;

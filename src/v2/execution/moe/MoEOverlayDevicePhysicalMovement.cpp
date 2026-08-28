@@ -22,7 +22,7 @@ namespace llaminar2
 
         /** Mix one canonical word into two independent transaction lanes. */
         void mixWord(
-            MoEOverlayResidencyTransactionFingerprint &fingerprint,
+            MoEOverlayResidencyExecutionFingerprint &fingerprint,
             std::uint64_t value,
             std::uint64_t ordinal) noexcept
         {
@@ -46,10 +46,10 @@ namespace llaminar2
         }
 
         /** Fingerprint every semantic command field without object padding. */
-        MoEOverlayResidencyTransactionFingerprint fingerprintCommand(
+        MoEOverlayResidencyExecutionFingerprint fingerprintCommand(
             const MoEOverlayDeviceTransportCommandBatch &command) noexcept
         {
-            MoEOverlayResidencyTransactionFingerprint fingerprint{
+            MoEOverlayResidencyExecutionFingerprint fingerprint{
                 .low = 0x243f6a8885a308d3ULL,
                 .high = 0x13198a2e03707344ULL,
             };
@@ -152,6 +152,28 @@ namespace llaminar2
             if (destination->tier_priority > source->tier_priority)
                 return MoEOverlayTierMigrationDirection::Demotion;
             return MoEOverlayTierMigrationDirection::SamePriority;
+        }
+
+        /**
+         * @brief Authenticate the device-authored objective without inference.
+         * @param encoded_axis Fixed command word written by the policy leader.
+         * @return Shared authority-ledger spelling of the same objective.
+         * @throws std::invalid_argument for a non-total wire value.
+         */
+        MoEOptimizationMovementAxis movementAxis(
+            std::uint32_t encoded_axis)
+        {
+            switch (static_cast<MoEOverlayDeviceMovementAxis>(encoded_axis))
+            {
+            case MoEOverlayDeviceMovementAxis::TierResidency:
+                return MoEOptimizationMovementAxis::TierResidency;
+            case MoEOverlayDeviceMovementAxis::ParticipantPlacement:
+                return MoEOptimizationMovementAxis::ParticipantPlacement;
+            case MoEOverlayDeviceMovementAxis::Combined:
+                return MoEOptimizationMovementAxis::Combined;
+            }
+            throw std::invalid_argument(
+                "device physical movement command has an invalid objective axis");
         }
 
         /** Build exact destination slot demand from physical arrivals. */
@@ -373,7 +395,7 @@ namespace llaminar2
             topology_fingerprint == 0u || transaction_id == 0u ||
             base_epoch == 0u || command_digest == 0u ||
             participant_count < 2u || num_layers == 0u ||
-            num_experts == 0u || !transaction_fingerprint.valid())
+            num_experts == 0u || !execution_fingerprint.valid())
         {
             return false;
         }
@@ -395,6 +417,11 @@ namespace llaminar2
                     migration.destination.owner_participant ||
                 !migration.source.device.is_gpu() ||
                 !migration.destination.device.is_gpu() ||
+                (kind == MoEOverlayDeviceControllerTransactionKind::
+                             DynamicPlacement &&
+                 migration.axis ==
+                     MoEOptimizationMovementAxis::ParticipantPlacement &&
+                 migration.crossesTier()) ||
                 migration.estimated_weight_bytes == 0u ||
                 migration.estimated_weight_bytes >
                     std::numeric_limits<std::uint64_t>::max() - bytes)
@@ -494,7 +521,7 @@ namespace llaminar2
             .participant_count = command.participant_count,
             .num_layers = command.num_layers,
             .num_experts = command.num_experts,
-            .transaction_fingerprint = fingerprintCommand(command),
+            .execution_fingerprint = fingerprintCommand(command),
         };
 
         for (const auto &entry : command.entries)
@@ -530,6 +557,7 @@ namespace llaminar2
                     topology,
                     source.owner_participant,
                     destination.owner_participant),
+                .axis = movementAxis(entry.flags),
                 .source = std::move(source),
                 .destination = std::move(destination),
             });

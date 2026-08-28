@@ -541,6 +541,14 @@ namespace llaminar2::test
             std::string error;
         };
 
+        /** @brief One terminal two-step retirement result and diagnostic. */
+        struct RetirementProgress
+        {
+            MoEOverlayRetirementFenceProgress progress =
+                MoEOverlayRetirementFenceProgress::Pending;
+            std::string error;
+        };
+
         /** @brief Poll all independent stage waves until each is terminal. */
         std::vector<TerminalProgress> finishStages(
             std::vector<MoEOverlayResidencyStageStart> &starts)
@@ -640,20 +648,29 @@ namespace llaminar2::test
             return results;
         }
 
-        /** @brief Poll all published waves through the global lease fence. */
-        std::vector<TerminalProgress> finishRetirementFences(
-            std::vector<MoEOverlayResidencyStageStart> &starts)
+        /** @brief Poll one ordered retirement phase for every independent rank. */
+        std::vector<RetirementProgress> finishRetirementPhase(
+            std::vector<MoEOverlayResidencyStageStart> &starts,
+            MoEOverlayRetirementAdmissionState admission,
+            const std::vector<MoEOverlayRetirementReaderState> &readers)
         {
-            std::vector<TerminalProgress> results(starts.size());
+            if (readers.size() != starts.size())
+            {
+                ADD_FAILURE() << "Retirement reader-state vector has wrong size";
+                return {};
+            }
+            std::vector<RetirementProgress> results(starts.size());
             for (int pass = 0; pass < 32; ++pass)
             {
                 for (std::size_t rank = 0; rank < starts.size(); ++rank)
                 {
                     if (results[rank].progress ==
-                        MoEOverlayResidencyWaveProgress::Pending)
+                        MoEOverlayRetirementFenceProgress::Pending)
                     {
                         results[rank].progress =
                             starts[rank].wave->pollRetirementFence(
+                                {.admission = admission,
+                                 .readers = readers[rank]},
                                 &results[rank].error);
                     }
                 }
@@ -663,14 +680,41 @@ namespace llaminar2::test
                         [](const auto &result)
                         {
                             return result.progress !=
-                                   MoEOverlayResidencyWaveProgress::Pending;
+                                   MoEOverlayRetirementFenceProgress::Pending;
                         }))
                 {
                     return results;
                 }
             }
-            ADD_FAILURE() << "Distributed retirement fence did not converge";
+            ADD_FAILURE() << "Distributed retirement phase did not converge";
             return results;
+        }
+
+        /** @brief Poll admission quiescence, close it, then prove final drain. */
+        std::vector<RetirementProgress> finishRetirementFences(
+            std::vector<MoEOverlayResidencyStageStart> &starts)
+        {
+            const std::vector<MoEOverlayRetirementReaderState> drained(
+                starts.size(), MoEOverlayRetirementReaderState::Drained);
+            const auto admission_ready = finishRetirementPhase(
+                starts,
+                MoEOverlayRetirementAdmissionState::Open,
+                drained);
+            for (const auto &result : admission_ready)
+            {
+                if (result.progress != MoEOverlayRetirementFenceProgress::
+                                           ReadyToCloseAdmission)
+                {
+                    ADD_FAILURE()
+                        << "Distributed retirement admission did not become ready: "
+                        << result.error;
+                    return admission_ready;
+                }
+            }
+            return finishRetirementPhase(
+                starts,
+                MoEOverlayRetirementAdmissionState::Closed,
+                drained);
         }
 
         /** @brief Start the same exact transaction through every rank facade. */
@@ -682,6 +726,42 @@ namespace llaminar2::test
             for (auto &transport : distributed.transports)
                 starts.push_back(transport->beginStage(transaction));
             return starts;
+        }
+
+        /** @brief Advance one started rank set to the published host epoch. */
+        void publishEveryRank(
+            std::vector<MoEOverlayResidencyStageStart> &starts)
+        {
+            const auto staged = finishStages(starts);
+            for (const auto &result : staged)
+                ASSERT_EQ(result.progress, MoEOverlayResidencyWaveProgress::Ready)
+                    << result.error;
+
+            for (auto &start : starts)
+            {
+                std::string error;
+                ASSERT_TRUE(start.wave->beginPrepare(&error)) << error;
+            }
+            const auto prepared = finishPreparations(starts);
+            for (std::size_t rank = 0; rank < starts.size(); ++rank)
+            {
+                ASSERT_EQ(
+                    prepared[rank].progress,
+                    MoEOverlayResidencyWaveProgress::Ready)
+                    << prepared[rank].error;
+                std::string error;
+                ASSERT_TRUE(starts[rank].wave->beginPublication(&error))
+                    << error;
+            }
+            const auto published = finishPublications(starts);
+            for (std::size_t rank = 0; rank < starts.size(); ++rank)
+            {
+                ASSERT_EQ(
+                    published[rank].progress,
+                    MoEOverlayResidencyWaveProgress::Ready)
+                    << published[rank].error;
+                starts[rank].wave->markAuthorityPublished();
+            }
         }
 
         /** @brief Abort every unpublished wrapper and prove cleanup readiness. */
@@ -770,7 +850,7 @@ namespace llaminar2::test
         {
             EXPECT_EQ(
                 retirement_ready[rank].progress,
-                MoEOverlayResidencyWaveProgress::Ready)
+                MoEOverlayRetirementFenceProgress::ReadyToRetire)
                 << retirement_ready[rank].error;
             retry[rank].wave->retirePrevious();
             EXPECT_TRUE(distributed.lanes[rank]->idle());
@@ -791,12 +871,134 @@ namespace llaminar2::test
         EXPECT_EQ(rank_one_stats.reservation_consensus_ready, 1u);
         EXPECT_EQ(rank_one_stats.stage_consensus_ready, 1u);
         EXPECT_EQ(rank_one_stats.preparation_consensus_ready, 1u);
+        EXPECT_EQ(
+            rank_one_stats.retirement_admission_consensus_started, 1u);
+        EXPECT_EQ(
+            rank_one_stats.retirement_admission_consensus_ready, 1u);
+        EXPECT_EQ(
+            rank_one_stats.retirement_admission_consensus_failed, 0u);
         EXPECT_EQ(rank_one_stats.retirement_consensus_started, 1u);
         EXPECT_EQ(rank_one_stats.retirement_consensus_ready, 1u);
         EXPECT_EQ(rank_one_stats.retirement_consensus_failed, 0u);
         EXPECT_EQ(rank_one_stats.waves_published, 1u);
         EXPECT_EQ(rank_one_stats.inference_thread_waits, 0u);
         EXPECT_EQ(rank_one_stats.blocking_synchronizations, 0u);
+    }
+
+    TEST(
+        Test__MoEOverlayDistributedResidencyTransport,
+        ActiveReaderRankJoinsWaitingGenerationsBeforeUnanimousRetirement)
+    {
+        auto transaction = makeTransaction();
+        DistributedTransportFixture distributed;
+        auto starts = startEveryRank(distributed, transaction.transaction);
+        publishEveryRank(starts);
+
+        const std::vector<MoEOverlayRetirementReaderState> admission_readers{
+            MoEOverlayRetirementReaderState::Active,
+            MoEOverlayRetirementReaderState::Drained,
+            MoEOverlayRetirementReaderState::Drained,
+        };
+        bool every_rank_observed_waiting = false;
+        for (int pass = 0; pass < 32 && !every_rank_observed_waiting; ++pass)
+        {
+            for (std::size_t rank = 0; rank < starts.size(); ++rank)
+            {
+                std::string error;
+                EXPECT_EQ(
+                    starts[rank].wave->pollRetirementFence(
+                        {.admission =
+                             MoEOverlayRetirementAdmissionState::Open,
+                         .readers = admission_readers[rank]},
+                        &error),
+                    MoEOverlayRetirementFenceProgress::Pending)
+                    << error;
+            }
+            every_rank_observed_waiting = std::all_of(
+                distributed.transports.begin(),
+                distributed.transports.end(),
+                [](const auto &transport)
+                {
+                    return transport->stats()
+                               .retirement_admission_consensus_waiting > 0u;
+                });
+        }
+        ASSERT_TRUE(every_rank_observed_waiting)
+            << "Every rank must consume the same waiting retirement generation";
+        for (const auto &local : distributed.locals)
+        {
+            EXPECT_EQ(local->retirements, 0)
+                << "Waiting readiness must not reclaim an old bank";
+        }
+
+        const std::vector<MoEOverlayRetirementReaderState> drained(
+            starts.size(), MoEOverlayRetirementReaderState::Drained);
+        const auto admission_ready = finishRetirementPhase(
+            starts,
+            MoEOverlayRetirementAdmissionState::Open,
+            drained);
+        for (const auto &result : admission_ready)
+        {
+            ASSERT_EQ(
+                result.progress,
+                MoEOverlayRetirementFenceProgress::ReadyToCloseAdmission)
+                << result.error;
+        }
+
+        const std::vector<MoEOverlayRetirementReaderState> final_readers{
+            MoEOverlayRetirementReaderState::Drained,
+            MoEOverlayRetirementReaderState::Active,
+            MoEOverlayRetirementReaderState::Drained,
+        };
+        every_rank_observed_waiting = false;
+        for (int pass = 0; pass < 32 && !every_rank_observed_waiting; ++pass)
+        {
+            for (std::size_t rank = 0; rank < starts.size(); ++rank)
+            {
+                std::string error;
+                EXPECT_EQ(
+                    starts[rank].wave->pollRetirementFence(
+                        {.admission =
+                             MoEOverlayRetirementAdmissionState::Closed,
+                         .readers = final_readers[rank]},
+                        &error),
+                    MoEOverlayRetirementFenceProgress::Pending)
+                    << error;
+            }
+            every_rank_observed_waiting = std::all_of(
+                distributed.transports.begin(),
+                distributed.transports.end(),
+                [](const auto &transport)
+                {
+                    return transport->stats().retirement_consensus_waiting > 0u;
+                });
+        }
+        ASSERT_TRUE(every_rank_observed_waiting)
+            << "Every rank must consume the same final-drain generation";
+
+        const auto retirement_ready = finishRetirementPhase(
+            starts,
+            MoEOverlayRetirementAdmissionState::Closed,
+            drained);
+        for (std::size_t rank = 0; rank < starts.size(); ++rank)
+        {
+            ASSERT_EQ(
+                retirement_ready[rank].progress,
+                MoEOverlayRetirementFenceProgress::ReadyToRetire)
+                << retirement_ready[rank].error;
+            starts[rank].wave->retirePrevious();
+            const auto stats = distributed.transports[rank]->stats();
+            EXPECT_GE(stats.retirement_admission_consensus_started, 2u);
+            EXPECT_GE(stats.retirement_admission_consensus_waiting, 1u);
+            EXPECT_EQ(stats.retirement_admission_consensus_ready, 1u);
+            EXPECT_EQ(stats.retirement_admission_consensus_failed, 0u);
+            EXPECT_GE(stats.retirement_consensus_started, 2u);
+            EXPECT_GE(stats.retirement_consensus_waiting, 1u);
+            EXPECT_EQ(stats.retirement_consensus_ready, 1u);
+            EXPECT_EQ(stats.retirement_consensus_failed, 0u);
+        }
+        for (const auto &local : distributed.locals)
+            EXPECT_EQ(local->retirements, 1);
     }
 
     TEST(
@@ -842,6 +1044,50 @@ namespace llaminar2::test
                 1u);
             EXPECT_TRUE(distributed.lanes[rank]->idle());
         }
+    }
+
+    TEST(
+        Test__MoEOverlayDistributedResidencyTransport,
+        PhysicalStageFailureRetainsExactDiagnosticOnOriginatingRank)
+    {
+        auto transaction = makeTransaction();
+        DistributedTransportFixture distributed;
+        distributed.locals[1]->stage_progress =
+            MoEOverlayResidencyWaveProgress::Failed;
+
+        auto starts = startEveryRank(distributed, transaction.transaction);
+        const auto failed = finishStages(starts);
+        for (std::size_t rank = 0; rank < failed.size(); ++rank)
+        {
+            EXPECT_EQ(
+                failed[rank].progress,
+                MoEOverlayResidencyWaveProgress::Failed);
+            EXPECT_NE(
+                failed[rank].error.find("world rank 1"),
+                std::string::npos)
+                << failed[rank].error;
+            EXPECT_NE(failed[rank].error.find("2102"), std::string::npos)
+                << failed[rank].error;
+            if (rank == 1u)
+            {
+                EXPECT_NE(
+                    failed[rank].error.find(
+                        "injected local physical stage failure"),
+                    std::string::npos)
+                    << failed[rank].error;
+            }
+            else
+            {
+                EXPECT_EQ(
+                    failed[rank].error.find(
+                        "injected local physical stage failure"),
+                    std::string::npos)
+                    << "Only the source rank owns the variable diagnostic";
+            }
+        }
+        abortEveryRank(starts);
+        for (const auto &lane : distributed.lanes)
+            EXPECT_TRUE(lane->idle());
     }
 
     TEST(

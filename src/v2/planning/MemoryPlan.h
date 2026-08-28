@@ -37,19 +37,28 @@ struct DeviceMemoryPlan
     size_t persistent_state_bytes = 0;
     size_t live_recurrent_state_bytes = 0;
     size_t checkpoint_state_bytes = 0;
+    /** Persistent device slots used to archive/restore one prefix payload. */
+    size_t prefix_cache_staging_bytes = 0;
+    /** Configured bounded capacity of the accelerator-hot prefix tier. */
+    size_t prefix_cache_device_hot_bytes = 0;
+    /** Opaque native-driver storage retained by the complete graph family. */
+    size_t captured_graph_bytes = 0;
     /** Persistent backend and FP16 scratch allocations owned by LocalTP. */
     size_t collective_bytes = 0;
     size_t activation_bytes = 0;
     size_t workspace_bytes = 0;
+    /** Workspace bytes already owned by a sealed model-context backing lease. */
+    size_t retained_workspace_bytes = 0;
 
     size_t device_total_bytes = 0;   // From DeviceInfo.memory_bytes
     size_t device_free_bytes = 0;    // From DeviceInfo.free_memory_bytes
-    size_t headroom_bytes = 128ULL * 1024 * 1024;  // 128 MB default
-
     size_t total_bytes() const
     {
-        return weight_bytes + additional_weight_bytes + kv_cache_bytes + persistent_state_bytes +
-               collective_bytes + activation_bytes + workspace_bytes;
+        return weight_bytes + additional_weight_bytes + kv_cache_bytes +
+               persistent_state_bytes + prefix_cache_staging_bytes +
+               prefix_cache_device_hot_bytes + captured_graph_bytes +
+               collective_bytes +
+               activation_bytes + workspace_bytes;
     }
 
     /** @return Complete persistent weight footprint across every physical view. */
@@ -73,25 +82,30 @@ struct DeviceMemoryPlan
      */
     size_t incremental_bytes() const
     {
+        const size_t incremental_workspace =
+            workspace_bytes -
+            std::min(workspace_bytes, retained_workspace_bytes);
         return incremental_weight_bytes() + kv_cache_bytes +
-               persistent_state_bytes + collective_bytes + activation_bytes +
-               workspace_bytes;
+               persistent_state_bytes + prefix_cache_staging_bytes +
+               prefix_cache_device_hot_bytes + captured_graph_bytes +
+               collective_bytes +
+               activation_bytes + incremental_workspace;
     }
 
     bool fits() const
     {
-        return incremental_bytes() + headroom_bytes <= device_free_bytes;
+        return incremental_bytes() <= device_free_bytes;
     }
 
     size_t deficit() const
     {
-        auto needed = incremental_bytes() + headroom_bytes;
+        auto needed = incremental_bytes();
         return needed > device_free_bytes ? needed - device_free_bytes : 0;
     }
 
     size_t remaining() const
     {
-        auto needed = incremental_bytes() + headroom_bytes;
+        auto needed = incremental_bytes();
         return device_free_bytes > needed ? device_free_bytes - needed : 0;
     }
 
@@ -106,9 +120,13 @@ struct DeviceMemoryPlan
            << "retained_weights=" << mb(retained_weight_bytes) << " MB, "
            << "kv_cache=" << mb(kv_cache_bytes) << " MB, "
            << "state=" << mb(persistent_state_bytes) << " MB, "
+           << "prefix_staging=" << mb(prefix_cache_staging_bytes) << " MB, "
+           << "prefix_hot=" << mb(prefix_cache_device_hot_bytes) << " MB, "
+           << "captured_graphs=" << mb(captured_graph_bytes) << " MB, "
            << "collective=" << mb(collective_bytes) << " MB, "
            << "activations=" << mb(activation_bytes) << " MB, "
            << "workspace=" << mb(workspace_bytes) << " MB, "
+           << "retained_workspace=" << mb(retained_workspace_bytes) << " MB, "
            << "total=" << mb(total_bytes()) << " MB, "
            << "new=" << mb(incremental_bytes()) << "/" << mb(device_free_bytes) << " MB"
            << (fits() ? " [OK]" : " [OVER by " + std::to_string(static_cast<int>(mb(deficit()))) + " MB]");

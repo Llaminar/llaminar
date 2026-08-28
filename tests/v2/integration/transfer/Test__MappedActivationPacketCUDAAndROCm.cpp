@@ -22,6 +22,7 @@
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/moe/MoEOverlayActivationEpochProtocol.h"
+#include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteExchange.h"
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "execution/moe/MoEOverlayRetainedActivationTransaction.h"
@@ -2845,6 +2846,187 @@ namespace
     };
 
     /**
+     * @brief Reuse one CPU-published canonical ticket for twenty GPU replays.
+     *
+     * Each replay publishes a different route permutation and payload. The CPU
+     * must be unable to arm the next replay while the current publication is
+     * live; after the exact-stream materialization and acknowledgement event,
+     * the same storage must become reusable without a stream/device sync. This
+     * proves both mapped bytes and the producer/consumer sequence protocol on
+     * the selected continuation backend.
+     */
+    void runCanonicalRouteTicketReuseProof(DeviceId continuation_device)
+    {
+        /* Qwen 3.5 122B decode publishes one original slot per top-k route at
+         * hidden width 3072. Keeping that exact geometry makes the regression
+         * cover the production 96-block mapped materialization launch. */
+        constexpr std::size_t route_capacity = 8u;
+        constexpr std::int32_t d_model = 3072;
+        constexpr std::uint64_t workspace_generation = 17u;
+        constexpr std::uint64_t first_residency_epoch = 101u;
+        constexpr std::size_t replay_count = 20u;
+        constexpr std::size_t element_count =
+            route_capacity * static_cast<std::size_t>(d_model);
+        constexpr std::size_t payload_bytes = element_count * sizeof(float);
+
+        SparseRouteExchangeResources resources(
+            continuation_device, continuation_device);
+        ASSERT_NE(resources.root_backend, nullptr);
+        ASSERT_GT(
+            resources.root_backend->deviceCount(),
+            continuation_device.ordinal);
+        resources.root_stream = resources.root_backend->createStream(
+            continuation_device.ordinal);
+        resources.root_terminal = resources.root_backend->createEvent(
+            continuation_device.ordinal);
+        ASSERT_NE(resources.root_stream, nullptr);
+        ASSERT_NE(resources.root_terminal, nullptr);
+
+        void *const output_device = resources.allocate(
+            resources.root_backend, continuation_device, payload_bytes);
+        ASSERT_NE(output_device, nullptr);
+        ASSERT_TRUE(resources.root_backend->memset(
+            output_device,
+            0,
+            payload_bytes,
+            continuation_device.ordinal,
+            resources.root_stream));
+
+        const std::array<DeviceId, 1> endpoints{continuation_device};
+        auto contribution_region =
+            TransferEngine::instance().allocateMappedHostRegion(
+                payload_bytes, endpoints);
+        ASSERT_NE(contribution_region, nullptr);
+        ASSERT_TRUE(contribution_region->isBound());
+
+        MoEOverlayCanonicalRouteReturnTicketStorage storage;
+        storage.bindFixedCapacity(
+            /*layer_idx=*/5,
+            route_capacity,
+            d_model,
+            continuation_device,
+            workspace_generation,
+            contribution_region);
+        ASSERT_TRUE(storage.hasValidBoundIdentity());
+
+        std::unique_ptr<IMoEKernel> kernel;
+        if (continuation_device.is_cuda())
+        {
+            kernel = std::make_unique<CUDAMoEKernel>(
+                continuation_device.ordinal);
+        }
+        else if (continuation_device.is_rocm())
+        {
+            kernel = std::make_unique<ROCmMoEKernel>(
+                continuation_device.ordinal);
+        }
+        ASSERT_NE(kernel, nullptr);
+
+        MoEOverlayCanonicalRouteTicketConsumeLaunch ticket{
+            .control = storage.controlDeviceAlias(),
+            .original_route_slots =
+                storage.originalRouteSlotsDeviceAlias(),
+            .compact_route_slots =
+                storage.compactRouteSlotsDeviceAlias(),
+            .compact_preweighted_contributions_fp32 =
+                storage.contributionRowsDeviceAlias(),
+            .canonical_route_contributions_fp32 =
+                static_cast<float *>(output_device),
+            .route_capacity = route_capacity,
+            .d_model = d_model,
+        };
+        ASSERT_TRUE(ticket.valid());
+
+        {
+            auto abandoned = storage.arm(first_residency_epoch - 1u);
+            ASSERT_TRUE(abandoned);
+        }
+        EXPECT_FALSE(storage.payloadReady());
+        EXPECT_TRUE(storage.arm(first_residency_epoch - 1u))
+            << "dropping an unpublished lease must restore quiescent ownership";
+
+        std::vector<float> actual(element_count, 0.0f);
+        std::vector<float> expected(element_count, 0.0f);
+        for (std::size_t replay = 0u; replay < replay_count; ++replay)
+        {
+            const std::uint64_t residency_epoch =
+                first_residency_epoch + replay;
+            auto publication = storage.arm(residency_epoch);
+            ASSERT_TRUE(publication)
+                << "replay=" << replay;
+            EXPECT_FALSE(storage.arm(residency_epoch + 1u))
+                << "a producer cannot arm one ticket twice";
+
+            std::fill(expected.begin(), expected.end(), 0.0f);
+            auto *const original_slots = storage.originalRouteSlotsHost();
+            auto *const compact_slots = storage.compactRouteSlotsHost();
+            float *const contribution_rows = storage.contributionRowsHost();
+            ASSERT_NE(original_slots, nullptr);
+            ASSERT_NE(compact_slots, nullptr);
+            ASSERT_NE(contribution_rows, nullptr);
+            for (std::size_t entry = 0u; entry < route_capacity; ++entry)
+            {
+                const std::size_t original_slot =
+                    (entry + replay) % route_capacity;
+                const std::size_t compact_slot =
+                    (entry + 2u * replay + 1u) % route_capacity;
+                original_slots[entry] =
+                    static_cast<std::int32_t>(original_slot);
+                compact_slots[entry] =
+                    static_cast<std::int32_t>(compact_slot);
+                for (std::size_t column = 0u;
+                     column < static_cast<std::size_t>(d_model);
+                     ++column)
+                {
+                    const float value = static_cast<float>(
+                        10000u * (replay + 1u) + 100u * entry + column);
+                    contribution_rows[
+                        compact_slot * static_cast<std::size_t>(d_model) +
+                        column] = value;
+                    expected[
+                        original_slot * static_cast<std::size_t>(d_model) +
+                        column] = value;
+                }
+            }
+
+            ASSERT_TRUE(publication.publish(route_capacity))
+                << "replay=" << replay;
+            ASSERT_TRUE(storage.payloadReadyFor(residency_epoch));
+            EXPECT_FALSE(publication.publish(route_capacity))
+                << "publication requires one fresh arm transition";
+            EXPECT_FALSE(storage.arm(residency_epoch + 1u))
+                << "mapped payload cannot be overwritten before GPU acknowledgement";
+
+            ASSERT_TRUE(kernel->consumeMoEOverlayCanonicalRouteTicket(
+                MoEKernelLaunchContext{.stream = resources.root_stream},
+                ticket));
+            ASSERT_TRUE(resources.root_backend->recordEvent(
+                resources.root_terminal,
+                continuation_device.ordinal,
+                resources.root_stream));
+            ASSERT_TRUE(awaitEvent(
+                resources.root_backend,
+                resources.root_terminal,
+                std::chrono::seconds(5),
+                continuation_device.ordinal));
+            EXPECT_FALSE(storage.payloadReady())
+                << "GPU did not acknowledge replay=" << replay;
+
+            ASSERT_TRUE(resources.root_backend->deviceToHost(
+                actual.data(),
+                output_device,
+                payload_bytes,
+                continuation_device.ordinal,
+                resources.root_stream));
+            for (std::size_t element = 0u; element < element_count; ++element)
+            {
+                EXPECT_FLOAT_EQ(actual[element], expected[element])
+                    << "replay=" << replay << " element=" << element;
+            }
+        }
+    }
+
+    /**
      * @brief Exercise five device-owned epochs, including placement invariance.
      *
      * The final two epochs retain identical per-route bytes while changing the
@@ -3498,6 +3680,26 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
     if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
         GTEST_SKIP() << "Requires CUDA and ROCm devices";
     runStaleAdmissionABAProof(DeviceId::rocm(0), DeviceId::cuda(0));
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CPUCanonicalRouteTicketReusesSafelyOnCUDA)
+{
+    IBackend *const cuda = getCUDABackend();
+    ASSERT_NE(cuda, nullptr);
+    if (cuda->deviceCount() < 1)
+        GTEST_SKIP() << "Requires one CUDA device";
+    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0));
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CPUCanonicalRouteTicketReusesSafelyOnROCm)
+{
+    IBackend *const rocm = getROCmBackend();
+    ASSERT_NE(rocm, nullptr);
+    if (rocm->deviceCount() < 1)
+        GTEST_SKIP() << "Requires one ROCm device";
+    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0));
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,

@@ -222,6 +222,14 @@ namespace llaminar2::test
                 EXPECT_EQ(command.candidate_epoch, 8u);
                 EXPECT_NE(command.source_participant,
                           command.destination_participant);
+                const auto axis = static_cast<MoEOverlayDeviceMovementAxis>(
+                    command.flags);
+                EXPECT_TRUE(
+                    axis == MoEOverlayDeviceMovementAxis::TierResidency ||
+                    axis ==
+                        MoEOverlayDeviceMovementAxis::ParticipantPlacement ||
+                    axis == MoEOverlayDeviceMovementAxis::Combined)
+                    << "device policy must author every movement objective";
                 if (index == 0u)
                     continue;
                 const auto &previous = plan.commands[index - 1u];
@@ -280,6 +288,15 @@ namespace llaminar2::test
                   plan.evidence.priority_cost_before);
         EXPECT_LT(plan.evidence.same_priority_makespan_after,
                   plan.evidence.same_priority_makespan_before);
+        EXPECT_TRUE(std::all_of(
+            plan.commands.begin(),
+            plan.commands.end(),
+            [](const auto &command)
+            {
+                return static_cast<MoEOverlayDeviceMovementAxis>(
+                           command.flags) ==
+                       MoEOverlayDeviceMovementAxis::ParticipantPlacement;
+            }));
         for (std::int32_t participant = 0; participant < 4; ++participant)
             EXPECT_EQ(ownerCount(plan, participant), 2u);
         expectCanonicalCommands(plan);
@@ -415,6 +432,62 @@ namespace llaminar2::test
         EXPECT_GT(plan.evidence.payoff_rejected_cycles, 0u);
         EXPECT_EQ(plan.evidence.residency_rejected_cycles, 0u);
         EXPECT_EQ(plan.evidence.projected_net_benefit_ns, 0u);
+    }
+
+    TEST(Test__MoEOverlayDevicePlacementPolicy,
+         DecodeGainCannotCrossSubsidizeAPrefillRegression)
+    {
+        auto policy_input = input(
+            /*priorities=*/{0, 17},
+            /*owners=*/{1, 0},
+            /*counts=*/{1000, 10});
+        ASSERT_TRUE(policy_input.economy.has_value());
+        auto &demand = policy_input.economy->phase_expert_demand;
+        const auto phase_offset = [&](std::uint32_t phase)
+        {
+            return static_cast<std::size_t>(phase) *
+                   policy_input.num_layers * policy_input.num_experts;
+        };
+
+        /*
+         * The desired swap produces a large decode win: expert zero leaves the
+         * slow tier. Prefill deliberately routes more work to expert one, so
+         * the same swap makes prefill slower. The old scalar sum admitted this
+         * because the decode gain was larger than the prefill loss.
+         */
+        demand[phase_offset(
+                   kMoEOverlayDeviceControllerEconomyDecodePhase) +
+               0u] = 1000u;
+        demand[phase_offset(
+                   kMoEOverlayDeviceControllerEconomyDecodePhase) +
+               1u] = 10u;
+        demand[phase_offset(
+                   kMoEOverlayDeviceControllerEconomyPrefillPhase) +
+               0u] = 10u;
+        demand[phase_offset(
+                   kMoEOverlayDeviceControllerEconomyPrefillPhase) +
+               1u] = 20u;
+
+        const auto rejected =
+            MoEOverlayDevicePlacementPolicyReference::planDynamic(
+                policy_input);
+        EXPECT_FALSE(rejected.hasMovement());
+        EXPECT_EQ(rejected.evidence.accepted_cycles, 0u);
+        EXPECT_GT(rejected.evidence.payoff_rejected_cycles, 0u);
+
+        /* Both phases favor the same move, which must remain economical. */
+        demand[phase_offset(
+                   kMoEOverlayDeviceControllerEconomyPrefillPhase) +
+               0u] = 100u;
+        demand[phase_offset(
+                   kMoEOverlayDeviceControllerEconomyPrefillPhase) +
+               1u] = 1u;
+        const auto accepted =
+            MoEOverlayDevicePlacementPolicyReference::planDynamic(
+                policy_input);
+        EXPECT_TRUE(accepted.hasMovement());
+        EXPECT_GT(accepted.evidence.accepted_cycles, 0u);
+        EXPECT_EQ(accepted.evidence.payoff_rejected_cycles, 0u);
     }
 
     TEST(Test__MoEOverlayDevicePlacementPolicy,

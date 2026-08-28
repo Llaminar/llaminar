@@ -30,6 +30,7 @@
 
 #include "WeightManagerConfig.h"
 #include "WeightTypes.h"
+#include "MmapReclaimLifecycle.h"
 #include "../backends/DeviceId.h"
 
 #include <vector>
@@ -339,9 +340,9 @@ namespace llaminar2
          * Called after the first forward pass completes, when GPU kernels have
          * uploaded their own device copies (e.g., embedding repack+upload to workspace).
          * At that point, the host data is no longer needed. This phase must not
-         * advise mmap pages itself: a caller follows it with
-         * adviseMmapDontneed(), which first unregisters every surviving mapped
-         * view from the accelerator runtime.
+         * reclaim mmap pages itself: scheduleMmapReclaim() follows it and lets
+         * the background worker unregister every surviving mapped view from the
+         * accelerator runtime before backing-aware advice.
          *
          * @return Number of tensors whose host data was released
          */
@@ -354,13 +355,36 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Advise the OS to reclaim mmap physical pages
+         * @brief Submit post-first-prefill mmap reclamation to its owner worker.
          *
-         * Safe to call after all GEMM engines have packed their weight data.
+         * Concrete model loaders perform host-registration retirement followed
+         * by backing-aware page advice. Mock/in-memory managers have no mapping,
+         * so their default result is already complete.
          *
-         * @return Total bytes advised
+         * @return Typed exactly-once submission outcome.
          */
-        virtual size_t adviseMmapDontneed() { return 0; }
+        virtual MmapReclaimLifecycle::Submission scheduleMmapReclaim()
+        {
+            return MmapReclaimLifecycle::Submission::AlreadyComplete;
+        }
+
+        /**
+         * @brief Cross the mmap-reclaim barrier before a dependent host allocation.
+         *
+         * Ordinary inference must never wait here. Model/JIT admission and owner
+         * teardown use this edge only when they need the capacity promised by an
+         * earlier reclaim submission.
+         *
+         * @return Terminal reclaim state and bytes actually advised.
+         */
+        virtual MmapReclaimLifecycle::Completion
+        awaitMmapReclaimBeforeHostAllocation()
+        {
+            return {
+                .state = MmapReclaimLifecycle::State::Complete,
+                .advised_bytes = 0,
+            };
+        }
 
         /**
          * @brief Set expert weight payload provider for metadata-based host retention

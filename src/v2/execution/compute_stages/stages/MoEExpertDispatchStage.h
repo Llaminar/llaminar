@@ -243,6 +243,24 @@ namespace llaminar2
         {
             return params_.ticket_storage != nullptr;
         }
+        /**
+         * @brief Return whether live residency must receive sequence identity.
+         *
+         * Static graph-frozen placement has no independently advancing bank.
+         * Dynamic and LLEP dispatch must instead consume the placement epoch
+         * pinned by the enclosing graph sequence.
+         */
+        bool hasMoEOverlayCollectiveRuntimeParams() const override
+        {
+            return params_.residency_authority != nullptr ||
+                   params_.cpu_current_batch_llep_state != nullptr;
+        }
+        /**
+         * @brief Store the typed transaction and exact placement epoch for the next execution.
+         * @param params Sequence identity published by the orchestration owner.
+         */
+        void updateMoEOverlayCollectiveRuntimeParams(
+            const MoEOverlayCollectiveRuntimeParams &params) override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -258,6 +276,8 @@ namespace llaminar2
         bool publishRoutingEvidence(int logical_seq_len) const;
 
         Params params_;
+        /** Sequence-owned identity stamped immediately before graph execution. */
+        MoEOverlayCollectiveRuntimeParams runtime_params_{};
         /** Persistent integer view of FP32 ticket expert ids; no execute allocation. */
         mutable std::vector<int> routing_evidence_expert_ids_;
     };

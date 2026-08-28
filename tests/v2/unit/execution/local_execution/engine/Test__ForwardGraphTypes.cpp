@@ -3891,6 +3891,201 @@ TEST(Test__GraphSegmentCache,
 }
 
 /**
+ * @brief Adjacent MoE layers compose around one CPU boundary apiece.
+ *
+ * Ticket ingress, the ordered route fold, dense/shared work, and the next
+ * layer's GPU producer are one retained successor. Closing another unit on
+ * the post-ticket reducer would create seven segments here instead of the
+ * canonical five and reintroduce an avoidable host launch between layers.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketLayersComposeConsumerWithNextProducer)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "layer0_gpu_producer", true, false,
+        ComputeStageType::MOE_EXPERT_FFN, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "layer0_cpu_ticket", false, true,
+        ComputeStageType::MOE_LOCAL_EXPERT, false, false, false, nullptr,
+        DeviceId::cpu(), true);
+    addFakeSegmentStage(
+        graph, "layer0_ticket_consume", true, false,
+        ComputeStageType::COPY, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "layer0_shared_and_residual", true, false,
+        ComputeStageType::ADD_RESIDUAL, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "layer1_gpu_producer", true, false,
+        ComputeStageType::MOE_EXPERT_FFN, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "layer1_cpu_ticket", false, true,
+        ComputeStageType::MOE_LOCAL_EXPERT, false, false, false, nullptr,
+        DeviceId::cpu(), true);
+    addFakeSegmentStage(
+        graph, "layer1_ticket_consume", true, false,
+        ComputeStageType::COPY, false, false, false, nullptr,
+        DeviceId::cuda(0));
+
+    graph.addDependency("layer0_cpu_ticket", "layer0_gpu_producer");
+    graph.addDependency("layer0_ticket_consume", "layer0_cpu_ticket");
+    graph.addDependency(
+        "layer0_shared_and_residual", "layer0_ticket_consume");
+    graph.addDependency(
+        "layer1_gpu_producer", "layer0_shared_and_residual");
+    graph.addDependency("layer1_cpu_ticket", "layer1_gpu_producer");
+    graph.addDependency("layer1_ticket_consume", "layer1_cpu_ticket");
+    graph.setHeterogeneousTicketUnitContract(
+        "layer0_gpu_producer",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "layer0_pre_cpu_ticket",
+        });
+    graph.setHeterogeneousTicketUnitContract(
+        "layer1_gpu_producer",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "layer1_pre_cpu_ticket",
+        });
+    graph.setTerminalNode("layer1_ticket_consume");
+    graph.setHeterogeneousTicketUnitContract(
+        "layer1_ticket_consume",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
+
+    ASSERT_EQ(cache.segments.size(), 5u);
+    EXPECT_EQ(
+        cache.segments[0].stage_names,
+        std::vector<std::string>{"layer0_gpu_producer"});
+    EXPECT_FALSE(cache.segments[1].capturable);
+    EXPECT_EQ(
+        cache.segments[2].stage_names,
+        (std::vector<std::string>{
+            "layer0_ticket_consume",
+            "layer0_shared_and_residual",
+            "layer1_gpu_producer"}));
+    EXPECT_FALSE(cache.segments[3].capturable);
+    EXPECT_EQ(
+        cache.segments[4].stage_names,
+        std::vector<std::string>{"layer1_ticket_consume"});
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            PerfStatsCollector::snapshot({"forward_graph"}),
+            "heterogeneous_ticket_transactions",
+            {{"capturable_segments", "3"},
+             {"manual_segments", "2"},
+             {"ticket_publication_authority",
+              "stage_owned_mapped_timeline"},
+             {"unit_boundaries", "2"},
+             {"terminal_units", "1"},
+             {"role", "authority"}}),
+        1.0);
+}
+
+/**
+ * @brief Host route materialization and remote sparse work form one manual unit.
+ *
+ * The immutable device ticket first drives all continuation-local GPU producer
+ * work. Host route materialization then prepares the immediately following CPU
+ * sparse transaction. No capturable node may be interposed between those two
+ * host stages: doing so would manufacture a second manual boundary and force
+ * every LocalTP follower to retain an otherwise meaningless extra executable.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketCoalescesHostPreparationWithSparseTransaction)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "ticket_publish", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "continuation_local_expert", true, false,
+        ComputeStageType::MOE_EXPERT_FFN, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "host_route_materialization", false, true,
+        ComputeStageType::COPY, false, false, false, nullptr,
+        DeviceId::cpu(), true);
+    addFakeSegmentStage(
+        graph, "remote_sparse_transaction", false, true,
+        ComputeStageType::MOE_LOCAL_EXPERT, false, false, false, nullptr,
+        DeviceId::cpu(), true);
+    addFakeSegmentStage(
+        graph, "ticket_consume", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(0));
+
+    graph.addDependency("continuation_local_expert", "ticket_publish");
+    graph.addDependency(
+        "host_route_materialization", "continuation_local_expert");
+    graph.addDependency(
+        "remote_sparse_transaction", "host_route_materialization");
+    graph.addDependency("ticket_consume", "remote_sparse_transaction");
+    graph.setHeterogeneousTicketUnitContract(
+        "continuation_local_expert",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "pre_cpu_ticket_unit",
+        });
+    graph.setTerminalNode("ticket_consume");
+    graph.setHeterogeneousTicketUnitContract(
+        "ticket_consume",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
+
+    ASSERT_EQ(cache.segments.size(), 3u);
+    EXPECT_TRUE(cache.segments[0].capturable);
+    EXPECT_EQ(
+        cache.segments[0].stage_names,
+        (std::vector<std::string>{
+            "ticket_publish", "continuation_local_expert"}));
+    EXPECT_FALSE(cache.segments[1].capturable);
+    EXPECT_EQ(
+        cache.segments[1].stage_names,
+        (std::vector<std::string>{
+            "host_route_materialization", "remote_sparse_transaction"}));
+    EXPECT_TRUE(cache.segments[2].capturable);
+    EXPECT_EQ(
+        cache.segments[2].stage_names,
+        std::vector<std::string>{"ticket_consume"});
+}
+
+/**
  * @brief A LocalTP sibling follows every ticket wave without host work.
  *
  * The authority owns mapped packet and CPU-ticket work. Its sibling retains

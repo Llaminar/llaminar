@@ -117,6 +117,19 @@ namespace llaminar2
         }
     }
 
+    bool MoEGraphRoleRunner::purgePrefixCache()
+    {
+        for (auto &participant_runner : config_.local_participant_runners)
+        {
+            if (participant_runner &&
+                !participant_runner->purgePrefixCache())
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     int MoEGraphRoleRunner::get_position() const
     {
         return position_;

@@ -18,6 +18,8 @@
  *   - Packing overhead comparison (native VNNI vs INT8 VNNI byte counts)
  *
  * Shapes tested: Qwen2.5-7B layer shapes (the regression model).
+ * A focused Qwen3.5-122B MTP sweep also compares automatic split-K against a
+ * single ordered K partition on the recurrent sidecar projection geometries.
  *
  * @note Requires ROCm device. Run with build_v2_release for representative timing.
  */
@@ -93,6 +95,14 @@ namespace
         {"7B_FFN_GateUp", 18944, 3584},  // Fused gate+up projection
         {"7B_FFN_Down", 3584, 18944},    // Down projection
         {"7B_LM_Head", 152064, 3584},    // LM head (vocab)
+    };
+
+    /** Recurrent Qwen3.5-122B sidecar projections that amplify decode error. */
+    static const std::vector<GEMVShape> SHAPES_QWEN35_122B_MTP = {
+        {"122B_MTP_EHProj", 3072, 6144},
+        {"122B_MTP_QProj", 16384, 3072},
+        {"122B_MTP_VProj", 512, 3072},
+        {"122B_MTP_AttnOut", 3072, 8192},
     };
 
     // =========================================================================
@@ -545,7 +555,10 @@ namespace
                 snprintf(b_mean, sizeof(b_mean), "%.1f", r.mean_us);
                 snprintf(b_bw, sizeof(b_bw), "%.1f", r.eff_bw_gbps);
                 snprintf(b_eff, sizeof(b_eff), "%.1f%%", r.bw_efficiency);
-                snprintf(b_cos, sizeof(b_cos), "%.4f", r.cosine_sim);
+                // Four decimals hides the accuracy delta this A/B exists to
+                // diagnose: both paths commonly round to 1.0000 even though
+                // recursive MTP can amplify their residual difference.
+                snprintf(b_cos, sizeof(b_cos), "%.8f", r.cosine_sim);
                 snprintf(b_speedup, sizeof(b_speedup), "%.2fx",
                          r.speedup_vs_int8 > 0 ? r.speedup_vs_int8 : 1.0);
                 table << r.shape_name << b_n << b_k << r.variant << b_mb
@@ -567,6 +580,68 @@ namespace
         fprintf(stderr, "  INT8-VNNI:   N×K bytes (INT8 layout) + N×4 bytes (FP32 per-row scale)\n");
         fprintf(stderr, "  Native-VNNI: N×K bytes (payload)     + N×K/32×2 bytes (FP16 per-block scale)\n");
         fprintf(stderr, "  Native-VNNI reads ~6.2%% more data per GEMV (per-block vs per-row scales)\n");
+#endif
+    }
+
+    // =========================================================================
+    // Test: Qwen3.5-122B recurrent MTP split-K accuracy/economy comparison
+    // =========================================================================
+
+    TEST_F(Q8_0_GEMV_Tuning, Qwen35_122B_MTP_Auto_vs_OrderedK)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device available";
+
+        fprintf(stderr,
+                "\n[Q8_0 MTP split-K] Device: %s\n"
+                "Accuracy is measured against the dequantized FP32 weight; "
+                "speedup >1 favors ordered-K.\n",
+                device_name_.c_str());
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Shape" << "N" << "K" << "Auto us" << "KB1 us"
+              << "Auto cosine" << "KB1 cosine" << "KB1 speedup"
+              << fort::endr;
+
+        for (const auto &shape : SHAPES_QWEN35_122B_MTP)
+        {
+            GpuWeightsCache gpu_w;
+            auto reference_weights = TestTensorFactory::createQ8_0Random(
+                {static_cast<size_t>(shape.N), static_cast<size_t>(shape.K)});
+            std::vector<float> fp32(
+                static_cast<size_t>(shape.N) * static_cast<size_t>(shape.K));
+            reference_weights->to_fp32(fp32.data());
+            ASSERT_TRUE(gpu_w.upload(fp32.data(), shape.N, shape.K, 0));
+
+            const TuningResult automatic =
+                benchmarkNativeVNNIPath(shape, &gpu_w);
+            const TuningResult ordered =
+                benchmarkNativeVNNIPath(shape, &gpu_w, /*kb_forced=*/1);
+            ASSERT_TRUE(automatic.correctness_pass) << shape.name;
+            ASSERT_TRUE(ordered.correctness_pass) << shape.name;
+
+            char auto_us[24], ordered_us[24], auto_cosine[24];
+            char ordered_cosine[24], speedup[24];
+            snprintf(auto_us, sizeof(auto_us), "%.1f", automatic.min_us);
+            snprintf(ordered_us, sizeof(ordered_us), "%.1f", ordered.min_us);
+            snprintf(auto_cosine, sizeof(auto_cosine), "%.9f",
+                     automatic.cosine_sim);
+            snprintf(ordered_cosine, sizeof(ordered_cosine), "%.9f",
+                     ordered.cosine_sim);
+            snprintf(speedup, sizeof(speedup), "%.3fx",
+                     ordered.min_us > 0.0
+                         ? automatic.min_us / ordered.min_us
+                         : 0.0);
+            table << shape.name << shape.N << shape.K << auto_us << ordered_us
+                  << auto_cosine << ordered_cosine << speedup << fort::endr;
+        }
+
+        fprintf(stderr, "%s\n", table.to_string().c_str());
 #endif
     }
 

@@ -23,7 +23,7 @@
 #   <BACKEND>_MODEL_FILES_SERIALIZED - Additional inputs for that backend
 # =============================================================================
 
-# The one-hour economy requirement is a reporting target, never an execution
+# The 75-minute economy requirement is a reporting target, never an execution
 # timeout. This separate ceiling exists only to terminate a stuck standalone
 # campaign; the aggregate runner applies the same safety horizon to the matrix.
 set(_production_campaign_completion_timeout_seconds 21600)
@@ -383,10 +383,13 @@ if(_production_campaign_keys AND NOT _all_production_model_files)
         "ProductionParity cases in ${TEST_EXECUTABLE} have no declared MODEL_FILES")
 endif()
 
-# Register one process-resident production campaign per backend signature.
-# Each campaign is an atomic scheduling/resource unit, not an independent SLA
-# unit. scripts/ci/run_production_parity_campaigns.py admits every registered
-# campaign while measuring one shared 3,600-second target for the complete
+# Register one process-resident production campaign child per backend
+# signature. These CTest entries are the aggregate driver's discovery and
+# scheduling units, not standalone public entrypoints or independent SLA
+# units. `LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN=1` makes the C++ fixture
+# reject execution unless the driver has also published its authenticated
+# tmpfs model directory. scripts/ci/run_production_parity_campaigns.py admits
+# every child while measuring one shared 4,500-second target for the complete
 # matrix. Crossing the target never prevents a campaign from running.
 foreach(_campaign_key IN LISTS _production_campaign_keys)
     string(MAKE_C_IDENTIFIER "${_campaign_key}" _signature_id)
@@ -452,7 +455,7 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
         "LLAMINAR_LOG_LEVEL=INFO"
         "LLAMINAR_PRODUCTION_PARITY=1"
         "LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN=1"
-        "LLAMINAR_PRODUCTION_PARITY_TARGET_SECONDS=3600"
+        "LLAMINAR_PRODUCTION_PARITY_TARGET_SECONDS=4500"
         "LLAMINAR_GPU_GRAPHS=1"
         "LLAMINAR_PREFILL_GRAPH_BUCKETS=1"
         "LLAMINAR_PREFILL_GRAPH_REQUIRED=1"
@@ -505,12 +508,25 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     set(_campaign_labels ${LABELS})
     # Target-level labels describe every parameter in a binary. Policy labels
     # must instead describe this exact process campaign.
-    list(REMOVE_ITEM _campaign_labels "CPU" "CUDA" "ROCm" "LLEP")
+    list(REMOVE_ITEM _campaign_labels
+        "CPU" "CUDA" "ROCm" "NCCL" "RCCL" "LLEP")
     foreach(_backend IN ITEMS CPU CUDA ROCm)
         if("${_backend_signature}" MATCHES "${_backend}")
             list(APPEND _campaign_labels "${_backend}")
         endif()
     endforeach()
+    # Collective labels are target-level capabilities, but a generated
+    # process campaign must advertise only the libraries its selected backend
+    # set can execute. This matters when one typed binary contains CUDA+CPU,
+    # ROCm+CPU, and mixed-vendor cells.
+    if("${_backend_signature}" MATCHES "CUDA" AND
+       ";${LABELS};" MATCHES ";NCCL;")
+        list(APPEND _campaign_labels "NCCL")
+    endif()
+    if("${_backend_signature}" MATCHES "ROCm" AND
+       ";${LABELS};" MATCHES ";RCCL;")
+        list(APPEND _campaign_labels "RCCL")
+    endif()
     if(_campaign_policy_slice)
         list(APPEND _campaign_labels
             "${_campaign_policy_slice}"
@@ -528,7 +544,7 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     else()
         list(APPEND _campaign_labels
             "Campaign"
-            "WholeMatrixOneHourTarget")
+            "WholeMatrix75MinuteTarget")
     endif()
     if(_campaign_variant)
         list(APPEND _campaign_labels "FreshMPIWorld")
@@ -537,6 +553,12 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     string(JOIN ";" _labels_joined ${_campaign_labels})
 
     set(_campaign_env_vars ${_env_vars})
+    # HSA compatibility is similarly scoped to campaigns that actually own a
+    # ROCm participant; it must not leak topology assumptions into CUDA/CPU.
+    if(NOT "${_backend_signature}" MATCHES "ROCm")
+        list(FILTER _campaign_env_vars EXCLUDE REGEX
+            "^HSA_OVERRIDE_GFX_VERSION=")
+    endif()
     # Integration tests default to DEBUG, but a complete real-weight campaign
     # emits canonical CSV/PerfStats evidence and must not benchmark synchronous
     # debug-log traffic.  A focused reproduction can still run at DEBUG.

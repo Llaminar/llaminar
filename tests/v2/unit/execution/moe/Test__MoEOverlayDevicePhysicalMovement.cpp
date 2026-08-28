@@ -262,7 +262,9 @@ namespace llaminar2::test
             std::uint32_t expert,
             std::uint32_t source,
             std::uint32_t destination,
-            std::uint64_t bytes = 4096u)
+            std::uint64_t bytes = 4096u,
+            MoEOverlayDeviceMovementAxis axis =
+                MoEOverlayDeviceMovementAxis::TierResidency)
         {
             return {
                 .op = static_cast<std::uint32_t>(op),
@@ -270,6 +272,7 @@ namespace llaminar2::test
                 .expert = expert,
                 .source_participant = source,
                 .destination_participant = destination,
+                .flags = static_cast<std::uint32_t>(axis),
                 .payload_bytes = bytes,
             };
         }
@@ -288,6 +291,8 @@ namespace llaminar2::test
                 .source_participant = participant,
                 .destination_participant = participant,
                 .payload_slot = kMoEOverlayDeviceInvalidSlot,
+                .flags = static_cast<std::uint32_t>(
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement),
             };
         }
     } // namespace
@@ -394,8 +399,22 @@ namespace llaminar2::test
             MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
             12u,
             {
-                move(MoEOverlayDeviceMovementOp::DurableMove, 0, 4, 1, 0),
-                move(MoEOverlayDeviceMovementOp::DurableMove, 0, 5, 0, 1),
+                move(
+                    MoEOverlayDeviceMovementOp::DurableMove,
+                    0,
+                    4,
+                    1,
+                    0,
+                    4096u,
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement),
+                move(
+                    MoEOverlayDeviceMovementOp::DurableMove,
+                    0,
+                    5,
+                    0,
+                    1,
+                    4096u,
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement),
             });
         ASSERT_TRUE(command.valid());
 
@@ -409,6 +428,14 @@ namespace llaminar2::test
         EXPECT_EQ(
             physical.migrations[1].direction,
             MoEOverlayTierMigrationDirection::SamePriority);
+        EXPECT_TRUE(std::all_of(
+            physical.migrations.begin(),
+            physical.migrations.end(),
+            [](const auto &migration)
+            {
+                return migration.axis ==
+                       MoEOptimizationMovementAxis::ParticipantPlacement;
+            }));
         ASSERT_EQ(physical.migration_cycles.size(), 1u);
     }
 
@@ -469,7 +496,8 @@ namespace llaminar2::test
                     7,
                     0,
                     2,
-                    8192u),
+                    8192u,
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement),
             });
         ASSERT_TRUE(command.valid());
 

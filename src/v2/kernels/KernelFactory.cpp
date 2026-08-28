@@ -3358,6 +3358,11 @@ namespace llaminar
                     return nullptr;
 
                 const bool quantized = isVnniPackableTensor(tensor);
+                if (!quantized)
+                {
+                    LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Floating-point expert preparation requires shared tensor ownership");
+                    return nullptr;
+                }
 
                 GemmPreparationKind resolved_kind = prep_kind;
                 if (resolved_kind == GemmPreparationKind::AUTO)
@@ -3417,6 +3422,45 @@ namespace llaminar
                 // Return ownership to caller — NO global registry insertion,
                 // NO has_prepared_device_state_ flag set
                 return std::shared_ptr<llaminar2::ITensorGemm>(std::move(kernel));
+            }
+
+            std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::prepareExpertGemmLocal(
+                std::shared_ptr<llaminar2::TensorBase> tensor,
+                llaminar2::DeviceId target_device,
+                GemmPreparationKind prep_kind)
+            {
+                if (!tensor)
+                    return nullptr;
+
+                const bool quantized = isVnniPackableTensor(tensor.get());
+                const GemmPreparationKind resolved_kind =
+                    resolveGemmPreparationKind(tensor.get(), target_device, prep_kind);
+
+                if (!quantized &&
+                    resolved_kind == GemmPreparationKind::FLOATING_POINT &&
+                    getDeviceType(target_device) == DeviceType::CPU)
+                {
+                    if (!tensor->raw_data())
+                    {
+                        LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Floating-point expert tensor has no raw data");
+                        return nullptr;
+                    }
+
+                    // The shared expert constructor copies native bytes into the
+                    // engine's final recyclable slot. Supplying shared ownership
+                    // here proves that the source cannot disappear during that
+                    // one preparation transaction.
+                    return std::make_shared<llaminar2::gemm::FloatingPointGemmKernel>(
+                        std::shared_ptr<const llaminar2::TensorBase>(std::move(tensor)),
+                        llaminar2::gemm::FloatingPointGemmKernel::NumericalPolicy::
+                            MovableExpert);
+                }
+
+                // Packed CPU kernels own their final representation. GPU expert
+                // preparation is rejected by the raw overload and must use the
+                // PreparedWeightStore-backed load pipeline.
+                return prepareExpertGemmLocal(
+                    tensor.get(), target_device, resolved_kind);
             }
 
             std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::createExpertGemmFromTransferBlob(
@@ -3783,6 +3827,28 @@ namespace llaminar
                     }
 
                     return combined;
+                }
+
+                /**
+                 * @brief Forward the typed fused-bundle scratch declaration.
+                 *
+                 * The gate kernel is the execution anchor for the two-child
+                 * transaction, so it is also the sole authority for any
+                 * backend-specific simultaneous projection arena.
+                 */
+                void appendFusedProjectionWorkspaceRequirements(
+                    llaminar2::WorkspaceRequirements &requirements,
+                    int m,
+                    std::span<const int> projection_columns,
+                    int k) const override
+                {
+                    auto *gate_consumer =
+                        dynamic_cast<llaminar2::IWorkspaceConsumer *>(gemm_gate_);
+                    if (gate_consumer)
+                    {
+                        gate_consumer->appendFusedProjectionWorkspaceRequirements(
+                            requirements, m, projection_columns, k);
+                    }
                 }
 
                 void bindWorkspace(llaminar2::DeviceWorkspaceManager *workspace) override

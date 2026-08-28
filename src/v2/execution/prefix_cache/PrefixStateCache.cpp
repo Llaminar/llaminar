@@ -463,6 +463,100 @@ namespace llaminar2
         return true;
     }
 
+    std::optional<PrefixFingerprintRebase>
+    PrefixStateCache::rebaseFingerprint(
+        uint64_t previous_fingerprint,
+        uint64_t active_fingerprint)
+    {
+        if (previous_fingerprint == 0 || active_fingerprint == 0 ||
+            previous_fingerprint == active_fingerprint)
+        {
+            return std::nullopt;
+        }
+
+        /*
+         * Explicit retain()/release() leases predate shared handle ownership
+         * but remain a supported unit-level contract. Preflight every stale
+         * resident before mutating any tier so a busy transition is all-or-
+         * nothing rather than a partially rebased cache.
+         */
+        for (const auto &[key, entry] : entries_)
+        {
+            if (key.fingerprint != active_fingerprint &&
+                entry.block.ref_count > 0)
+            {
+                return std::nullopt;
+            }
+        }
+
+        PrefixFingerprintRebase transition{
+            .previous_fingerprint = previous_fingerprint,
+            .active_fingerprint = active_fingerprint,
+        };
+
+        std::vector<PrefixCacheKey> stale_device_keys;
+        stale_device_keys.reserve(device_hot_entries_.size());
+        for (const auto &[key, handle] : device_hot_entries_)
+        {
+            (void)handle;
+            if (key.fingerprint != active_fingerprint)
+                stale_device_keys.push_back(key);
+        }
+        for (const PrefixCacheKey &key : stale_device_keys)
+        {
+            const auto found = device_hot_entries_.find(key);
+            if (found == device_hot_entries_.end())
+                continue;
+            transition.released_device_bytes += found->second.total_bytes;
+            if (removeDeviceHotEntry(key, /*capacity_eviction=*/false))
+                ++transition.invalidated_device_entries;
+        }
+
+        std::vector<PrefixCacheKey> stale_ram_keys;
+        stale_ram_keys.reserve(entries_.size());
+        for (const auto &[key, entry] : entries_)
+        {
+            (void)entry;
+            if (key.fingerprint != active_fingerprint)
+                stale_ram_keys.push_back(key);
+        }
+        for (const PrefixCacheKey &key : stale_ram_keys)
+        {
+            const auto found = entries_.find(key);
+            if (found == entries_.end())
+                continue;
+            transition.released_ram_bytes +=
+                found->second.block.handle.total_bytes;
+            if (evictResident(key))
+                ++transition.invalidated_ram_entries;
+        }
+
+        std::vector<PrefixCacheKey> stale_disk_keys;
+        stale_disk_keys.reserve(disk_entries_.size());
+        for (const auto &[key, handle] : disk_entries_)
+        {
+            (void)handle;
+            if (key.fingerprint != active_fingerprint)
+                stale_disk_keys.push_back(key);
+        }
+        for (const PrefixCacheKey &key : stale_disk_keys)
+        {
+            if (disk_entries_.find(key) == disk_entries_.end())
+                continue;
+            forgetDiskEntry(key);
+            ++transition.unindexed_disk_entries;
+        }
+
+        ++stats_.fingerprint_rebases;
+        stats_.fingerprint_invalidated_ram_entries +=
+            transition.invalidated_ram_entries;
+        stats_.fingerprint_invalidated_device_entries +=
+            transition.invalidated_device_entries;
+        stats_.fingerprint_unindexed_disk_entries +=
+            transition.unindexed_disk_entries;
+        return transition;
+    }
+
     bool PrefixStateCache::prepareInsert(
         const PrefixCacheKey &key,
         size_t incoming_bytes)
@@ -487,31 +581,60 @@ namespace llaminar2
         return evictUntilFits(incoming_bytes);
     }
 
-    bool PrefixStateCache::prepareDeviceHotCopy(
+    PrefixDeviceHotLeaseResult PrefixStateCache::prepareDeviceHotCopy(
         const PrefixBlockHandle &ram_archive,
+        void *producer_stream,
         PrefixBlockHandle *device_hot_handle)
     {
-        if (!device_hot_handle || !device_hot_backend_ ||
-            !ram_archive.valid() ||
-            ram_archive.total_bytes > device_hot_backend_->budgetBytes())
+        if (!device_hot_handle || !producer_stream || !device_hot_backend_ ||
+            !ram_archive.valid())
         {
-            return false;
+            return PrefixDeviceHotLeaseResult::Error;
         }
-        if (!evictDeviceHotUntilFits(ram_archive.total_bytes))
-            return false;
+        if (!device_hot_backend_->capacityEligible(
+                ram_archive.total_bytes))
+        {
+            return PrefixDeviceHotLeaseResult::Ineligible;
+        }
+
+        /*
+         * Evict cache-owned LRU handles until an arena slot is physically
+         * reusable. A request may still retain aliases to every evicted slot;
+         * exhausting the LRU in that state is Busy, not an allocator failure.
+         */
+        while (!device_hot_backend_->canStore(
+            ram_archive.total_bytes))
+        {
+            if (device_hot_lru_.empty())
+                return PrefixDeviceHotLeaseResult::Busy;
+            const PrefixCacheKey victim = device_hot_lru_.back();
+            if (!removeDeviceHotEntry(
+                    victim,
+                    /*capacity_eviction=*/true))
+            {
+                return PrefixDeviceHotLeaseResult::Error;
+            }
+        }
 
         std::string error;
-        return device_hot_backend_->allocateDeviceBlock(
-            ram_archive,
-            device_hot_handle,
-            &error);
+        if (device_hot_backend_->allocateDeviceBlock(
+                ram_archive,
+                producer_stream,
+                device_hot_handle,
+                &error))
+        {
+            return PrefixDeviceHotLeaseResult::Acquired;
+        }
+        return device_hot_backend_->canStore(ram_archive.total_bytes)
+                   ? PrefixDeviceHotLeaseResult::Error
+                   : PrefixDeviceHotLeaseResult::Busy;
     }
 
     bool PrefixStateCache::deviceHotCapacityEligible(size_t bytes) const
     {
         return device_hot_backend_ &&
                bytes > 0 &&
-               bytes <= device_hot_backend_->budgetBytes();
+               device_hot_backend_->capacityEligible(bytes);
     }
 
     std::optional<PrefixBlockHandle> PrefixStateCache::deviceHotCopy(
@@ -589,33 +712,6 @@ namespace llaminar2
                 break;
             }
             if (!evicted)
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool PrefixStateCache::evictDeviceHotUntilFits(size_t incoming_bytes)
-    {
-        if (!device_hot_backend_)
-        {
-            return false;
-        }
-        if (incoming_bytes > device_hot_backend_->budgetBytes())
-        {
-            return false;
-        }
-        while (device_hot_backend_->usedBytes() + incoming_bytes > device_hot_backend_->budgetBytes())
-        {
-            if (device_hot_lru_.empty())
-            {
-                return false;
-            }
-            const PrefixCacheKey victim = device_hot_lru_.back();
-            if (!removeDeviceHotEntry(
-                    victim,
-                    /*capacity_eviction=*/true))
             {
                 return false;
             }

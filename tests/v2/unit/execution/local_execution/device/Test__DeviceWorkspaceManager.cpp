@@ -271,6 +271,68 @@ TEST_F(
 }
 
 /**
+ * @brief A retired graph family can republish names over the same allocation.
+ *
+ * Sealing removes every graph-visible name but retains exactly one physical
+ * block. The next family must reuse that address, while an oversized family is
+ * rejected without allocating around the model-context capacity contract.
+ */
+TEST_F(
+    Test__DeviceWorkspaceManager,
+    SealedPrimaryBlockReplansInPlaceAndRejectsGrowth)
+{
+    WorkspaceRequirements first_requirements;
+    first_requirements.buffers = {
+        {"first_family", 4096, 256, true},
+    };
+    const SerialWorkspaceFamilyPlan first_plan =
+        DeviceWorkspaceManager::planSerialFamily({first_requirements});
+    ASSERT_TRUE(first_plan.valid()) << first_plan.error;
+
+    DeviceWorkspaceManager manager(device, 8192);
+    ASSERT_TRUE(manager.allocateSerialFamily(first_plan));
+    void *const original_pointer = manager.getBuffer("first_family");
+    ASSERT_NE(original_pointer, nullptr);
+    const size_t original_block_bytes = manager.primaryBlockSize();
+    ASSERT_EQ(original_block_bytes, 4096u);
+
+    std::string seal_error;
+    ASSERT_TRUE(manager.sealPrimaryBlockForReuse(&seal_error)) << seal_error;
+    EXPECT_TRUE(manager.hasReusablePrimaryBlock());
+    EXPECT_TRUE(manager.isAllocated());
+    EXPECT_EQ(manager.used(), 0u);
+    EXPECT_EQ(manager.bufferCount(), 0u);
+    EXPECT_FALSE(manager.hasBuffer("first_family"));
+    EXPECT_EQ(manager.primaryBlockSize(), original_block_bytes);
+
+    WorkspaceRequirements second_requirements;
+    second_requirements.buffers = {
+        {"second_family", 2048, 256, true},
+    };
+    const SerialWorkspaceFamilyPlan second_plan =
+        DeviceWorkspaceManager::planSerialFamily({second_requirements});
+    ASSERT_TRUE(second_plan.valid()) << second_plan.error;
+    ASSERT_TRUE(manager.reusePrimaryBlockForSerialFamily(second_plan));
+    EXPECT_FALSE(manager.hasReusablePrimaryBlock());
+    EXPECT_EQ(manager.getBuffer("second_family"), original_pointer)
+        << "A reusable lease must preserve the physical allocation address";
+    EXPECT_EQ(manager.primaryBlockSize(), original_block_bytes);
+
+    ASSERT_TRUE(manager.sealPrimaryBlockForReuse(&seal_error)) << seal_error;
+    WorkspaceRequirements oversized_requirements;
+    oversized_requirements.buffers = {
+        {"oversized_family", original_block_bytes + 256u, 256, true},
+    };
+    const SerialWorkspaceFamilyPlan oversized_plan =
+        DeviceWorkspaceManager::planSerialFamily({oversized_requirements});
+    ASSERT_TRUE(oversized_plan.valid()) << oversized_plan.error;
+    EXPECT_FALSE(manager.reusePrimaryBlockForSerialFamily(oversized_plan));
+    EXPECT_TRUE(manager.hasReusablePrimaryBlock());
+    EXPECT_EQ(manager.bufferCount(), 0u);
+    EXPECT_EQ(manager.primaryBlockSize(), original_block_bytes);
+}
+
+/**
  * @brief Family planning is deterministic and publishes maximum name capacity.
  */
 TEST_F(

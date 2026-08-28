@@ -144,7 +144,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint32_t kBatchMagic = 0x42454f4dU; // "MOEB" in little-endian memory.
-        constexpr uint32_t kBatchVersion = 1u;
+        constexpr uint32_t kBatchVersion = 2u;
         constexpr uint8_t kDispatchEnvelopeKind = 1u;
         constexpr uint8_t kReturnEnvelopeKind = 2u;
 
@@ -372,7 +372,9 @@ namespace llaminar2
             if (rows.source_participant < 0 || rows.d_model != d_model ||
                 rows.top_k != top_k || !rows.row_ids_host ||
                 !rows.entry_offsets_host || !rows.expert_ids_host ||
-                !rows.route_weights_host || !rows.hidden_rows_fp32)
+                !rows.route_weights_host ||
+                !rows.original_route_slots_host ||
+                !rows.compact_route_slots_host || !rows.hidden_rows_fp32)
             {
                 if (error)
                     *error = "dispatch subpacket has invalid identity, geometry, or storage";
@@ -845,7 +847,9 @@ namespace llaminar2
         const size_t offset_bytes = checkedMultiply(
             offset_count, sizeof(int32_t), "entry offset bytes");
         const size_t entry_bytes = checkedMultiply(
-            max_total_entries_, sizeof(int32_t) + sizeof(float), "route entries");
+            max_total_entries_,
+            3u * sizeof(int32_t) + sizeof(float),
+            "route entries and slot identities");
 
         size_t dispatch_capacity = kEnvelopeCapacityAllowance;
         dispatch_capacity = checkedAdd(
@@ -974,6 +978,12 @@ namespace llaminar2
                     packet.route_weights_host,
                     packet.live_entry_count * sizeof(float)) ||
                 !writer.appendBytes(
+                    packet.original_route_slots_host,
+                    packet.live_entry_count * sizeof(int32_t)) ||
+                !writer.appendBytes(
+                    packet.compact_route_slots_host,
+                    packet.live_entry_count * sizeof(int32_t)) ||
+                !writer.appendBytes(
                     packet.hidden_rows_fp32,
                     hidden_values * sizeof(float)))
             {
@@ -1072,6 +1082,8 @@ namespace llaminar2
                     !destination->entry_offsets_host ||
                     !destination->expert_ids_host ||
                     !destination->route_weights_host ||
+                    !destination->original_route_slots_host ||
+                    !destination->compact_route_slots_host ||
                     !destination->hidden_rows_fp32 ||
                     ((row_count != 0 || entry_count != 0) &&
                      residency_epoch == 0) ||
@@ -1089,6 +1101,8 @@ namespace llaminar2
                 const size_t offset_bytes = (row_count + 1u) * sizeof(int32_t);
                 const size_t expert_bytes = entry_count * sizeof(int32_t);
                 const size_t weight_bytes = entry_count * sizeof(float);
+                const size_t route_slot_bytes =
+                    entry_count * sizeof(int32_t);
                 const size_t hidden_bytes =
                     row_count * static_cast<size_t>(d_model_) * sizeof(float);
                 if (publish)
@@ -1097,6 +1111,8 @@ namespace llaminar2
                         !reader.readBytes(destination->entry_offsets_host, offset_bytes) ||
                         !reader.readBytes(destination->expert_ids_host, expert_bytes) ||
                         !reader.readBytes(destination->route_weights_host, weight_bytes) ||
+                        !reader.readBytes(destination->original_route_slots_host, route_slot_bytes) ||
+                        !reader.readBytes(destination->compact_route_slots_host, route_slot_bytes) ||
                         !reader.readBytes(destination->hidden_rows_fp32, hidden_bytes))
                     {
                         if (error)
@@ -1114,6 +1130,8 @@ namespace llaminar2
                 }
                 else if (!reader.skip(row_bytes) || !reader.skip(offset_bytes) ||
                          !reader.skip(expert_bytes) || !reader.skip(weight_bytes) ||
+                         !reader.skip(route_slot_bytes) ||
+                         !reader.skip(route_slot_bytes) ||
                          !reader.skip(hidden_bytes))
                 {
                     if (error)

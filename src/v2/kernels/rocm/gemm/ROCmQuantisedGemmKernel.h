@@ -628,6 +628,25 @@ namespace llaminar2
                 int m, int n = 0, int k = 0) const override;
 
             /**
+             * @brief Add the exact simultaneous split-K arena for a fused bundle.
+             *
+             * ROCm's grouped small-M and concurrent decode paths keep one
+             * partial slice per active side stream.  This declaration derives
+             * those slices from the actual projection widths instead of
+             * multiplying the largest unrelated kernel width by a fixed fanout.
+             *
+             * @param requirements Stage-owned aggregate to extend.
+             * @param m Maximum rows represented by the fused capture.
+             * @param projection_columns Ordered output widths in the bundle.
+             * @param k Shared input width; retained for the common contract.
+             */
+            void appendFusedProjectionWorkspaceRequirements(
+                WorkspaceRequirements &requirements,
+                int m,
+                std::span<const int> projection_columns,
+                int k) const override;
+
+            /**
              * @brief Bind workspace manager for managed mode
              *
              * After binding, the kernel uses pre-allocated buffers from the

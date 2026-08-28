@@ -32,6 +32,7 @@
 #include "../../../utils/VramBillOfMaterials.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -143,6 +144,24 @@ namespace llaminar2
                 return "synthetic_test";
             }
             return "invalid";
+        }
+
+        /** @brief Convert authenticated traffic phase to bounded endpoint telemetry. */
+        MoEOverlayEndpointPhase endpointTelemetryPhase(
+            ExpertHistogramSource source) noexcept
+        {
+            switch (source)
+            {
+            case ExpertHistogramSource::DecodeToken:
+                return MoEOverlayEndpointPhase::Decode;
+            case ExpertHistogramSource::PrefillChunk:
+                return MoEOverlayEndpointPhase::Prefill;
+            case ExpertHistogramSource::GroupedVerifier:
+                return MoEOverlayEndpointPhase::GroupedVerifier;
+            case ExpertHistogramSource::SyntheticTest:
+                return MoEOverlayEndpointPhase::SyntheticTest;
+            }
+            return MoEOverlayEndpointPhase::SyntheticTest;
         }
 
         /** @brief Convert packet histogram identity to the grouped CPU phase. */
@@ -914,6 +933,12 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "MoELocalExpertStage graph entry capacity exceeds its fixed packet view");
             }
+            if (params_.cpu_canonical_route_return &&
+                params_.cpu_canonical_route_ticket_return)
+            {
+                throw std::invalid_argument(
+                    "MoELocalExpertStage cannot publish one CPU result through two canonical return authorities");
+            }
             if (params_.cpu_canonical_route_return)
             {
                 const auto &binding = *params_.cpu_canonical_route_return;
@@ -925,6 +950,22 @@ namespace llaminar2
                 {
                     throw std::invalid_argument(
                         "MoELocalExpertStage mapped canonical return requires CPU execution, exact route-slot storage, and a canonical serial arena");
+                }
+            }
+            if (params_.cpu_canonical_route_ticket_return)
+            {
+                const auto &binding =
+                    *params_.cpu_canonical_route_ticket_return;
+                if (!params_.device_id.is_cpu() || !binding.valid() ||
+                    binding.storage->routeCapacity() < entry_capacity ||
+                    binding.storage->dModel() != params_.d_model ||
+                    binding.storage->layerIndex() != params_.layer_idx ||
+                    !params_.serial_compact_buffer_arena ||
+                    !params_.serial_compact_buffer_arena
+                         ->cpuCanonicalRoutes())
+                {
+                    throw std::invalid_argument(
+                        "MoELocalExpertStage canonical ticket return requires CPU execution, matching immutable route geometry, and a canonical serial arena");
                 }
             }
             if (!ensureCompactCapacity(row_capacity, params_.top_k))
@@ -985,6 +1026,45 @@ namespace llaminar2
             }
             createDeferredReplayFamilies();
         }
+    }
+
+    std::shared_ptr<MappedHostTransferRegion>
+    MoELocalExpertSerialBufferArena::mappedCPUCanonicalRoutes(
+        DeviceId continuation_device)
+    {
+        if (!cpu_canonical_routes_ || !device_id_.is_cpu() ||
+            !continuation_device.is_gpu())
+        {
+            throw std::logic_error(
+                "serial CPU canonical-route mapping requires retained CPU rows and an exact GPU consumer");
+        }
+        if (mapped_cpu_canonical_routes_)
+        {
+            if (mapped_cpu_canonical_route_consumer_ != continuation_device)
+            {
+                throw std::logic_error(
+                    "serial CPU canonical-route arena cannot be rebound to another continuation device");
+            }
+            return mapped_cpu_canonical_routes_;
+        }
+
+        const std::array<DeviceId, 1> devices{continuation_device};
+        mapped_cpu_canonical_routes_ =
+            TransferEngine::instance().registerExternalMappedHostRegion(
+                cpu_canonical_routes_->mutable_data(),
+                cpu_canonical_routes_->size_bytes(),
+                devices,
+                std::static_pointer_cast<void>(cpu_canonical_routes_));
+        if (!mapped_cpu_canonical_routes_ ||
+            !mapped_cpu_canonical_routes_->isBound() ||
+            !mapped_cpu_canonical_routes_->hasDevice(continuation_device))
+        {
+            mapped_cpu_canonical_routes_.reset();
+            throw std::runtime_error(
+                "TransferEngine did not publish the complete serial CPU canonical-route mapping");
+        }
+        mapped_cpu_canonical_route_consumer_ = continuation_device;
+        return mapped_cpu_canonical_routes_;
     }
 
     std::vector<size_t>
@@ -1096,7 +1176,8 @@ namespace llaminar2
         compute_params.routing_indices = compact_routing_indices_.get();
         compute_params.routing_weights = compact_routing_weights_.get();
         compute_params.output = compact_output_.get();
-        if (params_.cpu_canonical_route_return)
+        if (params_.cpu_canonical_route_return ||
+            params_.cpu_canonical_route_ticket_return)
         {
             if (!compact_canonical_routes_)
             {
@@ -2328,14 +2409,16 @@ namespace llaminar2
             compact_routing_weights_ = family->routing_weights;
             compact_output_ = family->output;
             compact_canonical_routes_ =
-                params_.cpu_canonical_route_return
+                (params_.cpu_canonical_route_return ||
+                 params_.cpu_canonical_route_ticket_return)
                     ? arena.cpuCanonicalRoutes()
                     : nullptr;
             compact_capacity_ = family->row_capacity;
             compact_routing_top_k_ = arena.routingTopK();
             return compact_hidden_ && compact_routing_indices_ &&
                    compact_routing_weights_ && compact_output_ &&
-                   (!params_.cpu_canonical_route_return ||
+                   (!(params_.cpu_canonical_route_return ||
+                      params_.cpu_canonical_route_ticket_return) ||
                     compact_canonical_routes_);
         }
 
@@ -2541,21 +2624,50 @@ namespace llaminar2
          * Without this zero-work record, a missing owner is indistinguishable
          * from an idle one when two CPU/NUMA endpoints share one backend name.
          */
-        const auto recordZeroLocalWork = [&]()
+        const auto recordZeroLocalWork = [&]() -> bool
         {
-            if (!MoEExpertOverlayProfiler::isEnabled())
-                return;
-            MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-                params_.layer_idx,
-                input.key.tier_idx,
-                params_.runtime_participant_index,
-                params_.device_id.to_string(),
-                params_.device_id.is_cpu(),
-                input.live_row_count,
-                /*active_routes=*/0,
-                /*output_rows=*/0,
-                {},
-                /*compute_ms=*/0.0);
+            /*
+             * A captured canonical-ticket consumer executes for every replay,
+             * including packets that route no work to this CPU participant.
+             * Publish an authenticated empty prefix so it can never consume a
+             * preceding replay's route identities or contribution rows.
+             */
+            if (params_.cpu_canonical_route_ticket_return)
+            {
+                const auto &binding =
+                    *params_.cpu_canonical_route_ticket_return;
+                auto publication = binding.valid()
+                                       ? binding.storage->arm(
+                                             input.residency_epoch)
+                                       : MoEOverlayCanonicalRouteReturnTicketStorage::
+                                             Publication{};
+                if (!publication ||
+                    !publication.publish(/*live_entry_count=*/0u))
+                {
+                    LOG_ERROR(
+                        "[MoELocalExpertStage] Could not publish an empty canonical-route ticket"
+                        << " layer=" << params_.layer_idx
+                        << " participant="
+                        << params_.runtime_participant_index
+                        << " epoch=" << input.residency_epoch);
+                    return false;
+                }
+            }
+            if (MoEExpertOverlayProfiler::isEnabled())
+            {
+                MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
+                    params_.layer_idx,
+                    input.key.tier_idx,
+                    params_.runtime_participant_index,
+                    params_.device_id.to_string(),
+                    params_.device_id.is_cpu(),
+                    input.live_row_count,
+                    /*active_routes=*/0,
+                    /*output_rows=*/0,
+                    {},
+                    /*compute_ms=*/0.0);
+            }
+            return true;
         };
 
         if (params_.moe_runtime_table)
@@ -2570,7 +2682,8 @@ namespace llaminar2
 
         if (input.live_row_count == 0)
         {
-            recordZeroLocalWork();
+            if (!recordZeroLocalWork())
+                return false;
             if (usesDeferredCompletion())
                 deferred_lifecycle_ = DeferredLifecycle::ReadyNoWork;
             return true;
@@ -2578,7 +2691,8 @@ namespace llaminar2
 
         if (params_.moe_runtime_table && !hasRuntimeLocalWorkForInput(input))
         {
-            recordZeroLocalWork();
+            if (!recordZeroLocalWork())
+                return false;
             if (usesDeferredCompletion())
                 deferred_lifecycle_ = DeferredLifecycle::ReadyNoWork;
             return true;
@@ -2587,7 +2701,8 @@ namespace llaminar2
         if (!execution_layer_bank && !params_.moe_runtime_table &&
             staticExpertMaskDisablesAllExperts())
         {
-            recordZeroLocalWork();
+            if (!recordZeroLocalWork())
+                return false;
             if (usesDeferredCompletion())
                 deferred_lifecycle_ = DeferredLifecycle::ReadyNoWork;
             return true;
@@ -2733,7 +2848,8 @@ namespace llaminar2
 
         if (active_routes_.empty())
         {
-            recordZeroLocalWork();
+            if (!recordZeroLocalWork())
+                return false;
             if (usesDeferredCompletion())
                 deferred_lifecycle_ = DeferredLifecycle::ReadyNoWork;
             return true;
@@ -3182,7 +3298,8 @@ namespace llaminar2
             compute_params.routing_indices = compact_routing_indices_.get();
             compute_params.routing_weights = compact_routing_weights_.get();
             compute_params.output = compact_output_.get();
-            if (params_.cpu_canonical_route_return)
+            if (params_.cpu_canonical_route_return ||
+                params_.cpu_canonical_route_ticket_return)
             {
                 /*
                  * The grouped CPU kernel must preserve one raw expert row per
@@ -3241,6 +3358,33 @@ namespace llaminar2
         {
             LOG_ERROR("[MoELocalExpertStage] GPU local expert compute requires a bound workspace");
             return false;
+        }
+
+        std::optional<
+            MoEOverlayCanonicalRouteReturnTicketStorage::Publication>
+            canonical_route_publication;
+        if (params_.cpu_canonical_route_ticket_return)
+        {
+            const auto &binding =
+                *params_.cpu_canonical_route_ticket_return;
+            if (!binding.valid())
+            {
+                LOG_ERROR(
+                    "[MoELocalExpertStage] CPU canonical-route publication lost its immutable ticket binding");
+                return false;
+            }
+            canonical_route_publication.emplace(
+                binding.storage->arm(input.residency_epoch));
+            if (!*canonical_route_publication)
+            {
+                LOG_ERROR(
+                    "[MoELocalExpertStage] CPU canonical-route payload is still owned by the prior GPU replay"
+                    << " layer=" << params_.layer_idx
+                    << " participant="
+                    << params_.runtime_participant_index
+                    << " epoch=" << input.residency_epoch);
+                return false;
+            }
         }
         const bool profiling_enabled = MoEExpertOverlayProfiler::isEnabled();
         std::chrono::steady_clock::time_point t_compute_start;
@@ -3349,16 +3493,22 @@ namespace llaminar2
 
         if (usesDeferredCompletion())
             return true;
-        return completeDeferredOutputOnCurrentThread(ctx);
+        return completeDeferredOutputOnCurrentThread(
+            ctx,
+            canonical_route_publication
+                ? &*canonical_route_publication
+                : nullptr);
     }
 
     bool MoELocalExpertStage::completeDeferredOutput(IDeviceContext *ctx)
     {
-        return completeDeferredOutputOnCurrentThread(ctx);
+        return completeDeferredOutputOnCurrentThread(ctx, nullptr);
     }
 
     bool MoELocalExpertStage::completeDeferredOutputOnCurrentThread(
-        IDeviceContext *ctx)
+        IDeviceContext *ctx,
+        MoEOverlayCanonicalRouteReturnTicketStorage::Publication *
+            canonical_route_publication)
     {
         if (!validateDeviceContext(
                 ctx, params_.device_id, "MoELocalExpertCompletionStage"))
@@ -3383,8 +3533,7 @@ namespace llaminar2
                     1.0,
                     "moe_overlay",
                     params_.device_id.to_string(),
-                    {{"active_routes", "0"},
-                     {"layer", std::to_string(params_.layer_idx)},
+                    {{"layer", std::to_string(params_.layer_idx)},
                      {"participant", std::to_string(params_.runtime_participant_index)},
                      {"service_source",
                       serviceSourceName(input.key.histogram_source)}});
@@ -3419,7 +3568,8 @@ namespace llaminar2
         };
 
         const bool publishes_canonical_routes =
-            params_.cpu_canonical_route_return.has_value();
+            params_.cpu_canonical_route_return.has_value() ||
+            params_.cpu_canonical_route_ticket_return.has_value();
         const float *compact_result = nullptr;
         if (usesDeferredCompletion())
         {
@@ -3513,6 +3663,201 @@ namespace llaminar2
 
         if (publishes_canonical_routes)
         {
+            if (params_.cpu_canonical_route_ticket_return)
+            {
+                const auto &binding =
+                    *params_.cpu_canonical_route_ticket_return;
+                auto &ticket = *binding.storage;
+                bool exact_packet =
+                    binding.valid() && input.original_route_slots_host &&
+                    input.compact_route_slots_host &&
+                    canonical_route_publication &&
+                    *canonical_route_publication &&
+                    canonical_route_publication->belongsTo(ticket) &&
+                    active_routes_.size() == input.live_entry_count &&
+                    output_input_rows_.size() == input.live_row_count &&
+                    input.live_entry_count <= ticket.routeCapacity() &&
+                    ticket.contributionRowsHost() == compact_result;
+                std::int32_t previous_original_slot = -1;
+                for (size_t compact_row = 0;
+                     exact_packet &&
+                     compact_row < output_input_rows_.size();
+                     ++compact_row)
+                {
+                    const size_t input_row = output_input_rows_[compact_row];
+                    if (input_row != compact_row)
+                    {
+                        exact_packet = false;
+                        break;
+                    }
+                    output.row_ids_host[compact_row] =
+                        input.row_ids_host[input_row];
+                    const std::int32_t begin =
+                        input.entry_offsets_host[input_row];
+                    const std::int32_t end =
+                        input.entry_offsets_host[input_row + 1u];
+                    if (begin < 0 || end <= begin ||
+                        end > static_cast<std::int32_t>(
+                                  input.live_entry_count) ||
+                        end - begin > params_.top_k)
+                    {
+                        exact_packet = false;
+                        break;
+                    }
+                    for (std::int32_t entry = begin; entry < end; ++entry)
+                    {
+                        const std::int32_t packet_local_route = entry - begin;
+                        const std::int32_t expected_packet_compact_slot =
+                            static_cast<std::int32_t>(input_row) *
+                                params_.top_k +
+                            packet_local_route;
+                        const auto &active_route =
+                            active_routes_[static_cast<size_t>(entry)];
+                        const size_t source_slot =
+                            active_route.compact_row *
+                                static_cast<size_t>(
+                                    compact_execution_top_k_) +
+                            active_route.route_offset;
+                        const std::int32_t original_slot =
+                            input.original_route_slots_host[entry];
+                        if (input.compact_route_slots_host[entry] !=
+                                expected_packet_compact_slot ||
+                            active_route.compact_row != compact_row ||
+                            active_route.route_offset !=
+                                static_cast<size_t>(packet_local_route) ||
+                            source_slot >= ticket.routeCapacity() ||
+                            original_slot <= previous_original_slot ||
+                            original_slot < 0 ||
+                            static_cast<size_t>(original_slot) >=
+                                ticket.routeCapacity())
+                        {
+                            exact_packet = false;
+                            break;
+                        }
+                        previous_original_slot = original_slot;
+                    }
+                }
+                if (!exact_packet)
+                {
+                    LOG_ERROR(
+                        "[MoELocalExpertStage] Colocated CPU canonical ticket does not match the authenticated compact/original route packet"
+                        << " layer=" << params_.layer_idx
+                        << " participant="
+                        << params_.runtime_participant_index
+                        << " epoch=" << input.residency_epoch
+                        << " live_rows=" << input.live_row_count
+                        << " live_entries=" << input.live_entry_count
+                        << " active_routes=" << active_routes_.size()
+                        << " execution_route_width="
+                        << compact_execution_top_k_
+                        << " route_capacity="
+                        << ticket.routeCapacity());
+                    return fail_completed_packet();
+                }
+
+                auto *const original_slots =
+                    ticket.originalRouteSlotsHost();
+                auto *const compact_slots =
+                    ticket.compactRouteSlotsHost();
+                float *const contribution_rows =
+                    ticket.contributionRowsHost();
+                const size_t d_model =
+                    static_cast<size_t>(params_.d_model);
+                const auto publish_entry = [&](size_t entry)
+                {
+                    const auto &active_route = active_routes_[entry];
+                    const size_t source_slot =
+                        active_route.compact_row *
+                            static_cast<size_t>(compact_execution_top_k_) +
+                        active_route.route_offset;
+                    original_slots[entry] =
+                        input.original_route_slots_host[entry];
+                    compact_slots[entry] =
+                        static_cast<std::int32_t>(source_slot);
+                    float *const row =
+                        contribution_rows + source_slot * d_model;
+                    const float weight = input.route_weights_host[entry];
+                    for (size_t col = 0; col < d_model; ++col)
+                        row[col] *= weight;
+                };
+
+                /*
+                 * Every compact source slot is unique, so publication can use
+                 * the socket's physical cores without changing arithmetic.
+                 * Decode stays serial to avoid paying an OpenMP fork for a
+                 * handful of route rows.
+                 */
+                constexpr size_t kParallelCanonicalPublicationEntries = 8u;
+                if (endpoint_detail_enabled)
+                    canonical_publication_started =
+                        std::chrono::steady_clock::now();
+                if (!omp_in_parallel() &&
+                    input.live_entry_count >=
+                        kParallelCanonicalPublicationEntries)
+                {
+#pragma omp parallel for schedule(static)
+                    for (std::int64_t entry = 0;
+                         entry < static_cast<std::int64_t>(
+                                     input.live_entry_count);
+                         ++entry)
+                    {
+                        publish_entry(static_cast<size_t>(entry));
+                    }
+                }
+                else
+                {
+                    for (size_t entry = 0;
+                         entry < input.live_entry_count;
+                         ++entry)
+                    {
+                        publish_entry(entry);
+                    }
+                }
+                if (endpoint_detail_enabled)
+                    canonical_publication_completed =
+                        std::chrono::steady_clock::now();
+
+                if (validate_finite_values)
+                {
+                    for (size_t entry = 0;
+                         entry < input.live_entry_count;
+                         ++entry)
+                    {
+                        const size_t source_slot = static_cast<size_t>(
+                            compact_slots[entry]);
+                        const float *const row =
+                            contribution_rows + source_slot * d_model;
+                        for (size_t col = 0; col < d_model; ++col)
+                        {
+                            if (!std::isfinite(row[col]))
+                            {
+                                LOG_ERROR(
+                                    "[MoELocalExpertStage] Non-finite colocated CPU canonical route contribution"
+                                    << " layer=" << params_.layer_idx
+                                    << " participant="
+                                    << params_.runtime_participant_index
+                                    << " entry=" << entry
+                                    << " compact_slot=" << source_slot
+                                    << " col=" << col);
+                                return fail_completed_packet();
+                            }
+                        }
+                    }
+                }
+                if (!canonical_route_publication->publish(
+                        input.live_entry_count))
+                {
+                    LOG_ERROR(
+                        "[MoELocalExpertStage] Could not release-publish the complete colocated CPU canonical ticket"
+                        << " layer=" << params_.layer_idx
+                        << " participant="
+                        << params_.runtime_participant_index
+                        << " live_entries=" << input.live_entry_count);
+                    return fail_completed_packet();
+                }
+            }
+            else
+            {
             const auto &binding = *params_.cpu_canonical_route_return;
             bool exact_packet = binding.valid() &&
                                 active_routes_.size() ==
@@ -3675,6 +4020,7 @@ namespace llaminar2
                     }
                 }
             }
+            }
         }
         else
         {
@@ -3761,60 +4107,43 @@ namespace llaminar2
                         .count();
                 return value > 0 ? static_cast<uint64_t>(value) : 1u;
             };
-            std::set<int> traced_experts;
-            for (const auto &route : active_routes_)
-                traced_experts.insert(route.expert_id);
-            std::ostringstream expert_ids;
-            bool first_expert = true;
-            for (const int expert : traced_experts)
-            {
-                if (!first_expert)
-                    expert_ids << ':';
-                expert_ids << expert;
-                first_expert = false;
-            }
 
-            const PerfStatsCollector::Tags tags{
-                {"active_expert_count", std::to_string(traced_experts.size())},
-                {"active_experts", expert_ids.str()},
-                {"active_routes", std::to_string(active_routes_.size())},
-                {"compact_family_bytes", std::to_string(compact_family_bytes)},
-                {"compact_row_capacity", std::to_string(compact_capacity_)},
-                {"input_rows", std::to_string(input.live_row_count)},
-                {"generation", std::to_string(input.key.generation_id)},
-                {"layer", std::to_string(params_.layer_idx)},
-                {"logical_step", std::to_string(input.key.step_id)},
-                {"output_rows", std::to_string(output.live_row_count)},
-                {"participant", std::to_string(params_.runtime_participant_index)},
-                {"residency_epoch", std::to_string(input.residency_epoch)},
-                {"route_width", std::to_string(compact_execution_top_k_)},
-                {"tier", std::to_string(input.key.tier_idx)}};
-            const std::string phase =
-                serviceSourceName(input.key.histogram_source);
-            const std::string device = params_.device_id.to_string();
-            const auto record = [&](const char *name, auto begin, auto end)
-            {
-                PerfStatsCollector::recordTimingNs(
-                    "moe_overlay_endpoint",
-                    name,
-                    elapsedNs(begin, end),
-                    phase,
-                    device,
-                    tags);
-            };
-            record("packet_service", service_start, completed_at);
-            record("route_validation_and_compaction", service_start, stage_setup_start);
-            record("stage_setup_and_transfers", stage_setup_start, t_compute_start);
-            record("compute_submission", t_compute_start, t_compute_end);
-            record("output_materialization", t_compute_end, output_materialized_at);
+            std::optional<std::uint64_t> canonical_publication_ns;
             if (publishes_canonical_routes)
             {
-                record(
-                    "canonical_route_preweight_and_publication",
+                canonical_publication_ns = elapsedNs(
                     canonical_publication_started,
                     canonical_publication_completed);
             }
-            record("return_validation_and_aggregation", output_materialized_at, completed_at);
+
+            MoEExpertOverlayProfiler::recordEndpointPacket(
+                MoEOverlayEndpointIdentity{
+                    .phase = endpointTelemetryPhase(
+                        input.key.histogram_source),
+                    .device = params_.device_id.to_string(),
+                    .layer = params_.layer_idx,
+                    .tier_index = input.key.tier_idx,
+                    .participant_id =
+                        params_.runtime_participant_index,
+                    .row_capacity = compact_capacity_,
+                    .route_width = compact_execution_top_k_,
+                },
+                MoEOverlayEndpointTimings{
+                    .packet_service_ns = elapsedNs(
+                        service_start, completed_at),
+                    .route_validation_and_compaction_ns = elapsedNs(
+                        service_start, stage_setup_start),
+                    .stage_setup_and_transfers_ns = elapsedNs(
+                        stage_setup_start, t_compute_start),
+                    .compute_submission_ns = elapsedNs(
+                        t_compute_start, t_compute_end),
+                    .output_materialization_ns = elapsedNs(
+                        t_compute_end, output_materialized_at),
+                    .canonical_route_preweight_and_publication_ns =
+                        canonical_publication_ns,
+                    .return_validation_and_aggregation_ns = elapsedNs(
+                        output_materialized_at, completed_at),
+                });
         }
 
         if (profiling_enabled)
@@ -3845,7 +4174,9 @@ namespace llaminar2
          * root-published generation and logical step carried by the paired
          * dispatch/return collective; tests can therefore distinguish a live
          * CPU cold-tier route from an idle graph endpoint without maintaining a
-         * host shadow of routing state.
+         * host shadow of routing state. Transaction identity is deliberately
+         * retained by the bounded ordered-sequence witness at the graph
+         * boundary, never as a per-packet aggregation tag.
          */
         if (PerfStatsCollector::isDomainEnabled("forward_graph"))
         {
@@ -3861,12 +4192,10 @@ namespace llaminar2
                 params_.device_id.to_string(),
                 {{"completion", "local_expert_packet_complete"},
                  {"device_kind", device_kind},
-                 {"generation", std::to_string(input.key.generation_id)},
                  {"identity_source", "sparse_collective_key"},
                  {"input_rows", std::to_string(input.live_row_count)},
                  {"compact_family_bytes", std::to_string(compact_family_bytes)},
                  {"compact_row_capacity", std::to_string(compact_capacity_)},
-                 {"logical_step", std::to_string(input.key.step_id)},
                  {"output_rows", std::to_string(output.live_row_count)},
                  {"participant", std::to_string(params_.runtime_participant_index)},
                  {"service_source",
@@ -3878,8 +4207,7 @@ namespace llaminar2
                 1.0,
                 "moe_overlay",
                 params_.device_id.to_string(),
-                {{"active_routes", std::to_string(active_routes_.size())},
-                 {"host_fence_policy",
+                {{"host_fence_policy",
                   usesDeferredCompletion() ? "active_progress_event" : "inline"},
                  {"host_execution",
                   "rank_graph_submit_completion_wave"},
@@ -3887,6 +4215,59 @@ namespace llaminar2
                  {"participant", std::to_string(params_.runtime_participant_index)},
                  {"service_source",
                   serviceSourceName(input.key.histogram_source)}});
+        }
+        if (params_.cpu_canonical_route_ticket_return &&
+            !active_routes_.empty() &&
+            PerfStatsCollector::isDomainEnabled("moe_overlay"))
+        {
+            const size_t dispatch_bytes =
+                compactMoEOverlayDispatchBytes(input);
+            const size_t return_bytes =
+                canonicalMoEOverlayTicketReturnBytes(
+                    input.live_entry_count,
+                    params_.d_model);
+            const PerfStatsCollector::Tags traffic_tags{
+                {"completion", "rank_local_canonical_ticket_complete"},
+                {"device_kind", "CPU"},
+                {"identity_source", "sparse_collective_key"},
+                {"participant",
+                 std::to_string(params_.runtime_participant_index)},
+                {"tier", std::to_string(input.key.tier_idx)},
+                {"transport", "compact"},
+            };
+            if (dispatch_bytes > 0u)
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_overlay",
+                    "rank_local_canonical_ticket_dispatch_bytes",
+                    static_cast<double>(dispatch_bytes),
+                    "gn_sparse_dispatch",
+                    params_.device_id.to_string(),
+                    traffic_tags);
+            }
+            if (return_bytes > 0u)
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_overlay",
+                    "rank_local_canonical_ticket_return_bytes",
+                    static_cast<double>(return_bytes),
+                    "gn_return_reduce",
+                    params_.device_id.to_string(),
+                    traffic_tags);
+            }
+            PerfStatsCollector::addCounter(
+                "moe_overlay",
+                "rank_local_canonical_ticket_cpu_rows",
+                static_cast<double>(input.live_entry_count),
+                "gn_local_expert",
+                params_.device_id.to_string(),
+                {{"completion", "rank_local_canonical_ticket_complete"},
+                 {"domain_kind", "CPU"},
+                 {"identity_source", "sparse_collective_key"},
+                 {"participant",
+                  std::to_string(params_.runtime_participant_index)},
+                 {"tier", std::to_string(input.key.tier_idx)},
+                 {"transport", "local"}});
         }
         resetDeferredInvocation();
         return true;

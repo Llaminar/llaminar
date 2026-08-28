@@ -104,20 +104,17 @@ namespace llaminar2::test
         }
 
         /**
-         * @brief Extract one brace-balanced class declaration for source-contract checks.
+         * @brief Extract one brace-balanced declaration for source checks.
          *
-         * A whole-header occurrence count can prove the total number of private
-         * backend owners, but it cannot prove which stage owns each one. Walking
-         * the declaration's braces lets ownership tests inspect every named stage
-         * independently without depending on line numbers or on the order of
-         * nested parameter structures.
+         * A whole-file occurrence count cannot prove which class or function
+         * owns a dependency. Walking braces lets ownership tests inspect one
+         * declaration independently of line numbers and nested block order.
          *
          * @param contents Complete source file contents.
-         * @param declaration Exact class-declaration prefix to locate.
-         * @return The complete class declaration, or an empty string when the
-         *         declaration is absent or has unbalanced braces.
+         * @param declaration Exact declaration prefix to locate.
+         * @return Complete declaration, or empty for an absent/unbalanced one.
          */
-        std::string classDeclarationRegion(
+        std::string braceBalancedDeclarationRegion(
             const std::string &contents,
             const std::string &declaration)
         {
@@ -1559,6 +1556,36 @@ namespace llaminar2::test
         }
     }
 
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ExpertMovementEdgesRemainTraceOnly)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path authority_source =
+            root / "src/v2/execution/moe/MoEOverlayResidencyAuthority.cpp";
+        ASSERT_TRUE(fs::exists(authority_source)) << authority_source;
+
+        const std::string contents = readFile(authority_source);
+        const std::string marker =
+            "\"[ExpertOverlay][Residency] committed edge epoch=\"";
+        const std::size_t marker_offset = contents.find(marker);
+        ASSERT_NE(marker_offset, std::string::npos);
+
+        /*
+         * One rebalance wave can commit hundreds of edges on every rank. The
+         * typed residency evidence owns those records and INFO owns one wave
+         * summary; terminal narration for each edge must remain TRACE-only so
+         * observability cannot change the measured inference economy.
+         */
+        const std::size_t log_offset = contents.rfind("LOG_TRACE(", marker_offset);
+        ASSERT_NE(log_offset, std::string::npos);
+        EXPECT_LT(marker_offset - log_offset, 128u);
+        const std::size_t info_offset =
+            contents.rfind("LOG_INFO(", marker_offset);
+        const std::size_t debug_offset =
+            contents.rfind("LOG_DEBUG(", marker_offset);
+        EXPECT_TRUE(info_offset == std::string::npos || info_offset < log_offset);
+        EXPECT_TRUE(debug_offset == std::string::npos || debug_offset < log_offset);
+    }
+
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, HotCacheRouterStatsSkipStaticPlacements)
     {
         const fs::path root = findRepoRoot();
@@ -2198,7 +2225,7 @@ namespace llaminar2::test
         const size_t publish = execute_body.find(
             "!publishServiceMeasurement(", elapsed_service);
         const size_t diagnostic_publish = execute_body.find(
-            "record(\"packet_service\"", publish);
+            "MoEExpertOverlayProfiler::recordEndpointPacket(", publish);
 
         ASSERT_NE(service_start, std::string::npos);
         ASSERT_NE(compact_capacity, std::string::npos);
@@ -2224,6 +2251,26 @@ namespace llaminar2::test
             << "Optional PerfStats detail must not contaminate the economy "
                "measurement used by placement";
 
+        const size_t endpoint_detail_end = execute_body.find(
+            "if (profiling_enabled)", diagnostic_publish);
+        ASSERT_NE(endpoint_detail_end, std::string::npos);
+        const std::string endpoint_detail = execute_body.substr(
+            diagnostic_publish,
+            endpoint_detail_end - diagnostic_publish);
+        for (const std::string_view forbidden_tag : {
+                 "active_experts",
+                 "active_routes",
+                 "generation_id",
+                 "step_id",
+                 "residency_epoch"})
+        {
+            EXPECT_EQ(
+                endpoint_detail.find(forbidden_tag),
+                std::string::npos)
+                << "Sparse endpoint PerfStats identity must remain bounded; "
+                << forbidden_tag << " belongs in aggregate evidence, not tags";
+        }
+
         EXPECT_EQ(execute_body.find("createTimingEvent("), std::string::npos);
         EXPECT_EQ(execute_body.find("recordEvent("), std::string::npos);
         EXPECT_EQ(execute_body.find("eventElapsedTimeMs("), std::string::npos)
@@ -2231,7 +2278,7 @@ namespace llaminar2::test
                "endpoint economy";
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, WeightManagerUnpinsMmapWeightsBeforeMadvise)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, WeightManagerWorkerUnpinsMmapWeightsBeforeAdvice)
     {
         const fs::path root = findRepoRoot();
         const fs::path manager_path = root / "src/v2/loaders/WeightManager.cpp";
@@ -2248,13 +2295,22 @@ namespace llaminar2::test
         ASSERT_FALSE(tensor_contents.empty()) << tensor_path;
         ASSERT_FALSE(slice_contents.empty()) << slice_path;
 
-        const size_t function_start = manager_contents.find("size_t WeightManager::adviseMmapDontneed()");
+        const size_t function_start = manager_contents.find("size_t WeightManager::performMmapReclaim()");
         ASSERT_NE(function_start, std::string::npos);
+        const size_t residual_release = manager_contents.find(
+            "releaseHostResidentWeightData()", function_start);
         const size_t release_call = manager_contents.find("releaseMmapHostRegistration()", function_start);
-        const size_t madvise_call = manager_contents.find("return loader_.adviseMmapDontneed();", function_start);
+        const size_t madvise_call = manager_contents.find(
+            "loader_.adviseMmapDontneed()", function_start);
+        const size_t allocator_trim = manager_contents.find(
+            "::malloc_trim(0)", function_start);
+        ASSERT_NE(residual_release, std::string::npos);
         ASSERT_NE(release_call, std::string::npos);
         ASSERT_NE(madvise_call, std::string::npos);
+        ASSERT_NE(allocator_trim, std::string::npos);
+        EXPECT_LT(residual_release, release_call);
         EXPECT_LT(release_call, madvise_call);
+        EXPECT_LT(madvise_call, allocator_trim);
 
         EXPECT_NE(tensor_contents.find("virtual void releaseMmapHostRegistration()"), std::string::npos);
         EXPECT_NE(tensor_contents.find("if (is_mmap_data())\n                unpinHostMemory();"), std::string::npos);
@@ -2278,62 +2334,74 @@ namespace llaminar2::test
         EXPECT_NE(contents.find("tensor->release_host_weight_data();"), std::string::npos);
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, MmapDontneedIsDeferredUntilAfterFirstPrefill)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PostPrefillHostReclaimIsWorkerOwnedAndAllocationGated)
     {
         const fs::path root = findRepoRoot();
         const fs::path dgo_path = root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
         const fs::path rank_path = root / "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp";
         const fs::path manager_path = root / "src/v2/loaders/WeightManager.cpp";
+        const fs::path runner_path = root / "src/v2/execution/runner/OrchestrationRunner.cpp";
         ASSERT_TRUE(fs::exists(dgo_path)) << dgo_path;
         ASSERT_TRUE(fs::exists(rank_path)) << rank_path;
         ASSERT_TRUE(fs::exists(manager_path)) << manager_path;
+        ASSERT_TRUE(fs::exists(runner_path)) << runner_path;
 
         const std::string dgo_contents = readFile(dgo_path);
         const std::string rank_contents = readFile(rank_path);
         const std::string manager_contents = readFile(manager_path);
+        const std::string runner_contents = readFile(runner_path);
         ASSERT_FALSE(dgo_contents.empty()) << dgo_path;
         ASSERT_FALSE(rank_contents.empty()) << rank_path;
         ASSERT_FALSE(manager_contents.empty()) << manager_path;
+        ASSERT_FALSE(runner_contents.empty()) << runner_path;
 
         const size_t graph_ready_start = dgo_contents.find("void DeviceGraphOrchestrator::onFirstGraphReady()");
         ASSERT_NE(graph_ready_start, std::string::npos);
-        const size_t graph_ready_end = dgo_contents.find("void DeviceGraphOrchestrator::adviseMmapDontneedAfterFirstPrefill()",
+        const size_t graph_ready_end = dgo_contents.find("void DeviceGraphOrchestrator::scheduleMmapReclaimAfterFirstPrefill()",
                                                          graph_ready_start);
         ASSERT_NE(graph_ready_end, std::string::npos);
         const std::string graph_ready_body = dgo_contents.substr(graph_ready_start, graph_ready_end - graph_ready_start);
-        EXPECT_EQ(graph_ready_body.find("adviseMmapDontneed()"), std::string::npos);
+        EXPECT_EQ(graph_ready_body.find("scheduleMmapReclaim()"), std::string::npos);
 
-        const size_t dgo_prefill_start = dgo_contents.find("void DeviceGraphOrchestrator::adviseMmapDontneedAfterFirstPrefill()");
+        const size_t dgo_prefill_start = dgo_contents.find("void DeviceGraphOrchestrator::scheduleMmapReclaimAfterFirstPrefill()");
         ASSERT_NE(dgo_prefill_start, std::string::npos);
-        const size_t dgo_prefill_advise = dgo_contents.find("weight_manager_->adviseMmapDontneed()", dgo_prefill_start);
-        ASSERT_NE(dgo_prefill_advise, std::string::npos);
+        const size_t dgo_prefill_submit = dgo_contents.find("weight_manager_->scheduleMmapReclaim()", dgo_prefill_start);
+        ASSERT_NE(dgo_prefill_submit, std::string::npos);
         const std::string dgo_prefill_body =
-            dgo_contents.substr(dgo_prefill_start, dgo_prefill_advise - dgo_prefill_start);
+            dgo_contents.substr(dgo_prefill_start, dgo_prefill_submit - dgo_prefill_start);
         EXPECT_EQ(dgo_prefill_body.find("synchronizeStream("), std::string::npos);
         EXPECT_EQ(dgo_prefill_body.find("synchronizeDevice("), std::string::npos)
             << "DeviceLoadPipeline completion owns the mmap-source lifetime edge; first prefill must not drain the GPU.";
+        EXPECT_EQ(dgo_prefill_body.find("awaitMmapReclaimBeforeHostAllocation("), std::string::npos)
+            << "Inference publishes reclaim but never crosses the allocation barrier";
+        EXPECT_EQ(dgo_prefill_body.find("releaseHostResidentWeightData("), std::string::npos)
+            << "Residual host weights belong to the reclaim worker, not the inference thread";
+        EXPECT_EQ(dgo_prefill_body.find("malloc_trim("), std::string::npos);
 
-        const size_t rank_release = rank_contents.find("releaseHostResidentWeightData();");
-        const size_t rank_advise = rank_contents.find("wm->adviseMmapDontneed()", rank_release);
-        ASSERT_NE(rank_release, std::string::npos);
-        ASSERT_NE(rank_advise, std::string::npos);
-        EXPECT_LT(rank_release, rank_advise);
-        const std::string rank_release_body =
-            rank_contents.substr(rank_release, rank_advise - rank_release);
-        EXPECT_EQ(rank_release_body.find("synchronizeStream("), std::string::npos);
-        EXPECT_EQ(rank_release_body.find("synchronizeDevice("), std::string::npos)
+        const size_t rank_submit =
+            rank_contents.find("wm->scheduleMmapReclaim()");
+        ASSERT_NE(rank_submit, std::string::npos);
+        const size_t rank_boundary = rank_contents.rfind(
+            "if (!host_resident_released_", rank_submit);
+        ASSERT_NE(rank_boundary, std::string::npos);
+        const std::string rank_submit_body =
+            rank_contents.substr(rank_boundary, rank_submit - rank_boundary);
+        EXPECT_EQ(rank_submit_body.find("releaseHostResidentWeightData("), std::string::npos);
+        EXPECT_EQ(rank_submit_body.find("malloc_trim("), std::string::npos);
+        EXPECT_EQ(rank_submit_body.find("synchronizeStream("), std::string::npos);
+        EXPECT_EQ(rank_submit_body.find("synchronizeDevice("), std::string::npos)
             << "Rank mmap reclamation must rely on completed load pipelines, not a rank-wide GPU drain.";
 
         /*
-         * Releasing host-resident tensors and advising the shared mmap are two
+         * Releasing host-resident tensors and reclaiming the shared mmap are two
          * ordered operations. The broad release skips TensorSlice views, so it
-         * must not issue MADV_DONTNEED before WeightManager::adviseMmapDontneed
+         * must not advise pages before WeightManager's background reclaim worker
          * has unregistered those remaining CUDA/HIP host mappings.
          */
         const size_t manager_release =
             manager_contents.find("size_t WeightManager::releaseHostResidentWeightData()");
         const size_t manager_advise =
-            manager_contents.find("size_t WeightManager::adviseMmapDontneed()", manager_release);
+            manager_contents.find("size_t WeightManager::performMmapReclaim()", manager_release);
         ASSERT_NE(manager_release, std::string::npos);
         ASSERT_NE(manager_advise, std::string::npos);
         const std::string manager_release_body =
@@ -2341,9 +2409,57 @@ namespace llaminar2::test
         EXPECT_EQ(manager_release_body.find("loader_.adviseMmapDontneed();"), std::string::npos)
             << "Host-resident release must not advise mmap pages before the explicit "
                "registration-release phase.";
+        EXPECT_EQ(manager_release_body.find("malloc_trim("), std::string::npos)
+            << "Allocator trimming is worker maintenance, never inline release work";
+
+        const size_t manager_reclaim_end =
+            manager_contents.find("size_t WeightManager::releaseMoEExpertHostWeightData()", manager_advise);
+        ASSERT_NE(manager_reclaim_end, std::string::npos);
+        const std::string manager_reclaim_body =
+            manager_contents.substr(manager_advise, manager_reclaim_end - manager_advise);
+        const size_t worker_release =
+            manager_reclaim_body.find("releaseHostResidentWeightData()");
+        const size_t worker_advise =
+            manager_reclaim_body.find("loader_.adviseMmapDontneed()");
+        const size_t worker_trim = manager_reclaim_body.find("::malloc_trim(0)");
+        ASSERT_NE(worker_release, std::string::npos);
+        ASSERT_NE(worker_advise, std::string::npos);
+        ASSERT_NE(worker_trim, std::string::npos);
+        EXPECT_LT(worker_release, worker_advise);
+        EXPECT_LT(worker_advise, worker_trim);
+
+        const size_t initialize_start =
+            runner_contents.find("bool OrchestrationRunner::initialize()");
+        const size_t initialize_end =
+            runner_contents.find("bool OrchestrationRunner::initializeForDryRun()", initialize_start);
+        ASSERT_NE(initialize_start, std::string::npos);
+        ASSERT_NE(initialize_end, std::string::npos);
+        const std::string initialize_body =
+            runner_contents.substr(initialize_start, initialize_end - initialize_start);
+        const size_t load_phase = initialize_body.find("\"loadWeights\"");
+        const size_t reclaim_barrier = initialize_body.find(
+            "\"awaitMmapReclaimBeforeRuntimeAllocation\"");
+        const size_t memory_plan = initialize_body.find("\"validateMemoryPlan\"");
+        ASSERT_NE(load_phase, std::string::npos);
+        ASSERT_NE(reclaim_barrier, std::string::npos);
+        ASSERT_NE(memory_plan, std::string::npos);
+        EXPECT_LT(load_phase, reclaim_barrier);
+        EXPECT_LT(reclaim_barrier, memory_plan);
+
+        const size_t clear_start =
+            runner_contents.find("void OrchestrationRunner::clearCache()");
+        const size_t clear_end =
+            runner_contents.find("bool OrchestrationRunner::purgePrefixCache()", clear_start);
+        ASSERT_NE(clear_start, std::string::npos);
+        ASSERT_NE(clear_end, std::string::npos);
+        EXPECT_EQ(
+            runner_contents.substr(clear_start, clear_end - clear_start)
+                .find("malloc_trim("),
+            std::string::npos)
+            << "Request reset must never perform process-wide allocator maintenance";
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DGOHostReleaseFollowsIntegratedMTPPrefillProducer)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DGOHostReclaimSubmissionFollowsIntegratedMTPPrefillProducer)
     {
         const fs::path root = findRepoRoot();
         const fs::path dgo_path = root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
@@ -2361,7 +2477,7 @@ namespace llaminar2::test
 
         const size_t forward_mtp = forward_body.find("bindShiftedMTPPrefillTransaction(");
         const size_t forward_terminal = forward_body.find("noteMainForwardHiddenProducedForMTP(");
-        const size_t forward_release = forward_body.find("releaseHostResidentWeightData();");
+        const size_t forward_release = forward_body.find("scheduleMmapReclaimAfterFirstPrefill();");
         ASSERT_NE(forward_mtp, std::string::npos);
         ASSERT_NE(forward_terminal, std::string::npos);
         ASSERT_NE(forward_release, std::string::npos);
@@ -2378,7 +2494,7 @@ namespace llaminar2::test
         const size_t chunk_mtp = chunk_body.find("bindShiftedMTPPrefillTransaction(");
         const size_t chunk_terminal =
             chunk_body.find("noteMainForwardHiddenProducedForMTP(");
-        const size_t chunk_release = chunk_body.find("releaseHostResidentWeightData();");
+        const size_t chunk_release = chunk_body.find("scheduleMmapReclaimAfterFirstPrefill();");
         ASSERT_NE(chunk_mtp, std::string::npos);
         ASSERT_NE(chunk_terminal, std::string::npos);
         ASSERT_NE(chunk_release, std::string::npos);
@@ -3566,8 +3682,11 @@ namespace llaminar2::test
         const fs::path canonical_path =
             parity_dir /
             "Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp";
+        const fs::path definitions_path =
+            parity_dir / "Qwen35MoEModelParityDefinitions.h";
         const fs::path cmake_path = root / "tests/v2/CMakeLists.txt";
         ASSERT_TRUE(fs::exists(canonical_path)) << canonical_path;
+        ASSERT_TRUE(fs::exists(definitions_path)) << definitions_path;
         ASSERT_TRUE(fs::exists(cmake_path)) << cmake_path;
 
         for (const char *obsolete : {
@@ -3581,8 +3700,10 @@ namespace llaminar2::test
         }
 
         const std::string canonical = readFile(canonical_path);
+        const std::string definitions = readFile(definitions_path);
         const std::string cmake = readFile(cmake_path);
         ASSERT_FALSE(canonical.empty()) << canonical_path;
+        ASSERT_FALSE(definitions.empty()) << definitions_path;
         ASSERT_FALSE(cmake.empty()) << cmake_path;
         EXPECT_EQ(canonical.find("TopologySmoke"), std::string::npos)
             << "Production ExpertOverlay parity must not admit plan-only topology tests";
@@ -3593,11 +3714,19 @@ namespace llaminar2::test
             std::string::npos)
             << "Every production cell must prove compact tier traffic through PerfStats";
         EXPECT_NE(
-            canonical.find("ProductionParity_CUDA_ROCm_CPU"),
-            std::string::npos);
-        EXPECT_NE(canonical.find("ProductionParity_CUDA_CPU"), std::string::npos);
-        EXPECT_NE(canonical.find("ProductionParity_ROCm_CPU"), std::string::npos);
-        EXPECT_NE(canonical.find("ProductionParity_CUDA_ROCm"), std::string::npos);
+            canonical.find("qwen35MoE35BOverlayTopologySpecs()"),
+            std::string::npos)
+            << "The fixture must expand the central typed 35B topology declarations";
+        for (const char *topology_id : {
+                 "CUDA1_ROCm1_CPU2_2xMPI_NodeExpertOverlay",
+                 "CUDA1_CPU2_2xMPI_NodeExpertOverlay",
+                 "ROCm1_CPU2_2xMPI_NodeExpertOverlay",
+                 "CUDA1_ROCm1_2xMPI_NodeExpertOverlay",
+             })
+        {
+            EXPECT_NE(definitions.find(topology_id), std::string::npos)
+                << "Missing typed 35B topology: " << topology_id;
+        }
 
         for (const char *obsolete_target : {
                  "v2_integration_parity_qwen35moe_expert_overlay",
@@ -3611,9 +3740,10 @@ namespace llaminar2::test
         }
         EXPECT_NE(
             cmake.find(
-                "PRODUCTION_PERF_STATS_FILTER \"forward_graph,moe_overlay,"),
+                "PRODUCTION_PERF_STATS_FILTER \"forward_graph,moe_placement,moe_overlay,"),
             std::string::npos)
-            << "The real campaign must retain sparse transport PerfStats evidence";
+            << "The real campaign must retain physical placement and sparse "
+               "transport evidence";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ParityCellsRequireExplicitDynamicMode)
@@ -3638,6 +3768,255 @@ namespace llaminar2::test
             << "Dense and static parity cells must not inherit the production "
                "Dynamic-MoE default; a cell may exercise maintenance only by "
                "declaring Dynamic mode explicitly.";
+    }
+
+    /**
+     * @brief Keep test-control collectives off the retained production context.
+     *
+     * A 122B campaign reuses prepared model state across adjacent generated
+     * cells. If evidence barriers share that stable MPI communicator, one fast
+     * rank can enter the next runner's initialization collective while a peer
+     * is still in prior-cell teardown. The fixture must therefore own a typed
+     * per-cell control communicator and route every in-cell test collective
+     * through it; only process/suite lifecycle and fatal abort retain WORLD.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         ProductionParitySeparatesCellControlFromRetainedMPIState)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path base_path =
+            root / "tests/v2/integration/parity/ParityTestBase.h";
+        const fs::path lifecycle_path =
+            root / "tests/v2/integration/parity/ParityCellLifecycle.h";
+        const fs::path qwen122_path =
+            root / "tests/v2/integration/parity/qwen35moe/"
+                   "Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp";
+        ASSERT_TRUE(fs::exists(base_path)) << base_path;
+        ASSERT_TRUE(fs::exists(lifecycle_path)) << lifecycle_path;
+        ASSERT_TRUE(fs::exists(qwen122_path)) << qwen122_path;
+
+        const std::string base = readFile(base_path);
+        const std::string lifecycle = readFile(lifecycle_path);
+        const std::string qwen122 = readFile(qwen122_path);
+        ASSERT_FALSE(base.empty());
+        ASSERT_FALSE(lifecycle.empty());
+        ASSERT_FALSE(qwen122.empty());
+
+        for (const char *contract : {
+                 "class ParityCellMPIChannel final",
+                 "class ParityCellLifecycle final",
+                 "struct ActiveChannels final",
+                 "void enter(MPI_Comm source)",
+                 "void teardownBarrier() const",
+                 "void retire()",
+             })
+        {
+            EXPECT_NE(lifecycle.find(contract), std::string::npos)
+                << "Missing typed parity lifecycle contract: " << contract;
+        }
+        for (const char *contract : {
+                 "#include \"integration/parity/ParityCellLifecycle.h\"",
+                 "ParityCellLifecycle parity_cell_lifecycle_;",
+                 "void enterParityCellLifecycle()",
+                 "void retireParityCellLifecycle()",
+                 "void parityLifecycleBarrier()",
+                 "parityCoordinationMPIContext()->allreduce_sum",
+             })
+        {
+            EXPECT_NE(base.find(contract), std::string::npos)
+                << "Missing typed parity-control contract: " << contract;
+        }
+        EXPECT_EQ(
+            base.find("\n                mpi_ctx_->barrier();"),
+            std::string::npos)
+            << "Parity barriers must use the isolated control context.";
+        EXPECT_NE(
+            base.find(
+                "profileParityScope(\"tear_down.initial_barrier\");\n"
+                "                parityLifecycleBarrier();"),
+            std::string::npos)
+            << "Teardown entry must use the lifecycle-only channel.";
+        EXPECT_NE(
+            base.find(
+                "profileParityScope(\"tear_down.final_barrier\");\n"
+                "                parityLifecycleBarrier();"),
+            std::string::npos)
+            << "Teardown exit must use the lifecycle-only channel.";
+        EXPECT_EQ(
+            countOccurrences(base, "enterParityCellLifecycle();"),
+            1u)
+            << "Only the common parity SetUp may enter the cell lifecycle.";
+        EXPECT_EQ(
+            countOccurrences(base, "retireParityCellLifecycle();"),
+            1u)
+            << "Only the common parity TearDown may retire the cell lifecycle.";
+
+        const size_t evidence_begin =
+            qwen122.find("bool broadcastRootFlag(bool root_value) const");
+        const size_t fatal_abort =
+            qwen122.find("[[noreturn]] void abortGraphNativeWorld", evidence_begin);
+        ASSERT_NE(evidence_begin, std::string::npos);
+        ASSERT_NE(fatal_abort, std::string::npos);
+        const std::string evidence_region = qwen122.substr(
+            evidence_begin, fatal_abort - evidence_begin);
+        EXPECT_EQ(evidence_region.find("MPI_COMM_WORLD"), std::string::npos)
+            << "Cell evidence must not share the retained production communicator.";
+
+        const size_t production_body = qwen122.find(
+            "void runGraphNativeProductionParityBody()");
+        const size_t fixture_members =
+            qwen122.find("std::shared_ptr<MoERoutedExpertPlacementPlan>", production_body);
+        ASSERT_NE(production_body, std::string::npos);
+        ASSERT_NE(fixture_members, std::string::npos);
+        const std::string production_region = qwen122.substr(
+            production_body, fixture_members - production_body);
+        EXPECT_EQ(production_region.find("MPI_COMM_WORLD"), std::string::npos)
+            << "The test-side worker-loop rendezvous belongs to cell control.";
+
+        EXPECT_EQ(
+            qwen122.find("enterParityCellLifecycle"),
+            std::string::npos)
+            << "A model/topology fixture must not own the common cell lifecycle.";
+        EXPECT_EQ(
+            qwen122.find("retireParityCellLifecycle"),
+            std::string::npos)
+            << "A model/topology fixture must not own the common cell lifecycle.";
+
+        const fs::path runner_path =
+            root / "src/v2/execution/runner/OrchestrationRunner.cpp";
+        ASSERT_TRUE(fs::exists(runner_path)) << runner_path;
+        const std::string runner = readFile(runner_path);
+        EXPECT_EQ(
+            runner.find("reusable_workspace_bytes == 0u"),
+            std::string::npos)
+            << "A weights-only ExpertOverlay participant is a complete model "
+               "retention owner.";
+        EXPECT_NE(
+            qwen122.find(
+                "contract.reuse_authority->state() !=\n"
+                "            ModelContextReuseAuthority::State::Reusable"),
+            std::string::npos)
+            << "The cache must authenticate lifecycle state before rank-wide "
+               "fresh-versus-reuse admission.";
+    }
+
+    /**
+     * @brief Keep heterogeneous graph certification tied to production state.
+     *
+     * PerfStats may expose the plan and completed replay, but neither parity nor
+     * telemetry may manufacture those facts. The coordinator must receive one
+     * immutable plan sealed after synchronized materialization and may publish
+     * replay evidence only after every exact follower slot retires.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         HeterogeneousCoordinatorCertificationMirrorsTypedTransactionPlan)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path header_path =
+            root / "src/v2/execution/moe/"
+                   "MoEOverlayInferenceTransactionService.h";
+        const fs::path service_path =
+            root / "src/v2/execution/moe/"
+                   "MoEOverlayInferenceTransactionService.cpp";
+        const fs::path runner_path =
+            root / "src/v2/execution/runner/OrchestrationRunner.cpp";
+        ASSERT_TRUE(fs::exists(header_path)) << header_path;
+        ASSERT_TRUE(fs::exists(service_path)) << service_path;
+        ASSERT_TRUE(fs::exists(runner_path)) << runner_path;
+
+        const std::string header = readFile(header_path);
+        const std::string service = readFile(service_path);
+        const std::string runner = readFile(runner_path);
+        for (const char *contract : {
+                 "class MoEOverlayInferenceCoordinatorGraphPlan final",
+                 "sealAfterSynchronizedMaterialization(",
+                 "MoEOverlayInferenceCoordinatorGraphPlan\n                graph_plan",
+                 "graphPlan() const noexcept",
+             })
+        {
+            EXPECT_NE(header.find(contract), std::string::npos)
+                << "Missing typed coordinator graph contract: " << contract;
+        }
+
+        const size_t materialization_enum = header.find(
+            "enum class MoEOverlayInferenceSegmentMaterializationKind");
+        const size_t materialization_enum_end =
+            header.find("};", materialization_enum);
+        ASSERT_NE(materialization_enum, std::string::npos);
+        ASSERT_NE(materialization_enum_end, std::string::npos);
+        EXPECT_EQ(
+            header.substr(
+                      materialization_enum,
+                      materialization_enum_end - materialization_enum)
+                .find("Unresolved"),
+            std::string::npos)
+            << "Only synchronized, sealed materialization may enter the plan.";
+        EXPECT_NE(
+            runner.find(
+                "sealAfterSynchronizedMaterialization(\n"
+                "                            graph_family.graph_family_generation"),
+            std::string::npos)
+            << "The production runner must bind the exact retained graph generation.";
+        EXPECT_NE(
+            runner.find(".graph_plan = std::move(coordinator_graph_plan)"),
+            std::string::npos);
+
+        const size_t retirement = service.find(
+            "retireCompletedGraphSequenceLocked(std::string *error)");
+        const size_t source_slot_retirement = service.find(
+            "config_.publishers[target]->retire(", retirement);
+        const size_t replay_evidence = service.find(
+            "\"segmented_replay_segments\"", retirement);
+        const size_t reset = service.find(
+            "resetGraphSequenceLocked();", replay_evidence);
+        ASSERT_NE(retirement, std::string::npos);
+        ASSERT_NE(source_slot_retirement, std::string::npos);
+        ASSERT_NE(replay_evidence, std::string::npos);
+        ASSERT_NE(reset, std::string::npos);
+        EXPECT_LT(source_slot_retirement, replay_evidence)
+            << "Submission is not proof that a remote sparse return completed.";
+        EXPECT_LT(replay_evidence, reset)
+            << "Replay evidence must retain the exact typed plan identity.";
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         InitiallyEmptyOverlayParticipantsRetainCapturedTopology)
+    {
+        const fs::path runner_path =
+            findRepoRoot() /
+            "src/v2/execution/moe/MoEOverlayParticipantGraphRunner.cpp";
+        const fs::path qwen_graph_path =
+            findRepoRoot() / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+        ASSERT_TRUE(fs::exists(runner_path)) << runner_path;
+        ASSERT_TRUE(fs::exists(qwen_graph_path)) << qwen_graph_path;
+
+        const std::string runner = readFile(runner_path);
+        const std::string qwen_graph = readFile(qwen_graph_path);
+        ASSERT_FALSE(runner.empty()) << runner_path;
+        ASSERT_FALSE(qwen_graph.empty()) << qwen_graph_path;
+        EXPECT_EQ(
+            runner.find(
+                "MoE overlay participant owns no routed-expert weight requirements"),
+            std::string::npos)
+            << "Initial residency must not decide whether a declared endpoint "
+               "gets a retained participant graph";
+        EXPECT_EQ(
+            runner.find("if (!owns_selected_expert)"),
+            std::string::npos)
+            << "An initially empty endpoint still needs its setup-owned compact "
+               "arena before later migration makes it live";
+        EXPECT_NE(
+            runner.find("Every declared local\n     * endpoint produces exactly one arena"),
+            std::string::npos)
+            << "Keep the empty-endpoint topology invariant documented at the "
+               "allocation boundary";
+        EXPECT_NE(
+            qwen_graph.find(
+                "if (hasActiveExpertMask(local_params.expert_mask) &&\n"
+                "                            !MoELocalExpertStage::prepareExpertGemmEngines("),
+            std::string::npos)
+            << "The continuation graph must retain a mapped endpoint whose "
+               "initial residency mask is empty";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
@@ -7214,6 +7593,8 @@ namespace llaminar2::test
         const fs::path root = findRepoRoot();
         const fs::path controller_path =
             root / "src/v2/execution/moe/DeviceMoERebalanceController.h";
+        const fs::path policy_path =
+            root / "src/v2/execution/moe/DeviceMoERebalancePolicyShared.h";
         const fs::path cuda_path =
             root / "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu";
         const fs::path rocm_path =
@@ -7221,11 +7602,13 @@ namespace llaminar2::test
         const fs::path orchestrator_path =
             root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
         ASSERT_TRUE(fs::exists(controller_path)) << controller_path;
+        ASSERT_TRUE(fs::exists(policy_path)) << policy_path;
         ASSERT_TRUE(fs::exists(cuda_path)) << cuda_path;
         ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
         ASSERT_TRUE(fs::exists(orchestrator_path)) << orchestrator_path;
 
         const std::string controller = readFile(controller_path);
+        const std::string policy = readFile(policy_path);
         const std::string cuda = readFile(cuda_path);
         const std::string rocm = readFile(rocm_path);
         const std::string orchestrator = readFile(orchestrator_path);
@@ -7235,6 +7618,9 @@ namespace llaminar2::test
         EXPECT_NE(controller.find("plan_overflow is"),
                   std::string::npos)
             << "The status contract must document that true command overflow remains fatal";
+        EXPECT_NE(policy.find("enum class DynamicPlanAdmission"),
+                  std::string::npos)
+            << "Dynamic command admission must expose typed backpressure and corruption outcomes";
         for (const auto &[backend, source] :
              std::array<std::pair<const char *, const std::string *>, 2>{
                  std::pair{"CUDA", &cuda},
@@ -7246,6 +7632,12 @@ namespace llaminar2::test
             EXPECT_NE(source->find("++status->plan_overflow;"),
                       std::string::npos)
                 << backend << " must retain fatal accounting for true command-buffer overflow";
+            EXPECT_NE(source->find("dynamicPlanAdmission("),
+                      std::string::npos)
+                << backend << " must classify the configured wave limit before physical overflow";
+            EXPECT_EQ(source->find("command_count + 2u > plan_capacity"),
+                      std::string::npos)
+                << backend << " must not confuse an exactly-full configured Dynamic wave with corruption";
         }
         EXPECT_NE(orchestrator.find(
                       "\"device_rebalance_capacity_limited_candidates\""),
@@ -7733,8 +8125,12 @@ namespace llaminar2::test
             << "Each path uses total slots for both config addressability and directory allocation";
 
         EXPECT_NE(
-            abi.find("kVersion = 11u"),
+            abi.find("kVersion = 12u"),
             std::string::npos);
+        EXPECT_NE(
+            abi.find("kPlanEntryBytes = 52u"),
+            std::string::npos)
+            << "The ABI version bump must pin the expanded cross-domain route identity record.";
         EXPECT_NE(
             abi.find("kConfigBytes = 140u"),
             std::string::npos);
@@ -8732,7 +9128,8 @@ namespace llaminar2::test
         for (const char *stage_declaration : kStageLocalMoEKernelOwners)
         {
             const std::string stage_region =
-                classDeclarationRegion(expert_header, stage_declaration);
+                braceBalancedDeclarationRegion(
+                    expert_header, stage_declaration);
             ASSERT_FALSE(stage_region.empty()) << stage_declaration;
             EXPECT_EQ(
                 countOccurrences(
@@ -8839,7 +9236,8 @@ namespace llaminar2::test
                "route retention into decode-equivalent top-k publication.";
         EXPECT_NE(
             router_stage_source.find(
-                "params_.defer_overlay_grouped_verifier_histogram_publication\n"
+                "params_.grouped_verifier_histogram_role ==\n"
+                "                            MoEGroupedVerifierHistogramRole::DeferredAcceptedRows\n"
                 "                        ? moe_runtime_layer_"),
             std::string::npos)
             << "Only an explicitly typed overlay router may publish its "
@@ -10033,6 +10431,492 @@ namespace llaminar2::test
             << "CUDA admission must derive the claimed resource count before probing.";
         EXPECT_LT(requirement_scan, rocm_probe)
             << "ROCm admission must derive the claimed resource count before probing.";
+    }
+
+    /**
+     * @brief Keep composition reset distinct from terminal context sealing.
+     *
+     * Initialization legitimately drains empty or partially composed services,
+     * but it must never publish a reusable-context seal. Doing so before the
+     * residency authority exists leaves loader-era expert bindings pointing at
+     * physical slots that a later movement wave may recycle.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         ExpertOverlayInitializationCannotSealReusableModelContext)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path runner_path =
+            root / "src/v2/execution/runner/OrchestrationRunner.cpp";
+        ASSERT_TRUE(fs::exists(runner_path)) << runner_path;
+        const std::string runner = readFile(runner_path);
+        ASSERT_FALSE(runner.empty());
+
+        const std::array<std::string, 2> initialization_regions{
+            braceBalancedDeclarationRegion(
+                runner,
+                "bool OrchestrationRunner::initializeMoEExpertOverlayResidencyAuthority()"),
+            braceBalancedDeclarationRegion(
+                runner,
+                "bool OrchestrationRunner::\n        initializeMoEExpertOverlayResidencyMaintenance()"),
+        };
+        for (const auto &region : initialization_regions)
+        {
+            ASSERT_FALSE(region.empty());
+            EXPECT_NE(
+                region.find(
+                    "MoEOverlayMaintenanceDrainIntent::ResetComposition"),
+                std::string::npos)
+                << "ExpertOverlay initialization must perform only a composition reset";
+            EXPECT_EQ(
+                region.find(
+                    "MoEOverlayMaintenanceDrainIntent::TerminalContextSeal"),
+                std::string::npos)
+                << "Initialization cannot claim the terminal prepared-context seal";
+        }
+
+        const std::string shutdown = braceBalancedDeclarationRegion(
+            runner,
+            "void OrchestrationRunner::\n        shutdownMoEExpertOverlayResidencyMaintenance(");
+        ASSERT_FALSE(shutdown.empty());
+        EXPECT_NE(
+            shutdown.find(
+                "intent ==\n            MoEOverlayMaintenanceDrainIntent::TerminalContextSeal"),
+            std::string::npos)
+            << "Physical restoration must remain guarded by the typed terminal intent";
+        EXPECT_NE(
+            shutdown.find("sealReusableModelContextPhysicalState"),
+            std::string::npos);
+    }
+
+    /**
+     * @brief Keep typed movement evidence alive after terminal resource drain.
+     *
+     * MPI command shutdown is deliberately earlier than runner destruction so
+     * callers can inspect terminal correctness evidence. The device service
+     * must therefore finish its collective drain, retain the complete ledger,
+     * and only then release the worker; the runner must copy that snapshot
+     * before destroying the shorter-lived service object.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         TerminalDrainRetainsDeviceMovementLedgerForRunnerLifetime)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path runner_path =
+            root / "src/v2/execution/runner/OrchestrationRunner.cpp";
+        const fs::path service_path =
+            root /
+            "src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp";
+        ASSERT_TRUE(fs::exists(runner_path)) << runner_path;
+        ASSERT_TRUE(fs::exists(service_path)) << service_path;
+
+        const std::string runner = readFile(runner_path);
+        const std::string service = readFile(service_path);
+        ASSERT_FALSE(runner.empty());
+        ASSERT_FALSE(service.empty());
+
+        const std::string shutdown = braceBalancedDeclarationRegion(
+            runner,
+            "void OrchestrationRunner::\n        shutdownMoEExpertOverlayResidencyMaintenance(");
+        ASSERT_FALSE(shutdown.empty());
+        const size_t drain = shutdown.find("->stopAndDrain()");
+        const size_t retain = shutdown.find(
+            "terminal_moe_optimization_movement_ledger_",
+            drain);
+        const size_t destroy = shutdown.find(
+            "moe_overlay_device_controller_graph_service_.reset()");
+        ASSERT_NE(drain, std::string::npos);
+        ASSERT_NE(retain, std::string::npos);
+        ASSERT_NE(destroy, std::string::npos);
+        EXPECT_LT(drain, retain);
+        EXPECT_LT(retain, destroy)
+            << "Runner destruction cannot erase terminal device movement evidence";
+
+        const std::string service_drain = braceBalancedDeclarationRegion(
+            service,
+            "void MoEOverlayDeviceControllerGraphService::stopAndDrain() noexcept");
+        ASSERT_FALSE(service_drain.empty());
+        const size_t service_retain = service_drain.find(
+            "terminal_movement_ledger_");
+        const size_t worker_release =
+            service_drain.find("dynamic_worker_.reset()");
+        ASSERT_NE(service_retain, std::string::npos);
+        ASSERT_NE(worker_release, std::string::npos);
+        EXPECT_LT(service_retain, worker_release)
+            << "The complete worker ledger must survive its resource owner";
+
+        const std::string ledger_getter = braceBalancedDeclarationRegion(
+            runner,
+            "OrchestrationRunner::moeOptimizationMovementLedger() const");
+        ASSERT_FALSE(ledger_getter.empty());
+        EXPECT_NE(
+            ledger_getter.find(
+                "terminal_moe_optimization_movement_ledger_"),
+            std::string::npos)
+            << "Post-drain callers must receive runner-lifetime typed evidence";
+    }
+
+    /**
+     * @brief Keep PerfStats observational throughout production and parity setup.
+     *
+     * Instrumentation may prove what happened after a transaction, but it may
+     * not decide whether certification, movement, or publication is complete.
+     * Production therefore has no counter-ledger readers outside result
+     * serialization, while parity lifecycle drivers consume the typed status
+     * projected by the sole ExpertOverlay authority.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         PerfStatsNeverOwnsOptimizationLifecycleProgress)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path exact_parity_path =
+            root /
+            "tests/v2/integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp";
+        const fs::path node_tp_parity_path =
+            root /
+            "tests/v2/integration/parity/qwen35moe/Test__Qwen35MoE_NodeTP_Parity.cpp";
+        ASSERT_TRUE(fs::exists(exact_parity_path)) << exact_parity_path;
+        ASSERT_TRUE(fs::exists(node_tp_parity_path)) << node_tp_parity_path;
+
+        const std::string exact_parity = readFile(exact_parity_path);
+        const std::string node_tp_parity = readFile(node_tp_parity_path);
+        ASSERT_FALSE(exact_parity.empty());
+        ASSERT_FALSE(node_tp_parity.empty());
+
+        const std::array<std::string, 3> lifecycle_drivers{
+            braceBalancedDeclarationRegion(
+                exact_parity,
+                "bool certifyDynamicResidencyEconomy()"),
+            braceBalancedDeclarationRegion(
+                exact_parity,
+                "bool driveDynamicResidencyToDistributedMigration()"),
+            braceBalancedDeclarationRegion(
+                node_tp_parity,
+                "bool driveDynamicEconomyAndMovement()"),
+        };
+        for (const auto &driver : lifecycle_drivers)
+        {
+            ASSERT_FALSE(driver.empty());
+            EXPECT_EQ(
+                driver.find("localResidencyCounter"),
+                std::string::npos);
+            EXPECT_EQ(driver.find("residencyCounter("), std::string::npos);
+            EXPECT_EQ(driver.find("controllerCounter("), std::string::npos);
+            EXPECT_EQ(
+                driver.find("movementDirectionCount("),
+                std::string::npos)
+                << "PerfStats may be rendered after failure, but counter "
+                   "interpretation cannot control lifecycle progress";
+            EXPECT_NE(driver.find("optimizationStatus()"), std::string::npos)
+                << "Lifecycle progress must come from the typed production owner";
+        }
+
+        const std::string promotion_attribution =
+            braceBalancedDeclarationRegion(
+                exact_parity,
+                "void cacheCommittedPromotionEvidence()");
+        ASSERT_FALSE(promotion_attribution.empty());
+        EXPECT_NE(
+            promotion_attribution.find(
+                "moeOptimizationMovementLedger()"),
+            std::string::npos)
+            << "Numerical moved-expert witnesses must come from the typed "
+               "movement authority";
+        EXPECT_EQ(
+            promotion_attribution.find("PerfStatsCollector"),
+            std::string::npos)
+            << "Telemetry tags cannot select which expert receives a "
+               "numerical correctness check";
+
+        const std::string movement_csv = braceBalancedDeclarationRegion(
+            exact_parity,
+            "void writeCommittedMovementEvidenceCsv() const");
+        ASSERT_FALSE(movement_csv.empty());
+        EXPECT_NE(
+            movement_csv.find("moeOptimizationMovementLedger()"),
+            std::string::npos);
+        EXPECT_EQ(
+            movement_csv.find("PerfStatsCollector::snapshot"),
+            std::string::npos)
+            << "The canonical movement CSV must serialize typed authority "
+               "state, not parse optional telemetry";
+
+        const std::string production_setup =
+            braceBalancedDeclarationRegion(exact_parity, "bool setupPipeline()");
+        ASSERT_FALSE(production_setup.empty());
+        EXPECT_NE(
+            production_setup.find("modelContextReuseStatus()"),
+            std::string::npos)
+            << "Prepared-model reuse validity needs a typed lifecycle proof";
+        EXPECT_EQ(
+            production_setup.find(
+                "preloaded_prepared_weight_store_reuses"),
+            std::string::npos)
+            << "A PerfStats counter cannot certify prepared-weight reuse";
+
+        const fs::path benchmark_path =
+            root / "src/v2/utils/BenchmarkRunner.cpp";
+        const fs::path adapter_path =
+            root / "src/v2/app/InferenceRunnerAdapter.cpp";
+        ASSERT_TRUE(fs::exists(benchmark_path)) << benchmark_path;
+        ASSERT_TRUE(fs::exists(adapter_path)) << adapter_path;
+        const std::string benchmark = readFile(benchmark_path);
+        const std::string movement_snapshot = braceBalancedDeclarationRegion(
+            benchmark,
+            "completedDynamicMovementSnapshot(const IInferenceRunner *runner)");
+        ASSERT_FALSE(movement_snapshot.empty());
+        EXPECT_NE(
+            movement_snapshot.find("moeOptimizationStatus()"),
+            std::string::npos)
+            << "Benchmark movement attribution must query the real runtime owner";
+        EXPECT_EQ(
+            movement_snapshot.find("PerfStatsCollector"),
+            std::string::npos)
+            << "Optional telemetry cannot own benchmark movement facts";
+
+        const std::string adapter = readFile(adapter_path);
+        const std::string adapter_status = braceBalancedDeclarationRegion(
+            adapter,
+            "InferenceRunnerAdapter::moeOptimizationStatus() const");
+        ASSERT_FALSE(adapter_status.empty());
+        EXPECT_NE(
+            adapter_status.find("orch_runner_->moeOptimizationStatus()"),
+            std::string::npos)
+            << "The public inference surface must preserve optimization authority";
+
+        const fs::path source_root = root / "src/v2";
+        for (const auto &entry : fs::recursive_directory_iterator(source_root))
+        {
+            if (!entry.is_regular_file())
+                continue;
+            const auto extension = entry.path().extension();
+            if (extension != ".cpp" && extension != ".h" &&
+                extension != ".hpp")
+            {
+                continue;
+            }
+            const std::string contents = readFile(entry.path());
+            if (contents.find("PerfStatsCollector::snapshot") ==
+                std::string::npos)
+            {
+                continue;
+            }
+            const auto relative = fs::relative(entry.path(), root);
+            EXPECT_TRUE(
+                relative == "src/v2/utils/BenchmarkRunner.cpp" ||
+                relative == "src/v2/utils/PerfStatsCollector.cpp")
+                << relative
+                << " reads the PerfStats ledger inside production code; use "
+                   "typed owner state instead";
+        }
+    }
+
+    /**
+     * @brief Keep floating ExpertOverlay movement symmetric and lifecycle-complete.
+     *
+     * CPU exercises repeated RCU publication, shadow-slot reuse, and terminal
+     * reusable-context sealing for every source format; each GPU backend proves
+     * CPU promotion/demotion through its exact persistent lane; and the
+     * heterogeneous gate proves retained CUDA->ROCm and ROCm->CUDA
+     * relay/endpoints. Every floating expert format must remain in all three
+     * layers of coverage so a quantized-only fix cannot silently narrow
+     * production.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         ExpertOverlayFloatingMovementCoverageIsBackendSymmetric)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path cpu_test_path =
+            root /
+            "tests/v2/unit/execution/moe/Test__MoEOverlayPhysicalResidencyFabric.cpp";
+        const fs::path gpu_test_path =
+            root /
+            "tests/v2/integration/moe/Test__ExpertTierGpuBlobTransferIntegration.cpp";
+        const fs::path cuda_lane_test_path =
+            root /
+            "tests/v2/integration/kernels/cuda/Test__CUDAExpertTierWeightKernels.cpp";
+        const fs::path rocm_lane_test_path =
+            root /
+            "tests/v2/integration/kernels/rocm/Test__ROCmExpertTierWeightKernels.cpp";
+        const fs::path cmake_path = root / "tests/v2/CMakeLists.txt";
+        ASSERT_TRUE(fs::exists(cpu_test_path)) << cpu_test_path;
+        ASSERT_TRUE(fs::exists(gpu_test_path)) << gpu_test_path;
+        ASSERT_TRUE(fs::exists(cuda_lane_test_path)) << cuda_lane_test_path;
+        ASSERT_TRUE(fs::exists(rocm_lane_test_path)) << rocm_lane_test_path;
+        ASSERT_TRUE(fs::exists(cmake_path)) << cmake_path;
+
+        const std::string cpu_test = readFile(cpu_test_path);
+        const std::string gpu_test = readFile(gpu_test_path);
+        const std::string cuda_lane_test = readFile(cuda_lane_test_path);
+        const std::string rocm_lane_test = readFile(rocm_lane_test_path);
+        const std::string cmake = readFile(cmake_path);
+        EXPECT_NE(
+            cpu_test.find(
+                "SingleShadowSlotSustainsRepeatedByteExactCpuRebalancingAndReusableSealingForEveryWeightFormat"),
+            std::string::npos);
+        EXPECT_NE(
+            cpu_test.find("sealReusableInitialPlacement"),
+            std::string::npos);
+        EXPECT_NE(
+            gpu_test.find(
+                "FloatingProjectionRelayCoversAllPrecisionsAndBothDirections"),
+            std::string::npos);
+        EXPECT_NE(
+            gpu_test.find(
+                "RemoteEndpointsPreserveEveryFloatingPrecisionBothDirections"),
+            std::string::npos);
+
+        for (const char *type : {
+                 "TensorType::FP16",
+                 "TensorType::BF16",
+                 "TensorType::FP32",
+             })
+        {
+            EXPECT_NE(cpu_test.find(type), std::string::npos) << type;
+            EXPECT_NE(gpu_test.find(type), std::string::npos) << type;
+            EXPECT_NE(cuda_lane_test.find(type), std::string::npos) << type;
+            EXPECT_NE(rocm_lane_test.find(type), std::string::npos) << type;
+        }
+        EXPECT_NE(
+            cuda_lane_test.find(
+                "ContiguousFloatingLaneRoundTripsAllPrecisionsWithoutInferenceWaits"),
+            std::string::npos);
+        EXPECT_NE(
+            rocm_lane_test.find(
+                "ContiguousFloatingLaneRoundTripsAllPrecisionsWithoutInferenceWaits"),
+            std::string::npos);
+        EXPECT_GE(
+            countOccurrences(
+                gpu_test,
+                "DeviceId::cuda(0), DeviceId::rocm(0)"),
+            2u)
+            << "Floating relay and remote endpoint coverage need CUDA->ROCm";
+        EXPECT_GE(
+            countOccurrences(
+                gpu_test,
+                "DeviceId::rocm(0), DeviceId::cuda(0)"),
+            2u)
+            << "Floating relay and remote endpoint coverage need ROCm->CUDA";
+        EXPECT_NE(
+            cmake.find("V2_Integration_HeterogeneousGPUExpertBlobTransfer"),
+            std::string::npos)
+            << "Real-device floating movement must remain in a registered gate";
+        EXPECT_NE(
+            cmake.find("V2_Integration_CUDA_ExpertTierWeightKernels"),
+            std::string::npos);
+        EXPECT_NE(
+            cmake.find("V2_Integration_ROCm_ExpertTierWeightKernels"),
+            std::string::npos);
+    }
+
+    /**
+     * @brief Keep mapped transfer command identity separate from GPU resources.
+     *
+     * Heterogeneous topology accounting multiplies edges, projections, and
+     * double-buffer slots. That complete command directory is required, but it
+     * must never become a stream/event-per-slot allocation. A typed execution
+     * pool carries the configured physical cycle bound, and a real-device
+     * topology-sized regression belongs to production parity preflight.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         MappedTransferProgressUsesBoundedTypedExecutionLanes)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path header_path =
+            root / "src/v2/transfer/MappedTransferProgressEpoch.h";
+        const fs::path implementation_path =
+            root / "src/v2/transfer/MappedTransferProgressEpoch.cpp";
+        const fs::path fabric_path =
+            root /
+            "src/v2/execution/moe/MoEOverlayPhysicalResidencyFabric.cpp";
+        const fs::path integration_path =
+            root /
+            "tests/v2/integration/transfer/Test__MappedTransferProgressEpoch.cpp";
+        const fs::path cmake_path = root / "tests/v2/CMakeLists.txt";
+        for (const auto &path : {
+                 header_path,
+                 implementation_path,
+                 fabric_path,
+                 integration_path,
+                 cmake_path,
+             })
+        {
+            ASSERT_TRUE(fs::exists(path)) << path;
+        }
+
+        const std::string header = readFile(header_path);
+        const std::string implementation = readFile(implementation_path);
+        const std::string fabric = readFile(fabric_path);
+        const std::string integration = readFile(integration_path);
+        const std::string cmake = readFile(cmake_path);
+
+        EXPECT_NE(
+            header.find("std::size_t execution_lane_capacity = 0u;"),
+            std::string::npos);
+        EXPECT_NE(header.find("enum class SlotLifecycle"), std::string::npos);
+        EXPECT_NE(
+            header.find("struct ExecutionLaneRuntime"), std::string::npos);
+
+        const std::string materialize = braceBalancedDeclarationRegion(
+            implementation,
+            "void MappedTransferProgressEpoch::materialize()");
+        ASSERT_FALSE(materialize.empty());
+        EXPECT_NE(
+            materialize.find(
+                "execution_lanes_.resize(config_.execution_lane_capacity)"),
+            std::string::npos);
+        EXPECT_NE(
+            materialize.find(
+                "index < config_.execution_lane_capacity"),
+            std::string::npos);
+        EXPECT_EQ(
+            materialize.find("index < config_.slot_capacity"),
+            std::string::npos)
+            << "Permanent command slots must not allocate GPU streams/events";
+
+        const std::string launch = braceBalancedDeclarationRegion(
+            implementation,
+            "bool MappedTransferProgressEpoch::launchOutstandingProgress() noexcept");
+        ASSERT_FALSE(launch.empty());
+        EXPECT_NE(
+            launch.find("execution_lanes_[lane_index]"),
+            std::string::npos);
+        EXPECT_NE(
+            launch.find("SlotLifecycle::Published"),
+            std::string::npos);
+        EXPECT_NE(
+            launch.find("SlotLifecycle::InFlight"),
+            std::string::npos);
+        EXPECT_NE(
+            launch.find("SlotLifecycle::CompletionPublished"),
+            std::string::npos);
+
+        const std::string fabric_materialization =
+            braceBalancedDeclarationRegion(
+                fabric,
+                "void materializeTransferLanes(");
+        ASSERT_FALSE(fabric_materialization.empty());
+        EXPECT_NE(
+            fabric_materialization.find(
+                "config.maximum_concurrent_cycles"),
+            std::string::npos);
+        EXPECT_NE(
+            fabric_materialization.find(
+                ".execution_lane_capacity = execution_lane_capacity"),
+            std::string::npos);
+
+        EXPECT_NE(
+            integration.find(
+                "TopologySizedDirectoryHasBoundedExecutionLanePool"),
+            std::string::npos);
+        EXPECT_NE(
+            integration.find(
+                "BoundedExecutionLanePoolQueuesWithoutLosingBytes"),
+            std::string::npos);
+        EXPECT_GE(
+            countOccurrences(
+                cmake, "V2_Integration_MappedTransferProgressEpoch"),
+            2u)
+            << "The registered real-device regression must also be in the production parity preflight inventory";
     }
 
 } // namespace llaminar2::test

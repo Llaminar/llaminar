@@ -28,6 +28,7 @@ from python.reference.loaders.tensor_name_mapper import (
 )
 from python.reference.qwen35_moe import (
     Qwen35MoEReferenceModel,
+    materialize_route_contributions,
     mtp_sidecar_replay_depth,
     production_router_distribution,
 )
@@ -84,6 +85,58 @@ def test_router_snapshot_uses_live_post_softmax_distribution():
     assert torch.allclose(observed.sum(dim=-1), torch.ones(1))
     with pytest.raises(RuntimeError, match="probabilities, weights, and indices"):
         production_router_distribution((probabilities,))
+
+
+def test_route_contribution_oracle_preserves_slots_and_reduces_to_hf_sum():
+    """The movement oracle must expose the exact addends of the HF output."""
+
+    experts = SimpleNamespace(
+        num_experts=3,
+        gate_up_proj=torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
+                [[2.0, 0.0], [0.0, 2.0], [1.0, 0.0], [0.0, 1.0]],
+                [[1.0, 1.0], [1.0, -1.0], [0.5, 0.0], [0.0, 0.5]],
+            ],
+            dtype=torch.float32,
+        ),
+        down_proj=torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[0.5, 0.0], [0.0, 0.5]],
+                [[1.0, -1.0], [0.5, 0.5]],
+            ],
+            dtype=torch.float32,
+        ),
+        act_fn=torch.nn.functional.silu,
+    )
+    hidden = torch.tensor([[1.0, 2.0], [3.0, -1.0]])
+    route_ids = torch.tensor([[2, 0], [1, 2]])
+    route_weights = torch.tensor([[0.75, 0.25], [0.6, 0.4]])
+
+    contributions = materialize_route_contributions(
+        experts, hidden, route_ids, route_weights
+    )
+
+    assert contributions.shape == (2, 2, 2)
+    expected_sum = torch.zeros_like(hidden)
+    for row in range(2):
+        for slot in range(2):
+            expert = int(route_ids[row, slot])
+            gate, up = torch.nn.functional.linear(
+                hidden[row : row + 1], experts.gate_up_proj[expert]
+            ).chunk(2, dim=-1)
+            expected = torch.nn.functional.linear(
+                experts.act_fn(gate) * up,
+                experts.down_proj[expert],
+            )[0] * route_weights[row, slot]
+            torch.testing.assert_close(contributions[row, slot], expected)
+            expected_sum[row] += expected
+
+    torch.testing.assert_close(
+        contributions.sum(dim=1),
+        expected_sum,
+    )
 
 
 def test_moe_snapshot_generator_help_exposes_diagnostic_snapshot_modes():

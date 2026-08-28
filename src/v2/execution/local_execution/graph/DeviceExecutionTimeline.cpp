@@ -208,6 +208,17 @@ namespace llaminar2
                     }),
                 },
                 {
+                    .point =
+                        DeviceTimelinePoint::MoEOverlayInitialRuntimeReady,
+                    .name = "moe_overlay_initial_runtime_ready",
+                    .producer =
+                        DeviceTimelineRole::MoEOverlayRuntimePublication,
+                    .consumers = roles({
+                        DeviceTimelineRole::MoEOverlayRuntimePublication,
+                        DeviceTimelineRole::MoERebalanceMaintenance,
+                    }),
+                },
+                {
                     .point = DeviceTimelinePoint::MoERebalanceMaintenanceReady,
                     .name = "moe_rebalance_maintenance_ready",
                     .producer = DeviceTimelineRole::MoERebalanceMaintenance,
@@ -318,6 +329,8 @@ namespace llaminar2
             return "prefix_restore_mutation";
         case DeviceTimelineRole::PrefixPayloadTransfer:
             return "prefix_payload_transfer";
+        case DeviceTimelineRole::MoEOverlayRuntimePublication:
+            return "moe_overlay_runtime_publication";
         case DeviceTimelineRole::MoERebalanceMaintenance:
             return "moe_rebalance_maintenance";
         case DeviceTimelineRole::RankCollective:

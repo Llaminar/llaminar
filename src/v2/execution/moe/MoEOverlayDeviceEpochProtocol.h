@@ -100,6 +100,24 @@ namespace llaminar2
         tryAcquireAdmitted(std::uint64_t admission_epoch) noexcept;
 
         /**
+         * @brief Acquire an authenticated peer-selected prepared epoch exactly.
+         * @param exact_epoch Positive epoch carried by a validated activation
+         *        descriptor after global inactive-bank preparation completed.
+         * @return A reader-holding ticket, or empty when the epoch is absent,
+         *         corrupt, or not Ready, Published, or Retiring.
+         *
+         * Heterogeneous selector publication is a parallel fan-out. A peer may
+         * therefore send E+1 after its selector flips while this participant's
+         * E+1 bank is still Ready. Global preparation consensus guarantees that
+         * the bank and runtime selectors are complete before any peer can name
+         * it. This exact admission pins that prepared bank without changing the
+         * participant-local publication floor; ordinary admission must continue
+         * to use @ref tryAcquireAdmitted and may never consume Ready state.
+         */
+        [[nodiscard]] std::optional<DeviceMoEOverlayEpochTicket>
+        tryAcquirePreparedExact(std::uint64_t exact_epoch) noexcept;
+
+        /**
          * @brief Release one reader installed by @ref tryAcquirePublished.
          * @param ticket Exact immutable ticket being released.
          * @return False for stale, malformed, or already-released identity.
@@ -177,6 +195,23 @@ namespace llaminar2
         [[nodiscard]] std::uint64_t acquisitionsInFlight() const noexcept;
 
     private:
+        /** Typed admission semantics for one shared acquire implementation. */
+        enum class AdmissionPolicy : std::uint8_t
+        {
+            PublishedFloor,
+            ExactPreparedPeer,
+        };
+
+        /**
+         * @brief Install one reader under the selected admission semantics.
+         * @param epoch Zero for the local publication floor, otherwise exact.
+         * @param policy Whether a globally prepared Ready bank is admissible.
+         * @return One reader-holding ticket or empty for invalid state.
+         */
+        [[nodiscard]] std::optional<DeviceMoEOverlayEpochTicket> tryAcquire(
+            std::uint64_t epoch,
+            AdmissionPolicy policy) noexcept;
+
         /** @return Bank holding @p epoch, irrespective of its lifecycle. */
         [[nodiscard]] std::optional<std::uint32_t> bankForEpoch(
             std::uint64_t epoch) const noexcept;

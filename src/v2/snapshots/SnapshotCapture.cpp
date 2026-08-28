@@ -68,11 +68,11 @@ namespace llaminar2
             const StoredSnapshot &first,
             const size_t first_logical_rows) noexcept
         {
-            constexpr std::string_view kCanonicalRouteContributions =
-                "_MOE_CANONICAL_ROUTE_CONTRIBUTIONS";
+            constexpr std::string_view kRouteContributions =
+                "_MOE_ROUTE_CONTRIBUTIONS";
             if (hasSemanticSuffix(
                     semantic_key,
-                    kCanonicalRouteContributions))
+                    kRouteContributions))
             {
                 return PrefillSnapshotSequenceLayout::PackedRouteRows;
             }
@@ -88,18 +88,18 @@ namespace llaminar2
         std::string routingIndexCompanionKey(
             const std::string &semantic_key)
         {
-            constexpr std::string_view kCanonicalRouteContributions =
-                "_MOE_CANONICAL_ROUTE_CONTRIBUTIONS";
+            constexpr std::string_view kRouteContributions =
+                "_MOE_ROUTE_CONTRIBUTIONS";
             if (!hasSemanticSuffix(
                     semantic_key,
-                    kCanonicalRouteContributions))
+                    kRouteContributions))
             {
                 return {};
             }
             return semantic_key.substr(
                        0,
                        semantic_key.size() -
-                           kCanonicalRouteContributions.size()) +
+                       kRouteContributions.size()) +
                    "_MOE_ROUTING_INDICES";
         }
 
@@ -198,18 +198,25 @@ namespace llaminar2
         {
             if (output_name == "output")
                 return prefix + "_MOE_EXPERT_OUTPUT";
+            if (output_name == "canonical_route_contributions")
+                return prefix + "_MOE_ROUTE_CONTRIBUTIONS";
             if (output_name == "domain_route_participant_ids")
                 return prefix + "_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS";
             if (output_name == "runtime_route_weights")
                 return prefix + "_MOE_RUNTIME_ROUTE_WEIGHTS";
             if (output_name == "overlay_route_participants_bank0")
                 return prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0";
+            if (output_name == "overlay_route_bank0_epoch")
+                return prefix + "_MOE_OVERLAY_ROUTE_BANK0_EPOCH";
             if (output_name == "overlay_route_participants_bank1")
                 return prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1";
+            if (output_name == "overlay_route_bank1_epoch")
+                return prefix + "_MOE_OVERLAY_ROUTE_BANK1_EPOCH";
             if (output_name == "overlay_route_selected_bank")
                 return prefix + "_MOE_OVERLAY_ROUTE_SELECTED_BANK";
             return {};
         }
+
     } // namespace
 
     // =========================================================================
@@ -636,7 +643,7 @@ namespace llaminar2
                          output.data)
                 {
                     storeOutput(
-                        prefix + "_MOE_CANONICAL_ROUTE_CONTRIBUTIONS",
+                        prefix + "_MOE_ROUTE_CONTRIBUTIONS",
                         output);
                     handled_named_output = true;
                 }
@@ -1443,7 +1450,9 @@ namespace llaminar2
                 prefix + "_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
                 prefix + "_MOE_RUNTIME_ROUTE_WEIGHTS",
                 prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+                prefix + "_MOE_OVERLAY_ROUTE_BANK0_EPOCH",
                 prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+                prefix + "_MOE_OVERLAY_ROUTE_BANK1_EPOCH",
                 prefix + "_MOE_OVERLAY_ROUTE_SELECTED_BANK"};
             keys.insert(keys.begin(), prefix + "_MOE_EXPERT_OUTPUT");
             return keys;
@@ -1497,7 +1506,7 @@ namespace llaminar2
                 else if (output_name == "canonical_route_contributions")
                 {
                     keys.push_back(
-                        prefix + "_MOE_CANONICAL_ROUTE_CONTRIBUTIONS");
+                        prefix + "_MOE_ROUTE_CONTRIBUTIONS");
                 }
                 else if (canonical_finalizer &&
                          output_name == "routed_output")

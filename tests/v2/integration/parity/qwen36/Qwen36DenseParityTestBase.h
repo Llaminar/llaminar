@@ -395,26 +395,8 @@ namespace llaminar2::test::parity::qwen36
     inline bool denseCaseUsesHomogeneousGPU(
         const DensePrefixRestoreParityCase &test_case)
     {
-        if (test_case.devices.empty())
-        {
-            return false;
-        }
-
-        const bool all_cuda = std::all_of(
-            test_case.devices.begin(),
-            test_case.devices.end(),
-            [](const GlobalDeviceAddress &device)
-            {
-                return device.isCUDA();
-            });
-        const bool all_rocm = std::all_of(
-            test_case.devices.begin(),
-            test_case.devices.end(),
-            [](const GlobalDeviceAddress &device)
-            {
-                return device.isROCm();
-            });
-        return all_cuda || all_rocm;
+        return classifyProductionParityExecutionTopology(test_case.devices) ==
+               ProductionParityExecutionTopology::HomogeneousGPU;
     }
 
     /**
@@ -4579,20 +4561,34 @@ namespace llaminar2::test::parity::qwen36
 
         artifact_recorder.finalize();
 
-        const bool homogeneous_gpu =
-            denseCaseUsesHomogeneousGPU(test_case);
+        const ProductionParityExecutionTopology execution_topology =
+            classifyProductionParityExecutionTopology(test_case.devices);
         const ProductionParityEvidence production_evidence =
             collectProductionParityEvidence(
                 production_records,
                 graph_execution,
-                homogeneous_gpu,
+                execution_topology,
+                resolveProductionParityGraphContract(
+                    execution_topology,
+                    /*is_campaign_authority=*/true,
+                    execution_topology !=
+                        ProductionParityExecutionTopology::CPUOnly),
                 model_context_reused,
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - campaign_started_at)
                     .count());
-        EXPECT_TRUE(production_evidence.graph_execution)
-            << "Dense MTP checkpoint parity did not use the production graph runner";
-        if (homogeneous_gpu)
+        const ProductionParityGraphCertification graph_certification =
+            certifyProductionParityGraphExecution(production_evidence);
+        EXPECT_TRUE(
+            graph_certification ==
+            ProductionParityGraphCertification::Certified)
+            << "Dense MTP graph certification failed: topology='"
+            << productionParityExecutionTopologyName(execution_topology)
+            << "' result='"
+            << productionParityGraphCertificationName(graph_certification)
+            << "'.\n"
+            << PerfStatsCollector::summaryString({"forward_graph", "mtp"});
+        if (production_evidence.usesHomogeneousGPU())
         {
             EXPECT_TRUE(production_evidence.device_generation_controller)
                 << "Dense MTP parity published no device-generation controller evidence";

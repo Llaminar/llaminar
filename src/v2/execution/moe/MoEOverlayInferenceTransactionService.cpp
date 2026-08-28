@@ -108,6 +108,175 @@ namespace llaminar2
         }
     } // namespace
 
+    MoEOverlayInferenceCoordinatorGraphPlan
+    MoEOverlayInferenceCoordinatorGraphPlan::
+        sealAfterSynchronizedMaterialization(
+            std::uint64_t graph_family_generation,
+            std::vector<Segment> segments)
+    {
+        /* Stable role/rank order is part of the setup certificate. It keeps
+         * diagnostics and publisher validation independent of the order in
+         * which declarative domains happened to be visited. */
+        std::sort(
+            segments.begin(),
+            segments.end(),
+            [](const Segment &left, const Segment &right)
+            {
+                if (left.role != right.role)
+                {
+                    return static_cast<std::uint8_t>(left.role) <
+                           static_cast<std::uint8_t>(right.role);
+                }
+                return left.world_rank < right.world_rank;
+            });
+
+        MoEOverlayInferenceCoordinatorGraphPlan result;
+        result.graph_family_generation_ = graph_family_generation;
+        result.segments_ = std::move(segments);
+        if (!result.valid())
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay coordinator graph plan requires one unique continuation rank, at least one unique follower rank, sealed materialization, and positive participant counts");
+        }
+        return result;
+    }
+
+    bool MoEOverlayInferenceCoordinatorGraphPlan::valid() const noexcept
+    {
+        if (graph_family_generation_ == 0 || segments_.size() < 2u)
+            return false;
+
+        std::size_t continuation_count = 0u;
+        std::size_t follower_count = 0u;
+        for (std::size_t index = 0u; index < segments_.size(); ++index)
+        {
+            const Segment &segment = segments_[index];
+            const bool valid_role =
+                segment.role ==
+                    MoEOverlayInferenceCoordinatorSegmentRole::Continuation ||
+                segment.role ==
+                    MoEOverlayInferenceCoordinatorSegmentRole::ExpertFollower;
+            const bool valid_materialization =
+                segment.materialization ==
+                    MoEOverlayInferenceSegmentMaterializationKind::
+                        NativeDeviceExecutable ||
+                segment.materialization ==
+                    MoEOverlayInferenceSegmentMaterializationKind::
+                        EagerHostGraph;
+            if (!valid_role || !valid_materialization ||
+                segment.world_rank < 0 ||
+                segment.local_participant_count == 0u)
+            {
+                return false;
+            }
+            for (std::size_t earlier = 0u; earlier < index; ++earlier)
+            {
+                if (segments_[earlier].world_rank == segment.world_rank)
+                    return false;
+            }
+            if (segment.role ==
+                MoEOverlayInferenceCoordinatorSegmentRole::Continuation)
+            {
+                ++continuation_count;
+            }
+            else
+            {
+                ++follower_count;
+            }
+        }
+        return continuation_count == 1u && follower_count != 0u;
+    }
+
+    std::size_t
+    MoEOverlayInferenceCoordinatorGraphPlan::followerSegmentCount()
+        const noexcept
+    {
+        return static_cast<std::size_t>(std::count_if(
+            segments_.begin(),
+            segments_.end(),
+            [](const Segment &segment)
+            {
+                return segment.role ==
+                       MoEOverlayInferenceCoordinatorSegmentRole::
+                           ExpertFollower;
+            }));
+    }
+
+    std::size_t
+    MoEOverlayInferenceCoordinatorGraphPlan::nativeSegmentCount()
+        const noexcept
+    {
+        return static_cast<std::size_t>(std::count_if(
+            segments_.begin(),
+            segments_.end(),
+            [](const Segment &segment)
+            {
+                return segment.materialization ==
+                       MoEOverlayInferenceSegmentMaterializationKind::
+                           NativeDeviceExecutable;
+            }));
+    }
+
+    std::size_t
+    MoEOverlayInferenceCoordinatorGraphPlan::eagerHostSegmentCount()
+        const noexcept
+    {
+        return static_cast<std::size_t>(std::count_if(
+            segments_.begin(),
+            segments_.end(),
+            [](const Segment &segment)
+            {
+                return segment.materialization ==
+                       MoEOverlayInferenceSegmentMaterializationKind::
+                           EagerHostGraph;
+            }));
+    }
+
+    std::size_t
+    MoEOverlayInferenceCoordinatorGraphPlan::nativeParticipantCount()
+        const noexcept
+    {
+        std::size_t count = 0u;
+        for (const Segment &segment : segments_)
+        {
+            if (segment.materialization ==
+                MoEOverlayInferenceSegmentMaterializationKind::
+                    NativeDeviceExecutable)
+            {
+                count += segment.local_participant_count;
+            }
+        }
+        return count;
+    }
+
+    int MoEOverlayInferenceCoordinatorGraphPlan::continuationWorldRank()
+        const noexcept
+    {
+        const auto found = std::find_if(
+            segments_.begin(),
+            segments_.end(),
+            [](const Segment &segment)
+            {
+                return segment.role ==
+                       MoEOverlayInferenceCoordinatorSegmentRole::Continuation;
+            });
+        return found == segments_.end() ? -1 : found->world_rank;
+    }
+
+    const MoEOverlayInferenceCoordinatorGraphPlan::Segment *
+    MoEOverlayInferenceCoordinatorGraphPlan::segmentForWorldRank(
+        int world_rank) const noexcept
+    {
+        const auto found = std::find_if(
+            segments_.begin(),
+            segments_.end(),
+            [world_rank](const Segment &segment)
+            {
+                return segment.world_rank == world_rank;
+            });
+        return found == segments_.end() ? nullptr : &*found;
+    }
+
     /**
      * @brief Setup-sized poll-only conjunction of participant GPU events.
      *
@@ -729,7 +898,7 @@ namespace llaminar2
         MoEOverlayInferenceTransactionCoordinator(Config config)
         : config_(std::move(config))
     {
-        if (config_.publishers.empty() ||
+        if (config_.publishers.empty() || !config_.graph_plan.valid() ||
             config_.continuation_participant_count <= 0 ||
             config_.ticket_authority_participant_index < 0 ||
             config_.ticket_authority_participant_index >=
@@ -749,7 +918,7 @@ namespace llaminar2
             config_.max_mtp_draft_depth < 0)
         {
             throw std::invalid_argument(
-                "ExpertOverlay transaction coordinator requires publishers, continuation participants, one in-range ticket authority, and fixed command capacity");
+                "ExpertOverlay transaction coordinator requires publishers, one sealed global graph plan, continuation participants, one in-range ticket authority, and fixed command capacity");
         }
 
         int source_rank = -1;
@@ -776,6 +945,44 @@ namespace llaminar2
             target_ranks.push_back(topology.target_world_rank);
         }
 
+        const auto *const continuation_segment =
+            config_.graph_plan.segmentForWorldRank(source_rank);
+        if (!continuation_segment ||
+            continuation_segment->role !=
+                MoEOverlayInferenceCoordinatorSegmentRole::Continuation ||
+            continuation_segment->local_participant_count !=
+                static_cast<std::size_t>(
+                    config_.continuation_participant_count) ||
+            config_.graph_plan.graphFamilyGeneration() !=
+                config_.publishers.front()
+                    ->topologyIdentity()
+                    .workspace_generation ||
+            config_.graph_plan.followerSegmentCount() !=
+                config_.publishers.size() ||
+            config_.graph_plan.segmentCount() !=
+                config_.publishers.size() + 1u)
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay transaction coordinator graph plan disagrees with its continuation rank, participant count, graph generation, or follower cardinality");
+        }
+        for (const auto &publisher : config_.publishers)
+        {
+            const auto &topology = publisher->topologyIdentity();
+            const auto *const follower_segment =
+                config_.graph_plan.segmentForWorldRank(
+                    topology.target_world_rank);
+            if (!follower_segment ||
+                follower_segment->role !=
+                    MoEOverlayInferenceCoordinatorSegmentRole::
+                        ExpertFollower ||
+                topology.workspace_generation !=
+                    config_.graph_plan.graphFamilyGeneration())
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay transaction coordinator publisher is absent from the sealed global graph plan");
+            }
+        }
+
         graph_group_slots_.resize(
             config_.max_transactions_per_command);
         for (auto &transaction : graph_group_slots_)
@@ -799,6 +1006,44 @@ namespace llaminar2
             std::make_shared<CompletionFenceSet>(
                 static_cast<std::size_t>(
                     config_.continuation_participant_count));
+
+        /* These records mirror the immutable plan constructed only after the
+         * synchronized serving-family phase. PerfStats is not consulted by
+         * admission or replay; it merely exposes that production authority to
+         * integration certification and operational diagnostics. */
+        const PerfStatsCollector::Tags plan_tags{
+            {"authority", "typed_overlay_transaction_plan"},
+            {"continuation_rank", std::to_string(source_rank)},
+            {"eager_host_segments",
+             std::to_string(config_.graph_plan.eagerHostSegmentCount())},
+            {"follower_segments",
+             std::to_string(config_.graph_plan.followerSegmentCount())},
+            {"graph_family_generation",
+             std::to_string(config_.graph_plan.graphFamilyGeneration())},
+            {"native_participants",
+             std::to_string(config_.graph_plan.nativeParticipantCount())},
+            {"native_segments",
+             std::to_string(config_.graph_plan.nativeSegmentCount())},
+            {"scope", "cross_rank_expert_overlay"},
+        };
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "segmented_plan_segments",
+            static_cast<double>(config_.graph_plan.segmentCount()),
+            "setup",
+            "continuation_rank",
+            plan_tags);
+        if (config_.graph_plan.nativeSegmentCount() != 0u)
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "segmented_graph_capture_segments",
+                static_cast<double>(
+                    config_.graph_plan.nativeSegmentCount()),
+                "setup",
+                "continuation_rank",
+                plan_tags);
+        }
     }
 
     bool MoEOverlayInferenceTransactionCoordinator::
@@ -1138,11 +1383,32 @@ namespace llaminar2
                 "ExpertOverlay MTP depth or sequence identity exceeds the retained graph family",
                 error);
         }
+
+        std::optional<MoEOverlayResidencyAuthority::TicketLease>
+            placement_epoch_lease;
+        std::uint64_t placement_epoch = current_placement_epoch_;
+        if (config_.residency_authority)
+        {
+            placement_epoch_lease = config_.residency_authority
+                                        ->tryAcquireGraphSequenceSnapshot();
+            if (!placement_epoch_lease || !*placement_epoch_lease ||
+                placement_epoch_lease->epoch() == 0 ||
+                placement_epoch_lease->epoch() < current_placement_epoch_)
+            {
+                return failLocked(
+                    "ExpertOverlay graph sequence could not pin a monotonic host residency epoch",
+                    error);
+            }
+            placement_epoch = placement_epoch_lease->epoch();
+        }
         execution_sequence_.state = ExecutionSequenceState::Open;
         execution_sequence_.draft_depth = draft_depth;
         execution_sequence_.next_graph_ordinal = 0;
-        execution_sequence_.placement_epoch = 0;
+        execution_sequence_.placement_epoch = placement_epoch;
         execution_sequence_.sequence_id = next_sequence_id_++;
+        execution_sequence_.placement_epoch_lease =
+            std::move(placement_epoch_lease);
+        current_placement_epoch_ = placement_epoch;
         ++graph_sequence_count_;
         return true;
     }
@@ -1998,6 +2264,8 @@ namespace llaminar2
         const int retired_draft_depth = execution_sequence_.draft_depth;
         const std::size_t retired_count = transaction_count_;
         std::uint64_t retired_prefill_tokens = 0u;
+        bool all_prefill = true;
+        bool all_serial_decode = true;
         for (std::size_t transaction_index = 0;
              transaction_index < retired_count;
              ++transaction_index)
@@ -2018,6 +2286,15 @@ namespace llaminar2
                         transaction.descriptor.request_count) *
                     static_cast<std::uint64_t>(
                         transaction.descriptor.logical_rows_per_request);
+            }
+            else
+            {
+                all_prefill = false;
+            }
+            if (transaction.descriptor.graph_role !=
+                MoEOverlayInferenceGraphRole::MainDecode)
+            {
+                all_serial_decode = false;
             }
             for (std::size_t target = 0;
                  target < config_.publishers.size(); ++target)
@@ -2049,7 +2326,39 @@ namespace llaminar2
                     error);
             }
         }
+        if (retired_count >
+            std::numeric_limits<std::size_t>::max() /
+                config_.graph_plan.segmentCount())
+        {
+            return failLocked(
+                "ExpertOverlay completed segment replay cardinality overflowed",
+                error);
+        }
+        const std::size_t completed_segments =
+            retired_count * config_.graph_plan.segmentCount();
         total_transaction_count_ += retired_count;
+        const char *const replay_phase =
+            all_prefill ? "prefill"
+                        : (all_serial_decode ? "decode" : "mtp");
+
+        /* Slot retirement follows the continuation graph's exact sparse-return
+         * fence. Reaching this edge proves both the local captured submissions
+         * and every authenticated follower transaction completed; earlier arm
+         * or terminal-submission states are deliberately insufficient. */
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "segmented_replay_segments",
+            static_cast<double>(completed_segments),
+            replay_phase,
+            "continuation_rank",
+            {{"authority", "typed_overlay_transaction_plan"},
+             {"command", std::to_string(active_command_.command_id)},
+             {"draft_depth", std::to_string(retired_draft_depth)},
+             {"graph_groups", std::to_string(retired_count)},
+             {"plan_segments",
+              std::to_string(config_.graph_plan.segmentCount())},
+             {"scope", "cross_rank_expert_overlay"},
+             {"terminal", "sparse_return_retired"}});
         PerfStatsCollector::addCounter(
             "moe_overlay_transaction",
             "coordinator_graph_sequences",
@@ -2275,6 +2584,7 @@ namespace llaminar2
                 }
             }
             state_ = MoEOverlayInferenceProtocolState::Failed;
+            resetGraphSequenceLocked();
             graph_group_completion_cv_.notify_all();
             if (failure_.empty())
             {

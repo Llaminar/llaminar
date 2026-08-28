@@ -148,4 +148,82 @@ namespace
             << "Error should contain the file path. Error was: " << runner.lastError();
     }
 
+    TEST(Test__ModelContextReuseAuthority, PublishesFinalRetentionOnlyAtReusableSeal)
+    {
+        ModelContextReuseAuthority authority;
+        std::string error;
+        EXPECT_FALSE(authority.sealedDeviceMemoryRetention(&error).has_value());
+        EXPECT_NE(error.find("no sealed"), std::string::npos) << error;
+
+        ASSERT_TRUE(authority.beginSealing(&error)) << error;
+        const std::vector<ModelDeviceMemoryRetention> retention{
+            ModelDeviceMemoryRetention{
+                .device = DeviceId::rocm(0),
+                .prepared_weight_bytes = 1024u,
+                .reusable_workspace_bytes = 256u,
+            },
+        };
+        ASSERT_TRUE(authority.publishReusable(retention, &error)) << error;
+        const auto sealed = authority.sealedDeviceMemoryRetention(&error);
+        ASSERT_TRUE(sealed.has_value()) << error;
+        EXPECT_EQ(*sealed, retention);
+
+        ASSERT_TRUE(authority.acquireRunnerExclusive(&error)) << error;
+        EXPECT_FALSE(authority.sealedDeviceMemoryRetention(&error).has_value())
+            << "A new runner must not inherit a prior generation's retirement BOM";
+    }
+
+    TEST(Test__ModelContextReuseAuthority, AcceptsWeightsOnlyParticipantRetention)
+    {
+        ModelContextReuseAuthority authority;
+        std::string error;
+        ASSERT_TRUE(authority.beginSealing(&error)) << error;
+
+        const std::vector<ModelDeviceMemoryRetention> retention{
+            ModelDeviceMemoryRetention{
+                .device = DeviceId::rocm(0),
+                .prepared_weight_bytes = 4096u,
+                .reusable_workspace_bytes = 0u,
+            },
+        };
+        ASSERT_TRUE(authority.publishReusable(retention, &error)) << error;
+        const auto sealed = authority.sealedDeviceMemoryRetention(&error);
+        ASSERT_TRUE(sealed.has_value()) << error;
+        EXPECT_EQ(*sealed, retention);
+    }
+
+    TEST(Test__ModelContextReuseAuthority, RejectsInvalidOrDuplicateRetentionRows)
+    {
+        ModelContextReuseAuthority authority;
+        std::string error;
+        ASSERT_TRUE(authority.beginSealing(&error)) << error;
+        EXPECT_FALSE(authority.publishReusable(
+            {
+                ModelDeviceMemoryRetention{
+                    .device = DeviceId::cuda(0),
+                    .prepared_weight_bytes = 10u,
+                    .reusable_workspace_bytes = 1u,
+                },
+                ModelDeviceMemoryRetention{
+                    .device = DeviceId::cuda(0),
+                    .prepared_weight_bytes = 20u,
+                    .reusable_workspace_bytes = 2u,
+                },
+            },
+            &error));
+        EXPECT_NE(error.find("duplicate"), std::string::npos) << error;
+        EXPECT_EQ(authority.state(), ModelContextReuseAuthority::State::Sealing);
+    }
+
+    TEST(Test__ModelContextReuseAuthority, CpuOnlySealPublishesAnExplicitEmptyBom)
+    {
+        ModelContextReuseAuthority authority;
+        std::string error;
+        ASSERT_TRUE(authority.beginSealing(&error)) << error;
+        ASSERT_TRUE(authority.publishReusable({}, &error)) << error;
+        const auto sealed = authority.sealedDeviceMemoryRetention(&error);
+        ASSERT_TRUE(sealed.has_value()) << error;
+        EXPECT_TRUE(sealed->empty());
+    }
+
 } // namespace

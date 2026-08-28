@@ -129,11 +129,10 @@ namespace llaminar2
     {
         if (bytes > workspace_size_)
         {
-            // Grow workspace (with some extra room)
-            size_t new_size = bytes + bytes / 4; // 25% headroom
-            workspace_.resize(new_size);
-            workspace_size_ = new_size;
-            LOG_DEBUG("CPUDeviceContext: workspace grown to " << new_size << " bytes");
+            workspace_.resize(bytes);
+            workspace_size_ = bytes;
+            LOG_DEBUG("CPUDeviceContext: workspace grown to exact requested capacity "
+                      << bytes << " bytes");
         }
 
         return workspace_.data();
@@ -313,18 +312,18 @@ namespace llaminar2
                 workspace_ = nullptr;
             }
 
-            // Allocate new workspace with headroom
-            size_t new_size = bytes + bytes / 4; // 25% headroom
-            workspace_ = allocate(new_size);
+            workspace_ = allocate(bytes);
             if (workspace_)
             {
-                workspace_size_ = new_size;
-                LOG_DEBUG("IGPUDeviceContext[" << gpu_device_id_ << "]: workspace grown to " << new_size << " bytes");
+                workspace_size_ = bytes;
+                LOG_DEBUG("IGPUDeviceContext[" << gpu_device_id_
+                                                << "]: workspace grown to exact requested capacity "
+                                                << bytes << " bytes");
             }
             else
             {
                 workspace_size_ = 0;
-                LOG_ERROR("IGPUDeviceContext: failed to allocate workspace of " << new_size << " bytes");
+                LOG_ERROR("IGPUDeviceContext: failed to allocate workspace of " << bytes << " bytes");
             }
         }
 

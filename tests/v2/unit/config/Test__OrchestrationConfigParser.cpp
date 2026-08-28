@@ -84,7 +84,9 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(
         config.moe_rebalance.migration_payoff_horizon_tokens,
         2048u);
-    EXPECT_EQ(config.moe_rebalance.migration_max_cycles_per_wave, 1u);
+    EXPECT_EQ(config.moe_rebalance.migration_transfer_slots, 1u);
+    EXPECT_FALSE(config.moe_rebalance.migration_cycles_per_wave.has_value());
+    EXPECT_EQ(config.moe_rebalance.resolvedMigrationCyclesPerWave(), 1u);
     EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 0);
     EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 8192u);
     EXPECT_EQ(config.moe_routed_prefill.llep_alpha_numerator, 1u);
@@ -1181,7 +1183,8 @@ moe:
     residency_maintenance_max_window: 512
     residency_maintenance_window_growth: 2.5
     migration_payoff_horizon_tokens: 16384
-    migration_max_cycles_per_wave: 3
+    migration_transfer_slots: 3
+    migration_cycles_per_wave: 2
     routed_prefill_assignment_window_tokens: 96
     overlay_prefill_segment_rows: 320
     routed_prefill_least_loaded_min_routed_rows: 2048
@@ -1221,7 +1224,10 @@ moe:
     EXPECT_EQ(
         config.moe_rebalance.migration_payoff_horizon_tokens,
         16'384u);
-    EXPECT_EQ(config.moe_rebalance.migration_max_cycles_per_wave, 3u);
+    EXPECT_EQ(config.moe_rebalance.migration_transfer_slots, 3u);
+    ASSERT_TRUE(config.moe_rebalance.migration_cycles_per_wave.has_value());
+    EXPECT_EQ(*config.moe_rebalance.migration_cycles_per_wave, 2u);
+    EXPECT_EQ(config.moe_rebalance.resolvedMigrationCyclesPerWave(), 2u);
     EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 96);
     EXPECT_EQ(config.moe_routed_prefill.overlay_segment_rows, 320);
     EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 2048u);
@@ -1262,7 +1268,8 @@ moe_residency_maintenance_window: 128
 moe_residency_maintenance_max_window: 1024
 moe_residency_maintenance_window_growth: 1.25
 moe_migration_payoff_horizon_tokens: 32768
-moe_migration_max_cycles_per_wave: 4
+moe_migration_transfer_slots: 4
+moe_migration_cycles_per_wave: 3
 moe_routed_prefill_assignment_window_tokens: 192
 moe_overlay_prefill_segment_rows: 384
 moe_routed_prefill_least_loaded_min_routed_rows: 4096
@@ -1301,7 +1308,10 @@ moe_release_raw_expert_weights: false
     EXPECT_EQ(
         config.moe_rebalance.migration_payoff_horizon_tokens,
         32'768u);
-    EXPECT_EQ(config.moe_rebalance.migration_max_cycles_per_wave, 4u);
+    EXPECT_EQ(config.moe_rebalance.migration_transfer_slots, 4u);
+    ASSERT_TRUE(config.moe_rebalance.migration_cycles_per_wave.has_value());
+    EXPECT_EQ(*config.moe_rebalance.migration_cycles_per_wave, 3u);
+    EXPECT_EQ(config.moe_rebalance.resolvedMigrationCyclesPerWave(), 3u);
     EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 192);
     EXPECT_EQ(config.moe_routed_prefill.overlay_segment_rows, 384);
     EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 4096u);
@@ -1991,7 +2001,8 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
                     "--moe-residency-maintenance-max-window", "2048",
                     "--moe-residency-maintenance-window-growth", "2.0",
                     "--moe-migration-payoff-horizon-tokens", "65536",
-                    "--moe-migration-max-cycles-per-wave", "5",
+                    "--moe-migration-transfer-slots", "5",
+                    "--moe-migration-cycles-per-wave", "4",
                     "--moe-routed-prefill-assignment-window", "384",
                     "--moe-overlay-prefill-segment-rows", "448",
                     "--moe-routed-prefill-least-loaded-min-routed-rows", "1024",
@@ -2026,7 +2037,10 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
     EXPECT_EQ(
         config.moe_rebalance.migration_payoff_horizon_tokens,
         65'536u);
-    EXPECT_EQ(config.moe_rebalance.migration_max_cycles_per_wave, 5u);
+    EXPECT_EQ(config.moe_rebalance.migration_transfer_slots, 5u);
+    ASSERT_TRUE(config.moe_rebalance.migration_cycles_per_wave.has_value());
+    EXPECT_EQ(*config.moe_rebalance.migration_cycles_per_wave, 4u);
+    EXPECT_EQ(config.moe_rebalance.resolvedMigrationCyclesPerWave(), 4u);
     EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 384);
     EXPECT_EQ(config.moe_routed_prefill.overlay_segment_rows, 448);
     EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 1024u);
@@ -2072,11 +2086,25 @@ TEST(Test__OrchestrationConfigParser,
 }
 
 TEST(Test__OrchestrationConfigParser,
+     ParseArgs_MigrationTransferSlotsMustBePositive)
+{
+    ArgvHelper args{
+        "llaminar2",
+        "--moe-migration-transfer-slots",
+        "0"};
+    OrchestrationConfigParser parser;
+
+    EXPECT_THROW(
+        parser.parseArgs(args.argc(), args.argv()),
+        std::invalid_argument);
+}
+
+TEST(Test__OrchestrationConfigParser,
      ParseArgs_MigrationCyclesPerWaveMustBePositive)
 {
     ArgvHelper args{
         "llaminar2",
-        "--moe-migration-max-cycles-per-wave",
+        "--moe-migration-cycles-per-wave",
         "0"};
     OrchestrationConfigParser parser;
 

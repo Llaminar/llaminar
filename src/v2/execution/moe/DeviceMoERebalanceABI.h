@@ -22,7 +22,17 @@ namespace llaminar2::moe_rebalance_abi
      * Any field-layout change to a cross-backend record must increment this
      * value and update the corresponding byte-size assertion below.
      */
-    inline constexpr uint32_t kVersion = 11u;
+    inline constexpr uint32_t kVersion = 12u;
+
+    /**
+     * @brief Exact byte size of one device-owned rebalance command.
+     *
+     * Ownership-transfer commands carry both the domain-local destination and
+     * its overlay-wide route identity. Keeping the latter in the immutable
+     * command prevents apply kernels from guessing that two unrelated
+     * participant namespaces happen to use the same integer.
+     */
+    inline constexpr uint32_t kPlanEntryBytes = 52u;
 
     /**
      * @brief Exact byte size of DeviceMoERebalanceConfig and device views.

@@ -563,9 +563,11 @@ namespace llaminar2
      * The global owner map assigns stable logical participant ids independently
      * of rank numbering.  This registry materializes only the participant ids
      * physically hosted by the current process and assembles their epoch-one
-     * banks layer by layer as model graph construction resolves prepared engine
-     * lifetimes.  Subsequent cached graph variants verify the same identities
-     * idempotently instead of creating another residency authority.
+     * banks from model-owned prepared engine lifetimes. Graph construction may
+     * register a layer early when it resolves that exact lifetime; one explicit
+     * setup finalization then supplies every retained graph-family layer before
+     * maintenance starts. Subsequent cached graph variants verify the same
+     * identities idempotently instead of creating another residency authority.
      */
     class MoEOverlayParticipantResidencyRegistry final
     {
@@ -580,17 +582,35 @@ namespace llaminar2
          */
         struct InitialBankExpertSelection
         {
+            /** Stable overlay-wide participant that owns this physical bank. */
             int participant_id = -1;
+            /** Exact backend device on which the prepared bank was published. */
             DeviceId device = DeviceId::invalid();
+            /** Integer-priority tier containing @ref participant_id. */
+            int tier_idx = -1;
+            /** Number of whole-expert participants sharing that exact tier. */
+            int tier_participant_count = 0;
+            /** Main-model or retained sidecar layer represented by the bank. */
             int layer_idx = -1;
+            /** Sorted logical expert IDs proven resident in the immutable bank. */
             std::vector<int> expert_ids;
+            /**
+             * Whether the installed resident mask exactly equals the frozen
+             * owner map for this participant and layer.
+             *
+             * This is stronger than classifying the IDs as contiguous: a
+             * typed initial-order override may deliberately make ordinal
+             * ownership non-contiguous while still installing the exact
+             * planner-authorized bank.
+             */
+            bool matches_frozen_owner_map = false;
         };
 
         /**
          * @brief Exact process-local initial-bank publication deficit.
          *
-         * Missing layers identify graph construction that never supplied a
-         * canonical prepared engine set.  An empty @ref missing_layers with
+         * Missing layers identify preparation/finalization that never supplied
+         * a canonical prepared engine set. An empty @ref missing_layers with
          * @ref publication_pending set means every layer was registered but
          * the endpoint still has no immutable bank for the initial epoch; that
          * state is a publication/lifecycle defect rather than a graph omission.
@@ -650,6 +670,31 @@ namespace llaminar2
             const std::vector<MoEOverlayPreparedExpertTriplet> &experts,
             std::string *error = nullptr);
 
+        /**
+         * @brief Complete the initial banks from the model-owned engine registry.
+         *
+         * This is the sole setup-time completion transition for process-local
+         * physical residency. It walks the frozen owner map in deterministic
+         * participant/layer order, resolves exact shared engine lifetimes, and
+         * feeds them through @ref registerInitialLayer. Layers already supplied
+         * by graph construction are identity-checked idempotently; dormant
+         * retained graph-family layers are materialized without executing or
+         * capturing that graph family.
+         *
+         * The method performs no fallback preparation and never fabricates an
+         * engine. Missing or inconsistent prepared entries fail startup with a
+         * participant/layer diagnostic.
+         *
+         * @param registry Model-owned registry containing the frozen prepared
+         *        engine set for every local participant.
+         * @param error Optional exact rejection diagnostic.
+         * @return True only when every process-local initial bank has completed
+         *         its one-way publication transition.
+         */
+        bool finalizeInitialBanksFromPreparedRegistry(
+            const ExpertGemmRegistry &registry,
+            std::string *error = nullptr);
+
         /** @return Process-local endpoint for @p participant_id, or null. */
         [[nodiscard]] std::shared_ptr<MoEOverlayParticipantResidency>
         endpoint(int participant_id) const noexcept;
@@ -672,7 +717,7 @@ namespace llaminar2
          * Results are ordered by participant and then layer. The method is a
          * setup/diagnostic boundary and may allocate; inference never calls it.
          * Each returned selection comes from a retained immutable bank lease,
-         * proving that graph construction published complete prepared engines
+         * proving that setup finalization published complete prepared engines
          * for the corresponding resident mask.
          *
          * @return Process-local physical selections in deterministic order.

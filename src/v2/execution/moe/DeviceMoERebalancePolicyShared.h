@@ -25,6 +25,8 @@ namespace llaminar2::moe_rebalance_policy
     constexpr uint32_t kPlanResidentExpertAssignment = 2u;
     constexpr uint32_t kPlanOwnershipTransfer = 3u;
     constexpr uint32_t kMaxPolicyParticipants = 8u;
+    /** Mathematical floor of a max/min ratio expressed per mille (1.0). */
+    constexpr uint32_t kMinimumDynamicImbalanceThresholdPerMille = 1000u;
     constexpr uint32_t kDefaultDynamicImbalanceThresholdPerMille = 1300u;
     constexpr uint32_t kDefaultDynamicMinImprovementPerMille = 50u;
     constexpr uint32_t kDefaultDynamicMaxSwapsPerLayer = 4u;
@@ -581,6 +583,37 @@ namespace llaminar2::moe_rebalance_policy
         const uint64_t rounded_remainder =
             (remainder_product + 999u) / 1000u;
         return before - after >= whole + rounded_remainder;
+    }
+
+    /**
+     * @brief Reject an economy candidate that regresses any measured phase.
+     *
+     * Decode and prefill are independent production objectives. Summing their
+     * service costs before admission would let a large win in one phase hide a
+     * regression in the other. The aggregate payoff gate still decides whether
+     * the complete cycle is worth its movement cost, while this helper enforces
+     * the orthogonal invariant that no measured phase becomes slower. Equality
+     * is intentional: a cycle may improve one phase while leaving another
+     * phase unchanged, and several such cycles can form one useful wave.
+     *
+     * @param before Exact critical-path service cost before movement by phase.
+     * @param after Exact critical-path service cost after movement by phase.
+     * @param phase_count Number of valid entries in both arrays.
+     * @return True when every measured phase is unchanged or improved.
+     */
+    LLAMINAR_MOE_REBALANCE_HD bool phaseObjectivesDoNotRegress(
+        const uint64_t *before,
+        const uint64_t *after,
+        uint32_t phase_count) noexcept
+    {
+        if (!before || !after || phase_count == 0u)
+            return false;
+        for (uint32_t phase = 0u; phase < phase_count; ++phase)
+        {
+            if (after[phase] > before[phase])
+                return false;
+        }
+        return true;
     }
 
     /**
@@ -1190,13 +1223,31 @@ namespace llaminar2::moe_rebalance_policy
         return post_wave_load_spread < pre_wave_load_spread;
     }
 
+    /**
+     * @brief Decide whether the whole-wave participant totals permit a paid wave.
+     *
+     * Participant totals are a useful guard, but they are not the execution
+     * critical path: opposite skews in different serial layers can cancel in
+     * the totals.  A separately proven critical-path payoff therefore permits
+     * a tied or worse aggregate total.  Callers must still apply the stricter
+     * per-layer aggregate-spread and configured post-wave ceiling gates.
+     *
+     * @param pre_policy_load_spread Participant-total spread before the wave.
+     * @param post_policy_load_spread Participant-total spread after the wave.
+     * @param pre_policy_load_total Total routed work before the wave.
+     * @param post_policy_load_total Total routed work after the wave.
+     * @param requested_payload_slots Paid payload slots required by the wave.
+     * @param realized_critical_path_payback Whether an independent critical-
+     *        path measure proves the wave useful.
+     * @return True when participant totals do not veto the paid wave.
+     */
     LLAMINAR_MOE_REBALANCE_HD bool transferWaveParticipantSpreadIsAcceptable(
         uint64_t pre_policy_load_spread,
         uint64_t post_policy_load_spread,
         uint64_t pre_policy_load_total,
         uint64_t post_policy_load_total,
         uint32_t requested_payload_slots,
-        bool realized_router_payback) noexcept
+        bool realized_critical_path_payback) noexcept
     {
         if (requested_payload_slots == 0u)
             return true;
@@ -1207,7 +1258,7 @@ namespace llaminar2::moe_rebalance_policy
             return false;
         }
         return post_policy_load_spread < pre_policy_load_spread ||
-               realized_router_payback;
+               realized_critical_path_payback;
     }
 
     template <typename PlanEntry>
@@ -2208,6 +2259,56 @@ namespace llaminar2::moe_rebalance_policy
         uint32_t command_capacity) noexcept
     {
         return command_count >= command_capacity;
+    }
+
+    /**
+     * @brief Typed admission result for one atomic Dynamic ownership swap.
+     *
+     * A swap contributes two inseparable commands. Reaching the configured
+     * wave budget is ordinary scheduling backpressure: the remaining
+     * candidates belong to a later epoch. Exhausting the larger physical plan
+     * before that declared budget is an invariant violation. Keeping these
+     * outcomes distinct prevents an exactly-full, valid wave from being
+     * reported as command-buffer corruption.
+     */
+    enum class DynamicPlanAdmission : uint8_t
+    {
+        Admit = 0,
+        ConfiguredWaveLimit,
+        PhysicalPlanOverflow,
+    };
+
+    /**
+     * @brief Classify whether an atomic Dynamic command group can be appended.
+     *
+     * The policy limit is evaluated first because it may intentionally equal
+     * the physical capacity. A zero policy limit means that physical capacity
+     * is the only bound. Subtraction-based checks avoid unsigned overflow.
+     *
+     * @param command_count Commands already published in the current wave.
+     * @param required_entries Atomic commands required by the candidate.
+     * @param configured_wave_limit User/policy limit, or zero for unbounded.
+     * @param physical_plan_capacity Allocated command-buffer capacity.
+     * @return The exact admission or rejection reason.
+     */
+    LLAMINAR_MOE_REBALANCE_HD DynamicPlanAdmission dynamicPlanAdmission(
+        uint32_t command_count,
+        uint32_t required_entries,
+        uint32_t configured_wave_limit,
+        uint32_t physical_plan_capacity) noexcept
+    {
+        if (configured_wave_limit != 0u &&
+            (command_count > configured_wave_limit ||
+             required_entries > configured_wave_limit - command_count))
+        {
+            return DynamicPlanAdmission::ConfiguredWaveLimit;
+        }
+        if (command_count > physical_plan_capacity ||
+            required_entries > physical_plan_capacity - command_count)
+        {
+            return DynamicPlanAdmission::PhysicalPlanOverflow;
+        }
+        return DynamicPlanAdmission::Admit;
     }
 
     template <typename RebalanceConfig>

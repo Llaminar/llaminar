@@ -10,7 +10,7 @@
 
 #include "execution/moe/MoEOverlayMPIResidencyConsensus.h"
 #include "execution/moe/MoEOverlayMPIEconomyEvidenceExchange.h"
-#include "execution/moe/MoEOverlayMPIHistogramPublisher.h"
+#include "execution/moe/MoEOverlayMPIResidencyProposalPublisher.h"
 #include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
 #include "execution/moe/MoEOverlayDistributedResidencyTransport.h"
 #include "execution/moe/MoEOverlayEconomyCalibrationController.h"
@@ -28,6 +28,7 @@
 #include <chrono>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -50,7 +51,7 @@ namespace llaminar2::test
                 .histogram_generation = 17,
                 .migration_count = 2,
                 .cycle_count = 1,
-                .transaction_fingerprint = {
+                .execution_fingerprint = {
                     .low = fingerprint_low,
                     .high = 0x8877665544332211ull,
                 },
@@ -69,6 +70,53 @@ namespace llaminar2::test
                 world_size,
                 MPI_COMM_WORLD);
         }
+
+        /**
+         * @brief Private test-only communicator for out-of-band coordination.
+         *
+         * The maintenance service deliberately blocks in collectives on its
+         * production context during terminal drain. A distinct communicator
+         * lets the test release a deliberately gated proposal without racing
+         * two collective sequences on the same communicator.
+         */
+        class ScopedControlCommunicator final
+        {
+        public:
+            /** @brief Duplicate the supplied live communicator collectively. */
+            explicit ScopedControlCommunicator(MPI_Comm source)
+            {
+                if (MPI_Comm_dup(source, &communicator_) != MPI_SUCCESS ||
+                    communicator_ == MPI_COMM_NULL)
+                {
+                    throw std::runtime_error(
+                        "Could not duplicate the MPI lifecycle-test communicator");
+                }
+            }
+
+            /** @brief Release the private communicator after every worker joins. */
+            ~ScopedControlCommunicator()
+            {
+                if (communicator_ != MPI_COMM_NULL &&
+                    MPI_Comm_free(&communicator_) != MPI_SUCCESS)
+                {
+                    std::terminate();
+                }
+            }
+
+            ScopedControlCommunicator(const ScopedControlCommunicator &) =
+                delete;
+            ScopedControlCommunicator &operator=(
+                const ScopedControlCommunicator &) = delete;
+
+            /** @return The private communicator owned by this scope. */
+            [[nodiscard]] MPI_Comm get() const noexcept
+            {
+                return communicator_;
+            }
+
+        private:
+            MPI_Comm communicator_ = MPI_COMM_NULL;
+        };
 
         /**
          * @brief Progress one exchange to completion without a blocking MPI wait.
@@ -97,18 +145,36 @@ namespace llaminar2::test
             }
         }
 
-        /** @brief Progress one coordinator publication without an MPI wait. */
-        std::shared_ptr<const DecodeExpertHistogramWindow>
-        finishHistogramPublication(
-            MoEOverlayMPIHistogramPublisher &publisher)
+        /** @brief Progress one canonical proposal publication without an MPI wait. */
+        std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+        finishProposalPublication(
+            MoEOverlayMPIResidencyProposalPublisher &publisher)
         {
-            std::shared_ptr<const DecodeExpertHistogramWindow> window;
+            std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+                accepted_proposal;
             for (;;)
             {
+                std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+                    proposal;
                 std::string error;
-                const auto progress = publisher.poll(&window, &error);
+                const auto progress = publisher.poll(&proposal, &error);
                 if (progress == MoEOverlayResidencyWaveProgress::Ready)
-                    return window;
+                {
+                    if (!publisher.isCoordinator() && proposal)
+                    {
+                        accepted_proposal = std::move(proposal);
+                        const bool accepted =
+                            publisher.acceptReceivedProposal(
+                                accepted_proposal->plan.histogram_window
+                                    ->generation,
+                                &error);
+                        EXPECT_TRUE(accepted) << error;
+                        if (!accepted)
+                            return {};
+                        continue;
+                    }
+                    return accepted_proposal;
+                }
                 EXPECT_EQ(
                     progress,
                     MoEOverlayResidencyWaveProgress::Pending)
@@ -343,6 +409,24 @@ namespace llaminar2::test
                                  .layer = 0,
                                  .nanoseconds_per_activation = {100, 200, 300}},
                             };
+                            /*
+                             * Live transaction admission prices the exact
+                             * participant critical path, not only its tier
+                             * aggregate. This two-participant fixture has one
+                             * layer, so totality requires one measured row per
+                             * physical owner. Keep the participant rows equal
+                             * to their single-member tier rows: the test is
+                             * isolating distributed transaction lifecycle, not
+                             * manufacturing an independent skew objective.
+                             */
+                            profile->participant_costs = {
+                                {.participant_id = 0,
+                                 .layer = 0,
+                                 .nanoseconds_per_activation = {10, 20, 30}},
+                                {.participant_id = 1,
+                                 .layer = 0,
+                                 .nanoseconds_per_activation = {100, 200, 300}},
+                            };
                             return profile;
                         }(),
                         .migration_cost_profile = []
@@ -473,6 +557,104 @@ namespace llaminar2::test
             std::vector<MoEOverlayResidencyTransactionFingerprint> fingerprints;
         };
 
+        /**
+         * @brief Hold real MPI proposal polling at an admitted generation.
+         *
+         * `beginPublish()` and the peer's constructor-time receive are real;
+         * only maintenance polling is withheld. This deterministically puts
+         * shutdown between proposal admission and acknowledgement without
+         * replacing any production transport or lifecycle implementation.
+         */
+        class PollGatedProposalPublisher final
+            : public IMoEOverlayResidencyProposalPublisher
+        {
+        public:
+            /** @brief Retain the real MPI publisher whose polls will be gated. */
+            explicit PollGatedProposalPublisher(
+                std::shared_ptr<MoEOverlayMPIResidencyProposalPublisher>
+                    publisher)
+                : publisher_(std::move(publisher))
+            {
+                if (!publisher_)
+                {
+                    throw std::invalid_argument(
+                        "A poll gate requires a real proposal publisher");
+                }
+            }
+
+            /** @brief Delegate publication so MPI owns the real packet sends. */
+            bool beginPublish(
+                const MoEOverlayDistributedResidencyProposal &proposal,
+                std::string *error) override
+            {
+                return publisher_->beginPublish(proposal, error);
+            }
+
+            /** @brief Suppress observation until the test releases progress. */
+            MoEOverlayResidencyWaveProgress poll(
+                std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+                    *received_proposal,
+                std::string *error) override
+            {
+                if (!polling_enabled_.load(std::memory_order_acquire))
+                {
+                    if (received_proposal)
+                        received_proposal->reset();
+                    if (error)
+                        error->clear();
+                    return MoEOverlayResidencyWaveProgress::Pending;
+                }
+                return publisher_->poll(received_proposal, error);
+            }
+
+            /** @brief Delegate post-adoption semantic acceptance. */
+            bool acceptReceivedProposal(
+                std::uint64_t histogram_generation,
+                std::string *error) override
+            {
+                return publisher_->acceptReceivedProposal(
+                    histogram_generation, error);
+            }
+
+            /** @brief Delegate fatal semantic rejection to the real MPI lane. */
+            void rejectReceivedProposal(
+                std::uint64_t histogram_generation,
+                std::string diagnostic) override
+            {
+                publisher_->rejectReceivedProposal(
+                    histogram_generation, std::move(diagnostic));
+            }
+
+            /** @brief Delegate the peer's next persistent receive arm. */
+            bool armReceive(std::string *error) override
+            {
+                return publisher_->armReceive(error);
+            }
+
+            /** @brief Drain the real MPI requests after maintenance quiesces. */
+            void stopAndDrain() override
+            {
+                publisher_->stopAndDrain();
+            }
+
+            /** @return Whether this rank is the arbitrary coordinator. */
+            [[nodiscard]] bool isCoordinator() const noexcept override
+            {
+                return publisher_->isCoordinator();
+            }
+
+            /** @brief Release the poll edge after terminal drain is active. */
+            void enablePolling() noexcept
+            {
+                polling_enabled_.store(true, std::memory_order_release);
+            }
+
+        private:
+            std::shared_ptr<MoEOverlayMPIResidencyProposalPublisher>
+                publisher_;
+            std::atomic<bool> polling_enabled_{false};
+        };
+
         /** @brief Progress one authority wave without a blocking MPI wait. */
         MoEOverlayResidencyApplyResult finishAuthorityWave(
             MoEOverlayResidencyAuthority &authority)
@@ -585,7 +767,7 @@ namespace llaminar2::test
             return {
                 .expected_epoch = 1,
                 .candidate_epoch = 2,
-                .transaction_fingerprint = {
+                .execution_fingerprint = {
                     .low = 0x6758493021abcdefull,
                     .high = 0xfedcba9876543210ull,
                 },
@@ -1440,6 +1622,92 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayMPIResidencyConsensus,
+        PreparedContextRestorationPurposeMovesExactRemoteBytes)
+    {
+        auto context = worldContext();
+        if (!requireTwoRanks(*context))
+            GTEST_SKIP() << "Remote restoration data plane requires two ranks";
+
+        constexpr std::size_t staging_bytes = 97;
+        MoEOverlayMPIRemoteProjectionTransport transport({
+            .mpi_context = context,
+            .lane_budget = {
+                .maximum_participants_per_cycle = 1,
+                .maximum_concurrent_cycles = 1,
+                .projections_per_expert = 1,
+            },
+            .staging_capacity_bytes = staging_bytes,
+            .perf_device = "mpi_remote_projection_restoration_test",
+        });
+
+        auto source_projection = remoteCpuProjection(117);
+        const auto projection_identity = remoteProjectionIdentity(
+            /*source_rank=*/0,
+            /*destination_rank=*/1,
+            /*migration_index=*/0,
+            ExpertTierWeightProjection::Gate);
+        const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(
+            projection_identity,
+            source_projection,
+            static_cast<std::uint32_t>(staging_bytes));
+        std::vector<std::uint8_t> destination_bytes(
+            source_projection.native_interleaved.size(), 0xa5u);
+        const auto source_lifetime = std::make_shared<int>(19);
+        const auto destination_lifetime = std::make_shared<int>(23);
+
+        auto binding = localHostBinding(
+            context->rank(),
+            /*lane_index=*/0,
+            projection_identity,
+            manifest,
+            source_projection,
+            destination_bytes,
+            source_lifetime,
+            destination_lifetime);
+        binding.purpose = MoEOverlayResidencyTransactionPurpose::
+            PreparedContextRestoration;
+        auto wave = transport.reserveWave({std::move(binding)});
+        ASSERT_EQ(wave.status, MoEOverlayResidencyStageStartStatus::Started)
+            << wave.error;
+        ASSERT_EQ(wave.operations.size(), 1u);
+        ASSERT_NE(wave.operations.front(), nullptr);
+
+        bool ready = false;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!ready && std::chrono::steady_clock::now() < deadline)
+        {
+            std::string error;
+            const auto progress = wave.operations.front()->poll(&error);
+            ASSERT_NE(progress, MoEOverlayResidencyWaveProgress::Failed)
+                << error;
+            ready = progress == MoEOverlayResidencyWaveProgress::Ready;
+            std::this_thread::yield();
+        }
+        ASSERT_TRUE(ready);
+
+        if (context->rank() == 1)
+        {
+            ASSERT_EQ(
+                destination_bytes.size(),
+                source_projection.native_interleaved.size());
+            EXPECT_TRUE(std::equal(
+                destination_bytes.begin(),
+                destination_bytes.end(),
+                source_projection.native_interleaved.begin(),
+                source_projection.native_interleaved.end()));
+        }
+        const auto stats = transport.stats();
+        EXPECT_EQ(stats.wave_reservations_started, 1u);
+        EXPECT_EQ(stats.wave_reservations_failed, 0u);
+        EXPECT_EQ(stats.operations_completed, 1u);
+        EXPECT_EQ(stats.protocol_failures, 0u);
+        EXPECT_EQ(stats.inference_stream_waits, 0u);
+        EXPECT_EQ(stats.blocking_synchronizations, 0u);
+    }
+
+    TEST(
+        Test__MoEOverlayMPIResidencyConsensus,
         DistributedPhysicalCpuFabricPublishesByteExactRCUBanks)
     {
         auto context = worldContext();
@@ -1460,8 +1728,6 @@ namespace llaminar2::test
         histogram_config.ownership = owner_map.layeredOwnership(1, 2);
         auto histogram = std::make_shared<DecodeExpertHistogram>(
             histogram_config);
-        const std::uint64_t counts[]{1, 100};
-        histogram->mergeLayerCounts(0, counts, 2, false);
 
         auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
             MoEOverlayResidencyAuthority::Config{
@@ -1477,6 +1743,66 @@ namespace llaminar2::test
                 .histogram = histogram.get(),
                 .perf_device = "mpi-distributed-physical-cpu",
             });
+        /* Every rank rotates the same pre-certification generation even though
+         * only the coordinator below retains policy/economy evidence. */
+        ASSERT_EQ(
+            authority->progressEconomyEvidenceRebase(),
+            MoEOverlayHistogramRebaseProgress::Complete);
+        if (context->rank() == 1)
+        {
+            auto service =
+                std::make_shared<MoERoutedTierServiceProfile>();
+            service->identity = "root-service-profile";
+            service->costs = {
+                {.tier_index = 0,
+                 .layer = 0,
+                 .nanoseconds_per_activation = {1, 1, 1}},
+                {.tier_index = 1,
+                 .layer = 0,
+                 .nanoseconds_per_activation = {100, 100, 100}},
+            };
+            service->participant_costs = {
+                {.participant_id = 0,
+                 .layer = 0,
+                 .nanoseconds_per_activation = {1, 1, 1}},
+                {.participant_id = 1,
+                 .layer = 0,
+                 .nanoseconds_per_activation = {100, 100, 100}},
+            };
+            auto migration =
+                std::make_shared<MoEOverlayMigrationCostProfile>();
+            migration->identity = "root-migration-profile";
+            migration->costs = {
+                {.source_participant = 0,
+                 .destination_participant = 1,
+                 .layer = 0,
+                 .transfer_and_repack_ns = 1},
+                {.source_participant = 1,
+                 .destination_participant = 0,
+                 .layer = 0,
+                 .transfer_and_repack_ns = 1},
+            };
+            authority->installEconomyCertification(
+                std::move(service),
+                std::move(migration),
+                {
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 1'000'000,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                });
+            ASSERT_EQ(
+                authority->activateOptimizationDemandAtRequestBoundary(),
+                MoEOverlayDemandActivationResult::Activated);
+        }
+
+        /* This is the first policy-bearing production window. Seed it only
+         * after the root has discarded its pre-certification generation so
+         * root and follower exercise the same executable proposal. */
+        const std::uint64_t counts[]{1, 100};
+        histogram->mergeLayerCounts(0, counts, 2, false);
+        histogram->recordTokenBoundary(0, 2);
         const auto initial_snapshot = authority->snapshot();
         ASSERT_NE(initial_snapshot, nullptr);
 
@@ -1555,7 +1881,67 @@ namespace llaminar2::test
             .perf_device = "mpi-distributed-physical-cpu",
         });
 
-        const auto transaction = authority->proposeFromHistogram();
+        /*
+         * Rank one is the sole policy authority.  Publish its dense executable
+         * plan over the same authenticated control lane used by production;
+         * the follower must reconstruct the transaction instead of rerunning
+         * policy without the coordinator's economy evidence.
+         */
+        constexpr int coordinator_world_rank = 1;
+        MoEOverlayMPIResidencyProposalPublisher proposal_publisher({
+            .mpi_context = context,
+            .coordinator_world_rank = coordinator_world_rank,
+            .num_layers = 1,
+            .num_experts = 2,
+            .perf_device = "mpi-distributed-physical-cpu",
+        });
+        MoEOverlayResidencyTransaction transaction;
+        if (proposal_publisher.isCoordinator())
+        {
+            transaction = authority->proposeFromHistogram();
+            ASSERT_TRUE(transaction.valid());
+            const auto proposal =
+                makeMoEOverlayDistributedResidencyProposal(
+                    authority->exportAuthoritativeResidencyPlan(transaction),
+                    transaction);
+            std::string proposal_error;
+            ASSERT_TRUE(proposal_publisher.beginPublish(
+                proposal, &proposal_error)) << proposal_error;
+        }
+
+        bool proposal_complete = false;
+        const auto proposal_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!proposal_complete &&
+               std::chrono::steady_clock::now() < proposal_deadline)
+        {
+            std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+                received;
+            std::string proposal_error;
+            const auto proposal_progress = proposal_publisher.poll(
+                &received, &proposal_error);
+            ASSERT_NE(
+                proposal_progress,
+                MoEOverlayResidencyWaveProgress::Failed) << proposal_error;
+            if (!proposal_publisher.isCoordinator() && received)
+            {
+                transaction = authority->adoptAuthoritativeResidencyPlan(
+                    received->plan);
+                ASSERT_TRUE(transaction.valid());
+                ASSERT_EQ(
+                    fingerprintMoEOverlayResidencyExecutionPlan(transaction),
+                    received->execution_fingerprint);
+                ASSERT_TRUE(proposal_publisher.acceptReceivedProposal(
+                    received->plan.histogram_window->generation,
+                    &proposal_error)) << proposal_error;
+                continue;
+            }
+            proposal_complete =
+                proposal_progress == MoEOverlayResidencyWaveProgress::Ready;
+            std::this_thread::yield();
+        }
+        ASSERT_TRUE(proposal_complete)
+            << "Authoritative physical-fabric proposal did not complete within five seconds";
         ASSERT_TRUE(transaction.valid());
         ASSERT_EQ(transaction.migrations.size(), 2u);
         EXPECT_TRUE(std::all_of(
@@ -1566,6 +1952,31 @@ namespace llaminar2::test
                 return migration.crossesWorldRank() &&
                        !migration.crossesBackend();
             }));
+
+        /*
+         * Model the production coordinator/follower split exactly. Rank one
+         * owns policy measurements while rank zero adopts only the executable
+         * plan. Before executable and policy fingerprints became distinct
+         * types, each rank embedded a different digest in its remote manifest
+         * and the destination rejected the source before any payload moved.
+         */
+        if (proposal_publisher.isCoordinator())
+        {
+            ASSERT_TRUE(transaction.economy.enabled);
+            auto follower_view = transaction;
+            follower_view.economy = {};
+            ASSERT_TRUE(follower_view.valid());
+            EXPECT_EQ(
+                fingerprintMoEOverlayResidencyExecutionPlan(transaction),
+                fingerprintMoEOverlayResidencyExecutionPlan(follower_view));
+            EXPECT_NE(
+                fingerprintMoEOverlayResidencyTransaction(transaction),
+                fingerprintMoEOverlayResidencyTransaction(follower_view));
+        }
+        else
+        {
+            EXPECT_FALSE(transaction.economy.enabled);
+        }
 
         auto progress = authority->beginApply(
             transaction, distributed_transport);
@@ -2024,15 +2435,15 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayMPIResidencyConsensus,
-        ArbitraryCoordinatorPublishesAuthenticatedFrozenWindow)
+        ArbitraryCoordinatorPublishesAuthenticatedCanonicalProposal)
     {
         auto context = worldContext();
         if (!requireTwoRanks(*context))
-            GTEST_SKIP() << "Histogram publication requires exactly two ranks";
+            GTEST_SKIP() << "Proposal publication requires exactly two ranks";
 
         /* Rank one is deliberate: hardware/routing ownership is not rank zero. */
         constexpr int coordinator_world_rank = 1;
-        MoEOverlayMPIHistogramPublisher publisher({
+        MoEOverlayMPIResidencyProposalPublisher publisher({
             .mpi_context = context,
             .coordinator_world_rank = coordinator_world_rank,
             .num_layers = 2,
@@ -2053,40 +2464,315 @@ namespace llaminar2::test
                 0, 0, 0, 0, 0, 0,
             },
         };
+        MoEOverlayDistributedResidencyProposal source_proposal{
+            .plan = {
+                .expected_epoch = 1,
+                .num_layers = 2,
+                .num_experts = 3,
+                .histogram_window =
+                    std::make_shared<DecodeExpertHistogramWindow>(source),
+                .entries = std::vector<
+                    MoEOverlayAuthoritativeResidencyEntry>(
+                    6,
+                    MoEOverlayAuthoritativeResidencyEntry{
+                        .candidate_tier_idx = 0,
+                        .candidate_owner_participant = 0,
+                    }),
+            },
+            .execution_fingerprint = {
+                .low = 0x1020304050607080ull,
+                .high = 0x8070605040302010ull,
+            },
+            .policy_fingerprint = {
+                .low = 0x1122334455667788ull,
+                .high = 0x8877665544332211ull,
+            },
+        };
+        ASSERT_TRUE(source_proposal.valid());
         if (publisher.isCoordinator())
         {
             std::string error;
-            ASSERT_TRUE(publisher.beginPublish(source, &error)) << error;
+            ASSERT_TRUE(publisher.beginPublish(source_proposal, &error))
+                << error;
         }
 
-        const auto received = finishHistogramPublication(publisher);
+        const auto received = finishProposalPublication(publisher);
         if (publisher.isCoordinator())
         {
             EXPECT_EQ(received, nullptr);
             EXPECT_EQ(
                 publisher.state(),
-                MoEOverlayMPIHistogramPublisherState::Idle);
+                MoEOverlayMPIResidencyProposalPublisherState::Idle);
             const auto stats = publisher.stats();
             EXPECT_EQ(stats.publications_started, 1u);
             EXPECT_EQ(stats.publications_completed, 1u);
             EXPECT_EQ(
                 stats.bytes_sent,
-                moeOverlayDistributedHistogramWireBytes(2, 3));
+                moeOverlayDistributedResidencyProposalWireBytes(2, 3));
         }
         else
         {
             ASSERT_NE(received, nullptr);
-            EXPECT_EQ(received->generation, source.generation);
-            EXPECT_EQ(received->token_count, source.token_count);
-            EXPECT_EQ(received->expert_counts, source.expert_counts);
+            EXPECT_EQ(
+                received->plan.histogram_window->generation,
+                source.generation);
+            EXPECT_EQ(
+                received->plan.histogram_window->token_count,
+                source.token_count);
+            EXPECT_EQ(
+                received->plan.histogram_window->expert_counts,
+                source.expert_counts);
+            EXPECT_EQ(
+                received->execution_fingerprint,
+                source_proposal.execution_fingerprint);
             const auto stats = publisher.stats();
             EXPECT_EQ(stats.receives_armed, 1u);
             EXPECT_EQ(stats.windows_received, 1u);
             EXPECT_EQ(
                 stats.bytes_received,
-                moeOverlayDistributedHistogramWireBytes(2, 3));
+                moeOverlayDistributedResidencyProposalWireBytes(2, 3));
         }
         EXPECT_EQ(publisher.stats().blocking_inference_waits, 0u);
+    }
+
+    TEST(
+        Test__MoEOverlayMPIResidencyConsensus,
+        RepeatedProposalPublisherLifecyclesDrainBeforeCommunicatorReuse)
+    {
+        auto context = worldContext();
+        if (!requireTwoRanks(*context))
+            GTEST_SKIP() << "Proposal lifecycle reuse requires exactly two ranks";
+
+        /*
+         * Production parity retains one MPI process while repeatedly replacing
+         * model runners.  Every runner owns a fresh proposal communicator, and
+         * the follower normally tears it down with the next passive receive
+         * already armed.  Exercise enough alternating coordinator lifetimes to
+         * force MPI context-id reuse and prove that no cancelled receive,
+         * acknowledgement, or packet can escape into a later runner.
+         */
+        constexpr std::uint64_t kLifecycleCount = 64u;
+        for (std::uint64_t lifecycle = 0; lifecycle < kLifecycleCount;
+             ++lifecycle)
+        {
+            const int coordinator_world_rank =
+                static_cast<int>(lifecycle % 2u);
+            MoEOverlayMPIResidencyProposalPublisher publisher({
+                .mpi_context = context,
+                .coordinator_world_rank = coordinator_world_rank,
+                .num_layers = 2,
+                .num_experts = 3,
+                .perf_device = "mpi_proposal_reuse_test",
+            });
+
+            const std::uint64_t generation = lifecycle + 1u;
+            MoEOverlayDistributedResidencyProposal proposal{
+                .plan = {
+                    .expected_epoch = generation,
+                    .num_layers = 2,
+                    .num_experts = 3,
+                    .histogram_window =
+                        std::make_shared<DecodeExpertHistogramWindow>(
+                            DecodeExpertHistogramWindow{
+                                .generation = generation,
+                                .token_count = 256,
+                                .source_token_counts = {256, 0, 0},
+                                .num_layers = 2,
+                                .num_experts = 3,
+                                .expert_counts = {9, 8, 7, 60, 50, 40},
+                                .source_expert_counts = {
+                                    9, 8, 7, 60, 50, 40,
+                                    0, 0, 0, 0, 0, 0,
+                                    0, 0, 0, 0, 0, 0,
+                                },
+                            }),
+                    .entries = std::vector<
+                        MoEOverlayAuthoritativeResidencyEntry>(
+                        6,
+                        MoEOverlayAuthoritativeResidencyEntry{
+                            .candidate_tier_idx = 0,
+                            .candidate_owner_participant = 0,
+                        }),
+                },
+                .execution_fingerprint = {
+                    .low = 0x1020304050607080ull ^ generation,
+                    .high = 0x8070605040302010ull,
+                },
+                .policy_fingerprint = {
+                    .low = 0x1122334455667788ull ^ generation,
+                    .high = 0x8877665544332211ull,
+                },
+            };
+            ASSERT_TRUE(proposal.valid());
+            if (publisher.isCoordinator())
+            {
+                std::string error;
+                ASSERT_TRUE(publisher.beginPublish(proposal, &error))
+                    << "lifecycle=" << lifecycle << " " << error;
+            }
+
+            const auto received = finishProposalPublication(publisher);
+            if (publisher.isCoordinator())
+            {
+                EXPECT_EQ(received, nullptr) << "lifecycle=" << lifecycle;
+                EXPECT_EQ(
+                    publisher.stats().publications_completed,
+                    1u) << "lifecycle=" << lifecycle;
+            }
+            else
+            {
+                ASSERT_NE(received, nullptr) << "lifecycle=" << lifecycle;
+                EXPECT_EQ(
+                    received->plan.histogram_window->generation,
+                    generation) << "lifecycle=" << lifecycle;
+
+                /* Match the maintenance service's steady state: it rearms the
+                 * immutable mailbox before the current runner is retired. */
+                std::string error;
+                ASSERT_TRUE(publisher.armReceive(&error))
+                    << "lifecycle=" << lifecycle << " " << error;
+            }
+
+            publisher.stopAndDrain();
+            EXPECT_EQ(
+                publisher.state(),
+                MoEOverlayMPIResidencyProposalPublisherState::Stopped)
+                << "lifecycle=" << lifecycle;
+
+            /* Keep collective communicator creation/free order symmetric even
+             * if one rank completes local acknowledgement progress first. */
+            context->barrier();
+        }
+    }
+
+    TEST(
+        Test__MoEOverlayMPIResidencyConsensus,
+        RepeatedDistributedMaintenanceLifecyclesDrainBeforeContextReuse)
+    {
+        auto context = worldContext();
+        if (!requireTwoRanks(*context))
+        {
+            GTEST_SKIP()
+                << "Distributed maintenance reuse requires exactly two ranks";
+        }
+
+        /*
+         * A production parity process retains MPI_COMM_WORLD while replacing
+         * complete model runners.  This boundary is deliberately broader than
+         * the publisher-only regression above: every lifetime creates a
+         * maintenance worker, policy authority, proposal lane, distributed
+         * transaction lane, and their private communicators.  Alternating the
+         * arbitrary coordinator and exceeding the campaign's observed
+         * pre-failure lifetime count catches leaked worker progress or MPI
+         * requests that a fresh publisher in isolation cannot expose.
+         */
+        constexpr std::uint64_t kLifecycleCount = 64u;
+        for (std::uint64_t lifecycle = 0; lifecycle < kLifecycleCount;
+             ++lifecycle)
+        {
+            const int coordinator_world_rank =
+                static_cast<int>(lifecycle % 2u);
+            {
+                auto fixture = realTransaction(coordinator_world_rank);
+                if (context->rank() == coordinator_world_rank)
+                {
+                    const std::vector<std::uint64_t> counts{1, 2, 100, 90};
+                    fixture.histogram->mergeLayerCounts(
+                        0,
+                        counts.data(),
+                        static_cast<int>(counts.size()),
+                        false);
+                    fixture.histogram->recordTokenBoundary(0, 4);
+                }
+                else
+                {
+                    ASSERT_FALSE(fixture.histogram->windowFull())
+                        << "lifecycle=" << lifecycle;
+                }
+
+                ImmediateLocalResidencyTransport local;
+                auto consensus =
+                    std::make_shared<MoEOverlayMPIResidencyConsensus>(
+                        MoEOverlayMPIResidencyConsensus::Config{
+                            .mpi_context = context,
+                            .perf_device =
+                                "repeated_mpi_maintenance_test",
+                        });
+                auto transport =
+                    std::make_shared<
+                        MoEOverlayDistributedResidencyTransport>(
+                        MoEOverlayDistributedResidencyTransport::Config{
+                            .local_transport = &local,
+                            .consensus = consensus,
+                            .perf_device =
+                                "repeated_mpi_maintenance_test",
+                        });
+                auto publisher =
+                    std::make_shared<
+                        MoEOverlayMPIResidencyProposalPublisher>(
+                        MoEOverlayMPIResidencyProposalPublisher::Config{
+                            .mpi_context = context,
+                            .coordinator_world_rank =
+                                coordinator_world_rank,
+                            .num_layers = 1,
+                            .num_experts = 4,
+                            .perf_device =
+                                "repeated_mpi_maintenance_test",
+                        });
+                auto authority =
+                    std::shared_ptr<MoEOverlayResidencyAuthority>(
+                        std::move(fixture.authority));
+                MoEOverlayResidencyMaintenanceService service({
+                    .authority = authority,
+                    .transport = transport,
+                    .proposal_publisher = publisher,
+                    .distributed_context = context,
+                    .idle_poll_interval = std::chrono::microseconds(100),
+                    .perf_device = "repeated_mpi_maintenance_test",
+                });
+
+                context->barrier();
+                service.start();
+                ASSERT_TRUE(waitForService(
+                    [&]
+                    {
+                        return !service.healthy() ||
+                               (authority->snapshot()->epoch == 2u &&
+                                service.stats().committed_waves == 1u);
+                    })) << "lifecycle=" << lifecycle << " "
+                        << service.failureMessage();
+                ASSERT_TRUE(service.healthy())
+                    << "lifecycle=" << lifecycle << " "
+                    << service.failureMessage();
+
+                service.stopAndDrain(
+                    MoEOverlayMaintenanceDrainScope::DistributedTopology);
+                EXPECT_EQ(
+                    service.state(),
+                    MoEOverlayMaintenanceState::Stopped)
+                    << "lifecycle=" << lifecycle;
+                EXPECT_EQ(service.stats().committed_waves, 1u)
+                    << "lifecycle=" << lifecycle;
+                EXPECT_EQ(local.retirements, 1)
+                    << "lifecycle=" << lifecycle;
+                EXPECT_TRUE(consensus->idle())
+                    << "lifecycle=" << lifecycle;
+
+                /* The stopped worker no longer polls this lane.  Explicitly
+                 * cancel the follower's prearmed next-generation receive (or
+                 * reap the coordinator's idle lane) before any shared owner is
+                 * released, matching runner teardown order. */
+                publisher->stopAndDrain();
+                EXPECT_EQ(
+                    publisher->state(),
+                    MoEOverlayMPIResidencyProposalPublisherState::Stopped)
+                    << "lifecycle=" << lifecycle;
+            }
+
+            /* Complete destruction before collective context allocation for
+             * the next runner, and keep that order identical on both ranks. */
+            context->barrier();
+        }
     }
 
     TEST(
@@ -2371,6 +3057,7 @@ namespace llaminar2::test
         auto context = worldContext();
         if (!requireTwoRanks(*context))
             GTEST_SKIP() << "Distributed maintenance requires exactly two ranks";
+        ScopedControlCommunicator control(context->communicator());
 
         /* The logical continuation/router root deliberately lives on rank one. */
         constexpr int coordinator_world_rank = 1;
@@ -2406,20 +3093,23 @@ namespace llaminar2::test
                     .perf_device = "real_mpi_maintenance_test",
                 });
         auto publisher =
-            std::make_shared<MoEOverlayMPIHistogramPublisher>(
-                MoEOverlayMPIHistogramPublisher::Config{
+            std::make_shared<MoEOverlayMPIResidencyProposalPublisher>(
+                MoEOverlayMPIResidencyProposalPublisher::Config{
                     .mpi_context = context,
                     .coordinator_world_rank = coordinator_world_rank,
                     .num_layers = 1,
                     .num_experts = 4,
                     .perf_device = "real_mpi_maintenance_test",
                 });
+        auto poll_gate =
+            std::make_shared<PollGatedProposalPublisher>(publisher);
         auto authority = std::shared_ptr<MoEOverlayResidencyAuthority>(
             std::move(fixture.authority));
         MoEOverlayResidencyMaintenanceService service({
             .authority = authority,
             .transport = local_transport,
-            .histogram_publisher = publisher,
+            .proposal_publisher = poll_gate,
+            .distributed_context = context,
             .idle_poll_interval = std::chrono::microseconds(100),
             .perf_device = "real_mpi_maintenance_test",
         });
@@ -2427,14 +3117,81 @@ namespace llaminar2::test
         context->barrier();
         service.start();
 
-        ASSERT_TRUE(waitForService(
+        /* Hold the real packet between MPI admission and peer acknowledgement. */
+        int publication_admitted = 0;
+        if (context->rank() == coordinator_world_rank)
+        {
+            publication_admitted = waitForService(
+                [&]
+                {
+                    return !service.healthy() ||
+                           publisher->stats().publications_started == 1u;
+                })
+                ? 1
+                : 0;
+        }
+        ASSERT_EQ(
+            MPI_Bcast(
+                &publication_admitted,
+                1,
+                MPI_INT,
+                coordinator_world_rank,
+                control.get()),
+            MPI_SUCCESS);
+        ASSERT_EQ(publication_admitted, 1) << service.failureMessage();
+        ASSERT_TRUE(service.healthy()) << service.failureMessage();
+        EXPECT_EQ(
+            publisher->state(),
+            context->rank() == coordinator_world_rank
+                ? MoEOverlayMPIResidencyProposalPublisherState::Publishing
+                : MoEOverlayMPIResidencyProposalPublisherState::Receiving);
+
+        /* A live distributed worker cannot be torn down by one rank alone. */
+        EXPECT_THROW(
+            service.stopAndDrain(
+                MoEOverlayMaintenanceDrainScope::ProcessLocalComposition),
+            std::logic_error);
+
+        std::atomic<bool> drain_returned{false};
+        std::jthread drain_thread(
             [&]
             {
-                return !service.healthy() ||
-                       (authority->snapshot()->epoch == 2u &&
-                        service.stats().committed_waves == 1u);
-            })) << service.failureMessage();
+                service.stopAndDrain(
+                    MoEOverlayMaintenanceDrainScope::DistributedTopology);
+                drain_returned.store(true, std::memory_order_release);
+            });
+
+        /* The coordinator must enter drain while the follower remains live. */
+        int coordinator_is_draining = 0;
+        if (context->rank() == coordinator_world_rank)
+        {
+            coordinator_is_draining = waitForService(
+                [&]
+                {
+                    return service.state() ==
+                           MoEOverlayMaintenanceState::Draining;
+                })
+                ? 1
+                : 0;
+        }
+        EXPECT_EQ(
+            MPI_Bcast(
+                &coordinator_is_draining,
+                1,
+                MPI_INT,
+                coordinator_world_rank,
+                control.get()),
+            MPI_SUCCESS);
+        EXPECT_EQ(coordinator_is_draining, 1);
+        EXPECT_FALSE(drain_returned.load(std::memory_order_acquire));
+
+        poll_gate->enablePolling();
+        service.notifyMaintenanceProgress();
+        drain_thread.join();
+
         ASSERT_TRUE(service.healthy()) << service.failureMessage();
+        EXPECT_TRUE(drain_returned.load(std::memory_order_acquire));
+        EXPECT_EQ(service.state(), MoEOverlayMaintenanceState::Stopped);
         EXPECT_EQ(authority->snapshot()->epoch, 2u);
         EXPECT_EQ(service.stats().proposals, 1u);
         EXPECT_EQ(service.stats().committed_waves, 1u);
@@ -2445,19 +3202,18 @@ namespace llaminar2::test
 
         if (context->rank() == coordinator_world_rank)
         {
-            EXPECT_EQ(service.stats().histogram_windows_published, 1u);
+            EXPECT_EQ(service.stats().proposals_published, 1u);
             EXPECT_EQ(publisher->stats().publications_completed, 1u);
         }
         else
         {
-            EXPECT_EQ(service.stats().histogram_windows_received, 1u);
-            EXPECT_EQ(service.stats().histogram_receives_rearmed, 1u);
+            EXPECT_EQ(service.stats().proposals_received, 1u);
+            EXPECT_EQ(service.stats().proposal_receives_rearmed, 1u);
             EXPECT_EQ(publisher->stats().windows_received, 1u);
             EXPECT_EQ(publisher->stats().receives_armed, 2u);
         }
 
-        service.stopAndDrain();
-        publisher->stopAndDrain();
+        poll_gate->stopAndDrain();
         EXPECT_TRUE(consensus->idle());
         ASSERT_EQ(local.fingerprints.size(), 1u);
         EXPECT_EQ(local.retirements, 1);

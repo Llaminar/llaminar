@@ -18,6 +18,7 @@
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "loaders/GPUVramPreflight.h"
+#include "planning/CapturedGraphMemoryEstimator.h"
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
 
@@ -42,6 +43,29 @@ namespace llaminar2
         size_t maximum_source_bytes = 0;
     };
 
+    /**
+     * @brief Resolve the physical native graph inventory for ExpertOverlay.
+     * @param model_layer_count Number of main-model routed layers.
+     * @param authority_execution Frozen host/device authority topology.
+     * @param model_graph_identity_count Retained prefill/decode/bridge graphs.
+     * @param auxiliary_native_executable_count Retained activation and MTP
+     *        helper/controller graphs.
+     * @return Valid inventory consumed by device-memory admission.
+     * @throws std::invalid_argument for unresolved authority or bad geometry.
+     * @throws std::overflow_error when the segment count exceeds size_t.
+     *
+     * Host-resident overlays contain an intentional CPU ticket boundary at
+     * every routed layer. Their continuation graph therefore owns one captured
+     * unit before each boundary plus one terminal unit. All-GPU device-owned
+     * timelines remain one native executable per complete graph identity.
+     */
+    [[nodiscard]] CapturedGraphExecutableInventory
+    resolveMoEOverlayCapturedGraphExecutableInventory(
+        int model_layer_count,
+        MoEOverlayAuthorityExecutionKind authority_execution,
+        std::size_t model_graph_identity_count,
+        std::size_t auxiliary_native_executable_count);
+
     /** @brief Complete immutable input for one rank's zero-routed-expert BOM. */
     struct MoEOverlayLocalCapacityPlannerInput
     {
@@ -65,8 +89,8 @@ namespace llaminar2
         int activation_channel_row_capacity = 0;
         /** Main plus routed MTP graph families sharing each channel. */
         std::size_t activation_graph_family_count = 0;
-        /** Native graph executables simultaneously retained on each GPU. */
-        std::size_t captured_graph_executable_count = 0;
+        /** Exact physical forward/segment/helper inventory retained per GPU. */
+        CapturedGraphExecutableInventory captured_graph_inventory;
         /** Required whenever this rank's physical resources include a GPU. */
         std::optional<MoEOverlayGPUWeightLoadCapacityInput>
             gpu_weight_load;

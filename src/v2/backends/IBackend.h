@@ -25,9 +25,121 @@
 
 namespace llaminar2
 {
+    class TransferEngine;
     struct MappedTransferProgressClaim;
     struct MappedTransferProgressCommand;
     struct MappedTransferProgressCompletion;
+
+    /**
+     * @brief One backend-owned device-memory observation at a lifecycle edge.
+     *
+     * Driver-visible free memory includes every live allocation and every
+     * runtime cache.  The graph and default asynchronous-pool fields split out
+     * the two caches that CUDA/HIP expose directly.  A false availability flag
+     * means that the installed runtime cannot account for that cache; it never
+     * means that a zero byte measurement was observed.
+     */
+    struct DeviceMemoryCacheSnapshot
+    {
+        size_t driver_free_bytes = 0u; ///< Free bytes reported by the GPU driver.
+        size_t graph_used_bytes = 0u; ///< Bytes still owned by graph allocations.
+        size_t graph_reserved_bytes = 0u; ///< Graph allocator backing bytes.
+        size_t async_pool_used_bytes = 0u; ///< Live default-pool allocations.
+        size_t async_pool_reserved_bytes = 0u; ///< Default-pool backing bytes.
+        bool graph_accounting_available = false; ///< Graph attributes were queried.
+        bool async_pool_accounting_available = false; ///< Pool attributes were queried.
+    };
+
+    /**
+     * @brief Low-level result of trimming unused CUDA/HIP runtime caches.
+     *
+     * This type deliberately does not claim that live model allocations were
+     * reclaimed.  Backend trim APIs may return only unused graph or async-pool
+     * reservations; ownership teardown must precede this call.  Production
+     * callers consume it through TransferEngine, which adds the lifecycle
+     * intent and minimum-delta certificate.
+     */
+    struct DeviceMemoryCacheReclamationResult
+    {
+        bool supported = false; ///< Backend implements scoped cache reclamation.
+        bool success = false; ///< Every required query/trim operation succeeded.
+        bool graph_trim_invoked = false; ///< Graph cache trim reached the runtime.
+        bool async_pool_trim_invoked = false; ///< Default-pool trim reached the runtime.
+        DeviceMemoryCacheSnapshot before; ///< Observation before cache trimming.
+        DeviceMemoryCacheSnapshot after; ///< Observation after cache trimming.
+        std::string diagnostic; ///< Precise failure or capability diagnostic.
+    };
+
+    /**
+     * @brief Exact canonical allocator ownership for one physical GPU.
+     *
+     * Driver free-memory is affected by runtime metadata, graph pools, and
+     * allocator caching.  This observation instead sums the live allocations
+     * made through the backend's canonical allocator, so a model-retirement
+     * ticket can prove its exact BOM without guessing fresh-context overhead.
+     */
+    struct DeviceAllocationAccounting
+    {
+        bool supported = false; ///< Backend exposes canonical allocation truth.
+        size_t active_allocations = 0u; ///< Number of live allocation owners.
+        size_t active_bytes = 0u; ///< Exact sum of live allocation byte counts.
+        std::string diagnostic; ///< Precise failure or capability diagnostic.
+    };
+
+    /**
+     * @brief Unforgeable authority to retire one exclusive GPU runtime generation.
+     *
+     * Only TransferEngine can construct this request, after consuming an
+     * exclusive model-retirement ticket and retiring the process-local worker
+     * context generation. Keeping the constructor private prevents ordinary
+     * backend callers from turning a device reset into an ad hoc memory-recovery
+     * mechanism.
+     */
+    class DeviceRuntimeGenerationRetirementRequest final
+    {
+    public:
+        /** @return Backend-local CUDA/HIP ordinal whose generation is retiring. */
+        [[nodiscard]] int deviceOrdinal() const noexcept
+        {
+            return device_ordinal_;
+        }
+
+    private:
+        friend class TransferEngine;
+
+        /** @brief Construct only at TransferEngine's exclusive ownership edge. */
+        explicit DeviceRuntimeGenerationRetirementRequest(
+            int device_ordinal) noexcept
+            : device_ordinal_(device_ordinal)
+        {
+        }
+
+        int device_ordinal_ = -1; ///< Exact backend-local physical device.
+    };
+
+    /**
+     * @brief Backend proof for one completed CUDA/HIP runtime reset generation.
+     *
+     * A successful result means the backend proved that no tracked device
+     * allocation or host registration remained, invalidated its own cached
+     * runtime handles, reset the named device context, and published a new
+     * monotonically increasing generation. Driver free-memory observations
+     * bracket the reset and are evidence, not admission authority.
+     */
+    struct DeviceRuntimeGenerationRetirementResult
+    {
+        bool supported = false; ///< Backend implements explicit generation reset.
+        bool success = false; ///< Every precondition, reset, and publication passed.
+        bool reset_invoked = false; ///< Native cuda/hip device reset was called.
+        std::uint64_t retired_generation = 0u; ///< Generation invalidated by reset.
+        std::uint64_t active_generation = 0u; ///< Fresh generation after reset.
+        size_t driver_free_bytes_before = 0u; ///< Driver free bytes before reset.
+        size_t driver_free_bytes_after = 0u; ///< Driver free bytes after reset.
+        size_t tracked_device_allocations = 0u; ///< Live allocations at preflight.
+        size_t tracked_device_allocation_bytes = 0u; ///< Live bytes at preflight.
+        size_t tracked_host_registrations = 0u; ///< Live registrations at preflight.
+        std::string diagnostic; ///< Precise failure or completion diagnostic.
+    };
 
     namespace sampling_math
     {
@@ -556,6 +668,94 @@ namespace llaminar2
          * @return Free memory in bytes (0 on error)
          */
         virtual size_t deviceMemoryFree(int device_id) const = 0;
+
+        /**
+         * @brief Observe exact allocations owned by the canonical backend.
+         *
+         * GPU implementations must serialize this observation against
+         * allocation/free and native runtime reset. The default is unsupported
+         * so an unaccounted backend cannot certify exclusive model retirement.
+         */
+        [[nodiscard]] virtual DeviceAllocationAccounting
+        deviceAllocationAccounting(int device_id) const
+        {
+            (void)device_id;
+            DeviceAllocationAccounting accounting;
+            accounting.diagnostic =
+                "backend does not expose canonical device-allocation accounting";
+            return accounting;
+        }
+
+        /**
+         * @brief Return unused backend runtime caches to the device allocator.
+         *
+         * This infrastructure hook is intentionally narrower than a device
+         * reset: it must preserve live allocations, contexts, streams, events,
+         * graphs, and library handles owned by other models.  Callers must
+         * first retire the exact execution topology whose caches they expect
+         * to release.  Production code calls TransferEngine rather than this
+         * method directly.
+         *
+         * CPU and test backends inherit an unsupported result unless they
+         * explicitly model this lifecycle operation.
+         *
+         * @param device_id Backend-local GPU ordinal.
+         * @return Before/after accounting plus typed success state.
+         */
+        virtual DeviceMemoryCacheReclamationResult
+        trimUnusedDeviceMemoryCaches(int device_id)
+        {
+            (void)device_id;
+            DeviceMemoryCacheReclamationResult result;
+            result.diagnostic =
+                "backend does not support scoped device-memory cache reclamation";
+            return result;
+        }
+
+        /**
+         * @brief Retire one exclusive CUDA/HIP runtime generation.
+         *
+         * This is an infrastructure-only primitive. Production code must call
+         * TransferEngine's two-phase exclusive model-retirement API, which is
+         * the only authority able to construct @p request. Implementations must
+         * reject the operation while any backend-tracked allocation or host
+         * registration remains, clear every backend-owned cached runtime handle,
+         * and publish a fresh generation only after the native reset succeeds.
+         *
+         * CPU and test backends inherit an unsupported result unless they model
+         * this lifecycle explicitly.
+         *
+         * @param request Unforgeable exact-device retirement authority.
+         * @return Typed reset and generation-publication evidence.
+         */
+        virtual DeviceRuntimeGenerationRetirementResult
+        retireExclusiveDeviceRuntimeGeneration(
+            const DeviceRuntimeGenerationRetirementRequest &request)
+        {
+            (void)request;
+            DeviceRuntimeGenerationRetirementResult result;
+            result.diagnostic =
+                "backend does not support exclusive runtime-generation retirement";
+            return result;
+        }
+
+        /**
+         * @brief Return the current runtime generation for one physical device.
+         *
+         * Persistent host-side caches that mirror device modules or handles use
+         * this identity in their cache keys. Zero means the backend does not
+         * expose reset generations and must never be treated as a live GPU
+         * generation.
+         *
+         * @param device_id Backend-local device ordinal.
+         * @return Non-zero active generation for supporting GPU backends.
+         */
+        [[nodiscard]] virtual std::uint64_t
+        deviceRuntimeGeneration(int device_id) const
+        {
+            (void)device_id;
+            return 0u;
+        }
 
         // ====================================================================
         // Capability Queries

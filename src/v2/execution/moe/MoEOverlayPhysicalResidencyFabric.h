@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,7 @@ namespace llaminar2
     class MoEOverlayMPIRemoteProjectionTransport;
     class MappedTransferProgressEpoch;
     struct MoEOverlayDevicePhysicalMovementBatch;
-    struct MoEOverlayResidencyTransactionFingerprint;
+    struct MoEOverlayResidencyExecutionFingerprint;
 
     /**
      * @brief Device-independent shape and source provenance for one projection.
@@ -142,6 +143,31 @@ namespace llaminar2
     };
 
     /**
+     * @brief Canonical process-local weight banks transferred back to a model context.
+     *
+     * Dynamic movement may return the logical owner map to its prepared placement
+     * while a resident still occupies an over-provisioned migration shadow slot.
+     * This value is produced only after every old inference reader and maintenance
+     * operation has drained.  Every retained triplet then aliases one of the exact
+     * loader-era allocations enrolled by the physical fabric, so destroying the
+     * fabric cannot leave a shadow arena pinned by the reusable model registry.
+     */
+    struct MoEOverlayReusableContextSeal
+    {
+        /** Published logical epoch whose owner map was physically canonicalized. */
+        std::uint64_t source_epoch = 0;
+        /** Complete immutable banks for every process-local participant. */
+        std::vector<MoEOverlayParticipantResidencyBank> local_banks;
+        /** Residents already occupying an adopted loader-era allocation. */
+        std::size_t retained_canonical_experts = 0;
+        /** Residents copied asynchronously out of a temporary shadow allocation. */
+        std::size_t compacted_shadow_experts = 0;
+
+        /** @return Whether this value names a positive epoch and complete banks. */
+        [[nodiscard]] bool valid() const noexcept;
+    };
+
+    /**
      * @brief Local slot, engine, and lane authority for arbitrary-tier moves.
      *
      * `create()` is a model-setup operation.  It requires the complete initial
@@ -215,8 +241,6 @@ namespace llaminar2
              * pools. It must equal the residency authority's scheduling cap.
              */
             std::size_t maximum_concurrent_cycles = 1;
-            /** Bytes kept free after each GPU shadow-slot arena allocation. */
-            std::size_t gpu_vram_safety_margin_bytes = 0;
             /**
              * Collect exact device/host timing evidence on local transfer lanes.
              * Dynamic production enables this for economy certification;
@@ -369,6 +393,26 @@ namespace llaminar2
         [[nodiscard]] bool submitOutstandingTransferProgress(
             std::string *error = nullptr) noexcept override;
 
+        /**
+         * @brief Canonicalize the restored placement for model-context reuse.
+         * @param published_epoch Exact quiescent participant-bank epoch.
+         * @param error Optional precise lifecycle, capacity, or transfer failure.
+         * @return A complete terminal seal, or no value on a fatal invariant.
+         *
+         * The caller must already own the typed terminal context-seal lifecycle:
+         * no inference ticket, migration wave, retirement, or abort may remain.
+         * This method first proves that every current resident matches the initial
+         * prepared owner map, then copies only non-canonical residents through the
+         * setup-owned CPU/GPU lanes.  GPU completion is event-polled and CPU work
+         * uses the retained background workers; no stream or device synchronization
+         * is introduced.  The returned banks, rather than the transient published
+         * banks, are the sole legal source for the reusable model registry.
+         */
+        [[nodiscard]] std::optional<MoEOverlayReusableContextSeal>
+        sealReusableInitialPlacement(
+            std::uint64_t published_epoch,
+            std::string *error = nullptr) noexcept;
+
         /** @return Race-safe cumulative model-lifetime proof counters. */
         [[nodiscard]] MoEOverlayPhysicalResidencyFabricStats stats()
             const noexcept;
@@ -385,7 +429,8 @@ namespace llaminar2
             MoEOverlayResidencyTransactionPurpose purpose,
             std::uint64_t expected_epoch,
             std::uint64_t candidate_epoch,
-            const MoEOverlayResidencyTransactionFingerprint &fingerprint,
+            const MoEOverlayResidencyExecutionFingerprint &
+                execution_fingerprint,
             const std::vector<MoEOverlayTierMigration> &migrations,
             const std::vector<MoEOverlayTierMigrationCycle> &migration_cycles,
             const std::vector<MoEOverlayTierShadowRequirement> &

@@ -3662,14 +3662,6 @@ namespace llaminar2
         /// (env: LLAMINAR_VRAM_BOM=1)
         bool vram_bom = false;
 
-        /// GPU weight-pipeline VRAM preflight safety margin as a percent of total VRAM.
-        /// (env: LLAMINAR_GPU_VRAM_PREFLIGHT_MARGIN_PCT, default: 5)
-        double gpu_vram_preflight_margin_pct = 5.0;
-
-        /// Minimum GPU weight-pipeline VRAM preflight safety margin in MiB.
-        /// (env: LLAMINAR_GPU_VRAM_PREFLIGHT_MIN_MARGIN_MB, default: 512)
-        int gpu_vram_preflight_min_margin_mib = 512;
-
         static const char *envValue(const char *name)
         {
             return name ? std::getenv(name) : nullptr;
@@ -3736,17 +3728,6 @@ namespace llaminar2
                 moe_expert_overlay.profile_csv_path = csv;
         }
 
-        void reloadGpuVramPreflightEnv()
-        {
-            gpu_vram_preflight_margin_pct = 5.0;
-            if (const char *pct = std::getenv("LLAMINAR_GPU_VRAM_PREFLIGHT_MARGIN_PCT"))
-                gpu_vram_preflight_margin_pct = std::max(0.0, std::atof(pct));
-
-            gpu_vram_preflight_min_margin_mib = 512;
-            if (const char *min_mib = std::getenv("LLAMINAR_GPU_VRAM_PREFLIGHT_MIN_MARGIN_MB"))
-                gpu_vram_preflight_min_margin_mib = std::max(0, std::atoi(min_mib));
-        }
-
         DebugEnv()
         {
             const char *tp_env = std::getenv("LLAMINAR_TP_TIMING");
@@ -3773,7 +3754,6 @@ namespace llaminar2
             weight_lifecycle_trace = weight_trace && std::string(weight_trace) == "1";
             vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
             vram_bom = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_BOM"));
-            reloadGpuVramPreflightEnv();
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             const char *act_rot = std::getenv("LLAMINAR_ACTIVATION_ROTATION");
@@ -3936,7 +3916,6 @@ namespace llaminar2
             weight_lifecycle_trace = weight_trace && std::string(weight_trace) == "1";
             vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
             vram_bom = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_BOM"));
-            reloadGpuVramPreflightEnv();
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             activation_rotation = true; // default on

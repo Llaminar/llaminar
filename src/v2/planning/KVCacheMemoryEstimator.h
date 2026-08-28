@@ -14,6 +14,20 @@
 
 namespace llaminar2
 {
+    /** @brief Native packed bytes for one logical GPU prefix-cache layer. */
+    struct GPULogicalKVBlockEstimate
+    {
+        /** Key payload, including the immutable AQ8 anchor when compressed. */
+        std::size_t k_bytes = 0;
+        /** Value payload in the configured native cache codec. */
+        std::size_t v_bytes = 0;
+
+        /** @return Combined K/V payload bytes. */
+        [[nodiscard]] std::size_t totalBytes() const noexcept
+        {
+            return k_bytes + v_bytes;
+        }
+    };
 
     /** @brief Exact backend-aware persistent KV-cache memory estimator. */
     class KVCacheMemoryEstimator
@@ -39,6 +53,31 @@ namespace llaminar2
             int n_layers,
             int batch_size,
             int max_seq_len,
+            int n_kv_heads,
+            int head_dim,
+            const std::string &kv_precision,
+            DeviceId device);
+
+        /**
+         * @brief Estimate one GPU cache layer's canonical archive payload.
+         *
+         * This mirrors `CUDARingKVCache::logicalBlockLayout()` and its ROCm
+         * counterpart, including the per-block AQ8 key anchor used by Q8/TQ
+         * caches. Metadata, rotation matrices, and live ring storage are not
+         * part of a serialized prefix payload and remain in @ref estimate.
+         *
+         * @param token_count Tokens serialized in the prefix block.
+         * @param n_kv_heads Participant-local KV head count.
+         * @param head_dim Coordinates per head.
+         * @param kv_precision Canonical runtime storage precision.
+         * @param device Exact CUDA or ROCm owner.
+         * @return Exact K and V byte counts for one full-attention layer.
+         * @throws std::invalid_argument for CPU, unsupported codecs, or
+         *         invalid positive geometry.
+         * @throws std::overflow_error when byte arithmetic overflows.
+         */
+        static GPULogicalKVBlockEstimate estimateGPULogicalBlock(
+            int token_count,
             int n_kv_heads,
             int head_dim,
             const std::string &kv_precision,

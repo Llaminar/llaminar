@@ -776,6 +776,18 @@ namespace llaminar2
              */
             int mtp_depth = -1;
 
+            /**
+             * Exact immutable residency epoch selected for this graph sequence.
+             *
+             * A heterogeneous MTP sequence may span several retained graphs
+             * while background maintenance publishes a successor placement.
+             * Every manual sparse boundary must therefore consume this exact
+             * epoch rather than independently sampling the newest host
+             * publication. Zero means the caller has no sequence-level
+             * placement authority and preserves process-local admission.
+             */
+            uint64_t placement_epoch = 0;
+
             /** @brief Return true when the runner supplied a usable protocol identity. */
             [[nodiscard]] bool valid() const noexcept { return generation_id != 0; }
             /** @return Whether the mathematical phase was supplied explicitly. */
@@ -783,6 +795,11 @@ namespace llaminar2
             {
                 return execution_semantics !=
                        ExecutionSemantics::Unspecified;
+            }
+            /** @return Whether the caller pinned one exact residency epoch. */
+            [[nodiscard]] bool hasPinnedPlacementEpoch() const noexcept
+            {
+                return placement_epoch != 0;
             }
         };
 

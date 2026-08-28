@@ -404,12 +404,19 @@ namespace llaminar2
                         value,
                         "moe.migration_payoff_horizon_tokens");
             }
-            else if (normalized_key == "migration_max_cycles_per_wave")
+            else if (normalized_key == "migration_transfer_slots")
             {
-                config.moe_rebalance.migration_max_cycles_per_wave =
+                config.moe_rebalance.migration_transfer_slots =
                     parsePositiveUint32Value(
                         value,
-                        "moe.migration_max_cycles_per_wave");
+                        "moe.migration_transfer_slots");
+            }
+            else if (normalized_key == "migration_cycles_per_wave")
+            {
+                config.moe_rebalance.migration_cycles_per_wave =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.migration_cycles_per_wave");
             }
             else if (normalized_key ==
                      "routed_prefill_assignment_window_tokens")
@@ -1821,17 +1828,31 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-migration-max-cycles-per-wave",
+            .long_name = "--moe-migration-transfer-slots",
             .category = "MoE Configuration",
-            .value_label = "<cycles>",
-            .description = "Maximum closed expert residency migration cycles staged concurrently in one async wave (default: 1)",
+            .value_label = "<slots>",
+            .description = "Preallocated parallel expert-migration cycle slots and setup-time physical capacity (default: 1)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    c.moe_rebalance.migration_max_cycles_per_wave =
+                    c.moe_rebalance.migration_transfer_slots =
                         parsePositiveUint32Value(
                             v,
-                            "--moe-migration-max-cycles-per-wave");
+                            "--moe-migration-transfer-slots");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-migration-cycles-per-wave",
+            .category = "MoE Configuration",
+            .value_label = "<cycles>",
+            .description = "Active economical migration cycles admitted per wave; defaults to the physical transfer-slot count",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.migration_cycles_per_wave =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-migration-cycles-per-wave");
                 }),
         });
         spec.add({
@@ -3354,12 +3375,20 @@ namespace llaminar2
                         "moe_migration_payoff_horizon_tokens");
             }
             else if (normalized_key ==
-                     "moe_migration_max_cycles_per_wave")
+                     "moe_migration_transfer_slots")
             {
-                config.moe_rebalance.migration_max_cycles_per_wave =
+                config.moe_rebalance.migration_transfer_slots =
                     parsePositiveUint32Value(
                         value,
-                        "moe_migration_max_cycles_per_wave");
+                        "moe_migration_transfer_slots");
+            }
+            else if (normalized_key ==
+                     "moe_migration_cycles_per_wave")
+            {
+                config.moe_rebalance.migration_cycles_per_wave =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_migration_cycles_per_wave");
             }
             else if (normalized_key ==
                      "moe_routed_prefill_assignment_window_tokens")

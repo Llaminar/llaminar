@@ -37,6 +37,7 @@
 #include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
 #include "../device/WorkspaceAllocator.h"
+#include "../device/ReusableExecutionWorkspace.h"
 #include "../../mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
 #include "../../moe/ExpertWeightTransfer.h"            // For ReceivedWeightsMap, ExpertMigration
@@ -44,6 +45,7 @@
 #include "../../moe/CPUCurrentBatchLLEP.h"             // CPU transient LLEP authority
 #include "../../moe/MoEExpertOverlayProfiler.h"        // For overlay profiling summary flush
 #include "../../moe/MoEOverlayEpochLeaseLifecycle.h"  // Typed epoch submission ownership
+#include "../../moe/MoESparseRequestIdentity.h"       // Local vs root request authority
 #include "../../factory/InferenceRunnerFactory.h"      // For FactoryPPStageConfig
 #include "../../../snapshots/SnapshotCapture.h"        // Snapshot capture (extracted Phase 2)
 #include "../engine/ForwardExecutionEngine.h"          // Forward execution engine (extracted Phase 3)
@@ -88,6 +90,148 @@
 
 namespace llaminar2
 {
+    class MoEOverlayInferenceParticipantGraphScope;
+
+    /**
+     * @brief Typed ownership state for the persistent MTP terminal-hidden mailbox.
+     *
+     * `PREFIX_TERMINAL_HIDDEN` has one stable arena address, but several legal
+     * producers: a main forward, prefix restore, accepted-verifier publication,
+     * or checkpoint restore.  A boolean cannot distinguish those transitions
+     * and previously let a sidecar reader infer its source from unrelated
+     * `last_forward_*` geometry.  This type records the actual producer and a
+     * monotonically increasing publication generation instead.
+     *
+     * Sidecars acquire a @ref ReadLease before enqueueing work.  The graph's
+     * buffer contract must prove the mailbox is read-only, and the lease then
+     * proves that no lifecycle transition replaced or invalidated the
+     * publication while the read was being submitted.
+     */
+    class MTPTerminalHiddenPublication
+    {
+    public:
+        /** @brief Legal producers of a current terminal-hidden row. */
+        enum class Source : uint8_t
+        {
+            Unavailable,
+            MainForward,
+            PrefixRestore,
+            AcceptedVerifier,
+            CheckpointRestore,
+        };
+
+        /** @brief Immutable identity of one current mailbox publication. */
+        struct ReadLease
+        {
+            Source source = Source::Unavailable;
+            uint64_t generation = 0;
+
+            /** @return true when this lease names a published row. */
+            [[nodiscard]] bool valid() const noexcept
+            {
+                return source != Source::Unavailable && generation != 0;
+            }
+        };
+
+        /** @return whether a legal producer currently owns the mailbox row. */
+        [[nodiscard]] bool current() const noexcept
+        {
+            return source_ != Source::Unavailable;
+        }
+
+        /** @return the typed producer of the current row, if any. */
+        [[nodiscard]] Source source() const noexcept { return source_; }
+
+        /** @return Stable diagnostic name for a publication source. */
+        [[nodiscard]] static const char *sourceName(Source source) noexcept
+        {
+            switch (source)
+            {
+            case Source::Unavailable:
+                return "unavailable";
+            case Source::MainForward:
+                return "main_forward";
+            case Source::PrefixRestore:
+                return "prefix_restore";
+            case Source::AcceptedVerifier:
+                return "accepted_verifier";
+            case Source::CheckpointRestore:
+                return "checkpoint_restore";
+            }
+            return "invalid";
+        }
+
+        /** @return the monotonic publication/invalidation generation. */
+        [[nodiscard]] uint64_t generation() const noexcept
+        {
+            return generation_;
+        }
+
+        /** @brief Invalidate the row after a live-state boundary or reset. */
+        void invalidate() noexcept
+        {
+            source_ = Source::Unavailable;
+            advanceGeneration();
+        }
+
+        /** @brief Publish a row archived by the current main-model forward. */
+        void publishMainForward() noexcept { publish(Source::MainForward); }
+
+        /** @brief Publish a row restored from the persistent prefix cache. */
+        void publishPrefixRestore() noexcept { publish(Source::PrefixRestore); }
+
+        /** @brief Publish a row selected from accepted verifier state. */
+        void publishAcceptedVerifier() noexcept
+        {
+            publish(Source::AcceptedVerifier);
+        }
+
+        /** @brief Publish a row restored from a live rollback checkpoint. */
+        void publishCheckpointRestore() noexcept
+        {
+            publish(Source::CheckpointRestore);
+        }
+
+        /**
+         * @brief Acquire immutable evidence for one read-only sidecar use.
+         * @return A valid lease for a current row, otherwise `std::nullopt`.
+         */
+        [[nodiscard]] std::optional<ReadLease> acquireReadLease() const noexcept
+        {
+            if (!current())
+                return std::nullopt;
+            return ReadLease{.source = source_, .generation = generation_};
+        }
+
+        /**
+         * @brief Verify that a read-only consumer did not cross a publication edge.
+         * @param lease Identity acquired immediately before the consumer launch.
+         * @return true only while the same producer publication remains current.
+         */
+        [[nodiscard]] bool stillOwns(const ReadLease &lease) const noexcept
+        {
+            return lease.valid() && current() && source_ == lease.source &&
+                   generation_ == lease.generation;
+        }
+
+    private:
+        void publish(Source source) noexcept
+        {
+            source_ = source;
+            advanceGeneration();
+        }
+
+        void advanceGeneration() noexcept
+        {
+            ++generation_;
+            if (generation_ == 0)
+                ++generation_;
+        }
+
+        Source source_ = Source::Unavailable;
+        uint64_t generation_ = 0;
+    };
+
     enum class DeviceTimelineRole : uint8_t;
 
     // Forward declarations
@@ -111,6 +255,7 @@ namespace llaminar2
     class RamPrefixStorageBackend;
     class DiskPrefixStorageBackend;
     class DeviceHotPrefixStorageBackend;
+    enum class PrefixDeviceHotLeaseResult;
     class ActivationRotation;
     enum class KVCacheLayoutMode : uint8_t;
 
@@ -298,11 +443,8 @@ namespace llaminar2
         /// uses this vector to gather each request's real terminal hidden row.
         std::vector<int> last_forward_request_lengths;
 
-        /// True when `prefix_terminal_hidden` is the accepted terminal row for
-        /// the current live state. Ordinary forward makes this stale; prefix
-        /// restore, accepted-state publication, or an explicit terminal refresh
-        /// makes it current again.
-        bool mtp_terminal_hidden_current = false;
+        /// Typed ownership of the row stored in `prefix_terminal_hidden`.
+        MTPTerminalHiddenPublication mtp_terminal_hidden_publication;
 
         /// Per-device KV caches for Pipeline Parallelism
         /// When PP is enabled, each PP stage device has its own KV cache containing
@@ -433,7 +575,7 @@ namespace llaminar2
             last_forward_seq_len = 0;
             last_forward_batch_size = 0;
             last_forward_request_lengths.clear();
-            mtp_terminal_hidden_current = false;
+            mtp_terminal_hidden_publication.invalidate();
         }
 
         /**
@@ -539,7 +681,8 @@ namespace llaminar2
     class DeviceGraphOrchestrator : public IInferenceRunner,
                                     public IForwardExecutionHost,
                                     public ICPUCurrentBatchLLEPPhysicalExecutor,
-                                    public IMoEOverlayDeviceInferenceBoundary
+                                    public IMoEOverlayDeviceInferenceBoundary,
+                                    public IMoEOverlayDeviceInitialRuntimePublisher
     {
     public:
         // =========================================================================
@@ -574,6 +717,14 @@ namespace llaminar2
             std::shared_ptr<IGraphBuilder> graph_builder;
 
             // ---- Optional: distributed execution ----
+
+            /**
+             * Rank-local MPI execution context used by production global-TP
+             * graphs. This is mutually exclusive with @ref topology: a graph
+             * may consume the concrete MPI authority or an injected topology
+             * interface, never two competing rank authorities.
+             */
+            std::shared_ptr<IMPIContext> mpi_ctx = nullptr;
 
             /// MPI topology for work distribution (nullptr for single-rank)
             std::shared_ptr<IMPITopology> topology = nullptr;
@@ -620,6 +771,13 @@ namespace llaminar2
 
             /// Graph caching configuration
             GraphCacheConfig cache_config;
+
+            /**
+             * Model-lifetime backing owner imported/exported with the prepared
+             * model context. Null keeps isolated/unit runners self-contained.
+             */
+            std::shared_ptr<ReusableExecutionWorkspaceRegistry>
+                reusable_execution_workspaces;
         };
 
         // =========================================================================
@@ -631,8 +789,9 @@ namespace llaminar2
          *
          * Accepts all configuration-time dependencies in a single struct.
          * Required fields: model_ctx, graph_builder.
-         * Optional: topology, collective_ctx, pp_stage_config, pipeline_config,
-         *           turboquant_ctx, weight_streamer, weight_manager, etc.
+         * Optional: mpi_ctx or topology, collective_ctx, pp_stage_config,
+         *           pipeline_config, turboquant_ctx, weight_streamer,
+         *           weight_manager, etc.
          *
          * @param deps Dependency injection container
          */
@@ -2543,6 +2702,13 @@ namespace llaminar2
 
         /** Return the active MoE placement epoch for graph-cache keying. */
         uint64_t moePlacementEpoch() const override;
+        /**
+         * @brief Return the sole authority's effective runtime placement epoch.
+         *
+         * Device-owned controllers contribute their local durable epoch. A
+         * heterogeneous host-owned overlay is sampled directly through its
+         * shared immutable RCU snapshot, without a device-orchestrator mirror.
+         */
         uint64_t moeRuntimeMovementEpoch() const override;
         std::string prefillGraphDomainId() const override;
         int prefillGraphParticipantId() const override;
@@ -3660,17 +3826,17 @@ namespace llaminar2
             clearDeviceResidentLogicalSequenceStateMailbox();
             retireDeviceResidentMTPTransaction();
             if (device_generation_storage_.active_request_count != 0 ||
-                device_generation_state_ready_.valid)
+                !device_generation_state_ready_.handoff.inactive())
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Request reset reached mutation after an unjoined device-generation transaction"
                           << " active_requests="
                           << device_generation_storage_.active_request_count
-                          << " ready="
-                          << device_generation_state_ready_.valid);
+                          << " handoff_phase="
+                          << static_cast<int>(
+                                 device_generation_state_ready_
+                                     .handoff.phase()));
                 std::terminate();
             }
-            device_generation_state_ready_.producer_stream = nullptr;
-            device_generation_state_ready_.request_count = 0;
             cache_stats_ = CacheStats{};
             reset_transaction.enter(
                 RequestStateResetTransaction::Phase::
@@ -3804,6 +3970,9 @@ namespace llaminar2
                 InferenceStateResetRequest::requestBoundary("clear_cache"));
         }
 
+        /** @copydoc IInferenceRunner::purgePrefixCache */
+        bool purgePrefixCache() override;
+
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
 
         /**
@@ -3835,6 +4004,10 @@ namespace llaminar2
         /** @brief Return this graph's one canonical overlay runtime source. */
         std::vector<MoEOverlayDeviceControllerRuntimeBinding>
         moeOverlayDeviceControllerRuntimeBindings() const override;
+
+        /** @copydoc IMoEOverlayDeviceInitialRuntimePublisher::publishMoEOverlayDeviceInitialRuntime */
+        [[nodiscard]] bool publishMoEOverlayDeviceInitialRuntime(
+            void *controller_stream) override;
 
         /**
          * @brief Join committed inference and release its overlay reader.
@@ -3950,7 +4123,11 @@ namespace llaminar2
 
         PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
         bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
-        bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
+        /** @copydoc IInferenceRunner::harvestPrefix */
+        bool harvestPrefix(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            int prompt_token_count) override;
         bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
         PrefixStateSnapshot captureLivePrefixCheckpoint(
@@ -5938,6 +6115,16 @@ namespace llaminar2
             bool apply_status_valid = false;
             uint32_t status_code = 0;
             uint32_t invalid_runtime_layers = 0;
+            /** First runtime layer rejected by the live device claim-index scan. */
+            uint32_t first_invalid_runtime_layer =
+                kDeviceMoEInvalidSlot;
+            uint32_t first_invalid_runtime_active_bank =
+                kDeviceMoEInvalidSlot;
+            uint32_t first_invalid_runtime_active_epoch = 0;
+            uint32_t first_invalid_runtime_expert_count = 0;
+            uint32_t first_invalid_runtime_participant_id =
+                kDeviceMoEInvalidSlot;
+            uint32_t first_invalid_runtime_participant_count = 0;
             uint32_t plan_overflow = 0;
             uint32_t capacity_limited_candidates = 0;
             uint32_t payload_bucket_overflow = 0;
@@ -6357,13 +6544,33 @@ namespace llaminar2
          *
          * Every present payload section is uploaded on `producer_stream`; one
          * readiness event is published after the final transfer, and only then
-         * is the completed handle installed in the device-hot LRU. The method
-         * performs no stream or device synchronization.
+         * is the completed handle installed in the device-hot LRU. Busy means
+         * a request still owns every arena slot and is a valid RAM-tier restore
+         * outcome; Error means the event/copy lifecycle itself failed. The
+         * method performs no stream or device synchronization.
          */
-        bool promotePrefixBlockToDeviceHotForRestore(
+        PrefixDeviceHotLeaseResult promotePrefixBlockToDeviceHotForRestore(
             const PrefixBlockHandle &lower_tier_handle,
             void *producer_stream,
             PrefixBlockHandle *promoted_handle);
+
+        /**
+         * @brief Publish one validated prefix fingerprint transition.
+         *
+         * `InvalidateOnRebalance` first rebases the cache's volatile capacity
+         * to the new request namespace. Other policies retain compatible
+         * records and only replace the active lookup key. This is the sole
+         * post-initialization writer of `prefix_fingerprint_`.
+         *
+         * @param next_fingerprint Non-zero fingerprint built from live state.
+         * @param policy Configured MoE/prefix compatibility policy.
+         * @param operation Stable lifecycle name for diagnostics.
+         * @return True after the complete transition is published.
+         */
+        bool publishPrefixFingerprintTransition(
+            uint64_t next_fingerprint,
+            PrefixCacheMoEPolicy policy,
+            const char *operation);
 
         bool refreshPrefixPayloadLayoutForLiveHybridState(const char *operation);
         bool isPrefixCacheMoEModel() const;
@@ -6469,6 +6676,7 @@ namespace llaminar2
         PrefixCacheFingerprintResult buildCurrentPrefixFingerprint(
             const PrefixCacheRuntimeConfig &prefix_config) const;
         PrefixCacheKey makePrefixKeyForBlock(
+            uint64_t request_fingerprint,
             const std::vector<int32_t> &tokens,
             int block_index,
             uint64_t parent_hash) const;
@@ -6507,6 +6715,59 @@ namespace llaminar2
                               bool kv_cache_only = false,
                               BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
                               bool defer_final_sync = false);
+
+        /**
+         * @brief Submit one retained depth-zero MTP sidecar transaction.
+         *
+         * This is the common ownership and ordering boundary for scalar decode,
+         * grouped verification, shifted-prefill catch-up, and prefix restore.
+         * GPU callers provide device-owned token/position state and receive an
+         * event-published completion; host synchronization is not a supported
+         * completion contract. When `terminal_hidden_buffer_id` names the
+         * persistent prefix mailbox, this method acquires and verifies its
+         * typed read lease around graph submission so no caller can bypass the
+         * publication lifecycle.
+         *
+         * @param draft_condition_tokens Optional host token rows; CPU-only in
+         *        production and mutually exclusive with a device token source.
+         * @param token_count Logical rows per request.
+         * @param terminal_hidden Exact hidden-state tensor bound by the graph.
+         * @param position_id Scalar starting position when no row override is
+         *        supplied.
+         * @param sidecar_perf_context Stable diagnostic/capture context name.
+         * @param kv_cache_only Execute shifted-KV catch-up without logits.
+         * @param terminal_hidden_buffer_id Arena identity of `terminal_hidden`.
+         * @param defer_final_sync Require event-published asynchronous completion.
+         * @param draft_condition_tokens_device Optional device token source.
+         * @param draft_condition_ready_slot Device scheduler slot whose event
+         *        orders the token source, or `-1` when not slot-backed.
+         * @param draft_condition_ready_is_target Whether the ready slot belongs
+         *        to target rather than draft sampling.
+         * @param request_batch Number of independent request rows.
+         * @param position_ids_override Optional host position per request.
+         * @param position_ids_device_override Optional device position rows.
+         * @param speculative_outcome_meta_device Optional resident verifier
+         *        outcome metadata used to compose the next condition tokens.
+         * @param speculative_outcome_meta_stride Metadata elements per request.
+         * @param speculative_outcome_output_tokens_device Optional resident
+         *        verifier output-token matrix.
+         * @param speculative_outcome_output_token_stride Token elements per
+         *        verifier-output request row.
+         * @param speculative_outcome_request_index Request row selected from
+         *        the resident verifier outcome, or `-1` when unused.
+         * @param speculative_first_output_token_index First verifier token to
+         *        consume for this transaction.
+         * @param speculative_outcome_ready_event Exact producer event for the
+         *        resident verifier outcome.
+         * @param draft_condition_token_stride Elements between token rows in
+         *        the device source.
+         * @param draft_condition_ready_count Number of scheduler-ready rows.
+         * @param draft_condition_ready_stride Elements between ready rows.
+         * @param device_position_offset Offset added by the device composer.
+         * @param first_seq_idx First shifted-KV sequence owned by this batch.
+         * @return `true` only after the graph and every typed publication/event
+         *         edge have been submitted successfully.
+         */
         bool executeMTPDepth0Batched(const int32_t *draft_condition_tokens,
                                      int token_count,
                                      TensorBase *terminal_hidden,
@@ -6657,14 +6918,16 @@ namespace llaminar2
          * @param batch_size Number of logical requests represented by the
          *        hidden-state tensor.
          * @param request_lengths Optional real row count for each padded request.
-         * @param terminal_hidden_archived True only when the caller has already
-         *        copied the latest terminal row into `PREFIX_TERMINAL_HIDDEN`.
+         * @param terminal_hidden_source Typed producer when the caller already
+         *        copied the latest terminal row into
+         *        `PREFIX_TERMINAL_HIDDEN`; otherwise `Unavailable`.
          */
         void noteMainForwardHiddenProducedForMTP(
             int seq_len,
             int batch_size,
             std::vector<int> request_lengths = {},
-            bool terminal_hidden_archived = false);
+            MTPTerminalHiddenPublication::Source terminal_hidden_source =
+                MTPTerminalHiddenPublication::Source::Unavailable);
 
         /**
          * @brief Resolve the terminal-hidden tensor that should seed a first MTP sidecar.
@@ -7375,7 +7638,10 @@ namespace llaminar2
          * are intentionally absent from this host cache.  The stage compares
          * every captured pointer and scalar before reuse; workspace generation
          * adds allocator lifetime to that identity.  Any mismatch destroys the
-         * native executable before a replacement is built.
+         * native executable before a replacement is built. MoE identities
+         * borrow the one model-lifetime producer stream owned by the runtime-
+         * table histogram authority; dense identities retain a cache-owned
+         * stream under the same immutable-binding rule.
          */
         struct MTPSpeculativeStatePublicationGraphCache
         {
@@ -7401,6 +7667,42 @@ namespace llaminar2
                 }
             }
 
+            /**
+             * @brief Discard one captured identity while retaining its exact stream.
+             *
+             * Publication identities are mutually exclusive and execute on one
+             * exact producer stream. ExpertOverlay streams are borrowed from
+             * the table authority; dense streams remain cache-owned. Replacing
+             * a request geometry must preserve that binding rather than
+             * manufacture a new producer. Native executables,
+             * diagnostic snapshot topology, and stage pointers are identity-
+             * specific and are cleared before the replacement is constructed.
+             * Full orchestrator teardown must call @ref invalidate instead.
+             */
+            void replaceIdentityPreservingProducerStream()
+            {
+                segment_cache.reset(
+                    DeviceGraphExecutor::GraphSegmentCache::
+                        StreamResetPolicy::Preserve);
+                /* Snapshot slots describe the discarded stage topology.  They
+                 * cannot follow the retained stream into the new identity. */
+                segment_cache.snapshot_manifest.clear();
+                segment_cache.snapshot_configuration_epoch = 0;
+                graph.reset();
+                stage = nullptr;
+                workspace_generation = 0;
+                valid = false;
+            }
+
+            /**
+             * @brief Destroy the graph and release its typed stream binding.
+             *
+             * This is the terminal binding-lifetime transition used before
+             * device contexts, runtime tables, or arena storage are released.
+             * Cache-owned streams are destroyed; borrowed streams are fenced
+             * and released to their table authority. Live graph replacement
+             * uses @ref replaceIdentityPreservingProducerStream.
+             */
             void invalidate()
             {
                 segment_cache.reset(
@@ -7657,8 +7959,10 @@ namespace llaminar2
             /** Greedy/stochastic compact-outcome topology in every branch. */
             std::optional<DeviceGenerationSamplingMode> sampling_mode;
             size_t fragment_count = 0;
-            /** Number of fragments whose execution is selected by device state. */
-            size_t conditional_fragment_count = 0;
+            /** Number of native conditional nodes embedded in the executable. */
+            size_t native_conditional_fragment_count = 0;
+            /** Number of retained semantic fragments selected by a device ticket. */
+            size_t ticket_conditioned_fragment_count = 0;
             ExecutionKind execution_kind = ExecutionKind::Unmaterialized;
             bool valid = false;
             bool launched = false;
@@ -7697,7 +8001,8 @@ namespace llaminar2
                 depth_policy_mode = -1;
                 sampling_mode.reset();
                 fragment_count = 0;
-                conditional_fragment_count = 0;
+                native_conditional_fragment_count = 0;
+                ticket_conditioned_fragment_count = 0;
                 branch_offsets.fill(0);
                 branch_fragment_counts.fill(0);
                 execution_kind = ExecutionKind::Unmaterialized;
@@ -8281,14 +8586,40 @@ namespace llaminar2
         /// no external factory is provided via setTensorFactory().
         std::unique_ptr<TensorFactory> owned_tensor_factory_;
 
-        /// Standalone workspace allocator
-        std::unique_ptr<WorkspaceAllocator> workspace_allocator_;
+        /** Exclusive model-lifetime workspace slot, when reuse is configured. */
+        std::unique_ptr<ReusableExecutionWorkspaceRegistry::Lease>
+            reusable_workspace_lease_;
+
+        /** Registry retained by the model-context reuse contract. */
+        std::shared_ptr<ReusableExecutionWorkspaceRegistry>
+            reusable_execution_workspaces_;
+
+        /// Workspace allocator owned either by the lease or this runner.
+        std::shared_ptr<WorkspaceAllocator> workspace_allocator_;
 
         /// Whether the complete serial graph family has published its workspace.
         bool forward_workspace_family_materialized_ = false;
 
         /// Immutable GPU workspace generation certified by that family manifest.
         uint64_t forward_workspace_family_generation_ = 0;
+
+        /**
+         * @brief Admission state of this runner's immutable serving family.
+         *
+         * Workspace-family construction and native capture are backend-owned,
+         * but both must converge on the same explicit setup edge before a
+         * distributed ExpertOverlay transaction coordinator can be installed.
+         * Keeping that edge typed prevents caller ordering or a PerfStats
+         * observation from masquerading as lifecycle authority.
+         */
+        enum class ServingGraphFamilyLifecycle : std::uint8_t
+        {
+            AwaitingMaterialization = 0, ///< No complete serving inventory has been certified.
+            Sealed, ///< The backend-specific family is immutable and admissible.
+        };
+
+        ServingGraphFamilyLifecycle serving_graph_family_lifecycle_ =
+            ServingGraphFamilyLifecycle::AwaitingMaterialization;
 
         /// Unified buffer arena — owns and tracks coherence for all activation buffers
         std::unique_ptr<BufferArena> arena_;
@@ -8758,29 +9089,7 @@ namespace llaminar2
         struct PendingDeviceGenerationStateReadyState
         {
             std::shared_ptr<void> event;
-            void *producer_stream = nullptr;
-            bool valid = false;
-            int request_count = 0;
-        };
-
-        /**
-         * @brief Semantic writer crossing the generation-controller event edge.
-         *
-         * Admission initializes only controller-owned scheduling storage. A
-         * committed transaction and the composed-parent terminal also close
-         * the verifier identity row written by their retained preparation
-         * graph. Encoding that distinction here prevents admission from
-         * falsely publishing an unmaterialized verifier row and prevents a
-         * terminal parent from leaving the arena pointed at transaction zero.
-         */
-        enum class DeviceGenerationStatePublicationKind : std::uint8_t
-        {
-            /// Request admission initialized response, control, and ticket rows.
-            Admission,
-            /// The externally scheduled transaction committed state and identity.
-            CommittedTransaction,
-            /// The retained generation parent completed every admitted transaction.
-            Terminal,
+            DeviceGenerationStateHandoff handoff;
         };
 
         /**
@@ -8903,6 +9212,15 @@ namespace llaminar2
             main_graph_build_device_state_ready_;
         PendingGraphBuildDeviceStateReadyState
             mtp_graph_build_device_state_ready_;
+        /**
+         * Model-lifetime handoff from graph-build publication to the first
+         * topology-wide controller stream. Two events keep the source join and
+         * completed retained-family publication independently reusable.
+         */
+        std::shared_ptr<void> moe_overlay_initial_runtime_source_ready_event_;
+        std::shared_ptr<void> moe_overlay_initial_runtime_published_event_;
+        void *moe_overlay_initial_runtime_publication_stream_ = nullptr;
+        bool moe_overlay_initial_runtime_published_ = false;
         PendingRequestInputAdmissionReadyState
             request_input_admission_ready_;
         PendingDeviceGenerationStateReadyState
@@ -8950,6 +9268,40 @@ namespace llaminar2
          * after either condition would permit use-after-release GPU work.
          */
         void retirePublishedDeviceWorkBeforeArenaRelease() noexcept;
+
+        /**
+         * @brief Retire model references to context-owned execution streams.
+         *
+         * Runtime MoE tables may retain exact producer stream identities so a
+         * maintenance stream can order asynchronous histogram rotations. The
+         * graph builder owns those references, while @ref device_contexts_
+         * owns the streams themselves. This terminal edge lets the builder
+         * join and forget every borrowed identity after inference work is done
+         * and before captured topology destroys the stream owners.
+         *
+         * A failure is fatal because continuing would make later table
+         * destruction dereference an already-dead backend stream.
+         */
+        void retireGraphBorrowedExecutionStreamsBeforeTopologyRelease() noexcept;
+
+        /**
+         * @brief Destroy every captured executable before arena storage is released.
+         *
+         * Native CUDA/HIP graph executables borrow arena pointers.  Releasing a
+         * backing allocation while an executable still embeds that address is
+         * not a valid ownership transition: HIP can defer the physical free
+         * until the graph dies, leaving the allocation unavailable to the next
+         * runner even though Llaminar no longer records it as live.  This method
+         * performs the typed `Captured -> Destroyed` transition for the complete
+         * graph family, then releases graph-owned streams and device contexts.
+         *
+         * The device-generation parent is destroyed before the child captures
+         * it names.  All remaining graph caches are destroyed before
+         * `device_contexts_`, and the caller invokes this method while `arena_`
+         * is still alive.  The operation is idempotent and teardown-only; exact
+         * producer-event retirement must already have completed.
+         */
+        void destroyCapturedExecutionTopologyBeforeArenaRelease() noexcept;
 
         /**
          * @brief Persistent explicit stream for compact stochastic response copies.
@@ -9812,7 +10164,13 @@ namespace llaminar2
         /**
          * @brief Advise mmap pages away after first successful prefill.
          */
-        void adviseMmapDontneedAfterFirstPrefill();
+        /**
+         * @brief Publish the first-prefill mmap reclaim boundary asynchronously.
+         *
+         * WeightManager is the exactly-once authority; this participant never
+         * waits for host registration retirement or page advice.
+         */
+        void scheduleMmapReclaimAfterFirstPrefill();
 
         // =========================================================================
         // Phase-Aware Weight Access Members (Gap 3 - CPU Decode Participation)
@@ -10082,7 +10440,6 @@ namespace llaminar2
         /// Whether host-resident weight data has been released after first prefill
         bool host_resident_released_ = false;
         bool release_host_resident_after_forward_ = true;
-        bool mmap_dontneed_advised_ = false;
 
         /// Whether raw MoE expert tensors were released after eager graph-build packing.
         bool raw_expert_weights_released_after_graph_build_ = false;
@@ -10427,6 +10784,54 @@ namespace llaminar2
             int row_count,
             const ComputeGraph **out_graph,
             std::string *error = nullptr) const;
+
+        /**
+         * @brief Resolve the one typed sparse-wire phase for an MTP graph.
+         *
+         * A cross-rank graph takes generation and logical-step identity from
+         * @p graph_scope. A process-local heterogeneous graph has no remote
+         * transaction coordinator, but its sparse stages still require an
+         * explicit mathematical phase; in that case the request generation is
+         * taken from the orchestrator and the stage keeps ownership of its
+         * process-local step counter. Keeping both cases behind this method
+         * prevents coordinator presence from becoming an accidental proxy for
+         * whether execution semantics exist.
+         *
+         * @param graph_scope Optional cross-rank participant binding.
+         * @param execution_semantics Exact MTP draft or grouped-verifier role.
+         * @param expected_transaction_draft_depth Optional speculative width
+         *        known by the caller. Cross-rank scopes always validate their
+         *        positive coordinator-owned width even when this is nullopt.
+         * @param sparse_graph_depth Namespace depth embedded in sparse stages;
+         *        zero for the learned Qwen NextN sidecar and the admitted
+         *        width for a grouped verifier.
+         * @param error Optional first violated lifecycle invariant.
+         * @return Fully typed runtime parameters, or nullopt on invalid state.
+         */
+        [[nodiscard]] std::optional<
+            IComputeStage::MoEOverlayCollectiveRuntimeParams>
+        resolveMTPMoEOverlayCollectiveRuntimeParams(
+            const MoEOverlayInferenceParticipantGraphScope &graph_scope,
+            IComputeStage::MoEOverlayCollectiveRuntimeParams::
+                ExecutionSemantics execution_semantics,
+            std::optional<int> expected_transaction_draft_depth,
+            int sparse_graph_depth,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Resolve the request-generation authority for this graph.
+         *
+         * ExpertOverlay graphs must consume the continuation-root generation;
+         * every other retained graph consumes the local request-state session.
+         * This method is the only selector so capture, ordinary replay, and
+         * hosted MTP replay cannot infer authority from backend or coordinator
+         * presence independently.
+         *
+         * @return Typed nonzero identity, or nullopt while an overlay request
+         *         has not yet received its root publication.
+         */
+        [[nodiscard]] std::optional<MoESparseRequestIdentity>
+        currentMoESparseRequestIdentity() const noexcept;
 
         /**
          * @brief Enqueue an exact retained sidecar on its production replay stream.
@@ -10935,6 +11340,20 @@ namespace llaminar2
         bool consumeDeviceGenerationStateReady(
             void *consumer_stream,
             DeviceTimelineRole consumer_role,
+            int expected_request_count,
+            const char *consumer_name);
+
+        /**
+         * @brief Join and retire any published or borrowed controller frontier.
+         *
+         * A verifier failure may occur after preparation borrowed the controller
+         * but before accepted-state publication creates the next ready version.
+         * Reset records the lifecycle event after that exact borrower stream,
+         * then waits on its own stream. No blocking synchronization or fabricated
+         * committed-state publication is permitted.
+         */
+        bool retireDeviceGenerationStateForRequestReset(
+            void *reset_stream,
             int expected_request_count,
             const char *consumer_name);
 

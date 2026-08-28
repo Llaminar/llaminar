@@ -482,6 +482,9 @@ namespace llaminar2
             weights.fa_block.moe_gate_exps ||
             weights.fa_block.moe_up_exps ||
             weights.fa_block.moe_down_exps;
+        const bool registry_owned_mtp_experts =
+            config_.moe.routed_expert_plan &&
+            config_.moe.routed_expert_plan->usesExpertOverlayAuthority();
         const bool mirror_mtp_lm_head =
             !kv_cache_only &&
             mirroredMTPHeadConfigured();
@@ -552,9 +555,12 @@ namespace llaminar2
         if (mtp_moe && !kv_cache_only)
         {
             if (missing("mtp.moe_gate", weights.fa_block.moe_gate) ||
-                missing("mtp.moe_gate_exps", weights.fa_block.moe_gate_exps) ||
-                missing("mtp.moe_up_exps", weights.fa_block.moe_up_exps) ||
-                missing("mtp.moe_down_exps", weights.fa_block.moe_down_exps) ||
+                (!registry_owned_mtp_experts &&
+                 missing("mtp.moe_gate_exps", weights.fa_block.moe_gate_exps)) ||
+                (!registry_owned_mtp_experts &&
+                 missing("mtp.moe_up_exps", weights.fa_block.moe_up_exps)) ||
+                (!registry_owned_mtp_experts &&
+                 missing("mtp.moe_down_exps", weights.fa_block.moe_down_exps)) ||
                 missing("output.moe_expert_indices", output.moe_expert_indices) ||
                 missing("output.moe_expert_weights", output.moe_expert_weights) ||
                 missing("output.moe_combined_output", output.moe_combined_output) ||
@@ -566,6 +572,18 @@ namespace llaminar2
             {
                 return graph;
             }
+
+            /*
+             * ExpertOverlay deliberately removes raw 3-D routed parents from
+             * a reusable graph binding. The model-owned ExpertGemmRegistry is
+             * the sole prepared-weight authority after terminal sealing, and
+             * Qwen35MoEGraph validates the exact layer placement while lowering
+             * its registry-only local-expert stages. Requiring source pointers
+             * here would force a second GGUF materialization merely to provide
+             * non-owning graph markers, defeating both lifecycle ownership and
+             * process-campaign reuse. The router and shared-expert tensors stay
+             * ordinary immutable graph bindings and remain mandatory above.
+             */
         }
 
         graph.addNode(prefix + "embedding",
@@ -987,7 +1005,7 @@ namespace llaminar2
          */
         const bool verifier_state_capture_supported =
             config_.grouped_mtp_verifier &&
-            config_.mtp.enabled &&
+            retainsMTPGraphCapacity(config_.mtp) &&
             (device.is_cpu() || device.is_cuda() || device.is_rocm());
         /*
          * LocalTP dense decode normally runs from replicated GDN weights and a

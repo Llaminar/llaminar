@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <unordered_map>
 
 #include "../../../tensors/TensorKernels.h"
@@ -37,6 +38,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include "../../common/FloatingExpertNumericalContract.h"
 #include "../CPUKernelBase.h"
 #include "../primitives/SwiGLUPrimitives.h"
 #include "../primitives/SoftmaxPrimitives_New.h"
@@ -481,6 +483,99 @@ namespace llaminar2
                 },
                 alpha,
                 beta);
+        }
+
+        /**
+         * @brief Execute the fixed movable-expert FP32 dot-product program.
+         *
+         * GPU ExpertOverlay kernels reduce 256 strided K lanes through a fixed
+         * binary tree. CPU-resident movable experts must emulate that exact
+         * tree; otherwise promotion changes the logical model and recursive
+         * MTP amplifies the placement-dependent perturbation. Four runtime
+         * rows share each decoded weight while retaining independent trees.
+         *
+         * @tparam WeightFn Callable accepting `(column, k)` and returning FP32.
+         * @param A Row-major FP32 activations `[M,K]`.
+         * @param C Row-major FP32 output `[M,N]`.
+         * @param M Runtime row count.
+         * @param N Output width.
+         * @param K Reduction width.
+         * @param weight Weight accessor for the stored floating format.
+         * @param alpha Output scale.
+         * @param beta Existing-output scale.
+         * @param bias Optional FP32 output-column bias.
+         * @return True after every output word is published.
+         */
+        template <typename WeightFn>
+        inline bool run_movable_expert_fp32_matmul(
+            const float *A,
+            float *C,
+            int M,
+            int N,
+            int K,
+            WeightFn &&weight,
+            float alpha = 1.0f,
+            float beta = 0.0f,
+            const float *bias = nullptr)
+        {
+            if (!A || !C || M < 0 || N < 0 || K <= 0)
+            {
+                LOG_ERROR("[FloatingPointGemmKernel] Invalid movable-expert matmul geometry"
+                          << " A=" << static_cast<const void *>(A)
+                          << " C=" << static_cast<void *>(C)
+                          << " M=" << M << " N=" << N << " K=" << K);
+                return false;
+            }
+
+            constexpr int kRowTile = 4;
+            const int row_tiles = (M + kRowTile - 1) / kRowTile;
+            auto work = [&]()
+            {
+#pragma omp for collapse(2) schedule(static)
+                for (int row_tile = 0; row_tile < row_tiles; ++row_tile)
+                {
+                    for (int column = 0; column < N; ++column)
+                    {
+                        const int first_row = row_tile * kRowTile;
+                        const int tile_rows =
+                            std::min(kRowTile, M - first_row);
+                        std::array<float, kRowTile> reduced{};
+                        floating_expert_numerical_contract::dotRows<kRowTile>(
+                            tile_rows,
+                            K,
+                            [&](int tile_row, int k)
+                            {
+                                return A[
+                                    static_cast<std::size_t>(
+                                        first_row + tile_row) * K +
+                                    static_cast<std::size_t>(k)];
+                            },
+                            [&](int k)
+                            {
+                                return weight(column, k);
+                            },
+                            reduced);
+
+                        const float bias_value = bias ? bias[column] : 0.0f;
+                        for (int tile_row = 0; tile_row < tile_rows;
+                             ++tile_row)
+                        {
+                            const std::size_t output_index =
+                                static_cast<std::size_t>(
+                                    first_row + tile_row) * N +
+                                static_cast<std::size_t>(column);
+                            float value = alpha * reduced[
+                                static_cast<std::size_t>(tile_row)];
+                            value += bias_value;
+                            if (beta != 0.0f)
+                                value += beta * C[output_index];
+                            C[output_index] = value;
+                        }
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(work);
+            return true;
         }
 
         /**
@@ -1294,27 +1389,116 @@ namespace llaminar2
          */
         class FloatingPointGemmKernel : public ITensorGemm, public CPUKernelBase
         {
-        public:
+        private:
             /**
-             * @brief Construct kernel bound to a floating-point weight tensor
-             * @param weight_tensor Pointer to weight tensor (must be FP32, FP16, or BF16)
+             * @brief Copy one expert view into engine-owned execution storage.
+             *
+             * A prepared expert may outlive the graph-frozen loader tensor and
+             * may later become a recyclable ExpertOverlay physical slot. Keeping
+             * a shared pointer to a view is insufficient because the loader is
+             * allowed to retire the parent's native vector after preparation.
+             * This method preserves the native bytes exactly—no conversion or
+             * arithmetic occurs—and returns an owning, contiguous tensor whose
+             * lifetime is identical to the GEMM engine's lifetime.
+             *
+             * @param source Live FP32, FP16, or BF16 expert matrix.
+             * @return Independent owning tensor containing the exact bytes.
+             * @throws std::invalid_argument for null, non-matrix, unsupported,
+             *         released, or internally inconsistent source storage.
              */
-            explicit FloatingPointGemmKernel(const TensorBase *weight_tensor)
-                : weight_tensor_(weight_tensor)
+            static std::shared_ptr<const TensorBase>
+            cloneExpertExecutionStorage(
+                const std::shared_ptr<const TensorBase> &source)
             {
-                if (weight_tensor)
+                if (!source || source->shape().size() != 2u ||
+                    !source->raw_data())
                 {
-                    weight_type_ = weight_tensor->native_type();
-
-                    // Validate weight type
-                    if (weight_type_ != TensorType::FP32 &&
-                        weight_type_ != TensorType::FP16 &&
-                        weight_type_ != TensorType::BF16)
-                    {
-                        LOG_ERROR("[FloatingPointGemmKernel] Unsupported weight type: " << static_cast<int>(weight_type_));
-                        throw std::runtime_error("FloatingPointGemmKernel only supports FP32, FP16, or BF16 weights");
-                    }
+                    throw std::invalid_argument(
+                        "Prepared floating expert requires a live 2-D source tensor");
                 }
+
+                std::shared_ptr<TensorBase> owned;
+                switch (source->native_type())
+                {
+                case TensorType::FP32:
+                    owned = std::make_shared<FP32Tensor>(source->shape());
+                    break;
+                case TensorType::FP16:
+                    owned = std::make_shared<FP16Tensor>(source->shape());
+                    break;
+                case TensorType::BF16:
+                    owned = std::make_shared<BF16Tensor>(source->shape());
+                    break;
+                default:
+                    throw std::invalid_argument(
+                        "Prepared floating expert supports only FP32, FP16, and BF16");
+                }
+
+                if (!owned->raw_mutable_data() ||
+                    owned->size_bytes() != source->size_bytes())
+                {
+                    throw std::logic_error(
+                        "Prepared floating expert allocation does not match source storage");
+                }
+
+                // Native-byte copy is the numerical contract: do not route this
+                // through FP32 conversion, which would alter FP16/BF16 payloads.
+                std::memcpy(
+                    owned->raw_mutable_data(),
+                    source->raw_data(),
+                    source->size_bytes());
+                return owned;
+            }
+
+        public:
+            /** Selects the arithmetic identity of one prepared weight engine. */
+            enum class NumericalPolicy
+            {
+                /** Ordinary CPU GEMM semantics for non-movable dense weights. */
+                BackendNative,
+                /** CPU emulation of the GPU movable-expert FP32 tree. */
+                MovableExpert,
+            };
+
+            /**
+             * @brief Construct a kernel that borrows a floating-point weight tensor.
+             *
+             * The caller must keep `weight_tensor` alive for the complete kernel
+             * lifetime. Long-lived prepared-expert registries must use the
+             * shared-ownership overload below instead.
+             *
+             * @param weight_tensor Borrowed weight tensor (FP32, FP16, or BF16).
+             * @param numerical_policy Backend-native or movable-expert arithmetic.
+             */
+            explicit FloatingPointGemmKernel(
+                const TensorBase *weight_tensor,
+                NumericalPolicy numerical_policy = NumericalPolicy::BackendNative)
+                : weight_tensor_(weight_tensor),
+                  numerical_policy_(numerical_policy)
+            {
+                validateBoundWeight();
+            }
+
+            /**
+             * @brief Construct a kernel with engine-owned expert weight bytes.
+             *
+             * The native bytes are copied exactly into a contiguous owning tensor.
+             * This mirrors packed CPU and GPU prepared-engine semantics: once the
+             * constructor returns, loader/source storage is no longer an input to
+             * inference and may be reclaimed independently.
+             *
+             * @param weight_tensor Shared weight tensor (FP32, FP16, or BF16).
+             * @param numerical_policy Backend-native or movable-expert arithmetic.
+             */
+            explicit FloatingPointGemmKernel(
+                std::shared_ptr<const TensorBase> weight_tensor,
+                NumericalPolicy numerical_policy = NumericalPolicy::BackendNative)
+                : weight_tensor_lifetime_(
+                      cloneExpertExecutionStorage(weight_tensor)),
+                  weight_tensor_(weight_tensor_lifetime_.get()),
+                  numerical_policy_(numerical_policy)
+            {
+                validateBoundWeight();
             }
 
             ~FloatingPointGemmKernel() override = default;
@@ -1352,6 +1536,17 @@ namespace llaminar2
             }
 
             /**
+             * @brief Confirm that expert preparation detached from loader bytes.
+             * @return Always true for the shared expert constructor's owning
+             *         representation; borrowed dense callers never use the raw
+             *         expert-preparation API.
+             */
+            bool canReleaseSourceWeightTensor() const override
+            {
+                return weight_tensor_lifetime_ != nullptr;
+            }
+
+            /**
              * @brief Check device support (CPU-only for OneDNN)
              */
             bool supports_device(int device_idx) const override
@@ -1385,11 +1580,12 @@ namespace llaminar2
             /**
              * @brief Tensor-based GEMM with runtime type checking
              *
-             * Validates that activation tensor type matches weight tensor type.
+             * Validates the activation/weight pair before dispatch.
              * Supported combinations:
              * - FP32 activation × FP32 weight
              * - FP16 activation × FP16 weight
              * - BF16 activation × BF16 weight
+             * - FP32 activation × FP16/BF16 weight
              *
              * @return true on success, false if type combination not supported
              */
@@ -1421,11 +1617,15 @@ namespace llaminar2
                 int k = static_cast<int>(a_shape.size() > 1 ? a_shape[1] : 1);
                 int n = static_cast<int>(c_shape.size() > 1 ? c_shape[1] : c_shape[0]);
 
-                // Validate type match
-                if (act_type != weight_type_)
+                const bool mixed_fp32_activation =
+                    act_type == TensorType::FP32 &&
+                    (weight_type_ == TensorType::FP16 ||
+                     weight_type_ == TensorType::BF16);
+                if (act_type != weight_type_ && !mixed_fp32_activation)
                 {
-                    LOG_ERROR("[FloatingPointGemmKernel] Activation type (" << static_cast<int>(act_type)
-                                                                            << ") must match weight type (" << static_cast<int>(weight_type_) << ")");
+                    LOG_ERROR("[FloatingPointGemmKernel] Unsupported activation/weight pair: activation="
+                              << static_cast<int>(act_type)
+                              << " weight=" << static_cast<int>(weight_type_));
                     return false;
                 }
 
@@ -1441,48 +1641,153 @@ namespace llaminar2
                     const float *A_data = A->data() + row_offset;
                     float *C_data = C->mutable_data();
                     const float *B_data = weight_tensor_->data();
+                    if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                    {
+                        if (!transpose_B)
+                        {
+                            LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                            return false;
+                        }
+                        return run_movable_expert_fp32_matmul(
+                            A_data, C_data, m, n, k,
+                            [&](int column, int kk)
+                            {
+                                return B_data[
+                                    static_cast<std::size_t>(column) * k +
+                                    static_cast<std::size_t>(kk)];
+                            },
+                            alpha, beta, bias_ptr);
+                    }
                     // OneDNN FP32 matmul supports fused bias natively
                     return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta, bias_ptr);
                 }
 
                 case TensorType::FP16:
                 {
-                    const auto *A_fp16 = dynamic_cast<const FP16Tensor *>(A);
                     const auto *B_fp16 = dynamic_cast<const FP16Tensor *>(weight_tensor_);
-                    if (!A_fp16 || !B_fp16)
+                    if (!B_fp16)
                     {
-                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast to FP16Tensor");
+                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast FP16 weights");
                         return false;
                     }
-                    const uint16_t *A_data = A_fp16->typed_data();
-                    const uint16_t *B_data = B_fp16->typed_data();
                     float *C_data = C->mutable_data();
-                    // TODO: Add fused bias support for FP16 matmul
                     if (bias_ptr)
                     {
-                        LOG_WARN("[FloatingPointGemmKernel] Bias not yet supported for FP16 GEMM");
+                        LOG_ERROR("[FloatingPointGemmKernel] Bias is unsupported for FP16 weights");
+                        return false;
                     }
-                    return run_onednn_fp16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
+                    if (mixed_fp32_activation)
+                    {
+                        if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                        {
+                            if (!transpose_B)
+                            {
+                                LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                                return false;
+                            }
+                            return run_movable_expert_fp32_matmul(
+                                A->data() + row_offset, C_data, m, n, k,
+                                [&](int column, int kk)
+                                {
+                                    return fp16_to_fp32(
+                                        B_fp16->typed_data()[
+                                            static_cast<std::size_t>(column) * k +
+                                            static_cast<std::size_t>(kk)]);
+                                },
+                                alpha, beta);
+                        }
+                        return run_fp32xfp16_skinny_matmul(
+                            A->data() + row_offset,
+                            B_fp16->typed_data(),
+                            C_data,
+                            m,
+                            n,
+                            k,
+                            transpose_B,
+                            alpha,
+                            beta);
+                    }
+                    const auto *A_fp16 =
+                        dynamic_cast<const FP16Tensor *>(A);
+                    if (!A_fp16)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast FP16 activations");
+                        return false;
+                    }
+                    return run_onednn_fp16_matmul(
+                        A_fp16->typed_data() + row_offset,
+                        B_fp16->typed_data(),
+                        C_data,
+                        m,
+                        n,
+                        k,
+                        transpose_B,
+                        alpha,
+                        beta);
                 }
 
                 case TensorType::BF16:
                 {
-                    const auto *A_bf16 = dynamic_cast<const BF16Tensor *>(A);
                     const auto *B_bf16 = dynamic_cast<const BF16Tensor *>(weight_tensor_);
-                    if (!A_bf16 || !B_bf16)
+                    if (!B_bf16)
                     {
-                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast to BF16Tensor");
+                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast BF16 weights");
                         return false;
                     }
-                    const uint16_t *A_data = A_bf16->typed_data();
-                    const uint16_t *B_data = B_bf16->typed_data();
                     float *C_data = C->mutable_data();
-                    // TODO: Add fused bias support for BF16 matmul
                     if (bias_ptr)
                     {
-                        LOG_WARN("[FloatingPointGemmKernel] Bias not yet supported for BF16 GEMM");
+                        LOG_ERROR("[FloatingPointGemmKernel] Bias is unsupported for BF16 weights");
+                        return false;
                     }
-                    return run_onednn_bf16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
+                    if (mixed_fp32_activation)
+                    {
+                        if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                        {
+                            if (!transpose_B)
+                            {
+                                LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                                return false;
+                            }
+                            return run_movable_expert_fp32_matmul(
+                                A->data() + row_offset, C_data, m, n, k,
+                                [&](int column, int kk)
+                                {
+                                    return simd::bf16_to_fp32(
+                                        B_bf16->typed_data()[
+                                            static_cast<std::size_t>(column) * k +
+                                            static_cast<std::size_t>(kk)]);
+                                },
+                                alpha, beta);
+                        }
+                        return run_fp32xbf16_skinny_matmul(
+                            A->data() + row_offset,
+                            B_bf16->typed_data(),
+                            C_data,
+                            m,
+                            n,
+                            k,
+                            transpose_B,
+                            alpha,
+                            beta);
+                    }
+                    const auto *A_bf16 =
+                        dynamic_cast<const BF16Tensor *>(A);
+                    if (!A_bf16)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast BF16 activations");
+                        return false;
+                    }
+                    return run_onednn_bf16_matmul(
+                        A_bf16->typed_data() + row_offset,
+                        B_bf16->typed_data(),
+                        C_data,
+                        m,
+                        n,
+                        k,
+                        transpose_B,
+                        alpha,
+                        beta);
                 }
 
                 default:
@@ -1534,11 +1839,15 @@ namespace llaminar2
 
                 const TensorType act_type = A->native_type();
 
-                // Validate type match
-                if (act_type != weight_type_)
+                const bool mixed_fp32_activation =
+                    act_type == TensorType::FP32 &&
+                    (weight_type_ == TensorType::FP16 ||
+                     weight_type_ == TensorType::BF16);
+                if (act_type != weight_type_ && !mixed_fp32_activation)
                 {
-                    LOG_ERROR("[FloatingPointGemmKernel] Activation type (" << static_cast<int>(act_type)
-                                                                            << ") must match weight type (" << static_cast<int>(weight_type_) << ")");
+                    LOG_ERROR("[FloatingPointGemmKernel] Unsupported activation/weight pair: activation="
+                              << static_cast<int>(act_type)
+                              << " weight=" << static_cast<int>(weight_type_));
                     return false;
                 }
 
@@ -1554,48 +1863,153 @@ namespace llaminar2
                     const float *A_data = A->data() + row_offset;
                     float *C_data = C->mutable_data();
                     const float *B_data = weight_tensor_->data();
+                    if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                    {
+                        if (!transpose_B)
+                        {
+                            LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                            return false;
+                        }
+                        return run_movable_expert_fp32_matmul(
+                            A_data, C_data, m, n, k,
+                            [&](int column, int kk)
+                            {
+                                return B_data[
+                                    static_cast<std::size_t>(column) * k +
+                                    static_cast<std::size_t>(kk)];
+                            },
+                            alpha, beta, bias_ptr);
+                    }
                     // OneDNN FP32 matmul supports fused bias natively
                     return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta, bias_ptr);
                 }
 
                 case TensorType::FP16:
                 {
-                    const auto *A_fp16 = dynamic_cast<const FP16Tensor *>(A);
                     const auto *B_fp16 = dynamic_cast<const FP16Tensor *>(weight_tensor_);
-                    if (!A_fp16 || !B_fp16)
+                    if (!B_fp16)
                     {
-                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast to FP16Tensor");
+                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast FP16 weights");
                         return false;
                     }
-                    const uint16_t *A_data = A_fp16->typed_data();
-                    const uint16_t *B_data = B_fp16->typed_data();
                     float *C_data = C->mutable_data();
-                    // TODO: Add fused bias support for FP16 matmul
                     if (bias_ptr)
                     {
-                        LOG_WARN("[FloatingPointGemmKernel] Bias not yet supported for FP16 GEMM");
+                        LOG_ERROR("[FloatingPointGemmKernel] Bias is unsupported for FP16 weights");
+                        return false;
                     }
-                    return run_onednn_fp16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
+                    if (mixed_fp32_activation)
+                    {
+                        if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                        {
+                            if (!transpose_B)
+                            {
+                                LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                                return false;
+                            }
+                            return run_movable_expert_fp32_matmul(
+                                A->data() + row_offset, C_data, m, n, k,
+                                [&](int column, int kk)
+                                {
+                                    return fp16_to_fp32(
+                                        B_fp16->typed_data()[
+                                            static_cast<std::size_t>(column) * k +
+                                            static_cast<std::size_t>(kk)]);
+                                },
+                                alpha, beta);
+                        }
+                        return run_fp32xfp16_skinny_matmul(
+                            A->data() + row_offset,
+                            B_fp16->typed_data(),
+                            C_data,
+                            m,
+                            n,
+                            k,
+                            transpose_B,
+                            alpha,
+                            beta);
+                    }
+                    const auto *A_fp16 =
+                        dynamic_cast<const FP16Tensor *>(A);
+                    if (!A_fp16)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast FP16 activations");
+                        return false;
+                    }
+                    return run_onednn_fp16_matmul(
+                        A_fp16->typed_data() + row_offset,
+                        B_fp16->typed_data(),
+                        C_data,
+                        m,
+                        n,
+                        k,
+                        transpose_B,
+                        alpha,
+                        beta);
                 }
 
                 case TensorType::BF16:
                 {
-                    const auto *A_bf16 = dynamic_cast<const BF16Tensor *>(A);
                     const auto *B_bf16 = dynamic_cast<const BF16Tensor *>(weight_tensor_);
-                    if (!A_bf16 || !B_bf16)
+                    if (!B_bf16)
                     {
-                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast to BF16Tensor");
+                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast BF16 weights");
                         return false;
                     }
-                    const uint16_t *A_data = A_bf16->typed_data();
-                    const uint16_t *B_data = B_bf16->typed_data();
                     float *C_data = C->mutable_data();
-                    // TODO: Add fused bias support for BF16 matmul
                     if (bias_ptr)
                     {
-                        LOG_WARN("[FloatingPointGemmKernel] Bias not yet supported for BF16 GEMM");
+                        LOG_ERROR("[FloatingPointGemmKernel] Bias is unsupported for BF16 weights");
+                        return false;
                     }
-                    return run_onednn_bf16_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta);
+                    if (mixed_fp32_activation)
+                    {
+                        if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                        {
+                            if (!transpose_B)
+                            {
+                                LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                                return false;
+                            }
+                            return run_movable_expert_fp32_matmul(
+                                A->data() + row_offset, C_data, m, n, k,
+                                [&](int column, int kk)
+                                {
+                                    return simd::bf16_to_fp32(
+                                        B_bf16->typed_data()[
+                                            static_cast<std::size_t>(column) * k +
+                                            static_cast<std::size_t>(kk)]);
+                                },
+                                alpha, beta);
+                        }
+                        return run_fp32xbf16_skinny_matmul(
+                            A->data() + row_offset,
+                            B_bf16->typed_data(),
+                            C_data,
+                            m,
+                            n,
+                            k,
+                            transpose_B,
+                            alpha,
+                            beta);
+                    }
+                    const auto *A_bf16 =
+                        dynamic_cast<const BF16Tensor *>(A);
+                    if (!A_bf16)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] Failed to cast BF16 activations");
+                        return false;
+                    }
+                    return run_onednn_bf16_matmul(
+                        A_bf16->typed_data() + row_offset,
+                        B_bf16->typed_data(),
+                        C_data,
+                        m,
+                        n,
+                        k,
+                        transpose_B,
+                        alpha,
+                        beta);
                 }
 
                 default:
@@ -1671,6 +2085,29 @@ namespace llaminar2
                 thread_local std::vector<float> swiglu_scratch_tls;
                 if (swiglu_scratch_tls.size() < input_elements)
                     swiglu_scratch_tls.resize(input_elements);
+                if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                {
+                    /*
+                     * Materialize each SwiGLU word once through the exact
+                     * CPU/CUDA/ROCm polynomial. GPU output blocks recompute
+                     * this pure value independently, so reuse changes cost but
+                     * not the published arithmetic program.
+                     */
+                    for (std::size_t index = 0; index < input_elements; ++index)
+                    {
+                        swiglu_scratch_tls[index] =
+                            floating_expert_numerical_contract::swigluValue(
+                                gate_data[index], up_data[index]);
+                    }
+                    return runMovableExpertDownProjection(
+                        swiglu_scratch_tls.data(),
+                        out_data,
+                        m,
+                        n,
+                        k,
+                        alpha,
+                        beta);
+                }
                 if (m == 1)
                 {
                     primitives::compute_swiglu_serial(
@@ -1822,11 +2259,23 @@ namespace llaminar2
                     PerfStatsCollector::isDomainEnabled("kernel");
                 auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                                : PerfStatsCollector::Clock::time_point{};
-                primitives::compute_swiglu(
-                    gate_data,
-                    up_data,
-                    swiglu_scratch_tls.data(),
-                    static_cast<int>(elements));
+                if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                {
+                    for (std::size_t index = 0; index < elements; ++index)
+                    {
+                        swiglu_scratch_tls[index] =
+                            floating_expert_numerical_contract::swigluValue(
+                                gate_data[index], up_data[index]);
+                    }
+                }
+                else
+                {
+                    primitives::compute_swiglu(
+                        gate_data,
+                        up_data,
+                        swiglu_scratch_tls.data(),
+                        static_cast<int>(elements));
+                }
                 recordVerifierTiming(
                     "cpu_fp32_verifier_swiglu_compute",
                     perf_start,
@@ -1839,7 +2288,22 @@ namespace llaminar2
                                           : PerfStatsCollector::Clock::time_point{};
                 bool down_ok = false;
                 const char *dtype_tag = "fp32";
-                if (weight_type_ == TensorType::FP32)
+                if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                {
+                    down_ok = runMovableExpertDownProjection(
+                        swiglu_scratch_tls.data(),
+                        out_data,
+                        m,
+                        n,
+                        k,
+                        alpha,
+                        beta);
+                    if (weight_type_ == TensorType::FP16)
+                        dtype_tag = "fp16";
+                    else if (weight_type_ == TensorType::BF16)
+                        dtype_tag = "bf16";
+                }
+                else if (weight_type_ == TensorType::FP32)
                 {
                     down_ok = run_fp32_skinny_matmul(
                         swiglu_scratch_tls.data(),
@@ -1966,11 +2430,25 @@ namespace llaminar2
                 (void)mpi_ctx;
                 (void)workspace;
 
+                const bool mixed_fp32_activation =
+                    input && input->native_type() == TensorType::FP32 &&
+                    (weight_type_ == TensorType::FP16 ||
+                     weight_type_ == TensorType::BF16);
                 if (!weight_tensor_ || !input || projections.empty() ||
-                    m <= 0 || k <= 0 || input->native_type() != weight_type_ ||
+                    m <= 0 || k <= 0 ||
+                    (input->native_type() != weight_type_ &&
+                     !mixed_fp32_activation) ||
                     input->numel() < static_cast<size_t>(m) * k)
                 {
-                    LOG_ERROR("[FloatingPointGemmKernel] Invalid fused projection bundle");
+                    LOG_ERROR("[FloatingPointGemmKernel] Invalid fused projection bundle"
+                              << " activation="
+                              << (input
+                                      ? static_cast<int>(input->native_type())
+                                      : -1)
+                              << " weight="
+                              << static_cast<int>(weight_type_)
+                              << " m=" << m << " k=" << k
+                              << " projections=" << projections.size());
                     return false;
                 }
 
@@ -2025,42 +2503,76 @@ namespace llaminar2
                         break;
                     case TensorType::FP16:
                     {
-                        const auto *typed_input =
-                            dynamic_cast<const FP16Tensor *>(input);
                         const auto *typed_weight =
                             dynamic_cast<const FP16Tensor *>(
                                 kernel->weight_tensor_);
-                        succeeded = typed_input && typed_weight &&
-                            run_onednn_fp16_matmul(
-                                typed_input->typed_data(),
-                                typed_weight->typed_data(),
-                                output,
-                                m,
-                                projection.n,
-                                k,
-                                /*transpose_B=*/true,
-                                /*alpha=*/1.0f,
-                                /*beta=*/0.0f);
+                        if (mixed_fp32_activation)
+                        {
+                            succeeded = typed_weight &&
+                                run_fp32xfp16_skinny_matmul(
+                                    input->data(),
+                                    typed_weight->typed_data(),
+                                    output,
+                                    m,
+                                    projection.n,
+                                    k,
+                                    /*transpose_B=*/true,
+                                    /*alpha=*/1.0f,
+                                    /*beta=*/0.0f);
+                        }
+                        else
+                        {
+                            const auto *typed_input =
+                                dynamic_cast<const FP16Tensor *>(input);
+                            succeeded = typed_input && typed_weight &&
+                                run_onednn_fp16_matmul(
+                                    typed_input->typed_data(),
+                                    typed_weight->typed_data(),
+                                    output,
+                                    m,
+                                    projection.n,
+                                    k,
+                                    /*transpose_B=*/true,
+                                    /*alpha=*/1.0f,
+                                    /*beta=*/0.0f);
+                        }
                         break;
                     }
                     case TensorType::BF16:
                     {
-                        const auto *typed_input =
-                            dynamic_cast<const BF16Tensor *>(input);
                         const auto *typed_weight =
                             dynamic_cast<const BF16Tensor *>(
                                 kernel->weight_tensor_);
-                        succeeded = typed_input && typed_weight &&
-                            run_onednn_bf16_matmul(
-                                typed_input->typed_data(),
-                                typed_weight->typed_data(),
-                                output,
-                                m,
-                                projection.n,
-                                k,
-                                /*transpose_B=*/true,
-                                /*alpha=*/1.0f,
-                                /*beta=*/0.0f);
+                        if (mixed_fp32_activation)
+                        {
+                            succeeded = typed_weight &&
+                                run_fp32xbf16_skinny_matmul(
+                                    input->data(),
+                                    typed_weight->typed_data(),
+                                    output,
+                                    m,
+                                    projection.n,
+                                    k,
+                                    /*transpose_B=*/true,
+                                    /*alpha=*/1.0f,
+                                    /*beta=*/0.0f);
+                        }
+                        else
+                        {
+                            const auto *typed_input =
+                                dynamic_cast<const BF16Tensor *>(input);
+                            succeeded = typed_input && typed_weight &&
+                                run_onednn_bf16_matmul(
+                                    typed_input->typed_data(),
+                                    typed_weight->typed_data(),
+                                    output,
+                                    m,
+                                    projection.n,
+                                    k,
+                                    /*transpose_B=*/true,
+                                    /*alpha=*/1.0f,
+                                    /*beta=*/0.0f);
+                        }
                         break;
                     }
                     default:
@@ -2122,11 +2634,17 @@ namespace llaminar2
                     return false;
                 }
 
-                if (input->native_type() != weight_type_)
+                const bool mixed_fp32_activation =
+                    input->native_type() == TensorType::FP32 &&
+                    (weight_type_ == TensorType::FP16 ||
+                     weight_type_ == TensorType::BF16);
+                if (input->native_type() != weight_type_ &&
+                    !mixed_fp32_activation)
                 {
-                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: activation type "
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: unsupported activation type "
                               << static_cast<int>(input->native_type())
-                              << " does not match weight type " << static_cast<int>(weight_type_));
+                              << " for weight type "
+                              << static_cast<int>(weight_type_));
                     return false;
                 }
 
@@ -2150,27 +2668,61 @@ namespace llaminar2
                     break;
                 case TensorType::FP16:
                 {
-                    const auto *typed = dynamic_cast<const FP16Tensor *>(input);
-                    input_fp16 = typed ? typed->typed_data() : nullptr;
-                    dtype_tag = "fp16";
-                    timing_name = "cpu_fp16_verifier_projection_matmul";
-                    if (!input_fp16)
+                    if (mixed_fp32_activation)
                     {
-                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host FP16 data");
-                        return false;
+                        input_fp32 = input->data();
+                        dtype_tag = "fp32xfp16";
+                        timing_name =
+                            "cpu_fp32xfp16_verifier_projection_matmul";
+                        if (!input_fp32)
+                        {
+                            LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host FP32 data");
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        const auto *typed =
+                            dynamic_cast<const FP16Tensor *>(input);
+                        input_fp16 = typed ? typed->typed_data() : nullptr;
+                        dtype_tag = "fp16";
+                        timing_name =
+                            "cpu_fp16_verifier_projection_matmul";
+                        if (!input_fp16)
+                        {
+                            LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host FP16 data");
+                            return false;
+                        }
                     }
                     break;
                 }
                 case TensorType::BF16:
                 {
-                    const auto *typed = dynamic_cast<const BF16Tensor *>(input);
-                    input_bf16 = typed ? typed->typed_data() : nullptr;
-                    dtype_tag = "bf16";
-                    timing_name = "cpu_bf16_verifier_projection_matmul";
-                    if (!input_bf16)
+                    if (mixed_fp32_activation)
                     {
-                        LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host BF16 data");
-                        return false;
+                        input_fp32 = input->data();
+                        dtype_tag = "fp32xbf16";
+                        timing_name =
+                            "cpu_fp32xbf16_verifier_projection_matmul";
+                        if (!input_fp32)
+                        {
+                            LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host FP32 data");
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        const auto *typed =
+                            dynamic_cast<const BF16Tensor *>(input);
+                        input_bf16 = typed ? typed->typed_data() : nullptr;
+                        dtype_tag = "bf16";
+                        timing_name =
+                            "cpu_bf16_verifier_projection_matmul";
+                        if (!input_bf16)
+                        {
+                            LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: input has no host BF16 data");
+                            return false;
+                        }
                     }
                     break;
                 }
@@ -2246,26 +2798,46 @@ namespace llaminar2
                     else if (weight_type_ == TensorType::FP16)
                     {
                         const auto *weight_fp16 = dynamic_cast<const FP16Tensor *>(fp->weight_tensor_);
-                        projection_ok = weight_fp16 && run_fp16_skinny_matmul(
-                                                          input_fp16,
-                                                          weight_fp16->typed_data(),
-                                                          out_data,
-                                                          m,
-                                                          proj.n,
-                                                          k,
-                                                          /*transpose_B=*/true);
+                        projection_ok = weight_fp16 &&
+                            (mixed_fp32_activation
+                                 ? run_fp32xfp16_skinny_matmul(
+                                       input_fp32,
+                                       weight_fp16->typed_data(),
+                                       out_data,
+                                       m,
+                                       proj.n,
+                                       k,
+                                       /*transpose_B=*/true)
+                                 : run_fp16_skinny_matmul(
+                                       input_fp16,
+                                       weight_fp16->typed_data(),
+                                       out_data,
+                                       m,
+                                       proj.n,
+                                       k,
+                                       /*transpose_B=*/true));
                     }
                     else if (weight_type_ == TensorType::BF16)
                     {
                         const auto *weight_bf16 = dynamic_cast<const BF16Tensor *>(fp->weight_tensor_);
-                        projection_ok = weight_bf16 && run_bf16_skinny_matmul(
-                                                          input_bf16,
-                                                          weight_bf16->typed_data(),
-                                                          out_data,
-                                                          m,
-                                                          proj.n,
-                                                          k,
-                                                          /*transpose_B=*/true);
+                        projection_ok = weight_bf16 &&
+                            (mixed_fp32_activation
+                                 ? run_fp32xbf16_skinny_matmul(
+                                       input_fp32,
+                                       weight_bf16->typed_data(),
+                                       out_data,
+                                       m,
+                                       proj.n,
+                                       k,
+                                       /*transpose_B=*/true)
+                                 : run_bf16_skinny_matmul(
+                                       input_bf16,
+                                       weight_bf16->typed_data(),
+                                       out_data,
+                                       m,
+                                       proj.n,
+                                       k,
+                                       /*transpose_B=*/true));
                     }
 
                     if (!projection_ok)
@@ -2806,8 +3378,106 @@ namespace llaminar2
             }
 
         private:
-            const TensorBase *weight_tensor_; ///< Bound weight tensor
+            /**
+             * @brief Down-project precomputed SwiGLU rows with the GPU tree.
+             *
+             * @param swiglu Row-major placement-invariant SwiGLU values `[M,K]`.
+             * @param output Row-major FP32 destination `[M,N]`.
+             * @param m Runtime row count.
+             * @param n Output width.
+             * @param k Reduction width.
+             * @param alpha Output scale.
+             * @param beta Existing-output scale.
+             * @return True after the format-specific tree completed.
+             */
+            bool runMovableExpertDownProjection(
+                const float *swiglu,
+                float *output,
+                int m,
+                int n,
+                int k,
+                float alpha,
+                float beta) const
+            {
+                switch (weight_type_)
+                {
+                case TensorType::FP32:
+                {
+                    const float *weights = weight_tensor_->data();
+                    return weights && run_movable_expert_fp32_matmul(
+                        swiglu, output, m, n, k,
+                        [&](int column, int kk)
+                        {
+                            return weights[
+                                static_cast<std::size_t>(column) * k +
+                                static_cast<std::size_t>(kk)];
+                        },
+                        alpha, beta);
+                }
+                case TensorType::FP16:
+                {
+                    const auto *weights =
+                        dynamic_cast<const FP16Tensor *>(weight_tensor_);
+                    return weights && run_movable_expert_fp32_matmul(
+                        swiglu, output, m, n, k,
+                        [&](int column, int kk)
+                        {
+                            return fp16_to_fp32(
+                                weights->typed_data()[
+                                    static_cast<std::size_t>(column) * k +
+                                    static_cast<std::size_t>(kk)]);
+                        },
+                        alpha, beta);
+                }
+                case TensorType::BF16:
+                {
+                    const auto *weights =
+                        dynamic_cast<const BF16Tensor *>(weight_tensor_);
+                    return weights && run_movable_expert_fp32_matmul(
+                        swiglu, output, m, n, k,
+                        [&](int column, int kk)
+                        {
+                            return simd::bf16_to_fp32(
+                                weights->typed_data()[
+                                    static_cast<std::size_t>(column) * k +
+                                    static_cast<std::size_t>(kk)]);
+                        },
+                        alpha, beta);
+                }
+                default:
+                    return false;
+                }
+            }
+
+            /**
+             * @brief Validate the type recorded by either ownership constructor.
+             *
+             * A null tensor remains representable for legacy diagnostic callers;
+             * execution methods reject it before dereference. Any non-null tensor
+             * must use one of the floating formats implemented by this kernel.
+             */
+            void validateBoundWeight()
+            {
+                if (!weight_tensor_)
+                    return;
+
+                weight_type_ = weight_tensor_->native_type();
+                if (weight_type_ != TensorType::FP32 &&
+                    weight_type_ != TensorType::FP16 &&
+                    weight_type_ != TensorType::BF16)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] Unsupported weight type: "
+                              << static_cast<int>(weight_type_));
+                    throw std::runtime_error(
+                        "FloatingPointGemmKernel only supports FP32, FP16, or BF16 weights");
+                }
+            }
+
+            /** Owns the exact contiguous bytes used by a prepared expert engine. */
+            std::shared_ptr<const TensorBase> weight_tensor_lifetime_;
+            const TensorBase *weight_tensor_ = nullptr; ///< Exact tensor used by GEMM.
             TensorType weight_type_ = TensorType::FP32;
+            NumericalPolicy numerical_policy_ = NumericalPolicy::BackendNative;
         };
 
     } // namespace gemm

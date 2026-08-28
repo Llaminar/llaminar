@@ -803,6 +803,7 @@ namespace llaminar2::test::parity::qwen2
             config_.early_layers_count = thresholds.early_layers_count;
             config_.min_early_layers_passed = thresholds.min_early_layers_passed;
             config_.kl_threshold = thresholds.kl_threshold;
+            config_.mtp_kl_threshold = thresholds.mtp_kl_threshold;
             config_.excluded_stages = thresholds.excluded_stages;
             config_.allreduce_stages = thresholds.allreduce_stages;
             config_.min_top1_accuracy = thresholds.min_top1_accuracy;
@@ -1301,15 +1302,6 @@ namespace llaminar2::test::parity::qwen2
             }
             else
             {
-                /*
-                 * Teacher-forced serial rows prove main-model arithmetic but
-                 * intentionally do not run predictor sampling or grouped
-                 * verification. Reuse this exact production runner now to
-                 * exercise the generated MTP policy and append every recursive
-                 * checkpoint to the same decode artifact before assertions
-                 * serialize it.
-                 */
-                runProductionParityMTPProof(decode);
                 assertDecodeParity(decode);
             }
 

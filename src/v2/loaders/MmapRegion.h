@@ -2,11 +2,16 @@
 
 /**
  * @file MmapRegion.h
- * @brief RAII wrapper for mmap'd file regions
+ * @brief RAII mapping, provenance, prefault, and page-reclaim authority.
  *
  * Used by ModelLoader to memory-map GGUF files for zero-syscall tensor loading.
- * When active, tensor data is read via memcpy from the mmap'd region instead of
- * seekg+read through an ifstream under file_mutex_, eliminating serialization.
+ * Besides owning the mapping, this class records immutable file provenance and
+ * the backing filesystem's reclaim semantics.  Durable files may drop process
+ * PTEs with MADV_DONTNEED after prepared weights become authoritative.  A model
+ * staged in tmpfs/ramfs already *is* the page store: advising its complete
+ * mapping cannot release the cached file bytes, but can spend seconds walking
+ * page tables and force later refaults.  Those mappings therefore use a typed
+ * retain policy consistently across whole-region and per-tensor advice.
  *
  * Usage:
  *   auto region = MmapRegion::create("/path/to/model.gguf");
@@ -34,8 +39,10 @@
 #include <vector>
 
 #ifdef __linux__
+#include <linux/magic.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -63,6 +70,19 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief Backing-specific policy for post-preparation process mappings.
+         *
+         * This policy is detected once from the opened file descriptor.  It is
+         * carried with address provenance so broad and incremental reclaim
+         * callers cannot disagree about the same mapping.
+         */
+        enum class PageReclaimPolicy : std::uint8_t
+        {
+            AdviseDontneed, ///< Durable file: process PTEs may be discarded asynchronously.
+            RetainMemoryFilesystemPages, ///< tmpfs/ramfs file: retain PTEs and avoid useless refault work.
+        };
+
+        /**
          * @brief File coordinates for an address inside a live mmap region.
          *
          * GPU startup loading uses this descriptor to replace serialized mmap
@@ -75,6 +95,8 @@ namespace llaminar2
             std::string path;
             uint64_t offset = 0;
             size_t available_bytes = 0;
+            PageReclaimPolicy page_reclaim_policy =
+                PageReclaimPolicy::AdviseDontneed;
         };
 
         /**
@@ -115,12 +137,14 @@ namespace llaminar2
         // Movable
         MmapRegion(MmapRegion &&other) noexcept
             : base_(other.base_), length_(other.length_), fd_(other.fd_), path_(std::move(other.path_)),
-              eager_prefaulted_(other.eager_prefaulted_)
+              eager_prefaulted_(other.eager_prefaulted_),
+              page_reclaim_policy_(other.page_reclaim_policy_)
         {
             other.base_ = nullptr;
             other.length_ = 0;
             other.fd_ = -1;
             other.eager_prefaulted_ = false;
+            other.page_reclaim_policy_ = PageReclaimPolicy::AdviseDontneed;
         }
 
         MmapRegion &operator=(MmapRegion &&other) noexcept
@@ -143,10 +167,12 @@ namespace llaminar2
                 fd_ = other.fd_;
                 path_ = std::move(other.path_);
                 eager_prefaulted_ = other.eager_prefaulted_;
+                page_reclaim_policy_ = other.page_reclaim_policy_;
                 other.base_ = nullptr;
                 other.length_ = 0;
                 other.fd_ = -1;
                 other.eager_prefaulted_ = false;
+                other.page_reclaim_policy_ = PageReclaimPolicy::AdviseDontneed;
             }
             return *this;
         }
@@ -193,6 +219,7 @@ namespace llaminar2
                         .path = entry.path,
                         .offset = static_cast<uint64_t>(raw - entry.begin),
                         .available_bytes = static_cast<size_t>(entry.end - raw),
+                        .page_reclaim_policy = entry.page_reclaim_policy,
                     };
                 }
             }
@@ -212,12 +239,48 @@ namespace llaminar2
          */
         bool wasEagerPrefaulted() const { return eager_prefaulted_; }
 
+        /** @return Immutable reclaim policy detected for the backing file. */
+        [[nodiscard]] PageReclaimPolicy pageReclaimPolicy() const noexcept
+        {
+            return page_reclaim_policy_;
+        }
+
+        /**
+         * @brief Classify a Linux filesystem type into model-page semantics.
+         *
+         * Exposed as a pure classifier so unit tests can cover every supported
+         * memory-filesystem magic without mounting filesystems. Unknown and
+         * durable filesystem types retain the historical advice behavior.
+         *
+         * @param filesystem_type Value returned by statfs/fstatfs in @c f_type.
+         * @return Typed policy shared by every reclaim entry point.
+         */
+        [[nodiscard]] static constexpr PageReclaimPolicy
+        classifyPageReclaimPolicy(long filesystem_type) noexcept
+        {
+#ifdef __linux__
+            if (filesystem_type == static_cast<long>(TMPFS_MAGIC)
+#ifdef RAMFS_MAGIC
+                || filesystem_type == static_cast<long>(RAMFS_MAGIC)
+#endif
+            )
+            {
+                return PageReclaimPolicy::RetainMemoryFilesystemPages;
+            }
+#else
+            (void)filesystem_type;
+#endif
+            return PageReclaimPolicy::AdviseDontneed;
+        }
+
         /**
          * @brief Release physical pages backing this mmap region.
          *
-         * Calls madvise(MADV_DONTNEED) to tell the kernel it can reclaim the
-         * physical pages. The virtual address range remains valid — future reads
-         * will re-fault pages from the underlying file (via page cache).
+         * Calls madvise(MADV_DONTNEED) for durable mappings so the kernel can
+         * discard their process PTEs. The virtual range remains valid and later
+         * reads re-fault from the underlying file/page cache. Memory-filesystem
+         * mappings return immediately: their cached file pages are the physical
+         * storage, so a page-table walk cannot free the model and is uneconomical.
          *
          * This is safe to call after all tensor data has been copied to owned
          * buffers (e.g., VNNI interleaved format). Small weights like FP32 norms
@@ -225,9 +288,14 @@ namespace llaminar2
          *
          * @return Number of bytes advised, or 0 on failure/unsupported platform
          */
-        size_t adviseDontneed()
+        [[nodiscard]] size_t adviseDontneed() const
         {
 #ifdef __linux__
+            if (page_reclaim_policy_ ==
+                PageReclaimPolicy::RetainMemoryFilesystemPages)
+            {
+                return 0;
+            }
             if (base_ && length_ > 0)
             {
                 if (::madvise(base_, length_, MADV_DONTNEED) == 0)
@@ -243,9 +311,9 @@ namespace llaminar2
         /**
          * @brief Release physical pages for an arbitrary address range within any mmap'd region.
          *
-         * Page-aligns the range and calls madvise(MADV_DONTNEED). Safe to call on
-         * sub-ranges of mmap'd files — the VA range stays valid and will re-fault
-         * from the page cache on next access.
+         * Resolves the range through the live mapping registry, applies the
+         * mapping's immutable reclaim policy, then page-aligns and advises only
+         * durable mappings. Heap/expired ranges and tmpfs/ramfs ranges are no-ops.
          *
          * Use this to incrementally release mmap pages after tensor data has been
          * copied to owned buffers (e.g., VNNI interleaved engines), reducing peak RSS
@@ -261,11 +329,26 @@ namespace llaminar2
             if (!addr || len == 0)
                 return 0;
 
-            const size_t page_size = 4096;
-            auto raw = reinterpret_cast<uintptr_t>(addr);
-            uintptr_t aligned_start = raw & ~(page_size - 1);
-            uintptr_t aligned_end = (raw + len + page_size - 1) & ~(page_size - 1);
-            size_t aligned_len = aligned_end - aligned_start;
+            const auto source = resolveFileSource(addr, len);
+            if (!source ||
+                source->page_reclaim_policy ==
+                    PageReclaimPolicy::RetainMemoryFilesystemPages)
+            {
+                return 0;
+            }
+
+            const long configured_page_size = ::sysconf(_SC_PAGESIZE);
+            if (configured_page_size <= 0)
+                return 0;
+            const auto page_size = static_cast<uintptr_t>(configured_page_size);
+            const auto raw = reinterpret_cast<uintptr_t>(addr);
+            const uintptr_t raw_end = raw + len;
+            if (raw_end > std::numeric_limits<uintptr_t>::max() - (page_size - 1))
+                return 0;
+            const uintptr_t aligned_start = raw - (raw % page_size);
+            const uintptr_t aligned_end =
+                ((raw_end + page_size - 1) / page_size) * page_size;
+            const size_t aligned_len = aligned_end - aligned_start;
 
             if (::madvise(reinterpret_cast<void *>(aligned_start), aligned_len, MADV_DONTNEED) == 0)
             {
@@ -303,6 +386,24 @@ namespace llaminar2
                 return false;
             }
             const size_t file_size = static_cast<size_t>(st.st_size);
+
+            struct statfs filesystem;
+            if (::fstatfs(fd, &filesystem) != 0)
+            {
+                LOG_WARN("[MmapRegion] prepopulatePageCache: failed to inspect backing filesystem for "
+                         << file_path << " (errno=" << errno << ")");
+                ::close(fd);
+                return false;
+            }
+            if (classifyPageReclaimPolicy(static_cast<long>(filesystem.f_type)) ==
+                PageReclaimPolicy::RetainMemoryFilesystemPages)
+            {
+                // tmpfs/ramfs contents are already represented by resident (or
+                // explicitly swappable) memory pages; sequentially rereading the
+                // entire model cannot warm a separate block-device page cache.
+                ::close(fd);
+                return true;
+            }
 
             // Use large sequential reads for maximum disk throughput.
             // 8MB buffer aligns with typical SSD/NVMe command queue depth.
@@ -393,11 +494,23 @@ namespace llaminar2
                 return nullptr;
             }
 
+            struct statfs filesystem;
+            if (::fstatfs(fd, &filesystem) != 0)
+            {
+                LOG_ERROR("[MmapRegion] Failed to inspect backing filesystem: "
+                          << file_path << " (errno=" << errno << ")");
+                ::close(fd);
+                return nullptr;
+            }
+            const PageReclaimPolicy page_reclaim_policy =
+                classifyPageReclaimPolicy(static_cast<long>(filesystem.f_type));
+
             const bool numa_bind = (numa_node >= 0);
 
             if (numa_bind &&
                 prefault_policy != PrefaultPolicy::DemandPaged &&
-                !skip_cache_eviction)
+                !skip_cache_eviction &&
+                page_reclaim_policy == PageReclaimPolicy::AdviseDontneed)
             {
                 // Evict any stale page-cache pages for this file so that our
                 // first-touch loop below allocates fresh pages on the target
@@ -577,7 +690,13 @@ namespace llaminar2
                  prefault_policy != PrefaultPolicy::DemandPaged) ||
                 eager_populate;
             return std::unique_ptr<MmapRegion>(
-                new MmapRegion(base, file_size, fd, file_path, fully_resident));
+                new MmapRegion(
+                    base,
+                    file_size,
+                    fd,
+                    file_path,
+                    fully_resident,
+                    page_reclaim_policy));
 #else
             (void)numa_node;
             (void)skip_cache_eviction;
@@ -593,6 +712,8 @@ namespace llaminar2
             uintptr_t begin = 0;
             uintptr_t end = 0;
             std::string path;
+            PageReclaimPolicy page_reclaim_policy =
+                PageReclaimPolicy::AdviseDontneed;
         };
 
         static std::mutex &fileSourceRegistryMutex()
@@ -629,8 +750,29 @@ namespace llaminar2
 #endif
         }
 
-        MmapRegion(void *base, size_t length, int fd, const std::string &path, bool eager_prefaulted)
-            : base_(base), length_(length), fd_(fd), path_(path), eager_prefaulted_(eager_prefaulted)
+        /**
+         * @brief Adopt a successful mapping and publish its immutable provenance.
+         *
+         * @param base Page-aligned mapping base.
+         * @param length Logical file length covered by the mapping.
+         * @param fd Owned file descriptor retained for mapping lifetime.
+         * @param path Stable source path used by buffered GPU loading.
+         * @param eager_prefaulted Whether creation synchronously faulted all pages.
+         * @param page_reclaim_policy Backing-filesystem policy detected at open.
+         */
+        MmapRegion(
+            void *base,
+            size_t length,
+            int fd,
+            const std::string &path,
+            bool eager_prefaulted,
+            PageReclaimPolicy page_reclaim_policy)
+            : base_(base),
+              length_(length),
+              fd_(fd),
+              path_(path),
+              eager_prefaulted_(eager_prefaulted),
+              page_reclaim_policy_(page_reclaim_policy)
         {
 #ifdef __linux__
             if (base_ && base_ != MAP_FAILED && length_ > 0)
@@ -641,6 +783,7 @@ namespace llaminar2
                     .begin = begin,
                     .end = begin + length_,
                     .path = path_,
+                    .page_reclaim_policy = page_reclaim_policy_,
                 });
             }
 #endif
@@ -651,6 +794,8 @@ namespace llaminar2
         int fd_ = -1;
         std::string path_;
         bool eager_prefaulted_ = false;
+        PageReclaimPolicy page_reclaim_policy_ =
+            PageReclaimPolicy::AdviseDontneed;
     };
 
 } // namespace llaminar2

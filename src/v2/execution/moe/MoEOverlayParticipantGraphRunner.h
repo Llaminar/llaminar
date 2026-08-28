@@ -24,6 +24,7 @@
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
+#include "loaders/PreparedWeightAdmission.h"
 #include "loaders/WeightPlan.h"
 
 #include <cstdint>
@@ -71,6 +72,15 @@ namespace llaminar2
     {
         /** @brief Immutable model/weight authority for this rank-local graph. */
         std::shared_ptr<ModelContext> model_context;
+        /**
+         * @brief Whether this runner creates or adopts its expert engines.
+         *
+         * Certified reuse consumes only the terminally sealed participant and
+         * domain registry aliases. It must never rematerialize GGUF selections
+         * because migrated logical experts may occupy different physical slots.
+         */
+        PreparedWeightAdmission prepared_weight_admission =
+            PreparedWeightAdmission::AllocateCompleteSet;
         /** @brief World used exclusively by the matched sparse-collective protocol. */
         std::shared_ptr<IMPIContext> mpi_context;
         /** @brief Authenticated whole-expert ownership and tier placement plan. */
@@ -144,8 +154,9 @@ namespace llaminar2
          * overall graph admission above.
          */
         int max_decode_activation_rows = 1;
-        /** @brief Whether setup must retain the model's routed MTP sidecar graph. */
-        bool mtp_enabled = false;
+        /** @brief Exact setup-time MTP graph-family retention policy. */
+        MoEOverlayMTPGraphFamilyPolicy mtp_graph_family_policy =
+            MoEOverlayMTPGraphFamilyPolicy::MainOnly;
         /** @brief Largest speculative draft depth admitted by the root controller. */
         int max_mtp_draft_depth = 0;
         /** @brief Largest request batch represented by one retained transaction. */
@@ -290,6 +301,8 @@ namespace llaminar2
         int vocab_size() const override;
         /** @brief Reset request position while retaining prepared graphs/weights. */
         void clear_cache() override;
+        /** @brief No-op: sparse participant graphs own no reusable prefix archive. */
+        bool purgePrefixCache() override;
         /** @return Logical position consumed by matched forward calls. */
         int get_position() const override;
         /** @return GRAPH; all participant operations are graph stages. */
@@ -416,7 +429,12 @@ namespace llaminar2
          * @brief Stamp every sparse boundary in one graph before execution.
          *
          * @param graph Cached participant graph for one exact live-row shape.
+         * @param generation_id Root-authoritative request generation.
          * @param logical_step Absolute request position of this operation.
+         * @param phase Mathematical sparse-transaction phase.
+         * @param mtp_graph_depth MTP graph namespace depth, or -1 for main execution.
+         * @param placement_epoch Exact transaction residency epoch, or zero
+         *        for a process-local operation without sequence authority.
          * @return False when a graph-native sparse stage lacks a generation.
          */
         bool stampMoEOverlayCollectiveRuntime(
@@ -424,7 +442,8 @@ namespace llaminar2
             uint64_t generation_id,
             uint64_t logical_step,
             SparseTransactionPhase phase,
-            int mtp_graph_depth = -1);
+            int mtp_graph_depth = -1,
+            uint64_t placement_epoch = 0);
         /**
          * @brief Arm and execute one node-local mapped follower epoch.
          *

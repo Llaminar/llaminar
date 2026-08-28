@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <initializer_list>
 #include <map>
 #include <string>
 #include <string_view>
@@ -18,7 +19,8 @@ namespace llaminar2
         enum class Kind
         {
             Counter,
-            Timer
+            Timer,
+            OrderedSequence
         };
 
         Kind kind = Kind::Counter;
@@ -33,6 +35,12 @@ namespace llaminar2
         uint64_t total_ns = 0;
         uint64_t min_ns = 0;
         uint64_t max_ns = 0;
+        /** Number of canonical 64-bit words folded into ordered evidence. */
+        uint64_t sequence_word_count = 0;
+        /** First half of the ordered, topology-bounded sequence fingerprint. */
+        uint64_t sequence_digest_lo = 0;
+        /** Independent second half of the ordered sequence fingerprint. */
+        uint64_t sequence_digest_hi = 0;
     };
 
     class PerfStatsCollector
@@ -123,6 +131,38 @@ namespace llaminar2
             std::string domain,
             std::string name,
             uint64_t duration_ns,
+            std::string phase = {},
+            std::string device = {},
+            Tags tags = {});
+
+        /**
+         * @brief Fold one ordered lifecycle step into a bounded evidence row.
+         *
+         * PerfStats keys describe stable aggregation dimensions. Request,
+         * token, command, and generation identifiers must therefore never be
+         * placed in tags: doing so turns the collector into an unbounded event
+         * log and adds progressively more map work to inference. This method
+         * retains the exact order-sensitive protocol witness in two 64-bit
+         * fingerprints while the key remains bounded by topology and phase.
+         *
+         * Equal step counts, word counts, and both independent digests provide
+         * bounded order-sensitive evidence that two independently executing
+         * roles observed the same canonical sequence. Runtime protocol
+         * validation remains the authority that rejects a mismatched ticket.
+         * The word encoding is explicitly little-endian and is stable across
+         * CPU architectures and device backends.
+         *
+         * @param domain Stable PerfStats domain.
+         * @param name Stable evidence-family name.
+         * @param words Canonical words for exactly one ordered step; non-empty.
+         * @param phase Stable execution phase.
+         * @param device Stable device or participant description.
+         * @param tags Stable, bounded aggregation dimensions only.
+         */
+        static void recordOrderedSequenceStep(
+            std::string domain,
+            std::string name,
+            std::initializer_list<uint64_t> words,
             std::string phase = {},
             std::string device = {},
             Tags tags = {});

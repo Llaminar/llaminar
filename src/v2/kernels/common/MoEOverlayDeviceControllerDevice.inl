@@ -106,6 +106,10 @@ namespace llaminar2::moe_overlay_controller_device
     /** Exact measured payoff and anti-oscillation verdict for one closed cycle. */
     struct DynamicCycleEconomyScore
     {
+        std::uint64_t service_before_by_phase_ns
+            [kMoEOverlayDeviceControllerDemandPhaseCount] = {};
+        std::uint64_t service_after_by_phase_ns
+            [kMoEOverlayDeviceControllerDemandPhaseCount] = {};
         std::uint64_t service_before_ns = 0u;
         std::uint64_t service_after_ns = 0u;
         std::uint64_t projected_service_gain_ns = 0u;
@@ -1336,11 +1340,11 @@ namespace llaminar2::moe_overlay_controller_device
                 }
                 const std::uint64_t service = scratch.service_cost
                     [static_cast<std::uint32_t>(selected_tier)][phase];
-                score.service_before_ns = saturatingAdd(
-                    score.service_before_ns,
+                score.service_before_by_phase_ns[phase] = saturatingAdd(
+                    score.service_before_by_phase_ns[phase],
                     saturatingMultiply(before_maximum, service));
-                score.service_after_ns = saturatingAdd(
-                    score.service_after_ns,
+                score.service_after_by_phase_ns[phase] = saturatingAdd(
+                    score.service_after_by_phase_ns[phase],
                     saturatingMultiply(after_maximum, service));
             }
         }
@@ -1363,13 +1367,13 @@ namespace llaminar2::moe_overlay_controller_device
                 {
                     const std::uint64_t demand =
                         scratch.phase_expert_counts[phase][expert];
-                    score.service_before_ns = saturatingAdd(
-                        score.service_before_ns,
+                    score.service_before_by_phase_ns[phase] = saturatingAdd(
+                        score.service_before_by_phase_ns[phase],
                         saturatingMultiply(
                             demand,
                             scratch.service_cost[source_tier][phase]));
-                    score.service_after_ns = saturatingAdd(
-                        score.service_after_ns,
+                    score.service_after_by_phase_ns[phase] = saturatingAdd(
+                        score.service_after_by_phase_ns[phase],
                         saturatingMultiply(
                             demand,
                             scratch.service_cost[destination_tier][phase]));
@@ -1430,6 +1434,24 @@ namespace llaminar2::moe_overlay_controller_device
             }
         }
 
+        if (!moe_rebalance_policy::phaseObjectivesDoNotRegress(
+                score.service_before_by_phase_ns,
+                score.service_after_by_phase_ns,
+                kMeasuredDemandPhases))
+        {
+            return score;
+        }
+        for (std::uint32_t phase = 0u;
+             phase < kMeasuredDemandPhases;
+             ++phase)
+        {
+            score.service_before_ns = saturatingAdd(
+                score.service_before_ns,
+                score.service_before_by_phase_ns[phase]);
+            score.service_after_ns = saturatingAdd(
+                score.service_after_ns,
+                score.service_after_by_phase_ns[phase]);
+        }
         if (!moe_rebalance_policy::relativeReductionAtLeastPerMille(
                 score.service_before_ns,
                 score.service_after_ns,
@@ -2737,6 +2759,18 @@ namespace llaminar2::moe_overlay_controller_device
                         participant_count,
                         expert_count,
                         priority_count);
+                const bool advances_priority =
+                    candidate_score.priority_cost <
+                    working_score.priority_cost;
+                const bool advances_participant =
+                    candidate_score.same_priority_makespan <
+                    working_score.same_priority_makespan;
+                const auto movement_axis =
+                    advances_priority && advances_participant
+                        ? MoEOverlayDeviceMovementAxis::Combined
+                        : (advances_priority
+                               ? MoEOverlayDeviceMovementAxis::TierResidency
+                               : MoEOverlayDeviceMovementAxis::ParticipantPlacement);
                 const std::uint64_t payload_bytes = loadPeerPublished(
                     binding.payload_bytes_per_layer + layer);
                 if (payload_bytes == 0u)
@@ -2762,6 +2796,7 @@ namespace llaminar2::moe_overlay_controller_device
                     command.expert = expert;
                     command.source_participant = source;
                     command.destination_participant = destination;
+                    command.flags = raw(movement_axis);
                     command.payload_bytes = payload_bytes;
                     command.source_epoch = base_epoch;
                     command.candidate_epoch = candidate_epoch;

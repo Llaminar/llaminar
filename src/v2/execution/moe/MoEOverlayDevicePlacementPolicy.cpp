@@ -8,6 +8,7 @@
 #include "DeviceMoERebalancePolicyShared.h"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -28,6 +29,14 @@ namespace llaminar2
         /** Measured payoff and committed-hysteresis verdict for one cycle. */
         struct CycleEconomyScore
         {
+            std::array<
+                std::uint64_t,
+                kMoEOverlayDeviceControllerDemandPhaseCount>
+                service_before_by_phase_ns{};
+            std::array<
+                std::uint64_t,
+                kMoEOverlayDeviceControllerDemandPhaseCount>
+                service_after_by_phase_ns{};
             std::uint64_t service_before_ns = 0u;
             std::uint64_t service_after_ns = 0u;
             std::uint64_t projected_service_gain_ns = 0u;
@@ -376,11 +385,11 @@ namespace llaminar2
                             static_cast<std::uint32_t>(selected_tier),
                             layer,
                             phase)];
-                    score.service_before_ns = saturatingAdd(
-                        score.service_before_ns,
+                    score.service_before_by_phase_ns[phase] = saturatingAdd(
+                        score.service_before_by_phase_ns[phase],
                         saturatingMultiply(before_maximum, service));
-                    score.service_after_ns = saturatingAdd(
-                        score.service_after_ns,
+                    score.service_after_by_phase_ns[phase] = saturatingAdd(
+                        score.service_after_by_phase_ns[phase],
                         saturatingMultiply(after_maximum, service));
                 }
             }
@@ -403,24 +412,26 @@ namespace llaminar2
                         const std::uint64_t demand =
                             economy.phase_expert_demand[demandOffset(
                                 input, phase, layer, expert)];
-                        score.service_before_ns = saturatingAdd(
-                            score.service_before_ns,
-                            saturatingMultiply(
-                                demand,
-                                economy.service_costs[serviceOffset(
-                                    input,
-                                    source_tier,
-                                    layer,
-                                    phase)]));
-                        score.service_after_ns = saturatingAdd(
-                            score.service_after_ns,
-                            saturatingMultiply(
-                                demand,
-                                economy.service_costs[serviceOffset(
-                                    input,
-                                    destination_tier,
-                                    layer,
-                                    phase)]));
+                        score.service_before_by_phase_ns[phase] =
+                            saturatingAdd(
+                                score.service_before_by_phase_ns[phase],
+                                saturatingMultiply(
+                                    demand,
+                                    economy.service_costs[serviceOffset(
+                                        input,
+                                        source_tier,
+                                        layer,
+                                        phase)]));
+                        score.service_after_by_phase_ns[phase] =
+                            saturatingAdd(
+                                score.service_after_by_phase_ns[phase],
+                                saturatingMultiply(
+                                    demand,
+                                    economy.service_costs[serviceOffset(
+                                        input,
+                                        destination_tier,
+                                        layer,
+                                        phase)]));
                     }
                 }
             }
@@ -468,6 +479,24 @@ namespace llaminar2
                 }
             }
 
+            if (!moe_rebalance_policy::phaseObjectivesDoNotRegress(
+                    score.service_before_by_phase_ns.data(),
+                    score.service_after_by_phase_ns.data(),
+                    kMoEOverlayDeviceControllerDemandPhaseCount))
+            {
+                return score;
+            }
+            for (std::uint32_t phase = 0u;
+                 phase < kMoEOverlayDeviceControllerDemandPhaseCount;
+                 ++phase)
+            {
+                score.service_before_ns = saturatingAdd(
+                    score.service_before_ns,
+                    score.service_before_by_phase_ns[phase]);
+                score.service_after_ns = saturatingAdd(
+                    score.service_after_ns,
+                    score.service_after_by_phase_ns[phase]);
+            }
             if (!moe_rebalance_policy::relativeReductionAtLeastPerMille(
                     score.service_before_ns,
                     score.service_after_ns,
@@ -999,6 +1028,18 @@ namespace llaminar2
                     candidate[expert] = desired[expert];
                 const PlacementScore candidate_score = scoreLayer(
                     input, candidate, counts, priorities);
+                const bool advances_priority =
+                    candidate_score.priority_cost <
+                    working_score.priority_cost;
+                const bool advances_participant =
+                    candidate_score.same_priority_makespan <
+                    working_score.same_priority_makespan;
+                const auto movement_axis =
+                    advances_priority && advances_participant
+                        ? MoEOverlayDeviceMovementAxis::Combined
+                        : (advances_priority
+                               ? MoEOverlayDeviceMovementAxis::TierResidency
+                               : MoEOverlayDeviceMovementAxis::ParticipantPlacement);
 
                 for (const std::uint32_t expert : best_cycle)
                 {
@@ -1013,6 +1054,7 @@ namespace llaminar2
                         .expert = expert,
                         .source_participant = source,
                         .destination_participant = destination,
+                        .flags = static_cast<std::uint32_t>(movement_axis),
                         .payload_bytes =
                             input.payload_bytes_per_layer[layer],
                         .source_epoch = input.base_epoch,

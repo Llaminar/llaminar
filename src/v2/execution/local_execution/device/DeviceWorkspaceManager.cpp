@@ -598,6 +598,152 @@ namespace llaminar2
         return allocatePlacedBuffers(plan.placements, plan.total_bytes);
     }
 
+    bool DeviceWorkspaceManager::sealPrimaryBlockForReuse(
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+
+        try
+        {
+            if (!extension_blocks_.empty())
+            {
+                if (error)
+                {
+                    *error =
+                        "workspace owns append-only extension blocks that cannot form one reusable serial-family allocation";
+                }
+                return false;
+            }
+
+            /*
+             * Publication objects can own backend events and immutable device
+             * metadata. The graph topology has already been retired by the
+             * caller, so replacing this registry closes the final host owner
+             * before the same bytes receive a new semantic layout.
+             */
+            persistent_slot_registry_ =
+                std::make_shared<detail::PersistentWorkspaceSlotRegistry>();
+            buffers_.clear();
+            used_bytes_ = 0;
+
+            if (!block_ || block_size_ == 0)
+            {
+                allocated_ = false;
+                reusable_primary_block_ = false;
+                return true;
+            }
+
+            allocated_ = true;
+            reusable_primary_block_ = true;
+            PerfStatsCollector::addCounter(
+                "memory",
+                "workspace_primary_block_reuse_seals",
+                1.0,
+                "model_teardown",
+                device_.to_string(),
+                {{"bytes", std::to_string(block_size_)},
+                 {"manager_id", std::to_string(id_)}});
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+        }
+        catch (...)
+        {
+            if (error)
+                *error = "workspace reuse sealing raised a non-standard exception";
+        }
+        return false;
+    }
+
+    bool DeviceWorkspaceManager::reusePrimaryBlockForSerialFamily(
+        const SerialWorkspaceFamilyPlan &plan)
+    {
+        if (!reusable_primary_block_ || !allocated_ || !block_ ||
+            block_size_ == 0)
+        {
+            LOG_ERROR(
+                "[DeviceWorkspaceManager] Serial-family reuse requires one sealed primary block on "
+                << device_.to_string());
+            return false;
+        }
+        if (!plan.valid())
+        {
+            LOG_ERROR(
+                "[DeviceWorkspaceManager] Refusing invalid reused serial workspace family on "
+                << device_.to_string() << ": " << plan.error);
+            return false;
+        }
+        if (plan.total_bytes > block_size_)
+        {
+            LOG_ERROR(
+                "[DeviceWorkspaceManager] Reused serial workspace family requires "
+                << plan.total_bytes << " bytes but retained block owns "
+                << block_size_ << " bytes on " << device_.to_string());
+            return false;
+        }
+
+        std::unordered_map<std::string, BufferInfo> republished;
+        republished.reserve(plan.placements.size());
+        for (const auto &placement : plan.placements)
+        {
+            const WorkspaceDescriptor &descriptor = placement.descriptor;
+            if (descriptor.name.empty() || descriptor.alignment == 0 ||
+                (descriptor.alignment & (descriptor.alignment - 1)) != 0 ||
+                placement.offset > plan.total_bytes ||
+                descriptor.size_bytes > plan.total_bytes - placement.offset)
+            {
+                LOG_ERROR(
+                    "[DeviceWorkspaceManager] Invalid placement while republishing reused workspace name='"
+                    << descriptor.name << "' on " << device_.to_string());
+                return false;
+            }
+            void *const pointer =
+                static_cast<char *>(block_) + placement.offset;
+            if (!device_.is_cpu() &&
+                (reinterpret_cast<std::uintptr_t>(pointer) &
+                 (descriptor.alignment - 1)) != 0)
+            {
+                LOG_ERROR(
+                    "[DeviceWorkspaceManager] Reused workspace placement is misaligned for '"
+                    << descriptor.name << "' on " << device_.to_string());
+                return false;
+            }
+            const auto [_, inserted] = republished.emplace(
+                descriptor.name,
+                BufferInfo{
+                    .base = block_,
+                    .offset = placement.offset,
+                    .size = descriptor.size_bytes,
+                });
+            if (!inserted)
+            {
+                LOG_ERROR(
+                    "[DeviceWorkspaceManager] Reused serial family publishes duplicate name '"
+                    << descriptor.name << "' on " << device_.to_string());
+                return false;
+            }
+        }
+
+        buffers_ = std::move(republished);
+        used_bytes_ = plan.total_bytes;
+        reusable_primary_block_ = false;
+        PerfStatsCollector::addCounter(
+            "memory",
+            "workspace_primary_block_reuses",
+            1.0,
+            "graph_setup",
+            device_.to_string(),
+            {{"retained_bytes", std::to_string(block_size_)},
+             {"planned_bytes", std::to_string(plan.total_bytes)},
+             {"buffer_count", std::to_string(plan.placements.size())},
+             {"manager_id", std::to_string(id_)}});
+        return true;
+    }
+
     bool DeviceWorkspaceManager::extend(
         const WorkspaceRequirements &requirements)
     {
@@ -971,6 +1117,7 @@ namespace llaminar2
             return false;
         }
         block_size_ = total_size;
+        reusable_primary_block_ = false;
 
         if (!device_.is_cpu())
         {
@@ -1250,6 +1397,7 @@ namespace llaminar2
         buffers_.clear();
         used_bytes_ = 0;
         allocated_ = false;
+        reusable_primary_block_ = false;
     }
 
     // =========================================================================

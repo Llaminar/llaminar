@@ -176,6 +176,107 @@ namespace llaminar2
     };
 
     /**
+     * @brief Host-published completion record for one colocated CPU route bank.
+     *
+     * The CPU producer writes every route slot and preweighted contribution
+     * before release-publishing the next @ref published_sequence. A retained
+     * CUDA/HIP consumer acquires that exact sequence, reads only
+     * @ref live_entry_count compact entries, and release-publishes the same
+     * value to @ref consumed_sequence after materialization completes. The
+     * producer may not reuse the mapped payload until both sequences match.
+     *
+     * Separate monotonic producer/consumer sequences deliberately replace a
+     * reusable zero/one flag. A captured consumer can therefore distinguish a
+     * new publication from the preceding replay even when it starts before the
+     * CPU has armed the next transaction. The record is isolated on its own
+     * cache line so polling never contends with route-slot payload bytes.
+     */
+    struct alignas(64) MoEOverlayCanonicalRouteTicketControl
+    {
+        static constexpr std::uint32_t kMagic = 0x43544f4du; // "MOTC"
+        static constexpr std::uint32_t kABIVersion = 2u;
+
+        std::uint32_t magic = kMagic; ///< Immutable ABI identity.
+        std::uint32_t abi_version = kABIVersion; ///< Immutable ABI version.
+        std::uint64_t workspace_generation = 0u; ///< Setup-owned graph identity.
+        /** CPU-owned monotonic release sequence; zero means never published. */
+        std::uint64_t published_sequence = 0u;
+        /** GPU-owned monotonic acknowledgement after complete materialization. */
+        std::uint64_t consumed_sequence = 0u;
+        std::uint64_t live_entry_count = 0u; ///< Compact entries published this replay.
+        std::uint64_t residency_epoch = 0u; ///< Exact placement epoch used by the CPU.
+        std::int32_t layer_idx = -1; ///< Model layer embedded in the ticket.
+        std::int32_t route_capacity = 0; ///< Maximum compact/original slot count.
+        std::int32_t d_model = 0; ///< Width of one canonical contribution row.
+        std::int32_t reserved = 0;
+
+        /** @return Whether immutable identity and geometry are representable. */
+        [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid() const noexcept
+        {
+            return magic == kMagic && abi_version == kABIVersion &&
+                   workspace_generation != 0u && layer_idx >= 0 &&
+                   route_capacity > 0 && d_model > 0;
+        }
+
+        /**
+         * @return Whether the producer/consumer cursors describe zero or one
+         *         outstanding SPSC publication.
+         */
+        [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool
+        sequenceStateValid() const noexcept
+        {
+            return published_sequence >= consumed_sequence &&
+                   published_sequence - consumed_sequence <= 1u;
+        }
+
+        /** @return Whether exactly one newly published payload awaits the GPU. */
+        [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool
+        publicationPending() const noexcept
+        {
+            return sequenceStateValid() &&
+                   published_sequence > consumed_sequence;
+        }
+    };
+
+    static_assert(
+        sizeof(MoEOverlayCanonicalRouteTicketControl) == 64u,
+        "canonical route ticket control must remain one cache line");
+    static_assert(
+        std::is_trivially_copyable_v<MoEOverlayCanonicalRouteTicketControl>);
+
+    /**
+     * @brief Captured GPU materialization of one colocated CPU route ticket.
+     *
+     * Route identities and contribution rows are immutable-address mapped host
+     * storage. The CPU stores contributions at the authenticated compact slot
+     * used by its grouped expert kernel; this launch places each row into the
+     * continuation bank's original router slot without reducing it.
+     */
+    struct MoEOverlayCanonicalRouteTicketConsumeLaunch
+    {
+        /** Mutable because the consumer acknowledges its exact publication. */
+        MoEOverlayCanonicalRouteTicketControl *control = nullptr;
+        const std::int32_t *original_route_slots = nullptr;
+        const std::int32_t *compact_route_slots = nullptr;
+        const float *compact_preweighted_contributions_fp32 = nullptr;
+        float *canonical_route_contributions_fp32 = nullptr;
+        std::size_t route_capacity = 0u;
+        std::int32_t d_model = 0;
+
+        /** @return Whether every capture-stable mapped/device address is complete. */
+        [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid() const noexcept
+        {
+            /* `control` is a GPU alias of mapped host memory. Host launch
+             * validation must not dereference that alias: the device kernel
+             * acquires and authenticates the record after publication. */
+            return control && original_route_slots && compact_route_slots &&
+                   compact_preweighted_contributions_fp32 &&
+                   canonical_route_contributions_fp32 && route_capacity > 0u &&
+                   d_model > 0;
+        }
+    };
+
+    /**
      * @brief Minimal graph-facing view of one versioned overlay placement bank.
      *
      * Packet compaction needs only the bank epoch and the overlay-wide target

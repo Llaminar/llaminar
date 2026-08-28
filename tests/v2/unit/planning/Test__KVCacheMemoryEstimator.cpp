@@ -138,6 +138,66 @@ TEST(Test__KVCacheMemoryEstimator, GPUQ8PricesAQ8KeysValuesAnchorsAndTables)
         expected);
 }
 
+TEST(Test__KVCacheMemoryEstimator,
+     GPULogicalPrefixBlocksMatchCUDAAndROCmNativePayloads)
+{
+    constexpr int tokens = 7;
+    const std::size_t linear_row =
+        kHeads * kHeadDim * sizeof(std::uint16_t);
+    for (const DeviceId device :
+         {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        const auto fp16 =
+            KVCacheMemoryEstimator::estimateGPULogicalBlock(
+                tokens,
+                kHeads,
+                kHeadDim,
+                "fp16",
+                device);
+        EXPECT_EQ(fp16.k_bytes, tokens * linear_row);
+        EXPECT_EQ(fp16.v_bytes, tokens * linear_row);
+
+        const auto q8 =
+            KVCacheMemoryEstimator::estimateGPULogicalBlock(
+                tokens,
+                kHeads,
+                kHeadDim,
+                "q8_1",
+                device);
+        EXPECT_EQ(
+            q8.k_bytes,
+            kHeads * kHeadDim * sizeof(float) +
+                tokens * kHeads * sizeof(AttentionKeyQ8Block_64));
+        EXPECT_EQ(
+            q8.v_bytes,
+            tokens * kHeads * 2 * sizeof(Q8_1Block));
+
+        const auto tq4 =
+            KVCacheMemoryEstimator::estimateGPULogicalBlock(
+                tokens,
+                kHeads,
+                kHeadDim,
+                "tq4",
+                device);
+        const auto tq8 =
+            KVCacheMemoryEstimator::estimateGPULogicalBlock(
+                tokens,
+                kHeads,
+                kHeadDim,
+                "tq",
+                device);
+        EXPECT_EQ(
+            tq4.k_bytes,
+            tq8.k_bytes);
+        EXPECT_EQ(
+            tq4.v_bytes,
+            tokens * kHeads * sizeof(TQ4Block_64));
+        EXPECT_EQ(
+            tq8.v_bytes,
+            tokens * kHeads * sizeof(TQ8Block_64));
+    }
+}
+
 TEST(Test__KVCacheMemoryEstimator, CPUTQ4IsTQ8KeysAndTQ4Values)
 {
     const std::size_t expected =
@@ -223,6 +283,18 @@ TEST(Test__KVCacheMemoryEstimator, UnsupportedInputsFailClosed)
         std::invalid_argument);
     EXPECT_THROW(
         KVCacheMemoryEstimator::getBytesPerElement("tq4"),
+        std::invalid_argument);
+    EXPECT_THROW(
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            64, 1, 64, "fp16", DeviceId::cpu()),
+        std::invalid_argument);
+    EXPECT_THROW(
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            0, 1, 64, "fp16", DeviceId::cuda(0)),
+        std::invalid_argument);
+    EXPECT_THROW(
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            64, 1, 64, "q16_1", DeviceId::rocm(0)),
         std::invalid_argument);
 }
 

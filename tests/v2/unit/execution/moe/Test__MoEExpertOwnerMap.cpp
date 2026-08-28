@@ -129,6 +129,50 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief Canonical lookup must not mistake an adjacent owner for a miss.
+     *
+     * Production dispatch performs this query for every routed activation.
+     * The logarithmic implementation relies on canonical owner order, so the
+     * boundary and cross-layer misses below lock down its exact equality check.
+     */
+    TEST(Test__MoEExpertOwnerMap,
+         CanonicalCoordinateLookupIsTotalAndRejectsAdjacentMisses)
+    {
+        auto plan =
+            disjointRocmPlan(RoutedExpertComputePolicy::Apportioned);
+        plan.placements.push_back(RoutedExpertLayerPlacement{
+            .layer = 1,
+            .routed_expert_tier = {0, 0, 0, 0, 0, 0},
+        });
+        const auto owner_map = MoEExpertOwnerMap::build(plan);
+
+        for (int layer = 0; layer < 2; ++layer)
+        {
+            for (int expert = 0; expert < 6; ++expert)
+            {
+                const auto *const owner = owner_map.ownerFor(layer, expert);
+                ASSERT_NE(owner, nullptr)
+                    << "layer=" << layer << " expert=" << expert;
+                EXPECT_EQ(owner->layer_idx, layer);
+                EXPECT_EQ(owner->expert_id, expert);
+                EXPECT_EQ(owner_map.ownerCountForExpert(layer, expert), 1u);
+            }
+        }
+
+        for (const auto [layer, expert] : {
+                 std::pair{-1, 0},
+                 std::pair{0, -1},
+                 std::pair{0, 6},
+                 std::pair{1, 6},
+                 std::pair{2, 0}})
+        {
+            EXPECT_EQ(owner_map.ownerFor(layer, expert), nullptr)
+                << "layer=" << layer << " expert=" << expert;
+            EXPECT_EQ(owner_map.ownerCountForExpert(layer, expert), 0u);
+        }
+    }
+
+    /**
      * @brief Explicit epoch ownership preserves a same-tier skew correction.
      *
      * The tier vector is unchanged: only the exact ROCm participant owners are

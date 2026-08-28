@@ -195,6 +195,11 @@ namespace llaminar2
         }
     }
 
+    bool MultiDomainOrchestrator::purgePrefixCache()
+    {
+        return !inner_runner_ || inner_runner_->purgePrefixCache();
+    }
+
     int MultiDomainOrchestrator::get_position() const
     {
         if (!initialized_)

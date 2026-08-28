@@ -667,6 +667,8 @@ namespace llaminar2
                                      MoEOverlayCollectiveRuntimeParams::
                                          ExecutionSemantics::Decode),
                 .mtp_depth = input.moe_overlay_mtp_depth,
+                .placement_epoch =
+                    input.moe_overlay_sequence_placement_epoch,
             };
         }
 
@@ -706,11 +708,10 @@ namespace llaminar2
          * @brief Emit one production-evidence record for a completed sparse graph execution.
          *
          * The counter is intentionally outside the stage loop: one graph
-         * invocation can contain many layer-local dispatch/return boundaries,
-         * but they must all carry the same request generation and logical
-         * chunk start.  Tests can therefore prove the continuation and remote
-         * expert graph used the same protocol sequence without turning
-         * layer-count into an observability artefact.  Callers invoke this
+         * invocation can contain many layer-local dispatch/return boundaries.
+         * Stable counters retain phase and geometry totals, while the ordered
+         * sequence row folds request generation and logical step into bounded
+         * evidence that can be compared with the remote participant. Callers invoke this
          * only after the graph result and its live-state handoff have both
          * succeeded: cache lookup is not execution evidence, because the
          * first use of an atomic GPU graph deliberately transitions from a
@@ -735,6 +736,18 @@ namespace llaminar2
                     : "prefill";
             const int logical_rows =
                 input.real_seq_len > 0 ? input.real_seq_len : input.seq_len;
+            PerfStatsCollector::recordOrderedSequenceStep(
+                "forward_graph",
+                "moe_overlay_collective_transaction_sequence",
+                {runtime_params.generation_id,
+                 runtime_params.step_id,
+                 static_cast<uint64_t>(logical_rows),
+                 static_cast<uint64_t>(input.seq_len)},
+                phase,
+                input.device.to_string(),
+                {{"role", "continuation_graph"},
+                 {"identity_source", "orchestration_request_and_chunk"},
+                 {"logical_step_semantics", "monotonic_transaction"}});
             PerfStatsCollector::addCounter(
                 "forward_graph",
                 "moe_overlay_collective_transaction",
@@ -743,12 +756,7 @@ namespace llaminar2
                 input.device.to_string(),
                 {{"role", "continuation_graph"},
                  {"identity_source", "orchestration_request_and_chunk"},
-                 {"generation", std::to_string(runtime_params.generation_id)},
-                 {"logical_step", std::to_string(runtime_params.step_id)},
                  {"logical_step_semantics", "monotonic_transaction"},
-                 {"prefill_chunk_index",
-                  std::to_string(input.prefill_chunk_index)},
-                 {"token_offset", std::to_string(input.token_offset)},
                  {"logical_rows", std::to_string(logical_rows)},
                  {"physical_rows", std::to_string(input.seq_len)},
                  {"graph_path", graph_path ? graph_path : "unknown"},

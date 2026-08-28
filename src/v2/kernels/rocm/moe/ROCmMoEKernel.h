@@ -91,6 +91,11 @@ namespace llaminar2
             const MoEKernelLaunchContext &launch,
             const MoEOverlayActivationReturnConsumeLaunch &packet) override;
 
+        /** @copydoc IMoEKernel::consumeMoEOverlayCanonicalRouteTicket */
+        bool consumeMoEOverlayCanonicalRouteTicket(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayCanonicalRouteTicketConsumeLaunch &ticket) override;
+
         /** @copydoc IMoEKernel::packSingleRowMoEOverlayActivationDispatch */
         bool packSingleRowMoEOverlayActivationDispatch(
             const MoEKernelLaunchContext &launch,
@@ -656,7 +661,8 @@ namespace llaminar2
             uint32_t command_buffer_count = 1,
             const DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr,
             uint32_t local_transfer_slot_count = 0,
-            DeviceMoELLEPLayerPlanScratch *llep_layer_plans = nullptr) override;
+            DeviceMoELLEPLayerPlanScratch *llep_layer_plans = nullptr,
+            DeviceMoEPlacementBank *placement_plan_scratch = nullptr) override;
 
         bool packDeviceRebalanceHistograms(
             const MoEKernelLaunchContext &launch,

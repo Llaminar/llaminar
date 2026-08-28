@@ -12,6 +12,7 @@
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
+#include "execution/moe/MoEOverlayPreparedWeightSource.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "loaders/ModelLoader.h"
 
@@ -60,7 +61,14 @@ namespace
         return model;
     }
 
-    /** @brief Build two process-local CPU tiers with an explicit owner order. */
+    /**
+     * @brief Build two logical process-local CPU tiers with an explicit order.
+     *
+     * Unit tests distinguish participants through their typed domain identity,
+     * not host NUMA coordinates. Real-node first-touch and cross-socket traffic
+     * remain integration concerns; encoding nodes 0/1 here made this device-free
+     * gate depend on the socket to which CTest happened to bind its one rank.
+     */
     MoERoutedExpertPlacementPlan twoCpuTierPlan(
         std::vector<int> expert_tiers,
         RoutedExpertResidencyPolicy policy)
@@ -71,7 +79,7 @@ namespace
         hot.name = "hot_domain";
         hot.scope = ExecutionDomainScope::SINGLE;
         hot.backend = CollectiveBackendType::HOST;
-        hot.participants = {GlobalDeviceAddress::cpu(0)};
+        hot.participants = {GlobalDeviceAddress::cpu()};
         hot.world_ranks = {0};
         hot.owner_rank = 0;
         hot.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
@@ -80,7 +88,7 @@ namespace
         cold.name = "cold_domain";
         cold.scope = ExecutionDomainScope::SINGLE;
         cold.backend = CollectiveBackendType::HOST;
-        cold.participants = {GlobalDeviceAddress::cpu(1)};
+        cold.participants = {GlobalDeviceAddress::cpu()};
         cold.world_ranks = {0};
         cold.owner_rank = 0;
         cold.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
@@ -113,16 +121,21 @@ namespace
         return plan;
     }
 
-    /** @brief Q4_0 gate/up/down shapes matching a 64x32 routed MLP. */
-    std::vector<CpuExpertSlotPool::ProjectionSpec> sourceProjectionSpecs()
-    {
-        const NativeVnniSourceIdentity source_identity{
+    /**
+     * @brief Gate/up/down shapes for one exact prepared-weight format.
+     * @param format NativeVNNI codebook or contiguous floating precision.
+     * @return Complete projection geometry matching a 64x32 routed MLP.
+     */
+    std::vector<CpuExpertSlotPool::ProjectionSpec> sourceProjectionSpecs(
+        ExpertWeightFormat format = ExpertWeightFormat::nativeVnni({
             .codebook_id = native_vnni_formats::Q4_0.codebook_id,
             .is_superblock = native_vnni_formats::Q4_0.is_superblock,
             .present = true,
-        };
-        const ExpertWeightFormat format =
-            ExpertWeightFormat::nativeVnni(source_identity);
+        }))
+    {
+        if (!format.valid())
+            throw std::invalid_argument(
+                "CPU overlay test requires a valid expert weight format");
         return {
             {
                 .projection = ExpertTierWeightProjection::Gate,
@@ -149,13 +162,18 @@ namespace
     MoEOverlayPreparedExpertTriplet makeSourceExpert(
         int participant_id,
         int expert_id,
-        std::uint8_t seed)
+        std::uint8_t seed,
+        ExpertWeightFormat format = ExpertWeightFormat::nativeVnni({
+            .codebook_id = native_vnni_formats::Q4_0.codebook_id,
+            .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+            .present = true,
+        }))
     {
         auto pool = CpuExpertSlotPool::create({
             .participant_id = participant_id,
             .layer_idx = 0,
             .capacity = 1,
-            .projections = sourceProjectionSpecs(),
+            .projections = sourceProjectionSpecs(format),
             .memory_placement =
                 CpuExpertSlotPool::MemoryPlacement::aggregateDomain(),
             .perf_device = "cpu-overlay-fabric-test",
@@ -252,8 +270,14 @@ namespace
         return registry;
     }
 
-    /** @brief Snapshot the exact final CPU bytes for a prepared triplet. */
-    std::array<std::vector<std::uint8_t>, 3> packedBytes(
+    /**
+     * @brief Snapshot the exact live CPU bytes for a prepared triplet.
+     *
+     * Quantized experts expose their final NativeVNNI buffer; floating experts
+     * expose their exact row-major FP16, BF16, or FP32 buffer. Reading through
+     * the engine interface keeps the assertion independent of slot ownership.
+     */
+    std::array<std::vector<std::uint8_t>, 3> preparedBytes(
         const MoEOverlayPreparedExpertTriplet &triplet)
     {
         std::array<std::vector<std::uint8_t>, 3> result;
@@ -266,14 +290,26 @@ namespace
              projection < engines.size();
              ++projection)
         {
-            const auto *packed =
-                engines[projection]->exportCPUNativeVNNIPackedWeights();
-            if (!packed)
+            if (const auto *packed =
+                    engines[projection]->exportCPUNativeVNNIPackedWeights())
+            {
+                result[projection].assign(
+                    packed->native_interleaved.begin(),
+                    packed->native_interleaved.end());
+                continue;
+            }
+
+            ContiguousFloatingPointWeightDescriptor floating;
+            if (!engines[projection]
+                     ->exportContiguousFloatingPointWeights(floating) ||
+                !floating.valid())
+            {
                 throw std::runtime_error(
-                    "CPU overlay test engine cannot export packed weights");
-            result[projection].assign(
-                packed->native_interleaved.begin(),
-                packed->native_interleaved.end());
+                    "CPU overlay test engine exposes neither a packed nor a floating weight view");
+            }
+            const auto *begin = static_cast<const std::uint8_t *>(
+                floating.data);
+            result[projection].assign(begin, begin + floating.bytes);
         }
         return result;
     }
@@ -451,8 +487,9 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
         << "Wave capacity must not be reduced to current endpoint occupancy";
     EXPECT_EQ(stats.gpu_shadow_slots, 0u);
     EXPECT_EQ(stats.persistent_transfer_lanes, 6u)
-        << "Both directed CPU address edges own gate/up/down workers";
-    EXPECT_EQ(stats.maximum_parallel_cpu_copy_lanes, 1u);
+        << "The shared CPU address owns two gate/up/down workers for its two "
+           "logical participants";
+    EXPECT_EQ(stats.maximum_parallel_cpu_copy_lanes, 2u);
     EXPECT_EQ(stats.parallel_cpu_copy_lane_reservations, 0u);
     EXPECT_EQ(stats.parallel_cpu_copy_lane_pool_exhaustions, 0u);
     EXPECT_EQ(stats.inference_stream_waits, 0u);
@@ -460,164 +497,398 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
 }
 
 TEST(Test__MoEOverlayPhysicalResidencyFabric,
-     SingleShadowSlotSustainsRepeatedByteExactCpuRebalancing)
+     SingleShadowSlotSustainsRepeatedByteExactCpuRebalancingAndReusableSealingForEveryWeightFormat)
 {
-    const auto plan = twoCpuTierPlan(
-        {0, 0, 1}, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
-    const auto owner_map = MoEExpertOwnerMap::build(plan);
+    struct FormatCase
+    {
+        const char *name;
+        ExpertWeightFormat format;
+    };
+    const std::array format_cases{
+        FormatCase{
+            "Q4_0",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q4_0.codebook_id,
+                .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "Q4_1",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q4_1.codebook_id,
+                .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "Q5_0",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q5_0.codebook_id,
+                .is_superblock = native_vnni_formats::Q5_0.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "Q5_1",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q5_1.codebook_id,
+                .is_superblock = native_vnni_formats::Q5_1.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "Q8_0",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q8_0.codebook_id,
+                .is_superblock = native_vnni_formats::Q8_0.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "Q2_K",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q2_K.codebook_id,
+                .is_superblock = native_vnni_formats::Q2_K.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "Q3_K",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q3_K.codebook_id,
+                .is_superblock = native_vnni_formats::Q3_K.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "Q4_K",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q4_K.codebook_id,
+                .is_superblock = native_vnni_formats::Q4_K.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "Q5_K",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q5_K.codebook_id,
+                .is_superblock = native_vnni_formats::Q5_K.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "Q6_K",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q6_K.codebook_id,
+                .is_superblock = native_vnni_formats::Q6_K.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "Q8_K",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q8_K.codebook_id,
+                .is_superblock = native_vnni_formats::Q8_K.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "IQ2_XXS",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::IQ2_XXS.codebook_id,
+                .is_superblock = native_vnni_formats::IQ2_XXS.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "IQ2_XS",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::IQ2_XS.codebook_id,
+                .is_superblock = native_vnni_formats::IQ2_XS.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "IQ3_XXS",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::IQ3_XXS.codebook_id,
+                .is_superblock = native_vnni_formats::IQ3_XXS.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "IQ1_S",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::IQ1_S.codebook_id,
+                .is_superblock = native_vnni_formats::IQ1_S.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "IQ4_NL",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::IQ4_NL.codebook_id,
+                .is_superblock = native_vnni_formats::IQ4_NL.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "IQ3_S",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::IQ3_S.codebook_id,
+                .is_superblock = native_vnni_formats::IQ3_S.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "IQ2_S",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::IQ2_S.codebook_id,
+                .is_superblock = native_vnni_formats::IQ2_S.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "IQ4_XS",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::IQ4_XS.codebook_id,
+                .is_superblock = native_vnni_formats::IQ4_XS.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "IQ1_M",
+            ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::IQ1_M.codebook_id,
+                .is_superblock = native_vnni_formats::IQ1_M.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "FP16", ExpertWeightFormat::floating(TensorType::FP16)},
+        FormatCase{
+            "BF16", ExpertWeightFormat::floating(TensorType::BF16)},
+        FormatCase{
+            "FP32", ExpertWeightFormat::floating(TensorType::FP32)},
+    };
 
-    DecodeExpertHistogramConfig histogram_config;
-    histogram_config.num_layers = 1;
-    histogram_config.num_experts = 3;
-    histogram_config.top_k = 1;
-    histogram_config.window_size = 2;
-    histogram_config.sockets = {DeviceId::cpu(), DeviceId::cpu()};
-    histogram_config.ownership = owner_map.layeredOwnership(1, 3);
-    auto histogram = std::make_shared<DecodeExpertHistogram>(histogram_config);
-    auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
-        MoEOverlayResidencyAuthority::Config{
-            .initial_plan = plan,
-            .model_metadata = {
-                .num_layers = 1,
-                .num_experts = 3,
-                .d_model = 64,
-                .routed_intermediate_size = 32,
-                .routed_quant_type = "Q4_0",
-            },
-            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
-            .histogram = histogram.get(),
+    for (const auto &format_case : format_cases)
+    {
+        SCOPED_TRACE(format_case.name);
+        const auto plan = twoCpuTierPlan(
+            {0, 0, 1}, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+        const auto owner_map = MoEExpertOwnerMap::build(plan);
+
+        DecodeExpertHistogramConfig histogram_config;
+        histogram_config.num_layers = 1;
+        histogram_config.num_experts = 3;
+        histogram_config.top_k = 1;
+        histogram_config.window_size = 2;
+        histogram_config.sockets = {DeviceId::cpu(), DeviceId::cpu()};
+        histogram_config.ownership = owner_map.layeredOwnership(1, 3);
+        auto histogram =
+            std::make_shared<DecodeExpertHistogram>(histogram_config);
+        auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
+            MoEOverlayResidencyAuthority::Config{
+                .initial_plan = plan,
+                .model_metadata = {
+                    .num_layers = 1,
+                    .num_experts = 3,
+                    .d_model = 64,
+                    .routed_intermediate_size = 32,
+                    .routed_quant_type = format_case.name,
+                },
+                .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+                .histogram = histogram.get(),
+                .perf_device = "cpu-hot/cpu-cold",
+            });
+        const auto initial_snapshot = authority->snapshot();
+        ASSERT_NE(initial_snapshot, nullptr);
+
+        const std::array<MoEOverlayPreparedExpertTriplet, 3> experts{
+            makeSourceExpert(0, 0, 11, format_case.format),
+            makeSourceExpert(0, 1, 93, format_case.format),
+            makeSourceExpert(1, 2, 177, format_case.format),
+        };
+        const std::array expected{
+            preparedBytes(experts[0]),
+            preparedBytes(experts[1]),
+            preparedBytes(experts[2]),
+        };
+        auto registry = makeRegistry(initial_snapshot, experts);
+        auto fabric = MoEOverlayPhysicalResidencyFabric::create({
+            .registry = registry,
+            .initial_snapshot = initial_snapshot,
+            .shadow_slots_per_endpoint_layer = 1,
+            .staging_capacity_bytes = 64,
             .perf_device = "cpu-hot/cpu-cold",
         });
-    const auto initial_snapshot = authority->snapshot();
-    ASSERT_NE(initial_snapshot, nullptr);
 
-    const std::array<MoEOverlayPreparedExpertTriplet, 3> experts{
-        makeSourceExpert(0, 0, 11),
-        makeSourceExpert(0, 1, 93),
-        makeSourceExpert(1, 2, 177),
-    };
-    const std::array expected{
-        packedBytes(experts[0]),
-        packedBytes(experts[1]),
-        packedBytes(experts[2]),
-    };
-    auto registry = makeRegistry(initial_snapshot, experts);
-    auto fabric = MoEOverlayPhysicalResidencyFabric::create({
-        .registry = registry,
-        .initial_snapshot = initial_snapshot,
-        .shadow_slots_per_endpoint_layer = 1,
-        .staging_capacity_bytes = 64,
-        .perf_device = "cpu-hot/cpu-cold",
-    });
+        MoEOverlayParticipantPreparedWaveFactory factory({
+            .registry = registry,
+            .transfer_provider = fabric,
+            .perf_device = "cpu-hot/cpu-cold",
+        });
+        MoEOverlayTierMigrationTransport transport({
+            .factory = &factory,
+            .projections_per_expert = 3,
+            .perf_device = "cpu-hot/cpu-cold",
+        });
 
-    MoEOverlayParticipantPreparedWaveFactory factory({
-        .registry = registry,
-        .transfer_provider = fabric,
-        .perf_device = "cpu-hot/cpu-cold",
-    });
-    MoEOverlayTierMigrationTransport transport({
-        .factory = &factory,
-        .projections_per_expert = 3,
-        .perf_device = "cpu-hot/cpu-cold",
-    });
-
-    const auto commit_window = [&](const std::array<std::uint64_t, 3> &counts,
-                                   std::uint64_t expected_epoch)
-    {
-        /* Rotation clears the previous evidence bank, so each wave is driven
-         * solely by this window's deliberately reversed expert temperature. */
-        histogram->mergeLayerCounts(0, counts.data(), 3, false);
-        const auto transaction = authority->proposeFromHistogram();
-        ASSERT_TRUE(transaction.valid());
-        ASSERT_EQ(transaction.candidate->epoch, expected_epoch);
-        ASSERT_EQ(transaction.migrations.size(), 2u);
-        ASSERT_EQ(transaction.migration_cycles.size(), 1u);
-
-        auto progress = authority->beginApply(transaction, transport);
-        ASSERT_EQ(progress.status, MoEOverlayResidencyApplyStatus::Started)
-            << progress.error;
-
-        bool committed = false;
-        for (int poll = 0; poll < 4096; ++poll)
+        const auto commit_window =
+            [&](const std::array<std::uint64_t, 3> &counts,
+                std::uint64_t expected_epoch)
         {
-            progress = authority->advanceBackground();
-            ASSERT_TRUE(progress.ok()) << progress.error;
-            if (progress.status == MoEOverlayResidencyApplyStatus::Published)
+            /* Rotation clears the previous evidence bank, so each wave is
+             * driven solely by this window's deliberately reversed expert
+             * temperature. */
+            histogram->mergeLayerCounts(0, counts.data(), 3, false);
+            const auto transaction = authority->proposeFromHistogram();
+            ASSERT_TRUE(transaction.valid());
+            ASSERT_EQ(transaction.candidate->epoch, expected_epoch);
+            ASSERT_EQ(transaction.migrations.size(), 2u);
+            ASSERT_EQ(transaction.migration_cycles.size(), 1u);
+
+            auto progress = authority->beginApply(transaction, transport);
+            ASSERT_EQ(
+                progress.status,
+                MoEOverlayResidencyApplyStatus::Started)
+                << progress.error;
+
+            bool committed = false;
+            for (int poll = 0; poll < 4096; ++poll)
             {
-                committed = true;
-                break;
+                progress = authority->advanceBackground();
+                ASSERT_TRUE(progress.ok()) << progress.error;
+                if (progress.status ==
+                    MoEOverlayResidencyApplyStatus::Published)
+                {
+                    committed = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
-        ASSERT_TRUE(committed)
-            << "Bounded CPU-copy polling did not publish epoch "
-            << expected_epoch;
-        EXPECT_EQ(authority->pendingRetirementCount(), 0u)
-            << "Ticket-free publication must recycle the old physical bank "
-               "before the next wave";
+            ASSERT_TRUE(committed)
+                << "Bounded CPU-copy polling did not publish epoch "
+                << expected_epoch;
+            EXPECT_EQ(authority->pendingRetirementCount(), 0u)
+                << "Ticket-free publication must recycle the old physical "
+                   "bank before the next wave";
 
-        for (const auto &migration : transaction.migrations)
+            for (const auto &migration : transaction.migrations)
+            {
+                const auto bank =
+                    registry
+                        ->endpoint(
+                            migration.destination.owner_participant)
+                        ->acquire(transaction.candidate->epoch);
+                ASSERT_NE(bank, nullptr);
+                const auto &arrived =
+                    bank->layers[static_cast<std::size_t>(
+                                     migration.layer_idx)]
+                        .experts[static_cast<std::size_t>(
+                            migration.expert_id)];
+                ASSERT_TRUE(arrived.complete());
+                EXPECT_EQ(
+                    preparedBytes(arrived),
+                    expected[static_cast<std::size_t>(migration.expert_id)])
+                    << "Published destination bytes differ from expert "
+                    << migration.expert_id << " at epoch " << expected_epoch;
+            }
+        };
+
+        /*
+         * Expert 1 remains in its loader-owned slot through epoch two and
+         * departs only in the second wave. Reaching epoch four with one shadow
+         * allocation proves bootstrap retirement keys physical birth at epoch
+         * one while the retirement fence may name a later bank. The third
+         * arrival then consumes that reclaimed slot and also proves later
+         * lease-managed reuse.
+         */
+        commit_window({1, 80, 100}, 2);
+        commit_window({100, 1, 80}, 3);
+        commit_window({80, 100, 1}, 4);
+
+        const auto fabric_stats = fabric->stats();
+        EXPECT_EQ(fabric_stats.adopted_initial_slots, 3u);
+        EXPECT_EQ(fabric_stats.adopted_initial_slots_recycled, 3u);
+        EXPECT_EQ(fabric_stats.cpu_shadow_slots, 2u);
+        EXPECT_EQ(fabric_stats.waves_prepared, 3u);
+        EXPECT_EQ(fabric_stats.waves_deferred, 0u);
+        EXPECT_EQ(fabric_stats.waves_failed, 0u);
+        EXPECT_EQ(fabric_stats.projection_operations_prepared, 18u);
+        EXPECT_EQ(fabric_stats.cpu_copy_operations, 18u);
+        EXPECT_EQ(fabric_stats.persistent_transfer_lanes, 6u);
+        EXPECT_EQ(fabric_stats.maximum_parallel_cpu_copy_lanes, 2u);
+        EXPECT_EQ(fabric_stats.parallel_cpu_copy_lane_reservations, 18u);
+        EXPECT_EQ(fabric_stats.parallel_cpu_copy_lane_pool_exhaustions, 0u);
+        EXPECT_EQ(fabric_stats.maximum_concurrent_cpu_copy_operations, 6u)
+            << "All gate/up/down operations for both cycle edges must reach "
+               "the launch barrier before any CPU copy starts";
+        EXPECT_EQ(fabric_stats.active_cpu_copy_operations, 0u);
+        EXPECT_EQ(fabric_stats.gpu_cpu_operations, 0u);
+        EXPECT_EQ(fabric_stats.inference_stream_waits, 0u);
+        EXPECT_EQ(fabric_stats.blocking_synchronizations, 0u);
+
+        const auto transport_stats = transport.stats();
+        EXPECT_EQ(transport_stats.waves_started, 3u);
+        EXPECT_EQ(transport_stats.transfer_operations_completed, 18u);
+        EXPECT_EQ(transport_stats.commits_completed, 3u);
+        EXPECT_EQ(transport_stats.inference_stream_waits, 0u);
+        EXPECT_EQ(transport_stats.blocking_synchronizations, 0u);
+
+        const auto authority_stats = authority->stats();
+        EXPECT_EQ(authority_stats.committed_waves, 3u);
+        EXPECT_EQ(authority_stats.committed_migrations, 6u);
+        EXPECT_EQ(authority_stats.promotions, 3u);
+        EXPECT_EQ(authority_stats.demotions, 3u);
+        EXPECT_EQ(authority_stats.cross_domain_migrations, 6u);
+
+        const auto restored = authority->snapshot();
+        ASSERT_NE(restored, nullptr);
+        ASSERT_EQ(restored->epoch, 4u);
+        std::string seal_error;
+        const auto seal = fabric->sealReusableInitialPlacement(
+            restored->epoch, &seal_error);
+        ASSERT_TRUE(seal.has_value()) << seal_error;
+        ASSERT_TRUE(seal->valid());
+        EXPECT_EQ(seal->retained_canonical_experts, 2u);
+        EXPECT_EQ(seal->compacted_shadow_experts, 1u)
+            << "The final closed cycle deliberately leaves one restored expert "
+               "in the generic shadow arena; terminal sealing must copy it into "
+               "the newly retired loader allocation";
+
+        std::array<bool, 3> observed{};
+        for (const auto &bank : seal->local_banks)
         {
-            const auto bank = registry
-                                  ->endpoint(
-                                      migration.destination.owner_participant)
-                                  ->acquire(transaction.candidate->epoch);
-            ASSERT_NE(bank, nullptr);
-            const auto &arrived =
-                bank->layers[static_cast<std::size_t>(migration.layer_idx)]
-                    .experts[static_cast<std::size_t>(migration.expert_id)];
-            ASSERT_TRUE(arrived.complete());
-            EXPECT_EQ(
-                packedBytes(arrived),
-                expected[static_cast<std::size_t>(migration.expert_id)])
-                << "Published destination bytes differ from expert "
-                << migration.expert_id << " at epoch " << expected_epoch;
+            ASSERT_EQ(bank.layers.size(), 1u);
+            for (int expert_id = 0; expert_id < 3; ++expert_id)
+            {
+                if (!bank.layers.front().resident_mask.at(
+                        static_cast<std::size_t>(expert_id)))
+                {
+                    continue;
+                }
+                const auto &triplet = bank.layers.front().experts.at(
+                    static_cast<std::size_t>(expert_id));
+                ASSERT_TRUE(triplet.complete());
+                EXPECT_EQ(
+                    preparedBytes(triplet),
+                    expected[static_cast<std::size_t>(expert_id)]);
+                observed[static_cast<std::size_t>(expert_id)] = true;
+            }
         }
-    };
+        EXPECT_TRUE(std::all_of(
+            observed.begin(), observed.end(), [](bool value) { return value; }));
 
-    /*
-     * Expert 1 remains in its loader-owned slot through epoch two and departs
-     * only in the second wave.  Reaching epoch four with one shadow allocation
-     * proves bootstrap retirement keys physical birth at epoch one while the
-     * retirement fence may name a later bank.  The third arrival then consumes
-     * that reclaimed slot and also proves later lease-managed reuse.
-     */
-    commit_window({1, 80, 100}, 2);
-    commit_window({100, 1, 80}, 3);
-    commit_window({80, 100, 1}, 4);
-
-    const auto fabric_stats = fabric->stats();
-    EXPECT_EQ(fabric_stats.adopted_initial_slots, 3u);
-    EXPECT_EQ(fabric_stats.adopted_initial_slots_recycled, 3u);
-    EXPECT_EQ(fabric_stats.cpu_shadow_slots, 2u);
-    EXPECT_EQ(fabric_stats.waves_prepared, 3u);
-    EXPECT_EQ(fabric_stats.waves_deferred, 0u);
-    EXPECT_EQ(fabric_stats.waves_failed, 0u);
-    EXPECT_EQ(fabric_stats.projection_operations_prepared, 18u);
-    EXPECT_EQ(fabric_stats.cpu_copy_operations, 18u);
-    EXPECT_EQ(fabric_stats.persistent_transfer_lanes, 6u);
-    EXPECT_EQ(fabric_stats.maximum_parallel_cpu_copy_lanes, 1u);
-    EXPECT_EQ(fabric_stats.parallel_cpu_copy_lane_reservations, 18u);
-    EXPECT_EQ(fabric_stats.parallel_cpu_copy_lane_pool_exhaustions, 0u);
-    EXPECT_EQ(fabric_stats.maximum_concurrent_cpu_copy_operations, 6u)
-        << "All gate/up/down operations for both cycle edges must reach the "
-           "launch barrier before any CPU copy starts";
-    EXPECT_EQ(fabric_stats.active_cpu_copy_operations, 0u);
-    EXPECT_EQ(fabric_stats.gpu_cpu_operations, 0u);
-    EXPECT_EQ(fabric_stats.inference_stream_waits, 0u);
-    EXPECT_EQ(fabric_stats.blocking_synchronizations, 0u);
-
-    const auto transport_stats = transport.stats();
-    EXPECT_EQ(transport_stats.waves_started, 3u);
-    EXPECT_EQ(transport_stats.transfer_operations_completed, 18u);
-    EXPECT_EQ(transport_stats.commits_completed, 3u);
-    EXPECT_EQ(transport_stats.inference_stream_waits, 0u);
-    EXPECT_EQ(transport_stats.blocking_synchronizations, 0u);
-
-    const auto authority_stats = authority->stats();
-    EXPECT_EQ(authority_stats.committed_waves, 3u);
-    EXPECT_EQ(authority_stats.committed_migrations, 6u);
-    EXPECT_EQ(authority_stats.promotions, 3u);
-    EXPECT_EQ(authority_stats.demotions, 3u);
-    EXPECT_EQ(authority_stats.cross_domain_migrations, 6u);
+        const auto repeated_seal = fabric->sealReusableInitialPlacement(
+            restored->epoch, &seal_error);
+        ASSERT_TRUE(repeated_seal.has_value()) << seal_error;
+        EXPECT_EQ(
+            repeated_seal->compacted_shadow_experts,
+            seal->compacted_shadow_experts)
+            << "A sealed fabric returns the immutable terminal value instead of "
+               "replaying physical copies";
+    }
 }

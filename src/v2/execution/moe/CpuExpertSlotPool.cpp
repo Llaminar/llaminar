@@ -276,7 +276,10 @@ namespace llaminar2
                                 config.memory_placement.node()));
                     }
                     auto engine = std::make_shared<
-                        gemm::FloatingPointGemmKernel>(tensor.get());
+                        gemm::FloatingPointGemmKernel>(
+                            tensor.get(),
+                            gemm::FloatingPointGemmKernel::NumericalPolicy::
+                                MovableExpert);
                     ContiguousFloatingPointWeightDescriptor descriptor;
                     if (!engine->exportContiguousFloatingPointWeights(
                             descriptor) ||

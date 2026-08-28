@@ -631,6 +631,18 @@ namespace llaminar2
                 workspace_m,
                 params_.n_v > 0 ? params_.n_v : n,
                 workspace_k));
+
+        std::vector<int> fused_columns;
+        fused_columns.reserve(projectionCount());
+        if (includesQuery())
+            fused_columns.push_back(params_.n_q > 0 ? params_.n_q : n);
+        fused_columns.push_back(params_.n_k > 0 ? params_.n_k : n);
+        fused_columns.push_back(params_.n_v > 0 ? params_.n_v : n);
+        if (auto *anchor = dynamic_cast<IWorkspaceConsumer *>(anchorKernel()))
+        {
+            anchor->appendFusedProjectionWorkspaceRequirements(
+                combined, workspace_m, fused_columns, workspace_k);
+        }
         addCudaConcurrentDecodeGemvSideStreamWorkspace(
             combined,
             params_.device_id,

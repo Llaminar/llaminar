@@ -109,11 +109,11 @@ namespace llaminar2
      *
      * The composer requires one service row per participant/layer/phase and one
      * migration row per directed participant pair/layer.  Participant service
-     * costs are reduced to a tier row with a maximum, because every participant
-     * in a tier is a possible whole-expert owner and the slowest endpoint is the
-     * safe critical-path cost. Runtime-disabled phases must remain explicitly
-     * zero throughout certification; a later non-zero demand in such a phase is
-     * therefore a lifecycle error rather than an invented cost.
+     * costs are retained exactly for live critical-path admission and are also
+     * reduced to a tier row with a maximum for conservative cold-start capacity
+     * placement. Runtime-disabled phases must remain explicitly zero throughout
+     * certification; a later non-zero demand in such a phase is therefore a
+     * lifecycle error rather than an invented cost.
      */
     class MoEOverlayEconomyProfileComposer final
     {

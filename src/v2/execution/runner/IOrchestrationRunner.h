@@ -25,11 +25,16 @@
 #include "../../config/OrchestrationConfig.h"
 #include "../prefix_cache/PrefixCacheStateProbe.h"
 #include "../InferenceReadiness.h"
+#include "../moe/MoEOptimizationStatus.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
+#include "../../transfer/TransferEngine.h"
 #include "../../utils/Sampler.h"
 #include "../../utils/ToolCallTypes.h"
+#include <algorithm>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 #include <optional>
 
@@ -39,11 +44,208 @@ namespace llaminar2
     class IMPIContext;         // Forward declaration
     class IModelContext;       // Forward declaration
     class ModelContext;        // Forward declaration
+    class ReusableExecutionWorkspaceRegistry; // Model-lifetime workspace owner
     struct GraphExecutorStats; // Forward declaration
 }
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Exclusive lifecycle for one reusable prepared model authority.
+     *
+     * A contract can be copied into a process campaign cache, but exactly one
+     * runner may own its prepared weights at a time. Dynamic ExpertOverlay also
+     * needs a terminal sealing interval in which logical placement is restored
+     * and registry bindings are atomically rebased. Encoding those transitions
+     * here prevents a caller from constructing a new runner while the previous
+     * graph, maintenance wave, or physical slot assignment is still live.
+     */
+    class ModelContextReuseAuthority final
+    {
+    public:
+        /** @brief Complete reusable-context lifecycle states. */
+        enum class State : std::uint8_t
+        {
+            RunnerExclusive, ///< Exactly one runner owns mutable execution state.
+            Sealing,         ///< Teardown is restoring/rebinding prepared weights.
+            Reusable,        ///< No runner state remains and a consumer may acquire.
+            Invalid,         ///< Sealing failed; reuse is permanently forbidden.
+        };
+
+        /** @brief Create authority initially owned by the exporting runner. */
+        ModelContextReuseAuthority() = default;
+
+        ModelContextReuseAuthority(const ModelContextReuseAuthority &) = delete;
+        ModelContextReuseAuthority &operator=(
+            const ModelContextReuseAuthority &) = delete;
+
+        /**
+         * @brief Acquire a reusable contract for exactly one new runner.
+         * @param error Optional state-specific rejection diagnostic.
+         * @return True only for the `Reusable -> RunnerExclusive` transition.
+         */
+        [[nodiscard]] bool acquireRunnerExclusive(
+            std::string *error = nullptr)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != State::Reusable)
+            {
+                if (error)
+                {
+                    *error = state_ == State::Invalid
+                        ? (diagnostic_.empty()
+                               ? "prepared model context is invalid"
+                               : diagnostic_)
+                        : "prepared model context is not at its reusable lifecycle boundary";
+                }
+                return false;
+            }
+            state_ = State::RunnerExclusive;
+            diagnostic_.clear();
+            sealed_device_memory_retention_.clear();
+            retention_published_ = false;
+            ++generation_;
+            return true;
+        }
+
+        /**
+         * @brief Close runner admission and begin terminal physical sealing.
+         * @param error Optional transition diagnostic.
+         * @return True only for `RunnerExclusive -> Sealing`.
+         */
+        [[nodiscard]] bool beginSealing(std::string *error = nullptr)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != State::RunnerExclusive)
+            {
+                if (error)
+                    *error = "prepared model context cannot enter sealing from its current lifecycle state";
+                return false;
+            }
+            state_ = State::Sealing;
+            return true;
+        }
+
+        /**
+         * @brief Publish successful teardown and its exact retained allocation BOM.
+         * @param retention Per-GPU allocations still owned after runner teardown.
+         * @param error Optional transition diagnostic.
+         * @return True only for `Sealing -> Reusable`.
+         *
+         * Admission describes peak construction and execution storage. Dynamic
+         * teardown may release shadow pools before the model becomes reusable,
+         * so only this terminal seal may publish the final owner's retirement
+         * obligation.
+         */
+        [[nodiscard]] bool publishReusable(
+            std::vector<ModelDeviceMemoryRetention> retention,
+            std::string *error = nullptr)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != State::Sealing)
+            {
+                if (error)
+                    *error = "prepared model context can become reusable only after sealing";
+                return false;
+            }
+            std::vector<DeviceId> devices;
+            devices.reserve(retention.size());
+            for (const auto &row : retention)
+            {
+                if (!row.valid() ||
+                    std::find(devices.begin(), devices.end(), row.device) !=
+                        devices.end())
+                {
+                    if (error)
+                    {
+                        *error =
+                            "prepared model context cannot publish an invalid or duplicate device-memory retention row";
+                    }
+                    return false;
+                }
+                devices.push_back(row.device);
+            }
+            sealed_device_memory_retention_ = std::move(retention);
+            retention_published_ = true;
+            state_ = State::Reusable;
+            diagnostic_.clear();
+            return true;
+        }
+
+        /**
+         * @brief Read the final-owner allocation BOM at a reusable boundary.
+         * @param error Optional lifecycle-specific rejection diagnostic.
+         * @return A copy of the sealed BOM, including an empty CPU-only value.
+         *
+         * The optional distinguishes a valid CPU-only empty BOM from an attempt
+         * to inspect mutable runner state. Retirement tickets must be captured
+         * before the contract's final allocation owners are dropped.
+         */
+        [[nodiscard]] std::optional<std::vector<ModelDeviceMemoryRetention>>
+        sealedDeviceMemoryRetention(std::string *error = nullptr) const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != State::Reusable || !retention_published_)
+            {
+                if (error)
+                {
+                    *error = state_ == State::Invalid
+                        ? (diagnostic_.empty()
+                               ? "prepared model context is invalid"
+                               : diagnostic_)
+                        : "prepared model context has no sealed reusable device-memory retention BOM";
+                }
+                return std::nullopt;
+            }
+            return sealed_device_memory_retention_;
+        }
+
+        /**
+         * @brief Permanently reject reuse after an incomplete seal.
+         * @param diagnostic Precise failure retained for every later consumer.
+         */
+        void invalidate(std::string diagnostic)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            state_ = State::Invalid;
+            sealed_device_memory_retention_.clear();
+            retention_published_ = false;
+            diagnostic_ = diagnostic.empty()
+                ? "prepared model context sealing failed"
+                : std::move(diagnostic);
+        }
+
+        /** @return Race-safe current lifecycle state. */
+        [[nodiscard]] State state() const noexcept
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return state_;
+        }
+
+        /** @return Number of runners that have exclusively owned this context. */
+        [[nodiscard]] std::uint64_t generation() const noexcept
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return generation_;
+        }
+
+        /** @return Retained invalidation diagnostic, if any. */
+        [[nodiscard]] std::string diagnostic() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return diagnostic_;
+        }
+
+    private:
+        mutable std::mutex mutex_;
+        State state_ = State::RunnerExclusive;
+        std::uint64_t generation_ = 1u;
+        std::vector<ModelDeviceMemoryRetention>
+            sealed_device_memory_retention_;
+        bool retention_published_ = false;
+        std::string diagnostic_;
+    };
 
     /**
      * @brief Exact model-state effect of a caller-selected generation token.
@@ -75,11 +277,21 @@ namespace llaminar2
      * validates the weight-affecting fields before using this contract.
      *
      * Mutable graph, arena, stream, controller, and request state are never part
-     * of this object.
+     * of this object. A separately typed workspace registry may retain only an
+     * unnamed backing allocation after every graph borrower has been destroyed;
+     * named mappings and publications remain runner-owned.
      */
     struct ModelContextReuseContract
     {
         std::shared_ptr<ModelContext> context;
+        /** Shared exclusive/sealing authority required by every consumer. */
+        std::shared_ptr<ModelContextReuseAuthority> reuse_authority;
+        /**
+         * Sealed primary workspace blocks retained beside prepared weights.
+         * No graph, stream, publication, or request state belongs here.
+         */
+        std::shared_ptr<ReusableExecutionWorkspaceRegistry>
+            reusable_execution_workspaces;
         RankExecutionPlan prepared_weight_plan;
         /**
          * Model-frozen quotas and initial placements whose prepared engines are
@@ -101,6 +313,29 @@ namespace llaminar2
          * occupied by the retained physical plan.
          */
         std::string routed_weight_authority_identity;
+    };
+
+    /**
+     * @brief Typed proof that this runner consumed a prepared-model contract.
+     *
+     * This observation comes from constructor admission, exact plan
+     * validation, and model-owned PreparedWeightStore accounting. Optional
+     * PerfStats counters may mirror it for diagnostics, but must never be used
+     * to decide whether reuse occurred or whether the retained state is valid.
+     */
+    struct ModelContextReuseStatus
+    {
+        bool imported_contract = false;
+        bool prepared_weight_plan_validated = false;
+        std::size_t prepared_entry_count = 0u;
+        std::uint64_t authority_generation = 0u;
+
+        /** @return Whether certified prepared weights were actually consumed. */
+        [[nodiscard]] bool reusedPreparedWeights() const noexcept
+        {
+            return imported_contract && prepared_weight_plan_validated &&
+                   prepared_entry_count > 0u && authority_generation > 1u;
+        }
     };
 
     /**
@@ -417,6 +652,33 @@ namespace llaminar2
          */
         virtual uint64_t moeRuntimeMovementEpoch() const { return 0; }
 
+        /**
+         * @brief Observe adaptive MoE lifecycle state from its sole authority.
+         *
+         * This passive diagnostic never polls a controller, advances a wave,
+         * or reads PerfStats. Production request admission continues to use
+         * @ref inferenceReadiness; correctness tests may use this narrower
+         * surface to wait for background optimization without interpreting
+         * instrumentation counters as control state.
+         */
+        virtual MoEOptimizationStatus moeOptimizationStatus() const
+        {
+            return {};
+        }
+
+        /**
+         * @brief Snapshot exact completed movement identities from their owner.
+         *
+         * Unlike PerfStats, this typed ledger is model state evidence. The
+         * snapshot is passive and must not poll, advance, or synchronize the
+         * movement lifecycle.
+         */
+        virtual MoEOptimizationMovementLedger
+        moeOptimizationMovementLedger() const
+        {
+            return {};
+        }
+
         // =====================================================================
         // Configuration
         // =====================================================================
@@ -484,6 +746,18 @@ namespace llaminar2
          * workspace lifetime change.
          */
         virtual void clearCache() = 0;
+
+        /**
+         * @brief Destructively retire the reusable prefix archive on all participants.
+         *
+         * This administrative operation is separate from clearCache(): it does
+         * not reset the live request and must not invalidate captured graphs,
+         * prepared weights, or model topology. Multi-rank implementations
+         * coordinate the operation through their ordinary command authority.
+         *
+         * @return True after no reusable prefix record remains addressable.
+         */
+        virtual bool purgePrefixCache() = 0;
 
         /**
          * @brief Drain completed decode-boundary maintenance diagnostics.
@@ -576,6 +850,15 @@ namespace llaminar2
         modelContextReuseContract() const
         {
             return std::nullopt;
+        }
+
+        /**
+         * @brief Observe imported prepared-model consumption without telemetry.
+         * @return Typed reuse proof; all-zero for runners without this feature.
+         */
+        virtual ModelContextReuseStatus modelContextReuseStatus() const
+        {
+            return {};
         }
 
         // =====================================================================
@@ -752,10 +1035,13 @@ namespace llaminar2
         virtual void runMPIWorkerLoop() {}
 
         /**
-         * @brief Signal all MPI worker ranks to shut down their worker loops.
+         * @brief Close coordinated inference admission and drain maintenance.
          *
-         * Called by rank 0 when the server is stopping. Workers will return
-         * from runMPIWorkerLoop() after receiving this signal.
+         * Called by the continuation authority when serving is stopping.
+         * Multi-rank workers return from runMPIWorkerLoop() after receiving the
+         * terminal signal. A single-rank implementation has no command to send,
+         * but must still drain model-lifetime background maintenance before
+         * terminal diagnostics are inspected.
          */
         virtual void shutdownMPIWorkers() {}
 

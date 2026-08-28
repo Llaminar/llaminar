@@ -1229,8 +1229,9 @@ namespace llaminar2
                 strided_allgather_temp_size_ = 0;
             }
 
-            // Allocate new buffer (with some headroom to reduce reallocations)
-            size_t alloc_bytes = temp_buffer_bytes + (temp_buffer_bytes / 4); // 25% extra
+            // This compatibility path allocates exactly the requested buffer;
+            // production graph setup must pre-materialize its collective BOM.
+            const size_t alloc_bytes = temp_buffer_bytes;
             if (!nccl_backend_detail::cudaAllocTempBuffer(&strided_allgather_temp_buf_, alloc_bytes))
             {
                 last_error_ = "Failed to allocate temp buffer for stridedAllgather: " +

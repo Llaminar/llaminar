@@ -730,6 +730,7 @@ extern "C"
         void *wave_state,
         void *controller_state,
         void *llep_layer_plans,
+        void *placement_plan_scratch,
         uint32_t command_buffer_count,
         const void *local_transfer_slots,
         uint32_t local_transfer_slot_count,
@@ -1806,6 +1807,21 @@ namespace llaminar2
         }
         return hipMoEOverlayActivationConsumeReturn(
             &packet, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::consumeMoEOverlayCanonicalRouteTicket(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayCanonicalRouteTicketConsumeLaunch &ticket)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "consumeMoEOverlayCanonicalRouteTicket");
+        if (!stream || !ticket.valid())
+        {
+            LOG_ERROR("[ROCmMoEKernel::consumeMoEOverlayCanonicalRouteTicket] complete mapped ticket binding and explicit stream are required");
+            return false;
+        }
+        return hipMoEOverlayConsumeCanonicalRouteTicket(
+            &ticket, device_ordinal_, stream);
     }
 
     bool ROCmMoEKernel::packSingleRowMoEOverlayActivationDispatch(
@@ -5853,16 +5869,22 @@ namespace llaminar2
         uint32_t command_buffer_count,
         const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
         uint32_t local_transfer_slot_count,
-        DeviceMoELLEPLayerPlanScratch *llep_layer_plans)
+        DeviceMoELLEPLayerPlanScratch *llep_layer_plans,
+        DeviceMoEPlacementBank *placement_plan_scratch)
     {
         if (!validateDeviceMoERebalanceConfig(config))
         {
             LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] invalid device rebalance config");
             return false;
         }
-        if (!runtime_layers || !gathered_histograms || !status || !controller_state)
+        const bool deferred_planning = hasDeviceMoERebalanceFlag(
+            config.flags,
+            DeviceMoERebalanceFlags::DeferRuntimeApply);
+        if (!runtime_layers || !gathered_histograms || !status ||
+            !controller_state ||
+            (deferred_planning && !placement_plan_scratch))
         {
-            LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, status, and persistent controller state must be non-null");
+            LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, status, controller state, and placement planner scratch must be non-null");
             return false;
         }
         if (config.routed_assignment_policy ==
@@ -5894,6 +5916,7 @@ namespace llaminar2
             wave_state,
             controller_state,
             llep_layer_plans,
+            placement_plan_scratch,
             command_buffer_count,
             local_transfer_slots,
             local_transfer_slot_count,

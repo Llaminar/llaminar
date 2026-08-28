@@ -158,6 +158,18 @@ namespace llaminar2
             params_.dispatch_output = params_.dispatch_output_lifetime.get();
         if (!params_.inbound_rows && params_.inbound_rows_lifetime)
             params_.inbound_rows = params_.inbound_rows_lifetime.get();
+        if (params_.payload_publication_role ==
+                PayloadPublicationRole::EmptyCollectiveParticipant &&
+            (params_.hidden || params_.routing_indices ||
+             params_.routing_weights || params_.hidden_buffer_id ||
+             params_.routing_indices_buffer_id ||
+             params_.routing_weights_buffer_id || params_.tier_dispatch ||
+             params_.dispatch_output || params_.ticket_storage ||
+             params_.fixed_residency_epoch != 0))
+        {
+            throw std::invalid_argument(
+                "MoESparseDispatchStage empty collective participant cannot own payload-producing bindings");
+        }
         if (params_.ticket_observation_role ==
                 TicketObservationRole::MaterializedHostDispatch &&
             (!params_.ticket_storage || !params_.dispatch_output))
@@ -476,8 +488,17 @@ namespace llaminar2
                     if (entry.token_row != token_row ||
                         !entry_targets_this_participant(entry))
                         continue;
+                    const std::int32_t local_route =
+                        static_cast<std::int32_t>(entry_cursor -
+                                                  row_entry_begin);
                     outbound.expert_ids_host[entry_cursor] = entry.expert_id;
                     outbound.route_weights_host[entry_cursor] = entry.route_weight;
+                    outbound.original_route_slots_host[entry_cursor] =
+                        static_cast<std::int32_t>(token_row) * params_.top_k +
+                        entry.route_slot;
+                    outbound.compact_route_slots_host[entry_cursor] =
+                        static_cast<std::int32_t>(compact_row) * params_.top_k +
+                        local_route;
                     ++entry_cursor;
                 }
                 if (entry_cursor == row_entry_begin)
@@ -529,9 +550,10 @@ namespace llaminar2
             MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
                 params_.key.layer_idx,
                 runtime_key.tier_idx,
-                runtime_key.toString(),
-                params_.source_participant,
-                params_.target_participant,
+                MoEOverlayProfileEdge{
+                    .source_participant = params_.source_participant,
+                    .target_participant = params_.target_participant,
+                },
                 outbound.live_row_count,
                 outbound.live_entry_count,
                 inbound_row_count,

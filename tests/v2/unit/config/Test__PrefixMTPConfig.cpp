@@ -377,6 +377,48 @@ TEST(Test__PrefixMTPConfig, RetainedGraphCapacityCoversPrefillAndMTPShapes)
         << "Non-MTP retained graphs preserve their selected prefill capacity.";
 }
 
+/**
+ * @brief Execution-off services may retain one explicit MTP setup envelope.
+ *
+ * This is the lifecycle used by a process-resident parity campaign and by a
+ * serving process that changes request policy without changing model
+ * placement. It must reserve capacity without accidentally enabling MTP.
+ */
+TEST(Test__PrefixMTPConfig, DisabledExecutionMayRetainMTPGraphCapacity)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = false;
+    mtp.draft_tokens = 1;
+    mtp.graph_capacity_draft_tokens = 15;
+
+    EXPECT_TRUE(retainsMTPGraphCapacity(mtp));
+    EXPECT_EQ(resolveMTPRetainedDraftCapacity(mtp), 15);
+    EXPECT_EQ(resolveMTPRetainedTargetQueryRows(mtp), 16);
+    EXPECT_EQ(resolveRetainedGraphRowCapacity(/*prefill_rows=*/9, mtp), 16);
+    EXPECT_FALSE(mtp.enabled)
+        << "retained setup capacity must never select an execution policy";
+}
+
+TEST(Test__PrefixMTPConfig, DisabledExecutionRejectsNegativeRetainedCapacity)
+{
+    OrchestrationConfig config;
+    config.mtp.enabled = false;
+    config.mtp.graph_capacity_draft_tokens = -1;
+
+    const auto errors = config.validate();
+    EXPECT_NE(
+        std::find_if(
+            errors.begin(),
+            errors.end(),
+            [](const std::string &error)
+            {
+                return error.find(
+                           "graph capacity draft tokens must be >= 0") !=
+                       std::string::npos;
+            }),
+        errors.end());
+}
+
 TEST(Test__PrefixMTPConfig, MTPTerminalHiddenArchiveCoversRequestAndVerifierRows)
 {
     MTPRuntimeConfig mtp;
@@ -684,6 +726,16 @@ TEST(Test__PrefixMTPConfig, ShapeDependentForwardPoliciesRequireEagerFamilyManif
         << "CPU stages and captured GPU graphs both retain bound workspace addresses";
 
     config.mtp.enabled = false;
+    config.mtp.graph_capacity_draft_tokens = 15;
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest())
+        << "A capacity-only model context must declare the same graph family as an enabled lease";
+    EXPECT_FALSE(config.usesMTPGroupedDecodeEquivalentRows());
+    config.compute_all_position_logits = true;
+    EXPECT_TRUE(config.usesMTPGroupedDecodeEquivalentRows())
+        << "A retained verifier declaration must select production grouped arithmetic even when execution is off";
+    config.compute_all_position_logits = false;
+
+    config.mtp.graph_capacity_draft_tokens = 0;
     config.dense_tp_decode_replicated = true;
     EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest());
 

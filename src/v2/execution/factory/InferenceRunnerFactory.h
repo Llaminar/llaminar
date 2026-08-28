@@ -60,6 +60,7 @@
 
 #include "../local_execution/orchestrators/IInferenceRunner.h"
 #include "../../loaders/ModelContext.h"
+#include "../../loaders/PreparedWeightAdmission.h"
 #include "../../interfaces/IModelContext.h"
 #include "../config/RuntimeConfig.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
@@ -90,6 +91,7 @@ namespace llaminar2
     class MoEOverlayNodeLocalRouteExchange;
     class MoEOverlayRankBatchTransportRegistry;
     class MoEOverlayNodeLocalDeviceControllerFabric;
+    class ReusableExecutionWorkspaceRegistry;
     struct GraphConfig;
     struct MoEExpertOverlayExecutionPlan;
     struct MoERoutedExpertPlacementPlan;
@@ -201,6 +203,25 @@ namespace llaminar2
         /// Optional stage-local prepared store. When supplied, concrete factory
         /// paths install this store before materializing/preparing weights.
         std::shared_ptr<PreparedWeightStore> prepared_weight_store;
+
+        /**
+         * @brief Whether graph setup creates or adopts its complete weight set.
+         *
+         * Certified reuse is installed only by the production model-context
+         * lifecycle after exact plan validation. Factories then exclude
+         * loader-backed routed-expert sources and require the sealed prepared
+         * registry instead; a missing entry is fatal and never triggers a
+         * source-loading fallback.
+         */
+        PreparedWeightAdmission prepared_weight_admission =
+            PreparedWeightAdmission::AllocateCompleteSet;
+
+        /**
+         * Model-lifetime backing blocks shared only across exclusive prepared-
+         * context runner generations. Graph topology remains runner-owned.
+         */
+        std::shared_ptr<ReusableExecutionWorkspaceRegistry>
+            reusable_execution_workspaces;
 
         /// Optional same-layer MoE expert overlay plan propagated into GraphConfig.
         std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;

@@ -96,7 +96,6 @@ namespace llaminar2
             int layer_idx,
             int active_capacity,
             std::vector<ProjectionSpec> specs,
-            size_t vram_safety_margin_bytes,
             int transfer_capacity = 0);
 
         /** @return Active capacity covering cache churn and one arrival batch. */

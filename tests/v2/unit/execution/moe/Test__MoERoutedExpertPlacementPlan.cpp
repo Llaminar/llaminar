@@ -123,6 +123,56 @@ namespace llaminar2::test
         EXPECT_TRUE(plan.isTieredOverlay());
     }
 
+    TEST(Test__MoERoutedExpertPlacementPlan,
+         PrimaryWorldRankAcceptsBoundParticipantAndRankLocalOwnerEncodings)
+    {
+        RoutedExpertDomain bound_collective;
+        bound_collective.world_ranks = {3, 4};
+        bound_collective.owner_rank = 9;
+        ASSERT_TRUE(bound_collective.primaryWorldRank().has_value());
+        EXPECT_EQ(*bound_collective.primaryWorldRank(), 3);
+
+        RoutedExpertDomain rank_local;
+        rank_local.owner_rank = 7;
+        ASSERT_TRUE(rank_local.primaryWorldRank().has_value());
+        EXPECT_EQ(*rank_local.primaryWorldRank(), 7);
+
+        RoutedExpertDomain unresolved;
+        EXPECT_FALSE(unresolved.primaryWorldRank().has_value());
+    }
+
+    /** Deferred setup overrides are complete permutations and a sole authority. */
+    TEST(Test__MoERoutedExpertPlacementPlan,
+         ValidatesDeferredInitialLayerOrders)
+    {
+        auto plan = validTwoTierPlan();
+        plan.placements.clear();
+        plan.initial_layer_order_overrides = {
+            {.layer = 0, .expert_ids = {3, 2, 1, 0}},
+        };
+        EXPECT_TRUE(validateMoERoutedExpertPlacementPlan(
+                        plan, twoLayerFourExpertOptions())
+                        .ok())
+            << "an omitted auxiliary layer must retain deterministic default ordering";
+
+        plan.initial_layer_order_overrides[0].expert_ids = {0, 2, 2, 3};
+        const auto duplicate = validateMoERoutedExpertPlacementPlan(
+            plan, twoLayerFourExpertOptions());
+        EXPECT_FALSE(duplicate.ok());
+        EXPECT_TRUE(hasErrorContaining(duplicate, "repeats expert 2"));
+
+        plan.initial_layer_order_overrides[0].expert_ids = {0, 2, 1, 3};
+        plan.placements = {
+            placement(0, {0, 0, 1, 1}),
+            placement(1, {0, 1, 0, 1}),
+        };
+        const auto competing = validateMoERoutedExpertPlacementPlan(
+            plan, twoLayerFourExpertOptions());
+        EXPECT_FALSE(competing.ok());
+        EXPECT_TRUE(hasErrorContaining(
+            competing, "both deferred initial orders and concrete placements"));
+    }
+
     /**
      * @brief Canonical placement storage must include routed MTP source layers.
      *
@@ -139,6 +189,31 @@ namespace llaminar2::test
 
         EXPECT_EQ(plan.placementLayerCapacity(/*minimum_layers=*/40), 41);
         EXPECT_EQ(plan.placementLayerCapacity(/*minimum_layers=*/48), 48);
+    }
+
+    /**
+     * @brief A retained sidecar cannot become the main inference boundary.
+     *
+     * The production parity matrix retains maximum MTP graph capacity even in
+     * its execution-off control cell.  Storage must include that auxiliary
+     * layer, while decode/prefill histogram windows still close on the final
+     * routed layer of the ordinary decoder.
+     */
+    TEST(Test__MoERoutedExpertPlacementPlan,
+         MainIntervalBoundaryExcludesRetainedMTPSourceLayer)
+    {
+        auto plan = validTwoTierPlan();
+        plan.placements.push_back(placement(2, {0, 1, 0, 1}));
+        plan.placements.push_back(placement(3, {1, 0, 1, 0}));
+
+        ASSERT_EQ(plan.placementLayerCapacity(), 4);
+        ASSERT_EQ(plan.lastPlacementLayerBefore(3), std::optional<int>{2});
+        EXPECT_EQ(plan.lastPlacementLayerBefore(4), std::optional<int>{3});
+        const MoERoutedExpertPlacementPlan empty_plan;
+        EXPECT_FALSE(empty_plan.lastPlacementLayerBefore(1).has_value());
+        EXPECT_THROW(
+            (void)plan.lastPlacementLayerBefore(0),
+            std::invalid_argument);
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan, AcceptsIndependentLeastLoadedAssignmentsOnApportionedDomainScopedTPDomains)

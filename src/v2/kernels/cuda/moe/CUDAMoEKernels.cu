@@ -49,6 +49,11 @@ namespace
         llaminar2::DeviceMoETransferSlotClaimIndexEntry;
 
     constexpr int kThreads = 256;
+    static_assert(
+        kThreads ==
+            llaminar2::MoEProjectionNumericalContract::
+                floating_ordered_k_partitions,
+        "CUDA floating MoE launch geometry must retain the movable-expert tree");
     constexpr unsigned int kCudaGridYDimensionLimit = 65535u;
 
     /**
@@ -326,6 +331,7 @@ namespace
         const uint32_t *runtime_histogram_active_bank;
         const llaminar2::DeviceMoEOverlayEpochTicket *overlay_epoch_ticket;
         const DeviceMoEPlacementBankView *overlay_placement_banks;
+        const llaminar2::DeviceMoEOverlayEpochStatus *overlay_epoch_status;
     };
 
     static_assert(
@@ -364,6 +370,9 @@ namespace
     static_assert(
         offsetof(DeviceMoELayerRuntimeView, overlay_placement_banks) ==
         llaminar2::moe_runtime_abi::kOverlayPlacementBanksOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView, overlay_epoch_status) ==
+        llaminar2::moe_runtime_abi::kOverlayEpochStatusOffset);
 
     /** Sentinel returned when an inference reader cannot prove its bank. */
     constexpr uint32_t kInvalidRuntimeExecutionBank = 0xffffffffu;
@@ -475,9 +484,13 @@ namespace
             {
                 asm("trap;");
             }
-            const uint32_t bank = *runtime.runtime_histogram_active_bank;
-            if (bank > 1u)
+            const uint32_t state = *runtime.runtime_histogram_active_bank;
+            if ((state &
+                 ~llaminar2::moe_runtime_abi::kHistogramWriterStateMask) != 0u)
                 asm("trap;");
+            const uint32_t bank =
+                state &
+                llaminar2::moe_runtime_abi::kHistogramWriterBankMask;
             return runtime.runtime_histogram_banks[bank].selected[source];
         }
         switch (source)
@@ -508,9 +521,13 @@ namespace
             {
                 asm("trap;");
             }
-            const uint32_t bank = *runtime.runtime_histogram_active_bank;
-            if (bank > 1u)
+            const uint32_t state = *runtime.runtime_histogram_active_bank;
+            if ((state &
+                 ~llaminar2::moe_runtime_abi::kHistogramWriterStateMask) != 0u)
                 asm("trap;");
+            const uint32_t bank =
+                state &
+                llaminar2::moe_runtime_abi::kHistogramWriterBankMask;
             return runtime.runtime_histogram_banks[bank].local[source];
         }
         switch (source)
@@ -527,11 +544,30 @@ namespace
         }
     }
 
+    /** @return Whether the current external/embedded writer admits route rows. */
+    __device__ __forceinline__ bool runtime_histogram_admits_rows(
+        const DeviceMoELayerRuntimeView &runtime)
+    {
+        if (!runtime.runtime_histogram_active_bank)
+            return true;
+        const uint32_t state = *runtime.runtime_histogram_active_bank;
+        if ((state &
+             ~llaminar2::moe_runtime_abi::kHistogramWriterStateMask) != 0u)
+        {
+            asm("trap;");
+        }
+        return (state &
+                llaminar2::moe_runtime_abi::kHistogramWriterQuarantineBit) ==
+               0u;
+    }
+
     /** @brief Clear one expert's exact production-phase demand counters. */
     __device__ __forceinline__ void reset_runtime_histogram_expert(
         DeviceMoELayerRuntimeView &runtime,
         uint32_t expert)
     {
+        if (!runtime_histogram_admits_rows(runtime))
+            return;
         for (uint32_t source = 0u;
              source < llaminar2::moe_runtime_abi::kHistogramSourceCount;
              ++source)
@@ -856,6 +892,7 @@ namespace
         uint32_t expert;
         uint32_t source_participant;
         uint32_t destination_participant;
+        int32_t destination_overlay_participant;
         uint32_t source_resident_mask;
         uint32_t flags;
         uint32_t destination_slot;
@@ -864,6 +901,41 @@ namespace
         uint32_t destination_previous_expert;
         uint32_t destination_generation;
     };
+    static_assert(
+        sizeof(DeviceMoERebalancePlanEntryView) ==
+            llaminar2::moe_rebalance_abi::kPlanEntryBytes,
+        "CUDA rebalance plan ABI must match the shared host record");
+
+    /**
+     * @brief Resolve one domain participant's stable overlay endpoint.
+     *
+     * The active bank is the device-owned namespace bridge: every expert owned
+     * by a domain participant must name the same overlay route. Returning -1
+     * rejects missing or contradictory mappings before an immutable transfer
+     * command is published.
+     */
+    __device__ __forceinline__ int32_t
+    rebalance_overlay_route_for_domain_participant(
+        const DeviceMoEPlacementBankView &bank,
+        uint32_t participant,
+        uint32_t expert_count)
+    {
+        int32_t route = -1;
+        for (uint32_t expert = 0; expert < expert_count; ++expert)
+        {
+            if (bank.experts[expert].owner_participant !=
+                static_cast<int32_t>(participant))
+            {
+                continue;
+            }
+            const int32_t candidate =
+                bank.overlay_route_participant[expert];
+            if (candidate < 0 || (route >= 0 && route != candidate))
+                return -1;
+            route = candidate;
+        }
+        return route;
+    }
 
     struct DeviceMoERebalanceCommandBufferHeaderView
     {
@@ -2625,6 +2697,22 @@ namespace
 
         if (lane == 0u)
         {
+            if (index->first_invalid_runtime_layer !=
+                kDeviceMoEInvalidSlot)
+            {
+                const auto &invalid_runtime = runtime_layers[
+                    index->first_invalid_runtime_layer];
+                index->first_invalid_runtime_active_bank =
+                    invalid_runtime.active_bank;
+                index->first_invalid_runtime_active_epoch =
+                    invalid_runtime.active_epoch;
+                index->first_invalid_runtime_expert_count =
+                    invalid_runtime.expert_count;
+                index->first_invalid_runtime_participant_id =
+                    invalid_runtime.participant_id;
+                index->first_invalid_runtime_participant_count =
+                    invalid_runtime.participant_count;
+            }
             if (index->summary.unique_claims != 0u)
             {
                 const uint32_t flat =
@@ -3598,6 +3686,7 @@ namespace
         DeviceMoERebalanceWaveStateView *wave_state,
         DeviceMoERebalanceGraphControllerStateView *controller_state,
         const DeviceMoELLEPLayerPlanScratchView *llep_layer_plans,
+        DeviceMoEPlacementBankView *placement_plan_scratch,
         uint32_t command_buffer_count,
         const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
         uint32_t local_transfer_slot_count)
@@ -3873,6 +3962,12 @@ namespace
             (config.flags & kDeviceMoERebalanceFlagPlanMissingArrivals) != 0u;
         const bool defer_runtime_apply =
             (config.flags & kDeviceMoERebalanceFlagDeferRuntimeApply) != 0u;
+        if (defer_runtime_apply && !placement_plan_scratch)
+        {
+            if (leader && status)
+                status->status_code = kDeviceMoERebalanceStatusInvalidRuntime;
+            return;
+        }
         const bool domain_root_planning = defer_runtime_apply && plan_missing_arrivals;
         constexpr bool least_loaded_assignment = LeastLoadedAssignment;
         const bool hot_replica_cache =
@@ -4159,7 +4254,17 @@ namespace
 
             const uint32_t inactive_bank = 1u - runtime.active_bank;
             const DeviceMoEPlacementBankView &active = runtime.banks[runtime.active_bank];
-            DeviceMoEPlacementBankView &next = runtime.banks[inactive_bank];
+            /*
+             * A deferred planner has not reserved an RCU candidate yet. Both
+             * runtime banks can therefore still be pinned by readers. Build
+             * the speculative layer in graph-owned scratch and publish only
+             * immutable commands; the later apply transaction alone writes
+             * the reserved durable candidate bank.
+             */
+            DeviceMoEPlacementBankView &next =
+                defer_runtime_apply
+                    ? *placement_plan_scratch
+                    : runtime.banks[inactive_bank];
             if (leader)
             {
                 next.epoch = runtime.active_epoch + 1u;
@@ -4458,6 +4563,22 @@ namespace
                         entry.expert = transfer.expert;
                         entry.source_participant = transfer.source_participant;
                         entry.destination_participant = transfer.destination_participant;
+                        entry.destination_overlay_participant =
+                            ownership_transfer
+                                ? rebalance_overlay_route_for_domain_participant(
+                                      active,
+                                      transfer.destination_participant,
+                                      config.num_experts)
+                                : -1;
+                        if (ownership_transfer &&
+                            runtime.overlay_epoch_ticket &&
+                            entry.destination_overlay_participant < 0)
+                        {
+                            status->status_code =
+                                kDeviceMoERebalanceStatusInvalidRuntime;
+                            shared_abort = 1u;
+                            break;
+                        }
                         entry.source_resident_mask =
                             ownership_transfer ? physical_source_resident_mask : resident_mask;
                         entry.destination_slot =
@@ -4520,6 +4641,8 @@ namespace
                         {
                             next.experts[transfer.expert].owner_participant =
                                 static_cast<int32_t>(transfer.destination_participant);
+                            next.overlay_route_participant[transfer.expert] =
+                                entry.destination_overlay_participant;
                             shared_expert_owners[transfer.expert] =
                                 static_cast<int32_t>(transfer.destination_participant);
                             if (!llaminar2::moe_rebalance_policy::
@@ -4648,24 +4771,28 @@ namespace
                     config.dynamic_max_swaps_per_layer == 0u
                         ? 0u
                         : config.dynamic_max_swaps_per_layer;
-                const uint32_t max_entries =
-                    config.dynamic_max_plan_entries_per_wave == 0u
-                        ? plan_capacity
-                        : min(config.dynamic_max_plan_entries_per_wave, plan_capacity);
                 for (uint32_t swap_iter = 0; swap_iter < max_swaps; ++swap_iter)
                 {
                     const uint32_t command_count =
                         plan_count ? ((*plan_count < plan_capacity) ? *plan_count : plan_capacity) : 0u;
-                    if (command_count + 2u > plan_capacity)
-                    {
-                        if (status)
-                            ++status->plan_overflow;
-                        break;
-                    }
-                    if (command_count + 2u > max_entries)
+                    const auto admission =
+                        llaminar2::moe_rebalance_policy::dynamicPlanAdmission(
+                            command_count,
+                            /*required_entries=*/2u,
+                            config.dynamic_max_plan_entries_per_wave,
+                            plan_capacity);
+                    if (admission == llaminar2::moe_rebalance_policy::
+                                         DynamicPlanAdmission::ConfiguredWaveLimit)
                     {
                         if (status)
                             ++status->capacity_limited_candidates;
+                        break;
+                    }
+                    if (admission == llaminar2::moe_rebalance_policy::
+                                         DynamicPlanAdmission::PhysicalPlanOverflow)
+                    {
+                        if (status)
+                            ++status->plan_overflow;
                         break;
                     }
 
@@ -4700,6 +4827,25 @@ namespace
                         shared_physical_source_resident_mask[swap_choice.heavy_expert] & valid_mask;
                     const uint32_t light_physical_source_mask =
                         shared_physical_source_resident_mask[swap_choice.light_expert] & valid_mask;
+                    const int32_t heavy_destination_overlay_participant =
+                        rebalance_overlay_route_for_domain_participant(
+                            next,
+                            heavy_destination,
+                            config.num_experts);
+                    const int32_t light_destination_overlay_participant =
+                        rebalance_overlay_route_for_domain_participant(
+                            next,
+                            light_destination,
+                            config.num_experts);
+                    if (runtime.overlay_epoch_ticket &&
+                        (heavy_destination_overlay_participant < 0 ||
+                         light_destination_overlay_participant < 0))
+                    {
+                        status->status_code =
+                            kDeviceMoERebalanceStatusInvalidRuntime;
+                        shared_abort = 1u;
+                        break;
+                    }
                     const uint32_t heavy_source_bit =
                         runtime_participant_bit(static_cast<int>(heavy_source));
                     const uint32_t light_source_bit =
@@ -4738,6 +4884,8 @@ namespace
                     heavy_entry.expert = swap_choice.heavy_expert;
                     heavy_entry.source_participant = heavy_source;
                     heavy_entry.destination_participant = heavy_destination;
+                    heavy_entry.destination_overlay_participant =
+                        heavy_destination_overlay_participant;
                     heavy_entry.source_resident_mask = heavy_physical_source_mask;
                     heavy_entry.destination_slot =
                         shared_destination_transfer_slot_counts[heavy_destination];
@@ -4750,6 +4898,8 @@ namespace
                     light_entry.expert = swap_choice.light_expert;
                     light_entry.source_participant = light_source;
                     light_entry.destination_participant = light_destination;
+                    light_entry.destination_overlay_participant =
+                        light_destination_overlay_participant;
                     light_entry.source_resident_mask = light_physical_source_mask;
                     light_entry.destination_slot =
                         shared_destination_transfer_slot_counts[light_destination];
@@ -4781,6 +4931,10 @@ namespace
                         static_cast<int32_t>(heavy_destination);
                     next.experts[swap_choice.light_expert].owner_participant =
                         static_cast<int32_t>(light_destination);
+                    next.overlay_route_participant[swap_choice.heavy_expert] =
+                        heavy_destination_overlay_participant;
+                    next.overlay_route_participant[swap_choice.light_expert] =
+                        light_destination_overlay_participant;
                     shared_post_policy_resident_mask[swap_choice.heavy_expert] =
                         runtime_participant_bit(static_cast<int>(heavy_destination));
                     shared_post_policy_resident_mask[swap_choice.light_expert] =
@@ -5771,6 +5925,17 @@ namespace
                     true);
             const bool durable_llep_ownership_wave =
                 least_loaded_assignment && !hot_replica_cache;
+            /*
+             * Layers execute serially, so the sum of per-layer participant
+             * spreads is the relevant compute critical path.  Whole-request
+             * participant totals can tie when opposite layer skews cancel;
+             * do not let that lossy aggregate veto a dynamic ownership wave
+             * whose retained plan demonstrably reduces the layer-wise sum.
+             */
+            const bool realized_layer_critical_path_payback =
+                requested_payload_slots > 0u &&
+                dynamic_ownership_swap_accepts > 0u &&
+                post_wave_load_spread < pre_wave_load_spread;
             const bool participant_load_spread_rejected =
                 requested_payload_slots > 0u &&
                 !llaminar2::moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
@@ -5779,7 +5944,8 @@ namespace
                      pre_total,
                      post_total,
                      requested_payload_slots,
-                     realized_router_payback);
+                     realized_router_payback ||
+                         realized_layer_critical_path_payback);
             const bool aggregate_load_spread_rejected =
                 requested_payload_slots > 0u &&
                 !llaminar2::moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
@@ -5885,6 +6051,12 @@ namespace
                 aggregate_load_spread_rejected ? 1u : 0u;
             status->skipped_configured_load_spread_ceiling =
                 configured_load_spread_ceiling_rejected ? 1u : 0u;
+            /* The terminal economy gate may prune provisional commands.  The
+             * published counters describe only commands that survived it. */
+            status->dynamic_ownership_swap_accepts =
+                dynamic_ownership_swap_accepts;
+            status->dynamic_ownership_swap_rejections =
+                dynamic_ownership_swap_rejections;
             status->payload_source_participant_mask = payload_source_participant_mask;
             status->payload_destination_participant_mask =
                 payload_destination_participant_mask;
@@ -6404,24 +6576,28 @@ namespace
                 }
 
                 const uint32_t max_swaps = config.dynamic_max_swaps_per_layer;
-                const uint32_t max_entries =
-                    config.dynamic_max_plan_entries_per_wave == 0u
-                        ? plan_capacity
-                        : min(config.dynamic_max_plan_entries_per_wave, plan_capacity);
                 for (uint32_t swap_iter = 0; swap_iter < max_swaps; ++swap_iter)
                 {
                     const uint32_t command_count =
                         plan_count ? ((*plan_count < plan_capacity) ? *plan_count : plan_capacity) : 0u;
-                    if (command_count + 2u > plan_capacity)
-                    {
-                        if (status)
-                            ++status->plan_overflow;
-                        break;
-                    }
-                    if (command_count + 2u > max_entries)
+                    const auto admission =
+                        llaminar2::moe_rebalance_policy::dynamicPlanAdmission(
+                            command_count,
+                            /*required_entries=*/2u,
+                            config.dynamic_max_plan_entries_per_wave,
+                            plan_capacity);
+                    if (admission == llaminar2::moe_rebalance_policy::
+                                         DynamicPlanAdmission::ConfiguredWaveLimit)
                     {
                         if (status)
                             ++status->capacity_limited_candidates;
+                        break;
+                    }
+                    if (admission == llaminar2::moe_rebalance_policy::
+                                         DynamicPlanAdmission::PhysicalPlanOverflow)
+                    {
+                        if (status)
+                            ++status->plan_overflow;
                         break;
                     }
 
@@ -6457,6 +6633,25 @@ namespace
                         active.resident_participant_mask[swap_choice.heavy_expert] & valid_mask;
                     const uint32_t light_physical_source_mask =
                         active.resident_participant_mask[swap_choice.light_expert] & valid_mask;
+                    const int32_t heavy_destination_overlay_participant =
+                        rebalance_overlay_route_for_domain_participant(
+                            active,
+                            heavy_destination,
+                            config.num_experts);
+                    const int32_t light_destination_overlay_participant =
+                        rebalance_overlay_route_for_domain_participant(
+                            active,
+                            light_destination,
+                            config.num_experts);
+                    if (runtime.overlay_epoch_ticket &&
+                        (heavy_destination_overlay_participant < 0 ||
+                         light_destination_overlay_participant < 0))
+                    {
+                        status->status_code =
+                            kDeviceMoERebalanceStatusInvalidRuntime;
+                        shared_abort = 1u;
+                        break;
+                    }
                     const uint32_t heavy_source_bit =
                         runtime_participant_bit(static_cast<int>(heavy_source));
                     const uint32_t light_source_bit =
@@ -6512,6 +6707,8 @@ namespace
                     heavy_entry.expert = swap_choice.heavy_expert;
                     heavy_entry.source_participant = heavy_source;
                     heavy_entry.destination_participant = heavy_destination;
+                    heavy_entry.destination_overlay_participant =
+                        heavy_destination_overlay_participant;
                     heavy_entry.source_resident_mask = heavy_physical_source_mask;
                     heavy_entry.destination_slot =
                         shared_destination_transfer_slot_counts[heavy_destination];
@@ -6524,6 +6721,8 @@ namespace
                     light_entry.expert = swap_choice.light_expert;
                     light_entry.source_participant = light_source;
                     light_entry.destination_participant = light_destination;
+                    light_entry.destination_overlay_participant =
+                        light_destination_overlay_participant;
                     light_entry.source_resident_mask = light_physical_source_mask;
                     light_entry.destination_slot =
                         shared_destination_transfer_slot_counts[light_destination];
@@ -6679,6 +6878,10 @@ namespace
                     accepted_load_spread_improvement_total,
                     requested_payload_slots,
                     config.min_wave_spread_improvement_per_payload_slot);
+            const bool realized_layer_critical_path_payback =
+                requested_payload_slots > 0u &&
+                dynamic_ownership_swap_accepts > 0u &&
+                post_wave_load_spread < pre_wave_load_spread;
             const bool participant_load_spread_rejected =
                 requested_payload_slots > 0u &&
                 !llaminar2::moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
@@ -6687,7 +6890,7 @@ namespace
                      pre_total,
                      post_total,
                      requested_payload_slots,
-                     false);
+                     realized_layer_critical_path_payback);
             const bool aggregate_load_spread_rejected =
                 requested_payload_slots > 0u &&
                 !llaminar2::moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
@@ -11137,6 +11340,9 @@ namespace
                     runtime.top_k != config.top_k ||
                     runtime.participant_id != config.participant_id ||
                     runtime.participant_count != config.participant_count ||
+                    (plan.op == kDeviceMoERebalancePlanOwnershipTransfer &&
+                     runtime.overlay_epoch_ticket &&
+                     plan.destination_overlay_participant < 0) ||
                     (current_batch_plan &&
                      (!runtime.overlay_placement_banks ||
                       !runtime.overlay_epoch_ticket ||
@@ -11387,6 +11593,9 @@ namespace
                     plan.expert >= config.num_experts ||
                     plan.source_participant >= config.participant_count ||
                     plan.destination_participant >= config.participant_count ||
+                    (plan.op == kDeviceMoERebalancePlanOwnershipTransfer &&
+                     runtime_layers[plan.layer].overlay_epoch_ticket &&
+                     plan.destination_overlay_participant < 0) ||
                     changed_layer[plan.layer] == 0u)
                 {
                     continue;
@@ -11489,6 +11698,11 @@ namespace
                         static_cast<uint8_t>(kDeviceMoEReplicaRoleNone);
                 }
                 next.experts[plan.expert] = desc;
+                if (ownership_transfer)
+                {
+                    next.overlay_route_participant[plan.expert] =
+                        plan.destination_overlay_participant;
+                }
                 next.resident_participant_mask[plan.expert] =
                     resident_mask & shared_valid_mask;
                 if (rebalance_plan_requires_payload(plan.op))
@@ -12100,6 +12314,9 @@ namespace
                 plan.expert >= config.num_experts ||
                 plan.source_participant >= config.participant_count ||
                 plan.destination_participant >= config.participant_count ||
+                (plan.op == kDeviceMoERebalancePlanOwnershipTransfer &&
+                 runtime.overlay_epoch_ticket &&
+                 plan.destination_overlay_participant < 0) ||
                 rebalance_plan_duplicates_prior_local_arrival(
                     wave_plan_entries,
                     i,
@@ -12308,7 +12525,10 @@ namespace
             if (!rebalance_plan_applies_runtime(plan.op) ||
                 plan.expert >= config.num_experts ||
                 plan.source_participant >= config.participant_count ||
-                plan.destination_participant >= config.participant_count)
+                plan.destination_participant >= config.participant_count ||
+                (plan.op == kDeviceMoERebalancePlanOwnershipTransfer &&
+                 runtime.overlay_epoch_ticket &&
+                 plan.destination_overlay_participant < 0))
             {
                 continue;
             }
@@ -12401,6 +12621,11 @@ namespace
                     static_cast<uint8_t>(kDeviceMoEReplicaRoleNone);
             }
             next.experts[plan.expert] = desc;
+            if (ownership_transfer)
+            {
+                next.overlay_route_participant[plan.expert] =
+                    plan.destination_overlay_participant;
+            }
             next.resident_participant_mask[plan.expert] = resident_mask & valid_mask;
             if (rebalance_plan_requires_payload(plan.op))
             {
@@ -13605,6 +13830,8 @@ namespace
             }
             if constexpr (UpdateRuntimeHistogram)
             {
+                if (!runtime_histogram_admits_rows(*runtime))
+                    return;
                 for (int k = 0; k < top_k; ++k)
                 {
                     const int expert = selected[k];
@@ -13681,7 +13908,8 @@ namespace
             }
         }
 
-        if (update_runtime_histogram)
+        if (update_runtime_histogram &&
+            runtime_histogram_admits_rows(*runtime))
         {
             for (int k = 0; k < top_k; ++k)
             {
@@ -14427,13 +14655,18 @@ namespace
                     runtime_durable_placement_banks(runtime);
                 const llaminar2::DeviceMoEOverlayEpochTicket *const ticket =
                     runtime ? runtime->overlay_epoch_ticket : nullptr;
+                const llaminar2::DeviceMoEOverlayEpochStatus *const status =
+                    runtime ? runtime->overlay_epoch_status : nullptr;
                 printf("runtime_prefill_invalid_contract "
                        "runtime=%p gate=%p up=%p down=%p experts=%d "
                        "active_ids=%p max_active=%d expert_counts=%p "
                        "expected_format=%u execution_bank=%u active_bank=%u "
                        "active_epoch=%u transient=%u ticket=%p "
                        "ticket_epoch=%llu ticket_selector=%llu "
-                       "placement_banks=%p bank0_epoch=%u bank1_epoch=%u\n",
+                       "status=%p status_code=%u status_operation=%u "
+                       "status_epoch=%llu status_selector=%llu status_bank=%u "
+                       "status_state=%u placement_banks=%p bank0_epoch=%u "
+                       "bank1_epoch=%u\n",
                        runtime,
                        gate_descs,
                        up_descs,
@@ -14454,6 +14687,15 @@ namespace
                            ticket ? ticket->epoch : 0u),
                        static_cast<unsigned long long>(
                            ticket ? ticket->selector : 0u),
+                       status,
+                       status ? status->code : 0xffffffffu,
+                       status ? status->operation : 0xffffffffu,
+                       static_cast<unsigned long long>(
+                           status ? status->epoch : 0u),
+                       static_cast<unsigned long long>(
+                           status ? status->selector : 0u),
+                       status ? status->bank : 0xffffffffu,
+                       status ? status->observed_state : 0xffffffffu,
                        placement_banks,
                        placement_banks ? placement_banks[0].epoch : 0u,
                        placement_banks ? placement_banks[1].epoch : 0u);
@@ -15169,7 +15411,8 @@ namespace
         if constexpr (PublishCompletePlan)
         {
             if (retain_routes_for_deferred_commit == 0 &&
-                tid < current_slots)
+                tid < current_slots &&
+                runtime_histogram_admits_rows(*runtime))
             {
                 const int expert_id = shared_route_experts[tid];
                 const int participant_id = shared_route_participants[tid];
@@ -15295,20 +15538,40 @@ namespace
                         bank.experts[invalid_expert];
                     const uint32_t local_bit =
                         runtime_participant_bit(local_participant);
+                    const DeviceMoEPlacementBankView *const durable_banks =
+                        runtime_durable_placement_banks(runtime);
+                    const llaminar2::DeviceMoEOverlayEpochTicket *const ticket =
+                        runtime->overlay_epoch_ticket;
                     printf("runtime_prefill_active_expert_not_ready "
                            "participant=%u expert=%d count=%d execution_bank=%u "
-                           "local_mask=%u resident_mask=%u local_bit=%u "
-                           "local_slot=%d logical=%d owner=%d\\n",
+                           "active_bank=%u active_epoch=%u bank0_epoch=%u "
+                           "bank1_epoch=%u local_mask=%u resident_mask=%u "
+                           "local_bit=%u local_slot=%d logical=%d owner=%d "
+                           "descriptor_flags=%u route_participant=%d "
+                           "external_banks=%u transient=%u ticket_epoch=%llu "
+                           "ticket_selector=%llu\\n",
                            runtime->participant_id,
                            invalid_expert,
                            runtime->expert_counts[invalid_expert],
                            execution_bank,
+                           runtime->active_bank,
+                           runtime->active_epoch,
+                           durable_banks ? durable_banks[0].epoch : 0u,
+                           durable_banks ? durable_banks[1].epoch : 0u,
                            bank.local_compute_mask[invalid_expert],
                            bank.resident_participant_mask[invalid_expert],
                            local_bit,
                            desc.local_slot,
                            desc.logical_expert_id,
-                           desc.owner_participant);
+                           desc.owner_participant,
+                           desc.flags,
+                           bank.overlay_route_participant[invalid_expert],
+                           runtime->overlay_placement_banks ? 1u : 0u,
+                           runtime->current_batch_llep_transient_bank_active,
+                           static_cast<unsigned long long>(
+                               ticket ? ticket->epoch : 0u),
+                           static_cast<unsigned long long>(
+                               ticket ? ticket->selector : 0u));
                     FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
                         "runtime active expert is not locally resident and compute-ready");
                 }
@@ -15573,6 +15836,8 @@ namespace
         const int expert_id =
             runtime->deferred_verifier_route_expert_ids[slot];
         if (expert_id < 0 || expert_id >= num_experts)
+            return;
+        if (!runtime_histogram_admits_rows(*runtime))
             return;
 
         atomicAdd(
@@ -16638,7 +16903,8 @@ namespace
          * already.  Count final assigned routes here so route-only grouping
          * remains side-effect free and ordinary prefill adds no launch.
          */
-        if (publish_prefill_histogram != 0)
+        if (publish_prefill_histogram != 0 &&
+            runtime_histogram_admits_rows(*runtime))
         {
             for (int slot = threadIdx.x;
                  slot < current_slots;
@@ -20586,16 +20852,23 @@ extern "C"
         void *wave_state,
         void *controller_state,
         void *llep_layer_plans,
+        void *placement_plan_scratch,
         uint32_t command_buffer_count,
         const void *local_transfer_slots,
         uint32_t local_transfer_slot_count,
         int device_idx,
         void *stream)
     {
-        if (!runtime_layers || !gathered_histograms || !status || !config || !stream)
+        if (!runtime_layers || !gathered_histograms || !status || !config ||
+            !stream)
             return false;
         cudaSetDevice(device_idx);
         const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        if ((cfg.flags & kDeviceMoERebalanceFlagDeferRuntimeApply) != 0u &&
+            !placement_plan_scratch)
+        {
+            return false;
+        }
         const bool dynamic_ownership_fast_path =
             cfg.routed_assignment_policy != kDeviceMoERebalanceAssignmentLeastLoadedResident &&
             (cfg.flags & kDeviceMoERebalanceFlagHotReplicaCache) == 0u &&
@@ -20709,6 +20982,8 @@ extern "C"
                 static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
                 static_cast<const DeviceMoELLEPLayerPlanScratchView *>(
                     llep_layer_plans),
+                static_cast<DeviceMoEPlacementBankView *>(
+                    placement_plan_scratch),
                 command_buffer_count,
                 static_cast<const DeviceMoEExpertDirectoryEntryView *>(
                     local_transfer_slots),
@@ -20729,6 +21004,8 @@ extern "C"
             static_cast<DeviceMoERebalanceWaveStateView *>(wave_state),
             static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
             nullptr,
+            static_cast<DeviceMoEPlacementBankView *>(
+                placement_plan_scratch),
             command_buffer_count,
             static_cast<const DeviceMoEExpertDirectoryEntryView *>(
                 local_transfer_slots),

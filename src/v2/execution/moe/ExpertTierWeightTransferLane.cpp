@@ -14,6 +14,7 @@
 #include "../../backends/GPUDeviceContextPool.h"
 #include "../../backends/IBackend.h"
 #include "../../backends/IWorkerGPUContext.h"
+#include "../../tensors/TensorKernels.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 
@@ -199,12 +200,16 @@ namespace llaminar2
             return false;
         }
 
-        direction_ = Direction::GpuToCpu;
+        direction_ = Direction::GpuToCpuRepacked;
         layout_ = layout;
         gpu_source_ = source;
         gpu_destination_ = {};
         cpu_destination_ = final_cpu_bytes;
         cpu_source_ = {};
+        gpu_contiguous_source_ = nullptr;
+        gpu_contiguous_destination_ = nullptr;
+        contiguous_total_bytes_ = 0;
+        contiguous_completed_bytes_ = 0;
         completed_units_ = 0;
         in_flight_units_ = 0;
         in_flight_bytes_ = 0;
@@ -254,12 +259,16 @@ namespace llaminar2
             return false;
         }
 
-        direction_ = Direction::CpuToGpu;
+        direction_ = Direction::CpuToGpuRepacked;
         layout_ = layout;
         gpu_source_ = {};
         gpu_destination_ = destination;
         cpu_destination_ = {};
         cpu_source_ = cpu_bytes;
+        gpu_contiguous_source_ = nullptr;
+        gpu_contiguous_destination_ = nullptr;
+        contiguous_total_bytes_ = 0;
+        contiguous_completed_bytes_ = 0;
         completed_units_ = 0;
         in_flight_units_ = 0;
         in_flight_bytes_ = 0;
@@ -274,6 +283,138 @@ namespace llaminar2
         transfer_started_at_ = std::chrono::steady_clock::now();
         ++stats_.transfers_started;
         return enqueueNextChunk(error);
+    }
+
+    bool ExpertTierWeightTransferLane::startGpuToCpuContiguous(
+        const ContiguousFloatingPointWeightDescriptor &source,
+        std::span<std::uint8_t> final_cpu_bytes,
+        const ExpertTierSourceReadiness &source_readiness,
+        std::string *error) noexcept
+    {
+        if (!materialized())
+        {
+            assignError(
+                error,
+                "GPU-to-CPU contiguous tier transfer lane is not materialized");
+            return false;
+        }
+        if (progress_ == ExpertTierWeightTransferProgress::Pending ||
+            progress_ == ExpertTierWeightTransferProgress::Failed)
+        {
+            assignError(
+                error,
+                "GPU-to-CPU contiguous tier transfer lane is already occupied");
+            return false;
+        }
+        if (!source.valid() || final_cpu_bytes.size() != source.bytes)
+        {
+            assignError(
+                error,
+                "GPU-to-CPU contiguous tier transfer storage is invalid or mismatched");
+            return false;
+        }
+        if (source_readiness.requiresProducerWait() &&
+            !gpu_context_->waitEventChecked(
+                source_readiness.event(), transfer_stream_))
+        {
+            assignError(
+                error,
+                "Could not enqueue contiguous source-to-transfer event dependency");
+            return false;
+        }
+
+        direction_ = Direction::GpuToCpuContiguous;
+        layout_ = {};
+        gpu_source_ = {};
+        gpu_destination_ = {};
+        cpu_destination_ = final_cpu_bytes;
+        cpu_source_ = {};
+        gpu_contiguous_source_ =
+            static_cast<const std::uint8_t *>(source.data);
+        gpu_contiguous_destination_ = nullptr;
+        contiguous_total_bytes_ = source.bytes;
+        contiguous_completed_bytes_ = 0;
+        completed_units_ = 0;
+        in_flight_units_ = 0;
+        in_flight_bytes_ = 0;
+        work_may_be_in_flight_ = false;
+        fail_after_in_flight_event_ = false;
+        in_flight_timing_valid_ = false;
+        transfer_device_nanoseconds_ = 0;
+        transfer_host_nanoseconds_ = 0;
+        transfer_bytes_ = static_cast<std::uint64_t>(source.bytes);
+        failure_.clear();
+        progress_ = ExpertTierWeightTransferProgress::Pending;
+        transfer_started_at_ = std::chrono::steady_clock::now();
+        ++stats_.transfers_started;
+        return enqueueNextChunk(error);
+    }
+
+    bool ExpertTierWeightTransferLane::startCpuToGpuContiguous(
+        std::span<const std::uint8_t> cpu_bytes,
+        const ContiguousFloatingPointWeightDescriptor &destination,
+        std::string *error) noexcept
+    {
+        if (!materialized())
+        {
+            assignError(
+                error,
+                "CPU-to-GPU contiguous tier transfer lane is not materialized");
+            return false;
+        }
+        if (progress_ == ExpertTierWeightTransferProgress::Pending ||
+            progress_ == ExpertTierWeightTransferProgress::Failed)
+        {
+            assignError(
+                error,
+                "CPU-to-GPU contiguous tier transfer lane is already occupied");
+            return false;
+        }
+        if (!destination.valid() || cpu_bytes.size() != destination.bytes)
+        {
+            assignError(
+                error,
+                "CPU-to-GPU contiguous tier transfer storage is invalid or mismatched");
+            return false;
+        }
+
+        direction_ = Direction::CpuToGpuContiguous;
+        layout_ = {};
+        gpu_source_ = {};
+        gpu_destination_ = {};
+        cpu_destination_ = {};
+        cpu_source_ = cpu_bytes;
+        gpu_contiguous_source_ = nullptr;
+        gpu_contiguous_destination_ = static_cast<std::uint8_t *>(
+            const_cast<void *>(destination.data));
+        contiguous_total_bytes_ = destination.bytes;
+        contiguous_completed_bytes_ = 0;
+        completed_units_ = 0;
+        in_flight_units_ = 0;
+        in_flight_bytes_ = 0;
+        work_may_be_in_flight_ = false;
+        fail_after_in_flight_event_ = false;
+        in_flight_timing_valid_ = false;
+        transfer_device_nanoseconds_ = 0;
+        transfer_host_nanoseconds_ = 0;
+        transfer_bytes_ = static_cast<std::uint64_t>(destination.bytes);
+        failure_.clear();
+        progress_ = ExpertTierWeightTransferProgress::Pending;
+        transfer_started_at_ = std::chrono::steady_clock::now();
+        ++stats_.transfers_started;
+        return enqueueNextChunk(error);
+    }
+
+    bool ExpertTierWeightTransferLane::isGpuToCpuDirection() const noexcept
+    {
+        return direction_ == Direction::GpuToCpuRepacked ||
+               direction_ == Direction::GpuToCpuContiguous;
+    }
+
+    bool ExpertTierWeightTransferLane::isContiguousDirection() const noexcept
+    {
+        return direction_ == Direction::GpuToCpuContiguous ||
+               direction_ == Direction::CpuToGpuContiguous;
     }
 
     ExpertTierWeightTransferProgress ExpertTierWeightTransferLane::fail(
@@ -300,6 +441,14 @@ namespace llaminar2
         std::uint32_t unit_count,
         std::size_t bytes) noexcept
     {
+        /*
+         * One maintenance thread may interleave lanes from several GPUs.
+         * Runtime kernel launch state is thread-local, so explicitly restore
+         * the device that owns this lane's pointers and auxiliary stream.
+         * This changes no stream ordering and performs no synchronization.
+         */
+        if (!backend_ || !backend_->setDevice(device_ordinal_))
+            return false;
         if (config_.device.is_cuda())
         {
 #ifdef HAVE_CUDA
@@ -329,6 +478,10 @@ namespace llaminar2
         std::uint32_t unit_count,
         std::size_t bytes) noexcept
     {
+        /* Do not rely on the preceding H2D call to select the device as a side
+         * effect: the repack launcher owns this invariant independently. */
+        if (!backend_ || !backend_->setDevice(device_ordinal_))
+            return false;
         if (config_.device.is_cuda())
         {
 #ifdef HAVE_CUDA
@@ -355,12 +508,32 @@ namespace llaminar2
     bool ExpertTierWeightTransferLane::enqueueNextChunk(
         std::string *error) noexcept
     {
-        const std::uint32_t remaining = layout_.unit_count - completed_units_;
-        const std::uint32_t unit_count =
-            std::min(layout_.maximum_units_per_chunk, remaining);
-        const std::size_t bytes = layout_.chunkBytes(unit_count);
-        if (unit_count == 0 || bytes == 0 ||
-            bytes > config_.staging_capacity_bytes)
+        std::uint32_t unit_count = 0;
+        std::size_t bytes = 0;
+        std::size_t byte_offset = 0;
+        if (isContiguousDirection())
+        {
+            if (contiguous_completed_bytes_ >= contiguous_total_bytes_)
+            {
+                fail("Contiguous tier transfer has no remaining bytes", error);
+                return false;
+            }
+            byte_offset = contiguous_completed_bytes_;
+            bytes = std::min(
+                config_.staging_capacity_bytes,
+                contiguous_total_bytes_ - contiguous_completed_bytes_);
+        }
+        else
+        {
+            const std::uint32_t remaining =
+                layout_.unit_count - completed_units_;
+            unit_count =
+                std::min(layout_.maximum_units_per_chunk, remaining);
+            bytes = layout_.chunkBytes(unit_count);
+            byte_offset = layout_.chunkBytes(completed_units_);
+        }
+        if (bytes == 0 || bytes > config_.staging_capacity_bytes ||
+            (!isContiguousDirection() && unit_count == 0))
         {
             fail("Tier transfer computed an invalid next chunk", error);
             return false;
@@ -376,7 +549,7 @@ namespace llaminar2
         }
 
         bool submitted = timing_started;
-        if (direction_ == Direction::GpuToCpu)
+        if (direction_ == Direction::GpuToCpuRepacked)
         {
             const bool converted = submitted && launchGpuToCpuChunk(
                 completed_units_, unit_count, bytes);
@@ -385,7 +558,7 @@ namespace llaminar2
                 device_ordinal_, transfer_stream_);
             submitted = converted && copied;
         }
-        else if (direction_ == Direction::CpuToGpu)
+        else if (direction_ == Direction::CpuToGpuRepacked)
         {
             /*
              * Copying into pinned staging is CPU maintenance work. The source
@@ -395,7 +568,7 @@ namespace llaminar2
             const auto host_copy_started = std::chrono::steady_clock::now();
             std::memcpy(
                 pinned_chunk_,
-                cpu_source_.data() + layout_.chunkBytes(completed_units_),
+                cpu_source_.data() + byte_offset,
                 bytes);
             recordHostCopyDuration(
                 std::chrono::steady_clock::now() - host_copy_started);
@@ -405,6 +578,33 @@ namespace llaminar2
             const bool converted = copied && launchCpuToGpuChunk(
                 completed_units_, unit_count, bytes);
             submitted = copied && converted;
+        }
+        else if (direction_ == Direction::GpuToCpuContiguous)
+        {
+            submitted = submitted && backend_->deviceToHostOnStream(
+                pinned_chunk_,
+                gpu_contiguous_source_ + byte_offset,
+                bytes,
+                device_ordinal_,
+                transfer_stream_);
+        }
+        else if (direction_ == Direction::CpuToGpuContiguous)
+        {
+            const auto host_copy_started = std::chrono::steady_clock::now();
+            std::memcpy(
+                pinned_chunk_, cpu_source_.data() + byte_offset, bytes);
+            recordHostCopyDuration(
+                std::chrono::steady_clock::now() - host_copy_started);
+            submitted = submitted && backend_->hostToDeviceOnStream(
+                gpu_contiguous_destination_ + byte_offset,
+                pinned_chunk_,
+                bytes,
+                device_ordinal_,
+                transfer_stream_);
+        }
+        else
+        {
+            submitted = false;
         }
 
         bool timing_stopped = true;
@@ -493,22 +693,31 @@ namespace llaminar2
                 error);
         }
 
-        if (direction_ == Direction::GpuToCpu)
+        if (isGpuToCpuDirection())
         {
             /* D2H completion makes the pinned bytes safe for final CPU copy. */
             const auto host_copy_started = std::chrono::steady_clock::now();
             std::memcpy(
-                cpu_destination_.data() + layout_.chunkBytes(completed_units_),
+                cpu_destination_.data() +
+                    (isContiguousDirection()
+                         ? contiguous_completed_bytes_
+                         : layout_.chunkBytes(completed_units_)),
                 pinned_chunk_,
                 in_flight_bytes_);
             recordHostCopyDuration(
                 std::chrono::steady_clock::now() - host_copy_started);
         }
 
-        completed_units_ += in_flight_units_;
+        if (isContiguousDirection())
+            contiguous_completed_bytes_ += in_flight_bytes_;
+        else
+            completed_units_ += in_flight_units_;
         in_flight_units_ = 0;
         in_flight_bytes_ = 0;
-        if (completed_units_ == layout_.unit_count)
+        const bool complete = isContiguousDirection()
+            ? contiguous_completed_bytes_ == contiguous_total_bytes_
+            : completed_units_ == layout_.unit_count;
+        if (complete)
         {
             progress_ = ExpertTierWeightTransferProgress::Ready;
             ++stats_.transfers_completed;
@@ -533,7 +742,7 @@ namespace llaminar2
             "maintenance",
             config_.perf_device,
             {{"lane", config_.lane_name},
-             {"direction", directionName(direction_ == Direction::GpuToCpu)},
+             {"direction", directionName(isGpuToCpuDirection())},
              {"device", config_.device.to_string()}});
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
@@ -542,7 +751,7 @@ namespace llaminar2
             "maintenance",
             config_.perf_device,
             {{"lane", config_.lane_name},
-             {"direction", directionName(direction_ == Direction::GpuToCpu)},
+             {"direction", directionName(isGpuToCpuDirection())},
              {"device", config_.device.to_string()}});
     }
 
@@ -559,7 +768,7 @@ namespace llaminar2
             .device_nanoseconds = transfer_device_nanoseconds_,
             .host_nanoseconds = transfer_host_nanoseconds_,
         };
-        const bool gpu_to_cpu = direction_ == Direction::GpuToCpu;
+        const bool gpu_to_cpu = isGpuToCpuDirection();
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
             "tier_transfers_completed",

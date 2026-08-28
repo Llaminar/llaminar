@@ -11,14 +11,105 @@
 
 #include "MTPStateTransaction.h"
 
+#include "tensors/FP16Utils.h"
+
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <sstream>
 #include <utility>
 #include <vector>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Decode one canonical floating KV segment into FP32 values.
+         *
+         * Quantized KV formats intentionally fail here until their canonical
+         * logical-block codec exposes an equally explicit numerical decoder.
+         * A placement-aware proof must never reinterpret unknown bytes or
+         * silently downgrade to hashes after those hashes already differed.
+         *
+         * @param payload Canonical native-precision bytes from a KV probe.
+         * @param precision Declared precision of the enclosing cache payload.
+         * @param decoded Receives every decoded scalar in logical-block order.
+         * @param reason Receives an actionable failure diagnostic.
+         * @return True only when the complete payload was decoded.
+         */
+        bool decodeFloatingKVPayload(
+            const std::vector<uint8_t> &payload,
+            ActivationPrecision precision,
+            std::vector<float> *decoded,
+            std::string *reason)
+        {
+            if (!decoded || !reason)
+                return false;
+            decoded->clear();
+            reason->clear();
+            if (payload.empty())
+            {
+                *reason = "retained KV segment payload is empty";
+                return false;
+            }
+
+            if (precision == ActivationPrecision::FP32)
+            {
+                if (payload.size() % sizeof(float) != 0u)
+                {
+                    *reason = "FP32 KV segment has malformed byte geometry";
+                    return false;
+                }
+                decoded->resize(payload.size() / sizeof(float));
+                std::memcpy(
+                    decoded->data(),
+                    payload.data(),
+                    payload.size());
+                return true;
+            }
+
+            if (precision == ActivationPrecision::FP16 ||
+                precision == ActivationPrecision::BF16)
+            {
+                if (payload.size() % sizeof(uint16_t) != 0u)
+                {
+                    *reason =
+                        std::string(activationPrecisionToString(precision)) +
+                        " KV segment has malformed byte geometry";
+                    return false;
+                }
+                decoded->resize(payload.size() / sizeof(uint16_t));
+                for (size_t index = 0; index < decoded->size(); ++index)
+                {
+                    uint16_t word = 0;
+                    std::memcpy(
+                        &word,
+                        payload.data() + index * sizeof(uint16_t),
+                        sizeof(word));
+                    if (precision == ActivationPrecision::FP16)
+                    {
+                        (*decoded)[index] = fp16_to_fp32(word);
+                    }
+                    else
+                    {
+                        const uint32_t fp32_bits =
+                            static_cast<uint32_t>(word) << 16u;
+                        std::memcpy(
+                            &(*decoded)[index],
+                            &fp32_bits,
+                            sizeof(fp32_bits));
+                    }
+                }
+                return true;
+            }
+
+            *reason =
+                std::string("placement-aware KV comparison has no canonical decoder for ") +
+                activationPrecisionToString(precision);
+            return false;
+        }
+    } // namespace
 
     MTPStateValidationResult MTPStateValidationResult::success()
     {
@@ -228,9 +319,20 @@ namespace llaminar2
         const PrefixRuntimeStateSnapshot &candidate,
         const MTPRuntimeSnapshotComparisonOptions &options)
     {
-        auto mismatch = [](std::string reason)
+        MTPStateValidationResult::TerminalPayloadNumericalEvidence
+            terminal_hidden_numerical;
+        MTPStateValidationResult::TerminalPayloadNumericalEvidence
+            terminal_logits_numerical;
+        MTPStateValidationResult::MainKVNumericalEvidence
+            main_kv_numerical;
+        auto mismatch = [&](std::string reason)
         {
-            return MTPStateValidationResult::failure(std::move(reason));
+            MTPStateValidationResult result =
+                MTPStateValidationResult::failure(std::move(reason));
+            result.terminal_hidden_numerical = terminal_hidden_numerical;
+            result.terminal_logits_numerical = terminal_logits_numerical;
+            result.main_kv_numerical = main_kv_numerical;
+            return result;
         };
 
         if (oracle.initialized != candidate.initialized)
@@ -283,47 +385,308 @@ namespace llaminar2
             return mismatch("terminal hidden availability mismatch");
         if (oracle.has_logits != candidate.has_logits)
             return mismatch("terminal logits availability mismatch");
-        if (oracle.terminal_hidden_hash_available !=
-            candidate.terminal_hidden_hash_available)
+        auto compare_terminal_payload =
+            [&](const char *label,
+                bool oracle_hash_available,
+                bool candidate_hash_available,
+                size_t oracle_bytes,
+                size_t candidate_bytes,
+                uint64_t oracle_hash,
+                uint64_t candidate_hash,
+                const std::vector<float> &oracle_values,
+                const std::vector<float> &candidate_values,
+                MTPTerminalPayloadComparisonPolicy policy,
+                double minimum_cosine,
+                MTPStateValidationResult::TerminalPayloadNumericalEvidence
+                    *numerical) -> MTPStateValidationResult
         {
-            return mismatch("terminal hidden hash availability mismatch");
+            if (oracle_hash_available != candidate_hash_available)
+            {
+                return mismatch(
+                    std::string("terminal ") + label +
+                    " hash availability mismatch");
+            }
+            if (!oracle_hash_available)
+                return MTPStateValidationResult::success();
+            if (oracle_bytes != candidate_bytes)
+            {
+                std::ostringstream message;
+                message << "terminal " << label << " payload mismatch: bytes="
+                        << oracle_bytes << "/" << candidate_bytes << " hash="
+                        << oracle_hash << "/" << candidate_hash;
+                return mismatch(message.str());
+            }
+            if (oracle_hash == candidate_hash)
+                return MTPStateValidationResult::success();
+
+            const bool placement_aware =
+                policy == MTPTerminalPayloadComparisonPolicy::
+                              ExactUnlessMoEPlacementChanged;
+            if (!placement_aware ||
+                oracle.moe_runtime_movement_epoch ==
+                    candidate.moe_runtime_movement_epoch)
+            {
+                std::ostringstream message;
+                message << "terminal " << label << " payload mismatch: bytes="
+                        << oracle_bytes << "/" << candidate_bytes << " hash="
+                        << oracle_hash << "/" << candidate_hash
+                        << " moe_movement_epoch="
+                        << oracle.moe_runtime_movement_epoch << "/"
+                        << candidate.moe_runtime_movement_epoch;
+                return mismatch(message.str());
+            }
+            if (!std::isfinite(minimum_cosine) || minimum_cosine < -1.0 ||
+                minimum_cosine > 1.0)
+            {
+                return mismatch(
+                    std::string("terminal ") + label +
+                    " numerical comparison has an invalid cosine threshold");
+            }
+            if (oracle_bytes % sizeof(float) != 0u)
+            {
+                return mismatch(
+                    std::string("terminal ") + label +
+                    " numerical comparison requires FP32 byte geometry");
+            }
+
+            const size_t expected_elements = oracle_bytes / sizeof(float);
+            if (oracle_values.size() != expected_elements ||
+                candidate_values.size() != expected_elements)
+            {
+                std::ostringstream message;
+                message << "terminal " << label
+                        << " placement-aware comparison requires complete "
+                           "retained values: expected="
+                        << expected_elements << " actual="
+                        << oracle_values.size() << "/"
+                        << candidate_values.size();
+                return mismatch(message.str());
+            }
+
+            double dot = 0.0;
+            double oracle_norm_sq = 0.0;
+            double candidate_norm_sq = 0.0;
+            double difference_norm_sq = 0.0;
+            double max_abs = 0.0;
+            bool finite = true;
+            for (size_t index = 0; index < expected_elements; ++index)
+            {
+                const double lhs = static_cast<double>(oracle_values[index]);
+                const double rhs = static_cast<double>(candidate_values[index]);
+                finite = finite && std::isfinite(lhs) && std::isfinite(rhs);
+                const double difference = lhs - rhs;
+                dot += lhs * rhs;
+                oracle_norm_sq += lhs * lhs;
+                candidate_norm_sq += rhs * rhs;
+                difference_norm_sq += difference * difference;
+                max_abs = std::max(max_abs, std::abs(difference));
+            }
+
+            const double norm_product =
+                std::sqrt(oracle_norm_sq) * std::sqrt(candidate_norm_sq);
+            const bool both_zero =
+                oracle_norm_sq <= 1e-30 && candidate_norm_sq <= 1e-30;
+            const double cosine =
+                both_zero ? 1.0
+                          : (norm_product > 1e-30 ? dot / norm_product : 0.0);
+            const double relative_l2 =
+                std::sqrt(difference_norm_sq) /
+                std::max(1e-30, std::sqrt(oracle_norm_sq));
+            *numerical = {
+                .compared = true,
+                .passed = finite && cosine >= minimum_cosine,
+                .elements = expected_elements,
+                .cosine = cosine,
+                .relative_l2 = relative_l2,
+                .max_abs = max_abs,
+            };
+            if (!numerical->passed)
+            {
+                std::ostringstream message;
+                message << "terminal " << label
+                        << " numerical mismatch after MoE placement change: "
+                           "epochs="
+                        << oracle.moe_runtime_movement_epoch << "/"
+                        << candidate.moe_runtime_movement_epoch
+                        << " elements=" << expected_elements
+                        << " finite=" << (finite ? "true" : "false")
+                        << " cosine=" << cosine
+                        << " required_cosine=" << minimum_cosine
+                        << " rel_l2=" << relative_l2
+                        << " max_abs=" << max_abs;
+                return mismatch(message.str());
+            }
+            return MTPStateValidationResult::success();
+        };
+
+        if (auto hidden_result = compare_terminal_payload(
+                "hidden",
+                oracle.terminal_hidden_hash_available,
+                candidate.terminal_hidden_hash_available,
+                oracle.terminal_hidden_bytes,
+                candidate.terminal_hidden_bytes,
+                oracle.terminal_hidden_hash,
+                candidate.terminal_hidden_hash,
+                oracle.terminal_hidden_values,
+                candidate.terminal_hidden_values,
+                options.terminal_hidden_policy,
+                options.terminal_hidden_min_cosine,
+                &terminal_hidden_numerical);
+            !hidden_result)
+        {
+            return hidden_result;
         }
-        if (oracle.terminal_hidden_hash_available &&
-            (oracle.terminal_hidden_bytes != candidate.terminal_hidden_bytes ||
-             oracle.terminal_hidden_hash != candidate.terminal_hidden_hash))
+        if (auto logits_result = compare_terminal_payload(
+                "logits",
+                oracle.terminal_logits_hash_available,
+                candidate.terminal_logits_hash_available,
+                oracle.terminal_logits_bytes,
+                candidate.terminal_logits_bytes,
+                oracle.terminal_logits_hash,
+                candidate.terminal_logits_hash,
+                oracle.terminal_logits_values,
+                candidate.terminal_logits_values,
+                options.terminal_logits_policy,
+                options.terminal_logits_min_cosine,
+                &terminal_logits_numerical);
+            !logits_result)
         {
-            std::ostringstream message;
-            message << "terminal hidden payload mismatch: bytes="
-                    << oracle.terminal_hidden_bytes << "/"
-                    << candidate.terminal_hidden_bytes << " hash="
-                    << oracle.terminal_hidden_hash << "/"
-                    << candidate.terminal_hidden_hash;
-            return mismatch(message.str());
-        }
-        if (oracle.terminal_logits_hash_available !=
-            candidate.terminal_logits_hash_available)
-        {
-            return mismatch("terminal logits hash availability mismatch");
-        }
-        if (oracle.terminal_logits_hash_available &&
-            (oracle.terminal_logits_bytes != candidate.terminal_logits_bytes ||
-             oracle.terminal_logits_hash != candidate.terminal_logits_hash))
-        {
-            std::ostringstream message;
-            message << "terminal logits payload mismatch: bytes="
-                    << oracle.terminal_logits_bytes << "/"
-                    << candidate.terminal_logits_bytes << " hash="
-                    << oracle.terminal_logits_hash << "/"
-                    << candidate.terminal_logits_hash;
-            return mismatch(message.str());
+            return logits_result;
         }
         if (oracle.gdn_layers.size() != candidate.gdn_layers.size())
             return mismatch("GDN layer count mismatch");
 
+        auto compare_main_kv_suffix_payload =
+            [&](const std::vector<uint8_t> &lhs_payload,
+                const std::vector<uint8_t> &rhs_payload,
+                ActivationPrecision precision,
+                size_t cache_idx,
+                int global_layer,
+                int seq_idx,
+                const char *kind) -> MTPStateValidationResult
+        {
+            if (!std::isfinite(options.main_kv_suffix_min_cosine) ||
+                options.main_kv_suffix_min_cosine < -1.0 ||
+                options.main_kv_suffix_min_cosine > 1.0)
+            {
+                return mismatch(
+                    "placement-aware main KV comparison has an invalid cosine threshold");
+            }
+
+            std::vector<float> lhs_values;
+            std::vector<float> rhs_values;
+            std::string decode_reason;
+            if (!decodeFloatingKVPayload(
+                    lhs_payload,
+                    precision,
+                    &lhs_values,
+                    &decode_reason))
+            {
+                return mismatch(
+                    std::string("oracle ") + kind +
+                    " suffix decode failed at cache " +
+                    std::to_string(cache_idx) + " layer " +
+                    std::to_string(global_layer) + " seq " +
+                    std::to_string(seq_idx) + ": " + decode_reason);
+            }
+            if (!decodeFloatingKVPayload(
+                    rhs_payload,
+                    precision,
+                    &rhs_values,
+                    &decode_reason))
+            {
+                return mismatch(
+                    std::string("candidate ") + kind +
+                    " suffix decode failed at cache " +
+                    std::to_string(cache_idx) + " layer " +
+                    std::to_string(global_layer) + " seq " +
+                    std::to_string(seq_idx) + ": " + decode_reason);
+            }
+            if (lhs_values.size() != rhs_values.size())
+            {
+                return mismatch(
+                    std::string(kind) +
+                    " suffix numerical geometry mismatch at cache " +
+                    std::to_string(cache_idx) + " layer " +
+                    std::to_string(global_layer) + " seq " +
+                    std::to_string(seq_idx));
+            }
+
+            double dot = 0.0;
+            double lhs_norm_sq = 0.0;
+            double rhs_norm_sq = 0.0;
+            double difference_norm_sq = 0.0;
+            double max_abs = 0.0;
+            bool finite = true;
+            for (size_t index = 0; index < lhs_values.size(); ++index)
+            {
+                const double lhs = static_cast<double>(lhs_values[index]);
+                const double rhs = static_cast<double>(rhs_values[index]);
+                const double difference = lhs - rhs;
+                finite = finite && std::isfinite(lhs) && std::isfinite(rhs);
+                dot += lhs * rhs;
+                lhs_norm_sq += lhs * lhs;
+                rhs_norm_sq += rhs * rhs;
+                difference_norm_sq += difference * difference;
+                max_abs = std::max(max_abs, std::abs(difference));
+            }
+            const bool both_zero =
+                lhs_norm_sq <= 1e-30 && rhs_norm_sq <= 1e-30;
+            const double norm_product =
+                std::sqrt(lhs_norm_sq) * std::sqrt(rhs_norm_sq);
+            const double cosine =
+                both_zero ? 1.0
+                          : (norm_product > 1e-30 ? dot / norm_product : 0.0);
+            const double relative_l2 =
+                std::sqrt(difference_norm_sq) /
+                std::max(1e-30, std::sqrt(lhs_norm_sq));
+            const bool passed =
+                finite && cosine >= options.main_kv_suffix_min_cosine;
+
+            if (!main_kv_numerical.compared)
+            {
+                main_kv_numerical.compared = true;
+                main_kv_numerical.passed = true;
+            }
+            main_kv_numerical.passed =
+                main_kv_numerical.passed && passed;
+            ++main_kv_numerical.numerical_suffix_payloads;
+            main_kv_numerical.elements += lhs_values.size();
+            main_kv_numerical.minimum_cosine = std::min(
+                main_kv_numerical.minimum_cosine,
+                cosine);
+            main_kv_numerical.maximum_relative_l2 = std::max(
+                main_kv_numerical.maximum_relative_l2,
+                relative_l2);
+            main_kv_numerical.maximum_abs = std::max(
+                main_kv_numerical.maximum_abs,
+                max_abs);
+
+            if (!passed)
+            {
+                std::ostringstream message;
+                message << kind
+                        << " suffix numerical mismatch after MoE placement change at cache "
+                        << cache_idx << " layer " << global_layer
+                        << " seq " << seq_idx
+                        << " precision=" << activationPrecisionToString(precision)
+                        << " elements=" << lhs_values.size()
+                        << " finite=" << (finite ? "true" : "false")
+                        << " cosine=" << cosine
+                        << " required_cosine="
+                        << options.main_kv_suffix_min_cosine
+                        << " rel_l2=" << relative_l2
+                        << " max_abs=" << max_abs;
+                return mismatch(message.str());
+            }
+            return MTPStateValidationResult::success();
+        };
+
         auto compare_kv_caches = [&](const std::vector<PrefixKVCacheProbe> &lhs_caches,
                                      const std::vector<PrefixKVCacheProbe> &rhs_caches,
                                      const char *label,
-                                     bool compare_payload_hashes) -> MTPStateValidationResult
+                                     bool compare_payload_hashes,
+                                     MTPMainKVPayloadComparisonPolicy payload_policy) -> MTPStateValidationResult
         {
             if (lhs_caches.size() != rhs_caches.size())
             {
@@ -399,6 +762,213 @@ namespace llaminar2
                         lhs.k_payload_hash != rhs.k_payload_hash ||
                         lhs.v_payload_hash != rhs.v_payload_hash)
                     {
+                        const bool placement_changed =
+                            oracle.moe_runtime_movement_epoch !=
+                            candidate.moe_runtime_movement_epoch;
+                        const bool placement_aware_suffix =
+                            payload_policy ==
+                                MTPMainKVPayloadComparisonPolicy::
+                                    ExactPrefixNumericalSuffixAfterMoEPlacementChange &&
+                            placement_changed;
+                        if (placement_aware_suffix)
+                        {
+                            if (lhs.k_payload_bytes != rhs.k_payload_bytes ||
+                                lhs.v_payload_bytes != rhs.v_payload_bytes)
+                            {
+                                std::ostringstream message;
+                                message
+                                    << label
+                                    << " KV placement-aware comparison requires identical "
+                                       "full-payload geometry at cache "
+                                    << cache_idx << " layer " << lhs.global_layer
+                                    << " seq " << lhs.seq_idx
+                                    << " k_bytes=" << lhs.k_payload_bytes << "/"
+                                    << rhs.k_payload_bytes
+                                    << " v_bytes=" << lhs.v_payload_bytes << "/"
+                                    << rhs.v_payload_bytes;
+                                return mismatch(message.str());
+                            }
+                            if (options.main_kv_exact_prefix_tokens < 0)
+                            {
+                                return mismatch(
+                                    "placement-aware main KV comparison requires an "
+                                    "explicit exact-prefix token count");
+                            }
+                            if (lhs.cached_tokens <=
+                                options.main_kv_exact_prefix_tokens)
+                            {
+                                std::ostringstream message;
+                                message
+                                    << label
+                                    << " KV placement-aware comparison has no recomputed "
+                                       "suffix at cache "
+                                    << cache_idx << " layer " << lhs.global_layer
+                                    << " seq " << lhs.seq_idx
+                                    << " cached_tokens=" << lhs.cached_tokens
+                                    << " exact_prefix_tokens="
+                                    << options.main_kv_exact_prefix_tokens;
+                                return mismatch(message.str());
+                            }
+
+                            /*
+                             * The leading digest proves that cache restore did
+                             * not modify one byte of the cached prefix.  Only
+                             * the disjoint, explicitly retained suffix below
+                             * may cross a floating-point comparison boundary.
+                             */
+                            const bool exact_prefix =
+                                lhs.leading_segment_hash_available &&
+                                rhs.leading_segment_hash_available &&
+                                lhs.leading_segment_tokens ==
+                                    options.main_kv_exact_prefix_tokens &&
+                                rhs.leading_segment_tokens ==
+                                    options.main_kv_exact_prefix_tokens &&
+                                lhs.leading_k_payload_bytes ==
+                                    rhs.leading_k_payload_bytes &&
+                                lhs.leading_v_payload_bytes ==
+                                    rhs.leading_v_payload_bytes &&
+                                lhs.leading_k_payload_hash ==
+                                    rhs.leading_k_payload_hash &&
+                                lhs.leading_v_payload_hash ==
+                                    rhs.leading_v_payload_hash;
+                            if (!exact_prefix)
+                            {
+                                std::ostringstream message;
+                                message
+                                    << label
+                                    << " KV cached-prefix bytes changed at cache "
+                                    << cache_idx << " layer " << lhs.global_layer
+                                    << " seq " << lhs.seq_idx
+                                    << " available="
+                                    << (lhs.leading_segment_hash_available ? "yes" : "no")
+                                    << "/"
+                                    << (rhs.leading_segment_hash_available ? "yes" : "no")
+                                    << " tokens=" << lhs.leading_segment_tokens << "/"
+                                    << rhs.leading_segment_tokens
+                                    << " required_tokens="
+                                    << options.main_kv_exact_prefix_tokens
+                                    << " k_bytes="
+                                    << lhs.leading_k_payload_bytes << "/"
+                                    << rhs.leading_k_payload_bytes
+                                    << " v_bytes="
+                                    << lhs.leading_v_payload_bytes << "/"
+                                    << rhs.leading_v_payload_bytes
+                                    << " k_hash=" << lhs.leading_k_payload_hash << "/"
+                                    << rhs.leading_k_payload_hash
+                                    << " v_hash=" << lhs.leading_v_payload_hash << "/"
+                                    << rhs.leading_v_payload_hash;
+                                return mismatch(message.str());
+                            }
+
+                            const int suffix_tokens =
+                                lhs.cached_tokens -
+                                options.main_kv_exact_prefix_tokens;
+                            auto find_suffix =
+                                [&](const std::vector<PrefixKVSegmentProbe> &segments)
+                                -> const PrefixKVSegmentProbe *
+                            {
+                                const PrefixKVSegmentProbe *found = nullptr;
+                                for (const auto &segment : segments)
+                                {
+                                    if (segment.token_start !=
+                                            options.main_kv_exact_prefix_tokens ||
+                                        segment.token_count != suffix_tokens)
+                                    {
+                                        continue;
+                                    }
+                                    if (found != nullptr)
+                                    {
+                                        return nullptr;
+                                    }
+                                    found = &segment;
+                                }
+                                return found;
+                            };
+                            const PrefixKVSegmentProbe *lhs_suffix =
+                                find_suffix(lhs.segments);
+                            const PrefixKVSegmentProbe *rhs_suffix =
+                                find_suffix(rhs.segments);
+                            if (!lhs_suffix || !rhs_suffix)
+                            {
+                                std::ostringstream message;
+                                message
+                                    << label
+                                    << " KV placement-aware comparison requires one "
+                                       "unambiguous retained suffix segment at cache "
+                                    << cache_idx << " layer " << lhs.global_layer
+                                    << " seq " << lhs.seq_idx
+                                    << " start="
+                                    << options.main_kv_exact_prefix_tokens
+                                    << " tokens=" << suffix_tokens;
+                                return mismatch(message.str());
+                            }
+                            const bool complete_suffix =
+                                lhs_suffix->hash_available &&
+                                rhs_suffix->hash_available &&
+                                lhs_suffix->k_payload_bytes ==
+                                    rhs_suffix->k_payload_bytes &&
+                                lhs_suffix->v_payload_bytes ==
+                                    rhs_suffix->v_payload_bytes &&
+                                lhs_suffix->k_payload.size() ==
+                                    lhs_suffix->k_payload_bytes &&
+                                rhs_suffix->k_payload.size() ==
+                                    rhs_suffix->k_payload_bytes &&
+                                lhs_suffix->v_payload.size() ==
+                                    lhs_suffix->v_payload_bytes &&
+                                rhs_suffix->v_payload.size() ==
+                                    rhs_suffix->v_payload_bytes;
+                            if (!complete_suffix)
+                            {
+                                std::ostringstream message;
+                                message
+                                    << label
+                                    << " KV placement-aware comparison requires complete "
+                                       "retained suffix bytes at cache "
+                                    << cache_idx << " layer " << lhs.global_layer
+                                    << " seq " << lhs.seq_idx
+                                    << " hash_available="
+                                    << (lhs_suffix->hash_available ? "yes" : "no")
+                                    << "/"
+                                    << (rhs_suffix->hash_available ? "yes" : "no")
+                                    << " k_bytes=" << lhs_suffix->k_payload.size()
+                                    << "/" << lhs_suffix->k_payload_bytes << " vs "
+                                    << rhs_suffix->k_payload.size() << "/"
+                                    << rhs_suffix->k_payload_bytes
+                                    << " v_bytes=" << lhs_suffix->v_payload.size()
+                                    << "/" << lhs_suffix->v_payload_bytes << " vs "
+                                    << rhs_suffix->v_payload.size() << "/"
+                                    << rhs_suffix->v_payload_bytes;
+                                return mismatch(message.str());
+                            }
+
+                            ++main_kv_numerical.exact_prefix_segments;
+                            if (auto result = compare_main_kv_suffix_payload(
+                                    lhs_suffix->k_payload,
+                                    rhs_suffix->k_payload,
+                                    lhs_cache.k_precision,
+                                    cache_idx,
+                                    lhs.global_layer,
+                                    lhs.seq_idx,
+                                    "K");
+                                !result)
+                            {
+                                return result;
+                            }
+                            if (auto result = compare_main_kv_suffix_payload(
+                                    lhs_suffix->v_payload,
+                                    rhs_suffix->v_payload,
+                                    lhs_cache.v_precision,
+                                    cache_idx,
+                                    lhs.global_layer,
+                                    lhs.seq_idx,
+                                    "V");
+                                !result)
+                            {
+                                return result;
+                            }
+                            continue;
+                        }
+
                         auto append_segment_hashes =
                             [](std::ostringstream &msg,
                                const char *name,
@@ -524,7 +1094,8 @@ namespace llaminar2
                     oracle.kv_caches,
                     candidate.kv_caches,
                     "main",
-                    options.compare_main_kv_payload_hashes);
+                    options.compare_main_kv_payload_hashes,
+                    options.main_kv_payload_policy);
             !kv_result)
         {
             return kv_result;
@@ -536,7 +1107,8 @@ namespace llaminar2
                         oracle.mtp_kv_caches,
                         candidate.mtp_kv_caches,
                         "shifted MTP",
-                        /*compare_payload_hashes=*/true);
+                        /*compare_payload_hashes=*/true,
+                        MTPMainKVPayloadComparisonPolicy::ExactBytes);
                 !mtp_kv_result)
             {
                 return mtp_kv_result;
@@ -695,7 +1267,12 @@ namespace llaminar2
                 return mismatch("GDN short-conv zero-state flag mismatch");
         }
 
-        return MTPStateValidationResult::success();
+        MTPStateValidationResult result =
+            MTPStateValidationResult::success();
+        result.terminal_hidden_numerical = terminal_hidden_numerical;
+        result.terminal_logits_numerical = terminal_logits_numerical;
+        result.main_kv_numerical = main_kv_numerical;
+        return result;
     }
 
 } // namespace llaminar2

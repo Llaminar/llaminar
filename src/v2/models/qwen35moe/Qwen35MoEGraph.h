@@ -150,6 +150,14 @@ namespace llaminar2
         deviceMoEOverlayControllerRuntimeBinding(
             DeviceId device) const override;
 
+        /** @copydoc IGraphBuilder::finalizeMoEOverlayDeviceControllerRuntime */
+        bool finalizeMoEOverlayDeviceControllerRuntime(
+            DeviceId device,
+            void *publication_stream) override;
+
+        /** @copydoc IGraphBuilder::retireBorrowedExecutionStreams */
+        void retireBorrowedExecutionStreams(DeviceId device) override;
+
         /**
          * @brief Describe device-retained main-graph layer checkpoints.
          *

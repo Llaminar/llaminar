@@ -101,26 +101,58 @@ namespace llaminar2
             return expert_order;
         }
 
+        /**
+         * @brief Resolve the setup-only fill order for one model layer.
+         *
+         * Model-aware validation has already proven that each override is an
+         * exact permutation. A layer without an override deliberately uses the
+         * deterministic expert-id order; this is how trailing MTP source layers
+         * discovered from the GGUF coexist with main-layer warm-start evidence.
+         */
+        std::vector<int> initialExpertOrder(
+            const MoERoutedExpertPlacementPlan &plan,
+            int layer,
+            int num_experts)
+        {
+            if (plan.initial_layer_order_overrides.empty())
+                return byIdExpertOrder(num_experts);
+
+            const auto found = std::find_if(
+                plan.initial_layer_order_overrides.begin(),
+                plan.initial_layer_order_overrides.end(),
+                [layer](const RoutedExpertInitialLayerOrder &order)
+                { return order.layer == layer; });
+            if (found == plan.initial_layer_order_overrides.end())
+                return byIdExpertOrder(num_experts);
+            if (static_cast<int>(found->expert_ids.size()) != num_experts)
+            {
+                throw std::invalid_argument(
+                    "Deferred initial expert order has invalid expert count at layer " +
+                    std::to_string(layer));
+            }
+            return found->expert_ids;
+        }
+
         /** @brief Uniform read-only view over live or frozen histogram evidence. */
         struct HistogramEvidence
         {
             const DecodeExpertHistogram *live = nullptr;
-            const DecodeExpertHistogramWindow *frozen = nullptr;
+            std::optional<ValidatedDecodeExpertHistogramWindowView> frozen;
 
             explicit operator bool() const noexcept
             {
-                return live != nullptr || frozen != nullptr;
+                return live != nullptr || frozen.has_value();
             }
 
             int numLayers() const noexcept
             {
-                return frozen ? frozen->num_layers
+                return frozen ? frozen->numLayers()
                               : (live ? live->config().num_layers : 0);
             }
 
             int numExperts() const noexcept
             {
-                return frozen ? frozen->num_experts
+                return frozen ? frozen->numExperts()
                               : (live ? live->config().num_experts : 0);
             }
 
@@ -295,10 +327,18 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "MoE placement planner accepts either a live or frozen histogram, not both");
             }
-            return {
+            HistogramEvidence evidence{
                 .live = options.decode_histogram,
-                .frozen = options.decode_histogram_window,
             };
+            if (options.decode_histogram_window)
+            {
+                /* Authenticate the distributed/frozen payload once. Every
+                 * placement objective below can then read its immutable phase
+                 * banks in O(1) without revalidating all model entries. */
+                evidence.frozen.emplace(
+                    options.decode_histogram_window->validatedView());
+            }
+            return evidence;
         }
 
         bool histogramLayerHasCounts(
@@ -943,10 +983,16 @@ namespace llaminar2
         {
             std::vector<RoutedExpertLayerPlacement> placements;
             placements.reserve(static_cast<size_t>(metadata.num_layers));
-            const auto expert_order = byIdExpertOrder(metadata.num_experts);
             for (int layer = 0; layer < metadata.num_layers; ++layer)
             {
-                placements.push_back(buildPlacementFromExpertOrder(plan, metadata, layer, expert_order, routed_expert_bytes_per_expert));
+                const auto expert_order = initialExpertOrder(
+                    plan, layer, metadata.num_experts);
+                placements.push_back(buildPlacementFromExpertOrder(
+                    plan,
+                    metadata,
+                    layer,
+                    expert_order,
+                    routed_expert_bytes_per_expert));
             }
             return placements;
         }
@@ -978,7 +1024,6 @@ namespace llaminar2
 
             std::vector<RoutedExpertLayerPlacement> placements;
             placements.reserve(static_cast<size_t>(metadata.num_layers));
-            const auto by_id_order = byIdExpertOrder(metadata.num_experts);
             for (int layer = 0; layer < metadata.num_layers; ++layer)
             {
                 const bool has_counts = histogramLayerHasCounts(
@@ -1007,7 +1052,10 @@ namespace llaminar2
                                                     histogram,
                                                     layer,
                                                     metadata.num_experts)
-                                              : by_id_order;
+                                              : initialExpertOrder(
+                                                    plan,
+                                                    layer,
+                                                    metadata.num_experts);
                 placements.push_back(buildPlacementFromExpertOrder(
                     plan,
                     metadata,
@@ -1189,8 +1237,6 @@ namespace llaminar2
                     service_profile.profile->identity;
             }
 
-            const auto by_id_order = byIdExpertOrder(metadata.num_experts);
-
             float sum_gpu_hit_rate = 0.0f;
             float sum_cpu_fallback = 0.0f;
             float sum_gpu_coverage = 0.0f;
@@ -1224,7 +1270,10 @@ namespace llaminar2
                                                         histogram,
                                                         layer,
                                                         metadata.num_experts)
-                                                  : by_id_order;
+                                                  : initialExpertOrder(
+                                                        plan,
+                                                        layer,
+                                                        metadata.num_experts);
                     placement = buildPlacementFromExpertOrder(
                         plan,
                         metadata,
@@ -1307,6 +1356,11 @@ namespace llaminar2
             planned_plan.placements = base_plan.placements;
             break;
         }
+
+        // Concrete placements are now the sole epoch-one authority. Retaining
+        // the setup permutation would leave two equivalent but independently
+        // mutable descriptions in the frozen graph identity.
+        planned_plan.initial_layer_order_overrides.clear();
 
         const MoERoutedExpertPlacementValidationOptions validation_options{
             .layer_count = metadata.num_layers,

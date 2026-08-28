@@ -394,6 +394,17 @@ namespace llaminar2
         }
     }
 
+    bool StageRunnerRegistry::purgePrefixCacheAll()
+    {
+        for (auto &entry : entries_)
+        {
+            if (!entry.runner || !entry.runner->purgePrefixCache())
+                return false;
+        }
+        return !compatibility_runner_ ||
+               compatibility_runner_->purgePrefixCache();
+    }
+
     bool StageRunnerRegistry::configureMTPRequestStopTokensAll(
         const std::vector<int32_t> &stop_tokens)
     {
@@ -1018,20 +1029,37 @@ namespace llaminar2
     }
 
     bool StageRunnerRegistry::harvestPrefixAll(
+        const PrefixLookupResult &admission,
         const std::vector<int32_t> &tokens,
         int prompt_token_count)
     {
+        if (!admission.cache_enabled || !admission.supported ||
+            last_prefix_hits_.size() != entries_.size() ||
+            static_cast<bool>(compatibility_prefix_hit_) !=
+                static_cast<bool>(compatibility_runner_))
+        {
+            return false;
+        }
+
         bool saw_runner = false;
         bool ok = true;
-        for (auto &entry : entries_)
+        for (size_t index = 0; index < entries_.size(); ++index)
         {
             saw_runner = true;
-            ok = entry.runner->harvestPrefix(tokens, prompt_token_count) && ok;
+            ok = entries_[index].runner->harvestPrefix(
+                     last_prefix_hits_[index],
+                     tokens,
+                     prompt_token_count) &&
+                 ok;
         }
         if (compatibility_runner_)
         {
             saw_runner = true;
-            ok = compatibility_runner_->harvestPrefix(tokens, prompt_token_count) && ok;
+            ok = compatibility_runner_->harvestPrefix(
+                     *compatibility_prefix_hit_,
+                     tokens,
+                     prompt_token_count) &&
+                 ok;
         }
         return saw_runner && ok;
     }
@@ -1217,6 +1245,10 @@ namespace llaminar2
                 &aggregate.terminal_hidden_hash_available,
                 &aggregate.terminal_hidden_bytes,
                 &aggregate.terminal_hidden_hash);
+            aggregate.terminal_hidden_values.insert(
+                aggregate.terminal_hidden_values.end(),
+                child.terminal_hidden_values.begin(),
+                child.terminal_hidden_values.end());
             fold_hash(
                 child.terminal_logits_hash_available,
                 child.terminal_logits_bytes,
@@ -1224,6 +1256,10 @@ namespace llaminar2
                 &aggregate.terminal_logits_hash_available,
                 &aggregate.terminal_logits_bytes,
                 &aggregate.terminal_logits_hash);
+            aggregate.terminal_logits_values.insert(
+                aggregate.terminal_logits_values.end(),
+                child.terminal_logits_values.begin(),
+                child.terminal_logits_values.end());
             if (aggregate.primary_device.is_cpu() && !child.primary_device.is_cpu())
                 aggregate.primary_device = child.primary_device;
             aggregate.kv_caches.insert(
@@ -2071,6 +2107,27 @@ namespace llaminar2
         }
     }
 
+    bool GlobalOrchestrator::purgePrefixCache()
+    {
+        const bool local_success = stage_runners_.purgePrefixCacheAll();
+        /*
+         * Global orchestration already owns rank coordination. Preserve that
+         * boundary so no rank begins a new lookup while a peer still exposes
+         * the old archive generation.
+         */
+        try
+        {
+            config_.mpi_ctx->barrier();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
+                      << " barrier in purgePrefixCache failed: " << e.what());
+            return false;
+        }
+        return local_success;
+    }
+
     int GlobalOrchestrator::get_position() const
     {
         const IInferenceRunner *runner = stage_runners_.defaultRunner();
@@ -2368,10 +2425,14 @@ namespace llaminar2
     }
 
     bool GlobalOrchestrator::harvestPrefix(
+        const PrefixLookupResult &admission,
         const std::vector<int32_t> &tokens,
         int prompt_token_count)
     {
-        return stage_runners_.harvestPrefixAll(tokens, prompt_token_count);
+        return stage_runners_.harvestPrefixAll(
+            admission,
+            tokens,
+            prompt_token_count);
     }
 
     bool GlobalOrchestrator::restorePrefixTerminalState(

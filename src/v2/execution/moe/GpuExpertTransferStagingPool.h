@@ -45,8 +45,7 @@ namespace llaminar2
             DeviceId device,
             int device_ordinal,
             int capacity,
-            std::vector<ProjectionSpec> specs,
-            size_t vram_safety_margin_bytes);
+            std::vector<ProjectionSpec> specs);
 
         static int recommendedCapacity(int num_experts, size_t rolling_wave_capacity);
 

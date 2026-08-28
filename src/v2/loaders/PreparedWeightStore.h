@@ -208,6 +208,18 @@ namespace llaminar2
         [[nodiscard]] size_t sizeForDevice(DeviceId device) const;
 
         /**
+         * @brief Sum unique live GPU embedding allocations for one device.
+         * @param device Exact backend and ordinal to inspect.
+         * @return Checked bytes owned by distinct PreparedEmbeddingWeights.
+         *
+         * Embedding aliases may publish several binding ids over one allocation.
+         * This query deduplicates by the allocation owner, not by logical entry,
+         * and is used only at a quiescent reusable-model seal.
+         */
+        [[nodiscard]] size_t preparedEmbeddingAllocationBytesForDevice(
+            DeviceId device) const;
+
+        /**
          * @brief Reset input-dependent state on all prepared kernels.
          *
          * Preserves packed weights and prepared handles, but clears request-local

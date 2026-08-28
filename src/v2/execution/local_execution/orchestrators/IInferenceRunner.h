@@ -23,6 +23,7 @@
 #include "../../moe/DeviceMoERebalanceABI.h"
 #include "../../moe/MoEOverlayAuthorityExecution.h"
 #include "../../moe/MoEOverlayDeviceControllerRuntimeBinding.h"
+#include "../../moe/MoEOptimizationStatus.h"
 #include "../../mtp/MTPRejectionSampler.h"
 #include "../../mtp/MTPVerifierOutcomeGraph.h"
 #include "../../prefix_cache/PrefixCacheStateProbe.h"
@@ -62,16 +63,18 @@ namespace llaminar2
     /**
      * @brief Setup transition required before a runner may accept inference.
      *
-     * CPU graphs are fully materialized by ordinary eager graph construction.
-     * GPU runners must additionally capture and instantiate every admitted
-     * serving executable before distributed ticket authority is installed.
-     * Composite runners report the strongest required transition; an
-     * unresolved value is fatal rather than an invitation to probe a method.
+     * CPU compute graphs are materialized by ordinary eager construction, but
+     * still cross the common serving-family admission transition so retained
+     * endpoint identity can be certified and ticket state sealed. GPU runners
+     * additionally capture and instantiate every admitted executable before
+     * distributed ticket authority is installed. Composite runners report the
+     * strongest work required; an unresolved value is fatal rather than an
+     * invitation to infer lifecycle from a failed operation.
      */
     enum class ServingGraphPreparationKind : uint8_t
     {
         Unresolved = 0,               ///< Runner has not declared its setup lifecycle.
-        EagerHostGraph,               ///< Host graph construction already completed setup.
+        EagerHostGraph,               ///< Host compute exists; admission certification remains.
         NativeDeviceExecutableFamily, ///< Retained device executables must be materialized.
     };
 
@@ -1413,15 +1416,16 @@ namespace llaminar2
         }
 
         /**
-         * @brief Capture and instantiate the complete serving graph family.
+         * @brief Prepare and seal the complete serving graph family.
          *
          * This setup-only operation must not execute model arithmetic, mutate
          * request/KV state, publish sparse tickets, or advance a transaction.
          * GPU implementations retain the resulting native executables so the
-         * first admitted request is an ordinary replay. Eager host graphs are
-         * already complete by construction and must not be passed to this
-         * native materialization operation. Composite native runners must
-         * invoke every symmetric LocalTP participant concurrently.
+         * first admitted request is an ordinary replay. Eager host
+         * implementations perform no native capture, but must certify their
+         * retained endpoint family and enter the same sealed admission state.
+         * Composite native runners invoke every symmetric LocalTP participant
+         * concurrently when capture can enter a collective.
          *
          * @param plan Frozen orchestration-owned physical graph inventory.
          * @return True only when every required executable is resident.
@@ -3299,6 +3303,19 @@ namespace llaminar2
          * adapter interfaces while the API migration proceeds.
          */
         virtual void clear_cache() = 0;
+
+        /**
+         * @brief Destructively retire every reusable prefix-cache record.
+         *
+         * This is an administrative cache-capacity boundary, not a request
+         * reset. Callers that need an empty live sequence must first invoke
+         * resetInferenceState(); implementations must not silently broaden
+         * this operation into KV/GDN/MTP mutation or graph invalidation.
+         * Runners with no reusable prefix archive return true as a no-op.
+         *
+         * @return True after no reusable prefix record remains addressable.
+         */
+        virtual bool purgePrefixCache() { return true; }
 
         /**
          * @brief GPU-side greedy sampling (skip D2H of full logits)
@@ -5204,15 +5221,30 @@ namespace llaminar2
         virtual uint64_t moePlacementEpoch() const { return 0; }
 
         /**
-         * @brief Domain-local MoE runtime movement epoch.
+         * @brief Effective MoE runtime placement epoch for this runner.
          *
          * This is the observable "expert placement data changed" epoch. For
          * CPU/host-applied rebalancing it normally matches moePlacementEpoch().
          * Graph-stable GPU rebalancing keeps moePlacementEpoch() out of graph
          * cache keys and increments this value when device-side runtime tables
-         * or transfer-slot backed residency state are updated.
+         * or transfer-slot backed residency state are updated. A participant
+         * attached to a heterogeneous ExpertOverlay returns the current epoch
+         * sampled directly from the sole shared RCU residency authority; it
+         * must not maintain a second mirrored epoch.
          */
         virtual uint64_t moeRuntimeMovementEpoch() const { return moePlacementEpoch(); }
+
+        /**
+         * @brief Observe adaptive MoE lifecycle and completed movement totals.
+         *
+         * This passive projection comes from the real optimization owner. It
+         * never reads PerfStats or advances maintenance, so disabling optional
+         * instrumentation cannot erase benchmark or correctness state.
+         */
+        virtual MoEOptimizationStatus moeOptimizationStatus() const
+        {
+            return {};
+        }
 
         /**
          * @brief Enumerate MoE rebalance controllers owned by this runner.
@@ -5293,8 +5325,29 @@ namespace llaminar2
             return false;
         }
 
-        virtual bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count)
+        /**
+         * @brief Archive a completed prompt under its immutable lookup identity.
+         *
+         * @p admission is the exact result returned when this request crossed
+         * prefix-cache admission.  Implementations must use its fingerprint
+         * rather than sampling mutable topology at harvest time: asynchronous
+         * ExpertOverlay publication may legitimately advance residency while
+         * the admitted request is still executing.  A stale admission may be
+         * discarded, but its payload must never be published under the newer
+         * fingerprint.
+         *
+         * @param admission Immutable prefix-cache identity for this request.
+         * @param tokens Complete prompt token sequence.
+         * @param prompt_token_count Number of live prompt tokens to archive.
+         * @return true when archival completed or was deliberately discarded
+         *         as stale; false for an invalid request or archival failure.
+         */
+        virtual bool harvestPrefix(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            int prompt_token_count)
         {
+            (void)admission;
             (void)tokens;
             (void)prompt_token_count;
             return false;

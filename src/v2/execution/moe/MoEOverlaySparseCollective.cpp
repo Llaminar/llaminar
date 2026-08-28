@@ -436,11 +436,361 @@ namespace llaminar2
         }
     }
 
+    void MoEOverlayCanonicalRouteReturnTicketStorage::bindFixedCapacity(
+        int layer_idx,
+        size_t route_capacity,
+        int d_model,
+        DeviceId continuation_device,
+        uint64_t workspace_generation,
+        std::shared_ptr<MappedHostTransferRegion> contribution_region)
+    {
+        if (metadata_region_ || contribution_region_)
+        {
+            throw std::logic_error(
+                "canonical route return ticket capacity is immutable after binding");
+        }
+        if (layer_idx < 0 || route_capacity == 0u || d_model <= 0 ||
+            !continuation_device.is_gpu() || workspace_generation == 0u ||
+            route_capacity >
+                static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+            !contribution_region || !contribution_region->isBound() ||
+            !contribution_region->hasDevice(continuation_device))
+        {
+            throw std::invalid_argument(
+                "canonical route return ticket requires complete layer, route, mapped contribution, and GPU identity");
+        }
+
+        const size_t contribution_elements = checkedTicketProduct(
+            route_capacity,
+            static_cast<size_t>(d_model),
+            "canonical contribution capacity");
+        const size_t contribution_bytes = checkedTicketProduct(
+            contribution_elements,
+            sizeof(float),
+            "canonical contribution bytes");
+        if (!contribution_region->contains(0u, contribution_bytes))
+        {
+            throw std::invalid_argument(
+                "canonical route return contribution region is smaller than immutable ticket geometry");
+        }
+
+        size_t offset = sizeof(MoEOverlayCanonicalRouteTicketControl);
+        offset = alignTicketOffset(offset, alignof(int32_t));
+        original_route_slots_offset_ = offset;
+        offset = checkedTicketAdd(
+            offset,
+            checkedTicketProduct(
+                route_capacity, sizeof(int32_t), "original route slots"),
+            "original route slots");
+        offset = alignTicketOffset(offset, alignof(int32_t));
+        compact_route_slots_offset_ = offset;
+        offset = checkedTicketAdd(
+            offset,
+            checkedTicketProduct(
+                route_capacity, sizeof(int32_t), "compact route slots"),
+            "compact route slots");
+
+        const std::array<DeviceId, 1> devices{continuation_device};
+        metadata_region_ =
+            TransferEngine::instance().allocateMappedHostRegion(offset, devices);
+        contribution_region_ = std::move(contribution_region);
+        control_host_ = static_cast<MoEOverlayCanonicalRouteTicketControl *>(
+            metadata_region_->mutableHostData());
+        original_route_slots_host_ = static_cast<int32_t *>(
+            metadata_region_->mutableHostData(original_route_slots_offset_));
+        compact_route_slots_host_ = static_cast<int32_t *>(
+            metadata_region_->mutableHostData(compact_route_slots_offset_));
+        *control_host_ = MoEOverlayCanonicalRouteTicketControl{
+            .magic = MoEOverlayCanonicalRouteTicketControl::kMagic,
+            .abi_version =
+                MoEOverlayCanonicalRouteTicketControl::kABIVersion,
+            .workspace_generation = workspace_generation,
+            .published_sequence = 0u,
+            .consumed_sequence = 0u,
+            .live_entry_count = 0u,
+            .residency_epoch = 0u,
+            .layer_idx = layer_idx,
+            .route_capacity = static_cast<int32_t>(route_capacity),
+            .d_model = d_model,
+            .reserved = 0,
+        };
+        continuation_device_ = continuation_device;
+        layer_idx_ = layer_idx;
+        route_capacity_ = route_capacity;
+        d_model_ = d_model;
+        workspace_generation_ = workspace_generation;
+        armed_sequence_ = 0u;
+        producer_lifecycle_ = ProducerLifecycle::Quiescent;
+    }
+
+    MoEOverlayCanonicalRouteReturnTicketStorage::Publication::~Publication()
+    {
+        reset();
+    }
+
+    MoEOverlayCanonicalRouteReturnTicketStorage::Publication::Publication(
+        Publication &&other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)),
+          sequence_(std::exchange(other.sequence_, 0u))
+    {
+    }
+
+    MoEOverlayCanonicalRouteReturnTicketStorage::Publication &
+    MoEOverlayCanonicalRouteReturnTicketStorage::Publication::operator=(
+        Publication &&other) noexcept
+    {
+        if (this == &other)
+            return *this;
+        reset();
+        owner_ = std::exchange(other.owner_, nullptr);
+        sequence_ = std::exchange(other.sequence_, 0u);
+        return *this;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::Publication::publish(
+        size_t live_entry_count) noexcept
+    {
+        if (!owner_ || sequence_ == 0u ||
+            !owner_->publishArmed(sequence_, live_entry_count))
+        {
+            return false;
+        }
+        owner_ = nullptr;
+        sequence_ = 0u;
+        return true;
+    }
+
+    void MoEOverlayCanonicalRouteReturnTicketStorage::Publication::reset()
+        noexcept
+    {
+        if (owner_ && sequence_ != 0u)
+            owner_->cancelArmed(sequence_);
+        owner_ = nullptr;
+        sequence_ = 0u;
+    }
+
+    MoEOverlayCanonicalRouteReturnTicketStorage::Publication
+    MoEOverlayCanonicalRouteReturnTicketStorage::arm(
+        uint64_t residency_epoch) noexcept
+    {
+        if (!hasValidBoundIdentity() || residency_epoch == 0u ||
+            producer_lifecycle_ != ProducerLifecycle::Quiescent)
+            return {};
+
+        const std::uint64_t published =
+            std::atomic_ref<std::uint64_t>(control_host_->published_sequence)
+                .load(std::memory_order_acquire);
+        const std::uint64_t consumed =
+            std::atomic_ref<std::uint64_t>(control_host_->consumed_sequence)
+                .load(std::memory_order_acquire);
+        /* One mapped payload has one producer and one consumer. Refusing reuse
+         * while a publication is live makes overwrite-before-consume impossible
+         * and turns a missing GPU acknowledgement into a precise hard failure. */
+        if (published != consumed ||
+            published == std::numeric_limits<std::uint64_t>::max())
+        {
+            return {};
+        }
+
+        control_host_->live_entry_count = 0u;
+        control_host_->residency_epoch = residency_epoch;
+        armed_sequence_ = published + 1u;
+        producer_lifecycle_ = ProducerLifecycle::Armed;
+        return Publication(this, armed_sequence_);
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::publishArmed(
+        uint64_t sequence, size_t live_entry_count) noexcept
+    {
+        if (!hasValidBoundIdentity() ||
+            producer_lifecycle_ != ProducerLifecycle::Armed ||
+            live_entry_count > route_capacity_ ||
+            control_host_->residency_epoch == 0u || armed_sequence_ == 0u ||
+            sequence != armed_sequence_)
+        {
+            return false;
+        }
+        const std::uint64_t published =
+            std::atomic_ref<std::uint64_t>(control_host_->published_sequence)
+                .load(std::memory_order_acquire);
+        const std::uint64_t consumed =
+            std::atomic_ref<std::uint64_t>(control_host_->consumed_sequence)
+                .load(std::memory_order_acquire);
+        if (published != consumed || armed_sequence_ != published + 1u)
+            return false;
+
+        control_host_->live_entry_count = live_entry_count;
+        std::atomic_ref<std::uint64_t>(control_host_->published_sequence)
+            .store(armed_sequence_, std::memory_order_release);
+        armed_sequence_ = 0u;
+        producer_lifecycle_ = ProducerLifecycle::Quiescent;
+        return true;
+    }
+
+    void MoEOverlayCanonicalRouteReturnTicketStorage::cancelArmed(
+        uint64_t sequence) noexcept
+    {
+        if (producer_lifecycle_ != ProducerLifecycle::Armed ||
+            sequence == 0u || sequence != armed_sequence_)
+        {
+            return;
+        }
+        /* Nothing was release-published, so no GPU may observe these partial
+         * bytes. Restore only host producer ownership; monotonic cursors remain
+         * unchanged and the next arm receives the same unused sequence. */
+        control_host_->live_entry_count = 0u;
+        control_host_->residency_epoch = 0u;
+        armed_sequence_ = 0u;
+        producer_lifecycle_ = ProducerLifecycle::Quiescent;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::payloadReady()
+        const noexcept
+    {
+        if (!hasValidBoundIdentity() ||
+            producer_lifecycle_ != ProducerLifecycle::Quiescent)
+        {
+            return false;
+        }
+        const std::uint64_t published =
+            std::atomic_ref<std::uint64_t>(control_host_->published_sequence)
+                .load(std::memory_order_acquire);
+        const std::uint64_t consumed =
+            std::atomic_ref<std::uint64_t>(control_host_->consumed_sequence)
+                .load(std::memory_order_acquire);
+        return published > consumed && published - consumed == 1u &&
+               control_host_->residency_epoch != 0u &&
+               control_host_->live_entry_count <= route_capacity_;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::payloadReadyFor(
+        uint64_t residency_epoch) const noexcept
+    {
+        return residency_epoch != 0u && payloadReady() &&
+               control_host_->residency_epoch == residency_epoch;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::hasValidBoundIdentity()
+        const noexcept
+    {
+        return metadata_region_ && metadata_region_->isBound() &&
+               metadata_region_->hasDevice(continuation_device_) &&
+               contribution_region_ && contribution_region_->isBound() &&
+               contribution_region_->hasDevice(continuation_device_) &&
+               control_host_ && control_host_->valid() &&
+               control_host_->workspace_generation == workspace_generation_ &&
+               control_host_->layer_idx == layer_idx_ &&
+               control_host_->route_capacity ==
+                   static_cast<int32_t>(route_capacity_) &&
+               control_host_->d_model == d_model_ &&
+               original_route_slots_host_ && compact_route_slots_host_ &&
+               continuation_device_.is_gpu();
+    }
+
+    int32_t *MoEOverlayCanonicalRouteReturnTicketStorage::
+        originalRouteSlotsHost() const noexcept
+    {
+        return original_route_slots_host_;
+    }
+
+    int32_t *MoEOverlayCanonicalRouteReturnTicketStorage::
+        compactRouteSlotsHost() const noexcept
+    {
+        return compact_route_slots_host_;
+    }
+
+    float *MoEOverlayCanonicalRouteReturnTicketStorage::
+        contributionRowsHost() const noexcept
+    {
+        try
+        {
+            return contribution_region_
+                       ? static_cast<float *>(
+                             contribution_region_->mutableHostData())
+                       : nullptr;
+        }
+        catch (...)
+        {
+            return nullptr;
+        }
+    }
+
+    MoEOverlayCanonicalRouteTicketControl *
+    MoEOverlayCanonicalRouteReturnTicketStorage::controlDeviceAlias()
+        const noexcept
+    {
+        try
+        {
+            return metadata_region_
+                       ? static_cast<MoEOverlayCanonicalRouteTicketControl *>(
+                             metadata_region_->deviceAlias(
+                                 continuation_device_))
+                       : nullptr;
+        }
+        catch (...)
+        {
+            return nullptr;
+        }
+    }
+
+    const int32_t *MoEOverlayCanonicalRouteReturnTicketStorage::
+        originalRouteSlotsDeviceAlias() const noexcept
+    {
+        try
+        {
+            return metadata_region_
+                       ? static_cast<const int32_t *>(
+                             metadata_region_->deviceAlias(
+                                 continuation_device_,
+                                 original_route_slots_offset_))
+                       : nullptr;
+        }
+        catch (...)
+        {
+            return nullptr;
+        }
+    }
+
+    const int32_t *MoEOverlayCanonicalRouteReturnTicketStorage::
+        compactRouteSlotsDeviceAlias() const noexcept
+    {
+        try
+        {
+            return metadata_region_
+                       ? static_cast<const int32_t *>(
+                             metadata_region_->deviceAlias(
+                                 continuation_device_,
+                                 compact_route_slots_offset_))
+                       : nullptr;
+        }
+        catch (...)
+        {
+            return nullptr;
+        }
+    }
+
+    const float *MoEOverlayCanonicalRouteReturnTicketStorage::
+        contributionRowsDeviceAlias() const noexcept
+    {
+        try
+        {
+            return contribution_region_
+                       ? static_cast<const float *>(
+                             contribution_region_->deviceAlias(
+                                 continuation_device_))
+                       : nullptr;
+        }
+        catch (...)
+        {
+            return nullptr;
+        }
+    }
+
     namespace
     {
         constexpr uint32_t kPacketMagic = 0x32454f4dU; // "MOE2"
-        /* Version 4 makes the typed inference phase part of the wire identity. */
-        constexpr uint32_t kPacketVersion = 4;
+        /* Version 5 adds authenticated original/compact route-slot identities. */
+        constexpr uint32_t kPacketVersion = 5;
         constexpr uint8_t kPacketKindDispatch = 1;
         constexpr uint8_t kPacketKindReturn = 2;
 
@@ -514,7 +864,9 @@ namespace llaminar2
                 return false;
             }
             if (!rows.row_ids_host || !rows.entry_offsets_host ||
-                !rows.expert_ids_host || !rows.route_weights_host || !rows.hidden_rows_fp32)
+                !rows.expert_ids_host || !rows.route_weights_host ||
+                !rows.original_route_slots_host ||
+                !rows.compact_route_slots_host || !rows.hidden_rows_fp32)
             {
                 if (error)
                     *error = "sparse payload is missing host buffers";
@@ -618,6 +970,8 @@ namespace llaminar2
             std::vector<int32_t> entry_offsets;
             std::vector<int32_t> expert_ids;
             std::vector<float> route_weights;
+            std::vector<int32_t> original_route_slots;
+            std::vector<int32_t> compact_route_slots;
             std::vector<float> hidden_rows;
         };
 
@@ -648,6 +1002,12 @@ namespace llaminar2
                                    rows.expert_ids_host + rows.live_entry_count);
             copy.route_weights.assign(rows.route_weights_host,
                                       rows.route_weights_host + rows.live_entry_count);
+            copy.original_route_slots.assign(
+                rows.original_route_slots_host,
+                rows.original_route_slots_host + rows.live_entry_count);
+            copy.compact_route_slots.assign(
+                rows.compact_route_slots_host,
+                rows.compact_route_slots_host + rows.live_entry_count);
             copy.hidden_rows.resize(
                 rows.live_row_count * static_cast<size_t>(rows.d_model));
             for (size_t compact_row = 0u;
@@ -729,6 +1089,12 @@ namespace llaminar2
             std::copy(payload.route_weights.begin(),
                       payload.route_weights.end(),
                       inbound->route_weights_host + inbound->live_entry_count);
+            std::copy(payload.original_route_slots.begin(),
+                      payload.original_route_slots.end(),
+                      inbound->original_route_slots_host + inbound->live_entry_count);
+            std::copy(payload.compact_route_slots.begin(),
+                      payload.compact_route_slots.end(),
+                      inbound->compact_route_slots_host + inbound->live_entry_count);
 
             const size_t d_model = static_cast<size_t>(inbound->d_model);
             std::copy(payload.hidden_rows.begin(),
@@ -806,6 +1172,8 @@ namespace llaminar2
                           payload.entry_offsets.size() * sizeof(int32_t) +
                           payload.expert_ids.size() * sizeof(int32_t) +
                           payload.route_weights.size() * sizeof(float) +
+                          payload.original_route_slots.size() * sizeof(int32_t) +
+                          payload.compact_route_slots.size() * sizeof(int32_t) +
                           payload.hidden_rows.size() * sizeof(float));
 
             appendPod(bytes, kPacketMagic);
@@ -849,6 +1217,14 @@ namespace llaminar2
                 bytes.insert(bytes.end(),
                              reinterpret_cast<const uint8_t *>(payload.route_weights.data()),
                              reinterpret_cast<const uint8_t *>(payload.route_weights.data() + payload.route_weights.size()));
+            if (!payload.original_route_slots.empty())
+                bytes.insert(bytes.end(),
+                             reinterpret_cast<const uint8_t *>(payload.original_route_slots.data()),
+                             reinterpret_cast<const uint8_t *>(payload.original_route_slots.data() + payload.original_route_slots.size()));
+            if (!payload.compact_route_slots.empty())
+                bytes.insert(bytes.end(),
+                             reinterpret_cast<const uint8_t *>(payload.compact_route_slots.data()),
+                             reinterpret_cast<const uint8_t *>(payload.compact_route_slots.data() + payload.compact_route_slots.size()));
             if (!payload.hidden_rows.empty())
                 bytes.insert(bytes.end(),
                              reinterpret_cast<const uint8_t *>(payload.hidden_rows.data()),
@@ -944,6 +1320,8 @@ namespace llaminar2
             out->entry_offsets.resize(static_cast<size_t>(row_count) + 1u);
             out->expert_ids.resize(entry_count);
             out->route_weights.resize(entry_count);
+            out->original_route_slots.resize(entry_count);
+            out->compact_route_slots.resize(entry_count);
             out->hidden_rows.resize(static_cast<size_t>(row_count) * static_cast<size_t>(out->d_model));
 
             const auto copyInto = [&](void *dst, size_t bytes, const char *name) -> bool
@@ -967,6 +1345,8 @@ namespace llaminar2
                 !copyInto(out->entry_offsets.data(), out->entry_offsets.size() * sizeof(int32_t), "entry offsets") ||
                 !copyInto(out->expert_ids.data(), out->expert_ids.size() * sizeof(int32_t), "expert ids") ||
                 !copyInto(out->route_weights.data(), out->route_weights.size() * sizeof(float), "route weights") ||
+                !copyInto(out->original_route_slots.data(), out->original_route_slots.size() * sizeof(int32_t), "original route slots") ||
+                !copyInto(out->compact_route_slots.data(), out->compact_route_slots.size() * sizeof(int32_t), "compact route slots") ||
                 !copyInto(out->hidden_rows.data(), out->hidden_rows.size() * sizeof(float), "hidden rows"))
             {
                 return false;
@@ -1353,6 +1733,34 @@ namespace llaminar2
                rows.live_row_count * static_cast<size_t>(rows.d_model) * sizeof(float);
     }
 
+    size_t canonicalMoEOverlayTicketReturnBytes(
+        size_t live_entry_count,
+        int d_model) noexcept
+    {
+        if (live_entry_count == 0u || d_model <= 0)
+            return 0u;
+
+        constexpr size_t kSlotBytes = 2u * sizeof(std::int32_t);
+        const size_t width = static_cast<size_t>(d_model);
+        if (width >
+            (std::numeric_limits<size_t>::max() - kSlotBytes) /
+                sizeof(float))
+        {
+            return 0u;
+        }
+        const size_t bytes_per_entry =
+            kSlotBytes + width * sizeof(float);
+        if (live_entry_count >
+            (std::numeric_limits<size_t>::max() -
+             sizeof(MoEOverlayCanonicalRouteTicketControl)) /
+                bytes_per_entry)
+        {
+            return 0u;
+        }
+        return sizeof(MoEOverlayCanonicalRouteTicketControl) +
+               live_entry_count * bytes_per_entry;
+    }
+
     MoEOverlaySparseTransferCounters measureMoEOverlaySparseTransferCounters(
         int seq_len,
         int top_k,
@@ -1479,6 +1887,10 @@ namespace llaminar2
             storage.expert_ids_host.resize(max_entries_);
         if (storage.route_weights_host.size() < max_entries_)
             storage.route_weights_host.resize(max_entries_);
+        if (storage.original_route_slots_host.size() < max_entries_)
+            storage.original_route_slots_host.resize(max_entries_);
+        if (storage.compact_route_slots_host.size() < max_entries_)
+            storage.compact_route_slots_host.resize(max_entries_);
         const size_t hidden_count = max_rows_ * static_cast<size_t>(d_model_);
         if (storage.hidden_rows_fp32.size() < hidden_count)
             storage.hidden_rows_fp32.resize(hidden_count);
@@ -1511,6 +1923,10 @@ namespace llaminar2
         view.entry_offsets_host = storage.entry_offsets_host.data();
         view.expert_ids_host = storage.expert_ids_host.data();
         view.route_weights_host = storage.route_weights_host.data();
+        view.original_route_slots_host =
+            storage.original_route_slots_host.data();
+        view.compact_route_slots_host =
+            storage.compact_route_slots_host.data();
         view.hidden_rows_fp32 = storage.hidden_rows_fp32.data();
         view.live_row_count = 0;
         view.live_entry_count = 0;
@@ -1534,6 +1950,10 @@ namespace llaminar2
         view.entry_offsets_host = storage.entry_offsets_host.data();
         view.expert_ids_host = storage.expert_ids_host.data();
         view.route_weights_host = storage.route_weights_host.data();
+        view.original_route_slots_host =
+            storage.original_route_slots_host.data();
+        view.compact_route_slots_host =
+            storage.compact_route_slots_host.data();
         view.hidden_rows_fp32 = storage.hidden_rows_fp32.data();
         view.live_row_count = 0;
         view.live_entry_count = 0;
@@ -1671,6 +2091,22 @@ namespace llaminar2
                 inbound->route_weights_host,
                 outbound.route_weights_host,
                 outbound.live_entry_count * sizeof(float));
+        }
+        if (inbound->original_route_slots_host !=
+            outbound.original_route_slots_host)
+        {
+            std::memmove(
+                inbound->original_route_slots_host,
+                outbound.original_route_slots_host,
+                outbound.live_entry_count * sizeof(std::int32_t));
+        }
+        if (inbound->compact_route_slots_host !=
+            outbound.compact_route_slots_host)
+        {
+            std::memmove(
+                inbound->compact_route_slots_host,
+                outbound.compact_route_slots_host,
+                outbound.live_entry_count * sizeof(std::int32_t));
         }
         if (inbound->hidden_rows_fp32 != outbound.hidden_rows_fp32)
         {

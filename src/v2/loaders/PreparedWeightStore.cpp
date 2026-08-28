@@ -3,6 +3,8 @@
 #include "../tensors/TensorKernels.h"
 
 #include <stdexcept>
+#include <limits>
+#include <unordered_set>
 #include <utility>
 
 /**
@@ -741,6 +743,33 @@ namespace llaminar2
                 ++count;
         }
         return count;
+    }
+
+    size_t PreparedWeightStore::preparedEmbeddingAllocationBytesForDevice(
+        DeviceId device) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::unordered_set<const PreparedEmbeddingWeights *> owners;
+        size_t bytes = 0u;
+        for (const auto &[_, entry] : embedding_entries_)
+        {
+            const auto *handle = entry.activeHandle();
+            if (!handle || handle->device_id != device || !handle->weights ||
+                handle->weights->device_id != device ||
+                handle->weights->byte_size == 0u ||
+                !owners.insert(handle->weights.get()).second)
+            {
+                continue;
+            }
+            if (handle->weights->byte_size >
+                std::numeric_limits<size_t>::max() - bytes)
+            {
+                throw std::overflow_error(
+                    "Prepared embedding allocation BOM overflows size_t");
+            }
+            bytes += handle->weights->byte_size;
+        }
+        return bytes;
     }
 
     void PreparedWeightStore::resetDynamicState()

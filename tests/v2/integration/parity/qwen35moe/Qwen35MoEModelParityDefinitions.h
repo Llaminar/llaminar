@@ -15,7 +15,12 @@
 
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -27,11 +32,92 @@ namespace llaminar2::test::parity::qwen35moe
     inline constexpr const char *kQwen35MoEParityPrompt =
         "The quick brown fox jumps over the lazy dog";
 
-    /** @return Authenticated tokenization of @ref kQwen35MoEParityPrompt. */
+    /** Authenticated tokenization of @ref kQwen35MoEParityPrompt. */
+    inline constexpr std::array<int, 9> kQwen35MoEParityTokenIds = {
+        760,
+        3841,
+        13477,
+        37550,
+        33075,
+        888,
+        279,
+        15217,
+        5388,
+    };
+
+    /**
+     * Complete authenticated demand window used by movement-only cells.
+     *
+     * A shorter prefix allowed the first demand bank to make a statistically
+     * valid but one-axis-only decision. The complete parity prompt gives every
+     * routed layer the same causal workload that numerical parity subsequently
+     * exercises, so a published promotion is re-exercised by the reference
+     * path instead of being certified only by unrelated synthetic traffic.
+     */
+    inline constexpr int kQwen35MoEMovementProofInitialWindowRows =
+        static_cast<int>(kQwen35MoEParityTokenIds.size());
+
+    /** @return An owning copy of the authenticated prompt tokenization. */
     inline std::vector<int> qwen35MoEParityTokenIds()
     {
-        return {760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388};
+        return {
+            kQwen35MoEParityTokenIds.begin(),
+            kQwen35MoEParityTokenIds.end(),
+        };
     }
+
+    /** Requests discarded symmetrically while convergence graphs warm. */
+    inline constexpr int kQwen35MoEConvergenceTimingWarmupRequests = 1;
+    /** Full-prefill observations retained in each placement cohort. */
+    inline constexpr int kQwen35MoEConvergenceTimingMeasuredRequests = 5;
+    /** Complete stationary request corpus replayed on both sides of the A/B. */
+    inline constexpr int kQwen35MoEConvergenceTimingCorpusRequests =
+        kQwen35MoEConvergenceTimingWarmupRequests +
+        kQwen35MoEConvergenceTimingMeasuredRequests;
+    /** Routed decode forwards issued after every convergence prefill. */
+    inline constexpr int kQwen35MoEConvergenceTimingDecodeForwards = 5;
+    /** Bucket-aligned routed rows in every convergence prefill. */
+    inline constexpr std::size_t kQwen35MoEConvergenceTimingPromptRows = 64u;
+
+    /**
+     * @return Exact routed-row corpus that one immutable timing epoch retains.
+     *
+     * This geometry is shared by matrix construction and the real-weight
+     * fixture. Keeping it beside the typed model definition prevents a
+     * fixture-local timing change from silently under-sizing the production
+     * histogram policy selected by the expander.
+     */
+    inline constexpr std::uint64_t
+    qwen35MoEConvergenceTimingCohortRoutedRows() noexcept
+    {
+        return static_cast<std::uint64_t>(
+                   kQwen35MoEConvergenceTimingCorpusRequests) *
+               (static_cast<std::uint64_t>(
+                    kQwen35MoEConvergenceTimingPromptRows) +
+                static_cast<std::uint64_t>(
+                    kQwen35MoEConvergenceTimingDecodeForwards));
+    }
+
+    /**
+     * Fixed demand-bank width for the matched before/after speed witness.
+     *
+     * The 414-row timing corpus must fit strictly inside one immutable epoch.
+     * Five retained request pairs give the latency gate an odd request-matched
+     * median and 25 decode observations per side; the discarded first request
+     * remains a graph/cache warmup. The remaining rows are deliberate
+     * publication headroom, not untyped fixture slack. Movement-only cells use
+     * their separate shorter policy.
+     */
+    inline constexpr int kQwen35MoEConvergenceHistogramWindowRows = 448;
+
+    static_assert(
+        static_cast<std::uint64_t>(
+            kQwen35MoEConvergenceHistogramWindowRows) >
+        qwen35MoEConvergenceTimingCohortRoutedRows());
+    static_assert(kQwen35MoEConvergenceTimingWarmupRequests > 0);
+    static_assert(
+        kQwen35MoEConvergenceTimingMeasuredRequests % 2 == 1,
+        "The convergence median must retain an odd request count");
 
     /** @return Canonical Qwen3.5-35B-A3B Q4_K_XL identity. */
     inline ModelParityModelDefinition qwen35MoE35BQ4KXLParityModel()
@@ -117,12 +203,265 @@ namespace llaminar2::test::parity::qwen35moe
     }
 
     /**
+     * @return Numerical contract for ExpertOverlay's completed sparse return.
+     *
+     * Generic tensor-parallel graphs expose `MOE_EXPERT_OUTPUT` before their
+     * cross-participant reduction, so the ordinary multi-device contract must
+     * exclude that branch-local value.  ExpertOverlay deliberately republishes
+     * the same semantic key from the final sparse-return consume stage.  That
+     * value is the canonical routed sum and therefore remains a required
+     * checkpoint in both the numerical comparison and its CSV evidence.
+     */
+    inline BackendThresholds qwen35MoEExpertOverlayThresholds()
+    {
+        auto thresholds = qwen35MoEMultiDeviceThresholds();
+        thresholds.excluded_stages.erase(
+            std::remove(
+                thresholds.excluded_stages.begin(),
+                thresholds.excluded_stages.end(),
+                "MOE_EXPERT_OUTPUT"),
+            thresholds.excluded_stages.end());
+        return thresholds;
+    }
+
+    /** Accelerator family owning dense continuation in a multi-tier proof. */
+    enum class Qwen35MoEOverlayContinuationBackend : std::uint8_t
+    {
+        CUDA,
+        ROCm,
+    };
+
+    /**
+     * @brief Compact source of truth for one 35B graph-native topology.
+     *
+     * Counts identify physical participants, never expert quotas. The live
+     * capacity planner fills each integer-priority tier to its exact remaining
+     * capacity after every named model-lifetime allocation is charged.
+     * `segmented_prefill` adds the complementary fixed-bucket graph profile to
+     * the same centrally expanded placement/movement matrix.
+     */
+    struct Qwen35MoE35BOverlayTopologySpec
+    {
+        const char *test_id;
+        int cuda_participants;
+        int rocm_participants;
+        int cpu_participants;
+        Qwen35MoEOverlayContinuationBackend continuation;
+        bool segmented_prefill;
+    };
+
+    /** @return Every 35B graph-native topology formerly registered by hand. */
+    inline const std::array<Qwen35MoE35BOverlayTopologySpec, 4> &
+    qwen35MoE35BOverlayTopologySpecs()
+    {
+        static const std::array<Qwen35MoE35BOverlayTopologySpec, 4> specs{{
+            {
+                "CUDA1_ROCm1_CPU2_2xMPI_NodeExpertOverlay",
+                1,
+                1,
+                2,
+                Qwen35MoEOverlayContinuationBackend::CUDA,
+                true,
+            },
+            {
+                "CUDA1_CPU2_2xMPI_NodeExpertOverlay",
+                1,
+                0,
+                2,
+                Qwen35MoEOverlayContinuationBackend::CUDA,
+                false,
+            },
+            {
+                "ROCm1_CPU2_2xMPI_NodeExpertOverlay",
+                0,
+                1,
+                2,
+                Qwen35MoEOverlayContinuationBackend::ROCm,
+                false,
+            },
+            {
+                "CUDA1_ROCm1_2xMPI_NodeExpertOverlay",
+                1,
+                1,
+                0,
+                Qwen35MoEOverlayContinuationBackend::CUDA,
+                false,
+            },
+        }};
+        return specs;
+    }
+
+    /** @brief Build one inventory-bound single-accelerator overlay domain. */
+    inline RoutedExpertDomain qwen35MoE35BAcceleratorOverlayDomain(
+        Qwen35MoEOverlayContinuationBackend backend,
+        bool continuation)
+    {
+        RoutedExpertDomain domain;
+        if (backend == Qwen35MoEOverlayContinuationBackend::CUDA)
+        {
+            domain.name = "cuda_hot";
+            domain.backend = CollectiveBackendType::NCCL;
+            domain.participants = {GlobalDeviceAddress::cuda(0)};
+        }
+        else
+        {
+            domain.name = continuation ? "rocm_hot" : "rocm_warm";
+            domain.backend = CollectiveBackendType::RCCL;
+            domain.participants = {GlobalDeviceAddress::rocm(0)};
+        }
+        domain.scope = ExecutionDomainScope::SINGLE;
+        domain.owner_rank = -1;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        domain.routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
+        domain.routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        domain.routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        return domain;
+    }
+
+    /** @brief Build the two-socket CPU overlay domain bound by live inventory. */
+    inline RoutedExpertDomain qwen35MoE35BCpuOverlayDomain(
+        int participant_count)
+    {
+        if (participant_count <= 0)
+            throw std::invalid_argument(
+                "35B CPU overlay domain requires positive participant count");
+        RoutedExpertDomain domain;
+        domain.name = "cpu_cold";
+        domain.scope = ExecutionDomainScope::NODE_LOCAL;
+        domain.backend = CollectiveBackendType::UPI;
+        for (int numa = 0; numa < participant_count; ++numa)
+            domain.participants.push_back(GlobalDeviceAddress::cpu(numa));
+        domain.owner_rank = -1;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        domain.routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
+        domain.routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        domain.routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        return domain;
+    }
+
+    /**
+     * @brief Build one immutable automatic-capacity multi-tier blueprint.
+     *
+     * Priorities are deliberately non-semantic and non-consecutive. All tier
+     * quotas remain zero so the production memory BOM, rather than the test,
+     * determines exact residency. The generated case later installs
+     * Static/Dynamic and Ordinal/Random without changing this topology.
+     */
+    inline std::shared_ptr<const MoERoutedExpertPlacementPlan>
+    qwen35MoE35BOverlayPlan(const Qwen35MoE35BOverlayTopologySpec &spec)
+    {
+        const bool cuda_continuation =
+            spec.continuation ==
+            Qwen35MoEOverlayContinuationBackend::CUDA;
+        if ((cuda_continuation && spec.cuda_participants != 1) ||
+            (!cuda_continuation && spec.rocm_participants != 1))
+        {
+            throw std::invalid_argument(
+                "35B overlay continuation requires exactly one accelerator");
+        }
+
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+        plan->enabled = true;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+        plan->owner_order = RoutedExpertOwnerOrder::Ordinal;
+
+        auto continuation = qwen35MoE35BAcceleratorOverlayDomain(
+            spec.continuation, true);
+        plan->continuation_domain = continuation.name;
+        plan->base_model_domain = continuation.name;
+        plan->shared_expert_domain = continuation.name;
+        plan->continuation_domain_spec.domain = continuation.name;
+        plan->continuation_domain_spec.logical_root_participant = 0;
+        plan->continuation_domain_spec.setDensePolicy(
+            DenseParallelPolicy::Replicated);
+        plan->domains.push_back(std::move(continuation));
+
+        if (cuda_continuation && spec.rocm_participants > 0)
+        {
+            plan->domains.push_back(
+                qwen35MoE35BAcceleratorOverlayDomain(
+                    Qwen35MoEOverlayContinuationBackend::ROCm, false));
+        }
+        else if (!cuda_continuation && spec.cuda_participants > 0)
+        {
+            plan->domains.push_back(
+                qwen35MoE35BAcceleratorOverlayDomain(
+                    Qwen35MoEOverlayContinuationBackend::CUDA, false));
+        }
+        if (spec.cpu_participants > 0)
+            plan->domains.push_back(
+                qwen35MoE35BCpuOverlayDomain(spec.cpu_participants));
+
+        constexpr std::array<int, 3> priorities{-20, 7, 41};
+        for (std::size_t index = 0; index < plan->domains.size(); ++index)
+        {
+            const int priority =
+                plan->domains.size() == 2u && index == 1u
+                    ? 17
+                    : priorities.at(index);
+            plan->routed_tiers.push_back({
+                .name = "priority_" + std::to_string(priority),
+                .domain = plan->domains[index].name,
+                .priority = priority,
+                .max_experts_per_layer = 0,
+                .memory_budget_bytes = 0,
+                .fallback = index + 1u == plan->domains.size(),
+            });
+        }
+
+        const auto validation = validateMoERoutedExpertPlacementPlan(*plan);
+        if (!validation.ok())
+        {
+            std::string message =
+                "invalid Qwen3.5 MoE 35B graph-native overlay plan";
+            for (const auto &error : validation.errors)
+                message += "\n - " + error;
+            throw std::logic_error(message);
+        }
+        return plan;
+    }
+
+    /** @return Typed participants and rank ownership for one 35B topology. */
+    inline ModelParityTopologyDefinition qwen35MoE35BOverlayTopology(
+        const Qwen35MoE35BOverlayTopologySpec &spec)
+    {
+        ModelParityTopologyDefinition topology{
+            .test_id = spec.test_id,
+            .kind = ModelParityTopologyKind::NodeMultiDomain,
+            .collective = Collective::None,
+            .mpi_ranks = 2,
+            .expert_overlay_plan = qwen35MoE35BOverlayPlan(spec),
+        };
+        for (int ordinal = 0; ordinal < spec.cuda_participants; ++ordinal)
+        {
+            topology.participants.push_back({
+                GlobalDeviceAddress::cuda(ordinal), std::nullopt});
+        }
+        for (int ordinal = 0; ordinal < spec.rocm_participants; ++ordinal)
+        {
+            topology.participants.push_back({
+                GlobalDeviceAddress::rocm(ordinal), std::nullopt});
+        }
+        for (int numa = 0; numa < spec.cpu_participants; ++numa)
+        {
+            topology.participants.push_back({
+                GlobalDeviceAddress::cpu(numa), numa});
+        }
+        return topology;
+    }
+
+    /**
      * @brief Build one homogeneous single-domain ExpertOverlay authority.
      *
      * Dense/shared work remains tensor parallel while routed experts are
      * apportioned across the same participants. A zero quota and budget ask
-     * production capacity planning to fill the only fallback tier up to its
-     * computed safety margin rather than embedding a model-specific cap.
+     * production capacity planning to fill the only fallback tier to its exact
+     * admitted capacity rather than embedding a model-specific cap.
      *
      * @param domain_name Stable diagnostic domain identity.
      * @param scope Rank-local or node-local execution scope.
@@ -267,9 +606,67 @@ namespace llaminar2::test::parity::qwen35moe
         definition.thresholds = std::move(thresholds);
         definition.precisions.activation = {ActivationPrecision::FP32};
         definition.precisions.kv_cache = {KVCachePrecision::FP16};
-        definition.dynamic_rebalance = qwen35MoEDynamicParityEconomics();
+        const auto dynamic_policy = qwen35MoEDynamicParityEconomics();
+        definition.dynamic_rebalance = {
+            .economic_movement = dynamic_policy,
+            .economic_movement_and_observed_speedup = dynamic_policy,
+        };
         definition.collective_evidence_source =
             ParityCollectiveEvidenceSource::PostCollectiveSnapshot;
+        return definition;
+    }
+
+    /**
+     * @brief Compose one 35B graph-native topology with every standard axis.
+     *
+     * The authenticated layer count determines the concurrent migration width:
+     * one tier cycle per layer plus one same-priority skew cycle. This replaces
+     * the former fixture-owned mutable value with declarative campaign policy.
+     * The CUDA/ROCm/CPU topology also crosses the ordinary and four-row
+     * segmented captured-prefill profiles.
+     */
+    inline ModelParityDefinition qwen35MoE35BGraphNativeParityDefinition(
+        const Qwen35MoE35BOverlayTopologySpec &spec)
+    {
+        auto model = qwen35MoE35BQ4KXLParityModel();
+        auto definition = qwen35MoEParityDefinition(
+            model,
+            qwen35MoE35BOverlayTopology(spec),
+            qwen35MoEExpertOverlayThresholds());
+        auto movement_policy =
+            definition.dynamic_rebalance.economic_movement;
+        movement_policy.window_size = 256;
+        movement_policy.max_window_size = 256;
+        movement_policy.migration_transfer_slots =
+            static_cast<std::uint32_t>(model.transformer_layers + 1);
+        movement_policy.dynamic_max_plan_entries_per_wave =
+            std::max(
+                movement_policy.dynamic_max_plan_entries_per_wave,
+                static_cast<std::uint32_t>(
+                    model.transformer_layers + 1));
+
+        auto observed_speedup_policy = movement_policy;
+        observed_speedup_policy.window_size =
+            kQwen35MoEConvergenceHistogramWindowRows;
+        observed_speedup_policy.max_window_size =
+            kQwen35MoEConvergenceHistogramWindowRows;
+        observed_speedup_policy.window_growth_factor = 1.0F;
+        definition.dynamic_rebalance = {
+            .economic_movement = std::move(movement_policy),
+            .economic_movement_and_observed_speedup =
+                std::move(observed_speedup_policy),
+        };
+        if (spec.segmented_prefill)
+        {
+            definition.features.prefill_graph = {
+                ModelParityPrefillGraphPolicy{},
+                ModelParityPrefillGraphPolicy{
+                    .mode =
+                        ModelParityPrefillGraphMode::SegmentedCaptured,
+                    .captured_rows = 4,
+                },
+            };
+        }
         return definition;
     }
 } // namespace llaminar2::test::parity::qwen35moe

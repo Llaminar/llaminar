@@ -2252,6 +2252,7 @@ struct DeviceMoELayerRuntimeView
     const uint32_t *runtime_histogram_active_bank;
     const llaminar2::DeviceMoEOverlayEpochTicket *overlay_epoch_ticket;
     const DeviceMoEPlacementBankView *overlay_placement_banks;
+    const llaminar2::DeviceMoEOverlayEpochStatus *overlay_epoch_status;
 };
 
 static_assert(
@@ -2289,6 +2290,9 @@ static_assert(
 static_assert(
     offsetof(DeviceMoELayerRuntimeView, overlay_placement_banks) ==
     llaminar2::moe_runtime_abi::kOverlayPlacementBanksOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView, overlay_epoch_status) ==
+    llaminar2::moe_runtime_abi::kOverlayEpochStatusOffset);
 
 /** Sentinel returned when a runtime inference bank is not provable. */
 constexpr uint32_t kInvalidMoERuntimeExecutionBank = 0xffffffffu;

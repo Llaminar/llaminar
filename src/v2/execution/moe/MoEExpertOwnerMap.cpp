@@ -217,6 +217,28 @@ namespace llaminar2
             return owner;
         }
 
+        /**
+         * @brief Put a complete owner relation in construction-independent order.
+         *
+         * Transition assignment is naturally produced tier-by-tier while an
+         * explicit assignment is naturally produced expert-by-expert.  Those
+         * are implementation details, not residency state.  Sorting once at
+         * setup/maintenance time gives every consumer one canonical value and
+         * prevents distributed fingerprints from depending on the builder.
+         */
+        void canonicalizeOwnerOrder(std::vector<MoEExpertOwner> &owners)
+        {
+            std::sort(
+                owners.begin(),
+                owners.end(),
+                [](const MoEExpertOwner &lhs, const MoEExpertOwner &rhs)
+                {
+                    if (lhs.layer_idx != rhs.layer_idx)
+                        return lhs.layer_idx < rhs.layer_idx;
+                    return lhs.expert_id < rhs.expert_id;
+                });
+        }
+
         std::vector<MoEExpertOwner> buildLayerTierOwners(
             const MoEExpertOwnerMap &owner_map,
             const RoutedExpertLayerPlacement &placement,
@@ -453,6 +475,7 @@ namespace llaminar2
                 "Explicit MoE ownership contains a layer absent from tier placement");
         }
 
+        canonicalizeOwnerOrder(explicit_owners);
         owner_map.owners_ = std::move(explicit_owners);
         return owner_map;
     }
@@ -540,14 +563,39 @@ namespace llaminar2
             }
         }
 
+        canonicalizeOwnerOrder(owner_map.owners_);
+
         return owner_map;
     }
 
     const MoEExpertOwner *MoEExpertOwnerMap::ownerFor(int layer_idx, int expert_id) const
     {
-        auto it = std::find_if(owners_.begin(), owners_.end(), [&](const auto &owner)
-                               { return owner.layer_idx == layer_idx && owner.expert_id == expert_id; });
-        return it == owners_.end() ? nullptr : &(*it);
+        /*
+         * Construction canonicalizes this immutable relation by
+         * `(layer, expert)`. Dispatch consults it once per routed activation,
+         * so a linear scan turns ordinary prefill into O(routes * model
+         * experts) host work. Preserve the general sparse-coordinate contract
+         * while using that canonical order as the lookup authority.
+         */
+        const std::pair<int, int> coordinate{layer_idx, expert_id};
+        const auto owner = std::lower_bound(
+            owners_.begin(),
+            owners_.end(),
+            coordinate,
+            [](const MoEExpertOwner &candidate,
+               const std::pair<int, int> &requested)
+            {
+                return std::pair{
+                           candidate.layer_idx,
+                           candidate.expert_id} < requested;
+            });
+        if (owner == owners_.end() ||
+            owner->layer_idx != layer_idx ||
+            owner->expert_id != expert_id)
+        {
+            return nullptr;
+        }
+        return &*owner;
     }
 
     const MoEExpertOwnerParticipant *MoEExpertOwnerMap::participantForId(int participant_id) const
@@ -598,8 +646,8 @@ namespace llaminar2
 
     size_t MoEExpertOwnerMap::ownerCountForExpert(int layer_idx, int expert_id) const
     {
-        return static_cast<size_t>(std::count_if(owners_.begin(), owners_.end(), [&](const auto &owner)
-                                                 { return owner.layer_idx == layer_idx && owner.expert_id == expert_id; }));
+        /* A successfully built map makes duplicate ownership unrepresentable. */
+        return ownerFor(layer_idx, expert_id) ? 1u : 0u;
     }
 
     MoELayeredExpertOwnership MoEExpertOwnerMap::layeredOwnership(

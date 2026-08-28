@@ -11,6 +11,7 @@
 
 #include "HardwareInventory.h"
 #include "GPUEnumeration.h"
+#include "HostMemoryCapacity.h"
 #include "../utils/Logger.h"
 
 #include <algorithm>
@@ -159,24 +160,18 @@ namespace llaminar2
                 std::sort(si.ht_threads.begin(), si.ht_threads.end());
 
                 /*
-                 * Capture total and currently free bytes from one kernel
-                 * query.  The free value is the NUMA-local admission
-                 * authority used by ExpertOverlay; it naturally reflects
-                 * tmpfs/ramdisk pages and allocations made before discovery.
+                 * Inventory and runtime preflight consume the same immutable
+                 * observation.  It charges tmpfs pages while admitting
+                 * reclaimable ordinary file cache, which is essential when a
+                 * production parity corpus is staged into a RAM filesystem.
                  */
-                if (numa_available() >= 0 && si.numa_node >= 0)
+                if (si.numa_node >= 0)
                 {
-                    long long free_bytes = 0;
-                    long long sz = numa_node_size64(
-                        si.numa_node, &free_bytes);
-                    if (sz > 0)
-                        si.memory_bytes = static_cast<size_t>(sz);
-                    if (free_bytes > 0)
-                    {
-                        si.available_memory_bytes = std::min(
-                            static_cast<size_t>(free_bytes),
-                            si.memory_bytes);
-                    }
+                    const auto memory =
+                        observeNUMAMemoryCapacity(si.numa_node);
+                    si.memory_bytes = memory.total_bytes;
+                    si.available_memory_bytes =
+                        memory.admission_available_bytes;
                 }
 
                 sockets.push_back(std::move(si));

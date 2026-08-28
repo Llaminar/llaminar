@@ -429,15 +429,16 @@ namespace llaminar2
             bool force_grouped_verifier_prefill_for_decode = false;
             bool force_decode_equivalent_verifier_prefill = false;
             /**
-             * @brief Retain this main-verifier layer's routes for later commit.
+             * @brief Declare this expert stage's verifier-history lifecycle role.
              *
              * Sidecar and main verifier stages both use grouped kernels, but
-             * only the main target graph publishes accepted rows into decode
-             * maintenance history. Keeping this policy explicit prevents a
-             * sidecar from accidentally advertising a deferred publication
-             * transaction merely because it uses grouped execution.
+             * only the selected main-target boundary may publish accepted rows
+             * into decode maintenance history. Static placement names the same
+             * boundary without retaining routes or creating a producer stream;
+             * sidecars and non-owning overlay stages remain @c NotOwner.
              */
-            bool defer_grouped_verifier_histogram_publication = false;
+            MoEGroupedVerifierHistogramRole grouped_verifier_histogram_role =
+                MoEGroupedVerifierHistogramRole::NotOwner;
 
             /**
              * @brief Device-owned absolute position for every grouped row.
@@ -1246,20 +1247,13 @@ namespace llaminar2
         bool hasWorkspace() const override;
         DeviceWorkspaceManager *getWorkspace() const override;
 
-        /**
-         * @brief Return whether this stage owns grouped-verifier route scratch.
-         *
-         * GPU grouped verification must defer persistent routing-history
-         * updates until the accepted-state transaction has produced its
-         * device-resident row counts. The orchestrator uses this predicate to
-         * discover exactly the verifier MoE stages that must participate in
-         * that commit.
-         */
-        [[nodiscard]] bool
-        requiresCommittedGroupedVerifierHistogramPublication() const noexcept override
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        [[nodiscard]] MoEGroupedVerifierHistogramRole
+        groupedVerifierHistogramRole() const noexcept override
         {
-            return params_.device_id.is_gpu() &&
-                   params_.defer_grouped_verifier_histogram_publication;
+            return params_.device_id.is_gpu()
+                       ? params_.grouped_verifier_histogram_role
+                       : MoEGroupedVerifierHistogramRole::NotOwner;
         }
 
         /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
@@ -1275,6 +1269,20 @@ namespace llaminar2
         {
             return "moe_ffn";
         }
+
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        [[nodiscard]] void *
+        groupedVerifierHistogramPublicationStream() const override
+        {
+            return params_.moe_runtime_table
+                       ? params_.moe_runtime_table
+                             ->groupedVerifierHistogramPublicationStream()
+                       : nullptr;
+        }
+
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        bool prepareGroupedVerifierHistogramProducer(
+            void *producer_stream) override;
 
         /**
          * @brief Publish accepted grouped-verifier demand on its producer stream.
@@ -1755,6 +1763,14 @@ namespace llaminar2
         bool runtimeTableHasActiveGroupedDecodeBank() const;
         bool supportsRequestedRoutedAssignmentPolicy() const;
         bool canUseRuntimeRowGrouping() const;
+        /**
+         * @brief Return whether this captured stage publishes ordinary prefill demand.
+         *
+         * Deferred grouped-verifier rows are published by the accepted-state
+         * transaction instead. Keeping the two producer roles disjoint makes
+         * stream admission complete without double-registering semantics.
+         */
+        [[nodiscard]] bool ownsRuntimePrefillHistogramPublication() const noexcept;
         bool canUseFixedTopologyGroupedPrefill() const;
         /**
          * @brief True when verifier rows can use the safe routed+shared composite path.

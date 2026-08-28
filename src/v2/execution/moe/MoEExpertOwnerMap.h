@@ -131,12 +131,28 @@ namespace llaminar2
             const MoELayeredExpertOwnership &ownership,
             const MoEExpertOwnerMapBuildOptions &options = {});
 
-        /** @return Every physical expert owner in deterministic map order. */
+        /**
+         * @return Every physical owner in canonical `(layer, expert)` order.
+         *
+         * Initial, transition, and explicit construction all expose the same
+         * order.  Distributed identity and migration code may therefore
+         * consume this vector without accidentally hashing the construction
+         * algorithm which produced an otherwise identical owner relation.
+         */
         const std::vector<MoEExpertOwner> &owners() const { return owners_; }
         /** @return Stable participant descriptors indexed by participant ID. */
         const std::vector<MoEExpertOwnerParticipant> &participants() const { return participants_; }
 
-        /** @return Owner for one model expert, or null when it is absent. */
+        /**
+         * @brief Look up one immutable owner through the canonical coordinate index.
+         * @param layer_idx Exact transformer-layer coordinate.
+         * @param expert_id Exact routed-expert coordinate within that layer.
+         * @return Owner for the model expert, or null when it is absent.
+         *
+         * Construction sorts the complete relation by `(layer, expert)`, so
+         * this graph-facing query is logarithmic rather than scanning every
+         * expert in the model for each routed activation.
+         */
         const MoEExpertOwner *ownerFor(int layer_idx, int expert_id) const;
         /** @return Descriptor for a participant ID, or null when absent. */
         const MoEExpertOwnerParticipant *participantForId(int participant_id) const;
@@ -150,7 +166,13 @@ namespace llaminar2
             int layer_idx,
             int owner_participant,
             int num_experts) const;
-        /** @return Number of owners recorded for the selected model expert. */
+        /**
+         * @brief Report total ownership for one model coordinate.
+         * @return Zero for an absent coordinate, otherwise exactly one.
+         *
+         * Duplicate ownership is rejected during construction, which makes a
+         * larger result unrepresentable in every live map.
+         */
         size_t ownerCountForExpert(int layer_idx, int expert_id) const;
 
         /**

@@ -66,6 +66,10 @@ MTP_SIDECAR_SNAPSHOT_SCHEMA = QWEN36_MTP_SIDECAR_SNAPSHOT_SCHEMA
 # workspace. Packs without this marker used the retired raw linear projection.
 MOE_ROUTER_SNAPSHOT_SCHEMA = 1
 
+# Schema 1 adds weighted per-route expert contributions. They let the C++
+# movement witness compare one expert independently of unrelated top-k drift.
+MOE_ROUTE_CONTRIBUTION_SNAPSHOT_SCHEMA = 1
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -280,6 +284,8 @@ Examples:
             decode_tokens,
             extra_metadata_lines=[
                 f"moe_router_snapshot_schema: {MOE_ROUTER_SNAPSHOT_SCHEMA}",
+                "moe_route_contribution_snapshot_schema: "
+                f"{MOE_ROUTE_CONTRIBUTION_SNAPSHOT_SCHEMA}",
                 *(
                     [
                         "mtp_sidecar_max_draft_depth: "

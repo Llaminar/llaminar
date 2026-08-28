@@ -20,6 +20,7 @@
 #include "MoEOverlayDeviceControllerABI.h"
 #include "MoEOverlayDeviceControllerRuntimeBinding.h"
 #include "../InferenceMeasurementReadiness.h"
+#include "MoEOptimizationStatus.h"
 
 #include <atomic>
 #include <array>
@@ -237,15 +238,21 @@ namespace llaminar2
         explicit MoEOverlayDeviceControllerGraphService(Config config);
 
         /**
-         * @brief Drain topology-wide Dynamic work, then release retained state.
+         * @brief Drain topology-wide Dynamic work and release GPU resources.
          *
-         * Dynamic destruction is a collective lifecycle edge. Every inference
+         * This is the explicit collective terminal transition. Every inference
          * producer first leaves admission while controller workers remain live;
          * all admitted transactions then reach a terminal durable epoch before
-         * any rank releases graphs, events, or policy storage. The coordinated
-         * runner must therefore publish its worker-loop shutdown command before
-         * destroying this service.
+         * any rank releases graphs, events, or policy storage. Completed totals
+         * and the authoritative movement ledger remain readable afterward.
+         * Repeated calls are no-ops.
+         *
+         * The coordinated runner must publish its worker-loop shutdown command
+         * before entering this transition.
          */
+        void stopAndDrain() noexcept;
+
+        /** @brief Invoke @ref stopAndDrain when ownership was not sealed explicitly. */
         ~MoEOverlayDeviceControllerGraphService();
 
         MoEOverlayDeviceControllerGraphService(
@@ -299,6 +306,20 @@ namespace llaminar2
          */
         [[nodiscard]] InferenceMeasurementReadiness
         measurementReadiness() const;
+
+        /**
+         * @brief Observe device-owned economy activation and durable movement.
+         *
+         * The mapped words are device-authored lifecycle publications; this
+         * method does not download policy state or consult PerfStats.
+         */
+        [[nodiscard]] MoEOptimizationStatus optimizationStatus() const;
+
+        /**
+         * @brief Snapshot exact device-authored edges completed by the follower.
+         * @return Typed ledger independent of PerfStats filtering or resets.
+         */
+        [[nodiscard]] MoEOptimizationMovementLedger movementLedger() const;
 
         /** @return Number of retained participant graphs owned by this rank. */
         [[nodiscard]] std::size_t localGraphCount() const noexcept;
@@ -362,6 +383,11 @@ namespace llaminar2
         Config config_;
         std::vector<std::unique_ptr<Endpoint>> endpoints_;
         std::unique_ptr<DynamicWorker> dynamic_worker_;
+        /** Successful terminal snapshot retained after the worker is released. */
+        MoEOptimizationMovementTotals terminal_movement_totals_;
+        MoEOptimizationMovementLedger terminal_movement_ledger_;
+        std::uint64_t terminal_published_movement_waves_ = 0u;
+        bool stopped_ = false;
         bool static_certified_ = false;
     };
 } // namespace llaminar2

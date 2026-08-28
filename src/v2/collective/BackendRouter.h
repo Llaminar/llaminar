@@ -34,6 +34,7 @@
 
 #include "ICollectiveBackend.h"
 #include "DeviceGroup.h"
+#include "CollectiveRuntimeLifecycle.h"
 #include "../execution/mpi_orchestration/DeviceInventory.h"
 #include "../utils/MPIContext.h"
 #include <algorithm>
@@ -418,6 +419,22 @@ namespace llaminar2
 
         static BackendRouter *get();
 
+        /**
+         * @brief Retire process collective state before native device reset.
+         *
+         * This is an infrastructure boundary used only by TransferEngine's
+         * exclusive model-retirement transaction. It destroys the singleton
+         * router, then retires inactive vendor coordinators while their native
+         * runtime generation is still valid. A live non-global owner is
+         * reported rather than interrupted.
+         *
+         * @param device Exact CUDA/HIP runtime about to be reset.
+         * @return Typed ownership and teardown evidence.
+         */
+        [[nodiscard]] static CollectiveRuntimeRetirementReceipt
+        retireForExclusiveDeviceRuntimeReset(DeviceId device);
+
+        /** @brief Retire the singleton and all inactive collective owners. */
         static void shutdown();
 
     private:

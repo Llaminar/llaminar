@@ -422,8 +422,11 @@ For model parity, use `.agents/model-parity-testing/SKILL.md`, then read
 production campaigns. The aggregate campaign system replaces the historical
 hand-picked PyTorch parity baseline: it keeps reference generation, live-path
 execution, every checkpoint comparison, CSV evidence, and the shared economy
-target in one registered matrix. Local reports and result directories are
-generated debris and must not be committed.
+target in one registered matrix. Each non-list run first executes the
+CMake-owned, model-free `ProductionParityPreflight` integration label; add a
+focused regression there when a parity defect establishes a reusable lifecycle,
+graph, stream/event, collective, or movement invariant. Local reports and
+result directories are generated debris and must not be committed.
 
 For a debugger attached directly to `llaminar2`, pass
 `--no-mpi-bootstrap`; otherwise it may attach to the MPI wrapper. Record any

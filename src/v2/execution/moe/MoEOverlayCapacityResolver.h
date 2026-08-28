@@ -3,7 +3,7 @@
  * @brief Exact setup-time memory and live-quota resolver for ExpertOverlay.
  *
  * ExpertOverlay residency is meaningful only when every live expert, inactive
- * migration slot, transfer lane, graph/KV allocation, and safety reserve is
+ * migration slot, transfer lane, and graph/KV allocation is
  * admitted against the physical participant that owns those bytes.  This file
  * defines the device-free resolver contract used to turn those inputs into one
  * immutable integer-priority quota plan and a complete per-resource bill of
@@ -31,7 +31,7 @@ namespace llaminar2
     /** @brief Whether a tier's live quota is setup-resolved or explicitly fixed. */
     enum class MoEOverlayLiveQuotaMode : std::uint8_t
     {
-        Automatic = 0, ///< Fill from physical headroom in strict priority order.
+        Automatic = 0, ///< Fill exact remaining capacity in strict priority order.
         FixedPerLayer = 1, ///< Admit the supplied per-layer quotas exactly.
     };
 
@@ -40,6 +40,15 @@ namespace llaminar2
     {
         Apportioned = 0, ///< One complete copy, balanced across participants.
         Replicated = 1,  ///< One complete copy on every tier participant.
+    };
+
+    /** @brief Setup-time live-residency invariant applied before priority fill. */
+    enum class MoEOverlayInitialResidencyPolicy : std::uint8_t
+    {
+        /** Strict priority may leave a declared endpoint initially empty. */
+        PriorityFillOnly = 0,
+        /** Every migration participant/layer begins with one outbound source. */
+        MigrationSourcePerParticipant = 1,
     };
 
     /**
@@ -57,7 +66,6 @@ namespace llaminar2
         std::size_t usable_budget_bytes = 0;
         std::size_t fixed_bytes = 0;
         std::size_t transfer_staging_bytes = 0;
-        std::size_t safety_reserve_bytes = 0;
     };
 
     /** @brief One logical participant's binding to a physical memory authority. */
@@ -98,6 +106,14 @@ namespace llaminar2
     struct MoEOverlayCapacityResolverInput
     {
         int num_experts = 0;
+        /**
+         * Migration calibration uses real reversible transfers and therefore
+         * needs one source expert on every declared endpoint/layer. The seed
+         * is initial residency only, not a permanent quota: the runtime
+         * authority may drain that endpoint after certification.
+         */
+        MoEOverlayInitialResidencyPolicy initial_residency_policy =
+            MoEOverlayInitialResidencyPolicy::PriorityFillOnly;
         std::vector<MoEOverlayLayerWeightManifest> layer_weight_manifest;
         std::vector<MoEOverlayPhysicalMemoryBudget> physical_budgets;
         std::vector<MoEOverlayTierCapacityRequest> tiers;
@@ -147,7 +163,6 @@ namespace llaminar2
         std::size_t usable_budget_bytes = 0;
         std::size_t fixed_bytes = 0;
         std::size_t transfer_staging_bytes = 0;
-        std::size_t safety_reserve_bytes = 0;
         std::size_t shadow_bytes = 0;
         std::size_t live_expert_bytes = 0;
         std::size_t used_bytes = 0;

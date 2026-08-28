@@ -12,8 +12,9 @@
 #pragma once
 
 #include "MoEOverlayEconomyCertificationController.h"
+#include "MoEOptimizationStatus.h"
 #include "MoEOverlayDeviceServiceTelemetryPublisher.h"
-#include "MoEOverlayHistogramPublisher.h"
+#include "MoEOverlayResidencyProposalPublisher.h"
 #include "MoEOverlayResidencyAuthority.h"
 #include "../InferenceMeasurementReadiness.h"
 
@@ -28,16 +29,21 @@
 
 namespace llaminar2
 {
+    class IMPIContext;
+
     /** @brief Observable lifecycle of the ExpertOverlay maintenance worker. */
     enum class MoEOverlayMaintenanceState
     {
         Prepared,   ///< Dependencies validated; no worker or protocol progress.
         Starting,   ///< Worker created but not yet inside its poll loop.
         CertifyingEconomy, ///< Real service/movement evidence is still sealing.
+        AwaitingDemandActivation, ///< Certificate sealed; next request opens demand.
         Waiting,    ///< No full histogram window or migration wave is ready.
         DrainingEvidence, ///< Device histogram banks are being copied/reset.
-        PublishingEvidence, ///< Coordinator is sending one frozen window.
-        ReceivingEvidence, ///< Peer is awaiting authoritative routing evidence.
+        ReconcilingDemand, ///< A completed decision is checking queued demand.
+        PlanningProposal, ///< Frozen evidence is becoming one bounded plan.
+        PublishingProposal, ///< Coordinator is sending one canonical plan.
+        ReceivingProposal, ///< Peer is awaiting one canonical root plan.
         Deferred,   ///< Frozen transaction awaits destination shadow capacity.
         Staging,    ///< Preparation and transfer events remain in flight.
         Preparing, ///< Inactive participant banks are being completed.
@@ -45,6 +51,81 @@ namespace llaminar2
         Draining,   ///< Shutdown rejected new work and is reaping resources.
         Failed,     ///< Fatal protocol or transport error stopped proposals.
         Stopped,    ///< Every wave, abort, and retirement has quiesced.
+    };
+
+    /**
+     * @brief Exact coordination boundary used to stop one maintenance worker.
+     *
+     * Setup rollback may destroy only process-local, not-yet-live composition.
+     * Terminal inference shutdown must instead keep every topology follower
+     * runnable until the arbitrary proposal coordinator has drained its last
+     * admitted generation. Keeping these operations distinct prevents a local
+     * destructor or setup failure from accidentally entering an MPI barrier.
+     */
+    enum class MoEOverlayMaintenanceDrainScope : std::uint8_t
+    {
+        ProcessLocalComposition, ///< Prepared/local-only setup ownership.
+        DistributedTopology,     ///< Terminal all-rank serving shutdown.
+    };
+
+    /**
+     * @brief Project the worker lifecycle into the public optimization state.
+     * @param state Exact maintenance-worker state.
+     * @return Typed background activity without consulting telemetry.
+     */
+    [[nodiscard]] constexpr MoEOptimizationActivityState
+    moeOptimizationActivityState(
+        MoEOverlayMaintenanceState state) noexcept
+    {
+        switch (state)
+        {
+        case MoEOverlayMaintenanceState::Prepared:
+        case MoEOverlayMaintenanceState::Starting:
+        case MoEOverlayMaintenanceState::ReconcilingDemand:
+        case MoEOverlayMaintenanceState::DrainingEvidence:
+        case MoEOverlayMaintenanceState::AwaitingDemandActivation:
+            return MoEOptimizationActivityState::ReconcilingDemand;
+        case MoEOverlayMaintenanceState::CertifyingEconomy:
+            return MoEOptimizationActivityState::LearningEconomy;
+        case MoEOverlayMaintenanceState::Waiting:
+            return MoEOptimizationActivityState::CollectingDemand;
+        case MoEOverlayMaintenanceState::PlanningProposal:
+            return MoEOptimizationActivityState::PlanningMovement;
+        case MoEOverlayMaintenanceState::PublishingProposal:
+            return MoEOptimizationActivityState::ExchangingProposal;
+        case MoEOverlayMaintenanceState::ReceivingProposal:
+            return MoEOptimizationActivityState::AwaitingAuthorityProposal;
+        case MoEOverlayMaintenanceState::Deferred:
+        case MoEOverlayMaintenanceState::Staging:
+        case MoEOverlayMaintenanceState::Preparing:
+            return MoEOptimizationActivityState::MovingWeights;
+        case MoEOverlayMaintenanceState::Publishing:
+            return MoEOptimizationActivityState::PublishingResidency;
+        case MoEOverlayMaintenanceState::Draining:
+        case MoEOverlayMaintenanceState::Stopped:
+            return MoEOptimizationActivityState::Draining;
+        case MoEOverlayMaintenanceState::Failed:
+            return MoEOptimizationActivityState::Failed;
+        }
+        return MoEOptimizationActivityState::Failed;
+    }
+
+    /**
+     * @brief Worker-owned lifecycle of the one immutable retained transaction.
+     *
+     * A distributed coordinator creates the transaction before publishing its
+     * canonical plan. `PublishingProposal` covers both coordinator publication
+     * and a peer's post-adoption acknowledgement, making premature physical
+     * staging unrepresentable. Only the terminal acknowledgement transitions it
+     * to `ReadyToStage`. Deferred capacity keeps that exact state and
+     * transaction, while `Active` transfers ownership to the authority wave.
+     */
+    enum class MoEOverlayRetainedTransactionState : std::uint8_t
+    {
+        Empty,
+        PublishingProposal,
+        ReadyToStage,
+        Active,
     };
 
     /**
@@ -79,6 +160,7 @@ namespace llaminar2
         case MoEOverlayEconomyCertificationState::ExchangingServiceReadiness:
             return MoEOverlayDeviceServicePublicationAction::Pause;
         case MoEOverlayEconomyCertificationState::ExchangingServiceEvidence:
+        case MoEOverlayEconomyCertificationState::RebasingRoutingEvidence:
         case MoEOverlayEconomyCertificationState::Complete:
         case MoEOverlayEconomyCertificationState::Failed:
         case MoEOverlayEconomyCertificationState::Stopped:
@@ -102,9 +184,9 @@ namespace llaminar2
         uint64_t committed_waves = 0;     ///< Candidate epochs published.
         uint64_t dynamic_no_movement = 0; ///< Dynamic windows needing no move.
         uint64_t static_no_movement = 0;  ///< Explicit static immobility checks.
-        uint64_t histogram_windows_published = 0; ///< Coordinator send completions.
-        uint64_t histogram_windows_received = 0; ///< Authenticated peer windows.
-        uint64_t histogram_receives_rearmed = 0; ///< Next-generation peer Irecvs.
+        uint64_t proposals_published = 0; ///< Coordinator send completions.
+        uint64_t proposals_received = 0; ///< Authenticated peer plans.
+        uint64_t proposal_receives_rearmed = 0; ///< Next-generation peer Irecvs.
         uint64_t fatal_failures = 0;      ///< Terminal service failures.
     };
 
@@ -151,14 +233,23 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayDeviceServiceTelemetryPublisher>
                 device_service_telemetry_publisher;
             /**
-             * Optional authoritative frozen-window publication lane.
+             * Optional authoritative canonical-proposal publication lane.
              *
              * When present, this service is in distributed mode. Only its
-             * coordinator consults the process-local histogram; peers derive
-             * proposals exclusively from authenticated published windows.
+             * coordinator consults the process-local histogram and runs
+             * policy. Peers only validate and materialize its published plan.
              */
-            std::shared_ptr<IMoEOverlayHistogramPublisher>
-                histogram_publisher;
+            std::shared_ptr<IMoEOverlayResidencyProposalPublisher>
+                proposal_publisher;
+            /**
+             * Optional topology barrier authority for a real distributed
+             * proposal lane.
+             *
+             * Production supplies the same rank set used to construct the
+             * publisher. Device-free in-process publishers leave this empty
+             * and retain process-local drain semantics.
+             */
+            std::shared_ptr<IMPIContext> distributed_context;
             /**
              * Maximum delay before the worker polls without a notification.
              * This is a responsiveness policy, not a correctness timeout.
@@ -213,14 +304,19 @@ namespace llaminar2
 
         /**
          * @brief Stop accepting unpublished proposals and drain owned work.
+         * @param scope Exact process-local or topology-terminal boundary.
          *
          * A distributed histogram generation that crossed publication remains
          * irrevocable and is completed through migration/publication before
-         * shutdown. This method is idempotent. It joins only the maintenance
-         * host thread; GPU and network completion is observed through
-         * non-blocking polls.
+         * shutdown. `DistributedTopology` drains the arbitrary coordinator
+         * first while follower workers remain live, then drains followers
+         * before any rank releases its publisher or starts prepared-context
+         * restoration. `ProcessLocalComposition` rejects a live production
+         * distributed worker because no one rank can prove peer quiescence.
+         * This method is idempotent. It joins only the maintenance host thread;
+         * GPU and network completion is observed through non-blocking polls.
          */
-        void stopAndDrain();
+        void stopAndDrain(MoEOverlayMaintenanceDrainScope scope);
 
         /** @return Current worker lifecycle state. */
         [[nodiscard]] MoEOverlayMaintenanceState state() const noexcept;
@@ -243,12 +339,37 @@ namespace llaminar2
         [[nodiscard]] InferenceMeasurementReadiness
         measurementReadiness() const;
 
+        /**
+         * @brief Observe Dynamic economy and publication from their real owners.
+         *
+         * The snapshot is passive and never advances maintenance. In
+         * particular, it does not derive lifecycle state from PerfStats.
+         */
+        [[nodiscard]] MoEOptimizationStatus optimizationStatus() const;
+
     private:
+        /** @brief Stop and join this process-local worker with the mutex held. */
+        void stopLocalAndDrainLocked();
+
         /** @brief Worker entry that catches all failures and owns state progress. */
         void run(std::stop_token stop_token) noexcept;
 
         /** @brief Perform one non-blocking maintenance iteration. */
         void pollOnce(bool allow_new_proposal);
+
+        /**
+         * @brief Publish a demand boundary reconciled through one generation.
+         *
+         * The worker calls this only after `progressHistogramWindow()` reports
+         * no complete window. A concurrent notification advances
+         * `notifications_` without changing this generation, so public status
+         * remains non-quiescent until a later poll observes that notification.
+         *
+         * @param observed_progress_generation Notification generation captured
+         *        immediately before the authoritative histogram poll.
+         */
+        void publishReconciledWaitingState(
+            std::uint64_t observed_progress_generation) noexcept;
 
         /** @brief Start or retry the exact retained transaction. */
         void tryBeginRetainedTransaction();
@@ -256,9 +377,10 @@ namespace llaminar2
         /** @brief Progress coordinator publication or peer reception once. */
         void progressDistributedProposal();
 
-        /** @brief Derive and retain one exact coordinator-published proposal. */
+        /** @brief Validate and retain one exact coordinator-published proposal. */
         void retainDistributedProposal(
-            std::shared_ptr<const DecodeExpertHistogramWindow> window);
+            std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+                proposal);
 
         /** @brief Interpret progress for the authority-owned active wave. */
         void handleActiveWaveResult(
@@ -291,19 +413,22 @@ namespace llaminar2
 
         /* These transaction fields are owned exclusively by `worker_`. */
         MoEOverlayResidencyTransaction retained_transaction_;
-        bool has_retained_transaction_ = false;
-        bool active_wave_ = false;
+        MoEOverlayRetainedTransactionState retained_transaction_state_ =
+            MoEOverlayRetainedTransactionState::Empty;
         bool static_check_complete_ = false;
-        /** Coordinator-owned window retained until its MPI sends complete. */
-        std::shared_ptr<const DecodeExpertHistogramWindow>
-            publishing_histogram_window_;
+        /** Coordinator-owned proposal retained until its MPI sends complete. */
+        std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+            publishing_proposal_;
         /** True while coordinator sends or the peer's next Irecv is active. */
-        bool histogram_exchange_active_ = false;
+        bool proposal_exchange_active_ = false;
         /** Worker-local edge detector for the one immutable certificate. */
         bool economy_certification_observed_ = false;
         std::atomic<uint64_t> worker_starts_{0};
         std::atomic<uint64_t> poll_iterations_{0};
+        /** Published by inference/event producers before each wake. */
         std::atomic<uint64_t> notifications_{0};
+        /** Latest notification generation proved empty by the policy worker. */
+        std::atomic<uint64_t> reconciled_progress_generation_{0};
         std::atomic<uint64_t> economy_certification_polls_{0};
         std::atomic<uint64_t> economy_certifications_{0};
         std::atomic<uint64_t> device_service_snapshots_imported_{0};
@@ -313,9 +438,9 @@ namespace llaminar2
         std::atomic<uint64_t> committed_waves_{0};
         std::atomic<uint64_t> dynamic_no_movement_{0};
         std::atomic<uint64_t> static_no_movement_{0};
-        std::atomic<uint64_t> histogram_windows_published_{0};
-        std::atomic<uint64_t> histogram_windows_received_{0};
-        std::atomic<uint64_t> histogram_receives_rearmed_{0};
+        std::atomic<uint64_t> proposals_published_{0};
+        std::atomic<uint64_t> proposals_received_{0};
+        std::atomic<uint64_t> proposal_receives_rearmed_{0};
         std::atomic<uint64_t> fatal_failures_{0};
     };
 

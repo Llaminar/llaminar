@@ -1563,6 +1563,7 @@ namespace llaminar2::test::parity::qwen36
             "decode_step0_MTP0_MOE_ROUTER_OUTPUT.npy",
             "decode_step0_MTP0_MOE_ROUTING_INDICES.npy",
             "decode_step0_MTP0_MOE_ROUTING_WEIGHTS.npy",
+            "decode_step0_MTP0_MOE_ROUTE_CONTRIBUTIONS.npy",
             "decode_step0_MTP0_MOE_EXPERT_OUTPUT.npy",
             "decode_step0_MTP0_MOE_SHARED_EXPERT_OUTPUT.npy",
             "decode_step0_MTP0_MOE_SHARED_GATE_OUTPUT.npy",
@@ -1591,6 +1592,7 @@ namespace llaminar2::test::parity::qwen36
             "MOE_ROUTER_OUTPUT",
             "MOE_ROUTING_INDICES",
             "MOE_ROUTING_WEIGHTS",
+            "MOE_ROUTE_CONTRIBUTIONS",
             "MOE_EXPERT_OUTPUT",
             "MOE_SHARED_EXPERT_OUTPUT",
             "MOE_SHARED_GATE_OUTPUT",
@@ -5755,26 +5757,34 @@ namespace llaminar2::test::parity::qwen36
         if (artifact_recorder)
         {
             artifact_recorder->finalize();
-            const bool homogeneous_gpu =
-                test_case.topology ==
-                    MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly ||
-                test_case.topology ==
-                    MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly ||
-                (test_case.topology ==
-                     MoEPrefixParityTopology::SingleDevice &&
-                 moEPrefixCaseUsesGPU(test_case));
+            const ProductionParityExecutionTopology execution_topology =
+                classifyProductionParityExecutionTopology(test_case.devices);
             const ProductionParityEvidence production_evidence =
                 collectProductionParityEvidence(
                     production_records,
                     graph_execution,
-                    homogeneous_gpu,
+                    execution_topology,
+                    resolveProductionParityGraphContract(
+                        execution_topology,
+                        /*is_campaign_authority=*/true,
+                        moEPrefixCaseUsesGPU(test_case)),
                     /*model_context_reused=*/false,
                     std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - campaign_started_at)
                         .count());
-            EXPECT_TRUE(production_evidence.graph_execution)
-                << "Stochastic MTP parity did not execute the production graph runner";
-            if (homogeneous_gpu)
+            const ProductionParityGraphCertification graph_certification =
+                certifyProductionParityGraphExecution(production_evidence);
+            EXPECT_TRUE(
+                graph_certification ==
+                ProductionParityGraphCertification::Certified)
+                << "Stochastic MTP graph certification failed: topology='"
+                << productionParityExecutionTopologyName(execution_topology)
+                << "' result='"
+                << productionParityGraphCertificationName(graph_certification)
+                << "'.\n"
+                << PerfStatsCollector::summaryString(
+                       {"forward_graph", "mtp"});
+            if (production_evidence.usesHomogeneousGPU())
             {
                 EXPECT_TRUE(production_evidence.device_generation_controller)
                     << "Stochastic MTP parity published no device-generation controller evidence";
@@ -13401,9 +13411,6 @@ namespace llaminar2::test::parity::qwen36
         const bool campaign_model_context_enabled =
             mayReuseMoEMTPModelContext(test_case);
         bool mtp_model_context_reused = false;
-        double mtp_model_context_cache_hits = 0.0;
-        double mtp_model_context_cache_misses = 0.0;
-        double mtp_prepared_store_reuses = 0.0;
         std::string mtp_model_context_error;
         std::optional<ModelContextReuseContract> mtp_reuse_contract;
         if (campaign_model_context_enabled)
@@ -13427,8 +13434,29 @@ namespace llaminar2::test::parity::qwen36
                        : factory->createFromOrchestrationConfig(mtp_config);
         ASSERT_NE(mtp, nullptr);
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+        const ModelContextReuseStatus mtp_reuse_status =
+            mtp->modelContextReuseStatus();
         if (campaign_model_context_enabled)
         {
+            if (mtp_model_context_reused)
+            {
+                ASSERT_TRUE(mtp_reuse_status.reusedPreparedWeights())
+                    << "MTP campaign cache hit did not consume its typed "
+                       "prepared-weight reuse contract; imported="
+                    << mtp_reuse_status.imported_contract
+                    << " plan_validated="
+                    << mtp_reuse_status.prepared_weight_plan_validated
+                    << " prepared_entries="
+                    << mtp_reuse_status.prepared_entry_count
+                    << " generation="
+                    << mtp_reuse_status.authority_generation;
+            }
+            else
+            {
+                EXPECT_FALSE(mtp_reuse_status.imported_contract)
+                    << "The first MTP campaign cell unexpectedly consumed an "
+                       "imported model context";
+            }
             if (!mtp_model_context_reused)
             {
                 /*
@@ -13459,26 +13487,6 @@ namespace llaminar2::test::parity::qwen36
                 {{"depth", std::to_string(mtp_draft_tokens)},
                  {"policy", dynamic_depth ? "dynamic" : "fixed"}});
 
-            /*
-             * Capture construction evidence before an optional seed request.
-             * Prefix-restore cells reset PerfStats after seeding so their final
-             * CSVs certify only the restored request; runner-construction
-             * evidence belongs to this earlier lifecycle boundary.
-             */
-            const auto setup_records = PerfStatsCollector::snapshot(
-                {"mtp", "weight_loading"});
-            mtp_model_context_cache_hits = perfCounterSum(
-                setup_records,
-                "mtp",
-                "parity_campaign_model_context_cache_hits");
-            mtp_model_context_cache_misses = perfCounterSum(
-                setup_records,
-                "mtp",
-                "parity_campaign_model_context_cache_misses");
-            mtp_prepared_store_reuses = perfCounterSum(
-                setup_records,
-                "weight_loading",
-                "preloaded_prepared_weight_store_reuses");
         }
         LOG_INFO(
             "[Qwen36MoEMTPParity] model context source="
@@ -14121,29 +14129,6 @@ namespace llaminar2::test::parity::qwen36
         mtp->disableSnapshotCapture();
         mtp->shutdown();
 
-        if (campaign_model_context_enabled)
-        {
-            EXPECT_EQ(
-                mtp_model_context_cache_hits,
-                mtp_model_context_reused ? 1.0 : 0.0)
-                << "MTP campaign cache-hit telemetry disagrees with runner construction";
-            EXPECT_EQ(
-                mtp_model_context_cache_misses,
-                mtp_model_context_reused ? 0.0 : 1.0)
-                << "MTP campaign cache-miss telemetry disagrees with runner construction";
-            if (mtp_model_context_reused)
-            {
-                EXPECT_GT(mtp_prepared_store_reuses, 0.0)
-                    << "A campaign context hit did not contain prepared device weights "
-                       "before production runner initialization";
-            }
-            else
-            {
-                EXPECT_EQ(mtp_prepared_store_reuses, 0.0)
-                    << "The first campaign cell unexpectedly inherited prepared weights";
-            }
-        }
-
         ASSERT_EQ(baseline_tokens.size(), mtp_tokens.size())
             << "diagnostic CSVs:\n"
             << token_csv_path << '\n'
@@ -14436,34 +14421,34 @@ namespace llaminar2::test::parity::qwen36
 
         artifact_recorder.finalize();
 
-        const bool all_cuda = !test_case.devices.empty() && std::all_of(
-            test_case.devices.begin(),
-            test_case.devices.end(),
-            [](const GlobalDeviceAddress &device)
-            {
-                return device.isCUDA();
-            });
-        const bool all_rocm = !test_case.devices.empty() && std::all_of(
-            test_case.devices.begin(),
-            test_case.devices.end(),
-            [](const GlobalDeviceAddress &device)
-            {
-                return device.isROCm();
-            });
-        const bool homogeneous_gpu = all_cuda || all_rocm;
+        const ProductionParityExecutionTopology execution_topology =
+            classifyProductionParityExecutionTopology(test_case.devices);
         const ProductionParityEvidence production_evidence =
             collectProductionParityEvidence(
                 production_records,
                 graph_execution,
-                homogeneous_gpu,
+                execution_topology,
+                resolveProductionParityGraphContract(
+                    execution_topology,
+                    /*is_campaign_authority=*/true,
+                    moEPrefixCaseUsesGPU(test_case)),
                 mtp_model_context_reused,
                 std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - campaign_started_at)
                     .count());
 
-        EXPECT_TRUE(production_evidence.graph_execution)
-            << "MTP parity did not execute through the production graph runner";
-        if (homogeneous_gpu)
+        const ProductionParityGraphCertification graph_certification =
+            certifyProductionParityGraphExecution(production_evidence);
+        EXPECT_TRUE(
+            graph_certification ==
+            ProductionParityGraphCertification::Certified)
+            << "MTP graph certification failed: topology='"
+            << productionParityExecutionTopologyName(execution_topology)
+            << "' result='"
+            << productionParityGraphCertificationName(graph_certification)
+            << "'.\n"
+            << PerfStatsCollector::summaryString({"forward_graph", "mtp"});
+        if (production_evidence.usesHomogeneousGPU())
         {
             ASSERT_TRUE(PerfStatsCollector::isEnabled());
             EXPECT_TRUE(production_evidence.device_generation_controller)
@@ -14495,7 +14480,7 @@ namespace llaminar2::test::parity::qwen36
             production_evidence))
             << "Failed to write production_path.csv";
         // Timing remains part of production_path.csv, but the aggregate driver
-        // owns the one-hour whole-matrix decision. Finish every MTP cell so a
+        // owns the 75-minute whole-matrix decision. Finish every MTP cell so a
         // performance miss cannot truncate mathematical or CSV evidence.
     }
 

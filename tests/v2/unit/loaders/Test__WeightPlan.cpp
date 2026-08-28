@@ -12,8 +12,10 @@
 #include "config/TensorParallelConfig.h"
 #include "models/GraphTypes.h"
 #include "../../mocks/MockModelLoader.h"
+#include "../../utils/EmbeddingVerifierFormats.h"
 #include "tensors/Tensors.h"
 
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -291,6 +293,104 @@ TEST(Test__WeightManagerMaterialize,
         << "The shared-expert GEMM gate matrix must retain its native codebook";
     EXPECT_EQ(gate_matrix.tensor->shape(),
               (std::vector<size_t>{intermediate, hidden}));
+}
+
+/**
+ * @brief Prove derived input-gate storage survives runner retirement.
+ *
+ * Production campaigns reuse one ModelContext across matrix cells.  The first
+ * runner may release the raw GGUF bytes after device preparation, so a derived
+ * FP32 input gate cannot be owned solely by that runner's frozen bindings.
+ * Exercise the canonical floating-point and quantized model-weight inventory
+ * to ensure the lifetime contract is representation-independent.
+ */
+TEST(Test__WeightManagerMaterialize,
+     ModelOwnedFP32OverridesSurviveRawReleaseForEverySourceFormat)
+{
+    constexpr size_t hidden = 256;
+    const std::vector<size_t> shape{1, hidden};
+    size_t tested_formats = 0;
+
+    for (const auto &format : embeddingVerifierFormats())
+    {
+        auto source_unique = format.create(shape, 9000u + tested_formats);
+        ASSERT_TRUE(source_unique) << format.label;
+
+        /*
+         * Native FP32 already is the canonical model-owned representation and
+         * intentionally needs no derived override.  Every other loadable model
+         * format must pass through the same typed cache contract.
+         */
+        if (source_unique->native_type() == TensorType::FP32)
+            continue;
+
+        SCOPED_TRACE(format.label);
+        ++tested_formats;
+        std::shared_ptr<TensorBase> source(std::move(source_unique));
+        std::vector<float> expected(source->numel());
+        source->to_fp32(expected.data());
+
+        const std::string name = "blk.0.ffn_gate_inp_shexp.weight";
+        auto loader = MockModelLoaderBuilder()
+                          .addTensor(name, source)
+                          .build();
+        WeightManager manager(*loader);
+
+        InferenceStrategy strategy;
+        strategy.mode = WeightInferenceMode::SingleDevice;
+        strategy.model_id = ModelContextId{101};
+        strategy.devices = {DeviceId::cuda(0)};
+
+        WeightPlan plan(strategy);
+        WeightRequirement requirement;
+        requirement.canonical_name = name;
+        requirement.target_device = DeviceId::cuda(0);
+        requirement.lookup_device = DeviceId::cpu();
+        requirement.host_policy = WeightHostPolicy::ReleasableAfterPreparation;
+        plan.add(requirement);
+
+        std::weak_ptr<TensorBase> model_owned_override;
+        const TensorBase *first_override = nullptr;
+        {
+            FrozenModelWeightSet first = manager.materialize(plan);
+            const auto &binding = first.layer(0, "ffn_gate_inp_shexp.weight");
+            ASSERT_TRUE(binding.tensor_owner);
+            ASSERT_EQ(binding.tensor->native_type(), TensorType::FP32);
+            ASSERT_EQ(binding.tensor->shape(), shape);
+            ASSERT_EQ(
+                std::memcmp(
+                    binding.tensor->data(),
+                    expected.data(),
+                    expected.size() * sizeof(float)),
+                0)
+                << "Initial FP32 conversion changed arithmetic";
+            model_owned_override = binding.tensor_owner;
+            first_override = binding.tensor;
+        }
+
+        /* Runner-owned storage would expire at the end of the preceding scope. */
+        ASSERT_FALSE(model_owned_override.expired());
+        source->release_host_weight_data();
+        ASSERT_TRUE(source->is_raw_data_released());
+
+        FrozenModelWeightSet second = manager.materialize(plan);
+        const auto &binding = second.layer(0, "ffn_gate_inp_shexp.weight");
+        ASSERT_TRUE(binding.tensor_owner);
+        EXPECT_EQ(binding.tensor, first_override)
+            << "Rematerialization must acquire the same model-owned authority";
+        EXPECT_EQ(binding.tensor_owner.get(), first_override);
+        EXPECT_EQ(binding.tensor->native_type(), TensorType::FP32);
+        EXPECT_EQ(
+            std::memcmp(
+                binding.tensor->data(),
+                expected.data(),
+                expected.size() * sizeof(float)),
+            0)
+            << "Cached override changed after source release";
+    }
+
+    EXPECT_EQ(tested_formats, embeddingVerifierFormats().size() - 1u)
+        << "Every non-FP32 format in the canonical registry must be covered";
 }
 
 TEST(Test__WeightManagerMaterialize, ProducesTiedAliasBindingFromSourceName)

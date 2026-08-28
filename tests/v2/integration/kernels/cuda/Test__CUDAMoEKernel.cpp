@@ -6,6 +6,7 @@
 
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/common/FloatingExpertNumericalContract.h"
 #include "kernels/common/SamplingMath.h"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
@@ -50,6 +51,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -220,6 +222,26 @@ extern "C" bool cudaMoE_group_prefill_routes_runtime(
     int top_k,
     int filter_to_local_runtime_experts,
     int retain_routes_for_deferred_commit,
+    int device_idx,
+    void *stream);
+
+extern "C" bool cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
+    const float *routing_indices,
+    const float *routing_weights,
+    void *runtime,
+    int *original_to_grouped,
+    llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+    llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+    llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+    int *active_expert_ids,
+    int current_slots,
+    int max_slots,
+    int num_experts,
+    int top_k,
+    int max_active_experts,
+    int filter_to_local_runtime_experts,
+    int retain_routes_for_deferred_commit,
+    llaminar2::DeviceMoEWeightFormat expected_format,
     int device_idx,
     void *stream);
 
@@ -642,7 +664,9 @@ namespace
             std::string operation,
             int device_ordinal = 0,
             llaminar2::GraphCaptureDependencyLedger *dependency_ledger = nullptr)
-            : graph_(stream, device_ordinal),
+            : stream_(stream),
+              device_ordinal_(device_ordinal),
+              graph_(stream, device_ordinal),
               transaction_(graph_, std::move(operation), dependency_ledger)
         {
             if (!transaction_.begin())
@@ -690,7 +714,42 @@ namespace
             return graph_.launch();
         }
 
+        /**
+         * @brief Launch one replay and publish its tensor outputs on the graph stream.
+         *
+         * Kernel facades deliberately suppress per-stage completion events while
+         * recording a graph.  The graph owner is therefore responsible for
+         * publishing the completed replay generation after launch.  Keeping that
+         * transition in this fixture prevents a test from accidentally treating a
+         * raw graph launch as an observable tensor publication.
+         *
+         * @param outputs Exact tensor outputs written by this replay.
+         * @return true after launch and event-backed publication of every output.
+         * @throws std::invalid_argument when an output is null.
+         */
+        [[nodiscard]] bool launchAndPublishOutputs(
+            std::initializer_list<llaminar2::ITensor *> outputs)
+        {
+            if (!graph_.launch())
+                return false;
+            for (llaminar2::ITensor *output : outputs)
+            {
+                if (!output)
+                {
+                    throw std::invalid_argument(
+                        "ScopedCudaTestGraph cannot publish a null graph output");
+                }
+                llaminar2::TransferEngine::publishDeviceWrite(
+                    output,
+                    llaminar2::DeviceId::cuda(device_ordinal_),
+                    stream_);
+            }
+            return true;
+        }
+
     private:
+        cudaStream_t stream_ = nullptr;
+        int device_ordinal_ = 0;
         llaminar2::CUDAGraphCapture graph_;
         llaminar2::ScopedBackendGraphCapture transaction_;
     };
@@ -736,11 +795,7 @@ namespace
 
         ~ScopedCudaDeviceStream()
         {
-            if (stream_)
-            {
-                (void)cudaSetDevice(device_ordinal_);
-                (void)cudaStreamDestroy(stream_);
-            }
+            (void)destroy();
         }
 
         ScopedCudaDeviceStream(const ScopedCudaDeviceStream &) = delete;
@@ -749,10 +804,69 @@ namespace
         cudaError_t status() const { return status_; }
         cudaStream_t get() const { return stream_; }
 
+        /**
+         * @brief Destroy the stream now and make later destruction idempotent.
+         * @return CUDA status from selecting the device or destroying the stream.
+         */
+        cudaError_t destroy()
+        {
+            if (!stream_)
+                return cudaSuccess;
+            cudaError_t result = cudaSetDevice(device_ordinal_);
+            if (result == cudaSuccess)
+                result = cudaStreamDestroy(stream_);
+            if (result == cudaSuccess)
+                stream_ = nullptr;
+            return result;
+        }
+
     private:
         int device_ordinal_ = 0;
         cudaStream_t stream_ = nullptr;
         cudaError_t status_ = cudaSuccess;
+    };
+
+    /**
+     * @brief Retire borrowed histogram streams before a focused test unwinds.
+     *
+     * Assertions can return from a test body before its explicit lifecycle
+     * checks finish. This guard preserves the production ownership order in
+     * that failure path: it retires the table while fixture/local streams still
+     * exist, then ordinary reverse destruction may release the table.
+     */
+    class ScopedRuntimeHistogramProducerRetirement final
+    {
+    public:
+        explicit ScopedRuntimeHistogramProducerRetirement(
+            llaminar2::DeviceMoERuntimeTable &table) noexcept
+            : table_(&table)
+        {
+        }
+
+        ~ScopedRuntimeHistogramProducerRetirement()
+        {
+            if (!table_)
+                return;
+            try
+            {
+                table_->retireRuntimeHistogramProducerStreams();
+            }
+            catch (...)
+            {
+                std::terminate();
+            }
+        }
+
+        ScopedRuntimeHistogramProducerRetirement(
+            const ScopedRuntimeHistogramProducerRetirement &) = delete;
+        ScopedRuntimeHistogramProducerRetirement &operator=(
+            const ScopedRuntimeHistogramProducerRetirement &) = delete;
+
+        /** @brief Disarm the guard after explicit retirement succeeds. */
+        void dismiss() noexcept { table_ = nullptr; }
+
+    private:
+        llaminar2::DeviceMoERuntimeTable *table_ = nullptr;
     };
 #endif
 
@@ -7649,27 +7763,439 @@ TEST_F(Test__CUDAMoEKernel,
     llaminar2::DeviceMoERuntimeTable table(config);
     table.enableAsyncDecodeHistogramDrain(
         llaminar2::kAllRuntimeExpertHistogramSources);
+    void *const publication_stream =
+        table.groupedVerifierHistogramPublicationStream();
+    ASSERT_NE(publication_stream, nullptr);
+    ASSERT_NE(publication_stream, stream_);
 
     EXPECT_THROW(
         table.recordDecodeHistogramProducerStream(stream_),
         std::logic_error);
-    ASSERT_NO_THROW(
-        table.prepareDecodeHistogramProducerStream(stream_));
+
+    llaminar2::DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = 1;
+    histogram_config.num_experts = 4;
+    histogram_config.top_k = 2;
+    histogram_config.window_size = 8;
+    histogram_config.sockets = {
+        llaminar2::DeviceId(llaminar2::DeviceType::CPU, 0)};
+    histogram_config.ownership =
+        llaminar2::MoELayeredExpertOwnership::uniform(
+            1, 1, std::vector<int>(4, 0));
+    llaminar2::DecodeExpertHistogram histogram(histogram_config);
+    const auto drain = table.progressAsyncDecodeHistogramDrain(histogram);
+    ASSERT_EQ(
+        drain.progress,
+        llaminar2::RuntimeExpertHistogramDrainProgress::Pending)
+        << drain.error;
+
+    /* This reproduces the production ordering: maintenance seals before the
+     * accepted-state graph is first materialized. Its pre-admitted stream must
+     * remain legal, while a genuinely late identity remains fatal. */
+    EXPECT_THROW(
+        table.prepareDecodeHistogramProducerStream(stream_),
+        std::logic_error);
 
     CudaAllocation graph_witness(sizeof(uint32_t));
     ScopedCudaTestGraph graph(
-        stream_,
-        "async histogram producer pre-capture admission");
+        static_cast<cudaStream_t>(publication_stream),
+        "pre-admitted histogram publication after topology seal");
     ASSERT_NO_THROW(
-        table.recordDecodeHistogramProducerStream(stream_));
+        table.recordDecodeHistogramProducerStream(publication_stream));
     ASSERT_EQ(
         cudaMemsetAsync(
-            graph_witness.get(), 0xa5, sizeof(uint32_t), stream_),
+            graph_witness.get(),
+            0xa5,
+            sizeof(uint32_t),
+            static_cast<cudaStream_t>(publication_stream)),
         cudaSuccess);
     ASSERT_TRUE(graph.finishAndInstantiate());
     ASSERT_TRUE(graph.launch());
+    ASSERT_EQ(
+        cudaStreamSynchronize(
+            static_cast<cudaStream_t>(publication_stream)),
+        cudaSuccess);
+    EXPECT_EQ(
+        table.decodeHistogramProducerStream(), publication_stream);
+#endif
+}
+
+/**
+ * @brief Prove CUDA histogram retirement severs borrowed stream lifetimes.
+ *
+ * Production destroys graph/device contexts before the model graph builder.
+ * The runtime table must therefore join its exact producer while that stream
+ * is live, erase the borrowed identity, and remain safely destructible after
+ * the external owner destroys the stream. This ordering reproduces the
+ * Dynamic campaign teardown edge without loading model weights.
+ */
+TEST_F(Test__CUDAMoEKernel,
+       BorrowedHistogramProducerRetiresBeforeExternalStreamDestruction)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    ScopedCudaDeviceStream producer_stream(/*device_ordinal=*/0);
+    ASSERT_EQ(producer_stream.status(), cudaSuccess);
+
+    llaminar2::DeviceMoERuntimeTable::Config config;
+    config.device_id = llaminar2::DeviceId::cuda(0);
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.mirror_to_device = true;
+    auto table =
+        std::make_unique<llaminar2::DeviceMoERuntimeTable>(config);
+    ScopedRuntimeHistogramProducerRetirement histogram_retirement(*table);
+
+    table->enableAsyncDecodeHistogramDrain(
+        llaminar2::kAllRuntimeExpertHistogramSources);
+    ASSERT_NO_THROW(
+        table->prepareDecodeHistogramProducerStream(producer_stream.get()));
+    ASSERT_NO_THROW(
+        table->recordDecodeHistogramProducerStream(producer_stream.get()));
+
+    CudaAllocation queued_work(sizeof(uint32_t));
+    ASSERT_EQ(
+        cudaMemsetAsync(
+            queued_work.get(),
+            0x5a,
+            sizeof(uint32_t),
+            producer_stream.get()),
+        cudaSuccess);
+
+    ASSERT_NO_THROW(table->retireRuntimeHistogramProducerStreams());
+    ASSERT_NO_THROW(table->retireRuntimeHistogramProducerStreams())
+        << "Producer retirement must be an idempotent terminal transition";
+    EXPECT_EQ(table->decodeHistogramProducerStream(), nullptr);
+    EXPECT_THROW(
+        table->recordDecodeHistogramProducerStream(producer_stream.get()),
+        std::logic_error);
+    histogram_retirement.dismiss();
+
+    ASSERT_EQ(producer_stream.destroy(), cudaSuccess);
+    table.reset();
+#endif
+}
+
+/**
+ * @brief Replay captured service telemetry while histogram rows are quarantined.
+ *
+ * The external histogram selector is a typed writer state: bit zero selects
+ * the physical RCU bank and bit one closes row admission during certification.
+ * Service telemetry observes counters without publishing rows, so it must mask
+ * the admission bit and continue reading the selected bank.  This regression
+ * drives the real asynchronous rotation to state three (bank one,
+ * quarantined), then replays the production CUDA telemetry kernels from an
+ * immutable graph. Treating the encoded state as a bare bank ordinal traps the
+ * replay and fails the exact stream synchronization below.
+ */
+TEST_F(Test__CUDAMoEKernel,
+       CapturedServiceTelemetryAcceptsQuarantinedHistogramWriterState)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int kNumLayers = 1;
+    constexpr int kNumExperts = 4;
+    constexpr int kTopK = 2;
+
+    llaminar2::DeviceMoERuntimeTable::Config table_config;
+    table_config.device_id = llaminar2::DeviceId::cuda(0);
+    table_config.num_layers = kNumLayers;
+    table_config.num_experts = kNumExperts;
+    table_config.top_k = kTopK;
+    table_config.mirror_to_device = true;
+    table_config.collect_overlay_service_telemetry = true;
+    llaminar2::DeviceMoERuntimeTable table(table_config);
+    ScopedRuntimeHistogramProducerRetirement histogram_retirement(table);
+    table.enableAsyncDecodeHistogramDrain(
+        llaminar2::kAllRuntimeExpertHistogramSources);
+    ASSERT_NO_THROW(table.prepareDecodeHistogramProducerStream(stream_));
+
+    auto *const telemetry = table.deviceOverlayServiceTelemetry();
+    auto *const sample = table.deviceOverlayServiceTelemetrySample(0);
+    ASSERT_NE(telemetry, nullptr);
+    ASSERT_NE(sample, nullptr);
+
+    const llaminar2::MoEKernelLaunchContext launch{
+        .stream = stream_,
+        .workspace = nullptr,
+    };
+    ScopedCudaTestGraph graph(
+        stream_, "quarantined histogram service telemetry");
+    ASSERT_TRUE(cuda_kernel_->beginMoEOverlayServiceTelemetry(
+        launch, sample));
+    ASSERT_TRUE(cuda_kernel_->finishMoEOverlayServiceTelemetry(
+        launch,
+        table.deviceLayerState(0),
+        telemetry,
+        sample,
+        kNumExperts,
+        llaminar2::MoEOverlayServicePhaseHint::Decode,
+        /*runtime_graph_role=*/nullptr));
+    ASSERT_TRUE(graph.finishAndInstantiate());
+
+    ASSERT_TRUE(graph.launch());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
-    EXPECT_EQ(table.decodeHistogramProducerStream(), stream_);
+
+    llaminar2::DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = kNumLayers;
+    histogram_config.num_experts = kNumExperts;
+    histogram_config.top_k = kTopK;
+    histogram_config.window_size = 8;
+    histogram_config.sockets = {
+        llaminar2::DeviceId(llaminar2::DeviceType::CPU, 0)};
+    histogram_config.ownership =
+        llaminar2::MoELayeredExpertOwnership::uniform(
+            kNumLayers,
+            1,
+            std::vector<int>(kNumExperts, 0));
+    llaminar2::DecodeExpertHistogram histogram(histogram_config);
+    histogram.beginOptimizationDemandRebase();
+
+    bool drain_ready = false;
+    for (int poll = 0; poll < 100000 && !drain_ready; ++poll)
+    {
+        const auto result =
+            table.progressAsyncDecodeHistogramDrain(histogram);
+        ASSERT_NE(
+            result.progress,
+            llaminar2::RuntimeExpertHistogramDrainProgress::Failed)
+            << result.error;
+        drain_ready =
+            result.progress ==
+            llaminar2::RuntimeExpertHistogramDrainProgress::Ready;
+        if (!drain_ready)
+            std::this_thread::yield();
+    }
+    ASSERT_TRUE(drain_ready)
+        << "Quarantined histogram generation did not finish rotating";
+
+    /* The writer state is now encoded as bank-one plus quarantine (3). */
+    ASSERT_TRUE(graph.launch());
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+#endif
+}
+
+/**
+ * @brief Replay one retained route graph across every histogram admission phase.
+ *
+ * Production captures routing while calibration evidence is admitted, rotates
+ * its external histogram bank into certification quarantine, and opens live
+ * optimization demand only at the next public request boundary.  The graph
+ * retains the runtime-table pointer across all three phases; only the small
+ * device-owned writer state changes.  This regression proves that the state
+ * publication is an event-ordered data transition rather than a reason to
+ * recapture, and that quarantined rows are discarded without corrupting the
+ * selected bank or trapping a later replay.
+ */
+TEST_F(Test__CUDAMoEKernel,
+       CapturedRouteSurvivesHistogramAdmissionTransitions)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int kNumLayers = 1;
+    constexpr int kNumExperts = 4;
+    constexpr int kTopK = 2;
+    constexpr int kDModel = 4;
+    constexpr int kPrefillTokens = 4;
+    constexpr int kPrefillSlots = kPrefillTokens * kTopK;
+
+    llaminar2::DeviceMoERuntimeTable::Config table_config;
+    table_config.device_id = llaminar2::DeviceId::cuda(0);
+    table_config.num_layers = kNumLayers;
+    table_config.num_experts = kNumExperts;
+    table_config.top_k = kTopK;
+    table_config.mirror_to_device = true;
+    table_config.prefill_token_capacity = kPrefillTokens;
+    llaminar2::DeviceMoERuntimeTable table(table_config);
+    ScopedRuntimeHistogramProducerRetirement histogram_retirement(table);
+
+    llaminar2::MoEPlacementUpdate placement;
+    placement.epoch = 1;
+    placement.expert_count = kNumExperts;
+    placement.experts.resize(kNumExperts);
+    /* Routing evidence is independent of expert payload residency. Keeping
+     * every expert remote avoids introducing prepared-weight fixtures into a
+     * lifecycle test whose only subject is the retained routing graph. */
+    placement.local_compute_mask.assign(kNumExperts, 0);
+    placement.replica_role.assign(kNumExperts, 0);
+    for (int expert = 0; expert < kNumExperts; ++expert)
+        placement.experts[static_cast<std::size_t>(expert)]
+            .logical_expert_id = expert;
+    ASSERT_TRUE(table.prepareInactiveBank(0, placement));
+    ASSERT_TRUE(table.flipActiveBank(0, placement.epoch, stream_));
+
+    table.enableAsyncDecodeHistogramDrain(
+        llaminar2::kAllRuntimeExpertHistogramSources);
+    ASSERT_NO_THROW(table.prepareDecodeHistogramProducerStream(stream_));
+
+    llaminar2::DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = kNumLayers;
+    histogram_config.num_experts = kNumExperts;
+    histogram_config.top_k = kTopK;
+    histogram_config.window_size = 32;
+    histogram_config.sockets = {
+        llaminar2::DeviceId(llaminar2::DeviceType::CPU, 0)};
+    histogram_config.ownership =
+        llaminar2::MoELayeredExpertOwnership::uniform(
+            kNumLayers,
+            1,
+            std::vector<int>(kNumExperts, 0));
+    llaminar2::DecodeExpertHistogram histogram(histogram_config);
+    histogram.registerRuntimeHistogramAdmission(
+        [&table](llaminar2::RuntimeExpertHistogramAdmission admission)
+        { return table.publishAsyncDecodeHistogramAdmission(admission); });
+
+    auto hidden = makeTensor({1, kDModel}, {0.2f, -0.1f, 0.3f, 0.5f});
+    auto gate = makeTensor(
+        {kNumExperts, kDModel},
+        {0.1f, 0.2f, 0.3f, 0.4f,
+         -0.2f, 0.0f, 0.1f, 0.2f,
+         0.5f, -0.3f, 0.2f, -0.1f,
+         -0.4f, 0.6f, -0.2f, 0.3f});
+    auto indices = makeZeros({1, kTopK});
+    auto weights = makeZeros({1, kTopK});
+    const auto cuda_device = llaminar2::DeviceId::cuda(0);
+    ASSERT_TRUE(hidden->ensureOnDevice(cuda_device, stream_));
+    ASSERT_TRUE(gate->ensureOnDevice(cuda_device, stream_));
+    ASSERT_TRUE(indices->ensureOnDevice(cuda_device, stream_));
+    ASSERT_TRUE(weights->ensureOnDevice(cuda_device, stream_));
+
+    /* Materialize persistent routing scratch before capture without adding
+     * evidence to the generation that the captured graph will own. */
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        table.deviceLayerState(0), hidden.get(), gate.get(), kDModel,
+        kNumExperts, kTopK, /*normalize_weights=*/true, indices.get(),
+        weights.get(), /*write_float_indices=*/true,
+        /*update_runtime_histogram=*/false, nullptr,
+        llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    ScopedCudaTestGraph graph(
+        stream_, "runtime histogram admission lifecycle");
+    ASSERT_NO_THROW(table.recordDecodeHistogramProducerStream(stream_));
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        table.deviceLayerState(0), hidden.get(), gate.get(), kDModel,
+        kNumExperts, kTopK, /*normalize_weights=*/true, indices.get(),
+        weights.get(), /*write_float_indices=*/true,
+        /*update_runtime_histogram=*/true, nullptr,
+        llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
+    ASSERT_TRUE(graph.finishAndInstantiate());
+
+    /* Capture the complete grouped-prefill plan publisher separately. This is
+     * the multi-row production kernel used by the failing ExpertOverlay
+     * segment: it consumes the same runtime pointer, groups final routes,
+     * materializes descriptor tables, and publishes prefill demand. Dummy
+     * descriptor destinations are sufficient because this lifecycle test
+     * keeps every expert remote and does not launch expert GEMMs. */
+    auto prefill_indices = makeTensor(
+        {kPrefillTokens, kTopK},
+        {0.0f, 1.0f, 1.0f, 2.0f, 2.0f, 3.0f, 3.0f, 0.0f});
+    auto prefill_weights = makeTensor(
+        {kPrefillTokens, kTopK},
+        {0.6f, 0.4f, 0.7f, 0.3f, 0.8f, 0.2f, 0.55f, 0.45f});
+    ASSERT_TRUE(prefill_indices->ensureOnDevice(cuda_device, stream_));
+    ASSERT_TRUE(prefill_weights->ensureOnDevice(cuda_device, stream_));
+    CudaAllocation original_to_grouped(
+        static_cast<std::size_t>(kPrefillSlots) * sizeof(int));
+    CudaAllocation gate_descs(
+        static_cast<std::size_t>(kNumExperts) *
+        sizeof(llaminar2::DeviceNativeVNNIMatrixDesc));
+    CudaAllocation up_descs(
+        static_cast<std::size_t>(kNumExperts) *
+        sizeof(llaminar2::DeviceNativeVNNIMatrixDesc));
+    CudaAllocation down_descs(
+        static_cast<std::size_t>(kNumExperts) *
+        sizeof(llaminar2::DeviceNativeVNNIMatrixDesc));
+    CudaAllocation active_expert_ids(
+        static_cast<std::size_t>(kNumExperts) * sizeof(int));
+
+    ScopedCudaTestGraph prefill_graph(
+        stream_, "runtime histogram prefill admission lifecycle");
+    ASSERT_NO_THROW(table.recordDecodeHistogramProducerStream(stream_));
+    ASSERT_TRUE(cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
+        static_cast<const float *>(prefill_indices->gpu_data_ptr()),
+        static_cast<const float *>(prefill_weights->gpu_data_ptr()),
+        table.deviceLayerState(0),
+        static_cast<int *>(original_to_grouped.get()),
+        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(gate_descs.get()),
+        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(up_descs.get()),
+        static_cast<llaminar2::DeviceNativeVNNIMatrixDesc *>(down_descs.get()),
+        static_cast<int *>(active_expert_ids.get()),
+        kPrefillSlots,
+        kPrefillSlots,
+        kNumExperts,
+        kTopK,
+        kNumExperts,
+        /*filter_to_local_runtime_experts=*/1,
+        /*retain_routes_for_deferred_commit=*/0,
+        llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+        /*device_idx=*/0,
+        stream_));
+    ASSERT_TRUE(prefill_graph.finishAndInstantiate());
+
+    const auto drain_one_generation = [&]()
+    {
+        for (int poll = 0; poll < 100000; ++poll)
+        {
+            auto result = table.progressAsyncDecodeHistogramDrain(histogram);
+            if (result.progress ==
+                llaminar2::RuntimeExpertHistogramDrainProgress::Ready)
+                return;
+            ASSERT_NE(
+                result.progress,
+                llaminar2::RuntimeExpertHistogramDrainProgress::Failed)
+                << result.error;
+            std::this_thread::yield();
+        }
+        FAIL() << "Asynchronous runtime histogram drain did not complete";
+    };
+    const auto selected_total = [&]()
+    {
+        uint64_t total = 0;
+        for (int expert = 0; expert < kNumExperts; ++expert)
+            total += histogram.activationCount(0, expert);
+        return total;
+    };
+
+    /* The rebase deliberately drains and discards calibration evidence while
+     * host admission is quarantined. It establishes an empty live baseline,
+     * rather than letting setup traffic influence placement economics. */
+    ASSERT_TRUE(graph.launch());
+    ASSERT_TRUE(prefill_graph.launch());
+    histogram.beginOptimizationDemandRebase();
+    drain_one_generation();
+    ASSERT_EQ(selected_total(), 0u);
+
+    /* The identical retained graph now observes quarantine. Its rows must not
+     * enter either bank, and replay must remain a valid captured operation. */
+    ASSERT_TRUE(graph.launch());
+    ASSERT_TRUE(prefill_graph.launch());
+    drain_one_generation();
+    ASSERT_EQ(selected_total(), 0u);
+
+    /* Request-boundary activation reopens the current bank. A third replay is
+     * merged exactly once without changing the graph executable. */
+    histogram.activateOptimizationDemand();
+    ASSERT_TRUE(graph.launch());
+    ASSERT_TRUE(prefill_graph.launch());
+    drain_one_generation();
+    ASSERT_EQ(
+        selected_total(),
+        static_cast<uint64_t>(kTopK + kPrefillSlots));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 #endif
 }
 
@@ -7716,6 +8242,7 @@ TEST_F(Test__CUDAMoEKernel,
         cuda_config.num_experts = num_experts;
         cuda_config.top_k = top_k;
         cuda_config.mirror_to_device = true;
+        cuda_config.prefill_token_capacity = 1;
         DeviceMoERuntimeTable cuda_table(cuda_config);
 
         llaminar2::MoEPlacementUpdate update;
@@ -7744,6 +8271,9 @@ TEST_F(Test__CUDAMoEKernel,
         auto gate = makeTensor({num_experts, d_model}, gate_values);
         auto cuda_indices = makeZeros({seq_len, top_k});
         auto cuda_weights = makeZeros({seq_len, top_k});
+
+        prepareRouteTensorStorage(
+            hidden.get(), gate.get(), cuda_indices.get(), cuda_weights.get());
 
         ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
             cuda_table.deviceLayerState(0), hidden.get(), gate.get(), d_model, num_experts, top_k,
@@ -7807,6 +8337,7 @@ TEST_F(Test__CUDAMoEKernel,
         cuda_config.num_experts = num_experts;
         cuda_config.top_k = top_k;
         cuda_config.mirror_to_device = true;
+        cuda_config.prefill_token_capacity = 1;
         DeviceMoERuntimeTable cuda_table(cuda_config);
 
         llaminar2::MoEPlacementUpdate update;
@@ -7835,11 +8366,16 @@ TEST_F(Test__CUDAMoEKernel,
         auto cuda_weights = makeZeros({seq_len, top_k});
 
         const auto cuda_device = llaminar2::DeviceId::cuda(0);
-        ASSERT_TRUE(hidden->ensureOnDevice(cuda_device, stream_));
-        ASSERT_TRUE(gate->ensureOnDevice(cuda_device, stream_));
-        ASSERT_TRUE(cuda_indices->ensureOnDevice(cuda_device, stream_));
-        ASSERT_TRUE(cuda_weights->ensureOnDevice(cuda_device, stream_));
-        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        prepareRouteTensorStorage(
+            hidden.get(), gate.get(), cuda_indices.get(), cuda_weights.get());
+        /* External setup publications must be joined to this exact consumer
+         * stream before capture begins. The test is about the missing Q8
+         * preparation, so leave only that intended lifecycle defect inside
+         * the captured call. */
+        ASSERT_NO_THROW(llaminar2::TransferEngine::requireDeviceInput(
+            hidden.get(), cuda_device, stream_));
+        ASSERT_NO_THROW(llaminar2::TransferEngine::requireDeviceInput(
+            gate.get(), cuda_device, stream_));
 
         llaminar2::GraphCaptureGuard guard;
         EXPECT_FALSE(cuda_kernel_->decodeRouteSelect(
@@ -7883,6 +8419,7 @@ TEST_F(Test__CUDAMoEKernel,
         cuda_config.num_experts = num_experts;
         cuda_config.top_k = top_k;
         cuda_config.mirror_to_device = true;
+        cuda_config.prefill_token_capacity = 1;
         DeviceMoERuntimeTable cuda_table(cuda_config);
 
         llaminar2::MoEPlacementUpdate update;
@@ -7905,6 +8442,9 @@ TEST_F(Test__CUDAMoEKernel,
         auto cuda_indices = makeZeros({seq_len, top_k});
         auto cuda_weights = makeZeros({seq_len, top_k});
 
+        prepareRouteTensorStorage(
+            hidden.get(), gate.get(), cuda_indices.get(), cuda_weights.get());
+
         EXPECT_FALSE(cuda_kernel_->decodeRouteSelect(
             cuda_table.deviceLayerState(0), hidden.get(), gate.get(), d_model, num_experts, top_k,
             false, cuda_indices.get(), cuda_weights.get(), true, true, nullptr,
@@ -7912,6 +8452,84 @@ TEST_F(Test__CUDAMoEKernel,
         ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 #endif
     }
+
+TEST_F(Test__CUDAMoEKernel,
+       CompleteInitialRuntimePublicationCoversDormantRetainedLayer)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using llaminar2::DeviceMoELayerRuntime;
+    using llaminar2::DeviceMoERuntimeTable;
+    constexpr int kLayers = 2;
+    DeviceMoERuntimeTable::Config table_config;
+    table_config.device_id = llaminar2::DeviceId::cuda(0);
+    table_config.num_layers = kLayers;
+    table_config.num_experts = 4;
+    table_config.top_k = 2;
+    table_config.mirror_to_device = true;
+    DeviceMoERuntimeTable runtime_table(table_config);
+
+    for (int layer = 0; layer < kLayers; ++layer)
+    {
+        auto update = makeParticipantOneBaseUpdate(/*epoch=*/1);
+        ASSERT_TRUE(runtime_table.prepareInactiveBank(layer, update));
+        ASSERT_TRUE(runtime_table.flipActiveBank(
+            layer, update.epoch, stream_));
+    }
+
+    /* The first capture is a construction checkpoint, not the family seal.
+     * Revise the retained layer so the test proves final publication cannot
+     * resurrect an older, otherwise-valid setup generation. */
+    auto revised_retained = makeParticipantOneBaseUpdate(/*epoch=*/2);
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(1, revised_retained));
+    ASSERT_TRUE(runtime_table.flipActiveBank(
+        1, revised_retained.epoch, stream_));
+    ASSERT_TRUE(runtime_table.hasCompleteInitialRuntimeState());
+
+    /* Model an unlaunched retained NextN graph: its host recipe exists, but
+     * the live device slot has never received that setup publication. */
+    ASSERT_EQ(
+        cudaMemsetAsync(
+            runtime_table.deviceLayerState(1),
+            0,
+            sizeof(DeviceMoELayerRuntime),
+            stream_),
+        cudaSuccess);
+    runtime_table.sealAndPublishCompleteInitialRuntimeState(stream_);
+
+    std::array<DeviceMoELayerRuntime, kLayers> observed{};
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            observed.data(),
+            runtime_table.deviceLayerState(0),
+            sizeof(observed),
+            cudaMemcpyDeviceToHost,
+            stream_),
+        cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    for (int layer = 0; layer < kLayers; ++layer)
+    {
+        SCOPED_TRACE("layer=" + std::to_string(layer));
+        const auto &runtime = observed[static_cast<size_t>(layer)];
+        EXPECT_EQ(runtime.active_epoch, layer == 1 ? 2u : 1u);
+        EXPECT_EQ(runtime.expert_count, 4u);
+        EXPECT_EQ(runtime.top_k, 2u);
+        EXPECT_EQ(runtime.participant_id, 1u);
+        EXPECT_EQ(runtime.participant_count, 3u);
+        ASSERT_LE(runtime.active_bank, 1u);
+        EXPECT_EQ(
+            runtime.banks[runtime.active_bank].epoch,
+            layer == 1 ? 2u : 1u);
+    }
+    EXPECT_THROW(
+        runtime_table.sealAndPublishCompleteInitialRuntimeState(stream_),
+        std::logic_error);
+#endif
+}
 
 TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPublishesRuntimeBankOnStream)
     {
@@ -8407,7 +9025,8 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansMissingReplicaArrivals
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansCapacityReleasingDynamicOwnershipTransfers)
+TEST_F(Test__CUDAMoEKernel,
+       DeviceRebalanceDeferredPlannerUsesScratchAndPlansCapacityReleasingOwnershipTransfers)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -8442,6 +9061,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansCapacityReleasingDynam
     config.active_transfer_slot_capacity = 1;
     config.transfer_slot_directory_capacity = 1;
     config.flags = 0;
+    config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::HotReplicaCache);
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::PlanMissingArrivals);
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::CollectLoadStats);
     config.flags |= static_cast<uint32_t>(llaminar2::DeviceMoERebalanceFlags::DeferRuntimeApply);
@@ -8470,6 +9090,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansCapacityReleasingDynam
     llaminar2::DeviceMoERebalanceCommandBufferHeader *d_command_header = nullptr;
     llaminar2::DeviceMoERebalanceWaveState *d_wave_state = nullptr;
     llaminar2::DeviceMoERebalanceGraphControllerState *d_controller_state = nullptr;
+    llaminar2::DeviceMoEPlacementBank *d_placement_plan_scratch = nullptr;
     const auto controller_state = makeControllerDueOnNextBoundary(config);
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered),
                          gathered.size() * sizeof(uint64_t)),
@@ -8492,6 +9113,9 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansCapacityReleasingDynam
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_controller_state),
                          sizeof(controller_state)),
               cudaSuccess);
+    ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_placement_plan_scratch),
+                         sizeof(llaminar2::DeviceMoEPlacementBank)),
+              cudaSuccess);
     ASSERT_EQ(cudaMemcpyAsync(d_gathered, gathered.data(),
                               gathered.size() * sizeof(uint64_t),
                               cudaMemcpyHostToDevice, stream_),
@@ -8501,6 +9125,13 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansCapacityReleasingDynam
                               sizeof(controller_state),
                               cudaMemcpyHostToDevice,
                               stream_),
+              cudaSuccess);
+
+    llaminar2::DeviceMoELayerRuntime runtime_before{};
+    ASSERT_EQ(cudaMemcpy(&runtime_before,
+                         runtime_table.deviceLayerState(0),
+                         sizeof(runtime_before),
+                         cudaMemcpyDeviceToHost),
               cudaSuccess);
 
     ASSERT_TRUE(cuda_kernel_->runDeviceRebalanceController(
@@ -8515,7 +9146,12 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansCapacityReleasingDynam
         1,
         d_command_header,
         d_wave_state,
-        d_controller_state));
+        d_controller_state,
+        1u,
+        nullptr,
+        0u,
+        nullptr,
+        d_placement_plan_scratch));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceStatus status;
@@ -8569,6 +9205,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansCapacityReleasingDynam
     EXPECT_EQ(plan[0].expert, 1u);
     EXPECT_EQ(plan[0].source_participant, 0u);
     EXPECT_EQ(plan[0].destination_participant, 1u);
+    EXPECT_EQ(plan[0].destination_overlay_participant, 1);
     EXPECT_EQ(plan[0].source_resident_mask, 0b01u);
     EXPECT_EQ(plan[0].destination_slot, 0u);
     EXPECT_EQ(plan[0].payload_slot, 0u);
@@ -8577,6 +9214,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansCapacityReleasingDynam
     EXPECT_EQ(plan[1].expert, 3u);
     EXPECT_EQ(plan[1].source_participant, 1u);
     EXPECT_EQ(plan[1].destination_participant, 0u);
+    EXPECT_EQ(plan[1].destination_overlay_participant, 0);
     EXPECT_EQ(plan[1].source_resident_mask, 0b10u);
     EXPECT_EQ(plan[1].destination_slot, 0u);
     EXPECT_EQ(plan[1].payload_slot, 0u);
@@ -8586,6 +9224,13 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansCapacityReleasingDynam
         << "ownership transfer must not become active before async payload arrival apply";
     EXPECT_EQ(bank.experts[3].owner_participant, 1)
         << "ownership transfer must not remove the local primary before apply";
+    EXPECT_EQ(
+        std::memcmp(
+            runtime_before.banks,
+            runtime.banks,
+            sizeof(runtime.banks)),
+        0)
+        << "deferred planning must never use either durable RCU bank as speculative scratch";
 
     cudaFree(d_gathered);
     cudaFree(d_status);
@@ -8594,6 +9239,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansCapacityReleasingDynam
     cudaFree(d_command_header);
     cudaFree(d_wave_state);
     cudaFree(d_controller_state);
+    cudaFree(d_placement_plan_scratch);
 #endif
 }
 
@@ -8662,6 +9308,10 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerRejectsOwnershipSwapFromNon
     llaminar2::DeviceMoERebalanceCommandBufferHeader *d_command_header = nullptr;
     llaminar2::DeviceMoERebalanceWaveState *d_wave_state = nullptr;
     llaminar2::DeviceMoERebalanceGraphControllerState *d_controller_state = nullptr;
+    CudaAllocation placement_plan_storage(
+        sizeof(llaminar2::DeviceMoEPlacementBank));
+    auto *d_placement_plan_scratch = static_cast<
+        llaminar2::DeviceMoEPlacementBank *>(placement_plan_storage.get());
     const auto controller_state = makeControllerDueOnNextBoundary(config);
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered),
                          gathered.size() * sizeof(uint64_t)),
@@ -8707,7 +9357,12 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerRejectsOwnershipSwapFromNon
         1,
         d_command_header,
         d_wave_state,
-        d_controller_state));
+        d_controller_state,
+        1u,
+        nullptr,
+        0u,
+        nullptr,
+        d_placement_plan_scratch));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceStatus status;
@@ -8794,17 +9449,18 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerNarrowsDeferredApplySpanToC
     set_count(1, 1, 2, 1);
     set_count(1, 1, 3, 9);
     /*
-     * Layer 2 proposes the same locally beneficial 69-row direction as layer
-     * 1. Accepting both would overshoot the wave-wide balance. The controller
-     * must retain only the first pair instead of constructing four commands
-     * and discarding the whole wave at its terminal participant-spread gate.
+     * The exact layer-local selector exchanges 30 rows for 9, shifting 21
+     * rows toward participant 1 in both layers 1 and 2. Layer 3 deliberately
+     * contributes 130 rows in the opposite direction, so the first exchange
+     * reduces the wave-wide participant spread from 50 to 8 while a second
+     * would increase it to 34. The controller must retain only the first pair
+     * instead of constructing four commands and relying on terminal rollback.
      */
     set_count(0, 2, 0, 70);
     set_count(0, 2, 1, 30);
     set_count(1, 2, 2, 1);
     set_count(1, 2, 3, 9);
-    set_count(0, 3, 0, 55);
-    set_count(1, 3, 2, 55);
+    set_count(1, 3, 2, 130);
     const auto controller_state = makeControllerDueOnNextBoundary(config);
 
     uint64_t *d_gathered = nullptr;
@@ -8814,6 +9470,10 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerNarrowsDeferredApplySpanToC
     llaminar2::DeviceMoERebalanceCommandBufferHeader *d_command_header = nullptr;
     llaminar2::DeviceMoERebalanceWaveState *d_wave_state = nullptr;
     llaminar2::DeviceMoERebalanceGraphControllerState *d_controller_state = nullptr;
+    CudaAllocation placement_plan_storage(
+        sizeof(llaminar2::DeviceMoEPlacementBank));
+    auto *d_placement_plan_scratch = static_cast<
+        llaminar2::DeviceMoEPlacementBank *>(placement_plan_storage.get());
     ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&d_gathered),
                          gathered.size() * sizeof(uint64_t)),
               cudaSuccess);
@@ -8858,7 +9518,12 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerNarrowsDeferredApplySpanToC
         2,
         d_command_header,
         d_wave_state,
-        d_controller_state));
+        d_controller_state,
+        1u,
+        nullptr,
+        0u,
+        nullptr,
+        d_placement_plan_scratch));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceStatus status;
@@ -8946,11 +9611,15 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansLLEPOwnershipTransfers
     const auto controller_state = makeControllerDueOnNextBoundary(config);
     CudaAllocation controller_storage(sizeof(controller_state));
     CudaAllocation planner_storage(llepPlannerScratchBytes(config));
+    CudaAllocation placement_plan_storage(
+        sizeof(llaminar2::DeviceMoEPlacementBank));
     auto *d_controller_state = static_cast<
         llaminar2::DeviceMoERebalanceGraphControllerState *>(
         controller_storage.get());
     auto *d_llep_layer_plans = static_cast<
         llaminar2::DeviceMoELLEPLayerPlanScratch *>(planner_storage.get());
+    auto *d_placement_plan_scratch = static_cast<
+        llaminar2::DeviceMoEPlacementBank *>(placement_plan_storage.get());
     ASSERT_EQ(cudaMemcpyAsync(
                   d_controller_state,
                   &controller_state,
@@ -9004,7 +9673,8 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansLLEPOwnershipTransfers
         1u,
         nullptr,
         0u,
-        d_llep_layer_plans));
+        d_llep_layer_plans,
+        d_placement_plan_scratch));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceStatus status;
@@ -9036,6 +9706,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansLLEPOwnershipTransfers
     EXPECT_EQ(plan.expert, 0u);
     EXPECT_EQ(plan.source_participant, 0u);
     EXPECT_EQ(plan.destination_participant, 1u);
+    EXPECT_EQ(plan.destination_overlay_participant, 1);
     EXPECT_EQ(plan.source_resident_mask, 0b01u);
     EXPECT_EQ(plan.destination_slot, 0u);
     EXPECT_EQ(plan.payload_slot, 0u);
@@ -9046,6 +9717,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansLLEPOwnershipTransfers
         .expert = 0u,
         .source_participant = 0u,
         .destination_participant = 1u,
+        .destination_overlay_participant = 1,
         .source_resident_mask = 0b01u,
         .flags = 0u,
         .destination_slot = 0u,
@@ -9148,11 +9820,15 @@ TEST_F(Test__CUDAMoEKernel,
     const auto controller_state = makeControllerDueOnNextBoundary(config);
     CudaAllocation controller_storage(sizeof(controller_state));
     CudaAllocation planner_storage(llepPlannerScratchBytes(config));
+    CudaAllocation placement_plan_storage(
+        sizeof(llaminar2::DeviceMoEPlacementBank));
     auto *d_controller_state = static_cast<
         llaminar2::DeviceMoERebalanceGraphControllerState *>(
         controller_storage.get());
     auto *d_llep_layer_plans = static_cast<
         llaminar2::DeviceMoELLEPLayerPlanScratch *>(planner_storage.get());
+    auto *d_placement_plan_scratch = static_cast<
+        llaminar2::DeviceMoEPlacementBank *>(placement_plan_storage.get());
     ASSERT_EQ(cudaMemcpyAsync(
                   d_controller_state,
                   &controller_state,
@@ -9205,7 +9881,8 @@ TEST_F(Test__CUDAMoEKernel,
         /*command_buffer_count=*/1u,
         /*local_transfer_slots=*/nullptr,
         /*local_transfer_slot_count=*/0u,
-        d_llep_layer_plans));
+        d_llep_layer_plans,
+        d_placement_plan_scratch));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceStatus status{};
@@ -9308,11 +9985,15 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerUsesExactLLEPGroupedLoadsFo
     const auto controller_state = makeControllerDueOnNextBoundary(config);
     CudaAllocation controller_storage(sizeof(controller_state));
     CudaAllocation planner_storage(llepPlannerScratchBytes(config));
+    CudaAllocation placement_plan_storage(
+        sizeof(llaminar2::DeviceMoEPlacementBank));
     auto *d_controller_state = static_cast<
         llaminar2::DeviceMoERebalanceGraphControllerState *>(
         controller_storage.get());
     auto *d_llep_layer_plans = static_cast<
         llaminar2::DeviceMoELLEPLayerPlanScratch *>(planner_storage.get());
+    auto *d_placement_plan_scratch = static_cast<
+        llaminar2::DeviceMoEPlacementBank *>(placement_plan_storage.get());
     ASSERT_EQ(cudaMemcpyAsync(
                   d_controller_state,
                   &controller_state,
@@ -9368,7 +10049,8 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerUsesExactLLEPGroupedLoadsFo
         1u,
         nullptr,
         0u,
-        d_llep_layer_plans));
+        d_llep_layer_plans,
+        d_placement_plan_scratch));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoERebalanceStatus status;
@@ -10452,6 +11134,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectWithReadyRebalanceApplyTargetAllRol
     table_config.num_experts = 4;
     table_config.top_k = 2;
     table_config.mirror_to_device = true;
+    table_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable runtime_table(table_config);
 
     for (int layer = 0; layer < 2; ++layer)
@@ -10480,6 +11163,8 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectWithReadyRebalanceApplyTargetAllRol
                                     1.0f, 0.0f, 0.0f, 0.0f});
     auto indices = makeZeros({1, 2});
     auto weights = makeZeros({1, 2});
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), indices.get(), weights.get());
 
     std::vector<llaminar2::DeviceMoERebalancePlanEntry> plan_entries(
         static_cast<size_t>(plan_capacity) * command_buffer_count);
@@ -10662,6 +11347,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeReadyRebalanceApplyDoesNotAdvanceIncompleteTra
     table_config.num_experts = 4;
     table_config.top_k = 2;
     table_config.mirror_to_device = true;
+    table_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable runtime_table(table_config);
 
     auto update = makeDynamicOwnershipTransferUpdate(1, 1);
@@ -10686,6 +11372,8 @@ TEST_F(Test__CUDAMoEKernel, DecodeReadyRebalanceApplyDoesNotAdvanceIncompleteTra
                                     1.0f, 0.0f, 0.0f, 0.0f});
     auto indices = makeZeros({1, 2});
     auto weights = makeZeros({1, 2});
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), indices.get(), weights.get());
 
     std::vector<llaminar2::DeviceMoERebalancePlanEntry> plan_entries(
         static_cast<size_t>(plan_capacity) * command_buffer_count);
@@ -10859,6 +11547,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeReadyRebalanceApplyUsesOrderedLayerCursor)
     table_config.num_experts = 4;
     table_config.top_k = 2;
     table_config.mirror_to_device = true;
+    table_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable runtime_table(table_config);
 
     for (int layer = 0; layer < 2; ++layer)
@@ -10887,6 +11576,8 @@ TEST_F(Test__CUDAMoEKernel, DecodeReadyRebalanceApplyUsesOrderedLayerCursor)
                                     1.0f, 0.0f, 0.0f, 0.0f});
     auto indices = makeZeros({1, 2});
     auto weights = makeZeros({1, 2});
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), indices.get(), weights.get());
 
     std::vector<llaminar2::DeviceMoERebalancePlanEntry> plan_entries(
         static_cast<size_t>(plan_capacity) * command_buffer_count);
@@ -12050,6 +12741,7 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceCopyAndApplyArrivalUsesTransferSlot)
     table_config.num_experts = 4;
     table_config.top_k = 2;
     table_config.mirror_to_device = true;
+    table_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable runtime_table(table_config);
 
     auto update = makeParticipantOneBaseUpdate(1);
@@ -14959,6 +15651,9 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectBF16GateMatchesCPU)
     auto cpu_indices = makeZeros({seq_len, top_k});
     auto cpu_weights = makeZeros({seq_len, top_k});
 
+    prepareRouteTensorStorage(
+        hidden.get(), gate_bf16.get(), cuda_indices.get(), cuda_weights.get());
+
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         cuda_table.deviceLayerState(0), hidden.get(), gate_bf16.get(), d_model, num_experts, top_k,
         true, cuda_indices.get(), cuda_weights.get(), true, true, nullptr,
@@ -14995,6 +15690,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRejectsUnsupportedGateType)
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    cuda_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable cuda_table(cuda_config);
 
     llaminar2::MoEPlacementUpdate update;
@@ -15015,6 +15711,9 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRejectsUnsupportedGateType)
         {static_cast<size_t>(num_experts), static_cast<size_t>(d_model)}, /*seed=*/123);
     auto cuda_indices = makeZeros({seq_len, top_k});
     auto cuda_weights = makeZeros({seq_len, top_k});
+
+    prepareRouteTensorStorage(
+        hidden.get(), gate_q8.get(), cuda_indices.get(), cuda_weights.get());
 
     EXPECT_FALSE(cuda_kernel_->decodeRouteSelect(
         cuda_table.deviceLayerState(0), hidden.get(), gate_q8.get(), d_model, num_experts, top_k,
@@ -15046,6 +15745,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeOnlyDoesNotRequireLegacyOutp
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    cuda_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable cuda_table(cuda_config);
 
     llaminar2::MoEPlacementUpdate update;
@@ -15064,6 +15764,12 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeOnlyDoesNotRequireLegacyOutp
                                                     0.0f, -0.5f, 0.3f, 0.8f});
     auto cpu_indices = makeZeros({seq_len, top_k});
     auto cpu_weights = makeZeros({seq_len, top_k});
+
+    const auto device = llaminar2::DeviceId::cuda(0);
+    llaminar2::TransferEngine::prepareDeviceInput(
+        hidden.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceInput(
+        gate.get(), device, stream_);
 
     auto *cuda_layer = cuda_table.deviceLayerState(0);
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
@@ -15222,6 +15928,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossPar
         config.num_experts = num_experts;
         config.top_k = top_k;
         config.mirror_to_device = true;
+        config.prefill_token_capacity = 1;
         auto table = std::make_unique<DeviceMoERuntimeTable>(config);
         auto update = make_update(participant_id);
         EXPECT_TRUE(table->prepareInactiveBank(0, update));
@@ -15244,6 +15951,18 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossPar
     auto weights1 = makeZeros({seq_len, top_k});
     auto indices2 = makeZeros({seq_len, top_k});
     auto weights2 = makeZeros({seq_len, top_k});
+
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), indices0.get(), weights0.get());
+    const auto device = llaminar2::DeviceId::cuda(0);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        indices1.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        weights1.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        indices2.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        weights2.get(), device, stream_);
 
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         table0->deviceLayerState(0), hidden.get(), gate.get(), d_model, num_experts, top_k,
@@ -15390,6 +16109,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeRecordsHotCacheBalanceImprov
         config.num_experts = num_experts;
         config.top_k = top_k;
         config.mirror_to_device = true;
+        config.prefill_token_capacity = 1;
         auto table = std::make_unique<DeviceMoERuntimeTable>(config);
         auto update = make_update(participant_id);
         EXPECT_TRUE(table->prepareInactiveBank(0, update));
@@ -15412,6 +16132,18 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeRecordsHotCacheBalanceImprov
     auto weights1 = makeZeros({seq_len, top_k});
     auto indices2 = makeZeros({seq_len, top_k});
     auto weights2 = makeZeros({seq_len, top_k});
+
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), indices0.get(), weights0.get());
+    const auto device = llaminar2::DeviceId::cuda(0);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        indices1.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        weights1.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        indices2.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        weights2.get(), device, stream_);
 
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         table0->deviceLayerState(0), hidden.get(), gate.get(), d_model, num_experts, top_k,
@@ -15497,6 +16229,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectQwenScaleRuntimeTopKMatchesCPU)
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    cuda_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable cuda_table(cuda_config);
 
     llaminar2::MoEPlacementUpdate update;
@@ -15532,6 +16265,9 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectQwenScaleRuntimeTopKMatchesCPU)
     auto cuda_weights = makeZeros({seq_len, top_k});
     auto cpu_indices = makeZeros({seq_len, top_k});
     auto cpu_weights = makeZeros({seq_len, top_k});
+
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), cuda_indices.get(), cuda_weights.get());
 
     auto *cuda_layer = cuda_table.deviceLayerState(0);
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
@@ -15594,6 +16330,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectUsesWorkspaceAcrossRebind)
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    cuda_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable cuda_table(cuda_config);
 
     llaminar2::MoEPlacementUpdate update;
@@ -15631,6 +16368,9 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectUsesWorkspaceAcrossRebind)
     auto cpu_indices = makeZeros({seq_len, top_k});
     auto cpu_weights = makeZeros({seq_len, top_k});
 
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), cuda_indices.get(), cuda_weights.get());
+
     auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(cuda_kernel_);
     ASSERT_NE(workspace_consumer, nullptr);
 
@@ -15666,6 +16406,11 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectUsesWorkspaceAcrossRebind)
 
     auto cuda_indices_second = makeZeros({seq_len, top_k});
     auto cuda_weights_second = makeZeros({seq_len, top_k});
+
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        cuda_indices_second.get(), llaminar2::DeviceId::cuda(0), stream_);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        cuda_weights_second.get(), llaminar2::DeviceId::cuda(0), stream_);
 
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         cuda_layer, hidden.get(), gate.get(), d_model, num_experts, top_k,
@@ -15708,6 +16453,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRejectsGraphCaptureWithoutWorkspace
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    cuda_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable cuda_table(cuda_config);
 
     llaminar2::MoEPlacementUpdate update;
@@ -15735,11 +16481,12 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRejectsGraphCaptureWithoutWorkspace
     auto cuda_weights = makeZeros({seq_len, top_k});
 
     const auto cuda_device = llaminar2::DeviceId::cuda(0);
-    ASSERT_TRUE(hidden->ensureOnDevice(cuda_device, stream_));
-    ASSERT_TRUE(gate->ensureOnDevice(cuda_device, stream_));
-    ASSERT_TRUE(cuda_indices->ensureOnDevice(cuda_device, stream_));
-    ASSERT_TRUE(cuda_weights->ensureOnDevice(cuda_device, stream_));
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), cuda_indices.get(), cuda_weights.get());
+    ASSERT_NO_THROW(llaminar2::TransferEngine::requireDeviceInput(
+        hidden.get(), cuda_device, stream_));
+    ASSERT_NO_THROW(llaminar2::TransferEngine::requireDeviceInput(
+        gate.get(), cuda_device, stream_));
 
     llaminar2::GraphCaptureGuard guard;
     EXPECT_FALSE(cuda_kernel_->decodeRouteSelect(
@@ -15799,6 +16546,8 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsMatchesCPU)
 
     llaminar2::MoERoutingResult cuda_host_result;
     llaminar2::MoERoutingResult cpu_host_result;
+    prepareRouteTensorStorage(
+        hidden.get(), gate.get(), cuda_indices.get(), cuda_weights.get());
     ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
                                                num_experts, top_k, true,
                                                cuda_indices.get(), cuda_weights.get(), cuda_host_result));
@@ -19719,8 +20468,8 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
     constexpr int seq_len = 4;
     constexpr int top_k = 4;
     constexpr int num_experts = 16;
-    constexpr int d_model = 32;
-    constexpr int intermediate = 32;
+    constexpr int d_model = 544;
+    constexpr int intermediate = 544;
     constexpr size_t descriptor_bytes = 4096;
 
     std::vector<CudaAllocation> payloads;
@@ -20314,9 +21063,19 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    cuda_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable cuda_table(cuda_config);
     auto *runtime_layer = cuda_table.deviceLayerState(0);
     ASSERT_NE(runtime_layer, nullptr);
+
+    llaminar2::MoEPlacementUpdate runtime_update;
+    runtime_update.epoch = 1;
+    runtime_update.expert_count = num_experts;
+    runtime_update.experts.resize(num_experts);
+    markAllExpertsLocalForRouting(runtime_update, num_experts);
+    ASSERT_TRUE(cuda_table.prepareInactiveBank(0, runtime_update));
+    ASSERT_TRUE(cuda_table.flipActiveBank(
+        0, runtime_update.epoch, stream_));
 
     std::vector<float> hidden_values(static_cast<size_t>(d_model));
     std::vector<float> router_values(static_cast<size_t>(num_experts) * static_cast<size_t>(d_model));
@@ -20362,6 +21121,20 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
     auto two_step_output = makeZeros({d_model});
     auto fused_output = makeZeros({d_model});
 
+    llaminar2::TransferEngine::prepareDeviceInput(hidden.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceInput(router.get(), device, stream_);
+    for (int slot = 0; slot < top_k; ++slot)
+    {
+        llaminar2::TransferEngine::prepareDeviceOutput(
+            gate_outputs[slot], device, stream_);
+        llaminar2::TransferEngine::prepareDeviceOutput(
+            up_outputs[slot], device, stream_);
+    }
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        two_step_output.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        fused_output.get(), device, stream_);
+
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         runtime_layer, hidden.get(), router.get(), d_model, num_experts, top_k,
         true, nullptr, nullptr, /*write_legacy_outputs=*/false, /*update_runtime_histogram=*/false,
@@ -20397,7 +21170,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
         fused_output.get(), d_model, intermediate);
     EXPECT_TRUE(captured_fused);
     ASSERT_TRUE(graph.finishAndInstantiate());
-    ASSERT_TRUE(graph.launch());
+    ASSERT_TRUE(graph.launchAndPublishOutputs({fused_output.get()}));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     std::vector<float> replay_values(
@@ -21104,9 +21877,19 @@ TEST_F(Test__CUDAMoEKernel, RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpe
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    cuda_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable cuda_table(cuda_config);
     auto *runtime_layer = cuda_table.deviceLayerState(0);
     ASSERT_NE(runtime_layer, nullptr);
+
+    llaminar2::MoEPlacementUpdate runtime_update;
+    runtime_update.epoch = 1;
+    runtime_update.expert_count = num_experts;
+    runtime_update.experts.resize(num_experts);
+    markAllExpertsLocalForRouting(runtime_update, num_experts);
+    ASSERT_TRUE(cuda_table.prepareInactiveBank(0, runtime_update));
+    ASSERT_TRUE(cuda_table.flipActiveBank(
+        0, runtime_update.epoch, stream_));
 
     std::vector<float> hidden_values(static_cast<size_t>(d_model), 1.0f);
     std::vector<float> router_values(static_cast<size_t>(num_experts) * static_cast<size_t>(d_model));
@@ -21122,6 +21905,11 @@ TEST_F(Test__CUDAMoEKernel, RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpe
     auto route_indices = makeZeros({top_k});
     auto route_weights = makeZeros({top_k});
     auto output = makeZeros({d_model});
+
+    prepareRouteTensorStorage(
+        hidden.get(), router.get(), route_indices.get(), route_weights.get());
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        output.get(), device, stream_);
 
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         runtime_layer, hidden.get(), router.get(), d_model, num_experts, top_k,
@@ -21161,7 +21949,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeRouteSelectAndFusedDecodeCaptureWithLargeExpe
            "the router producer recorded earlier in the same capture";
 
     for (int replay = 0; replay < 3; ++replay)
-        ASSERT_TRUE(graph.launch());
+        ASSERT_TRUE(graph.launchAndPublishOutputs({output.get()}));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     llaminar2::DeviceMoELayerRuntime host_runtime{};
@@ -21264,6 +22052,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
             0.003f * static_cast<float>((i % 7) - 3);
     }
     auto hidden = makeTensor({1, d_model}, hidden_values);
+    llaminar2::TransferEngine::prepareDeviceInput(
+        hidden.get(), device, stream_);
 
     const std::array<int, top_k> expert_ids = {1};
     const std::array<float, top_k> expert_weights = {1.0f};
@@ -21273,6 +22063,10 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
         auto up = makeZeros({intermediate});
         std::array<llaminar2::ITensor *, top_k> gate_outputs = {gate.get()};
         std::array<llaminar2::ITensor *, top_k> up_outputs = {up.get()};
+        llaminar2::TransferEngine::prepareDeviceOutput(
+            gate.get(), device, stream_);
+        llaminar2::TransferEngine::prepareDeviceOutput(
+            up.get(), device, stream_);
 
         ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
             hidden.get(), expert_ids.data(), gateup_table, top_k,
@@ -21284,6 +22078,10 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
 
     auto stale_reference = makeZeros({d_model});
     auto fresh_reference = makeZeros({d_model});
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        stale_reference.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        fresh_reference.get(), device, stream_);
     run_table_reference(stale_gateup_table, stale_down_table, stale_reference.get());
     run_table_reference(fresh_gateup_table, fresh_down_table, fresh_reference.get());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
@@ -21344,6 +22142,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
               cudaSuccess);
 
     auto runtime_output = makeZeros({d_model});
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        runtime_output.get(), device, stream_);
     ASSERT_TRUE(cuda_kernel_->groupedExpertDecodeFromRuntime(
         device_runtime, hidden.get(), stale_gateup_table, stale_down_table, top_k,
         runtime_output.get(), d_model, intermediate,
@@ -21362,7 +22162,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithou
     ASSERT_EQ(cudaMemcpyAsync(device_runtime, &runtime_fresh, sizeof(runtime_fresh),
                               cudaMemcpyHostToDevice, stream_),
               cudaSuccess);
-    ASSERT_TRUE(graph.launch());
+    ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_output.get()}));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     const std::vector<float> runtime_values(
@@ -24767,6 +25567,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeDescriptorPathCapturesAfterWarmu
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    cuda_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable cuda_table(cuda_config);
 
     std::vector<CudaAllocation> payloads;
@@ -24847,6 +25648,19 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeDescriptorPathCapturesAfterWarmu
     std::array<llaminar2::ITensor *, top_k> gate_outputs = {gate0.get(), gate1.get()};
     std::array<llaminar2::ITensor *, top_k> up_outputs = {up0.get(), up1.get()};
     auto *runtime_layer = cuda_table.deviceLayerState(0);
+
+    const auto device = llaminar2::DeviceId::cuda(0);
+    llaminar2::TransferEngine::prepareDeviceInput(hidden.get(), device, stream_);
+    llaminar2::TransferEngine::prepareDeviceInput(router.get(), device, stream_);
+    for (int slot = 0; slot < top_k; ++slot)
+    {
+        llaminar2::TransferEngine::prepareDeviceOutput(
+            gate_outputs[slot], device, stream_);
+        llaminar2::TransferEngine::prepareDeviceOutput(
+            up_outputs[slot], device, stream_);
+    }
+    llaminar2::TransferEngine::prepareDeviceOutput(
+        output.get(), device, stream_);
 
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         runtime_layer, hidden.get(), router.get(), d_model, num_experts, top_k,
@@ -25113,22 +25927,26 @@ TEST_F(Test__CUDAMoEKernel,
         const auto &format = formats[format_index];
         SCOPED_TRACE(format.label);
 
-        /* Diagonal matrices make every expected dot product a single rounded
-         * multiply. The test can consequently use tight checkpoint tolerances
-         * without depending on a host compiler's reduction reassociation. */
+        /* Dense K>256 rows force every logical reduction lane and tree edge. */
         std::vector<float> gate_values(
-            static_cast<size_t>(intermediate) * d_model, 0.0f);
-        std::vector<float> up_values(gate_values.size(), 0.0f);
+            static_cast<size_t>(intermediate) * d_model);
+        std::vector<float> up_values(gate_values.size());
         std::vector<float> down_values(
-            static_cast<size_t>(d_model) * intermediate, 0.0f);
-        for (int row = 0; row < d_model; ++row)
+            static_cast<size_t>(d_model) * intermediate);
+        for (size_t index = 0; index < gate_values.size(); ++index)
         {
-            gate_values[static_cast<size_t>(row) * d_model + row] =
-                (row & 1) ? -0.5f : 0.5f;
-            up_values[static_cast<size_t>(row) * d_model + row] =
-                (row & 2) ? -0.25f : 0.25f;
-            down_values[static_cast<size_t>(row) * intermediate + row] =
-                (row & 4) ? -0.75f : 0.75f;
+            gate_values[index] =
+                static_cast<float>(
+                    static_cast<int>((index * 37u + 11u) % 97u) - 48) *
+                0.00390625f;
+            up_values[index] =
+                static_cast<float>(
+                    static_cast<int>((index * 43u + 19u) % 101u) - 50) *
+                0.00390625f;
+            down_values[index] =
+                static_cast<float>(
+                    static_cast<int>((index * 47u + 23u) % 103u) - 51) *
+                0.00390625f;
         }
 
         auto gate_weight = make_weight(
@@ -25232,38 +26050,48 @@ TEST_F(Test__CUDAMoEKernel,
         std::vector<float> reference_output(static_cast<size_t>(d_model));
         for (int n = 0; n < intermediate; ++n)
         {
-            float gate_sum = 0.0f;
-            float up_sum = 0.0f;
-            for (int k = 0; k < d_model; ++k)
-            {
-                gate_sum = std::fma(
-                    hidden_values[static_cast<size_t>(k)],
-                    rounded_gate[static_cast<size_t>(n) * d_model + k],
-                    gate_sum);
-                up_sum = std::fma(
-                    hidden_values[static_cast<size_t>(k)],
-                    rounded_up[static_cast<size_t>(n) * d_model + k],
-                    up_sum);
-            }
-            reference_gate[static_cast<size_t>(n)] = gate_sum;
-            reference_up[static_cast<size_t>(n)] = up_sum;
+            std::array<float, 1> gate_sum{};
+            std::array<float, 1> up_sum{};
+            llaminar2::floating_expert_numerical_contract::dotRows<1>(
+                1, d_model,
+                [&](int, int k) { return hidden_values[static_cast<size_t>(k)]; },
+                [&](int k)
+                {
+                    return rounded_gate[
+                        static_cast<size_t>(n) * d_model + k];
+                },
+                gate_sum);
+            llaminar2::floating_expert_numerical_contract::dotRows<1>(
+                1, d_model,
+                [&](int, int k) { return hidden_values[static_cast<size_t>(k)]; },
+                [&](int k)
+                {
+                    return rounded_up[
+                        static_cast<size_t>(n) * d_model + k];
+                },
+                up_sum);
+            reference_gate[static_cast<size_t>(n)] = gate_sum[0];
+            reference_up[static_cast<size_t>(n)] = up_sum[0];
         }
         for (int n = 0; n < d_model; ++n)
         {
-            float sum = 0.0f;
-            for (int k = 0; k < intermediate; ++k)
-            {
-                const float gate_value =
-                    reference_gate[static_cast<size_t>(k)];
-                const float swiglu =
-                    (gate_value / (1.0f + std::exp(-gate_value))) *
-                    reference_up[static_cast<size_t>(k)];
-                sum = std::fma(
-                    swiglu,
-                    rounded_down[static_cast<size_t>(n) * intermediate + k],
-                    sum);
-            }
-            reference_output[static_cast<size_t>(n)] = sum;
+            std::array<float, 1> sum{};
+            llaminar2::floating_expert_numerical_contract::dotRows<1>(
+                1, intermediate,
+                [&](int, int k)
+                {
+                    return llaminar2::floating_expert_numerical_contract::
+                        swigluValue(
+                        reference_gate[static_cast<size_t>(k)],
+                        reference_up[static_cast<size_t>(k)]);
+                },
+                [&](int k)
+                {
+                    return rounded_down[
+                        static_cast<size_t>(n) * intermediate + k];
+                },
+                sum);
+            reference_output[static_cast<size_t>(n)] = sum[0];
         }
 
         auto validate_checkpoints = [&]()
@@ -25297,8 +26125,8 @@ TEST_F(Test__CUDAMoEKernel,
                     << "gate checkpoint index=" << index;
                 ASSERT_FLOAT_EQ(observed_up[index], reference_up[index])
                     << "up checkpoint index=" << index;
-                ASSERT_NEAR(
-                    observed_output[index], reference_output[index], 2.0e-6f)
+                ASSERT_FLOAT_EQ(
+                    observed_output[index], reference_output[index])
                     << "output checkpoint index=" << index;
                 ASSERT_TRUE(std::isfinite(observed_output[index]));
             }
@@ -25475,8 +26303,7 @@ TEST(Test__CUDAMoERequestReset,
             /*device_ordinal=*/0,
             /*participant_id=*/0,
             /*slot_count=*/4,
-            std::move(profile),
-            /*vram_safety_margin_bytes=*/0);
+            std::move(profile));
     ASSERT_NE(directory, nullptr);
     EXPECT_THROW(directory->resetRequestPublications(nullptr),
                  std::invalid_argument);

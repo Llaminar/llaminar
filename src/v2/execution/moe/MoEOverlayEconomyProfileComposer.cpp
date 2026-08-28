@@ -612,6 +612,16 @@ namespace llaminar2
         auto service_profile =
             std::make_shared<MoERoutedTierServiceProfile>();
         service_profile->active_sources = measurements.active_sources;
+        service_profile->participant_costs.reserve(expected_service_rows);
+        for (const auto &row : measurements.participant_service)
+        {
+            service_profile->participant_costs.push_back({
+                .participant_id = row.participant_id,
+                .layer = row.layer,
+                .nanoseconds_per_activation =
+                    row.nanoseconds_per_activation,
+            });
+        }
         service_profile->costs.reserve(checkedProduct(
             tier_count,
             layer_count,

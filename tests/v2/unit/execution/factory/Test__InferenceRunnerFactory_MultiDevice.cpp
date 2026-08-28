@@ -661,6 +661,79 @@ namespace
     }
 
     /**
+     * @brief Factory forwarding preserves the complete model reuse contract.
+     *
+     * The unit binary deliberately does not initialize MPI, while the concrete
+     * factory consults the production rank context. Guard the more fundamental
+     * source invariant instead: one optional typed contract crosses the private
+     * boundary and is moved directly into OrchestrationRunner. This makes all
+     * present and future ownership fields indivisible at compile time.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract,
+         PreparedModelReuseContractRemainsIndivisible)
+    {
+        const std::string source = readFactorySourceFile(
+            "src/v2/execution/runner/OrchestrationRunnerFactory.cpp");
+        ASSERT_FALSE(source.empty());
+        const std::string compact = withoutFactorySourceWhitespace(source);
+
+        EXPECT_NE(
+            compact.find(
+                "std::optional<ModelContextReuseContract>reuse_contract"),
+            std::string::npos)
+            << "the private construction boundary must retain the typed contract";
+        EXPECT_NE(
+            compact.find(
+                "createFromOrchestrationConfigImpl(std::move(config),nullptr,std::move(reuse_contract))"),
+            std::string::npos)
+            << "the public overload must forward the complete contract";
+        EXPECT_NE(
+            compact.find("std::move(*reuse_contract)"),
+            std::string::npos)
+            << "OrchestrationRunner must consume the original contract object";
+        EXPECT_EQ(
+            compact.find(
+                "automodel_context=std::move(reuse_contract.context)"),
+            std::string::npos)
+            << "member-wise decomposition can silently drop new ownership fields";
+    }
+
+    /**
+     * @brief Every production device-graph factory receives workspace authority.
+     *
+     * A prepared model can execute through the ordinary rank-local graph,
+     * unified pipeline graph, explicit PP stage, or interface-testable graph.
+     * Missing the authority in even one construction path makes that runner
+     * free model-lifetime backing and causes the next MTP family to allocate a
+     * second workspace. Guard all four typed dependency sites together.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract,
+         ProductionGraphFactoriesPropagateReusableWorkspaceAuthority)
+    {
+        const std::string source =
+            readFactorySourceFile(
+                "src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        ASSERT_FALSE(source.empty());
+        const std::string compact = withoutFactorySourceWhitespace(source);
+
+        EXPECT_GE(
+            countFactorySourceOccurrences(
+                compact,
+                "deps.reusable_execution_workspaces=config.reusable_execution_workspaces;"),
+            4u)
+            << "every device-graph construction path must share model-lifetime workspace ownership";
+        EXPECT_NE(
+            compact.find("deps.mpi_ctx=mpi_ctx;"),
+            std::string::npos)
+            << "the ordinary production graph must retain its concrete MPI authority in typed dependencies";
+        EXPECT_EQ(
+            compact.find(
+                "std::make_unique<DeviceGraphOrchestrator>(std::move(graph_builder),mpi_ctx)"),
+            std::string::npos)
+            << "the legacy constructor cannot carry prepared-model workspace ownership";
+    }
+
+    /**
      * @brief Primary and mirrored-head plans must share one prepared store.
      *
      * NodeTP materializes the ordinary sharded model before its replicated
@@ -956,6 +1029,18 @@ namespace
                 *model_ctx,
                 mtp_config);
 
+        InferenceRunnerConfig retained_control_config = serial_config;
+        retained_control_config.mtp.enabled = false;
+        retained_control_config.mtp.graph_capacity_draft_tokens = 15;
+        const auto retained_control_plan =
+            resolveMoERoutedExpertPlacementPlanForModel(
+                *model_ctx,
+                retained_control_config);
+        const auto retained_control_metadata =
+            resolveMoERoutedExpertModelMetadataForModel(
+                *model_ctx,
+                retained_control_config.mtp);
+
         ASSERT_NE(serial_plan, nullptr);
         ASSERT_NE(mtp_plan, nullptr);
         EXPECT_TRUE(requested_plan->placements.empty());
@@ -963,13 +1048,25 @@ namespace
         EXPECT_EQ(serial_plan->placements.back().layer, 2);
         ASSERT_EQ(mtp_plan->placements.size(), 4u);
         EXPECT_EQ(mtp_plan->placements.back().layer, 3);
+        ASSERT_NE(retained_control_plan, nullptr);
+        ASSERT_EQ(retained_control_plan->placements.size(), 4u);
+        EXPECT_EQ(retained_control_plan->placements.back().layer, 3);
+        EXPECT_EQ(retained_control_metadata.num_layers, 4);
+        EXPECT_EQ(
+            retained_control_metadata.main_inference_layer_count,
+            kMoELayers)
+            << "retained MTP storage must not redefine the ordinary inference interval";
+        EXPECT_EQ(
+            retained_control_plan->lastPlacementLayerBefore(
+                retained_control_metadata.main_inference_layer_count),
+            std::optional<int>{kMoELayers - 1});
 
         const auto serial_family =
             resolveMoEOverlayInferenceGraphFamilyIdentity(
                 *model_ctx->loader(),
                 model_ctx->architecture(),
                 model_ctx->totalBlockCount(),
-                /*mtp_enabled=*/false,
+                MoEOverlayMTPGraphFamilyPolicy::MainOnly,
                 /*graph_family_generation=*/1,
                 /*max_graph_rows=*/16,
                 /*max_decode_rows=*/1,
@@ -980,7 +1077,7 @@ namespace
                 *model_ctx->loader(),
                 model_ctx->architecture(),
                 model_ctx->totalBlockCount(),
-                /*mtp_enabled=*/true,
+                MoEOverlayMTPGraphFamilyPolicy::RetainModelSidecars,
                 /*graph_family_generation=*/1,
                 /*max_graph_rows=*/16,
                 /*max_decode_rows=*/4,

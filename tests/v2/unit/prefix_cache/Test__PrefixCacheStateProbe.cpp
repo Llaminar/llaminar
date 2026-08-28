@@ -78,6 +78,27 @@ TEST(Test__PrefixCacheStateProbe, FloatHashAndZeroDetection)
               hashFloatBufferForPrefixProbe(values.data(), values.size()));
 }
 
+TEST(Test__PrefixCacheStateProbe,
+     TerminalValueCaptureAlsoSelectsMatchingDigest)
+{
+    ScopedEnvVar hash_terminal(
+        "LLAMINAR_PREFIX_PROBE_HASH_TERMINAL_STATE",
+        nullptr);
+    ScopedEnvVar capture_values(
+        "LLAMINAR_PREFIX_PROBE_CAPTURE_TERMINAL_HIDDEN_VALUES",
+        "1");
+    ScopedEnvVar capture_logits_values(
+        "LLAMINAR_PREFIX_PROBE_CAPTURE_TERMINAL_LOGITS_VALUES",
+        "1");
+
+    const PrefixProbeCapturePolicy policy =
+        PrefixProbeCapturePolicy::fromEnvironment();
+    EXPECT_TRUE(policy.capture_terminal_hidden_values);
+    EXPECT_TRUE(policy.capture_terminal_logits_values);
+    EXPECT_TRUE(policy.hash_terminal_state)
+        << "Raw terminal values and their digest must come from one materialization";
+}
+
 TEST(Test__PrefixCacheStateProbe, CapturesCPURingKVInventory)
 {
     CPURingKVCacheFP32 cache(getTestMPIContext(), 2, 1, 4, 2, 2, DeviceId::cpu());
@@ -130,6 +151,9 @@ TEST(Test__PrefixCacheStateProbe, CapturesNamedKVPayloadSegments)
 {
     ScopedEnvVar hash_payloads("LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1");
     ScopedEnvVar hash_segments("LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS", "1");
+    ScopedEnvVar capture_segment_payloads(
+        "LLAMINAR_PREFIX_PROBE_CAPTURE_KV_SEGMENT_PAYLOADS",
+        "1");
     ScopedEnvVar requested_segments(
         "LLAMINAR_PREFIX_PROBE_KV_SEGMENTS",
         "prefix=0:2,suffix=2:2");
@@ -179,6 +203,8 @@ TEST(Test__PrefixCacheStateProbe, CapturesNamedKVPayloadSegments)
               hashByteBufferForPrefixProbe(suffix_k.data(), suffix_k.size()));
     EXPECT_EQ(layer.segments[1].v_payload_hash,
               hashByteBufferForPrefixProbe(suffix_v.data(), suffix_v.size()));
+    EXPECT_EQ(layer.segments[1].k_payload, suffix_k);
+    EXPECT_EQ(layer.segments[1].v_payload, suffix_v);
 }
 
 /**

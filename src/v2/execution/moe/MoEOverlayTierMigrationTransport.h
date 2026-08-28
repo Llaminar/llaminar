@@ -283,6 +283,10 @@ namespace llaminar2
         std::uint64_t waves_failed_to_prepare = 0;
         std::uint64_t transfer_operations_started = 0;
         std::uint64_t transfer_operations_completed = 0;
+        /** Ready projection operations belonging to publishable placement waves. */
+        std::uint64_t placement_transfer_operations_completed = 0;
+        /** Exact payload bytes observed for publishable placement waves. */
+        std::uint64_t placement_transfer_payload_bytes_completed = 0;
         std::uint64_t stage_pending_polls = 0;
         std::uint64_t commits_started = 0;
         std::uint64_t commits_completed = 0;
@@ -351,6 +355,10 @@ namespace llaminar2
 
         /** @brief Return cumulative control-plane proof counters. */
         [[nodiscard]] MoEOverlayTierMigrationTransportStats stats() const noexcept;
+
+        /** @return Exact payload bytes in completed publishable waves. */
+        [[nodiscard]] std::uint64_t
+        completedPlacementPayloadBytes() const noexcept override;
 
     private:
         Config config_;

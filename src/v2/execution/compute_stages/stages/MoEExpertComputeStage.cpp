@@ -2276,11 +2276,10 @@ namespace llaminar2
         void *producer_stream)
     {
         /* This diagnostic wrapper is explicitly outside captured execution.
-         * Complete producer admission before the publication kernel writes the
-         * active bank; enqueue-only graph callers are prepared by their graph
-         * lifecycle owner and never enter this wrapper. */
-        params_.moe_runtime_table->prepareDecodeHistogramProducerStream(
-            producer_stream);
+         * Production graph owners make the same typed preparation transition
+         * from their prepareGraphLaunch() boundary. */
+        if (!prepareGroupedVerifierHistogramProducer(producer_stream))
+            return false;
         if (!enqueueCommittedGroupedVerifierHistograms(
                 accepted_state_counts_device,
                 publication_ok_flags_device,
@@ -2291,13 +2290,41 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * This wrapper is retained for explicit diagnostic owners outside a
-         * captured graph body. Production capture stages call the enqueue-only
-         * method so cloning cannot preserve a stale host stream alias.
-         */
-        params_.moe_runtime_table->recordDecodeHistogramProducerStream(
-            producer_stream);
+        return true;
+    }
+
+    bool MoEExpertComputeStage::prepareGroupedVerifierHistogramProducer(
+        void *producer_stream)
+    {
+        void *const publication_stream =
+            groupedVerifierHistogramPublicationStream();
+        if (groupedVerifierHistogramRole() !=
+                MoEGroupedVerifierHistogramRole::DeferredAcceptedRows ||
+            !params_.moe_runtime_table || !producer_stream ||
+            !publication_stream || producer_stream != publication_stream)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Deferred verifier histogram producer "
+                "preparation requires the table-owned publication stream"
+                << " layer=" << params_.layer_idx
+                << " stream=" << producer_stream
+                << " expected=" << publication_stream);
+            return false;
+        }
+        try
+        {
+            params_.moe_runtime_table->prepareDecodeHistogramProducerStream(
+                producer_stream);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Deferred verifier histogram producer "
+                "preparation failed"
+                << " layer=" << params_.layer_idx
+                << " reason=" << error.what());
+            return false;
+        }
         return true;
     }
 
@@ -2308,7 +2335,8 @@ namespace llaminar2
         int rows_per_request,
         void *producer_stream)
     {
-        if (!requiresCommittedGroupedVerifierHistogramPublication())
+        if (groupedVerifierHistogramRole() !=
+            MoEGroupedVerifierHistogramRole::DeferredAcceptedRows)
         {
             LOG_ERROR(
                 "[MoEExpertComputeStage] Committed grouped-verifier histogram "
@@ -2338,6 +2366,23 @@ namespace llaminar2
                 "[MoEExpertComputeStage] Committed grouped-verifier histogram "
                 "publication requires an initialized per-layer device route ledger"
                 << " layer=" << params_.layer_idx);
+            return false;
+        }
+        try
+        {
+            /* Capture-safe identity validation only. Persistent events and the
+             * initialization edge were installed by the publication stage's
+             * prepareGraphLaunch() transition. */
+            params_.moe_runtime_table->recordDecodeHistogramProducerStream(
+                producer_stream);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Deferred verifier histogram producer "
+                "was not prepared before enqueue"
+                << " layer=" << params_.layer_idx
+                << " reason=" << error.what());
             return false;
         }
 
@@ -6698,6 +6743,17 @@ namespace llaminar2
         return false;
     }
 
+    bool MoEExpertComputeStage::ownsRuntimePrefillHistogramPublication() const
+        noexcept
+    {
+        return params_.device_id.is_gpu() &&
+               params_.moe_runtime_table != nullptr &&
+               params_.use_runtime_row_grouping &&
+               params_.seq_len > 1 &&
+               groupedVerifierHistogramRole() ==
+                   MoEGroupedVerifierHistogramRole::NotOwner;
+    }
+
     bool MoEExpertComputeStage::canUseFixedTopologyGroupedPrefill() const
     {
         const bool forced_decode_replay =
@@ -7384,6 +7440,34 @@ namespace llaminar2
             }
         }
         const bool runtime_grouping = canUseRuntimeRowGrouping();
+        if (ownsRuntimePrefillHistogramPublication())
+        {
+            if (!runtime_grouping)
+            {
+                LOG_ERROR(
+                    "[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                    "ordinary prefill histogram publication lost its runtime "
+                    "grouping authority"
+                    << " layer=" << params_.layer_idx);
+                return false;
+            }
+            try
+            {
+                /* Validation and identity publication only: producer events
+                 * were allocated before capture by prepareGraphLaunch(). */
+                params_.moe_runtime_table->recordDecodeHistogramProducerStream(
+                    compute_launch.stream);
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR(
+                    "[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                    "ordinary prefill histogram producer was not prepared"
+                    << " layer=" << params_.layer_idx
+                    << " reason=" << error.what());
+                return false;
+            }
+        }
         uint64_t fixed_topology_trace_sequence = 0;
         IBackend *assignment_trace_backend = nullptr;
         void *assignment_trace_stream = nullptr;
@@ -7498,7 +7582,8 @@ namespace llaminar2
                      << " down_desc_table=" << grouped_down_desc_table_id_);
         }
         const bool retain_routes_for_deferred_commit =
-            requiresCommittedGroupedVerifierHistogramPublication();
+            groupedVerifierHistogramRole() ==
+            MoEGroupedVerifierHistogramRole::DeferredAcceptedRows;
         if (retain_routes_for_deferred_commit)
         {
             if (!runtime_grouping || !params_.moe_runtime_table ||
@@ -8624,6 +8709,29 @@ namespace llaminar2
         }
         setGPUStream(stream);
 
+        if (ownsRuntimePrefillHistogramPublication())
+        {
+            try
+            {
+                /* The complete grouped-prefill planner publishes ordinary
+                 * demand from this stage, not from MoERoutingStage. Admit its
+                 * exact capture/replay stream before any graph can retain the
+                 * runtime-table pointer. */
+                params_.moe_runtime_table->prepareDecodeHistogramProducerStream(
+                    stream);
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR(
+                    "[MoEExpertComputeStage] Failed to prepare the ordinary "
+                    "prefill histogram producer"
+                    << " device=" << params_.device_id.to_string()
+                    << " layer=" << params_.layer_idx
+                    << " reason=" << error.what());
+                return false;
+            }
+        }
+
         if (supportsGraphCaptureAfterLaunchPreparation())
         {
             if (!refreshGraphStablePlacement(
@@ -8891,6 +8999,19 @@ namespace llaminar2
                     workspace_rows,
                     n,
                     k));
+                const int projection_width =
+                    params_.expert_intermediate > 0
+                        ? params_.expert_intermediate
+                        : n;
+                const size_t projection_count = static_cast<size_t>(
+                    std::max(1, workspace_top_k)) * 2u;
+                const std::vector<int> fused_columns(
+                    projection_count, projection_width);
+                consumer->appendFusedProjectionWorkspaceRequirements(
+                    combined,
+                    workspace_rows,
+                    fused_columns,
+                    params_.d_model > 0 ? params_.d_model : k);
                 addCudaConcurrentDecodeGemvSideStreamWorkspace(
                     combined,
                     params_.device_id,
@@ -8923,6 +9044,13 @@ namespace llaminar2
                 combined.merge(c->getWorkspaceRequirements(rows, intermediate, d_model));
             if (auto *c = dynamic_cast<IWorkspaceConsumer *>(shared_down))
                 combined.merge(c->getWorkspaceRequirements(rows, d_model, intermediate));
+            if (auto *c = dynamic_cast<IWorkspaceConsumer *>(shared_gate))
+            {
+                const std::array<int, 2> fused_columns = {
+                    intermediate, intermediate};
+                c->appendFusedProjectionWorkspaceRequirements(
+                    combined, rows, fused_columns, d_model);
+            }
             addCudaConcurrentDecodeGemvSideStreamWorkspace(
                 combined,
                 params_.device_id,
@@ -10588,6 +10716,13 @@ namespace llaminar2
             combined.merge(c->getWorkspaceRequirements(rows, intermediate, d_model));
         if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_down_gemm_))
             combined.merge(c->getWorkspaceRequirements(rows, d_model, intermediate));
+        if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_gate_gemm_))
+        {
+            const std::array<int, 2> fused_columns = {
+                intermediate, intermediate};
+            c->appendFusedProjectionWorkspaceRequirements(
+                combined, rows, fused_columns, d_model);
+        }
 
         /*
          * M=1 decode may overlap shared gate/up projections on the fixed CUDA
@@ -12017,6 +12152,10 @@ namespace llaminar2
             ownsCanonicalRouteReduction(params_.reduction_role);
         const bool participates =
             owns_reduction || params_.node_local_route_exchange;
+        const bool publishes_complete_canonical_bank =
+            owns_reduction && !params_.node_local_route_exchange &&
+            params_.external_route_source ==
+                MoEExternalCanonicalRouteSource::RootCanonicalRouteBank;
         if (participates && params_.canonical_route_contributions)
         {
             info.addInput(
@@ -12024,6 +12163,22 @@ namespace llaminar2
                 params_.canonical_route_contributions,
                 static_cast<size_t>(params_.seq_len * params_.top_k),
                 static_cast<size_t>(params_.d_model));
+
+            /* A mapped single-participant continuation materializes every
+             * returned route in this bank before the ordered fold. Publish a
+             * diagnostic output alias at that final boundary so parity sees
+             * the completed bank, not the local-only value emitted by the
+             * earlier expert stage. Node-local peer folding deliberately does
+             * not qualify: peer slots stream directly into the dense result
+             * and are not all resident in this tensor. */
+            if (publishes_complete_canonical_bank)
+            {
+                info.addOutput(
+                    "canonical_route_contributions",
+                    params_.canonical_route_contributions,
+                    static_cast<size_t>(params_.seq_len * params_.top_k),
+                    static_cast<size_t>(params_.d_model));
+            }
         }
         if (owns_reduction && params_.routing_weights &&
             params_.canonical_route_arithmetic ==

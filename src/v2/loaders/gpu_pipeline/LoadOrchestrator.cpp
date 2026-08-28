@@ -26,7 +26,6 @@
 #endif
 
 #include <algorithm>
-#include <optional>
 #include <stdexcept>
 
 namespace llaminar2
@@ -43,8 +42,7 @@ namespace llaminar2
                                  int device_id,
                                  size_t planned_weight_bytes,
                                  size_t staging_slot_bytes,
-                                 int staging_stream_count,
-                                 std::optional<size_t> safety_margin_override)
+                                 int staging_stream_count)
         {
             if (!backend)
                 return true;
@@ -53,10 +51,7 @@ namespace llaminar2
                 return true;
 
             const size_t free_vram_bytes = backend->deviceMemoryFree(device_id);
-            const size_t total_vram_bytes = backend->deviceMemoryTotal(device_id);
-            auto policy = configuredGPUWeightLoadMemoryPolicy(
-                /*staging_budget_override=*/std::nullopt,
-                safety_margin_override);
+            auto policy = configuredGPUWeightLoadMemoryPolicy();
             /*
              * allocate() already receives the exact slot selected by the
              * caller's load BOM. Unlimited staging here means "price this
@@ -69,11 +64,9 @@ namespace llaminar2
                 planned_weight_bytes,
                 staging_slot_bytes,
                 free_vram_bytes,
-                total_vram_bytes,
                 policy);
             const size_t required_vram_bytes = load_bom.load_bytes;
             const size_t staging_bytes = load_bom.staging_bytes;
-            const size_t safety_margin_bytes = load_bom.safety_margin_bytes;
             if (load_bom.fits())
             {
                 logVramBomLine(
@@ -86,18 +79,13 @@ namespace llaminar2
                         " planned_weights_mib=" + vramBomMiB(planned_weight_bytes) +
                         " staging_bytes=" + std::to_string(staging_bytes) +
                         " staging_mib=" + vramBomMiB(staging_bytes) +
-                        " safety_margin_bytes=" + std::to_string(safety_margin_bytes) +
-                        " safety_margin_mib=" + vramBomMiB(safety_margin_bytes) +
                         " free_bytes=" + std::to_string(free_vram_bytes) +
-                        " free_mib=" + vramBomMiB(free_vram_bytes) +
-                        " total_bytes=" + std::to_string(total_vram_bytes) +
-                        " total_mib=" + vramBomMiB(total_vram_bytes));
+                        " free_mib=" + vramBomMiB(free_vram_bytes));
                 LOG_DEBUG("LoadOrchestrator: VRAM preflight passed for device " << device_id
                                                                                 << " required=" << formatMiB(required_vram_bytes)
                                                                                 << " planned_weights=" << formatMiB(planned_weight_bytes)
                                                                                 << " staging=" << formatMiB(staging_bytes)
-                                                                                << " free=" << formatMiB(free_vram_bytes)
-                                                                                << " safety_margin=" << formatMiB(safety_margin_bytes));
+                                                                                << " free=" << formatMiB(free_vram_bytes));
                 return true;
             }
 
@@ -111,21 +99,13 @@ namespace llaminar2
                     " planned_weights_mib=" + vramBomMiB(planned_weight_bytes) +
                     " staging_bytes=" + std::to_string(staging_bytes) +
                     " staging_mib=" + vramBomMiB(staging_bytes) +
-                    " safety_margin_bytes=" + std::to_string(safety_margin_bytes) +
-                    " safety_margin_mib=" + vramBomMiB(safety_margin_bytes) +
                     " free_bytes=" + std::to_string(free_vram_bytes) +
-                    " free_mib=" + vramBomMiB(free_vram_bytes) +
-                    " total_bytes=" + std::to_string(total_vram_bytes) +
-                    " total_mib=" + vramBomMiB(total_vram_bytes));
+                    " free_mib=" + vramBomMiB(free_vram_bytes));
             LOG_ERROR("LoadOrchestrator: VRAM preflight failed for device " << device_id
                                                                             << ": required=" << formatMiB(required_vram_bytes)
-                                                                            << " available_after_margin="
-                                                                            << formatMiB(load_bom.availableAfterSafetyReserve())
                                                                             << " free=" << formatMiB(free_vram_bytes)
-                                                                            << " total=" << formatMiB(total_vram_bytes)
                                                                             << " planned_weights=" << formatMiB(planned_weight_bytes)
                                                                             << " staging=" << formatMiB(staging_bytes)
-                                                                            << " safety_margin=" << formatMiB(safety_margin_bytes)
                                                                             << ". Mitigations: set LLAMINAR_WEIGHT_STREAMING=1, use a smaller model, "
                                                                             << "reduce context/KV cache pressure, or reduce resident experts.");
             return false;
@@ -213,8 +193,7 @@ namespace llaminar2
                     ctx.device_id,
                     planned_weight_bytes,
                     pinned_slot_size,
-                    staging_slots,
-                    vram_preflight_safety_margin_override_))
+                    staging_slots))
             {
                 throw std::runtime_error("LoadOrchestrator: VRAM budget preflight failed for device " +
                                          std::to_string(ctx.device_id));

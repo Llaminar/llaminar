@@ -98,7 +98,7 @@ namespace
         return residency.installReadyBank(std::move(*prepared), error);
     }
 
-    MoEExpertOwnerMap twoParticipantOwnerMap()
+    MoEExpertOwnerMap twoParticipantOwnerMap(int num_layers = 1)
     {
         RoutedExpertDomain first_domain;
         first_domain.name = "first";
@@ -136,10 +136,14 @@ namespace
         plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan.domains = {std::move(first_domain), std::move(second_domain)};
         plan.routed_tiers = {std::move(first_tier), std::move(second_tier)};
-        plan.placements = {{
-            .layer = 0,
-            .routed_expert_tier = {0, 1},
-        }};
+        plan.placements.reserve(static_cast<std::size_t>(num_layers));
+        for (int layer = 0; layer < num_layers; ++layer)
+        {
+            plan.placements.push_back({
+                .layer = layer,
+                .routed_expert_tier = {0, 1},
+            });
+        }
         return MoEExpertOwnerMap::build(plan);
     }
 
@@ -1034,9 +1038,11 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
     EXPECT_EQ(selections[0].device, DeviceId::cpu());
     EXPECT_EQ(selections[0].layer_idx, 0);
     EXPECT_EQ(selections[0].expert_ids, (std::vector<int>{0}));
+    EXPECT_TRUE(selections[0].matches_frozen_owner_map);
     EXPECT_EQ(selections[1].participant_id, 1);
     EXPECT_EQ(selections[1].layer_idx, 0);
     EXPECT_EQ(selections[1].expert_ids, (std::vector<int>{1}));
+    EXPECT_TRUE(selections[1].matches_frozen_owner_map);
 
     const auto first = registry.endpoint(0);
     const auto second = registry.endpoint(1);
@@ -1224,6 +1230,95 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         &error));
     EXPECT_TRUE(resolved.empty());
     EXPECT_FALSE(error.empty());
+}
+
+TEST(Test__MoEOverlayParticipantResidencyRegistry,
+     FinalizesDormantLayersFromModelOwnedPreparedEngines)
+{
+    const auto owner_map = twoParticipantOwnerMap(2);
+    const auto *participant = owner_map.participantForId(0);
+    ASSERT_NE(participant, nullptr);
+    MoEOverlayParticipantResidencyRegistry residency({
+        .owner_map = owner_map,
+        .local_participant_ids = {0},
+        .num_layers = 2,
+        .num_experts = 2,
+        .initial_epoch = 1,
+    });
+    ExpertGemmRegistry prepared_engines;
+    const int world_rank = participant->world_rank_known
+                               ? participant->world_rank
+                               : -1;
+    const auto register_triplet =
+        [&](int layer_idx,
+            const MoEOverlayPreparedExpertTriplet &engines)
+    {
+        const auto register_role =
+            [&](ExpertGemmRegistry::WeightRole role,
+                const std::shared_ptr<ITensorGemm> &engine)
+        {
+            prepared_engines.registerEngineForParticipant(
+                participant->domain_name,
+                participant->device,
+                world_rank,
+                participant->domain_participant_index,
+                layer_idx,
+                0,
+                role,
+                engine.get(),
+                engine);
+        };
+        register_role(ExpertGemmRegistry::WeightRole::GATE, engines.gate);
+        register_role(ExpertGemmRegistry::WeightRole::UP, engines.up);
+        register_role(ExpertGemmRegistry::WeightRole::DOWN, engines.down);
+    };
+
+    const auto main_layer = triplet(1600);
+    register_triplet(0, main_layer);
+    std::vector<MoEOverlayPreparedExpertTriplet> main_layer_table(2);
+    main_layer_table[0] = main_layer;
+    std::string error;
+    ASSERT_TRUE(residency.registerInitialLayer(
+        0,
+        0,
+        {true, false},
+        main_layer_table,
+        &error))
+        << error;
+    ASSERT_FALSE(residency.allInitialBanksReady());
+
+    /*
+     * The missing retained sidecar must fail precisely; finalization may not
+     * fabricate an engine or silently shrink the physical graph family.
+     */
+    EXPECT_FALSE(residency.finalizeInitialBanksFromPreparedRegistry(
+        prepared_engines,
+        &error));
+    EXPECT_NE(error.find("participant 0 layer 1"), std::string::npos)
+        << error;
+    EXPECT_FALSE(residency.allInitialBanksReady());
+
+    const auto dormant_sidecar_layer = triplet(1700);
+    register_triplet(1, dormant_sidecar_layer);
+    ASSERT_TRUE(residency.finalizeInitialBanksFromPreparedRegistry(
+        prepared_engines,
+        &error))
+        << error;
+    EXPECT_TRUE(residency.allInitialBanksReady());
+    const auto selections = residency.initialBankExpertSelections();
+    ASSERT_EQ(selections.size(), 2u);
+    EXPECT_EQ(selections[0].layer_idx, 0);
+    EXPECT_EQ(selections[0].expert_ids, (std::vector<int>{0}));
+    EXPECT_TRUE(selections[0].matches_frozen_owner_map);
+    EXPECT_EQ(selections[1].layer_idx, 1);
+    EXPECT_EQ(selections[1].expert_ids, (std::vector<int>{0}));
+    EXPECT_TRUE(selections[1].matches_frozen_owner_map);
+
+    /* A cached graph family observes the same completed one-way transition. */
+    EXPECT_TRUE(residency.finalizeInitialBanksFromPreparedRegistry(
+        prepared_engines,
+        &error))
+        << error;
 }
 
 TEST(Test__MoEOverlayPreparedExpertArrival,
@@ -1447,14 +1542,18 @@ TEST(Test__MoEOverlayParticipantMigration,
         << published.error;
     EXPECT_EQ(fixture.authority->snapshot()->epoch, 2u);
     EXPECT_EQ(script->retire_calls, 0);
-    EXPECT_EQ(script->poll_retirement_calls, 0)
-        << "The live epoch-one ticket must gate both host and device retirement";
+    EXPECT_GT(script->poll_retirement_calls, 0)
+        << "The device grace-period event must progress concurrently with a live host reader";
+    const int retirement_polls_with_live_reader =
+        script->poll_retirement_calls;
 
     old_ticket.reset();
     EXPECT_EQ(
         fixture.authority->advanceBackground().status,
         MoEOverlayResidencyApplyStatus::Idle);
-    EXPECT_GT(script->poll_retirement_calls, 0);
+    EXPECT_GT(
+        script->poll_retirement_calls,
+        retirement_polls_with_live_reader);
     EXPECT_EQ(script->retire_calls, 0);
     EXPECT_NE(fixture.registry->endpoint(0)->acquire(1), nullptr);
 

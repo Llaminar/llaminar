@@ -216,6 +216,8 @@ namespace llaminar2
         static constexpr const char *WS_TRANSFER_PLAN_COUNT = "moe_rebalance_transfer_plan_count";
         static constexpr const char *WS_COMMAND_HEADER = "moe_rebalance_command_header";
         static constexpr const char *WS_CONTROLLER_STATE = "moe_rebalance_controller_state";
+        static constexpr const char *WS_PLACEMENT_PLAN_SCRATCH =
+            "moe_rebalance_placement_plan_scratch";
         static constexpr const char *WS_LLEP_LAYER_PLANS = "moe_rebalance_llep_layer_plans";
         static constexpr const char *WS_GATHERED_TRANSFER_PLAN = "moe_rebalance_gathered_transfer_plan";
         static constexpr const char *WS_GATHERED_COMMAND_HEADER = "moe_rebalance_gathered_command_header";
@@ -367,6 +369,7 @@ namespace llaminar2
         std::string transferPlanCountBufferName() const;
         std::string commandHeaderBufferName() const;
         std::string controllerStateBufferName() const;
+        std::string placementPlanScratchBufferName() const;
         std::string llepLayerPlansBufferName() const;
         std::string gatheredTransferPlanBufferName() const;
         std::string gatheredCommandHeaderBufferName() const;

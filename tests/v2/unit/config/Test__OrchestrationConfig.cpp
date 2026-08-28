@@ -449,10 +449,10 @@ TEST(Test__OrchestrationConfig, Validate_DefaultConfig_ReturnsEmpty)
     EXPECT_TRUE(errors.empty());
 }
 
-TEST(Test__OrchestrationConfig, Validate_ZeroMigrationCyclesPerWaveReturnsError)
+TEST(Test__OrchestrationConfig, Validate_ZeroMigrationTransferSlotsReturnsError)
 {
     auto config = OrchestrationConfig::defaults();
-    config.moe_rebalance.migration_max_cycles_per_wave = 0;
+    config.moe_rebalance.migration_transfer_slots = 0;
 
     const auto errors = config.validate();
     EXPECT_TRUE(std::any_of(
@@ -460,9 +460,80 @@ TEST(Test__OrchestrationConfig, Validate_ZeroMigrationCyclesPerWaveReturnsError)
         errors.end(),
         [](const std::string &error)
         {
-            return error.find("migration max cycles per wave") !=
+            return error.find("migration transfer slots") !=
                    std::string::npos;
         }));
+}
+
+TEST(Test__OrchestrationConfig,
+     Validate_MigrationCyclePolicyMustFitPhysicalTransferSlots)
+{
+    auto config = OrchestrationConfig::defaults();
+    config.moe_rebalance.migration_transfer_slots = 4u;
+    config.moe_rebalance.migration_cycles_per_wave = 0u;
+
+    auto errors = config.validate();
+    EXPECT_TRUE(std::any_of(
+        errors.begin(),
+        errors.end(),
+        [](const std::string &error)
+        {
+            return error.find("cycles per wave must be > 0") !=
+                   std::string::npos;
+        }));
+
+    config.moe_rebalance.migration_cycles_per_wave = 5u;
+    errors = config.validate();
+    EXPECT_TRUE(std::any_of(
+        errors.begin(),
+        errors.end(),
+        [](const std::string &error)
+        {
+            return error.find("cannot exceed physical transfer slots") !=
+                   std::string::npos;
+        }));
+
+    config.moe_rebalance.migration_cycles_per_wave = 2u;
+    errors = config.validate();
+    EXPECT_FALSE(std::any_of(
+        errors.begin(),
+        errors.end(),
+        [](const std::string &error)
+        {
+            return error.find("migration cycles per wave") !=
+                   std::string::npos;
+        }));
+}
+
+TEST(Test__OrchestrationConfig, Validate_DynamicRebalanceGeometryAtAdmission)
+{
+    const auto contains = [](const auto &errors, const std::string &needle)
+    {
+        return std::any_of(
+            errors.begin(),
+            errors.end(),
+            [&](const std::string &error)
+            { return error.find(needle) != std::string::npos; });
+    };
+
+    auto config = OrchestrationConfig::defaults();
+    config.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+
+    config.moe_rebalance.dynamic_imbalance_threshold_per_mille =
+        moe_rebalance_policy::kMinimumDynamicImbalanceThresholdPerMille - 1u;
+    EXPECT_TRUE(contains(config.validate(), "imbalance threshold"));
+
+    config.moe_rebalance.dynamic_imbalance_threshold_per_mille =
+        moe_rebalance_policy::kMinimumDynamicImbalanceThresholdPerMille;
+    config.moe_rebalance.dynamic_max_swaps_per_layer = 0u;
+    EXPECT_TRUE(contains(config.validate(), "maximum swaps per layer"));
+
+    config.moe_rebalance.dynamic_max_swaps_per_layer = 1u;
+    config.moe_rebalance.dynamic_max_plan_entries_per_wave = 1u;
+    EXPECT_TRUE(contains(config.validate(), "paired swap"));
+
+    config.moe_rebalance.dynamic_max_plan_entries_per_wave = 2u;
+    EXPECT_FALSE(contains(config.validate(), "Dynamic"));
 }
 
 TEST(Test__OrchestrationConfig, Validate_InvalidTPDegree_ReturnsError)

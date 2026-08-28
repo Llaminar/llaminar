@@ -221,7 +221,7 @@ namespace llaminar2
              * complete canonical route tensor without changing its fixed
              * router-slot arithmetic order.
              */
-            config["MOE_CANONICAL_ROUTE_CONTRIBUTIONS"] =
+            config["MOE_ROUTE_CONTRIBUTIONS"] =
                 SnapshotShardingMode::ROW_PARALLEL;
 
             /*
@@ -255,7 +255,11 @@ namespace llaminar2
                 SnapshotShardingMode::ROOT_ONLY;
             config["MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0"] =
                 SnapshotShardingMode::ROOT_ONLY;
+            config["MOE_OVERLAY_ROUTE_BANK0_EPOCH"] =
+                SnapshotShardingMode::ROOT_ONLY;
             config["MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1"] =
+                SnapshotShardingMode::ROOT_ONLY;
+            config["MOE_OVERLAY_ROUTE_BANK1_EPOCH"] =
                 SnapshotShardingMode::ROOT_ONLY;
             config["MOE_OVERLAY_ROUTE_SELECTED_BANK"] =
                 SnapshotShardingMode::ROOT_ONLY;

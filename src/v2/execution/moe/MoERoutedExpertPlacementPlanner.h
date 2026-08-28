@@ -25,6 +25,13 @@ namespace llaminar2
 
     struct MoERoutedExpertModelMetadata
     {
+        /**
+         * Total routed-layer storage required by the retained graph family.
+         *
+         * This may exceed the ordinary decoder layer count when a model keeps
+         * routed NextN/MTP sidecar banks resident for graph reuse.  Consumers
+         * must not infer a main-inference boundary from this capacity.
+         */
         int num_layers = 0;
         int num_experts = 0;
         int d_model = 0;
@@ -33,6 +40,15 @@ namespace llaminar2
         bool has_shared_expert = false;
         std::string routed_quant_type = "F32";
         std::string shared_quant_type = "F32";
+        /**
+         * Exclusive upper bound of ordinary main-model layer identities.
+         *
+         * The model-aware resolver always publishes this independently of
+         * retained sidecar capacity.  A zero value means that the metadata was
+         * not resolved from a live model and is invalid for inference-window
+         * boundary selection.
+         */
+        int main_inference_layer_count = 0;
     };
 
     struct MoERoutedExpertLayerTierMask
@@ -96,12 +112,31 @@ namespace llaminar2
     };
 
     /**
+     * @brief Measured routed service cost for one exact overlay participant.
+     *
+     * Tier aggregates are sufficient for cold-start capacity placement, but a
+     * live residency transaction must price the parallel critical path across
+     * the actual owners.  Keeping this row in the certified profile prevents a
+     * slower participant from being hidden by a tier label and lets promotion,
+     * demotion, and same-tier skew correction share one measured objective.
+     */
+    struct MoERoutedParticipantLayerPhaseServiceCost
+    {
+        int participant_id = -1;
+        int layer = -1;
+        std::array<uint64_t, kExpertHistogramProductionSourceCount>
+            nanoseconds_per_activation{};
+    };
+
+    /**
      * @brief Complete immutable service profile consumed by tier assignment.
      *
-     * A valid profile contains exactly one row for every `(tier, layer)` and a
-     * stable non-empty identity derived by its setup-time certification owner.
-     * Integer priority controls capacity fill and the final deterministic tie;
-     * measured service time controls the primary runtime economy objective.
+     * A placement-valid profile contains exactly one tier row for every
+     * `(tier, layer)`.  A profile used by the live ExpertOverlay economy also
+     * contains one participant row for every `(participant, layer)`.  The tier
+     * rows are conservative aggregates used for cold-start capacity placement;
+     * transaction admission uses the participant rows to compare the exact
+     * before/after parallel critical path.  The stable identity covers both.
      */
     struct MoERoutedTierServiceProfile
     {
@@ -110,6 +145,8 @@ namespace llaminar2
         ExpertHistogramProductionSourceMask active_sources =
             kAllExpertHistogramProductionSources;
         std::vector<MoERoutedTierLayerPhaseServiceCost> costs;
+        std::vector<MoERoutedParticipantLayerPhaseServiceCost>
+            participant_costs;
     };
 
     /**

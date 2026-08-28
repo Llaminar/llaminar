@@ -10,7 +10,8 @@
  * 5. releaseHostResidentWeightData() releases only host-resident tensors
  * 6. releaseHostResidentWeightData() retains non-host-resident tensors
  * 7. releaseHostResidentWeightData() deduplicates shared tensor pointers
- * 8. Return counts are correct
+ * 8. Scheduled post-prefill reclaim owns residual host release
+ * 9. Return counts are correct
  *
  * Uses lifecycle-gate control plus TensorBase prepared-device-state metadata to
  * exercise the release decision tree without depending on KernelFactory static state.
@@ -338,4 +339,29 @@ TEST_F(Test__WeightManagerHostRelease, ReleaseHostResident_SkipsBorrowedTensorSl
     EXPECT_EQ(released, 0);
     EXPECT_FALSE(slice->is_raw_data_released())
         << "Borrowed TensorSlice views must not release their wrapped storage during the broad host-resident sweep";
+}
+
+TEST_F(
+    Test__WeightManagerHostRelease,
+    ScheduledPostPrefillReclaimReleasesResidualHostWeightsBeforeAllocationBarrier)
+{
+    TestableWeightManager wm(*mock_loader_);
+
+    auto tensor = loadTensor(wm, "token_embd.weight");
+    ASSERT_NE(tensor, nullptr);
+    tensor->setHostResident();
+    ASSERT_FALSE(tensor->is_raw_data_released());
+
+    EXPECT_EQ(
+        wm.scheduleMmapReclaim(),
+        MmapReclaimLifecycle::Submission::Scheduled);
+    const auto completion =
+        wm.awaitMmapReclaimBeforeHostAllocation();
+
+    EXPECT_EQ(completion.state, MmapReclaimLifecycle::State::Complete);
+    EXPECT_TRUE(tensor->is_raw_data_released())
+        << "The worker must complete residual host release before model/JIT allocation proceeds";
+    EXPECT_EQ(
+        wm.scheduleMmapReclaim(),
+        MmapReclaimLifecycle::Submission::AlreadyComplete);
 }

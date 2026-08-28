@@ -36,6 +36,7 @@
 
 #pragma once
 
+#include <span>
 #include <string>
 #include <vector>
 
@@ -86,6 +87,40 @@ namespace llaminar2
          */
         virtual WorkspaceRequirements getWorkspaceRequirements(
             int m, int n = 0, int k = 0) const = 0;
+
+        /**
+         * @brief Append scratch required by one fused projection transaction.
+         *
+         * Ordinary per-kernel requirements describe a projection that executes
+         * by itself.  A first-class fused GEMM may additionally keep several
+         * projection partials live at once.  The stage that owns that bundle
+         * calls this method exactly once on its anchor kernel with the complete
+         * ordered output-width inventory.  This prevents a large singleton,
+         * such as an LM head, from being mistaken for a maximum-width fused
+         * bundle while still letting a backend declare its exact concurrent
+         * layout.
+         *
+         * The default implementation is intentionally empty: backends whose
+         * fused implementation does not need extra simultaneous scratch retain
+         * only their ordinary per-kernel requirements.
+         *
+         * @param requirements Aggregate requirements owned by the calling stage.
+         * @param m Maximum rows represented by the captured fused transaction.
+         * @param projection_columns Ordered output width of every projection in
+         *        the transaction. Repeated widths are significant.
+         * @param k Shared input width for the fused transaction.
+         */
+        virtual void appendFusedProjectionWorkspaceRequirements(
+            WorkspaceRequirements &requirements,
+            int m,
+            std::span<const int> projection_columns,
+            int k) const
+        {
+            (void)requirements;
+            (void)m;
+            (void)projection_columns;
+            (void)k;
+        }
 
         // =========================================================================
         // Workspace Binding

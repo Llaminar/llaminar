@@ -32,7 +32,7 @@
 #include <algorithm>
 #include <vector>
 #include <mutex>
-#include <set>
+#include <unordered_map>
 #include <stdexcept>
 
 #ifdef HAVE_ROCM
@@ -68,15 +68,32 @@ namespace llaminar2
         {
 #ifdef HAVE_ROCM
             static std::mutex iq_grid_mutex;
-            static std::set<int> iq_grids_initialized_devices;
+            static std::unordered_map<int, std::uint64_t>
+                iq_grid_runtime_generations;
+
+            IBackend *const backend = getROCmBackend();
+            const std::uint64_t runtime_generation = backend
+                                                         ? backend->deviceRuntimeGeneration(
+                                                               device_id)
+                                                         : 0u;
+            if (runtime_generation == 0u)
+            {
+                LOG_ERROR(
+                    "[ROCmWeightPacker] IQ grid initialization has no live "
+                    "runtime generation for device "
+                    << device_id);
+                return false;
+            }
 
             // Initialization publishes several translation-unit-local constant
             // tables as one logical transaction. Keep the lock through the
             // entire transaction so concurrent graph preparation cannot launch
             // duplicate asynchronous table copies or observe partial success.
             std::lock_guard<std::mutex> lock(iq_grid_mutex);
-            if (iq_grids_initialized_devices.find(device_id) !=
-                iq_grids_initialized_devices.end())
+            const auto initialized =
+                iq_grid_runtime_generations.find(device_id);
+            if (initialized != iq_grid_runtime_generations.end() &&
+                initialized->second == runtime_generation)
             {
                 return true;
             }
@@ -135,7 +152,7 @@ namespace llaminar2
                 return false;
             }
 
-            iq_grids_initialized_devices.insert(device_id);
+            iq_grid_runtime_generations[device_id] = runtime_generation;
             return true;
 #else
             (void)device_id;

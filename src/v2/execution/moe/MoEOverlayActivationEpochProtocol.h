@@ -135,14 +135,16 @@ namespace llaminar2
          * @brief Arm a quiescent slot with one immutable scheduler ticket.
          * @param ticket Already-validated Execute ticket for this rank pair.
          * @param epoch_generation Strictly increasing timeline generation.
-         * @param deadline_ns Positive absolute watchdog deadline.
+         * @param timeout_not_before_ns Positive absolute lower bound for a
+         *        terminal watchdog observation. Individual dispatch and
+         *        completion rendezvous own independent no-progress deadlines.
          * @param error Optional stable diagnostic.
          * @return Complete device identity, or empty on rejection.
          */
         [[nodiscard]] std::optional<MoEOverlayActivationEpochIdentity> arm(
             const MoEOverlayInferenceTransactionTicket &ticket,
             std::uint64_t epoch_generation,
-            std::uint64_t deadline_ns,
+            std::uint64_t timeout_not_before_ns,
             std::string *error = nullptr);
 
         /**
@@ -240,7 +242,8 @@ namespace llaminar2
         /**
          * @brief Terminal watchdog observation at the explicit host boundary.
          * @param epoch_generation Exact currently armed generation.
-         * @param observed_ns Monotonic timestamp to compare with the armed deadline.
+         * @param observed_ns Monotonic timestamp to compare with the armed
+         *        timeout-eligibility lower bound.
          * @return True only when this call transitions Armed to Failed/TimedOut.
          */
         bool markTimedOut(

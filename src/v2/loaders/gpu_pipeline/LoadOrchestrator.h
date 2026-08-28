@@ -15,7 +15,6 @@
 #include "loaders/gpu_pipeline/DeviceLoadPipeline.h"
 
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -56,14 +55,6 @@ namespace llaminar2
         /// @param num_h2d_streams   Number of ring buffer slots.
         void allocate(size_t pinned_slot_size, int num_h2d_streams = 3);
 
-        /// Override the VRAM safety margin used by allocate() preflight.
-        /// Runtime expert arrivals already occur after initial model residency is
-        /// established, so callers can keep a smaller reserve than initial load.
-        void setVramPreflightSafetyMarginBytes(size_t bytes)
-        {
-            vram_preflight_safety_margin_override_ = bytes;
-        }
-
         /// Get pool for a device. Returns nullptr if not found.
         WeightVRAMPool *getPool(int device_id);
         const WeightVRAMPool *getPool(int device_id) const;
@@ -103,7 +94,6 @@ namespace llaminar2
 
         IBackend *backend_ = nullptr;
         std::vector<DeviceContext> devices_;
-        std::optional<size_t> vram_preflight_safety_margin_override_;
     };
 
 } // namespace llaminar2

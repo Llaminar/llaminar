@@ -19,8 +19,11 @@
  */
 
 #include <gtest/gtest.h>
+#include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
+#include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
+#include "transfer/TransferEngine.h"
 
 #if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 #include <hip/hip_runtime.h>
@@ -74,6 +77,8 @@ using namespace llaminar2;
 
 namespace
 {
+    constexpr size_t kRuntimeRetirementAllocationBytes = 64u * 1024u * 1024u;
+
     void expectAuxiliaryStreamsReuseByName(IWorkerGPUContext &ctx)
     {
         ctx.resetAuxiliaryStreams();
@@ -102,6 +107,122 @@ namespace
         EXPECT_TRUE(created);
 
         ctx.resetAuxiliaryStreams();
+    }
+
+    /**
+     * @brief Prove the complete public model-retirement transaction on a GPU.
+     *
+     * The live allocation is included in the ticket's exact BOM, then released
+     * before completion just as the final model owner would be. Completion must
+     * destroy the worker generation, reset the native runtime generation, and
+     * leave both the canonical backend allocator and worker-context pool usable.
+     */
+    void expectExclusiveRuntimeGenerationRetirement(DeviceId device)
+    {
+        IBackend *const backend = getBackendFor(device);
+        ASSERT_NE(backend, nullptr);
+
+        auto &pool = GPUDeviceContextPool::instance();
+        ASSERT_TRUE(pool.getContext(device).isInitialized());
+
+        const std::uint64_t runtime_generation_before =
+            backend->deviceRuntimeGeneration(device.gpu_ordinal());
+        ASSERT_NE(runtime_generation_before, 0u);
+
+        void *const allocation = backend->allocate(
+            kRuntimeRetirementAllocationBytes,
+            device.gpu_ordinal());
+        ASSERT_NE(allocation, nullptr);
+
+        TransferEngine engine;
+        auto ticket = engine.beginExclusiveModelRetirement(
+            ModelDeviceMemoryRetention{
+                .device = device,
+                .prepared_weight_bytes =
+                    kRuntimeRetirementAllocationBytes,
+                .reusable_workspace_bytes = 0u,
+            });
+
+        // Model owners release their canonical allocations between the two
+        // typed retirement phases; the backend tracker must therefore be empty
+        // before TransferEngine is permitted to reset the runtime generation.
+        backend->free(allocation, device.gpu_ordinal());
+        const DeviceMemoryReclamationReceipt receipt =
+            engine.completeExclusiveModelRetirement(std::move(ticket));
+
+        EXPECT_TRUE(receipt.runtime_reset_invoked);
+        EXPECT_EQ(
+            receipt.retired_runtime_generation,
+            runtime_generation_before);
+        EXPECT_EQ(
+            receipt.active_runtime_generation,
+            runtime_generation_before + 1u);
+        EXPECT_EQ(
+            backend->deviceRuntimeGeneration(device.gpu_ordinal()),
+            runtime_generation_before + 1u);
+        EXPECT_GE(
+            receipt.releasedCanonicalBytes(),
+            kRuntimeRetirementAllocationBytes);
+
+        // Neither a stale worker nor a stale allocator handle may survive the
+        // primary-context reset. Both authorities must lazily bind to the new
+        // runtime generation and remain usable by the next model admission.
+        ASSERT_TRUE(pool.getContext(device).isInitialized());
+        void *const fresh_allocation =
+            backend->allocate(4096u, device.gpu_ordinal());
+        ASSERT_NE(fresh_allocation, nullptr);
+        backend->free(fresh_allocation, device.gpu_ordinal());
+
+        /*
+         * A process campaign keeps its ClusterInventory while retiring one
+         * model generation. Prove that the same typed mutation used by
+         * production admission replaces that deliberately stale discovery
+         * value with the newly recreated backend generation's live capacity.
+         */
+        RankInventory runtime_inventory;
+        runtime_inventory.rank = 0;
+        runtime_inventory.gpus.push_back(DeviceInfo{
+            .type = device.type,
+            .local_device_id = device.ordinal,
+            .memory_bytes = 1u,
+            .free_memory_bytes = 1u,
+        });
+        const std::size_t runtime_total_bytes =
+            backend->deviceMemoryTotal(device.gpu_ordinal());
+        const std::size_t runtime_free_bytes =
+            backend->deviceMemoryFree(device.gpu_ordinal());
+        ASSERT_GT(runtime_total_bytes, 0u);
+        ASSERT_GT(runtime_free_bytes, 0u);
+        installMoEOverlayRuntimeGPUCapacityObservation(
+            runtime_inventory,
+            device,
+            runtime_total_bytes,
+            runtime_free_bytes);
+        ASSERT_EQ(runtime_inventory.gpus.size(), 1u);
+        EXPECT_EQ(
+            runtime_inventory.gpus.front().memory_bytes,
+            runtime_total_bytes);
+        EXPECT_EQ(
+            runtime_inventory.gpus.front().free_memory_bytes,
+            runtime_free_bytes);
+    }
+
+    /**
+     * @brief Prove acquisition remains excluded for the whole retirement scope.
+     */
+    void expectContextAcquisitionExcludedDuringRetirement(DeviceId device)
+    {
+        auto &pool = GPUDeviceContextPool::instance();
+        ASSERT_TRUE(pool.getContext(device).isInitialized());
+
+        {
+            auto retirement =
+                pool.beginExclusiveGenerationRetirement(device);
+            EXPECT_TRUE(retirement.receipt().retiredLiveContext());
+            EXPECT_THROW((void)pool.getContext(device), std::logic_error);
+        }
+
+        ASSERT_TRUE(pool.getContext(device).isInitialized());
     }
 } // namespace
 
@@ -235,6 +356,86 @@ TEST(Test__GPUDeviceContextPool, GetContextInvalidOrdinal)
         int count = pool.amdDeviceCount();
         EXPECT_THROW(pool.getAMDContext(count + 100), std::runtime_error);
     }
+}
+
+TEST(Test__GPUDeviceContextPool, ExclusiveRetirementRejectsCPU)
+{
+    auto &pool = GPUDeviceContextPool::instance();
+    EXPECT_THROW(
+        (void)pool.retireExclusiveGeneration(DeviceId::cpu()),
+        std::invalid_argument);
+}
+
+TEST(Test__GPUDeviceContextPool, CUDAExclusiveRetirementCreatesFreshGeneration)
+{
+    SKIP_IF_NO_CUDA();
+
+    auto &pool = GPUDeviceContextPool::instance();
+    ASSERT_TRUE(pool.getNvidiaContext(0).isInitialized());
+
+    const auto first =
+        pool.retireExclusiveGeneration(DeviceId::cuda(0));
+    ASSERT_TRUE(first.retiredLiveContext());
+    EXPECT_EQ(first.device, DeviceId::cuda(0));
+
+    // Lazy acquisition after the terminal edge must materialize a distinct
+    // lifecycle generation even if the host allocator reuses an object address.
+    ASSERT_TRUE(pool.getNvidiaContext(0).isInitialized());
+    const auto second =
+        pool.retireExclusiveGeneration(DeviceId::cuda(0));
+    EXPECT_GT(second.retired_generation, first.retired_generation);
+
+    // Leave a live context for the remaining backend integration cases.
+    ASSERT_TRUE(pool.getNvidiaContext(0).isInitialized());
+}
+
+TEST(Test__GPUDeviceContextPool, ROCmExclusiveRetirementCreatesFreshGeneration)
+{
+    SKIP_IF_NO_ROCM();
+
+    auto &pool = GPUDeviceContextPool::instance();
+    ASSERT_TRUE(pool.getAMDContext(0).isInitialized());
+
+    const auto first =
+        pool.retireExclusiveGeneration(DeviceId::rocm(0));
+    ASSERT_TRUE(first.retiredLiveContext());
+    EXPECT_EQ(first.device, DeviceId::rocm(0));
+
+    ASSERT_TRUE(pool.getAMDContext(0).isInitialized());
+    const auto second =
+        pool.retireExclusiveGeneration(DeviceId::rocm(0));
+    EXPECT_GT(second.retired_generation, first.retired_generation);
+
+    // Later tests consume the ordinary live generation, not a retired handle.
+    ASSERT_TRUE(pool.getAMDContext(0).isInitialized());
+}
+
+TEST(Test__GPUDeviceContextPool,
+     CUDAAcquisitionIsExcludedAcrossRuntimeRetirementScope)
+{
+    SKIP_IF_NO_CUDA();
+    expectContextAcquisitionExcludedDuringRetirement(DeviceId::cuda(0));
+}
+
+TEST(Test__GPUDeviceContextPool,
+     ROCmAcquisitionIsExcludedAcrossRuntimeRetirementScope)
+{
+    SKIP_IF_NO_ROCM();
+    expectContextAcquisitionExcludedDuringRetirement(DeviceId::rocm(0));
+}
+
+TEST(Test__GPUDeviceContextPool,
+     CUDAExclusiveModelRetirementResetsRuntimeGeneration)
+{
+    SKIP_IF_NO_CUDA();
+    expectExclusiveRuntimeGenerationRetirement(DeviceId::cuda(0));
+}
+
+TEST(Test__GPUDeviceContextPool,
+     ROCmExclusiveModelRetirementResetsRuntimeGeneration)
+{
+    SKIP_IF_NO_ROCM();
+    expectExclusiveRuntimeGenerationRetirement(DeviceId::rocm(0));
 }
 
 TEST(Test__GPUDeviceContextPool, ConcurrentAccess)

@@ -1,6 +1,6 @@
 /**
- * @file MoEOverlayMPIHistogramPublisher.h
- * @brief Coordinator-to-rank publication of frozen ExpertOverlay histograms.
+ * @file MoEOverlayMPIResidencyProposalPublisher.h
+ * @brief Coordinator-to-rank publication of canonical ExpertOverlay proposals.
  *
  * Dynamic placement has one routing-evidence authority: the world rank that
  * owns the logical continuation/router root.  This model-lifetime lane sends
@@ -13,7 +13,7 @@
 
 #pragma once
 
-#include "MoEOverlayHistogramPublisher.h"
+#include "MoEOverlayResidencyProposalPublisher.h"
 
 #include <mpi.h>
 
@@ -27,11 +27,12 @@ namespace llaminar2
 {
     class IMPIContext;
 
-    /** @brief Observable local lifecycle of one histogram publication lane. */
-    enum class MoEOverlayMPIHistogramPublisherState
+    /** @brief Observable local lifecycle of one proposal publication lane. */
+    enum class MoEOverlayMPIResidencyProposalPublisherState
     {
         Idle,
         Receiving,
+        AwaitingValidation,
         Acknowledging,
         Publishing,
         Failed,
@@ -54,17 +55,17 @@ namespace llaminar2
      * @return True only for an initiated coordinator publication.
      */
     [[nodiscard]] constexpr bool
-    moeOverlayHistogramOwnsProgressDeadline(
-        MoEOverlayMPIHistogramPublisherState state) noexcept
+    moeOverlayProposalOwnsProgressDeadline(
+        MoEOverlayMPIResidencyProposalPublisherState state) noexcept
     {
         return state ==
-                   MoEOverlayMPIHistogramPublisherState::Publishing ||
+                   MoEOverlayMPIResidencyProposalPublisherState::Publishing ||
                state ==
-                   MoEOverlayMPIHistogramPublisherState::Acknowledging;
+                   MoEOverlayMPIResidencyProposalPublisherState::Acknowledging;
     }
 
     /** @brief Process-local proof counters for coordinator histogram traffic. */
-    struct MoEOverlayMPIHistogramPublisherStats
+    struct MoEOverlayMPIResidencyProposalPublisherStats
     {
         std::uint64_t receives_armed = 0;
         std::uint64_t publications_started = 0;
@@ -86,14 +87,15 @@ namespace llaminar2
      *
      * The coordinator may be any world rank; no device or socket number is
      * inferred from it. Peers keep one exact-size Irecv posted. After a peer
-     * decodes a window it acknowledges that exact generation before returning
-     * the immutable object to the maintenance service. The coordinator returns
-     * Ready only after every peer acknowledgement has arrived. A peer then
-     * remains Idle until @ref armReceive is called for the next epoch,
-     * preventing a new proposal from overwriting retained evidence.
+     * decodes a window it returns the immutable object in `AwaitingValidation`.
+     * Only explicit semantic adoption may start the exact-generation
+     * acknowledgement. The coordinator returns Ready only after every peer
+     * acknowledgement has arrived. A peer then remains Idle until
+     * @ref armReceive is called for the next epoch, preventing a new proposal
+     * from overwriting retained evidence.
      */
-    class MoEOverlayMPIHistogramPublisher final
-        : public IMoEOverlayHistogramPublisher
+    class MoEOverlayMPIResidencyProposalPublisher final
+        : public IMoEOverlayResidencyProposalPublisher
     {
     public:
         /** @brief Immutable communicator, coordinator, and model geometry. */
@@ -114,15 +116,15 @@ namespace llaminar2
          *
          * Non-coordinator ranks post their first receive before returning.
          */
-        explicit MoEOverlayMPIHistogramPublisher(Config config);
+        explicit MoEOverlayMPIResidencyProposalPublisher(Config config);
 
         /** @brief Drain setup/control-plane MPI and free the communicator. */
-        ~MoEOverlayMPIHistogramPublisher();
+        ~MoEOverlayMPIResidencyProposalPublisher();
 
-        MoEOverlayMPIHistogramPublisher(
-            const MoEOverlayMPIHistogramPublisher &) = delete;
-        MoEOverlayMPIHistogramPublisher &operator=(
-            const MoEOverlayMPIHistogramPublisher &) = delete;
+        MoEOverlayMPIResidencyProposalPublisher(
+            const MoEOverlayMPIResidencyProposalPublisher &) = delete;
+        MoEOverlayMPIResidencyProposalPublisher &operator=(
+            const MoEOverlayMPIResidencyProposalPublisher &) = delete;
 
         /**
          * @brief Publish one coordinator-frozen generation to every peer.
@@ -131,7 +133,7 @@ namespace llaminar2
          * @return True after all non-blocking sends are owned by MPI.
          */
         bool beginPublish(
-            const DecodeExpertHistogramWindow &window,
+            const MoEOverlayDistributedResidencyProposal &proposal,
             std::string *error = nullptr) override;
 
         /**
@@ -142,9 +144,19 @@ namespace llaminar2
          * @return Pending, Ready, or Failed without waiting.
          */
         MoEOverlayResidencyWaveProgress poll(
-            std::shared_ptr<const DecodeExpertHistogramWindow>
-                *received_window,
+            std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+                *received_proposal,
             std::string *error = nullptr) override;
+
+        /** @brief Start the peer acknowledgement after exact local adoption. */
+        bool acceptReceivedProposal(
+            std::uint64_t histogram_generation,
+            std::string *error = nullptr) override;
+
+        /** @brief Abort every rank after a peer semantic-adoption failure. */
+        void rejectReceivedProposal(
+            std::uint64_t histogram_generation,
+            std::string diagnostic) override;
 
         /**
          * @brief Post the next fixed receive after the prior wave releases it.
@@ -169,14 +181,14 @@ namespace llaminar2
         [[nodiscard]] bool isCoordinator() const noexcept override;
 
         /** @return Current local lane state. */
-        [[nodiscard]] MoEOverlayMPIHistogramPublisherState state()
+        [[nodiscard]] MoEOverlayMPIResidencyProposalPublisherState state()
             const noexcept
         {
             return state_;
         }
 
         /** @return Process-local lane counters. */
-        [[nodiscard]] MoEOverlayMPIHistogramPublisherStats stats()
+        [[nodiscard]] MoEOverlayMPIResidencyProposalPublisherStats stats()
             const noexcept
         {
             return stats_;
@@ -204,14 +216,13 @@ namespace llaminar2
         std::vector<MPI_Request> acknowledgement_receive_requests_;
         std::vector<std::uint64_t> acknowledgement_receive_generations_;
         std::vector<std::uint8_t> wire_buffer_;
-        std::shared_ptr<const DecodeExpertHistogramWindow>
-            received_window_pending_acknowledgement_;
         std::uint64_t publishing_generation_ = 0;
+        std::uint64_t awaiting_validation_generation_ = 0;
         std::uint64_t acknowledgement_send_generation_ = 0;
         std::chrono::steady_clock::time_point operation_started_at_{};
-        MoEOverlayMPIHistogramPublisherState state_ =
-            MoEOverlayMPIHistogramPublisherState::Idle;
+        MoEOverlayMPIResidencyProposalPublisherState state_ =
+            MoEOverlayMPIResidencyProposalPublisherState::Idle;
         std::string failure_;
-        MoEOverlayMPIHistogramPublisherStats stats_;
+        MoEOverlayMPIResidencyProposalPublisherStats stats_;
     };
 } // namespace llaminar2

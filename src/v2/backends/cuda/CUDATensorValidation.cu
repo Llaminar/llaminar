@@ -520,6 +520,28 @@ namespace llaminar2
         return getCUDATensorValidator(device_id);
     }
 
+    /**
+     * @brief Destroy one validator before its CUDA runtime generation resets.
+     *
+     * Moving the owner out under the registry lock prevents a concurrent lookup
+     * from observing a half-retired validator. Destruction happens after the
+     * lock is released because cudaFree/cudaEventDestroy may enter the driver.
+     */
+    bool retireCUDATensorValidatorRuntimeGeneration(int device_id)
+    {
+        std::unique_ptr<CUDATensorValidator> retired;
+        {
+            std::lock_guard<std::mutex> lock(g_cuda_validator_mutex);
+            const auto iterator = g_cuda_validators.find(device_id);
+            if (iterator == g_cuda_validators.end())
+                return true;
+            retired = std::move(iterator->second);
+            g_cuda_validators.erase(iterator);
+        }
+        retired.reset();
+        return true;
+    }
+
 } // namespace llaminar2
 
 // C linkage export for cross-TU factory
@@ -531,4 +553,11 @@ extern "C" llaminar2::ITensorValidator *llaminar2_getCUDATensorValidator()
 extern "C" llaminar2::ITensorValidator *llaminar2_getCUDATensorValidatorForDevice(int device_id)
 {
     return llaminar2::getCUDATensorValidator(device_id);
+}
+
+/** @brief C-linkage retirement hook owned by CUDA backend lifecycle code. */
+extern "C" bool llaminar2_retireCUDATensorValidatorRuntimeGeneration(
+    int device_id)
+{
+    return llaminar2::retireCUDATensorValidatorRuntimeGeneration(device_id);
 }

@@ -162,6 +162,34 @@ extern "C" bool hipMoEOverlayActivationConsumeReturn(
     return launchAccepted();
 }
 
+extern "C" bool hipMoEOverlayConsumeCanonicalRouteTicket(
+    const llaminar2::MoEOverlayCanonicalRouteTicketConsumeLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const std::size_t capacity_elements =
+        launch->route_capacity * static_cast<std::size_t>(launch->d_model);
+    const unsigned int blocks = std::min(
+        kSparseRoutePayloadBlocks, blocksFor(capacity_elements));
+    const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL(
+        llaminar2::moe_activation_packet_device::
+            materializeCanonicalRouteTicketKernel,
+        dim3(blocks), dim3(kThreads), 0u, hip_stream, *launch);
+    /* A separate one-thread node cannot race the materialization blocks. Its
+     * exact-stream release is the sole authority permitting host payload reuse. */
+    hipLaunchKernelGGL(
+        llaminar2::moe_activation_packet_device::
+            acknowledgeCanonicalRouteTicketKernel,
+        dim3(1u), dim3(1u), 0u, hip_stream, *launch);
+    return launchAccepted();
+}
+
 extern "C" bool hipMoEOverlayActivationPackSingleRowDispatch(
     const llaminar2::MoEOverlayActivationSingleRowDispatchPackLaunch *launch,
     int device_ordinal,

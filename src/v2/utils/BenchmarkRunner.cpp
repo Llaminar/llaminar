@@ -512,53 +512,20 @@ namespace llaminar2
             {"records", std::move(records_json)}};
     }
 
-    /** Monotonic host-owned diagnostic totals for completed device-authored work. */
-    struct CompletedDynamicMovementSnapshot
-    {
-        std::uint64_t transactions = 0;
-        std::uint64_t commands = 0;
-        std::uint64_t physical_bytes = 0;
-        std::uint64_t promotions = 0;
-        std::uint64_t demotions = 0;
-        std::uint64_t same_priority_moves = 0;
-    };
-
     /**
-     * @brief Snapshot cumulative completed Dynamic work without device polling.
+     * @brief Snapshot completed Dynamic work from the sole runtime authority.
      *
-     * Dynamic movement completes on a background worker while inference keeps
-     * running. Snapshotting the process-global PerfStats ledger at a request
-     * boundary gives the benchmark a monotonic progress marker without a GPU
-     * event wait, stream synchronization, or host placement mirror.
+     * The runner projects host- or device-owned operational totals without a
+     * GPU event wait, stream synchronization, or host placement mirror. The
+     * optional PerfStats ledger is deliberately not consulted: disabling or
+     * filtering telemetry cannot change benchmark movement attribution.
      */
-    static CompletedDynamicMovementSnapshot
-    completedDynamicMovementSnapshot()
+    static MoEOptimizationMovementTotals
+    completedDynamicMovementSnapshot(const IInferenceRunner *runner)
     {
-        CompletedDynamicMovementSnapshot snapshot;
-        for (const auto &record : PerfStatsCollector::snapshot(
-                 {"moe_overlay_controller"}))
-        {
-            if (record.domain != "moe_overlay_controller" ||
-                record.value <= 0.0)
-            {
-                continue;
-            }
-            const auto value = static_cast<std::uint64_t>(
-                std::llround(record.value));
-            if (record.name == "dynamic_movement_transactions")
-                snapshot.transactions += value;
-            else if (record.name == "dynamic_movement_commands")
-                snapshot.commands += value;
-            else if (record.name == "dynamic_physical_bytes")
-                snapshot.physical_bytes += value;
-            else if (record.name == "dynamic_promotions")
-                snapshot.promotions += value;
-            else if (record.name == "dynamic_demotions")
-                snapshot.demotions += value;
-            else if (record.name == "dynamic_same_priority_moves")
-                snapshot.same_priority_moves += value;
-        }
-        return snapshot;
+        return runner
+                   ? runner->moeOptimizationStatus().completed_movement
+                   : MoEOptimizationMovementTotals{};
     }
 
     /** Return a saturating delta across a measurement interval. */
@@ -578,11 +545,12 @@ namespace llaminar2
      */
     static void captureCompletedDynamicMovement(
         BenchmarkIterationResult *iteration,
-        const CompletedDynamicMovementSnapshot &before)
+        const MoEOptimizationMovementTotals &before,
+        const IInferenceRunner *runner)
     {
         if (!iteration)
             return;
-        const auto after = completedDynamicMovementSnapshot();
+        const auto after = completedDynamicMovementSnapshot(runner);
         iteration->dynamic_movement_transactions =
             monotonicDelta(before.transactions, after.transactions);
         iteration->dynamic_movement_commands =
@@ -2219,7 +2187,7 @@ namespace llaminar2
             iteration_result.moe_runtime_movement_epoch_start =
                 runner_ ? runner_->moeRuntimeMovementEpoch() : 0u;
             const auto dynamic_movement_start =
-                completedDynamicMovementSnapshot();
+                completedDynamicMovementSnapshot(runner_.get());
 
             // Run prefill
             KernelProfiler::setCurrentPhase(KernelProfiler::Phase::PREFILL);
@@ -2335,7 +2303,7 @@ namespace llaminar2
                 const PrefixRuntimeStateSnapshot iteration_state =
                     runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
                 iteration_result.moe_runtime_movement_epoch =
-                    iteration_state.moe_runtime_movement_epoch;
+                    runner_ ? runner_->moeRuntimeMovementEpoch() : 0u;
                 if (!has_measured_mtp_state)
                 {
                     measured_mtp_state = iteration_state;
@@ -2348,7 +2316,7 @@ namespace llaminar2
                 logGPUMemorySnapshot(("after-decode iter=" + std::to_string(iter + 1)).c_str());
             }
             captureCompletedDynamicMovement(
-                &iteration_result, dynamic_movement_start);
+                &iteration_result, dynamic_movement_start, runner_.get());
             result.iterations.push_back(std::move(iteration_result));
             LOG_DEBUG("    Prefill: " << std::fixed << std::setprecision(2) << prefill_time << " ms"
                                       << (n_decode > 0 ? ", Decode: " + std::to_string(static_cast<int>(decode_times.back())) + " ms" : ""));

@@ -20,6 +20,7 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string_view>
 #include <system_error>
 #include <tuple>
@@ -53,6 +54,9 @@ namespace llaminar2
             uint64_t total_ns = 0;
             uint64_t min_ns = std::numeric_limits<uint64_t>::max();
             uint64_t max_ns = 0;
+            uint64_t sequence_word_count = 0;
+            uint64_t sequence_digest_lo = 0;
+            uint64_t sequence_digest_hi = 0;
         };
 
         struct PerfStatsState
@@ -356,8 +360,60 @@ namespace llaminar2
                 return "counter";
             case PerfStatRecord::Kind::Timer:
                 return "timer";
+            case PerfStatRecord::Kind::OrderedSequence:
+                return "ordered_sequence";
             }
             return "unknown";
+        }
+
+        /** Fold one integer into an architecture-independent FNV-style lane. */
+        void mixSequenceWord(
+            uint64_t &digest,
+            uint64_t word,
+            uint64_t prime) noexcept
+        {
+            // Select bytes explicitly so a big-endian host produces the same
+            // evidence as the little-endian machines used in production.
+            for (unsigned byte = 0; byte < sizeof(word); ++byte)
+            {
+                digest ^= (word >> (byte * 8u)) & 0xffu;
+                digest *= prime;
+            }
+        }
+
+        /** Append one delimited step to both independent digest lanes. */
+        void appendSequenceStep(
+            PerfStatAccumulator &record,
+            std::initializer_list<uint64_t> words) noexcept
+        {
+            constexpr uint64_t kLowOffset = 14695981039346656037ull;
+            constexpr uint64_t kLowPrime = 1099511628211ull;
+            constexpr uint64_t kHighOffset = 7809847782465536322ull;
+            constexpr uint64_t kHighPrime = 14029467366897019727ull;
+            constexpr uint64_t kStepBegin = 0x6c6c616d696e6172ull;
+            constexpr uint64_t kStepEnd = 0x73657175656e6365ull;
+
+            if (record.count == 0u)
+            {
+                record.sequence_digest_lo = kLowOffset;
+                record.sequence_digest_hi = kHighOffset;
+            }
+            mixSequenceWord(
+                record.sequence_digest_lo,
+                kStepBegin ^ static_cast<uint64_t>(words.size()),
+                kLowPrime);
+            mixSequenceWord(
+                record.sequence_digest_hi,
+                ~kStepBegin ^ static_cast<uint64_t>(words.size()),
+                kHighPrime);
+            for (const uint64_t word : words)
+            {
+                mixSequenceWord(record.sequence_digest_lo, word, kLowPrime);
+                mixSequenceWord(record.sequence_digest_hi, ~word, kHighPrime);
+            }
+            mixSequenceWord(record.sequence_digest_lo, kStepEnd, kLowPrime);
+            mixSequenceWord(record.sequence_digest_hi, ~kStepEnd, kHighPrime);
+            record.sequence_word_count += static_cast<uint64_t>(words.size());
         }
 
         std::string jsonEscape(const std::string &value)
@@ -630,6 +686,40 @@ namespace llaminar2
         ++s.version;
     }
 
+    void PerfStatsCollector::recordOrderedSequenceStep(
+        std::string domain,
+        std::string name,
+        std::initializer_list<uint64_t> words,
+        std::string phase,
+        std::string device,
+        Tags tags)
+    {
+        if (!isDomainEnabled(domain))
+            return;
+        if (words.size() == 0u)
+        {
+            throw std::invalid_argument(
+                "PerfStats ordered sequence steps require at least one word");
+        }
+
+        PerfStatKey key;
+        key.kind = PerfStatRecord::Kind::OrderedSequence;
+        key.domain = std::move(domain);
+        key.name = std::move(name);
+        key.phase = std::move(phase);
+        key.device = std::move(device);
+        key.tags = std::move(tags);
+
+        auto &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        auto &record = s.records[key];
+        record.kind = PerfStatRecord::Kind::OrderedSequence;
+        appendSequenceStep(record, words);
+        ++record.count;
+        record.value += 1.0;
+        ++s.version;
+    }
+
     std::vector<PerfStatRecord> PerfStatsCollector::snapshot(
         const std::vector<std::string> &filters)
     {
@@ -652,12 +742,15 @@ namespace llaminar2
             record.total_ns = acc.total_ns;
             record.min_ns = acc.min_ns == std::numeric_limits<uint64_t>::max() ? 0 : acc.min_ns;
             record.max_ns = acc.max_ns;
+            record.sequence_word_count = acc.sequence_word_count;
+            record.sequence_digest_lo = acc.sequence_digest_lo;
+            record.sequence_digest_hi = acc.sequence_digest_hi;
             result.push_back(std::move(record));
         };
 
         /*
          * PerfStatKey is ordered by kind and then domain. A single unqualified
-         * filter therefore has two exact contiguous ranges (counter/timer).
+         * filter therefore has one exact contiguous range per record kind.
          * This is the latency-sensitive path used by background-protocol
          * polling and avoids scanning or copying unrelated stage evidence.
          */
@@ -668,7 +761,8 @@ namespace llaminar2
             const std::string &domain = filters.front();
             for (const auto kind : {
                      PerfStatRecord::Kind::Counter,
-                     PerfStatRecord::Kind::Timer})
+                     PerfStatRecord::Kind::Timer,
+                     PerfStatRecord::Kind::OrderedSequence})
             {
                 PerfStatKey lower;
                 lower.kind = kind;
@@ -734,7 +828,13 @@ namespace llaminar2
             out << "      \"total_ms\": " << std::setprecision(17) << total_ms << ",\n";
             out << "      \"avg_us\": " << std::setprecision(17) << avg_us << ",\n";
             out << "      \"min_us\": " << std::setprecision(17) << min_us << ",\n";
-            out << "      \"max_us\": " << std::setprecision(17) << max_us << "\n";
+            out << "      \"max_us\": " << std::setprecision(17) << max_us << ",\n";
+            out << "      \"sequence_word_count\": "
+                << record.sequence_word_count << ",\n";
+            out << "      \"sequence_digest_lo\": "
+                << record.sequence_digest_lo << ",\n";
+            out << "      \"sequence_digest_hi\": "
+                << record.sequence_digest_hi << "\n";
             out << "    }" << (i + 1 == records.size() ? "\n" : ",\n");
         }
         out << "  ]\n";
@@ -746,7 +846,7 @@ namespace llaminar2
     {
         const auto records = snapshot(filters);
         std::ostringstream out;
-        out << "kind,domain,name,phase,device,tags,count,value,total_ns,total_ms,avg_us,min_us,max_us\n";
+        out << "kind,domain,name,phase,device,tags,count,value,total_ns,total_ms,avg_us,min_us,max_us,sequence_word_count,sequence_digest_lo,sequence_digest_hi\n";
         for (const auto &record : records)
         {
             const double total_ms = static_cast<double>(record.total_ns) / 1.0e6;
@@ -768,7 +868,10 @@ namespace llaminar2
                 << std::setprecision(17) << total_ms << ','
                 << std::setprecision(17) << avg_us << ','
                 << std::setprecision(17) << min_us << ','
-                << std::setprecision(17) << max_us << '\n';
+                << std::setprecision(17) << max_us << ','
+                << record.sequence_word_count << ','
+                << record.sequence_digest_lo << ','
+                << record.sequence_digest_hi << '\n';
         }
         return out.str();
     }
@@ -871,7 +974,7 @@ namespace llaminar2
                       << tagsToDisplay(record.tags)
                       << fort::endr;
             }
-            else
+            else if (record.kind == PerfStatRecord::Kind::Counter)
             {
                 const double avg = record.count > 0
                                        ? record.value / static_cast<double>(record.count)
@@ -883,6 +986,21 @@ namespace llaminar2
                       << std::to_string(record.count)
                       << fmt_value(record.value)
                       << fmt_value(avg)
+                      << tagsToDisplay(record.tags)
+                      << fort::endr;
+            }
+            else
+            {
+                std::ostringstream digest;
+                digest << std::hex << record.sequence_digest_hi << ':'
+                       << record.sequence_digest_lo;
+                table << "sequence"
+                      << metric
+                      << record.phase
+                      << record.device
+                      << std::to_string(record.count)
+                      << digest.str()
+                      << std::to_string(record.sequence_word_count) + " words"
                       << tagsToDisplay(record.tags)
                       << fort::endr;
             }

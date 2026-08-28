@@ -20,6 +20,87 @@ block-diffusion drafter. DFlash is not a second verifier path; the shared MTP
 transaction is generalized behind proposer-neutral interfaces before DFlash is
 connected.
 
+2026-08-24 update: the mixed-vendor 122B depth-1 prefix-restored campaign
+localized a shifted-KV correction failure to an unnecessary terminal-hidden
+reselection. `PREFIX_TERMINAL_HIDDEN` is a stable arena mailbox read by the MTP
+sidecar, but the correction path tried to rebuild it afterward from transient
+host-visible forward geometry. `MTPTerminalHiddenPublication` now records the
+typed producer and monotonic generation; correction takes an immutable read
+lease, and cold graph construction rejects any dense, MoE, or ExpertOverlay
+sidecar stage that writes the mailbox. The focused
+`V2_Unit_{DeviceGraphOrchestrator,MTPGraphConstruction,GpuWorkspaceAllocationPolicy}`
+gate passes. Exact CUDA2/ROCm4 real-weight re-certification is pending; see the
+terminal-hidden lifecycle chart in
+`../2026-08/EXPERT_OVERLAY_TIER_MIGRATION_DESIGN.md`.
+
+2026-08-24 update 2: a depth-2 to depth-3 same-process campaign then exposed a
+separate model-context reuse defect while the second runner materialized
+`SharedExpertInputGate`. The lifecycle audit found that a helper described its
+FP32 result as model-owned while only the first runner's `FrozenModelWeightSet`
+actually retained it. Once device preparation released the raw BF16 source and
+that runner retired, the next cell tried to convert a null raw pointer. The
+repair removes that false ownership edge: `WeightManager` is now the sole
+authority for immutable model-prepared FP32 overrides, keyed by canonical
+weight, semantic role, and exact target device. Runner bindings only acquire a
+shared lease. No reuse flags, restoration callbacks, or runner-to-runner handoff
+remain.
+
+The rejected lifecycle had two independently expiring owners:
+
+```mermaid
+flowchart LR
+    MC[ModelContext / WeightManager] --> RAW[Raw BF16 or codebook source]
+    RAW --> CONVERT[Runner A converts to FP32]
+    CONVERT --> FA[Frozen bindings A own override]
+    FA --> PREP[Prepare runner A]
+    PREP --> RELEASE[Release raw source bytes]
+    FA --> RETIRE[Retire runner A]
+    RETIRE --> LOST[Override destroyed]
+    RELEASE --> B[Runner B materializes]
+    LOST --> B
+    B --> NULL[Convert released source]
+    NULL --> CRASH[Invalid lifecycle state]
+```
+
+The accepted lifecycle has one model-scoped authority and only cheap runner
+leases:
+
+```mermaid
+stateDiagram-v2
+    [*] --> SourceAvailable: ModelContext created
+    SourceAvailable --> OverridePublished: first typed materialization
+    OverridePublished --> RunnerAReady: runner A acquires lease
+    RunnerAReady --> SourceReleased: preparation proves raw bytes releasable
+    SourceReleased --> RunnerARetired: mutable graph/arena/streams retire
+    RunnerARetired --> RunnerBReady: runner B acquires same cached override
+    RunnerBReady --> ContextRetired: ModelContext reuse contract retires
+    ContextRetired --> [*]: source and override cache retire together
+```
+
+The cache-miss publication and raw-source release share `cache_mutex_`, making
+the transition atomic. A cache miss after source release is a fatal diagnostic;
+it never dereferences null storage or invents a fallback. The focused
+`V2_Unit_WeightPlan` regression destroys runner-A bindings, releases the source,
+and rematerializes byte-identically through the same model-owned object for
+FP16, BF16, and every quantized format in the canonical codebook registry.
+The same-process 122B depth-transition repair is now integration-proven. The
+CUDA2/ROCm4 Static/Ordinal campaign passes MTP off, depths 1/2/3/15, and dynamic
+depth in 184.558 seconds through one retained model context, with mandatory
+prefix restore and strict checkpoint/CSV evidence. The broader Dynamic and
+random-order ExpertOverlay cells remain the aggregate gate.
+
+2026-08-24 update 3: process-campaign reuse now separates retained MTP model
+capacity from active request execution. Every MTP-capable matrix cell retains
+the same routed predictor weights, 16-row verifier envelope, mapped follower
+families, transaction slots, and memory/placement BOM. The off cell selects
+only the main graph; enabled cells select buckets inside that retained envelope.
+Initial ExpertOverlay residency no longer depends on which active graph was
+visited first: one rank-synchronized finalization resolves every participant
+and retained layer from the model-owned prepared-engine registry before
+maintenance composition. See the complete Mermaid lifecycle and rationale in
+`../2026-08/EXPERT_OVERLAY_TIER_MIGRATION_DESIGN.md` under “Retained MTP
+capacity and initial-bank finalization lifecycle re-audit.”
+
 2026-07-06 update: CUDA2 ExpertOverlay Dynamic + prefix-cache + MTP long-context
 parity now passes after prefix restore without a model-runtime snapshot destroys
 depth-0 MTP sidecar graph caches instead of preserving graph objects whose MoE

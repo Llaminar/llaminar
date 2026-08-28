@@ -737,7 +737,6 @@ namespace llaminar2
 
         const bool partial = event_backend_ || event_device_ordinal_ >= 0 ||
                              producer_ready_event_ || !lane_streams_.empty() ||
-                             !lane_return_ready_events_.empty() ||
                              std::any_of(
                                  shared_dispatch_payload_groups_.begin(),
                                  shared_dispatch_payload_groups_.end(),
@@ -766,32 +765,24 @@ namespace llaminar2
             auto &gpu_ctx =
                 GPUDeviceContextPool::instance().getContext(device_);
             lane_streams_.reserve(lanes_.size());
-            lane_return_ready_events_.reserve(lanes_.size());
             for (std::size_t lane_index = 0u;
                  lane_index < lanes_.size();
                  ++lane_index)
             {
                 /* Lane ordinals intentionally bound stream count across layers
-                 * and graph families. Unique per-layer events retain exact graph
-                 * producer/consumer identity even though streams are shared. */
+                 * and graph families. Only outbound publication uses these
+                 * streams; the mapped return timeline remains the one
+                 * cross-executable completion authority. */
                 void *const lane_stream =
                     gpu_ctx.getOrCreateAuxiliaryStream(
                         "moe_overlay_activation_lane:" +
                         std::to_string(lane_index));
-                void *const return_ready =
-                    event_backend_->createEvent(event_device_ordinal_);
-                if (!lane_stream || !return_ready)
+                if (!lane_stream)
                 {
-                    if (return_ready)
-                    {
-                        event_backend_->destroyEvent(
-                            return_ready, event_device_ordinal_);
-                    }
                     throw std::runtime_error(
-                        "could not create lane stream/event pair");
+                        "could not create outbound lane stream");
                 }
                 lane_streams_.push_back(lane_stream);
-                lane_return_ready_events_.push_back(return_ready);
             }
             producer_ready_event_ =
                 event_backend_->createEvent(event_device_ordinal_);
@@ -828,16 +819,11 @@ namespace llaminar2
         return event_backend_ && event_device_ordinal_ >= 0 &&
                producer_ready_event_ &&
                lane_streams_.size() == lanes_.size() &&
-               lane_return_ready_events_.size() == lanes_.size() &&
                lane_shared_dispatch_payload_groups_.size() == lanes_.size() &&
                std::all_of(
                    lane_streams_.begin(),
                    lane_streams_.end(),
                    [](const void *stream) { return stream != nullptr; }) &&
-               std::all_of(
-                   lane_return_ready_events_.begin(),
-                   lane_return_ready_events_.end(),
-                   [](const void *event) { return event != nullptr; }) &&
                std::all_of(
                    shared_dispatch_payload_groups_.begin(),
                    shared_dispatch_payload_groups_.end(),
@@ -854,11 +840,6 @@ namespace llaminar2
                 event_backend_->destroyEvent(
                     producer_ready_event_, event_device_ordinal_);
             }
-            for (void *event : lane_return_ready_events_)
-            {
-                if (event)
-                    event_backend_->destroyEvent(event, event_device_ordinal_);
-            }
             for (auto &group : shared_dispatch_payload_groups_)
             {
                 if (group.ready_event)
@@ -869,7 +850,6 @@ namespace llaminar2
             }
         }
         producer_ready_event_ = nullptr;
-        lane_return_ready_events_.clear();
         for (auto &group : shared_dispatch_payload_groups_)
             group.ready_event = nullptr;
         /* Auxiliary streams remain owned by IWorkerGPUContext. */
@@ -884,17 +864,6 @@ namespace llaminar2
         if (index >= lane_streams_.size())
             throw std::out_of_range("MoE overlay activation lane stream index");
         return lane_streams_[index];
-    }
-
-    void *MoEOverlayActivationLaneBatchState::laneReturnReadyEvent(
-        std::size_t index) const
-    {
-        if (index >= lane_return_ready_events_.size())
-        {
-            throw std::out_of_range(
-                "MoE overlay activation return event index");
-        }
-        return lane_return_ready_events_[index];
     }
 
     bool MoEOverlayActivationLaneBatchState::laneUsesSharedDispatchPayload(
@@ -2386,25 +2355,11 @@ namespace llaminar2
                         return false;
                     }
 
-                    /* Queue the complete remote half immediately after its
-                     * dispatch. The device timeline wait suspends only this lane;
-                     * the main stream is free to execute local experts. */
-                    if (!waitForMappedTimeline(
-                            lane,
-                            lane.return_signal_offsets[bank],
-                            timeline,
-                            lane_stream,
-                            "return lane batch"))
-                    {
-                        return false;
-                    }
-                    if (!gpu_ctx.recordEventChecked(
-                            transaction.laneReturnReadyEvent(lane_index),
-                            lane_stream))
-                    {
-                        LOG_ERROR("[MoEOverlayActivationDispatchPackBatchStage] Failed to record lane return readiness");
-                        return false;
-                    }
+                    /* Stop at outbound publication. The captured continuation
+                     * can now run local experts while the peer works. The
+                     * consumer imports the peer-owned mapped return timeline
+                     * directly, which remains valid even when a manual CPU
+                     * transaction separates two native executables. */
                 }
                 PerfStatsCollector::addCounter(
                     "forward_graph",
@@ -2927,18 +2882,26 @@ namespace llaminar2
         {
             try
             {
-                auto &gpu_ctx =
-                    GPUDeviceContextPool::instance().getContext(
-                        params_.device_id);
+                const std::uint32_t bank =
+                    moeOverlayActivationBufferIndex(
+                        transaction.stageOrdinal());
+                const std::uint64_t timeline =
+                    moeOverlayActivationLeasedTimelineValue(
+                        moeOverlayActivationBufferVisit(
+                            transaction.stageOrdinal()));
                 for (std::size_t lane_index = 0u;
                      lane_index < lanes.size();
                      ++lane_index)
                 {
-                    if (!gpu_ctx.waitEventChecked(
-                            transaction.laneReturnReadyEvent(lane_index),
-                            stream))
+                    const auto &lane = lanes[lane_index];
+                    if (!waitForMappedTimeline(
+                            lane,
+                            lane.return_signal_offsets[bank],
+                            timeline,
+                            stream,
+                            "return consumer batch"))
                     {
-                        LOG_ERROR("[MoEOverlayActivationReturnConsumeBatchStage] Failed to join an imported lane return");
+                        LOG_ERROR("[MoEOverlayActivationReturnConsumeBatchStage] Failed to acquire one mapped lane return");
                         return false;
                     }
                 }

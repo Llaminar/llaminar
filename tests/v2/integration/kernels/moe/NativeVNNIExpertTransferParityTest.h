@@ -52,6 +52,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstddef>
@@ -558,8 +559,7 @@ namespace llaminar2::test
             device.ordinal,
             kDestinationParticipant,
             /*slot_count=*/kTransferSlotCount,
-            DeviceMoETransferSlotDirectory::profileForLayerFormats(format_specs),
-            /*vram_safety_margin_bytes=*/0u);
+            DeviceMoETransferSlotDirectory::profileForLayerFormats(format_specs));
         ASSERT_NE(transfer_directory, nullptr);
         ASSERT_EQ(transfer_directory->slotCount(), kTransferSlotCount);
 
@@ -1836,9 +1836,28 @@ namespace llaminar2::test
          * pretending to own device execution state.
          */
         class QuiescentOverlayInferenceBoundary final
-            : public IMoEOverlayDeviceInferenceBoundary
+            : public IMoEOverlayDeviceInferenceBoundary,
+              public IMoEOverlayDeviceInitialRuntimePublisher
         {
         public:
+            /** The focused fixture has already published its sole runtime layer. */
+            bool publishMoEOverlayDeviceInitialRuntime(
+                void *controller_stream) override
+            {
+                if (!controller_stream)
+                    return false;
+                initial_runtime_published_.store(
+                    true, std::memory_order_release);
+                return true;
+            }
+
+            /** @return Whether setup invoked the typed initial publication edge. */
+            [[nodiscard]] bool initialRuntimePublished() const noexcept
+            {
+                return initial_runtime_published_.load(
+                    std::memory_order_acquire);
+            }
+
             MoEOverlayInferenceBoundaryStatus
             enqueueMoEOverlayDeviceInferenceBoundary(
                 void *maintenance_stream,
@@ -1854,6 +1873,9 @@ namespace llaminar2::test
             {
                 return epoch != nullptr;
             }
+
+        private:
+            std::atomic<bool> initial_runtime_published_{false};
         };
 
         /** @brief Build one two-tier, one-participant-per-domain placement. */
@@ -2486,6 +2508,7 @@ namespace llaminar2::test
                 .maintenance_epoch = epoch_arena->maintenanceEpoch(),
                 .maintenance_status = epoch_arena->maintenanceStatus(),
                 .inference_boundary = &inference_boundary,
+                .initial_runtime_publisher = &inference_boundary,
             };
             ASSERT_TRUE(runtime_binding.hostPublicationValid());
             auto publisher = std::make_shared<
@@ -2495,6 +2518,7 @@ namespace llaminar2::test
                     .registry = registry,
                     .perf_device = device.to_string(),
                 });
+            ASSERT_TRUE(inference_boundary.initialRuntimePublished());
             auto transaction = publisher->createTransaction(
                 previous_snapshot,
                 candidate_snapshot,

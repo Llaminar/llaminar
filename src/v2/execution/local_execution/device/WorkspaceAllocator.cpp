@@ -84,22 +84,13 @@ namespace llaminar2
         float fraction = device.is_cpu() ? config.cpu_fraction : config.gpu_fraction;
         size_t budget = static_cast<size_t>(static_cast<double>(available) * fraction);
 
-        if (budget > config.headroom)
-        {
-            budget -= config.headroom;
-        }
-        else
-        {
-            budget = 0;
-        }
-
         budget = std::max(budget, config.min_budget);
         budget = std::min(budget, config.max_budget);
 
         LOG_TRACE("[WorkspaceAllocator] " << device.toString()
                                           << " available=" << (available / (1024 * 1024)) << "MB"
                                           << ", budget=" << (budget / (1024 * 1024)) << "MB"
-                                          << " (fraction=" << fraction << ", headroom=" << (config.headroom / (1024 * 1024)) << "MB)");
+                                          << " (fraction=" << fraction << ")");
 
         return budget;
     }
@@ -126,9 +117,7 @@ namespace llaminar2
         // Prepared embedding weights live in their own device allocation, so
         // embedding tables do not contribute to transient graph workspace.
         const size_t base_workspace = lm_head_workspace + mk_overhead + padded_n_buffer;
-        const size_t safety_margin = base_workspace / 10;
-        const size_t min_budget = 768ULL * 1024 * 1024;
-        const size_t floor = std::max(min_budget, base_workspace + safety_margin);
+        const size_t floor = base_workspace;
         logVramBomLine(
             "workspace_model_floor",
             "max_seq_len=" + std::to_string(max_seq_len) +
@@ -141,8 +130,6 @@ namespace llaminar2
                 " mk_overhead_mib=" + vramBomMiB(mk_overhead) +
                 " padded_n_bytes=" + std::to_string(padded_n_buffer) +
                 " padded_n_mib=" + vramBomMiB(padded_n_buffer) +
-                " min_budget_bytes=" + std::to_string(min_budget) +
-                " min_budget_mib=" + vramBomMiB(min_budget) +
                 " floor_bytes=" + std::to_string(floor) +
                 " floor_mib=" + vramBomMiB(floor));
         return floor;
@@ -668,7 +655,8 @@ namespace llaminar2
             }
 
             auto existing = device_workspaces_.find(device);
-            if (existing != device_workspaces_.end() && existing->second)
+            if (existing != device_workspaces_.end() && existing->second &&
+                !existing->second->hasReusablePrimaryBlock())
             {
                 // Check if new consumers need buffers that are absent or larger
                 // than the existing workspace allocation. Bucketed prefill can
@@ -1024,7 +1012,7 @@ namespace llaminar2
             }
 
             // If the combined requirements exceed the initial budget, try to
-            // expand up to the available device memory (minus headroom).
+            // Expand up to the exact live available-device observation.
             // The initial budget uses a conservative max_budget cap that may
             // be too small for models with many per-instance GEMM workspaces.
             const size_t active_needed =
@@ -1132,9 +1120,7 @@ namespace llaminar2
             if (needed > budget)
             {
                 const size_t available = queryAvailableMemory(device);
-                const size_t max_expandable = (available > config.headroom)
-                                                  ? available - config.headroom
-                                                  : 0;
+                const size_t max_expandable = available;
                 if (needed <= max_expandable)
                 {
                     LOG_TRACE("[WorkspaceAllocator] Expanding budget on "
@@ -1146,10 +1132,28 @@ namespace llaminar2
                 }
             }
 
-            auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
+            DeviceWorkspaceManager *manager = nullptr;
+            std::unique_ptr<DeviceWorkspaceManager> new_manager;
+            auto retained = device_workspaces_.find(device);
+            const bool reusing_primary_block =
+                retained != device_workspaces_.end() && retained->second &&
+                retained->second->hasReusablePrimaryBlock();
+            if (reusing_primary_block)
+            {
+                manager = retained->second.get();
+                budget = manager->budget();
+            }
+            else
+            {
+                new_manager =
+                    std::make_unique<DeviceWorkspaceManager>(device, budget);
+                manager = new_manager.get();
+            }
             logVramBomLine(
                 "workspace_plan",
-                "phase=allocate device=" + device.toString() +
+                std::string("phase=") +
+                    (reusing_primary_block ? "reuse_primary" : "allocate") +
+                    " device=" + device.toString() +
                     " consumers=" + std::to_string(consumers.size()) +
                     " buffers=" + std::to_string(combined.buffers.size()) +
                     " needed_bytes=" + std::to_string(needed) +
@@ -1160,10 +1164,16 @@ namespace llaminar2
                     " model_floor_mib=" + vramBomMiB(model_floor_budget));
             logWorkspaceVramTrace(device, "workspace.before_allocate", needed);
             const bool allocated =
-                hints.graph_family_policy ==
-                        WorkspaceGraphFamilyPolicy::ExclusiveLifetime
-                    ? manager->allocate(combined, needed)
-                    : manager->allocateSerialFamily(serial_family_plan);
+                reusing_primary_block
+                    ? (hints.graph_family_policy !=
+                               WorkspaceGraphFamilyPolicy::ExclusiveLifetime &&
+                       manager->reusePrimaryBlockForSerialFamily(
+                           serial_family_plan))
+                    : (hints.graph_family_policy ==
+                               WorkspaceGraphFamilyPolicy::ExclusiveLifetime
+                           ? manager->allocate(combined, needed)
+                           : manager->allocateSerialFamily(
+                                 serial_family_plan));
             if (!allocated)
             {
                 LOG_ERROR("[WorkspaceAllocator] Failed to allocate workspace on "
@@ -1201,7 +1211,7 @@ namespace llaminar2
 
             for (const auto &consumer_binding : consumers)
             {
-                consumer_binding.consumer->bindWorkspace(manager.get());
+                consumer_binding.consumer->bindWorkspace(manager);
             }
 
             LOG_TRACE("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
@@ -1211,7 +1221,8 @@ namespace llaminar2
 
             device_workspace_budgets_[device] = budget;
             bumpDeviceGeneration(device);
-            device_workspaces_[device] = std::move(manager);
+            if (new_manager)
+                device_workspaces_[device] = std::move(new_manager);
         }
 
         return true;
@@ -1335,6 +1346,30 @@ namespace llaminar2
         device_workspace_budgets_.clear();
     }
 
+    bool WorkspaceAllocator::sealReusablePrimaryBlocks(
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+        for (auto &[device, manager] : device_workspaces_)
+        {
+            if (!manager)
+                continue;
+            std::string device_error;
+            if (!manager->sealPrimaryBlockForReuse(&device_error))
+            {
+                if (error)
+                {
+                    *error = "could not seal reusable workspace on " +
+                             device.toString() + ": " + device_error;
+                }
+                return false;
+            }
+            bumpDeviceGeneration(device);
+        }
+        return true;
+    }
+
     // =========================================================================
     // Access
     // =========================================================================
@@ -1369,6 +1404,21 @@ namespace llaminar2
     {
         auto it = device_workspaces_.find(device);
         return (it != device_workspaces_.end()) ? it->second->used() : 0;
+    }
+
+    size_t WorkspaceAllocator::retainedPrimaryBytes() const noexcept
+    {
+        size_t total = 0;
+        for (const auto &[_, manager] : device_workspaces_)
+        {
+            if (!manager || !manager->hasReusablePrimaryBlock())
+                continue;
+            const size_t bytes = manager->primaryBlockSize();
+            if (bytes > std::numeric_limits<size_t>::max() - total)
+                return std::numeric_limits<size_t>::max();
+            total += bytes;
+        }
+        return total;
     }
 
     void WorkspaceAllocator::bumpDeviceGeneration(DeviceId device)

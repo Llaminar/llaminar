@@ -27,6 +27,7 @@ namespace llaminar2
     class IDeviceContext;
     class IMPIContext;
     class MappedHostTransferRegion;
+    struct MoEOverlayCanonicalRouteTicketControl;
 
     /**
      * @brief Fixed ABI header for one captured heterogeneous MoE dispatch.
@@ -197,6 +198,203 @@ namespace llaminar2
         MoEOverlayDispatchTicket ticket_;
     };
 
+    /**
+     * @brief Setup-owned sparse return ticket from one colocated CPU participant.
+     *
+     * The route-slot arrays and completion record live in a small mapped region.
+     * Preweighted rows remain in the participant's serial CPU expert arena and
+     * are registered exactly once through TransferEngine, so every layer graph
+     * can reuse the maximum route workspace without allocating a top-k-sized
+     * return matrix per layer. One ticket has one producer and one continuation
+     * GPU; capacity and every mapped alias are immutable after binding.
+     */
+    class MoEOverlayCanonicalRouteReturnTicketStorage final
+    {
+    public:
+        /**
+         * @brief Move-only CPU ownership of one unpublished ticket payload.
+         *
+         * The lease is created only after the prior GPU acknowledgement is
+         * visible. Destroying an unpublished lease cancels the arm transition,
+         * so a failed expert computation cannot strand the reusable ticket.
+         * Calling @ref publish transfers ownership to the GPU consumer and
+         * makes the mapped payload immutable until its device acknowledgement.
+         */
+        class Publication final
+        {
+        public:
+            /** @brief Construct an invalid lease for conditional ownership. */
+            Publication() = default;
+            /** @brief Cancel an armed but unpublished payload, if one remains. */
+            ~Publication();
+
+            Publication(const Publication &) = delete;
+            Publication &operator=(const Publication &) = delete;
+            /** @brief Transfer unique producer ownership from @p other. */
+            Publication(Publication &&other) noexcept;
+            /** @brief Cancel current ownership, then acquire it from @p other. */
+            Publication &operator=(Publication &&other) noexcept;
+
+            /** @return Whether this lease owns one armed CPU publication. */
+            [[nodiscard]] explicit operator bool() const noexcept
+            {
+                return owner_ != nullptr && sequence_ != 0u;
+            }
+
+            /**
+             * @brief Release-publish the initialized compact route prefix.
+             * @param live_entry_count Number of initialized route identities/rows.
+             * @return False for invalid ownership, capacity, or sequence state.
+             */
+            bool publish(size_t live_entry_count) noexcept;
+
+            /** @return Whether this lease belongs to @p storage. */
+            [[nodiscard]] bool belongsTo(
+                const MoEOverlayCanonicalRouteReturnTicketStorage &storage)
+                const noexcept
+            {
+                return owner_ == &storage;
+            }
+
+        private:
+            friend class MoEOverlayCanonicalRouteReturnTicketStorage;
+
+            /** @brief Construct the unique lease for one armed sequence. */
+            Publication(
+                MoEOverlayCanonicalRouteReturnTicketStorage *owner,
+                uint64_t sequence) noexcept
+                : owner_(owner), sequence_(sequence)
+            {
+            }
+
+            /** @brief Cancel an unpublished arm before dropping ownership. */
+            void reset() noexcept;
+
+            MoEOverlayCanonicalRouteReturnTicketStorage *owner_ = nullptr;
+            uint64_t sequence_ = 0u;
+        };
+
+        MoEOverlayCanonicalRouteReturnTicketStorage() = default;
+        ~MoEOverlayCanonicalRouteReturnTicketStorage() = default;
+
+        MoEOverlayCanonicalRouteReturnTicketStorage(
+            const MoEOverlayCanonicalRouteReturnTicketStorage &) = delete;
+        MoEOverlayCanonicalRouteReturnTicketStorage &operator=(
+            const MoEOverlayCanonicalRouteReturnTicketStorage &) = delete;
+        MoEOverlayCanonicalRouteReturnTicketStorage(
+            MoEOverlayCanonicalRouteReturnTicketStorage &&) = delete;
+        MoEOverlayCanonicalRouteReturnTicketStorage &operator=(
+            MoEOverlayCanonicalRouteReturnTicketStorage &&) = delete;
+
+        /**
+         * @brief Bind immutable layer geometry and the serial CPU contribution arena.
+         * @param layer_idx Exact model layer represented by this ticket.
+         * @param route_capacity Maximum compact/original route slots.
+         * @param d_model Width of one FP32 contribution row.
+         * @param continuation_device Exact local CUDA/ROCm consumer.
+         * @param workspace_generation Positive setup-owned graph identity.
+         * @param contribution_region Mapped CPU canonical-route arena, with at
+         *        least `route_capacity * d_model * sizeof(float)` bytes.
+         * @throws std::invalid_argument for incomplete geometry or mapping.
+         * @throws std::logic_error when a live ticket is rebound.
+         */
+        void bindFixedCapacity(
+            int layer_idx,
+            size_t route_capacity,
+            int d_model,
+            DeviceId continuation_device,
+            uint64_t workspace_generation,
+            std::shared_ptr<MappedHostTransferRegion> contribution_region);
+
+        /**
+         * @brief Arm one CPU publication before it writes route rows.
+         * @param residency_epoch Exact non-zero placement epoch of the packet.
+         * @return A valid move-only publication lease, or an invalid lease when
+         *         identity is incomplete, this producer is already armed, or
+         *         the GPU has not acknowledged the prior publication.
+         */
+        [[nodiscard]] Publication arm(uint64_t residency_epoch) noexcept;
+
+        /** @return Whether a complete current publication is host-visible. */
+        [[nodiscard]] bool payloadReady() const noexcept;
+        /**
+         * @brief Test readiness for one exact immutable residency epoch.
+         * @param residency_epoch Epoch named by the sparse dispatch packet.
+         */
+        [[nodiscard]] bool payloadReadyFor(
+            uint64_t residency_epoch) const noexcept;
+        /** @return Whether all immutable mapped identities remain valid. */
+        [[nodiscard]] bool hasValidBoundIdentity() const noexcept;
+        /** @return Exact continuation GPU consuming this ticket. */
+        [[nodiscard]] DeviceId continuationDevice() const noexcept
+        {
+            return continuation_device_;
+        }
+        /** @return Immutable compact/original route capacity. */
+        [[nodiscard]] size_t routeCapacity() const noexcept
+        {
+            return route_capacity_;
+        }
+        /** @return Immutable contribution width. */
+        [[nodiscard]] int dModel() const noexcept { return d_model_; }
+        /** @return Exact model layer represented by the ticket. */
+        [[nodiscard]] int layerIndex() const noexcept { return layer_idx_; }
+
+        /** @return Host route-slot destination written by the CPU producer. */
+        [[nodiscard]] int32_t *originalRouteSlotsHost() const noexcept;
+        /** @return Host compact-slot destination written by the CPU producer. */
+        [[nodiscard]] int32_t *compactRouteSlotsHost() const noexcept;
+        /** @return Host contribution arena written by the CPU expert stage. */
+        [[nodiscard]] float *contributionRowsHost() const noexcept;
+        /** @return Device-visible completion record embedded in captured ingress. */
+        [[nodiscard]] MoEOverlayCanonicalRouteTicketControl *
+        controlDeviceAlias() const noexcept;
+        /** @return Device-visible original-slot array embedded in captured ingress. */
+        [[nodiscard]] const int32_t *originalRouteSlotsDeviceAlias() const noexcept;
+        /** @return Device-visible compact-slot array embedded in captured ingress. */
+        [[nodiscard]] const int32_t *compactRouteSlotsDeviceAlias() const noexcept;
+        /** @return Device-visible CPU contribution arena embedded in ingress. */
+        [[nodiscard]] const float *contributionRowsDeviceAlias() const noexcept;
+
+    private:
+        /** Host-side producer transition; GPU acknowledgement lives in the ABI. */
+        enum class ProducerLifecycle : uint8_t
+        {
+            Unbound,   ///< No immutable mapped ticket has been installed.
+            Quiescent, ///< Producer is idle; sequences may be checked for reuse.
+            Armed,     ///< One unpublished payload is owned by the CPU producer.
+        };
+
+        /**
+         * @brief Complete the exact lease and transfer payload ownership to GPU.
+         * @param sequence Sequence authenticated by the unique producer lease.
+         * @param live_entry_count Number of initialized compact route rows.
+         * @return Whether the exact armed payload was release-published.
+         */
+        bool publishArmed(
+            uint64_t sequence, size_t live_entry_count) noexcept;
+        /**
+         * @brief Roll back one exact unpublished lease after CPU failure.
+         * @param sequence Sequence authenticated by the expiring producer lease.
+         */
+        void cancelArmed(uint64_t sequence) noexcept;
+
+        std::shared_ptr<MappedHostTransferRegion> metadata_region_;
+        std::shared_ptr<MappedHostTransferRegion> contribution_region_;
+        MoEOverlayCanonicalRouteTicketControl *control_host_ = nullptr;
+        int32_t *original_route_slots_host_ = nullptr;
+        int32_t *compact_route_slots_host_ = nullptr;
+        size_t original_route_slots_offset_ = 0u;
+        size_t compact_route_slots_offset_ = 0u;
+        DeviceId continuation_device_ = DeviceId::invalid();
+        int layer_idx_ = -1;
+        size_t route_capacity_ = 0u;
+        int d_model_ = 0;
+        uint64_t workspace_generation_ = 0u;
+        uint64_t armed_sequence_ = 0u;
+        ProducerLifecycle producer_lifecycle_ = ProducerLifecycle::Unbound;
+    };
+
     enum class MoEOverlayCollectiveDirection : uint8_t
     {
         Dispatch = 0,
@@ -291,6 +489,10 @@ namespace llaminar2
         int32_t *entry_offsets_host = nullptr;
         int32_t *expert_ids_host = nullptr;
         float *route_weights_host = nullptr;
+        /** Original `logical_row * top_k + router_slot` for every live entry. */
+        int32_t *original_route_slots_host = nullptr;
+        /** Participant-local `compact_row * top_k + local_slot` per entry. */
+        int32_t *compact_route_slots_host = nullptr;
         float *hidden_rows_fp32 = nullptr;
 
         /**
@@ -385,6 +587,21 @@ namespace llaminar2
      */
     size_t compactMoEOverlayDispatchBytes(const MoEOverlaySparseRows &rows);
     size_t compactMoEOverlayReturnBytes(const MoEOverlayReturnRows &rows);
+    /**
+     * @brief Return exact live bytes read through one canonical CPU ticket.
+     *
+     * The fixed mapped allocation is setup-owned capacity and is deliberately
+     * excluded. One live publication exposes a cache-line control record, two
+     * route-slot integers, and one FP32 contribution row per route entry.
+     * Returning zero denotes invalid geometry or arithmetic overflow.
+     *
+     * @param live_entry_count Number of published compact route entries.
+     * @param d_model Width of one FP32 contribution row.
+     * @return Exact live mapped payload bytes, or zero when unrepresentable.
+     */
+    size_t canonicalMoEOverlayTicketReturnBytes(
+        size_t live_entry_count,
+        int d_model) noexcept;
     MoEOverlaySparseTransferCounters measureMoEOverlaySparseTransferCounters(
         int seq_len,
         int top_k,
@@ -485,6 +702,8 @@ namespace llaminar2
             std::vector<int32_t> entry_offsets_host;
             std::vector<int32_t> expert_ids_host;
             std::vector<float> route_weights_host;
+            std::vector<int32_t> original_route_slots_host;
+            std::vector<int32_t> compact_route_slots_host;
             std::vector<float> hidden_rows_fp32;
         };
 

@@ -61,6 +61,71 @@ def production_router_distribution(router_output) -> torch.Tensor:
     return router_output[0]
 
 
+def materialize_route_contributions(
+    experts,
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Reproduce Hugging Face's weighted output for every selected route.
+
+    Hugging Face's public experts result is the sum over the top-k routes. A
+    summed row cannot isolate one moved expert when quantized and FP32 routers
+    exchange an unrelated, low-weight boundary expert. This reference-only
+    recorder evaluates the same expert equations and preserves each route in
+    ``[token, slot, hidden]`` order. It never participates in inference; its
+    sole purpose is to provide an unambiguous numerical parity oracle.
+    """
+
+    if hidden_states.ndim != 2:
+        raise RuntimeError("Qwen3.5 MoE expert input must be a rank-2 tensor")
+    if (
+        selected_experts.ndim != 2
+        or routing_weights.shape != selected_experts.shape
+    ):
+        raise RuntimeError(
+            "Qwen3.5 MoE route IDs and weights must share rank-2 geometry"
+        )
+    if selected_experts.shape[0] != hidden_states.shape[0]:
+        raise RuntimeError(
+            "Qwen3.5 MoE route rows must match the flattened expert input"
+        )
+
+    route_contributions = hidden_states.new_zeros(
+        (
+            hidden_states.shape[0],
+            selected_experts.shape[1],
+            hidden_states.shape[1],
+        )
+    )
+    for encoded_expert in torch.unique(selected_experts):
+        expert_idx = int(encoded_expert.item())
+        if expert_idx < 0 or expert_idx >= int(experts.num_experts):
+            raise RuntimeError(
+                f"Qwen3.5 MoE route names invalid expert {expert_idx}"
+            )
+        positions = torch.nonzero(
+            selected_experts == expert_idx, as_tuple=False
+        )
+        token_indices = positions[:, 0]
+        route_slots = positions[:, 1]
+        current_state = hidden_states[token_indices]
+        gate, up = F.linear(
+            current_state, experts.gate_up_proj[expert_idx]
+        ).chunk(2, dim=-1)
+        expert_output = F.linear(
+            experts.act_fn(gate) * up,
+            experts.down_proj[expert_idx],
+        )
+        weighted_output = expert_output * routing_weights[
+            token_indices, route_slots, None
+        ]
+        route_contributions[token_indices, route_slots] = weighted_output.to(
+            route_contributions.dtype
+        )
+    return route_contributions
+
+
 class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
     """
     PyTorch reference implementation for Qwen 3.5 MoE models.
@@ -829,8 +894,26 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                 _capture_mtp(captures, key("MOE_ROUTING_INDICES"), out[2].float())
 
             handles.append(moe_block.gate.register_forward_hook(_router))
-            handles.append(moe_block.experts.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, key("MOE_EXPERT_OUTPUT"), out)))
+            def _mtp_experts(mod, inp, out):
+                _capture_mtp(captures, key("MOE_EXPERT_OUTPUT"), out)
+                if not isinstance(inp, tuple) or len(inp) != 3:
+                    raise RuntimeError(
+                        "Qwen3.5 MoE MTP experts did not receive complete route inputs"
+                    )
+                _capture_mtp(
+                    captures,
+                    key("MOE_ROUTE_CONTRIBUTIONS"),
+                    materialize_route_contributions(
+                        mod,
+                        inp[0],
+                        inp[1],
+                        inp[2],
+                    ),
+                )
+
+            handles.append(
+                moe_block.experts.register_forward_hook(_mtp_experts)
+            )
 
             def _shared_expert(_mod, _inp, out):
                 runtime["shared_expert_output"] = out.detach()
@@ -1354,6 +1437,21 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             def _experts(mod, inp, out, i=idx):
                 if self._should_capture(PipelineStage.MOE_EXPERT_OUTPUT):
                     self.capture_stage(PipelineStage.MOE_EXPERT_OUTPUT, out, i)
+                if self._should_capture(PipelineStage.MOE_ROUTE_CONTRIBUTIONS):
+                    if not isinstance(inp, tuple) or len(inp) != 3:
+                        raise RuntimeError(
+                            "Qwen3.5 MoE experts did not receive hidden rows, route IDs, and route weights"
+                        )
+                    self.capture_stage(
+                        PipelineStage.MOE_ROUTE_CONTRIBUTIONS,
+                        materialize_route_contributions(
+                            mod,
+                            inp[0],
+                            inp[1],
+                            inp[2],
+                        ),
+                        i,
+                    )
             self._hook_handles.append(
                 moe_block.experts.register_forward_hook(_experts)
             )

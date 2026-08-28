@@ -2785,6 +2785,8 @@ namespace
             WorkspaceRequirements combined;
             for (size_t i = 0; i < Ns.size(); ++i)
                 combined.merge(kernels[i]->getWorkspaceRequirements(M, Ns[i], K));
+            kernels.front()->appendFusedProjectionWorkspaceRequirements(
+                combined, M, Ns, K);
 
             shared_workspace = std::make_unique<DeviceWorkspaceManager>(
                 DeviceId::rocm(0),
@@ -2962,6 +2964,8 @@ namespace
             WorkspaceRequirements combined;
             for (size_t i = 0; i < Ns.size(); ++i)
                 combined.merge(kernels[i]->getWorkspaceRequirements(M, Ns[i], K));
+            kernels.front()->appendFusedProjectionWorkspaceRequirements(
+                combined, M, Ns, K);
 
             shared_workspace = std::make_unique<DeviceWorkspaceManager>(
                 DeviceId::rocm(0),
@@ -3123,6 +3127,8 @@ namespace
         WorkspaceRequirements combined;
         for (size_t i = 0; i < Ns.size(); ++i)
             combined.merge(kernels[i]->getWorkspaceRequirements(M, Ns[i], K));
+        kernels.front()->appendFusedProjectionWorkspaceRequirements(
+            combined, M, Ns, K);
 
         auto shared_workspace = std::make_unique<DeviceWorkspaceManager>(
             DeviceId::rocm(0),
@@ -3253,6 +3259,8 @@ namespace
 #endif
             combined.merge(kernels.back()->getWorkspaceRequirements(M, Ns[i], K));
         }
+        kernels.front()->appendFusedProjectionWorkspaceRequirements(
+            combined, M, Ns, K);
 
         auto shared_workspace = std::make_unique<DeviceWorkspaceManager>(
             DeviceId::rocm(0),
@@ -3425,6 +3433,10 @@ namespace
             combined.merge(kernels.back()->getWorkspaceRequirements(
                 request_rows, Ns[projection], K));
         }
+        kernels.front()->appendFusedProjectionWorkspaceRequirements(
+            combined, padded_rows, Ns, K);
+        kernels.front()->appendFusedProjectionWorkspaceRequirements(
+            combined, request_rows, Ns, K);
 
         auto workspace = std::make_unique<DeviceWorkspaceManager>(
             DeviceId::rocm(0),
@@ -3853,6 +3865,59 @@ TEST(Test__ROCmQuantisedGemmSmallM, NativeVNNIPrefillActiveRowsAllFormatsByteExa
         }
         ++geometry_index;
     }
+#endif
+}
+
+/**
+ * @test Prove a scalar GEMM executes without the fused-projection arena.
+ *
+ * The public workspace declaration intentionally reserves
+ * `ROCM_SCATTER_PARTIAL_BATCHED` only after a graph declares a concurrent
+ * projection bundle. The kernel's binding validator must honor that same
+ * contract; otherwise standalone decode and LM-head callers receive a plan
+ * that the kernel itself rejects before launch.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM,
+     StandaloneWorkspaceContractDoesNotRequireFusedProjectionArena)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    constexpr int M = 1;
+    constexpr int N = 128;
+    constexpr int K = 256;
+    auto weights = TestTensorFactory::createQ4_0Random({N, K}, /*seed=*/2811);
+    ROCmPackedWeights packed;
+    ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+    ROCmQuantisedGemmKernel kernel(&packed, /*rocm_device_id=*/0);
+
+#ifdef HAVE_ROCM
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    kernel.setGPUStream(stream);
+#endif
+
+    const WorkspaceRequirements requirements =
+        kernel.getWorkspaceRequirements(M, N, K);
+    EXPECT_EQ(
+        requirements.find(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED),
+        nullptr);
+    auto workspace = bindWorkspace(kernel, M, N, K);
+    ASSERT_NE(workspace, nullptr);
+
+    auto input = TestTensorFactory::createFP32Random({M, K});
+    auto output = TestTensorFactory::createFP32({M, N});
+    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+#ifdef HAVE_ROCM
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+#endif
+
+    kernel.unbindWorkspace();
+#ifdef HAVE_ROCM
+    kernel.clearGPUStreamBinding();
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
 }
 
@@ -4503,6 +4568,15 @@ TEST(Test__ROCmQuantisedGemmSmallM, FloatingProjectionAllFormatsRuntimeMMatchSer
                 N,
                 K));
         }
+        const std::array<int, 2> grouped_widths{N, N};
+        auto *group_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(kernels.front());
+        ASSERT_NE(group_consumer, nullptr);
+        group_consumer->appendFusedProjectionWorkspaceRequirements(
+            requirements,
+            kGroupedVerifierRuntimeRows.back(),
+            grouped_widths,
+            K);
 
         DeviceWorkspaceManager workspace(
             device,
@@ -4769,6 +4843,14 @@ TEST(
             requirements.merge(consumer->getWorkspaceRequirements(
                 request_rows, N, K));
         }
+        const std::array<int, 2> grouped_widths{N, N};
+        auto *group_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(kernels.front());
+        ASSERT_NE(group_consumer, nullptr);
+        group_consumer->appendFusedProjectionWorkspaceRequirements(
+            requirements, padded_rows, grouped_widths, K);
+        group_consumer->appendFusedProjectionWorkspaceRequirements(
+            requirements, request_rows, grouped_widths, K);
 
         DeviceWorkspaceManager workspace(
             device,
@@ -6175,6 +6257,8 @@ TEST(Test__ROCmQuantisedGemmSmallM,
     WorkspaceRequirements combined;
     for (size_t i = 0; i < widths.size(); ++i)
         combined.merge(kernels[i]->getWorkspaceRequirements(M, widths[i], K));
+    kernels.front()->appendFusedProjectionWorkspaceRequirements(
+        combined, M, widths, K);
     auto workspace = std::make_unique<DeviceWorkspaceManager>(
         DeviceId::rocm(0),
         combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
@@ -6413,6 +6497,9 @@ TEST(Test__ROCmQuantisedGemmSmallM,
                 participant.kernels[i]->getWorkspaceRequirements(
                     M, widths[i], K));
         }
+        participant.kernels.front()
+            ->appendFusedProjectionWorkspaceRequirements(
+                combined, M, widths, K);
 
         participant.workspace = std::make_unique<DeviceWorkspaceManager>(
             DeviceId::rocm(device),
@@ -6751,6 +6838,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2UsesCanonicalBatche
         kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
         combined.merge(kernels.back()->getWorkspaceRequirements(M, N, K));
     }
+    const std::array<int, 2> fused_widths{N, N};
+    kernels.front()->appendFusedProjectionWorkspaceRequirements(
+        combined, M, fused_widths, K);
 
     int single_partial_buffers = 0;
     int batched_partial_buffers = 0;
@@ -6858,6 +6948,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsUndersizedDe
         kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
         combined.merge(kernels.back()->getWorkspaceRequirements(M, N, K));
     }
+    const std::array<int, 2> fused_widths{N, N};
+    kernels.front()->appendFusedProjectionWorkspaceRequirements(
+        combined, M, fused_widths, K);
 
     bool shrunk_partial = false;
     for (auto &buf : combined.buffers)

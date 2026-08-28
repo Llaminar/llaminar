@@ -118,6 +118,8 @@ namespace llaminar2
                     .source_participant = 0u,
                     .destination_participant = 1u,
                     .payload_slot = 0u,
+                    .flags = static_cast<std::uint32_t>(
+                        MoEOverlayDeviceMovementAxis::ParticipantPlacement),
                     .payload_bytes = 4096u,
                     .source_epoch = 7u,
                     .candidate_epoch = 8u,
@@ -378,6 +380,42 @@ namespace llaminar2
                 MoEOverlayDeviceControllerError::PhysicalTransportFailure));
         EXPECT_EQ(fixture.controller.transaction_id, transaction);
         EXPECT_EQ(fixture.controller.current_durable_epoch, 7u);
+    }
+
+    TEST(MoEOverlayDeviceTransportProtocol,
+         AuthorityFailureBeforeCommandPublicationFailsImmediately)
+    {
+        Fixture fixture;
+        MoEOverlayDeviceTransportProtocol transport(fixture.binding);
+
+        // An invalid commit makes the device authority terminal before it can
+        // publish immutable command bytes. The host follower must report that
+        // exact terminal edge on its first poll, not wait for a command that
+        // can no longer exist and eventually report a timeout.
+        ASSERT_FALSE(fixture.device.beginCommit(/*transaction=*/1u));
+        ASSERT_EQ(
+            fixture.device.state(),
+            MoEOverlayDeviceControllerState::Error);
+        ASSERT_EQ(fixture.controller.command_transaction, 0u);
+
+        const auto acquired = transport.tryAcquire(0u);
+        EXPECT_EQ(
+            acquired.status,
+            MoEOverlayDeviceTransportAcquireStatus::Failed);
+        EXPECT_NE(acquired.error.find("authority is terminal"),
+                  std::string::npos);
+        EXPECT_NE(acquired.error.find("error_code="), std::string::npos);
+
+        // Observing an authority failure does not relabel it as a physical
+        // transport failure or mutate the group-local completion lane.
+        EXPECT_EQ(
+            fixture.transport.status_code,
+            static_cast<std::uint32_t>(
+                MoEOverlayDeviceControllerError::None));
+        EXPECT_EQ(
+            fixture.transport.state,
+            static_cast<std::uint32_t>(
+                MoEOverlayDeviceControllerTransportState::Idle));
     }
 
     TEST(MoEOverlayDeviceTransportProtocol,

@@ -127,7 +127,11 @@ namespace llaminar2
      *
      * Controls how WorkspaceAllocator computes workspace budgets for GPU and CPU
      * devices. The budget is calculated as:
-     *   budget = min(max(available * fraction - headroom, min_budget), max_budget)
+     *   budget = min(max(available * fraction, min_budget), max_budget)
+     *
+     * This is an initial allocation-policy ceiling, not an unnamed memory
+     * reserve. Production graph-family planning raises it to the exact declared
+     * requirement when that requirement fits the live device observation.
      */
     struct WorkspaceBudgetConfig
     {
@@ -135,7 +139,6 @@ namespace llaminar2
         float cpu_fraction = 0.3f;                     ///< Fraction of free CPU memory to use (conservative)
         size_t min_budget = 64 * 1024 * 1024;          ///< Minimum budget (64MB)
         size_t max_budget = 4ULL * 1024 * 1024 * 1024; ///< Maximum budget (4GB)
-        size_t headroom = 128 * 1024 * 1024;           ///< Reserved headroom (128MB)
     };
 
     /**
@@ -389,6 +392,19 @@ namespace llaminar2
          */
         void releaseAll();
 
+        /**
+         * @brief Retire every graph-visible workspace mapping for model reuse.
+         *
+         * The caller must first destroy every graph executable and stage that
+         * borrowed a workspace pointer. Successful sealing retains only each
+         * manager's primary backend allocation; a later exclusive runner may
+         * publish a different serial-family layout over those bytes.
+         *
+         * @param error Optional first rejection diagnostic.
+         * @return True when every device manager reached reusable-backing state.
+         */
+        bool sealReusablePrimaryBlocks(std::string *error = nullptr) noexcept;
+
         // =====================================================================
         // Access
         // =====================================================================
@@ -425,6 +441,9 @@ namespace llaminar2
          * @brief Workspace allocated for a specific device
          */
         size_t deviceAllocated(DeviceId device) const;
+
+        /** @return Primary bytes retained for a future exclusive runner. */
+        size_t retainedPrimaryBytes() const noexcept;
 
         /**
          * @brief Number of devices with workspace allocated

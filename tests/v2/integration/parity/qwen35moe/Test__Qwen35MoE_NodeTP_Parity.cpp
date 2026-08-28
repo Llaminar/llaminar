@@ -253,13 +253,24 @@ protected:
         std::abort();
     }
 
-    /** @brief Snapshot and sum one process-local residency counter. */
-    double localResidencyCounter(const std::string &name) const
+    /**
+     * @return Passive state projected by the sole production authority.
+     * @throws std::logic_error when the runner is absent or maintenance failed.
+     */
+    MoEOptimizationStatus optimizationStatus() const
     {
-        return perfCounterTotal(
-            PerfStatsCollector::snapshot({"moe_overlay_residency"}),
-            "moe_overlay_residency",
-            name);
+        if (!orch_runner_)
+            throw std::logic_error(
+                "CPU ExpertOverlay optimization status requires a live runner");
+        auto status = orch_runner_->moeOptimizationStatus();
+        if (status.failed())
+        {
+            throw std::logic_error(
+                status.diagnostic.empty()
+                    ? "CPU ExpertOverlay optimization lifecycle failed"
+                    : status.diagnostic);
+        }
+        return status;
     }
 
     /**
@@ -269,10 +280,11 @@ protected:
      * A newly started Dynamic authority profiles a finite set of reversible
      * production transfer waves in the background. Ordinary prefill/decode
      * traffic independently supplies prepared-expert service telemetry. The
-     * fixture knows neither controller state nor requested workloads: it uses
-     * the same public request surface as the server and observes only outcome
-     * evidence. Once production certifies economy, a stationary request stream
-     * lets the histogram policy commit a profitable same-priority move.
+     * fixture drives only the same request surface as the server and passively
+     * observes the typed owner lifecycle; it never reads instrumentation as
+     * state or advances maintenance itself. Once production certifies economy,
+     * a stationary request stream lets histogram policy commit a profitable
+     * same-priority move.
      */
     bool driveDynamicEconomyAndMovement()
     {
@@ -404,9 +416,16 @@ protected:
         };
 
         std::uint64_t service_profile_forwards = 0;
+        MoEOptimizationStatus optimization = optimizationStatus();
+        if (!optimization.learning() && !optimization.active())
+        {
+            LOG_ERROR(
+                "[Qwen3.5 MoE CPU ExpertOverlay] Dynamic economy has no learning or active authority");
+            return false;
+        }
         for (int request = 0;
              request < kMaximumServiceProfileRequests &&
-             localResidencyCounter("economy_certification_complete") == 0.0;
+             !optimization.active();
              ++request)
         {
             /*
@@ -430,9 +449,10 @@ protected:
                 if (*complete)
                     break;
             }
+            optimization = optimizationStatus();
         }
 
-        if (localResidencyCounter("economy_certification_complete") == 0.0)
+        if (!optimization.active())
         {
             LOG_ERROR(
                 "[Qwen3.5 MoE CPU ExpertOverlay] Economy profile did not certify after "
@@ -444,6 +464,9 @@ protected:
         LOG_INFO(
             "[Qwen3.5 MoE CPU ExpertOverlay] Measured economy certified after "
             << service_profile_forwards << " ordinary production forwards");
+
+        const std::uint64_t initial_published_waves =
+            optimization.published_movement_waves;
 
         /*
          * Keep the post-certification workload stationary. A changed corpus
@@ -467,8 +490,15 @@ protected:
                     break;
             }
 
-            if (localResidencyCounter("committed_expert_migrations") > 0.0 &&
-                localResidencyCounter("same_priority_moves") > 0.0)
+            const MoEOptimizationStatus current = optimizationStatus();
+            if (!current.active())
+            {
+                LOG_ERROR(
+                    "[Qwen3.5 MoE CPU ExpertOverlay] Active Dynamic economy regressed while awaiting movement");
+                return false;
+            }
+            if (current.published_movement_waves >
+                initial_published_waves)
             {
                 LOG_INFO(
                     "[Qwen3.5 MoE CPU ExpertOverlay] Certified economy and committed same-tier movement after "
@@ -480,8 +510,7 @@ protected:
             LOG_INFO(
                 "[Qwen3.5 MoE CPU ExpertOverlay] Stationary histogram request "
                 << (request + 1)
-                << " completed without a committed same-tier move; proposals="
-                << localResidencyCounter("economy_proposals"));
+                << " completed without a durable movement publication");
         }
 
         LOG_ERROR(
@@ -706,7 +735,7 @@ protected:
             activeClearSnapshots();
             activeClearCache();
 
-            const auto decode = runDecodeParity(
+            auto decode = runDecodeParity(
                 ParityDecodePrefillMode::CompletePrefixRestore);
             if (decode.steps_total == 0)
             {

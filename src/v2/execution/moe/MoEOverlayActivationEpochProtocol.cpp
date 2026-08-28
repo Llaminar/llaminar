@@ -274,7 +274,7 @@ namespace llaminar2
     MoEOverlayActivationEpochProtocol::arm(
         const MoEOverlayInferenceTransactionTicket &ticket,
         std::uint64_t epoch_generation,
-        std::uint64_t deadline_ns,
+        std::uint64_t timeout_not_before_ns,
         std::string *error)
     {
         if (error)
@@ -334,9 +334,9 @@ namespace llaminar2
             fail("ExpertOverlay activation generation exceeds the 64-bit timeline ABI", error);
             return std::nullopt;
         }
-        if (deadline_ns == 0u)
+        if (timeout_not_before_ns == 0u)
         {
-            fail("ExpertOverlay activation epoch requires a positive watchdog deadline", error);
+            fail("ExpertOverlay activation epoch requires a positive watchdog timeout lower bound", error);
             return std::nullopt;
         }
 
@@ -399,7 +399,8 @@ namespace llaminar2
                 MoEOverlayActivationEndpointState::Armed);
         }
 
-        control_->admission.deadline_ns = deadline_ns;
+        control_->admission.timeout_not_before_ns =
+            timeout_not_before_ns;
         control_->admission.observed_timeout_ns = 0u;
         control_->admission.digest = identity.digest;
         control_->admission.code = static_cast<std::uint32_t>(
@@ -1030,8 +1031,13 @@ namespace llaminar2
             return fail("ExpertOverlay watchdog observed no armed activation epoch", error);
         if (epoch_generation != control_->identity.epoch_generation)
             return fail("ExpertOverlay watchdog generation is stale or divergent", error);
-        if (observed_ns < acquireValue(control_->admission.deadline_ns))
-            return fail("ExpertOverlay activation epoch has not reached its watchdog deadline", error);
+        if (observed_ns <
+            acquireValue(control_->admission.timeout_not_before_ns))
+        {
+            return fail(
+                "ExpertOverlay activation epoch has not reached its watchdog timeout lower bound",
+                error);
+        }
 
         control_->admission.observed_timeout_ns = observed_ns;
         atomicValue(control_->admission.code).store(
@@ -1107,7 +1113,7 @@ namespace llaminar2
         control_->identity = {};
         clearStatus(control_->continuation_status);
         clearStatus(control_->follower_status);
-        control_->admission.deadline_ns = 0u;
+        control_->admission.timeout_not_before_ns = 0u;
         control_->admission.observed_timeout_ns = 0u;
         control_->admission.digest = {};
         control_->admission.code = static_cast<std::uint32_t>(

@@ -717,6 +717,15 @@ namespace llaminar2::test
         histogram_config.ownership = initial->layered_ownership;
         auto histogram = std::make_shared<DecodeExpertHistogram>(
             std::move(histogram_config));
+        int histogram_rebase_polls = 0;
+        histogram->registerRuntimeHistogramDrain(
+            [&]()
+            {
+                ++histogram_rebase_polls;
+                return histogram_rebase_polls == 1
+                           ? RuntimeExpertHistogramDrainResult::pending()
+                           : RuntimeExpertHistogramDrainResult::ready();
+            });
         auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
             MoEOverlayResidencyAuthority::Config{
                 .initial_plan = *initial->placement_plan,
@@ -852,20 +861,30 @@ namespace llaminar2::test
                     MoEOverlayServiceMeasurementRecordStatus::Recorded);
             }
         }
-        for (int iteration = 0;
-             iteration < 100 &&
-             certification.state() !=
-                 MoEOverlayEconomyCertificationState::Complete;
-             ++iteration)
-        {
-            certification.poll();
-        }
+        certification.poll();
+        ASSERT_EQ(
+            certification.state(),
+            MoEOverlayEconomyCertificationState::
+                RebasingRoutingEvidence);
+        EXPECT_FALSE(authority->hasEconomyCertification());
+
+        certification.poll();
+        EXPECT_EQ(
+            certification.state(),
+            MoEOverlayEconomyCertificationState::
+                RebasingRoutingEvidence);
+        EXPECT_FALSE(authority->hasEconomyCertification());
+        EXPECT_EQ(histogram_rebase_polls, 1);
+
+        certification.poll();
         ASSERT_TRUE(certification.healthy())
             << certification.failureMessage();
         EXPECT_EQ(
             certification.state(),
             MoEOverlayEconomyCertificationState::Complete);
         EXPECT_TRUE(authority->hasEconomyCertification());
+        EXPECT_EQ(histogram_rebase_polls, 2);
+        EXPECT_EQ(certification.stats().routing_evidence_rebases, 1u);
         EXPECT_EQ(certification.stats().certifications_installed, 1u);
         EXPECT_EQ(factory.observations->bank_preparations, 0u);
     }

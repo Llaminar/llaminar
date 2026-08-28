@@ -244,17 +244,20 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   sizeof(uint32_t) +
                   sizeof(DeviceMoERebalanceCommandBufferHeader) +
                   sizeof(DeviceMoERebalanceGraphControllerState) +
+                  sizeof(DeviceMoEPlacementBank) +
                   sizeof(DeviceMoERebalanceWaveState) +
                   sizeof(DeviceMoERebalanceStatus));
 
     const WorkspaceRequirements reqs = stage.getWorkspaceRequirements(0, 0, 0);
-    ASSERT_EQ(reqs.buffers.size(), 8u);
+    ASSERT_EQ(reqs.buffers.size(), 9u);
     const auto *local_desc = reqs.find("moe_rebalance_local_histogram_decode_rebalance");
     const auto *gathered_desc = reqs.find("moe_rebalance_gathered_histogram_decode_rebalance");
     const auto *plan_desc = reqs.find("moe_rebalance_transfer_plan_decode_rebalance");
     const auto *plan_count_desc = reqs.find("moe_rebalance_transfer_plan_count_decode_rebalance");
     const auto *command_header_desc = reqs.find("moe_rebalance_command_header_decode_rebalance");
     const auto *controller_state_desc = reqs.find("moe_rebalance_controller_state_decode_rebalance");
+    const auto *placement_plan_scratch_desc =
+        reqs.find("moe_rebalance_placement_plan_scratch_decode_rebalance");
     const auto *wave_state_desc = reqs.find("moe_rebalance_wave_state_decode_rebalance");
     const auto *status_desc = reqs.find("moe_rebalance_status_decode_rebalance");
     ASSERT_NE(local_desc, nullptr);
@@ -263,6 +266,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
     ASSERT_NE(plan_count_desc, nullptr);
     ASSERT_NE(command_header_desc, nullptr);
     ASSERT_NE(controller_state_desc, nullptr);
+    ASSERT_NE(placement_plan_scratch_desc, nullptr);
     ASSERT_NE(wave_state_desc, nullptr);
     ASSERT_NE(status_desc, nullptr);
     EXPECT_EQ(reqs.find("moe_rebalance_local_transfer_payload_decode_rebalance"), nullptr)
@@ -275,6 +279,9 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
     EXPECT_EQ(plan_count_desc->size_bytes, sizeof(uint32_t));
     EXPECT_EQ(command_header_desc->size_bytes, sizeof(DeviceMoERebalanceCommandBufferHeader));
     EXPECT_EQ(controller_state_desc->size_bytes, sizeof(DeviceMoERebalanceGraphControllerState));
+    EXPECT_EQ(placement_plan_scratch_desc->size_bytes,
+              sizeof(DeviceMoEPlacementBank))
+        << "Speculative planning owns one immutable-address graph-lifetime RCU bank; it must not borrow a live placement bank.";
     EXPECT_EQ(wave_state_desc->size_bytes, sizeof(DeviceMoERebalanceWaveState));
     EXPECT_EQ(status_desc->size_bytes, sizeof(DeviceMoERebalanceStatus));
 
@@ -343,6 +350,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   transfer_command_buffers * sizeof(uint32_t) +
                   transfer_command_buffers * sizeof(DeviceMoERebalanceCommandBufferHeader) +
                   sizeof(DeviceMoERebalanceGraphControllerState) +
+                  sizeof(DeviceMoEPlacementBank) +
                   transfer_command_buffers * sizeof(DeviceMoERebalanceWaveState) +
                   sizeof(DeviceMoERebalanceStatus) +
                   sizeof(DeviceMoERebalanceApplyStatus) +
@@ -363,7 +371,12 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   compact_payload_gathered_bytes);
 
     const WorkspaceRequirements compact_reqs = compact_stage.getWorkspaceRequirements(0, 0, 0);
-    ASSERT_EQ(compact_reqs.buffers.size(), 18u);
+    ASSERT_EQ(compact_reqs.buffers.size(), 19u);
+    EXPECT_NE(
+        compact_reqs.find(
+            "moe_rebalance_placement_plan_scratch_decode_rebalance"),
+        nullptr)
+        << "Compact transfer planning still requires an isolated speculative RCU bank.";
     const auto *compact_local_source_desc =
         compact_reqs.find("moe_rebalance_local_source_descriptors_decode_rebalance");
     ASSERT_NE(compact_local_source_desc, nullptr);
@@ -428,6 +441,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   transfer_command_buffers * sizeof(uint32_t) +
                   transfer_command_buffers * sizeof(DeviceMoERebalanceCommandBufferHeader) +
                   sizeof(DeviceMoERebalanceGraphControllerState) +
+                  sizeof(DeviceMoEPlacementBank) +
                   transfer_command_buffers * sizeof(DeviceMoERebalanceWaveState) +
                   sizeof(DeviceMoERebalanceStatus) +
                   local_directory_entries * sizeof(DeviceMoEExpertDirectoryEntry) +
@@ -448,7 +462,12 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   collective_payload_gathered_bytes);
 
     const WorkspaceRequirements transfer_reqs = transfer_stage.getWorkspaceRequirements(0, 0, 0);
-    ASSERT_EQ(transfer_reqs.buffers.size(), 18u);
+    ASSERT_EQ(transfer_reqs.buffers.size(), 19u);
+    EXPECT_NE(
+        transfer_reqs.find(
+            "moe_rebalance_placement_plan_scratch_decode_rebalance"),
+        nullptr)
+        << "Fixed-payload planning still requires an isolated speculative RCU bank.";
     const auto *transfer_plan_desc =
         transfer_reqs.find("moe_rebalance_transfer_plan_decode_rebalance");
     const auto *transfer_plan_count_desc =

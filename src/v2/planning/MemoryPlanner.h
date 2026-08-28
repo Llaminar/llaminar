@@ -16,6 +16,7 @@
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
+#include "loaders/PreparedWeightAdmission.h"
 
 #include <optional>
 #include <stdexcept>
@@ -32,22 +33,6 @@ enum class DeviceExecutionMemoryRole
     ContinuationGraph,
     /** Sparse routed-expert endpoint: no attention/KV/recurrent authority. */
     RoutedExpertParticipant,
-};
-
-/**
- * @brief Whether planned model weights require a new device allocation.
- *
- * Current free-memory readings already exclude allocations retained by the
- * process.  A second runner that adopts a plan-certified PreparedWeightStore
- * must therefore preserve the complete weight BOM while charging only its new
- * graph/runtime allocations against current free memory.
- */
-enum class PreparedWeightAdmission
-{
-    /** The planner must reserve and allocate the complete planned weight set. */
-    AllocateCompleteSet,
-    /** A matching production plan certifies the complete set is already resident. */
-    ReuseCertifiedCompleteSet,
 };
 
 /**
@@ -73,17 +58,18 @@ enum class AdditionalPersistentWeightSet
  * @brief Resolve extra persistent sets implied by one dense execution policy.
  * @param policy Declarative dense/shared execution policy.
  * @param tensor_parallel_degree Number of participants in the primary view.
- * @param mtp_enabled Whether a speculative sidecar is retained.
- * @param mtp_terminal_logits_layout Exact participant-local MTP head layout.
+ * @param terminal_head_policy Exact terminal-head placement policy. A
+ *        mirrored policy applies to the serial decode oracle even when MTP is
+ *        disabled for the current request, so admission must not key this
+ *        persistent view on `mtp.enabled`.
  * @return Complete, duplicate-free list of additional physical weight sets.
  */
 [[nodiscard]] inline std::vector<AdditionalPersistentWeightSet>
 resolveAdditionalPersistentWeightSets(
     DenseParallelPolicy policy,
     int tensor_parallel_degree,
-    bool mtp_enabled = false,
-    MTPTerminalLogitsLayout mtp_terminal_logits_layout =
-        MTPTerminalLogitsLayout::VocabularyShardPerParticipant)
+    MTPTerminalHeadPolicy terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded)
 {
     if (tensor_parallel_degree <= 1)
         return {};
@@ -92,9 +78,7 @@ resolveAdditionalPersistentWeightSets(
 
     std::vector<AdditionalPersistentWeightSet> sets;
     const bool mirrored_mtp_head =
-        mtp_enabled &&
-        mtp_terminal_logits_layout ==
-            MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+        mtpTerminalHeadIsMirrored(terminal_head_policy);
     if (denseParallelPolicyMirrorsDecodeEmbedding(policy) ||
         mirrored_mtp_head)
     {
@@ -124,6 +108,29 @@ enum class RoutedExpertCompactBufferLifetime
     PerLayerGraphOwned,
     /** One graph-stable packet is shared by each serial local participant. */
     SerialFamilyPerParticipant,
+};
+
+/**
+ * @brief Exact retained native forward-executable inventory for one device.
+ *
+ * Native CUDA/HIP graph executables own opaque driver allocations outside the
+ * tensor and workspace arenas. The prefill ladder is capacity-dependent, while
+ * decode and restored-prefix bridge executables are fixed members. Keeping the
+ * two counts typed lets resident-row admission price the same family that setup
+ * will later materialize without guessing from a model or backend name.
+ */
+struct CapturedServingGraphMemoryInventory
+{
+    /** Configured prefill bucket boundaries before resident-row clamping. */
+    std::vector<int> prefill_bucket_rows;
+    /** Complete forward executables retained independently of prefill rows. */
+    std::size_t fixed_executable_count = 0u;
+
+    /** @return true when this declaration names at least one executable. */
+    [[nodiscard]] bool enabled() const noexcept
+    {
+        return !prefill_bucket_rows.empty() || fixed_executable_count != 0u;
+    }
 };
 
 /// Configuration for a single device in a memory plan.
@@ -180,6 +187,17 @@ struct DevicePlanConfig
     std::string kv_precision = "fp16";
     int local_kv_heads = 0;   // After TP sharding, 0 = use profile.n_kv_heads
 
+    /**
+     * Prefix-state archive policy retained by this continuation device.
+     *
+     * GPU archive staging and the bounded device-hot tier are real concurrent
+     * owners beside the live KV cache. Keeping the production policy in the
+     * device plan lets auto-capacity and final preflight price the same bytes.
+     * Routed-expert-only participants ignore this field because they own no KV
+     * or recurrent inference state.
+     */
+    PrefixCacheRuntimeConfig prefix_cache;
+
     // Runtime parameters
     int batch_size = 1;
     int max_seq_len = 0;  // 0 = use profile.max_seq_len
@@ -196,6 +214,9 @@ struct DevicePlanConfig
     /** Exact ownership contract for compact routed-expert activation packets. */
     RoutedExpertCompactBufferLifetime routed_expert_compact_buffer_lifetime =
         RoutedExpertCompactBufferLifetime::PerLayerGraphOwned;
+
+    /** Native graph family whose opaque driver storage must be admitted. */
+    CapturedServingGraphMemoryInventory captured_serving_graphs;
 
     /**
      * @brief Number of local participants with an independently runnable serial packet.
@@ -230,12 +251,17 @@ struct DevicePlanConfig
     PreparedWeightAdmission prepared_weight_admission =
         PreparedWeightAdmission::AllocateCompleteSet;
 
+    /**
+     * Primary workspace bytes already retained by the exact prepared-model
+     * context. The live free-memory observation excludes these bytes, while a
+     * newly planned serial family can republish them without allocation.
+     */
+    std::size_t retained_workspace_bytes = 0u;
+
     /** Runtime-state role; auxiliary experts never own dense-model caches. */
     DeviceExecutionMemoryRole execution_role =
         DeviceExecutionMemoryRole::ContinuationGraph;
 
-    // Headroom
-    size_t headroom_bytes = 128ULL * 1024 * 1024;
 };
 
 /**

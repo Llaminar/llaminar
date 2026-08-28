@@ -13,6 +13,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define LLAMINAR_MOE_RUNTIME_HD __host__ __device__
+#else
+#define LLAMINAR_MOE_RUNTIME_HD
+#endif
+
 namespace llaminar2::moe_runtime_abi
 {
     /** Number of independently retained runtime routing phases. */
@@ -27,7 +33,8 @@ namespace llaminar2::moe_runtime_abi
     };
 
     /** @return One policy-mask bit for a validated histogram source. */
-    [[nodiscard]] constexpr std::uint32_t histogramSourceBit(
+    [[nodiscard]] LLAMINAR_MOE_RUNTIME_HD constexpr std::uint32_t
+    histogramSourceBit(
         HistogramSource source) noexcept
     {
         return 1u << static_cast<std::uint32_t>(source);
@@ -37,8 +44,55 @@ namespace llaminar2::moe_runtime_abi
     inline constexpr std::uint32_t kAllHistogramSourcesMask =
         (1u << kHistogramSourceCount) - 1u;
 
+    /** Low bit selecting one of the two persistent histogram banks. */
+    inline constexpr std::uint32_t kHistogramWriterBankMask = 1u;
+    /**
+     * Bit that quarantines route rows while economy activation crosses a
+     * request boundary. Raw states 0/1 intentionally remain admitted so
+     * existing model-setup initialization is the economical fast path.
+     */
+    inline constexpr std::uint32_t kHistogramWriterQuarantineBit = 2u;
+    /** Complete set of bits accepted by the host/device writer-state ABI. */
+    inline constexpr std::uint32_t kHistogramWriterStateMask =
+        kHistogramWriterBankMask | kHistogramWriterQuarantineBit;
+
+    /** @return A complete writer state for one bank and admission decision. */
+    [[nodiscard]] LLAMINAR_MOE_RUNTIME_HD constexpr std::uint32_t
+    makeHistogramWriterState(
+        std::uint32_t bank,
+        bool admit_rows) noexcept
+    {
+        return (bank & kHistogramWriterBankMask) |
+               (admit_rows ? 0u : kHistogramWriterQuarantineBit);
+    }
+
+    /** @return Whether a device-published writer state is structurally valid. */
+    [[nodiscard]] LLAMINAR_MOE_RUNTIME_HD constexpr bool
+    validHistogramWriterState(
+        std::uint32_t state) noexcept
+    {
+        return (state & ~kHistogramWriterStateMask) == 0u;
+    }
+
+    /** @return Physical bank selected by a validated writer state. */
+    [[nodiscard]] LLAMINAR_MOE_RUNTIME_HD constexpr std::uint32_t
+    histogramWriterBank(
+        std::uint32_t state) noexcept
+    {
+        return state & kHistogramWriterBankMask;
+    }
+
+    /** @return Whether a validated writer state admits route rows. */
+    [[nodiscard]] LLAMINAR_MOE_RUNTIME_HD constexpr bool
+    histogramWriterAdmitsRows(
+        std::uint32_t state) noexcept
+    {
+        return (state & kHistogramWriterQuarantineBit) == 0u;
+    }
+
     /** @return Whether a policy mask selects at least one known source only. */
-    [[nodiscard]] constexpr bool validHistogramSourceMask(
+    [[nodiscard]] LLAMINAR_MOE_RUNTIME_HD constexpr bool
+    validHistogramSourceMask(
         std::uint32_t mask) noexcept
     {
         return mask != 0u &&
@@ -86,7 +140,7 @@ namespace llaminar2::moe_runtime_abi
     /** Offset of the overlay-wide sparse-packet target array inside a bank. */
     inline constexpr std::size_t kOverlayRouteParticipantOffset = 62976;
 
-    inline constexpr std::size_t kLayerRuntimeBytes = 140768;
+    inline constexpr std::size_t kLayerRuntimeBytes = 140776;
     /** First device-local decode execution counter in the inline ABI. */
     inline constexpr std::size_t kDecodeLocalHistogramOffset = 130224;
     /** First device-local ordinary-prefill execution counter. */
@@ -109,7 +163,11 @@ namespace llaminar2::moe_runtime_abi
     inline constexpr std::size_t kRuntimeHistogramActiveBankOffset = 140744;
     inline constexpr std::size_t kOverlayEpochTicketOffset = 140752;
     inline constexpr std::size_t kOverlayPlacementBanksOffset = 140760;
+    /** Failure-only provenance for the last device epoch-boundary operation. */
+    inline constexpr std::size_t kOverlayEpochStatusOffset = 140768;
 
     static_assert(sizeof(void *) == 8,
                   "DeviceMoELayerRuntime ABI requires 64-bit pointers");
 } // namespace llaminar2::moe_runtime_abi
+
+#undef LLAMINAR_MOE_RUNTIME_HD

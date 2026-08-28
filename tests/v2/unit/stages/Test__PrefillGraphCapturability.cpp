@@ -16,6 +16,8 @@
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.h"
+#include "execution/moe/IMoEGroupedVerifierHistogramPublisher.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
@@ -39,6 +41,64 @@ using namespace llaminar2::testing;
 
 namespace
 {
+
+    /**
+     * @brief Record the accepted-state graph's typed producer admission call.
+     *
+     * This device-free publisher isolates graph lifecycle semantics from the
+     * backend kernel.  The integration suites separately prove that the exact
+     * CUDA/HIP stream admitted here can publish accepted rows during capture.
+     */
+    class RecordingGroupedVerifierHistogramPublisher final
+        : public IMoEGroupedVerifierHistogramPublisher
+    {
+    public:
+        [[nodiscard]] MoEGroupedVerifierHistogramRole
+        groupedVerifierHistogramRole() const noexcept override
+        {
+            return MoEGroupedVerifierHistogramRole::DeferredAcceptedRows;
+        }
+
+        [[nodiscard]] int
+        groupedVerifierHistogramLayerIndex() const noexcept override
+        {
+            return 7;
+        }
+
+        [[nodiscard]] std::string_view
+        groupedVerifierHistogramPublisherName() const noexcept override
+        {
+            return "recording_grouped_verifier";
+        }
+
+        [[nodiscard]] void *
+        groupedVerifierHistogramPublicationStream() const override
+        {
+            return publication_stream;
+        }
+
+        bool prepareGroupedVerifierHistogramProducer(
+            void *producer_stream) override
+        {
+            ++prepare_calls;
+            prepared_stream = producer_stream;
+            return producer_stream != nullptr;
+        }
+
+        bool enqueueCommittedGroupedVerifierHistograms(
+            const int32_t *,
+            const int32_t *,
+            int,
+            int,
+            void *) override
+        {
+            return true;
+        }
+
+        int prepare_calls = 0;
+        void *prepared_stream = nullptr;
+        void *publication_stream = nullptr;
+    };
 
     // =========================================================================
     // Scoped DebugEnv flag helpers
@@ -539,6 +599,48 @@ TEST_F(MoERoutingPrefillGraphCapture, GroupedVerifierUsesCaptureOnlyLaunchPrepar
 }
 
 /**
+ * @brief Accepted-state publication must expose its producer-admission hook.
+ *
+ * A prepareGraphLaunch() implementation paired with policy None is dead code:
+ * the graph controller correctly skips it and capture later sees an unknown
+ * producer stream.  This regression locks the policy and the exact stream
+ * delivered to every deferred MoE histogram publisher together.
+ */
+TEST(MTPSpeculativeStatePublicationGraphCapture,
+     CapturePreparationAdmitsExactHistogramProducerStream)
+{
+    void *const capture_stream =
+        reinterpret_cast<void *>(uintptr_t{0x5A7100});
+    RecordingGroupedVerifierHistogramPublisher publisher;
+    publisher.publication_stream = capture_stream;
+    MTPSpeculativeStatePublicationStage stage(
+        MTPSpeculativeStatePublicationStage::Params{
+            .device_id = DeviceId::cuda(0),
+            .moe_histogram_publishers = {&publisher},
+            .moe_histogram_publication_stream = capture_stream,
+        });
+
+    EXPECT_EQ(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::CaptureOnly);
+    EXPECT_TRUE(requiresGraphLaunchPreparation(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPhase::Capture));
+    EXPECT_FALSE(requiresGraphLaunchPreparation(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPhase::Replay));
+
+    ASSERT_TRUE(stage.prepareGraphLaunch(nullptr, capture_stream));
+    EXPECT_EQ(publisher.prepare_calls, 1);
+    EXPECT_EQ(publisher.prepared_stream, capture_stream);
+
+    void *const foreign_stream =
+        reinterpret_cast<void *>(uintptr_t{0x5A7200});
+    EXPECT_FALSE(stage.prepareGraphLaunch(nullptr, foreign_stream));
+    EXPECT_EQ(publisher.prepare_calls, 1);
+}
+
+/**
  * @brief Prove capture preparation binds every grouped-verifier route depth.
  *
  * This is the stage-level regression for the Q8 router cache miss discovered
@@ -706,7 +808,8 @@ TEST_F(MoERoutingPrefillGraphCapture,
     params.layer_idx = 0;
     params.moe_runtime_table = &runtime_table;
     params.force_decode_equivalent_verifier_prefill = true;
-    params.defer_overlay_grouped_verifier_histogram_publication = true;
+    params.grouped_verifier_histogram_role =
+        MoEGroupedVerifierHistogramRole::DeferredAcceptedRows;
 
     MoERoutingStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
@@ -717,7 +820,9 @@ TEST_F(MoERoutingPrefillGraphCapture,
     stage.setGPUStream(route_stream);
     MockDeviceContext ctx(device, ComputeBackendType::GPU_ROCM);
 
-    ASSERT_TRUE(stage.requiresCommittedGroupedVerifierHistogramPublication());
+    ASSERT_EQ(
+        stage.groupedVerifierHistogramRole(),
+        MoEGroupedVerifierHistogramRole::DeferredAcceptedRows);
     ASSERT_TRUE(stage.execute(&ctx));
     EXPECT_EQ(stub_kernel_.verifier_route_calls, 1);
     EXPECT_EQ(
@@ -753,7 +858,8 @@ TEST_F(MoERoutingPrefillGraphCapture,
     params.layer_idx = 0;
     params.moe_runtime_table = &runtime_table;
     params.force_decode_equivalent_verifier_prefill = true;
-    params.defer_overlay_grouped_verifier_histogram_publication = true;
+    params.grouped_verifier_histogram_role =
+        MoEGroupedVerifierHistogramRole::DeferredAcceptedRows;
 
     MoERoutingStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);

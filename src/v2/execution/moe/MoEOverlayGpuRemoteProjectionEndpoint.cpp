@@ -390,6 +390,16 @@ namespace llaminar2
         std::uint32_t first_unit,
         std::uint32_t unit_count) noexcept
     {
+        /*
+         * A maintenance worker can progress lanes for several devices on one
+         * host thread.  Streams and pointers retain their owning device, but
+         * CUDA/HIP kernel launch state is thread-local.  Select this lane's
+         * exact device before dispatch so a device-1 stream is never submitted
+         * while the thread still names device 0.  setDevice() is a context
+         * selection operation; it does not synchronize either stream.
+         */
+        if (!backend_ || !backend_->setDevice(device_ordinal_))
+            return false;
         if (config_.device.is_cuda())
         {
 #ifdef HAVE_CUDA
@@ -430,6 +440,11 @@ namespace llaminar2
         std::uint32_t unit_count,
         std::size_t bytes) noexcept
     {
+        /* Keep repack dispatch device-exact even if the preceding H2D copy is
+         * later replaced or reordered.  Kernel correctness must not depend on
+         * an unrelated backend call incidentally selecting this device. */
+        if (!backend_ || !backend_->setDevice(device_ordinal_))
+            return false;
         if (config_.device.is_cuda())
         {
 #ifdef HAVE_CUDA
@@ -924,8 +939,7 @@ namespace llaminar2
             !source.valid() || !format.valid() || !lifetime_ ||
             manifest_.identity.source_device != lane_->device() ||
             !manifest_.identity.source_device.is_gpu() ||
-            !manifest_.identity.destination_device.is_gpu() ||
-            !manifest_.carriesGpuFloatingBytes() ||
+            !manifest_.carriesFloatingBytes() ||
             manifest_.format_kind != format.kind ||
             manifest_.N != source.n || manifest_.K != source.k ||
             manifest_.region_bytes !=
@@ -1360,13 +1374,12 @@ namespace llaminar2
                 return false;
             }
         }
-        else if (manifest.carriesGpuFloatingBytes())
+        else if (manifest.carriesFloatingBytes())
         {
             const auto &descriptor = candidate.floating_descriptor;
             const auto format = ExpertWeightFormat::floating(
                 descriptor.type);
             if (!descriptor.valid() || !format.valid() ||
-                !manifest.identity.source_device.is_gpu() ||
                 manifest.format_kind != format.kind ||
                 manifest.N != descriptor.n ||
                 manifest.K != descriptor.k ||

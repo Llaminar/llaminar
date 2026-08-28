@@ -28,6 +28,8 @@ namespace llaminar2
         size_t live_recurrent_state_bytes = 0;
         size_t checkpoint_state_bytes = 0;
         size_t sequence_metadata_bytes = 0;
+        /** Exact GPU serialization bytes for the main cache's GDN state. */
+        size_t prefix_hybrid_device_state_bytes = 0;
         int main_full_attention_layers = 0;
         int main_gdn_layers = 0;
         int mtp_full_attention_layers = 0;

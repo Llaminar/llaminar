@@ -26,6 +26,9 @@
 #include "WeightPlan.h"
 #include "WeightPlacementMap.h"
 #include "WeightManagerConfig.h"
+#include "PreparedWeightAdmission.h"
+#include "PreparedDeviceAllocationLedger.h"
+#include "MmapReclaimLifecycle.h"
 #include "../execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "../backends/DeviceId.h"
 #include "../config/TensorParallelConfig.h"
@@ -41,6 +44,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
+#include <vector>
 
 namespace llaminar2
 {
@@ -85,6 +89,15 @@ namespace llaminar2
                       std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
                       WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
                       WeightPrecision weight_precision = WeightPrecision::NATIVE);
+
+        /**
+         * @brief Join any submitted mapping reclaim before loader state is destroyed.
+         *
+         * The owned worker borrows this manager and its loader, so teardown owns
+         * an explicit completion edge rather than relying on member destruction
+         * order alone.
+         */
+        ~WeightManager() override;
 
         /**
          * @brief Get weight tensor for a specific device (device-isolated instance)
@@ -167,13 +180,18 @@ namespace llaminar2
          * @param frozen_weights Immutable graph bindings for that participant;
          *        mandatory when the scoped plan contains accelerator requests.
          * @param execution_plan Optional rank filter applied before device scope.
+         * @param admission Whether to create exact prepared engines or adopt a
+         *        complete set certified by the model-context reuse lifecycle.
+         *        Certified adoption never falls back to source materialization.
          * @return true after all scoped requests have been prepared.
          */
         bool prepareMoEExpertOverlayWeights(
             const MoEExpertOverlayRuntimePlan &runtime_plan,
             DeviceId target_device,
             const FrozenModelWeightSet *frozen_weights = nullptr,
-            const MoEExpertOverlayExecutionPlan *execution_plan = nullptr);
+            const MoEExpertOverlayExecutionPlan *execution_plan = nullptr,
+            PreparedWeightAdmission admission =
+                PreparedWeightAdmission::AllocateCompleteSet);
 
         /**
          * @brief Prepare weights for a single device, filtered to a layer range
@@ -298,9 +316,9 @@ namespace llaminar2
          * Called after the first forward pass completes. Unlike releaseAllHostWeightData()
          * which retains host-resident tensors because they haven't been uploaded yet,
          * this method releases them because the GPU kernels have now created their own copies.
-         * This method deliberately does not advise mmap pages: borrowed views must be
-         * unregistered through adviseMmapDontneed() before the shared mapping may be
-         * reclaimed.
+         * This method deliberately does not reclaim mmap pages: borrowed views
+         * are retired by the asynchronous scheduleMmapReclaim() operation before
+         * the shared mapping may be advised.
          *
          * @return Number of tensors whose host data was released
          */
@@ -318,14 +336,27 @@ namespace llaminar2
         size_t releaseMoEExpertHostWeightData();
 
         /**
-         * @brief Advise the OS to reclaim mmap physical pages.
+         * @brief Submit exactly-once mmap reclaim to the prestarted worker.
          *
-         * Delegates to the loader's adviseMmapDontneed(). Safe to call
-         * after all GEMM engines have packed their weight data.
+         * Submission is non-blocking and performs no allocator, device-runtime,
+         * or madvise work on the inference authority thread. The worker retires
+         * remaining mmap host registrations before applying the loader's typed
+         * backing-storage policy.
          *
-         * @return Total bytes advised
+         * @return Typed submission outcome.
          */
-        size_t adviseMmapDontneed() override;
+        MmapReclaimLifecycle::Submission scheduleMmapReclaim() override;
+
+        /**
+         * @brief Wait for reclaim before an allocation that depends on its RAM.
+         *
+         * This is an admission/teardown boundary, never an inference hot-path
+         * operation.
+         *
+         * @return Terminal state and total bytes actually advised.
+         */
+        MmapReclaimLifecycle::Completion
+        awaitMmapReclaimBeforeHostAllocation() override;
 
         /**
          * @brief Get statistics about preloaded weights
@@ -824,6 +855,20 @@ namespace llaminar2
             DeviceId device) const;
 
         /**
+         * @brief Return exact model-owned GPU weight bytes still live at seal.
+         * @param device Exact GPU backend and ordinal.
+         * @return Checked sum of live persistent weight pools and embeddings.
+         *
+         * Pool entries retain only weak ownership, so runner-only Dynamic
+         * shadow allocations disappear before this query. Model-owned kernels
+         * keep their original pool owner alive; prepared embeddings expose
+         * their independent allocation through PreparedWeightStore. This is an
+         * ownership query, never an allocator free-memory estimate.
+         */
+        [[nodiscard]] size_t retainedPreparedDeviceBytes(
+            DeviceId device) const;
+
+        /**
          * @brief Get the current lifecycle state (derived from gates)
          */
         WeightLifecycleState lifecycleState() const { return lifecycle_gates_.currentState(); }
@@ -905,6 +950,69 @@ namespace llaminar2
          */
         static ShardingMode toShardingMode(WeightShardingMode mode);
 
+        /**
+         * @brief Identity of one immutable model-prepared FP32 override.
+         *
+         * A canonical source can be bound under different semantic roles and
+         * to different devices.  Both facts affect the representation and its
+         * eventual device residency, so neither may be inferred from tensor
+         * shape or omitted from cache identity.
+         */
+        struct ModelPreparedFp32OverrideKey
+        {
+            std::string canonical_name; ///< Stable model weight identity.
+            WeightRole role = WeightRole::Other; ///< Graph semantic role.
+            DeviceId target_device = DeviceId::invalid(); ///< Exact consumer.
+
+            /** @return true when all representation-defining fields match. */
+            bool operator==(const ModelPreparedFp32OverrideKey &other) const
+            {
+                return canonical_name == other.canonical_name &&
+                       role == other.role &&
+                       target_device == other.target_device;
+            }
+        };
+
+        /** @brief Hashes the complete prepared-override identity. */
+        struct ModelPreparedFp32OverrideKeyHash
+        {
+            /**
+             * @param key Complete override identity.
+             * @return Stable process-local hash suitable for unordered lookup.
+             */
+            size_t operator()(const ModelPreparedFp32OverrideKey &key) const noexcept
+            {
+                size_t hash = std::hash<std::string>{}(key.canonical_name);
+                hash ^= std::hash<int>{}(static_cast<int>(key.role)) +
+                        0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+                hash ^= std::hash<DeviceId>{}(key.target_device) +
+                        0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+                return hash;
+            }
+        };
+
+        /**
+         * @brief Acquire a model-owned FP32 representation for special graph roles.
+         *
+         * The returned object is cached for the lifetime of this WeightManager,
+         * not the lifetime of a FrozenModelWeightSet or graph runner.  This is
+         * required because raw GGUF bytes may be released after the first runner
+         * is prepared while a later campaign cell reuses the same ModelContext.
+         *
+         * @param name Canonical model weight name.
+         * @param role Semantic graph role selected by the weight plan.
+         * @param source Loaded source tensor.
+         * @param target_device Exact consuming device.
+         * @return Shared immutable FP32 tensor, or nullptr when no override applies.
+         * @throws std::runtime_error when an uncached override is requested after
+         *         its source bytes have already been released.
+         */
+        std::shared_ptr<TensorBase> createModelPreparedFp32Override(
+            const std::string &name,
+            WeightRole role,
+            const TensorBase *source,
+            DeviceId target_device);
+
         IModelLoader &loader_;                                                      ///< Model loader (GGUF, mock, etc.)
         std::shared_ptr<IMPIContext> mpi_ctx_;                                      ///< MPI context (nullptr = single rank)
         std::shared_ptr<WeightPlacementMap> placement_map_;                         ///< Fine-grained placement decisions
@@ -912,6 +1020,18 @@ namespace llaminar2
         WeightDistributionStrategy strategy_;                                       ///< Distribution strategy
         WeightPrecision weight_precision_;                                          ///< How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_;        ///< Weight cache
+        /**
+         * Immutable derived values whose lifetime is the complete model context.
+         *
+         * These deliberately do not participate in host-weight release sweeps:
+         * they are small canonical graph inputs needed to rematerialize runners
+         * after the corresponding raw source bytes have been reclaimed.
+         */
+        std::unordered_map<
+            ModelPreparedFp32OverrideKey,
+            std::shared_ptr<TensorBase>,
+            ModelPreparedFp32OverrideKeyHash>
+            model_prepared_fp32_overrides_;
         mutable std::mutex cache_mutex_;                                            ///< Protects cache_ and decode_cache_ access
         mutable std::unordered_map<std::string, ShardingMode> sharding_mode_cache_; ///< Cached sharding modes
         mutable std::mutex sharding_mode_cache_mutex_;                              ///< Protects sharding_mode_cache_ (separate from cache_mutex_ to avoid deadlock — getShardingMode may be called while cache_mutex_ is held)
@@ -1464,6 +1584,9 @@ namespace llaminar2
         std::shared_ptr<PreparedWeightStore> prepared_weight_store_;
         uint64_t next_pipeline_prepared_binding_id_ = (1ULL << 48);
 
+        /** Exact weak ownership of every finalized GPU weight pool. */
+        PreparedDeviceAllocationLedger prepared_device_allocations_;
+
         // =========================================================================
         // Phase 2: Per-weight/device readiness tickets and TP-safe reclaim eligibility
         // =========================================================================
@@ -1499,6 +1622,22 @@ namespace llaminar2
         void evaluateReclaimEligibility(const std::string &name, bool is_gemm);
         bool tryReleaseReclaimHostRawData(const std::string &name);
         static const char *weightPrepStateName(WeightPrepState state);
+
+        /**
+         * @brief Execute the complete reclaim sequence on the lifecycle worker.
+         *
+         * Snapshots all surviving mapped tensors under the cache mutex, then
+         * retires their accelerator host registrations before asking the loader
+         * to advise its durable mappings. The snapshot owns tensor lifetimes
+         * after the mutex is released, so inference never waits on the expensive
+         * device-runtime or page-table operations.
+         *
+         * @return Number of durable mapping bytes advised by the loader.
+         */
+        size_t performMmapReclaim();
+
+        /** Sole exactly-once authority for asynchronous model-mapping reclaim. */
+        MmapReclaimLifecycle mmap_reclaim_lifecycle_;
     };
 
 } // namespace llaminar2

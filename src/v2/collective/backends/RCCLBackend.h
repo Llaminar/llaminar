@@ -23,6 +23,7 @@
 
 #include "../ICollectiveBackend.h"
 #include "../DeviceGroup.h"
+#include "../CollectiveRuntimeLifecycle.h"
 #include "../../utils/MPIContext.h"
 
 // Note: No longer include rccl.h directly - use dynamic loading via wrappers
@@ -423,22 +424,62 @@ namespace llaminar2
         // access faults after multiple init/destroy cycles).
         std::shared_ptr<RCCLCoordinator> coordinator_;
 
+        /** True while this backend is registered as a live coordinator owner. */
+        bool coordinator_owner_registered_ = false;
+
         // Helper to convert our types to integer values for wrapper functions
         static int toRcclDataTypeInt(CollectiveDataType dtype);
         static int toRcclRedOpInt(CollectiveOp op);
 
         // Static coordinator pool: avoids repeated ncclCommDestroy/ncclCommInit
         // cycles that trigger ROCm CLR state accumulation bugs.
-        // Key: sorted device ordinals string (e.g., "0,1")
+        // Key: rank-ordered device ordinals string (e.g., "0,1"). Device
+        // order is part of communicator identity and must never be sorted away.
+        struct PooledCoordinatorEntry
+        {
+            std::vector<int> device_ordinals; ///< Immutable clique identity.
+            std::shared_ptr<RCCLCoordinator> coordinator; ///< Inactive owner.
+        };
+
+        /** Live backends sharing one immutable device-clique identity. */
+        struct ActiveCoordinatorEntry
+        {
+            std::vector<int> device_ordinals; ///< Immutable clique identity.
+            std::size_t owners = 0u; ///< Live RCCLBackend instances.
+        };
+
         static std::mutex coordinator_pool_mutex_;
-        static std::unordered_map<std::string, std::shared_ptr<RCCLCoordinator>> coordinator_pool_;
+        static std::vector<PooledCoordinatorEntry> coordinator_pool_;
+        static std::unordered_map<std::string, ActiveCoordinatorEntry>
+            active_coordinator_owners_;
         static std::string makePoolKey(const std::vector<int> &device_ordinals);
+
+        /** @brief Publish this backend as a live owner under the pool mutex. */
+        void registerActiveCoordinatorOwnerLocked();
+
+        /** @brief Remove this backend's live-owner publication under the mutex. */
+        void unregisterActiveCoordinatorOwnerLocked() noexcept;
 #endif
 
     public:
-        /// Drain the static coordinator pool, destroying all pooled coordinators.
-        /// Call this at process shutdown (e.g., from GlobalBackendRouter::shutdown())
-        /// to ensure RCCL resources are properly released.
+        /**
+         * @brief Retire pooled RCCL owners that intersect one HIP runtime.
+         *
+         * Active owners are never interrupted: they produce an explicit
+         * `ActiveOwner` receipt, causing the native-reset transaction to fail.
+         * Inactive coordinators are detached under the pool mutex and joined
+         * outside it while all participating HIP generations are still live.
+         */
+        [[nodiscard]] static CollectiveRuntimeRetirementReceipt
+        retireRuntimeGenerationResources(DeviceId device);
+
+        /**
+         * @brief Drain every inactive coordinator at process shutdown.
+         *
+         * Call only after every backend instance has retired. A surviving live
+         * owner is a fatal lifecycle defect rather than a resource to tear out
+         * from underneath its caller.
+         */
         static void drainCoordinatorPool();
     };
 

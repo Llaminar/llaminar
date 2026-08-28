@@ -38,7 +38,7 @@ namespace llaminar2
     {
         CpuNativeVnniInterleaved = 1, ///< Final CPU execution units.
         GpuSeparatedNativeVnni = 2,   ///< Payload/scales/mins/emins blobs.
-        GpuContiguousFloating = 3,    ///< One raw FP16/BF16/FP32 matrix blob.
+        ContiguousFloating = 3,       ///< One raw FP16/BF16/FP32 matrix blob.
     };
 
     /**
@@ -52,7 +52,8 @@ namespace llaminar2
     {
         std::uint64_t expected_epoch = 0;
         std::uint64_t candidate_epoch = 0;
-        MoEOverlayResidencyTransactionFingerprint transaction_fingerprint;
+        /** Executable plan identity; root-only economy evidence is excluded. */
+        MoEOverlayResidencyExecutionFingerprint execution_fingerprint;
         std::uint64_t migration_index = 0;
         std::int32_t layer_idx = -1;
         std::int32_t expert_id = -1;
@@ -157,11 +158,11 @@ namespace llaminar2
                                   GpuSeparatedNativeVnni;
         }
 
-        /** @return Whether region zero is one contiguous floating GPU matrix. */
-        [[nodiscard]] bool carriesGpuFloatingBytes() const noexcept
+        /** @return Whether region zero is one contiguous floating matrix. */
+        [[nodiscard]] bool carriesFloatingBytes() const noexcept
         {
             return packing == MoEOverlayRemoteProjectionPacking::
-                                  GpuContiguousFloating;
+                                  ContiguousFloating;
         }
     };
 
@@ -207,14 +208,18 @@ namespace llaminar2
         std::uint32_t maximum_chunk_bytes);
 
     /**
-     * @brief Construct a byte-preserving contiguous floating GPU manifest.
+     * @brief Construct a byte-preserving contiguous floating manifest.
      * @param identity Exact cross-rank transaction/projection identity.
      * @param source Live FP16, BF16, or FP32 matrix retained by its GEMM.
      * @param maximum_chunk_bytes Persistent network staging capacity.
      * @return Authenticated one-region raw floating blob contract.
+     *
+     * CPU and GPU floating GEMMs share the same scalar representation. The
+     * endpoint-specific source and destination classes determine whether each
+     * chunk is read directly by MPI or crosses an exact auxiliary GPU stream.
      */
     [[nodiscard]] MoEOverlayRemoteProjectionManifest
-    makeMoEOverlayRemoteGpuFloatingProjectionManifest(
+    makeMoEOverlayRemoteFloatingProjectionManifest(
         const MoEOverlayRemoteProjectionIdentity &identity,
         const ContiguousFloatingPointWeightDescriptor &source,
         std::uint32_t maximum_chunk_bytes);

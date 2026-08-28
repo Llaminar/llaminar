@@ -110,7 +110,8 @@ def summarize(results_root: Path, artifact_name: str) -> tuple[str, int, int]:
             if not evidence:
                 continue
             row = evidence[0]
-            homogeneous_gpu = passed_bool(row.get("homogeneous_gpu")) is True
+            execution_topology = row.get("execution_topology", "unknown")
+            graph_contract = row.get("graph_contract", "unknown")
             graph_ok = row.get("execution_path") == "graph"
             within_budget = passed_bool(row.get("within_budget")) is True
             full_graph = (
@@ -162,23 +163,44 @@ def summarize(results_root: Path, artifact_name: str) -> tuple[str, int, int]:
             captured_generation = (
                 forward_graph if hosted_policy_ok else full_graph
             )
-            segmented = any(
-                passed_bool(row.get(key)) is True
-                for key in (
-                    "segmented_plan",
-                    "segmented_capture",
-                    "segmented_replay",
-                )
+            segmented_plan = passed_bool(row.get("segmented_plan")) is True
+            segmented_capture = (
+                passed_bool(row.get("segmented_capture")) is True
             )
-            path_passed = graph_ok and within_budget and (
-                not homogeneous_gpu
-                or (
-                    captured_generation
+            segmented_replay = (
+                passed_bool(row.get("segmented_replay")) is True
+            )
+            segmented = (
+                segmented_plan or segmented_capture or segmented_replay
+            )
+            decode_capture = (
+                passed_bool(row.get("decode_graph_capture")) is True
+            )
+            decode_replay = (
+                passed_bool(row.get("decode_graph_replay")) is True
+            )
+            if execution_topology == "cpu_only":
+                topology_path_ok = graph_contract == "cpu_declarative"
+            elif execution_topology == "homogeneous_gpu":
+                topology_path_ok = (
+                    graph_contract == "homogeneous_gpu_captured"
+                    and captured_generation
                     and decode_graph
                     and generation_ok
                     and not segmented
                 )
-            )
+            elif execution_topology == "heterogeneous_accelerator":
+                topology_path_ok = (
+                    graph_contract == "heterogeneous_coordinator_segmented"
+                    and segmented_plan
+                    and segmented_capture
+                    and segmented_replay
+                    and decode_capture
+                    and decode_replay
+                )
+            else:
+                topology_path_ok = False
+            path_passed = graph_ok and within_budget and topology_path_ok
             status = "✅" if path_passed else "❌"
             total += 1
             if not path_passed:

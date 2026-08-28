@@ -612,7 +612,7 @@ namespace llaminar2
 
     bool QwenGraphBase::denseDecodeReplicatedActiveForTokens(int total_tokens) const
     {
-        const int max_decode_like_rows = config_.mtp.enabled
+        const int max_decode_like_rows = retainsMTPGraphCapacity(config_.mtp)
             ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
             : 1;
         const bool decode_like =
@@ -634,7 +634,7 @@ namespace llaminar2
 
     bool QwenGraphBase::denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const
     {
-        const int max_decode_like_rows = config_.mtp.enabled
+        const int max_decode_like_rows = retainsMTPGraphCapacity(config_.mtp)
             ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
             : 1;
         return config_.dense_tp_enabled &&
@@ -647,7 +647,7 @@ namespace llaminar2
 
     bool QwenGraphBase::replicatedAttentionStateActiveForTokens(int total_tokens) const
     {
-        const int max_decode_like_rows = config_.mtp.enabled
+        const int max_decode_like_rows = retainsMTPGraphCapacity(config_.mtp)
             ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
             : 1;
         const bool decode_like =
@@ -1403,7 +1403,7 @@ namespace llaminar2
         const bool tiered_overlay_graphs =
             moe.routed_expert_plan &&
             moe.routed_expert_plan->usesExpertOverlayAuthority();
-        return mtp.enabled || phase_split_dense_graphs ||
+        return retainsMTPGraphCapacity(mtp) || phase_split_dense_graphs ||
                tiered_overlay_graphs;
     }
 
@@ -3787,7 +3787,8 @@ namespace llaminar2
         const bool reserve_global_mtp_gather =
             resolveMTPTerminalLogitsCollective({
                 .layout = config_.mtpTerminalLogitsLayout(),
-                .sidecar_produces_logits = config_.mtp.enabled,
+                .sidecar_produces_logits =
+                    retainsMTPGraphCapacity(config_.mtp),
                 .spans_multiple_global_ranks =
                     spans_multiple_global_ranks,
             }) ==

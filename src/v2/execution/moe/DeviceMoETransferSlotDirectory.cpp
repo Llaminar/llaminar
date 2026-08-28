@@ -253,8 +253,7 @@ namespace llaminar2
         int device_ordinal,
         uint32_t participant_id,
         uint32_t slot_count,
-        FormatProfile format_profile,
-        size_t vram_safety_margin_bytes)
+        FormatProfile format_profile)
     {
         if (!backend)
             throw std::invalid_argument("DeviceMoETransferSlotDirectory requires a backend");
@@ -282,7 +281,6 @@ namespace llaminar2
         }
 
         auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
-        orchestrator->setVramPreflightSafetyMarginBytes(vram_safety_margin_bytes);
         orchestrator->addDevice(device_ordinal);
 
         for (uint32_t slot = 0; slot < slot_count; ++slot)

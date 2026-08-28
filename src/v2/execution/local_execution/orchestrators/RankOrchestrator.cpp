@@ -19,6 +19,7 @@
 #include "LogitsGatherer.h"
 #include "DeviceSampler.h"
 #include "DeviceGraphOrchestrator.h"
+#include "PipelineGraphExecutionPlan.h"
 #include "../../../collective/CollectiveTimeoutPolicy.h"
 #include "../../mtp/MTPSpecTransactionDriver.h"
 #include "../../mtp/MTPSpecStateContract.h"
@@ -71,7 +72,6 @@
 #include <string_view>
 #include <utility>
 #ifdef __linux__
-#include <malloc.h> // malloc_trim for deferred host weight release
 #endif
 
 namespace llaminar2
@@ -1041,6 +1041,21 @@ namespace llaminar2
             config);
         orchestrator->mode_ = ParallelismMode::PP;
         orchestrator->pp_stage_runners_ = std::move(pp_stage_runners);
+        orchestrator->initializePPGraphExecutionPlan();
+
+        /*
+         * Injected unit-test runners stand in for already prepared endpoints.
+         * The public production constructor never takes this shortcut: its
+         * native children cross the real materialization transition before
+         * request admission.
+         */
+        std::string materialization_error;
+        if (!orchestrator->pp_graph_execution_plan_->markMaterialized(
+                orchestrator->pp_graph_execution_plan_->nativeSegmentCount(),
+                &materialization_error))
+        {
+            throw std::runtime_error(materialization_error);
+        }
         return orchestrator;
     }
 
@@ -1246,13 +1261,17 @@ namespace llaminar2
 
         /*
          * GQA models with fewer KV heads than TP participants replicate the K/V
-         * stream.  Keep every semantic snapshot at that lifetime boundary in
-         * lockstep so diagnostics do not combine projections one way and cache
-         * state another way.
+         * stream. Keep every semantic snapshot from projection through the
+         * effective attention input in lockstep. In particular, per-head
+         * K_NORM is still a full replica even though Q_NORM remains sharded by
+         * query head; concatenating those K replicas invents TP-degree times as
+         * many logical KV columns as the model owns.
          */
-        static constexpr const char *kv_keys[] = {
+        static constexpr std::array<std::string_view, 10>
+            kReplicatedGQAKVSnapshotStageTypes = {
             "K_PROJECTION",
             "V_PROJECTION",
+            "K_NORM",
             "K_ROPE",
             "KV_APPEND_SOURCE_K",
             "KV_APPEND_SOURCE_V",
@@ -1262,10 +1281,18 @@ namespace llaminar2
             "ATTENTION_EFFECTIVE_V",
         };
 
-        for (const char *key : kv_keys)
+        for (const std::string_view stage_type :
+             kReplicatedGQAKVSnapshotStageTypes)
         {
-            stage_sharding_map_[key] = SnapshotShardingMode::REPLICATED;
+            stage_sharding_map_[std::string(stage_type)] =
+                SnapshotShardingMode::REPLICATED;
         }
+
+        LOG_DEBUG(
+            "RankOrchestrator: runtime GQA snapshot policy treats the complete "
+            "K/V checkpoint family as replicated (n_kv_heads="
+            << model_ctx_->headCountKV()
+            << " < tp_degree=" << tp_ctx_->degree() << ")");
     }
 
     bool RankOrchestrator::ownsMainForwardLogits() const noexcept
@@ -1610,18 +1637,12 @@ namespace llaminar2
                     }
                 }
 
-                // GQA-aware stage sharding override: when n_kv_heads < tp_degree,
-                // K/V are replicated (not column-parallel). Override the snapshot
-                // sharding map so parity tests compare K/V outputs correctly.
-                if (dense_tp_enabled && n_kv_heads < tp_ctx_->degree())
-                {
-                    stage_sharding_map_["K_PROJECTION"] = SnapshotShardingMode::REPLICATED;
-                    stage_sharding_map_["V_PROJECTION"] = SnapshotShardingMode::REPLICATED;
-                    stage_sharding_map_["K_ROPE"] = SnapshotShardingMode::REPLICATED;
-                    LOG_DEBUG("RankOrchestrator: GQA override: K/V stages set to REPLICATED "
-                              "(n_kv_heads="
-                              << n_kv_heads << " < tp_degree=" << tp_ctx_->degree() << ")");
-                }
+                /*
+                 * Runtime snapshot layout was frozen from this same model and
+                 * TP topology before device runners were initialized. Do not
+                 * maintain a second, partial override list here: it previously
+                 * omitted K_NORM and let parity concatenate four GQA replicas.
+                 */
             }
         }
 
@@ -1867,6 +1888,10 @@ namespace llaminar2
                                                  runner_config.moe_rebalance = config_.moe_rebalance;
                                                  runner_config.use_mapped_memory = config_.use_mapped_memory;
                                                  runner_config.prepared_weight_store = config_.prepared_weight_store;
+                                                 runner_config.prepared_weight_admission =
+                                                     config_.prepared_weight_admission;
+                                                 runner_config.reusable_execution_workspaces =
+                                                     config_.reusable_execution_workspaces;
                                                  runner_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
                                                  runner_config.moe_expert_overlay_residency_authority =
                                                      config_.moe_expert_overlay_residency_authority;
@@ -1985,9 +2010,6 @@ namespace llaminar2
                     {
                         LOG_DEBUG("RankOrchestrator: Host weight release after graph materialization: "
                                   << released << " tensors released");
-#ifdef __linux__
-                        ::malloc_trim(0);
-#endif
                     }
                 }
             }
@@ -2170,6 +2192,10 @@ namespace llaminar2
             runner_config.moe_rebalance = config_.moe_rebalance;
             runner_config.use_mapped_memory = config_.use_mapped_memory;
             runner_config.prepared_weight_store = config_.prepared_weight_store;
+            runner_config.prepared_weight_admission =
+                config_.prepared_weight_admission;
+            runner_config.reusable_execution_workspaces =
+                config_.reusable_execution_workspaces;
             runner_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
             runner_config.moe_expert_overlay_residency_authority =
                 config_.moe_expert_overlay_residency_authority;
@@ -2230,6 +2256,10 @@ namespace llaminar2
                 nested_config.moe_rebalance = config_.moe_rebalance;
                 nested_config.use_mapped_memory = config_.use_mapped_memory;
                 nested_config.prepared_weight_store = config_.prepared_weight_store;
+                nested_config.prepared_weight_admission =
+                    config_.prepared_weight_admission;
+                nested_config.reusable_execution_workspaces =
+                    config_.reusable_execution_workspaces;
                 nested_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
                 nested_config.moe_expert_overlay_residency_authority =
                     config_.moe_expert_overlay_residency_authority;
@@ -2365,6 +2395,159 @@ namespace llaminar2
 
         // Note: PP context initialization is done by the caller (constructor)
         // after this method returns, to avoid double-initialization
+        initializePPGraphExecutionPlan();
+    }
+
+    void RankOrchestrator::initializePPGraphExecutionPlan()
+    {
+        if (pp_stage_runners_.empty())
+        {
+            throw std::runtime_error(
+                "Cannot initialize a pipeline graph execution plan without stages");
+        }
+
+        std::vector<PipelineGraphExecutionSegment> segments;
+        segments.reserve(pp_stage_runners_.size());
+        for (std::size_t stage = 0; stage < pp_stage_runners_.size(); ++stage)
+        {
+            const auto &runner = pp_stage_runners_[stage];
+            if (!runner)
+            {
+                throw std::runtime_error(
+                    "Pipeline graph execution plan found a missing runner at stage " +
+                    std::to_string(stage));
+            }
+
+            const ServingGraphPreparationKind kind =
+                runner->servingGraphPreparationKind();
+            PipelineGraphSegmentExecution execution;
+            switch (kind)
+            {
+            case ServingGraphPreparationKind::EagerHostGraph:
+                execution = PipelineGraphSegmentExecution::HostDeclarative;
+                break;
+            case ServingGraphPreparationKind::NativeDeviceExecutableFamily:
+                execution =
+                    PipelineGraphSegmentExecution::NativeDeviceExecutable;
+                break;
+            case ServingGraphPreparationKind::Unresolved:
+                throw std::runtime_error(
+                    "Pipeline graph execution plan found an unresolved graph owner at stage " +
+                    std::to_string(stage));
+            }
+
+            segments.push_back(PipelineGraphExecutionSegment{
+                .stage_index = stage,
+                .primary_device = runner->primaryDeviceId(),
+                .execution = execution,
+            });
+        }
+
+        pp_graph_execution_plan_ =
+            std::make_unique<PipelineGraphExecutionPlan>(
+                std::move(segments));
+    }
+
+    bool RankOrchestrator::validatePPGraphTransactionReady(
+        const char *operation) const noexcept
+    {
+        const char *const operation_name =
+            operation && *operation ? operation : "LocalPP transaction";
+        if (!pp_graph_execution_plan_)
+        {
+            LOG_ERROR(operation_name << " has no frozen pipeline graph plan");
+            return false;
+        }
+        if (pp_graph_execution_plan_->segmentCount() !=
+            pp_stage_runners_.size())
+        {
+            LOG_ERROR(
+                operation_name
+                << " runner cardinality changed after graph-plan construction"
+                << " planned="
+                << pp_graph_execution_plan_->segmentCount()
+                << " live=" << pp_stage_runners_.size());
+            return false;
+        }
+
+        for (const auto &segment : pp_graph_execution_plan_->segments())
+        {
+            if (segment.stage_index >= pp_stage_runners_.size() ||
+                !pp_stage_runners_[segment.stage_index])
+            {
+                LOG_ERROR(
+                    operation_name << " lost pipeline stage "
+                                   << segment.stage_index);
+                return false;
+            }
+            const auto &runner = pp_stage_runners_[segment.stage_index];
+            const ServingGraphPreparationKind expected_kind =
+                segment.execution ==
+                        PipelineGraphSegmentExecution::HostDeclarative
+                    ? ServingGraphPreparationKind::EagerHostGraph
+                    : ServingGraphPreparationKind::
+                          NativeDeviceExecutableFamily;
+            if (runner->primaryDeviceId() != segment.primary_device ||
+                runner->servingGraphPreparationKind() != expected_kind)
+            {
+                LOG_ERROR(
+                    operation_name
+                    << " detected pipeline graph identity drift at stage "
+                    << segment.stage_index
+                    << " planned_device="
+                    << segment.primary_device.toString()
+                    << " live_device="
+                    << runner->primaryDeviceId().toString());
+                return false;
+            }
+        }
+
+        if (pp_graph_execution_plan_->nativeSegmentCount() != 0u &&
+            !pp_graph_execution_plan_->materialized())
+        {
+            LOG_ERROR(
+                operation_name
+                << " preceded native pipeline graph-family materialization");
+            return false;
+        }
+        return true;
+    }
+
+    void RankOrchestrator::recordCompletedPPGraphTransactions(
+        const char *phase,
+        std::size_t completed_segments,
+        std::size_t transaction_count) const
+    {
+        if (!pp_graph_execution_plan_ ||
+            !pp_graph_execution_plan_->hasHeterogeneousBoundary())
+        {
+            return;
+        }
+
+        std::string certification_error;
+        if (transaction_count == 0u ||
+            !pp_graph_execution_plan_->certifiesReplay(
+                completed_segments, &certification_error))
+        {
+            LOG_ERROR(
+                "Completed LocalPP transaction violated its frozen graph plan: "
+                << (transaction_count == 0u
+                        ? "transaction count is zero"
+                        : certification_error));
+            std::terminate();
+        }
+
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "segmented_replay_segments",
+            static_cast<double>(completed_segments * transaction_count),
+            phase && *phase ? phase : "inference",
+            "pipeline_coordinator",
+            {{"segments_per_transaction",
+              std::to_string(completed_segments)},
+             {"transactions", std::to_string(transaction_count)},
+             {"heterogeneous_segmented", "true"},
+             {"boundary_authority", "rank_pipeline_graph_plan"}});
     }
 
     void RankOrchestrator::initializePPContext()
@@ -2709,10 +2892,20 @@ namespace llaminar2
                     "RankOrchestrator PP serving graph setup found an invalid composite runner shape");
                 return false;
             }
-
-            for (std::size_t stage = 0;
-                 stage < pp_stage_runners_.size(); ++stage)
+            if (!pp_graph_execution_plan_ ||
+                pp_graph_execution_plan_->segmentCount() !=
+                    pp_stage_runners_.size())
             {
+                LOG_ERROR(
+                    "RankOrchestrator PP serving graph setup has no exact frozen pipeline plan");
+                return false;
+            }
+
+            std::size_t materialized_native_segments = 0u;
+            for (const auto &segment :
+                 pp_graph_execution_plan_->segments())
+            {
+                const std::size_t stage = segment.stage_index;
                 auto &runner = pp_stage_runners_[stage];
                 if (!runner)
                 {
@@ -2723,16 +2916,25 @@ namespace llaminar2
                 }
                 const auto child_kind =
                     runner->servingGraphPreparationKind();
-                if (child_kind ==
-                    ServingGraphPreparationKind::Unresolved)
+                const ServingGraphPreparationKind planned_kind =
+                    segment.execution ==
+                            PipelineGraphSegmentExecution::HostDeclarative
+                        ? ServingGraphPreparationKind::EagerHostGraph
+                        : ServingGraphPreparationKind::
+                              NativeDeviceExecutableFamily;
+                if (child_kind != planned_kind ||
+                    runner->primaryDeviceId() != segment.primary_device)
                 {
                     LOG_ERROR(
-                        "RankOrchestrator PP serving graph setup found an unresolved stage lifecycle at index "
-                        << stage);
+                        "RankOrchestrator PP serving graph setup detected identity drift at stage "
+                        << stage << " planned_device="
+                        << segment.primary_device.toString()
+                        << " live_device="
+                        << runner->primaryDeviceId().toString());
                     return false;
                 }
-                if (child_kind ==
-                    ServingGraphPreparationKind::EagerHostGraph)
+                if (segment.execution ==
+                    PipelineGraphSegmentExecution::HostDeclarative)
                 {
                     continue;
                 }
@@ -2760,6 +2962,50 @@ namespace llaminar2
                         << stage);
                     return false;
                 }
+                ++materialized_native_segments;
+            }
+
+            std::string materialization_error;
+            if (!pp_graph_execution_plan_->markMaterialized(
+                    materialized_native_segments,
+                    &materialization_error))
+            {
+                LOG_ERROR(
+                    "RankOrchestrator PP serving graph setup did not cover its frozen native inventory: "
+                    << materialization_error);
+                return false;
+            }
+
+            if (pp_graph_execution_plan_->hasHeterogeneousBoundary())
+            {
+                const std::string total_segments = std::to_string(
+                    pp_graph_execution_plan_->segmentCount());
+                const std::string native_segments = std::to_string(
+                    pp_graph_execution_plan_->nativeSegmentCount());
+                const std::string host_segments = std::to_string(
+                    pp_graph_execution_plan_->hostSegmentCount());
+                const PerfStatsCollector::Tags tags =
+                    {{"scope", "pipeline_coordinator"},
+                     {"total_segments", total_segments},
+                     {"native_segments", native_segments},
+                     {"host_segments", host_segments},
+                     {"heterogeneous_segmented", "true"},
+                     {"boundary_authority", "rank_pipeline_graph_plan"}};
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "segmented_plan_segments",
+                    static_cast<double>(
+                        pp_graph_execution_plan_->segmentCount()),
+                    "setup",
+                    "pipeline_coordinator",
+                    tags);
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "segmented_graph_capture_segments",
+                    static_cast<double>(materialized_native_segments),
+                    "setup",
+                    "pipeline_coordinator",
+                    tags);
             }
 
             PerfStatsCollector::addCounter(
@@ -3619,6 +3865,11 @@ namespace llaminar2
                 "pipeline stages, and a LocalPP transfer context");
             return false;
         }
+        if (!validatePPGraphTransactionReady(
+                "RankOrchestrator PP prefill schedule"))
+        {
+            return false;
+        }
         if (policy.real_token_start != current_position_ ||
             policy.real_token_count != seq_len)
         {
@@ -3648,7 +3899,9 @@ namespace llaminar2
             logits_gatherer_->invalidate();
 
         std::uint64_t transferred_rows = 0u;
-        const std::size_t num_stages = pp_stage_runners_.size();
+        const std::size_t num_stages =
+            pp_graph_execution_plan_->segmentCount();
+        std::size_t completed_transactions = 0u;
         for (const PrefillChunkPlan &chunk : root_schedule.chunks)
         {
             const int relative_offset =
@@ -3689,8 +3942,11 @@ namespace llaminar2
                 }
             }
 
-            for (std::size_t stage = 0; stage < num_stages; ++stage)
+            std::size_t completed_segments = 0u;
+            for (const auto &segment :
+                 pp_graph_execution_plan_->segments())
             {
+                const std::size_t stage = segment.stage_index;
                 auto &runner = pp_stage_runners_[stage];
                 if (!runner)
                 {
@@ -3777,7 +4033,17 @@ namespace llaminar2
                         << stage << " chunk=" << chunk.chunk_index);
                     return false;
                 }
+                ++completed_segments;
             }
+            if (completed_segments != num_stages)
+            {
+                LOG_ERROR(
+                    "RankOrchestrator PP prefill transaction did not traverse its frozen pipeline plan"
+                    << " completed=" << completed_segments
+                    << " expected=" << num_stages);
+                std::terminate();
+            }
+            ++completed_transactions;
         }
 
         if (!skip_logits_gather_prefill_)
@@ -3795,6 +4061,8 @@ namespace llaminar2
                 config_.max_seq_len);
         }
 
+        recordCompletedPPGraphTransactions(
+            "prefill", num_stages, completed_transactions);
         current_position_ += seq_len;
         PerfStatsCollector::addCounter(
             "forward_graph",
@@ -4430,23 +4698,18 @@ namespace llaminar2
                 host_resident_released_ = true;
                 if (auto wm = model_ctx_->weightManager())
                 {
-                    wm->releaseHostResidentWeightData();
-                    if (!mmap_dontneed_advised_)
+                    /*
+                     * The worker owns residual host-buffer release, mmap host
+                     * unregistration, backing-aware advice, and allocator
+                     * trimming as one ordered operation.  Publishing this edge
+                     * performs none of that maintenance on the inference
+                     * authority thread.
+                     */
+                    const auto submission = wm->scheduleMmapReclaim();
+                    if (debugEnv().vram_trace)
                     {
-                        mmap_dontneed_advised_ = true;
-                        /*
-                         * Every participant enters inference only after its
-                         * DeviceLoadPipeline has drained H2D and repack work.
-                         * Runtime kernels consume device allocations and have
-                         * no ownership edge to the original mmap pages, so the
-                         * rank can release host pages without draining any GPU.
-                         */
-                        if (debugEnv().vram_trace)
-                            LOG_TRACE("[VRAM_TRACE] rank_mmap_release.before_advise phase=after_first_prefill");
-                        const size_t advised_bytes = wm->adviseMmapDontneed();
-                        if (debugEnv().vram_trace)
-                            LOG_TRACE("[VRAM_TRACE] rank_mmap_release.after_advise phase=after_first_prefill bytes="
-                                      << advised_bytes);
+                        LOG_TRACE("[VRAM_TRACE] rank_mmap_reclaim phase=after_first_prefill submission="
+                                  << MmapReclaimLifecycle::toString(submission));
                     }
                 }
             }
@@ -4514,6 +4777,11 @@ namespace llaminar2
             LOG_ERROR("RankOrchestrator::forwardPP: No LocalPPContext available for transfers");
             return false;
         }
+        if (!validatePPGraphTransactionReady(
+                "RankOrchestrator PP forward"))
+        {
+            return false;
+        }
 
         const bool restored_prefix_bridge =
             dispatch == MainForwardDispatch::RestoredPrefixMTPDecodeBridge;
@@ -4539,7 +4807,9 @@ namespace llaminar2
             logits_gatherer_->invalidate();
         }
 
-        const size_t num_stages = pp_stage_runners_.size();
+        const size_t num_stages =
+            pp_graph_execution_plan_->segmentCount();
+        std::size_t completed_segments = 0u;
 
         LOG_DEBUG("RankOrchestrator::forwardPP: seq_len=" << seq_len
                                                           << " num_stages=" << num_stages);
@@ -4594,12 +4864,17 @@ namespace llaminar2
             LOG_ERROR("RankOrchestrator::forwardPP: Stage 0 forward failed");
             return false;
         }
+        ++completed_segments;
 
         // =====================================================================
         // Intermediate stages: Transfer activations and continue execution
         // =====================================================================
-        for (size_t stage_idx = 1; stage_idx < num_stages; ++stage_idx)
+        for (std::size_t plan_index = 1u;
+             plan_index < pp_graph_execution_plan_->segments().size();
+             ++plan_index)
         {
+            const size_t stage_idx =
+                pp_graph_execution_plan_->segments()[plan_index].stage_index;
             auto &prev_runner = pp_stage_runners_[stage_idx - 1];
             auto &curr_runner = pp_stage_runners_[stage_idx];
 
@@ -4657,6 +4932,7 @@ namespace llaminar2
                 LOG_ERROR("RankOrchestrator::forwardPP: Stage " << stage_idx << " forward failed");
                 return false;
             }
+            ++completed_segments;
 
             // Clear hidden state input for clean state on next forward
             curr_runner->clearHiddenStateInput();
@@ -4693,6 +4969,11 @@ namespace llaminar2
         // need to update current_position_ for consistency with TP mode and
         // get_position() queries.
         // =====================================================================
+        recordCompletedPPGraphTransactions(
+            logits_phase == LogitsForwardPhase::Decode
+                ? "decode"
+                : "prefill",
+            completed_segments);
         current_position_ += seq_len;
 
         LOG_DEBUG("RankOrchestrator::forwardPP: Complete, all " << num_stages << " stages executed"
@@ -15292,6 +15573,22 @@ namespace llaminar2
             InferenceStateResetRequest::requestBoundary("clear_cache"));
     }
 
+    bool RankOrchestrator::purgePrefixCache()
+    {
+        /* Every LocalTP/PP child owns a shard of the same logical archive. */
+        for (auto &runner : device_runners_)
+        {
+            if (runner && !runner->purgePrefixCache())
+                return false;
+        }
+        for (auto &runner : pp_stage_runners_)
+        {
+            if (runner && !runner->purgePrefixCache())
+                return false;
+        }
+        return true;
+    }
+
     DeviceMoERebalanceMaintenanceExecutionPolicy
     RankOrchestrator::deviceMoERebalanceMaintenanceExecutionPolicy()
         const noexcept
@@ -16224,24 +16521,42 @@ namespace llaminar2
         return true;
     }
 
-    bool RankOrchestrator::harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count)
+    bool RankOrchestrator::harvestPrefix(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        int prompt_token_count)
     {
+        if (!admission.cache_enabled || !admission.supported)
+            return false;
+
         bool saw_runner = false;
         bool ok = true;
-        auto harvest_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners)
+        auto harvest_runners = [&]
+        (
+            std::vector<std::unique_ptr<IInferenceRunner>> &runners,
+            const std::vector<PrefixLookupResult> &admissions)
         {
+            size_t admission_index = 0;
             for (auto &runner : runners)
             {
                 if (!runner)
                     continue;
+                if (admission_index >= admissions.size())
+                    return false;
                 saw_runner = true;
-                ok = runner->harvestPrefix(tokens, prompt_token_count) && ok;
+                ok = runner->harvestPrefix(
+                         admissions[admission_index++],
+                         tokens,
+                         prompt_token_count) &&
+                     ok;
             }
+            return admission_index == admissions.size();
         };
 
-        harvest_runners(device_runners_);
-        harvest_runners(pp_stage_runners_);
-        return saw_runner && ok;
+        const bool admissions_complete =
+            harvest_runners(device_runners_, last_device_prefix_hits_) &&
+            harvest_runners(pp_stage_runners_, last_pp_prefix_hits_);
+        return saw_runner && admissions_complete && ok;
     }
 
     bool RankOrchestrator::restorePrefixTerminalState(const PrefixLookupResult &hit)
@@ -16901,6 +17216,10 @@ namespace llaminar2
                 &snapshot.terminal_hidden_hash_available,
                 &snapshot.terminal_hidden_bytes,
                 &snapshot.terminal_hidden_hash);
+            snapshot.terminal_hidden_values.insert(
+                snapshot.terminal_hidden_values.end(),
+                child.terminal_hidden_values.begin(),
+                child.terminal_hidden_values.end());
             merge_terminal_hash(
                 child.terminal_logits_hash_available,
                 child.terminal_logits_bytes,
@@ -16908,6 +17227,10 @@ namespace llaminar2
                 &snapshot.terminal_logits_hash_available,
                 &snapshot.terminal_logits_bytes,
                 &snapshot.terminal_logits_hash);
+            snapshot.terminal_logits_values.insert(
+                snapshot.terminal_logits_values.end(),
+                child.terminal_logits_values.begin(),
+                child.terminal_logits_values.end());
             if (snapshot.primary_device.is_cpu() && !child.primary_device.is_cpu())
             {
                 snapshot.primary_device = child.primary_device;

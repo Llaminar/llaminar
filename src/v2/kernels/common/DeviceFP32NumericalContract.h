@@ -1,16 +1,24 @@
 /**
  * @file DeviceFP32NumericalContract.h
- * @brief Cross-backend explicit-rounding primitives for device arithmetic.
+ * @brief Cross-backend explicit-rounding primitives for movable-expert arithmetic.
  *
  * CUDA and HIP expose compatible round-to-nearest intrinsics, but the HIP
- * optimizer may still reassociate a completed result with its consumer. These
- * primitives make each published binary32 dependency edge explicit so higher
- * level numerical contracts can describe one program for both device types.
+ * optimizer may still reassociate a completed result with its consumer. CPU
+ * experts must execute the same program when ExpertOverlay moves a logical
+ * expert between host and device tiers. These primitives therefore make every
+ * published binary32 dependency edge explicit on all three backends.
  */
 
 #pragma once
 
+#include <cmath>
 #include <cstdint>
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define LLAMINAR_FP32_CONTRACT_INLINE __device__ __forceinline__
+#else
+#define LLAMINAR_FP32_CONTRACT_INLINE inline
+#endif
 
 namespace llaminar2::device_fp32_contract
 {
@@ -19,7 +27,7 @@ namespace llaminar2::device_fp32_contract
      * @param bits Exact binary representation.
      * @return Floating-point value carrying exactly @p bits.
      */
-    __device__ __forceinline__ float floatFromBits(
+    LLAMINAR_FP32_CONTRACT_INLINE float floatFromBits(
         std::uint32_t bits) noexcept
     {
         union Word
@@ -36,7 +44,7 @@ namespace llaminar2::device_fp32_contract
      * @param value Floating-point value to inspect.
      * @return Exact binary representation of @p value.
      */
-    __device__ __forceinline__ std::uint32_t bitsFromFloat(
+    LLAMINAR_FP32_CONTRACT_INLINE std::uint32_t bitsFromFloat(
         float value) noexcept
     {
         union Word
@@ -58,10 +66,18 @@ namespace llaminar2::device_fp32_contract
      * @param value Result of one explicit binary32 arithmetic operation.
      * @return The identical binary32 word with its dependency edge retained.
      */
-    __device__ __forceinline__ float persistRounded(float value) noexcept
+    LLAMINAR_FP32_CONTRACT_INLINE float persistRounded(float value) noexcept
     {
 #if defined(__HIP_DEVICE_COMPILE__)
         asm volatile("" : "+v"(value));
+#elif !defined(__CUDA_ARCH__)
+        /*
+         * A volatile binary32 store/load is the portable host equivalent of
+         * the device dependency barrier. It prevents contraction or
+         * reassociation across a contract edge without changing the value.
+         */
+        volatile float rounded = value;
+        return rounded;
 #endif
         return value;
     }
@@ -72,11 +88,15 @@ namespace llaminar2::device_fp32_contract
      * @param rhs Right operand.
      * @return Explicitly rounded binary32 product.
      */
-    __device__ __forceinline__ float multiply(
+    LLAMINAR_FP32_CONTRACT_INLINE float multiply(
         float lhs,
         float rhs) noexcept
     {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
         return persistRounded(__fmul_rn(lhs, rhs));
+#else
+        return persistRounded(lhs * rhs);
+#endif
     }
 
     /**
@@ -85,11 +105,34 @@ namespace llaminar2::device_fp32_contract
      * @param rhs Right operand.
      * @return Explicitly rounded binary32 sum.
      */
-    __device__ __forceinline__ float add(
+    LLAMINAR_FP32_CONTRACT_INLINE float add(
         float lhs,
         float rhs) noexcept
     {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
         return persistRounded(__fadd_rn(lhs, rhs));
+#else
+        return persistRounded(lhs + rhs);
+#endif
+    }
+
+    /**
+     * @brief Fused multiply-add with one retained round-to-nearest boundary.
+     * @param lhs Multiplicand.
+     * @param rhs Multiplier.
+     * @param accumulator Addend.
+     * @return Explicitly rounded `lhs * rhs + accumulator`.
+     */
+    LLAMINAR_FP32_CONTRACT_INLINE float fusedMultiplyAdd(
+        float lhs,
+        float rhs,
+        float accumulator) noexcept
+    {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+        return persistRounded(__fmaf_rn(lhs, rhs, accumulator));
+#else
+        return persistRounded(std::fma(lhs, rhs, accumulator));
+#endif
     }
 
     /**
@@ -102,7 +145,7 @@ namespace llaminar2::device_fp32_contract
      * @param denominator Finite value in the inclusive interval [1, 2].
      * @return Deterministic binary32 reciprocal.
      */
-    __device__ __forceinline__ float reciprocalOneToTwo(
+    LLAMINAR_FP32_CONTRACT_INLINE float reciprocalOneToTwo(
         float denominator) noexcept
     {
         float reciprocal = 0.75f;
@@ -131,7 +174,7 @@ namespace llaminar2::device_fp32_contract
      * @param denominator Positive finite value, zero, or positive infinity.
      * @return Deterministic reciprocal word.
      */
-    __device__ __forceinline__ float reciprocalPositive(
+    LLAMINAR_FP32_CONTRACT_INLINE float reciprocalPositive(
         float denominator) noexcept
     {
         constexpr std::uint32_t kMantissaMask = 0x007fffffu;
@@ -157,7 +200,11 @@ namespace llaminar2::device_fp32_contract
             // Normalize a positive subnormal by moving its highest set bit to
             // the implicit-one position. `__clz` is an exact integer primitive
             // on both device ISAs.
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
             const int shift = __clz(mantissa) - 8;
+#else
+            const int shift = __builtin_clz(mantissa) - 8;
+#endif
             mantissa = (mantissa << shift) & kMantissaMask;
             unbiased_exponent = -126 - shift;
         }
@@ -203,3 +250,5 @@ namespace llaminar2::device_fp32_contract
         return floatFromBits(rounded);
     }
 } // namespace llaminar2::device_fp32_contract
+
+#undef LLAMINAR_FP32_CONTRACT_INLINE

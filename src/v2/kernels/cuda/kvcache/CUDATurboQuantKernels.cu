@@ -24,6 +24,8 @@
 #include <cmath>
 #include <cstring>
 #include <atomic>
+#include <mutex>
+#include <unordered_map>
 #include <stdexcept>
 
 namespace llaminar2
@@ -41,16 +43,40 @@ namespace llaminar2
     // Precomputed RoPE frequency table: freq[i] = 1/theta^(2i/D)
     // Max head_dim = 128, half = 64 pairs
     __constant__ float d_ROPE_FREQS[128];
-    static std::atomic<bool> s_rope_freqs_uploaded{false};
-    static float s_rope_theta_cached = 0.0f;
-    static int s_rope_head_dim_cached = 0;
+    /** Host mirror identity for one CUDA module's uploaded RoPE constants. */
+    struct CUDARopeConstantGeneration
+    {
+        std::uint64_t runtime_generation = 0u;
+        float rope_theta = 0.0f;
+        int head_dim = 0;
+    };
+
+    static std::mutex s_rope_freqs_mutex;
+    static std::unordered_map<int, CUDARopeConstantGeneration>
+        s_rope_freqs_by_device;
 
     void cuda_tq_upload_rope_freqs(float rope_theta, int head_dim, cudaStream_t stream)
     {
-        // Only recompute if theta or head_dim changed
-        if (s_rope_freqs_uploaded.load(std::memory_order_acquire) &&
-            s_rope_theta_cached == rope_theta && s_rope_head_dim_cached == head_dim)
+        int device_id = -1;
+        if (cudaGetDevice(&device_id) != cudaSuccess)
             return;
+        IBackend *const backend = getCUDABackend();
+        const std::uint64_t generation = backend
+                                             ? backend->deviceRuntimeGeneration(
+                                                   device_id)
+                                             : 0u;
+        if (generation == 0u)
+            return;
+
+        std::lock_guard<std::mutex> lock(s_rope_freqs_mutex);
+        const auto existing = s_rope_freqs_by_device.find(device_id);
+        if (existing != s_rope_freqs_by_device.end() &&
+            existing->second.runtime_generation == generation &&
+            existing->second.rope_theta == rope_theta &&
+            existing->second.head_dim == head_dim)
+        {
+            return;
+        }
 
         const int half = head_dim / 2;
         float host_freqs[128] = {};
@@ -62,9 +88,11 @@ namespace llaminar2
         cudaStreamSynchronize(stream);
         if (cudaGetLastError() == cudaSuccess)
         {
-            s_rope_theta_cached = rope_theta;
-            s_rope_head_dim_cached = head_dim;
-            s_rope_freqs_uploaded.store(true, std::memory_order_release);
+            s_rope_freqs_by_device[device_id] = {
+                .runtime_generation = generation,
+                .rope_theta = rope_theta,
+                .head_dim = head_dim,
+            };
         }
     }
 

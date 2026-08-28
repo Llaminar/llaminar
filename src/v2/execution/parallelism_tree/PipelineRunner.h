@@ -176,6 +176,9 @@ namespace llaminar2
          */
         void clear_cache() override;
 
+        /** @copydoc IInferenceRunner::purgePrefixCache */
+        bool purgePrefixCache() override;
+
         /**
          * @brief Get current position in sequence
          */

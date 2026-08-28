@@ -163,6 +163,445 @@ namespace llaminar2
         }
     } // namespace
 
+    const char *to_string(DeviceMemoryReclamationIntent intent) noexcept
+    {
+        switch (intent)
+        {
+        case DeviceMemoryReclamationIntent::RetiredExecutionTopology:
+            return "retired_execution_topology";
+        case DeviceMemoryReclamationIntent::ExclusiveModelRetirement:
+            return "exclusive_model_retirement";
+        }
+        return "unknown";
+    }
+
+    size_t ModelDeviceMemoryRetention::totalBytes() const
+    {
+        if (prepared_weight_bytes >
+            std::numeric_limits<size_t>::max() -
+                reusable_workspace_bytes)
+        {
+            throw std::overflow_error(
+                "Model device-memory retention BOM overflows size_t");
+        }
+        return prepared_weight_bytes + reusable_workspace_bytes;
+    }
+
+    bool ModelDeviceMemoryRetention::valid() const noexcept
+    {
+        if (!device.is_gpu())
+            return false;
+        if (prepared_weight_bytes >
+            std::numeric_limits<size_t>::max() -
+                reusable_workspace_bytes)
+        {
+            return false;
+        }
+        return prepared_weight_bytes + reusable_workspace_bytes > 0u;
+    }
+
+    DeviceMemoryReclamationRequest
+    DeviceMemoryReclamationRequest::retiredExecutionTopology(DeviceId device)
+    {
+        if (!device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "Retired execution-topology reclamation requires an exact GPU device");
+        }
+        return DeviceMemoryReclamationRequest(device);
+    }
+
+    ExclusiveModelRetirementTicket
+    TransferEngine::beginExclusiveModelRetirement(
+        const ModelDeviceMemoryRetention &retention) const
+    {
+        if (!retention.valid())
+        {
+            throw std::invalid_argument(
+                "Exclusive model retirement requires one exact GPU and a positive, representable allocation BOM");
+        }
+
+        IBackend *const backend = resolveBackend(retention.device);
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "Exclusive model retirement has no backend for " +
+                retention.device.toString());
+        }
+        const DeviceAllocationAccounting accounting =
+            backend->deviceAllocationAccounting(
+                retention.device.gpu_ordinal());
+        if (!accounting.supported)
+        {
+            throw std::runtime_error(
+                "Exclusive model retirement cannot observe canonical allocations for " +
+                retention.device.toString() + ": " +
+                (accounting.diagnostic.empty()
+                     ? std::string("backend returned unsupported accounting")
+                     : accounting.diagnostic));
+        }
+        const size_t expected = retention.totalBytes();
+        if (accounting.active_bytes < expected)
+        {
+            std::ostringstream error;
+            error
+                << "Exclusive model-retirement BOM exceeds canonical live "
+                   "allocation ownership for "
+                << retention.device.toString()
+                << ": expected_retired_bytes=" << expected
+                << " canonical_active_allocations="
+                << accounting.active_allocations
+                << " canonical_active_bytes=" << accounting.active_bytes;
+            throw std::runtime_error(error.str());
+        }
+        const size_t baseline = backend->deviceMemoryFree(
+            retention.device.gpu_ordinal());
+
+        LOG_INFO(
+            "[DeviceMemoryReclamation] begin device="
+            << retention.device.toString()
+            << " intent="
+            << to_string(DeviceMemoryReclamationIntent::ExclusiveModelRetirement)
+            << " driver_free_before_owner_release=" << baseline
+            << " prepared_weight_bytes=" << retention.prepared_weight_bytes
+            << " reusable_workspace_bytes="
+            << retention.reusable_workspace_bytes
+            << " expected_retired_bytes=" << expected
+            << " canonical_active_allocations="
+            << accounting.active_allocations
+            << " canonical_active_bytes=" << accounting.active_bytes);
+        return ExclusiveModelRetirementTicket(
+            retention,
+            baseline,
+            accounting.active_allocations,
+            accounting.active_bytes);
+    }
+
+    DeviceMemoryReclamationReceipt
+    TransferEngine::completeExclusiveModelRetirement(
+        ExclusiveModelRetirementTicket &&ticket) const
+    {
+        if (!ticket.valid_)
+        {
+            throw std::logic_error(
+                "Exclusive model-retirement ticket was moved or already consumed");
+        }
+
+        const DeviceId device = ticket.retention_.device;
+        const size_t expected_retired_bytes =
+            ticket.retention_.totalBytes();
+        ticket.valid_ = false;
+
+        IBackend *const backend = resolveBackend(device);
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "Exclusive model retirement has no backend for " +
+                device.toString());
+        }
+
+        /* Collective libraries own native streams, events, communicators, and
+         * internal allocations that are intentionally outside IBackend's
+         * tensor-allocation registry. Retire that process authority first;
+         * resetting HIP/CUDA underneath a pooled coordinator leaves stale
+         * handles whose later destructor enters an invalid primary context. */
+        const CollectiveRuntimeRetirementReceipt collective_retirement =
+            GlobalBackendRouter::retireForExclusiveDeviceRuntimeReset(
+                device);
+        if (!collective_retirement.complete())
+        {
+            std::ostringstream error;
+            error
+                << "Exclusive runtime-generation retirement found live "
+                   "collective ownership for "
+                << device.toString()
+                << " state="
+                << static_cast<int>(collective_retirement.state)
+                << " active_owners="
+                << collective_retirement.active_owners
+                << ": "
+                << (collective_retirement.diagnostic.empty()
+                        ? "collective authority returned an incomplete receipt"
+                        : collective_retirement.diagnostic);
+            throw std::runtime_error(error.str());
+        }
+
+        /*
+         * All graph/model owners named by the ticket are gone. Keep context
+         * acquisition excluded from worker destruction through native runtime
+         * reset: HIP direct-dispatch handlers retain graph-touched slabs beyond
+         * hipFree and stream destruction, and only generation retirement ends
+         * that hidden ownership. CUDA implements the same lifecycle contract
+         * so sequential JIT model loading has backend-symmetric semantics.
+         */
+        auto context_retirement =
+            GPUDeviceContextPool::instance()
+                .beginExclusiveGenerationRetirement(device);
+        const GPUDeviceContextGenerationRetirementReceipt context_receipt =
+            context_retirement.receipt();
+        const DeviceRuntimeGenerationRetirementRequest runtime_request(
+            device.gpu_ordinal());
+        const DeviceRuntimeGenerationRetirementResult runtime_receipt =
+            backend->retireExclusiveDeviceRuntimeGeneration(runtime_request);
+        if (!runtime_receipt.supported || !runtime_receipt.success ||
+            !runtime_receipt.reset_invoked ||
+            runtime_receipt.retired_generation == 0u ||
+            runtime_receipt.active_generation !=
+                runtime_receipt.retired_generation + 1u ||
+            runtime_receipt.tracked_device_allocations != 0u ||
+            runtime_receipt.tracked_device_allocation_bytes != 0u ||
+            runtime_receipt.tracked_host_registrations != 0u)
+        {
+            std::ostringstream error;
+            error
+                << "Exclusive runtime-generation retirement failed for "
+                << device.toString()
+                << " backend=" << backend->backendName()
+                << " reset_invoked="
+                << (runtime_receipt.reset_invoked ? "true" : "false")
+                << " retired_generation="
+                << runtime_receipt.retired_generation
+                << " active_generation="
+                << runtime_receipt.active_generation
+                << " tracked_device_allocations="
+                << runtime_receipt.tracked_device_allocations
+                << " tracked_device_allocation_bytes="
+                << runtime_receipt.tracked_device_allocation_bytes
+                << " tracked_host_registrations="
+                << runtime_receipt.tracked_host_registrations
+                << ": "
+                << (runtime_receipt.diagnostic.empty()
+                        ? "backend returned an incomplete runtime-reset receipt"
+                        : runtime_receipt.diagnostic);
+            throw std::runtime_error(error.str());
+        }
+
+        /* Native generation reset already destroys graph and default-pool
+         * caches. Build the exclusive receipt directly instead of creating a
+         * fresh generation only to trim it again. */
+        DeviceMemoryReclamationReceipt receipt{
+            .device = device,
+            .intent =
+                DeviceMemoryReclamationIntent::ExclusiveModelRetirement,
+            .expected_retired_bytes = expected_retired_bytes,
+            .driver_free_bytes_before_owner_release =
+                ticket.driver_free_bytes_before_owner_release_,
+            .canonical_allocations_before_owner_release =
+                ticket.canonical_allocations_before_owner_release_,
+            .canonical_allocation_bytes_before_owner_release =
+                ticket.canonical_allocation_bytes_before_owner_release_,
+            .canonical_allocations_before_runtime_reset =
+                runtime_receipt.tracked_device_allocations,
+            .canonical_allocation_bytes_before_runtime_reset =
+                runtime_receipt.tracked_device_allocation_bytes,
+            .driver_free_bytes_before =
+                runtime_receipt.driver_free_bytes_before,
+            .driver_free_bytes_after =
+                runtime_receipt.driver_free_bytes_after,
+        };
+        if (receipt.releasedCanonicalBytes() <
+            receipt.expected_retired_bytes)
+        {
+            std::ostringstream error;
+            error
+                << "Exclusive model-retirement canonical allocation proof "
+                   "is incomplete for "
+                << receipt.device.toString()
+                << ": released_canonical_bytes="
+                << receipt.releasedCanonicalBytes()
+                << " expected_retired_bytes="
+                << receipt.expected_retired_bytes
+                << " canonical_allocations_before_owner_release="
+                << receipt.canonical_allocations_before_owner_release
+                << " canonical_allocation_bytes_before_owner_release="
+                << receipt.canonical_allocation_bytes_before_owner_release
+                << " canonical_allocations_before_runtime_reset="
+                << receipt.canonical_allocations_before_runtime_reset
+                << " canonical_allocation_bytes_before_runtime_reset="
+                << receipt.canonical_allocation_bytes_before_runtime_reset;
+            throw std::runtime_error(error.str());
+        }
+        receipt.retired_context_generation =
+            context_receipt.retired_generation;
+        receipt.runtime_reset_invoked = runtime_receipt.reset_invoked;
+        receipt.retired_runtime_generation =
+            runtime_receipt.retired_generation;
+        receipt.active_runtime_generation =
+            runtime_receipt.active_generation;
+        receipt.runtime_driver_free_bytes_before =
+            runtime_receipt.driver_free_bytes_before;
+        receipt.runtime_driver_free_bytes_after =
+            runtime_receipt.driver_free_bytes_after;
+        PerfStatsCollector::addCounter(
+            "device_memory",
+            "retired_context_generations",
+            context_receipt.retiredLiveContext() ? 1.0 : 0.0,
+            "model_lifecycle",
+            device.toString(),
+            {{"generation",
+              std::to_string(context_receipt.retired_generation)}});
+        PerfStatsCollector::addCounter(
+            "device_memory",
+            "retired_runtime_generations",
+            1.0,
+            "model_lifecycle",
+            device.toString(),
+            {{"retired_generation",
+              std::to_string(runtime_receipt.retired_generation)},
+             {"active_generation",
+              std::to_string(runtime_receipt.active_generation)},
+             {"driver_free_before_bytes",
+              std::to_string(runtime_receipt.driver_free_bytes_before)},
+             {"driver_free_after_bytes",
+              std::to_string(runtime_receipt.driver_free_bytes_after)},
+             {"released_canonical_bytes",
+              std::to_string(receipt.releasedCanonicalBytes())},
+             {"expected_retired_bytes",
+              std::to_string(receipt.expected_retired_bytes)}});
+        LOG_INFO(
+            "[DeviceRuntimeGeneration] device="
+            << device.toString()
+            << " backend=" << backend->backendName()
+            << " context_generation="
+            << context_receipt.retired_generation
+            << " runtime_generation="
+            << runtime_receipt.retired_generation << "->"
+            << runtime_receipt.active_generation
+            << " canonical_allocation_bytes="
+            << receipt.canonical_allocation_bytes_before_owner_release
+            << "->"
+            << receipt.canonical_allocation_bytes_before_runtime_reset
+            << " driver_free="
+            << runtime_receipt.driver_free_bytes_before << "->"
+            << runtime_receipt.driver_free_bytes_after);
+        return receipt;
+    }
+
+    DeviceMemoryReclamationReceipt TransferEngine::reclaimDeviceMemory(
+        const DeviceMemoryReclamationRequest &request) const
+    {
+        IBackend *const backend = resolveBackend(request.device());
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "Device-memory reclamation has no backend for " +
+                request.device().toString());
+        }
+
+        const DeviceMemoryCacheReclamationResult raw =
+            backend->trimUnusedDeviceMemoryCaches(
+                request.device().gpu_ordinal());
+        if (!raw.supported || !raw.success)
+        {
+            std::ostringstream error;
+            error << "Device-memory reclamation failed for "
+                  << request.device().toString()
+                  << " intent=" << to_string(request.intent())
+                  << " backend=" << backend->backendName()
+                  << ": "
+                  << (raw.diagnostic.empty()
+                          ? "backend returned an incomplete reclamation result"
+                          : raw.diagnostic);
+            throw std::runtime_error(error.str());
+        }
+        if (!raw.before.graph_accounting_available ||
+            !raw.after.graph_accounting_available ||
+            raw.before.async_pool_accounting_available !=
+                raw.after.async_pool_accounting_available ||
+            !raw.graph_trim_invoked)
+        {
+            throw std::runtime_error(
+                "Device-memory reclamation backend returned an internally inconsistent receipt for " +
+                request.device().toString());
+        }
+
+        DeviceMemoryReclamationReceipt receipt{
+            .device = request.device(),
+            .intent = request.intent(),
+            .driver_free_bytes_before = raw.before.driver_free_bytes,
+            .driver_free_bytes_after = raw.after.driver_free_bytes,
+            .graph_used_bytes_before = raw.before.graph_used_bytes,
+            .graph_used_bytes_after = raw.after.graph_used_bytes,
+            .graph_reserved_bytes_before = raw.before.graph_reserved_bytes,
+            .graph_reserved_bytes_after = raw.after.graph_reserved_bytes,
+            .async_pool_used_bytes_before = raw.before.async_pool_used_bytes,
+            .async_pool_used_bytes_after = raw.after.async_pool_used_bytes,
+            .async_pool_reserved_bytes_before =
+                raw.before.async_pool_reserved_bytes,
+            .async_pool_reserved_bytes_after =
+                raw.after.async_pool_reserved_bytes,
+            .graph_accounting_available =
+                raw.before.graph_accounting_available,
+            .async_pool_accounting_available =
+                raw.before.async_pool_accounting_available,
+            .graph_trim_invoked = raw.graph_trim_invoked,
+            .async_pool_trim_invoked = raw.async_pool_trim_invoked,
+        };
+
+        LOG_INFO(
+            "[DeviceMemoryReclamation] device="
+            << receipt.device.toString()
+            << " intent=" << to_string(receipt.intent)
+            << " driver_free_before=" << receipt.driver_free_bytes_before
+            << " driver_free_before_owner_release="
+            << receipt.driver_free_bytes_before_owner_release
+            << " driver_free_after=" << receipt.driver_free_bytes_after
+            << " reclaimed=" << receipt.reclaimedDriverBytes()
+            << " driver_bytes_visible_since_owner_release="
+            << receipt.driverBytesVisibleSinceOwnerRelease()
+            << " expected_retired_bytes="
+            << receipt.expected_retired_bytes
+            << " graph_used=" << receipt.graph_used_bytes_before
+            << "->" << receipt.graph_used_bytes_after
+            << " graph_reserved=" << receipt.graph_reserved_bytes_before
+            << "->" << receipt.graph_reserved_bytes_after
+            << " async_pool_used=" << receipt.async_pool_used_bytes_before
+            << "->" << receipt.async_pool_used_bytes_after
+            << " async_pool_reserved="
+            << receipt.async_pool_reserved_bytes_before
+            << "->" << receipt.async_pool_reserved_bytes_after
+            << " async_pool_accounted="
+            << (receipt.async_pool_accounting_available ? "true" : "false"));
+        PerfStatsCollector::addCounter(
+            "device_memory",
+            "reclamation_receipts",
+            1.0,
+            "model_lifecycle",
+            receipt.device.toString(),
+            {{"intent", to_string(receipt.intent)},
+             {"driver_free_before_bytes",
+              std::to_string(receipt.driver_free_bytes_before)},
+             {"driver_free_before_owner_release_bytes",
+              std::to_string(
+                  receipt.driver_free_bytes_before_owner_release)},
+             {"driver_free_after_bytes",
+              std::to_string(receipt.driver_free_bytes_after)},
+             {"reclaimed_driver_bytes",
+              std::to_string(receipt.reclaimedDriverBytes())},
+             {"driver_bytes_visible_since_owner_release",
+              std::to_string(
+                  receipt.driverBytesVisibleSinceOwnerRelease())},
+             {"expected_retired_bytes",
+              std::to_string(receipt.expected_retired_bytes)},
+             {"graph_used_before_bytes",
+              std::to_string(receipt.graph_used_bytes_before)},
+             {"graph_used_after_bytes",
+              std::to_string(receipt.graph_used_bytes_after)},
+             {"graph_reserved_before_bytes",
+              std::to_string(receipt.graph_reserved_bytes_before)},
+             {"graph_reserved_after_bytes",
+              std::to_string(receipt.graph_reserved_bytes_after)},
+             {"async_pool_used_before_bytes",
+              std::to_string(receipt.async_pool_used_bytes_before)},
+             {"async_pool_used_after_bytes",
+              std::to_string(receipt.async_pool_used_bytes_after)},
+             {"async_pool_reserved_before_bytes",
+              std::to_string(receipt.async_pool_reserved_bytes_before)},
+             {"async_pool_reserved_after_bytes",
+              std::to_string(receipt.async_pool_reserved_bytes_after)}});
+        return receipt;
+    }
+
     PinnedHostTransferBuffer::PinnedHostTransferBuffer(
         size_t bytes,
         DeviceId registration_device)

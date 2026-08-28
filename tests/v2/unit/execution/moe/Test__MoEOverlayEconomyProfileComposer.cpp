@@ -234,6 +234,28 @@ namespace llaminar2::test
             return *found;
         }
 
+        /** @brief Locate one retained participant/layer service row. */
+        const MoERoutedParticipantLayerPhaseServiceCost &participantServiceRow(
+            const MoERoutedTierServiceProfile &profile,
+            int participant,
+            int layer)
+        {
+            const auto found = std::find_if(
+                profile.participant_costs.begin(),
+                profile.participant_costs.end(),
+                [&](const auto &row)
+                {
+                    return row.participant_id == participant &&
+                           row.layer == layer;
+                });
+            if (found == profile.participant_costs.end())
+            {
+                throw std::logic_error(
+                    "Composed profile omitted a participant service row");
+            }
+            return *found;
+        }
+
         /** @brief Produce one retained projection observation for pure tests. */
         ExpertTierProjectionTransferMeasurement projectionMeasurement(
             std::uint64_t sequence,
@@ -301,6 +323,25 @@ namespace llaminar2::test
                 second.service->costs[index].nanoseconds_per_activation);
         }
         ASSERT_EQ(
+            first.service->participant_costs.size(),
+            second.service->participant_costs.size());
+        for (std::size_t index = 0;
+             index < first.service->participant_costs.size();
+             ++index)
+        {
+            EXPECT_EQ(
+                first.service->participant_costs[index].participant_id,
+                second.service->participant_costs[index].participant_id);
+            EXPECT_EQ(
+                first.service->participant_costs[index].layer,
+                second.service->participant_costs[index].layer);
+            EXPECT_EQ(
+                first.service->participant_costs[index]
+                    .nanoseconds_per_activation,
+                second.service->participant_costs[index]
+                    .nanoseconds_per_activation);
+        }
+        ASSERT_EQ(
             first.migration->costs.size(),
             second.migration->costs.size());
         for (std::size_t index = 0;
@@ -338,6 +379,16 @@ namespace llaminar2::test
                 .nanoseconds_per_activation,
             (std::array<uint64_t, kExpertHistogramProductionSourceCount>{
                 100, 200, 300}));
+        EXPECT_EQ(
+            participantServiceRow(*first.service, 1, 0)
+                .nanoseconds_per_activation,
+            (std::array<uint64_t, kExpertHistogramProductionSourceCount>{
+                10, 20, 30}));
+        EXPECT_EQ(
+            participantServiceRow(*first.service, 2, 0)
+                .nanoseconds_per_activation,
+            (std::array<uint64_t, kExpertHistogramProductionSourceCount>{
+                12, 18, 25}));
     }
 
     TEST(

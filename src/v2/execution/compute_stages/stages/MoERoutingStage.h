@@ -161,22 +161,26 @@ namespace llaminar2
             bool force_decode_equivalent_verifier_prefill = false;
 
             /**
-             * @brief Retain selected verifier routes at an overlay ticket boundary.
+             * @brief Declare this router's grouped-verifier history role.
              *
              * A manual heterogeneous ExpertOverlay graph has no local grouped
              * expert stage on the continuation GPU, so its decode-equivalent
-             * router is the last device stage that sees all selected expert
-             * IDs.  Enabling this policy makes that router fuse selected-ID
-             * retention into top-k publication.  Participant IDs are retained
-             * as `-1`: global demand drives overlay placement, while local
-             * participant demand belongs to the remote execution domains.
+             * router is the last device stage that sees all selected expert IDs.
+             * @ref MoEGroupedVerifierHistogramRole::DeferredAcceptedRows makes
+             * that router fuse selected-ID retention into top-k publication.
+             * Participant IDs are retained as `-1`: global demand drives overlay
+             * placement, while local participant demand belongs to the remote
+             * execution domains. Static placement selects the same lifecycle
+             * boundary with @ref MoEGroupedVerifierHistogramRole::StaticNoPublication,
+             * but allocates and publishes no demand history.
              *
              * This is valid only for a GPU main verifier with a complete
              * per-layer runtime ledger.  Ordinary and LocalTP overlay graphs
-             * leave it false because their expert stage owns final assignment
-             * retention.
+             * use @ref MoEGroupedVerifierHistogramRole::NotOwner because their
+             * expert stage owns the per-layer boundary.
              */
-            bool defer_overlay_grouped_verifier_histogram_publication = false;
+            MoEGroupedVerifierHistogramRole grouped_verifier_histogram_role =
+                MoEGroupedVerifierHistogramRole::NotOwner;
 
             /**
              * @brief Device-owned logical row count for every variable-row GPU graph.
@@ -209,11 +213,12 @@ namespace llaminar2
         int layerIndex() const { return params_.layer_idx; }
 
         /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
-        [[nodiscard]] bool
-        requiresCommittedGroupedVerifierHistogramPublication() const noexcept override
+        [[nodiscard]] MoEGroupedVerifierHistogramRole
+        groupedVerifierHistogramRole() const noexcept override
         {
-            return params_.device_id.is_gpu() &&
-                   params_.defer_overlay_grouped_verifier_histogram_publication;
+            return params_.device_id.is_gpu()
+                       ? params_.grouped_verifier_histogram_role
+                       : MoEGroupedVerifierHistogramRole::NotOwner;
         }
 
         /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
@@ -229,6 +234,20 @@ namespace llaminar2
         {
             return "moe_router_overlay_ticket";
         }
+
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        [[nodiscard]] void *
+        groupedVerifierHistogramPublicationStream() const override
+        {
+            return params_.moe_runtime_table
+                       ? params_.moe_runtime_table
+                             ->groupedVerifierHistogramPublicationStream()
+                       : nullptr;
+        }
+
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        bool prepareGroupedVerifierHistogramProducer(
+            void *producer_stream) override;
 
         /**
          * @brief Commit accepted overlay-verifier selections from this ledger.

@@ -14,6 +14,31 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Authority phase governing whether route rows may enter a window.
+     *
+     * Service measurements initially contribute calibration evidence. Once
+     * those measurements are complete, maintenance closes admission before it
+     * drains and rotates every host/device bank. The resulting quarantine
+     * remains closed until the next public request boundary; this prevents the
+     * tail of the request that completed certification from becoming movement
+     * demand. `OptimizationDemand` is the only post-certificate live phase.
+     */
+    enum class RuntimeExpertHistogramAdmission
+    {
+        CalibrationEvidence,
+        CertificationQuarantine,
+        OptimizationDemand,
+    };
+
+    /** @return Whether inference rows belong in the selected histogram bank. */
+    [[nodiscard]] constexpr bool admitsRuntimeExpertHistogramRows(
+        RuntimeExpertHistogramAdmission admission) noexcept
+    {
+        return admission !=
+               RuntimeExpertHistogramAdmission::CertificationQuarantine;
+    }
+
     /** @brief Lifecycle result from one non-blocking histogram-drain poll. */
     enum class RuntimeExpertHistogramDrainProgress
     {

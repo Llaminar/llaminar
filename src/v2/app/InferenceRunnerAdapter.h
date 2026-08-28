@@ -34,6 +34,7 @@ namespace llaminar2
         const float *logits() const override;
         int vocab_size() const override;
         void clear_cache() override;
+        bool purgePrefixCache() override;
         int get_position() const override;
         DeviceId primaryDeviceId() const override;
         ExecutionPath executionPath() const override;
@@ -63,6 +64,8 @@ namespace llaminar2
         void setAccumulatePrefill(bool accumulate) override;
         void flushStageTimeline() override;
         PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+        uint64_t moeRuntimeMovementEpoch() const override;
+        MoEOptimizationStatus moeOptimizationStatus() const override;
         /**
          * @brief Admit stop tokens through the orchestration ownership layer.
          *

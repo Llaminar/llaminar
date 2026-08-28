@@ -1,7 +1,7 @@
 # ExpertOverlay Tier Migration and Heterogeneous Ticket Design
 
 Created: 2026-08-11  
-Last implementation audit: 2026-08-22
+Last implementation audit: 2026-08-25
 
 ## Document status
 
@@ -28,15 +28,81 @@ that the corresponding row is already certified.
 | Live service and movement-economy certification | `MoEOverlayEconomyCalibrationController`, `MoEOverlayMigrationMeasurementLedger`, `MoEOverlayEconomyProfileComposer`, `MoEOverlayEconomyCertificationController`, the local GPU service-evidence publisher, and the private MPI evidence lane measure real non-publishable waves plus exact live prepared-expert service, merge owner-authenticated evidence, and seal the authority before proposals | Installed for local and distributed dynamic overlays; device-free lifecycle and real two-rank physical-fabric calibration are proven. The graph-native CUDA/CPU real-weight cell now certifies both CPU and CUDA service coordinates and has published repeated host/device epochs; completion of its two-axis movement proof and the aggregate matrix remains the current gate |
 | Live histogram-to-tier proposal, physical transfer, inactive-bank publication, and retirement | `MoEOverlayResidencyMaintenanceService` drives coordinator-frozen histogram generations through the local or distributed migration transport and `MoEOverlayPhysicalResidencyFabric` | Installed for local and distributed dynamic overlays; real-weight three-tier production parity proves repeated publication and retirement, while the wider topology/performance matrix remains |
 | Cross-rank prepare/commit/abort/retire consensus and remote projection data plane | `MoEOverlayDistributedResidencyProtocol.*`, `MoEOverlayMPIResidencyConsensus.*`, `MoEOverlayMPIRemoteProjectionTransport.*`, `MoEOverlayGpuRemoteProjectionEndpoint.*`, `MoEOverlayPhysicalResidencyFabric.*`, and the two-rank heterogeneous residency integrations | Implemented and composed in the production runner; CPU, GPU/CPU conversion, same-packed GPU, and cross-vendor GPU blob paths are proven below model level |
-| Exact model- and topology-aware capacity admission | `MoEOverlayCapacityResolver.*`, `MoEOverlayCapacityAdmission.*`, `MoEOverlayLocalCapacityPlanner.*`, and `OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()` build the GGUF manifest, charge fixed/live/shadow/staging/reserve bytes per rank/device, search resident captured-prefill shapes, and install layer quotas before placement | Installed in production and device-free proven across all 21 NativeVNNI formats; real-weight CUDA/ROCm/CPU admission is proven, while the remaining target topology matrix must still be certified |
+| Exact model- and topology-aware capacity admission | `MoEOverlayCapacityResolver.*`, `MoEOverlayCapacityAdmission.*`, `MoEOverlayLocalCapacityPlanner.*`, and `OrchestrationRunner::freezeMoEExpertOverlayPlanForLoadedModel()` build the GGUF manifest, charge every named fixed/live/shadow/staging allocation per rank/device, search resident captured-prefill shapes, and install layer quotas before placement | Installed in production and device-free proven across all 21 NativeVNNI formats; real-weight CUDA/ROCm/CPU admission is proven, while the remaining target topology matrix must still be certified |
 | Universal multi-device MoE placement authority | Every multi-device MoE topology, including one domain with one tier, is normalized to an ExpertOverlay plan and uses one RCU authority for durable placement, same-tier skew correction, replicas, and request-scoped LLEP leases | The tiered-overlay host authority now composes cross-tier optimization and capacity-preserving same-tier participant swaps in one candidate epoch, including makespan-based economy and explicit `same_priority_moves` evidence. Legacy non-overlay LocalTP/NodeLocalTP cells still own an independent controller and must be normalized to this authority. |
 | Multi-tier current-batch LLEP | One authority-pinned request transaction minimizes ordinary-prefill makespan over already-resident endpoints and separately budgeted transient arrivals without mutating durable placement | **Target architecture; not installed.** Current CPU/GPU LLEP planning assumes one routed domain owns every expert in the layer. It proves one-tier transient movement, but cannot yet plan a topology-wide batch across multiple tier domains. |
 | All-GPU authority execution locus | ExpertOverlay remains the sole logical authority, while one topology-selected leader GPU and device-resident follower controllers own policy, epoch selection, and generation-loop decisions without a host mirror, regardless of tier count or GPU vendor mix | Installed for homogeneous CUDA/ROCm and the mixed-vendor CUDA2/ROCm4 two-tier topology. The 122B Dynamic proof records `policy_owner=device`, device-authored promotion/demotion/same-priority edges, and request-selected device banks. Remaining topology/depth cells are campaign work, not an alternate host authority |
 | CPU-participating authority execution locus | A topology with any live CPU expert participant uses the one host-resident ExpertOverlay authority because CPU execution state is host-owned; GPU controllers are physical followers/executors, never competing policy authorities | Installed for two-/three-tier CPU-participating overlays and real-weight correctness proven. The legacy non-overlay controllers still require retirement. |
-| Real-weight two- and three-tier model parity | The Qwen 3.5 production graph-native overlay cells cover CUDA/CPU, ROCm/CPU, CUDA/ROCm, CUDA/ROCm/CPU, and CUDA2/ROCm4 layouts, segmented heterogeneous prefill, exact checkpoints/CSV artifacts, and a static zero-movement control | The split route-assignment authority, placement-invariant numerical contract, hosted MTP cursor, and indivisible epoch-lease publication lifecycle are fixed. Focused 122B CUDA2/ROCm4 Dynamic/Ordinal depth 2 then depth 3 in one reused model context, plus standalone depth 15, pass strict checkpoint, recursive MTP, movement, sparse-endpoint, and production-path evidence. The complete canonical Static/Dynamic, ordinal/random, depth 1/2/3/dynamic/15 rerun remains the aggregate gate. |
+| Real-weight two- and three-tier model parity | The Qwen 3.5 production graph-native overlay cells cover CUDA/CPU, ROCm/CPU, CUDA/ROCm, CUDA/ROCm/CPU, and CUDA2/ROCm4 layouts, segmented heterogeneous prefill, exact checkpoints/CSV artifacts, and a static zero-movement control | The split route-assignment authority, placement-invariant numerical contract, hosted MTP cursor, and indivisible epoch-lease publication lifecycle are fixed. The 122B CUDA2/ROCm4 Static/Ordinal process campaign now passes MTP off, fixed depths 1/2/3/15, and dynamic depth in 184.558 seconds through one retained model context, including mandatory prefix restore and strict CSV evidence. The remaining Dynamic and random-order cells are the aggregate gate. |
 | Repack/stream throughput, occupancy, register/VGPR, and spill certification | `V2_Perf_CUDA_ExpertTierWeightStreaming`, `V2_Perf_ROCm_ExpertTierWeightStreaming`, Nsight Compute, `rocprofv3`, and static gfx906 code-object inspection | Implemented and certified for all formats and real projection shapes |
 | End-to-end migration interference and staging backpressure during real inference | Deterministic device integrations prove asynchronous overlap, including concurrent FusedQKV stream pools. The real-weight two-rank CPU NodeTP campaign now collects exact paired baseline/concurrent inference intervals while a non-publishable reciprocal expert wave runs. | CPU NodeTP overlap is measured and gated; equivalent real-model CUDA/ROCm/heterogeneous contention and observed-speed certification remain |
 | Economy-selected background/quiescent movement | The sole authority compares no movement, opportunistic movement under measured residual bandwidth, and a drained full-bandwidth transaction, including delayed-publication loss and resume cost | **Target architecture; not installed.** Current controllers admit background waves only and the current economy ABI has no resource-utilization forecast, quiescent admission state, or crossover proof |
+
+### Distributed proposal-authority correction (2026-08-25)
+
+The production campaign exposed a split policy authority in the distributed
+host-controlled path.  The continuation rank froze one histogram, but the
+histogram publisher sent only that evidence.  Every rank then independently
+ran smoothing, tier placement, participant-skew planning, wave bounding, and
+economy selection.  Rank-local service measurements are physical facts about
+that rank, so this reconstruction was neither required nor guaranteed to be
+identical.  Consensus correctly rejected the resulting transaction identities.
+
+```mermaid
+flowchart LR
+    H[Continuation root freezes histogram H] --> B[Broadcast H]
+    B --> P0[Rank 0 reruns policy and economy]
+    B --> P1[Rank 1 reruns policy and economy]
+    B --> PN[Rank N reruns policy and economy]
+    P0 --> T0[Transaction T0]
+    P1 --> T1[Transaction T1]
+    PN --> TN[Transaction TN]
+    T0 --> C{Consensus identity}
+    T1 --> C
+    TN --> C
+    C -->|rank-local measurements differ| F[Fail before staging]
+```
+
+The corrected lifecycle has one policy authority and two separately typed
+identities.  The root publishes an immutable canonical execution proposal:
+the frozen histogram, expected epoch, complete candidate tier/participant
+tables, movement-axis annotations, estimated expert bytes, and the root's
+policy audit fingerprint.  A follower does not run placement or economy.  It
+validates its current epoch and topology, reconstructs the exact candidate
+against its local immutable snapshot, and authenticates the resulting
+execution-plan fingerprint.  Consensus covers executable state; the policy
+audit fingerprint records the root-only economic decision without pretending
+that followers own that policy evidence.
+
+```mermaid
+flowchart LR
+    H[Continuation root freezes histogram H] --> D[Root alone runs policy and economy]
+    D --> T[Canonical transaction T]
+    T --> E[Encode canonical execution proposal P]
+    E --> B[Publish P on private async lane]
+    B --> V0[Root retains T]
+    B --> V1[Peer validates epoch and topology]
+    B --> VN[Peer validates epoch and topology]
+    V1 --> R1[Reconstruct local physical projection of P]
+    VN --> RN[Reconstruct local physical projection of P]
+    V0 --> C{Execution-plan fingerprint consensus}
+    R1 --> C
+    RN --> C
+    C --> S[Reserve and stage local edges in parallel]
+    S --> Q[Prepare inactive banks]
+    Q --> U[Publish one global epoch]
+    U --> G[Close old admission and drain leases]
+    G --> X[Retire old banks and terminally drain lane]
+```
+
+The proposal lane is a model-lifetime, non-blocking control plane.  Publication
+completion is the irrevocability edge: after it, shutdown must finish or
+globally abort that exact proposal before any private communicator is freed.
+A passive preposted receive is not a promised collective and may be cancelled
+during teardown.  A live consensus vote is never destroyed; failure and stop
+first drive it to a typed terminal state.  There is no peer-side replanning,
+fingerprint field omission, timeout extension, or host mirror of device-owned
+all-GPU authority state.
 
 The historical non-overlay Dynamic machinery and its
 `DeviceMoERebalanceController` still own a separate durable table in legacy
@@ -765,118 +831,265 @@ promotion/demotion and same-priority edges, every prefill checkpoint passes,
 incremental decode passes 4/4, and MTP1 passes. The CSV keeps `participant` as
 the global ID and adds `domain_participant` and `selected_placement_bank`.
 
-### Numerical lifecycle re-audit after depth-15 localization (2026-08-20)
+### Deferred device-plan RCU re-audit (2026-08-23)
 
-The complete 122B CUDA2/ROCm4 campaign narrowed the remaining failure to one
-Dynamic/Ordinal/depth-15 recurrent sidecar LM head. Nineteen other cells pass,
-including Static depth 15, while a fresh Dynamic depth-15 execution can pass or
-fail according to the legal placement reached by earlier histogram epochs. The
-first recurrent embedding is exact and every ticket, graph ordinal, movement
-epoch, route identity, and ordinary main-model checkpoint is valid. Drift is
-already visible in the terminal hidden input to the sidecar and is amplified by
-fourteen applications of the learned recurrent predictor.
+The Qwen 3.6 Dynamic/Random/depth-15 campaign exposed one remaining violation
+of the two-bank contract in the homogeneous device controller. A deferred
+planning kernel used the inactive durable bank as temporary policy scratch.
+That bank was not a candidate yet: physical arrivals had not completed, and it
+could still be the retiring bank selected by a live request. A second defect in
+the same path copied only the domain-local destination ID into the eventual
+bank, leaving the overlay-wide sparse-route owner stale after movement.
 
-Re-plotting the numerical path exposes two placement-dependent arithmetic
-choices beneath the otherwise-correct typed route lifecycle:
-
-```mermaid
-flowchart TB
-    A[Router publishes canonical slots 0 through top_k minus 1] --> B[Epoch-pinned placement resolves each slot]
-    B --> C{Owning backend and participant}
-
-    C -->|CUDA| D[NativeVNNI projection with fixed 16-way split-K]
-    C -->|ROCm| E[NativeVNNI projection with generated serial-M1 split-K]
-    C -->|CPU| F[CPU projection with CPU reduction contract]
-
-    D --> G[Participant-local weighted route rows]
-    E --> G
-    F --> G
-    G --> H[Participant or domain locally aggregates its assigned rows]
-    H --> I[Continuation merges participant aggregates in participant order]
-    I --> J[MOE_EXPERT_OUTPUT]
-    J --> K[Main terminal hidden]
-    K --> L[Recurrent MTP sidecar applied up to depth 15]
-
-    B -. movement changes backend .-> C
-    B -. movement changes participant grouping .-> H
-```
-
-For the Q8_K expert geometry in this model, CUDA currently uses sixteen K
-partitions for both gate/up and down. ROCm's generated codebook-19 serial-M1
-policy uses eleven partitions for gate/up `(N=1024, K=3072)` and seven for down
-`(N=3072, K=1024)`. The return ABI then carries one already-summed FP32 row per
-participant rather than the original router-slot rows. Completion order is
-deterministic, but neither the projection parenthesization nor the final route
-parenthesization is invariant under a legal promotion, demotion, or same-tier
-move. Placement is therefore an accidental numerical-policy authority.
-
-This is a data contract, not a fourth lifecycle. Adding ticket flags, epochs,
-events, retries, or a special MTP path would preserve the wrong abstraction.
-The target is one immutable `MoENumericalContract` resolved when the production
-graph family is built and included in capture identity:
+The fix does not add a lifecycle phase. It makes the existing phases own
+different typed storage:
 
 ```mermaid
 flowchart TB
-    A[Model source format plus projection geometry] --> B[Resolve MoENumericalContract C]
-    T[Topology may contain CPU CUDA ROCm] --> B
-    B --> C1[Typed projection reduction tree per gate up down]
-    B --> C2[Canonical router-slot contribution ABI]
-    B --> C3[Fixed slot-order reduction tree]
-
-    E[ExecutionSequenceLease pins residency epoch E] --> R[Router slots]
-    R --> P[Placement chooses only physical executor]
-    C1 --> X[Every executor evaluates the same projection contract]
-    P --> X
-    X --> Y[Publish sparse records slot_id plus FP32 contribution row]
-    C2 --> Y
-    Y --> Z[Scatter records into stable top_k slot bank]
-    C3 --> Q[Reduce every slot in one fixed tree]
-    Z --> Q
-    Q --> O[MOE_EXPERT_OUTPUT independent of placement grouping]
+    A[Request ticket pins active durable bank E] --> R[Readers use E only]
+    A --> P[Policy reads E plus frozen histograms]
+    P --> S[Write graph-owned placement-plan scratch]
+    P --> C[Emit immutable movement commands]
+    C --> T[Prepare all conflict-free arrivals concurrently]
+    T --> V[Validate destination slot leases and generations]
+    S --> B[Build inactive durable bank E plus 1]
+    V --> B
+    B --> B1[Changed rows copy scratch local and global destinations]
+    B --> B2[Unchanged rows clone active bank E]
+    B1 --> Q[Candidate Ready]
+    B2 --> Q
+    Q --> U[Atomically publish selector E plus 1]
+    U --> N[New tickets acquire E plus 1]
+    R --> G[Old readers release E]
+    G --> X[Retire E after its grace period]
 ```
 
-The contract has one authority and three typed components:
+The storage states are deliberately non-interchangeable:
 
-1. `MoEProjectionReductionTree` names the exact K partition boundaries and
-   ordered FP32 fold for each projection. A backend may use different launch
-   geometry, wave size, or vectorization only when it proves the same arithmetic
-   result. A heterogeneous graph must reject a participant that cannot execute
-   the selected tree; it must not silently select that backend's local serial
-   policy.
-2. `MoECanonicalRouteContribution` carries the original router slot ID, token
-   row ID, route weight, and one weighted FP32 result row. Local and remote
-   producers use the same record. The mapped return ABI may compact absent
-   slots, but it may not erase slot identity by pre-aggregating unrelated
-   routes.
-3. `MoERouteReductionTree` consumes the stable slot bank in one declared order.
-   Participant and domain completion order affects readiness only, never
-   arithmetic parenthesization.
+```mermaid
+stateDiagram-v2
+    [*] --> ScratchFree
+    ScratchFree --> ScratchPlanned: policy derives candidate
+    ScratchPlanned --> ScratchFree: zero movement or abort
+    ScratchPlanned --> CandidateBuilding: authenticated arrivals ready
+    CandidateBuilding --> CandidateReady: changed and unchanged rows complete
+    CandidateBuilding --> Failed: lease generation or route identity mismatch
+    CandidateReady --> Published: selector flips once
+    Published --> RetiringOld: new readers use candidate
+    RetiringOld --> ScratchFree: old readers drain and old bank is reusable
+    Failed --> [*]
+```
 
-This simplifies the implementation surface despite returning more precise
-data: one canonical contribution record replaces separate local-slot,
-participant-aggregate, and heterogeneous-return numerical meanings. The
-existing placement bank, domain ledger, graph group, sequence lease, and
-authenticated terminal remain unchanged. Static, Dynamic, and eventually LLEP
-become pure placement policies again.
+`DeviceMoEPlacementBank` scratch is graph-owned persistent memory and is part of
+capture identity; it is neither a third durable bank nor a host mirror. The
+immutable `DeviceMoERebalancePlanEntry` carries both
+`destination_participant` (domain-local execution ID) and
+`destination_overlay_participant` (overlay-wide sparse endpoint). Apply is the
+only writer that converts those planned values into durable placement. CUDA and
+ROCm use the same ABI and byte-size assertions, and focused real-device tests
+hold the active bank constant through planning before proving the changed row,
+global route, and untouched-row clone after apply.
 
-The cutover must be proof-driven:
+### MTP controller and maintenance-boundary composition (2026-08-23)
 
-- a process-isolated CUDA/ROCm integration witness executes identical prepared
-  gate/up/down bytes and input rows, records per-projection and per-slot CSV
-  evidence, and first demonstrates the current divergence;
-- candidate trees are compared for Hugging Face accuracy and profiled on both
-  vendors before one contract is installed; selecting an arbitrary common
-  partition count is not sufficient;
-- focused tests permute the same top-k routes over participants and domains and
-  require invariant canonical output, including split local/remote ownership;
-- existing all-format M=1..15/16/65/257/2560 grouped, transfer, and migration
-  suites certify every source codebook and floating format under the contract;
-- the exact 122B 20-cell matrix, including Dynamic/Ordinal/depth 15, must then
-  pass without loosening cosine, KL, routing, or top-k thresholds;
-- performance evidence must show the per-slot sparse return remains economical
-  for decode, grouped verification, and prefill. If payload dominates prefill,
-  optimization may change transport encoding, never the declared arithmetic
-  tree or slot identity.
+Adaptive MTP depth and ExpertOverlay maintenance are independent device-owned
+policies, but they share one irreducible transaction boundary. A maintenance
+deadline may limit the token budget of the next generation transaction so a
+new placement epoch can be published. The MTP depth controller correctly
+rejects that clipped transaction as an economics sample: learning from work the
+scheduler prevented it from attempting would bias the selected depth. With an
+initial and recurring maintenance cadence of one token, however, every MTP
+transaction is clipped and the adaptive controller can never observe a window.
+
+The typed composition rule is:
+
+```mermaid
+flowchart LR
+    A[Request admitted] --> B{Maintenance due?}
+    B -->|yes| C[One bounded serial-visible transaction]
+    C --> D[Publish or complete movement epoch]
+    B -->|no| E[Admit full-budget MTP transaction]
+    D --> E
+    E --> F[Predictor rows plus one grouped verifier]
+    F --> G{Budget limited?}
+    G -->|yes| H[Do not train adaptive depth]
+    G -->|no| I[Publish one adaptive-depth window]
+    I --> J[Next maintenance boundary remains eligible]
+    H --> J
+```
+
+The canonical proof therefore keeps two concerns explicit. Its original
+stop-isolated transaction proves every recursive checkpoint and emitted token
+against the serial oracle. A fresh prefix-restored request then retires the
+initially due movement with one ordinary token and runs one complete verifier
+under a recurring cadence at least as wide as the declared verifier
+transaction. The second transaction must be serial-token exact and must
+increase the controller-window, attempted-draft, and verifier counters. Those
+facts are emitted in `mtp_transactions.csv`; a physical depth-15 run without an
+adaptive policy window is not accepted as dynamic-depth coverage. This is a
+test-profile economy choice, not a magic production cadence: serving policy may
+choose a wider interval, but it may not configure a cadence that makes its
+selected MTP policy structurally unable to execute.
+
+### Terminal-hidden mailbox lifecycle re-audit (2026-08-24)
+
+The 122B CUDA2/ROCm4 Static/Ordinal/depth-1 prefix-restored cell localized a
+failure outside ExpertOverlay placement. A resident shifted-KV correction
+sidecar consumed the stable `PREFIX_TERMINAL_HIDDEN` arena mailbox and then
+tried to reconstruct that same row from `last_forward_seq_len` and
+`last_forward_batch_size`. A full prefix hit or retained device-generation
+continuation legitimately has no fresh host-visible verifier geometry, so the
+reconstruction failed even though the correct row was already resident.
+
+The former effective lifecycle contained an unnecessary destructive edge:
+
+```mermaid
+flowchart LR
+    A[Main forward, prefix restore, verifier, or checkpoint] --> B[Publish terminal-hidden mailbox]
+    B --> C[Acquire logical-state reader]
+    C --> D[Sidecar reads terminal hidden and appends shifted KV]
+    D --> E[Infer producer rows from last-forward host geometry]
+    E --> F[Reselect terminal hidden into the same mailbox]
+    F --> G[Release logical-state reader]
+    E -->|no current geometry| X[Fatal despite valid resident publication]
+```
+
+There is no reason for `E` or `F`. The production MTP graph is declarative and
+every dense, MoE, and ExpertOverlay sidecar stage declares
+`PREFIX_TERMINAL_HIDDEN` as read-only. The simplified lifecycle therefore owns
+one typed publication and one immutable read lease:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unavailable
+    Unavailable --> Current: typed producer publishes source plus generation
+
+    state "Current publication: MainForward, PrefixRestore, AcceptedVerifier, or CheckpointRestore" as Current {
+        [*] --> PublishedGeneration
+        PublishedGeneration --> SidecarReadLease: acquire source plus generation
+        SidecarReadLease --> PublishedGeneration: read-only graph and same generation
+    }
+
+    Current --> Unavailable: reset or live-state mutation
+    Current --> Current: another typed producer publishes next generation
+```
+
+`MTPTerminalHiddenPublication` makes source and generation explicit. A sidecar
+acquires a `ReadLease`, queues the existing producer-event wait and graph work,
+then verifies that the publication generation did not change before releasing
+the logical-state reader. Graph construction fails if any sidecar stage writes
+the mailbox. No selector, host geometry, copy, recapture, or synchronization is
+introduced after the read. Focused orchestrator, graph-construction, and source
+policy tests prove the typed transitions and the read-only contract; the exact
+real-weight mixed-vendor cell remains the production re-certification gate.
+
+### Depth-15 oracle and optimization-status lifecycle re-audit (2026-08-24)
+
+The historical `0.981` depth-15 observation did not identify a backend
+arithmetic defect. The serial oracle request and grouped-MTP request were
+independent production requests while Dynamic maintenance remained live. A
+legal publication could therefore place them on different residency epochs.
+The old diagnostic compared those different experiments as if they shared one
+execution epoch, then attributed the resulting branch drift to numerical
+lowering. That edge was invalid.
+
+The invalid comparison was:
+
+```mermaid
+flowchart LR
+    A[Serial request acquires epoch E] --> B[Capture serial token and row]
+    B --> C[Background maintenance publishes E plus 1]
+    C --> D[Grouped MTP request acquires E plus 1]
+    D --> X[Unconditional serial versus grouped comparison]
+    X --> F[False numerical failure]
+```
+
+No additional MTP, graph, or placement state is needed. Each existing
+`ExecutionSequenceLease` already publishes the exact placement epoch it
+consumed. The corrected proof records that authority beside every serial and
+grouped row and only claims serial equivalence when the epochs match:
+
+```mermaid
+flowchart TB
+    S[One-token serial production request] --> SE[Authenticated execution epoch Es]
+    S --> SR[Serial token and main-model snapshots]
+    G[Grouped production MTP request] --> GE[Authenticated execution epoch Eg]
+    G --> GR[Grouped tokens and verifier snapshots]
+
+    SE --> Q{Es equals Eg}
+    GE --> Q
+    Q -->|yes| X[Require exact serial token trajectory and row-zero comparison]
+    Q -->|no| N[Record epoch mismatch; make no serial-equivalence claim]
+
+    GR --> H[Always compare eligible main and recursive checkpoints with Hugging Face]
+    SR --> X
+    X --> C[Write token and checkpoint CSV evidence]
+    N --> C
+    H --> C
+```
+
+This removes one false edge instead of adding a lifecycle. The strict aggregate
+gate is now `0.99`, and the exact Qwen 3.5 122B ROCm+CPU
+Dynamic/Ordinal/fixed-depth-15 production cell passes it with real movement,
+prefix restore, grouped verification, and the canonical CSV artifacts. A
+future placement-invariant arithmetic project still needs concrete divergent
+same-input/same-weight evidence; this incident is not that evidence.
+
+The same audit found that parity setup used PerfStats counters to decide when
+economy certification and movement had completed. PerfStats is a diagnostic
+sink and can be disabled or filtered, so it cannot be a lifecycle authority.
+`MoEOptimizationStatus` is now a passive typed projection of the sole real
+owner:
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotApplicable: no ExpertOverlay authority
+    [*] --> MovementDisabled: Static authority
+    [*] --> LearningEconomy: Dynamic authority not yet certified
+    LearningEconomy --> Active: immutable economy profile installed
+    LearningEconomy --> Failed: certification or publication fails
+    Active --> Active: durable movement wave publishes
+    Active --> Failed: owning maintenance/controller fails
+
+    state Active {
+        [*] --> OwnerState
+        OwnerState --> OwnerState: publish monotonic wave and movement totals
+    }
+```
+
+Host status reads the RCU residency authority and physical transport. Device
+status reads the device-controller fabric and its physical follower's coherent
+completion totals. `IOrchestrationRunner`, `IInferenceRunner`, and the public
+adapter preserve that status without polling or advancing maintenance. The
+benchmark delimits each request with two typed owner snapshots; it no longer
+reconstructs transactions, commands, bytes, promotions, demotions, or
+same-priority moves from telemetry. Static reports zero completed movement by
+construction.
+
+```mermaid
+flowchart LR
+    H[Host residency authority] --> O[MoEOptimizationStatus]
+    D[Device controller authority] --> O
+    O --> P[Parity lifecycle driver]
+    O --> B[Benchmark interval attribution]
+
+    H -. post-run evidence only .-> T[PerfStats and CSV export]
+    D -. post-run evidence only .-> T
+    P -. assertions only .-> T
+    B -. result serialization only .-> T
+```
+
+There is deliberately no arrow from PerfStats back to certification, movement,
+publication, request admission, or benchmark accounting. A source-policy gate
+allows production ledger reads only in result serialization and the collector
+itself. Tests may still assert PerfStats because it proves that the optimized
+path ran; those assertions observe completed work and never cause it.
+
+Floating expert movement is covered symmetrically under this lifecycle. The
+CPU physical fabric runs repeated RCU publication and shadow-slot reuse for
+FP16, BF16, and FP32, while the real CUDA/ROCm integration runs every format in
+both directions through retained relay and remote endpoint paths with byte-exact
+publication and no blocking inference waits.
 
 The completed ExpertOverlay system keeps the most frequently selected routed experts in the tiers
 with the greatest compute capacity and demotes colder experts when residency is
@@ -1133,12 +1346,14 @@ never schema values or recognized labels.
 
 ### The intended answer
 
-Yes: after setup has resolved safe physical capacities, live experts are
+Yes: after setup has resolved exact physical capacities, live experts are
 apportioned by filling the lowest-numeric-priority tier first, then the next
 priority, and finally the coverage tier. The word "fill" refers to the tier's
 resolved **live expert quota**, not every byte of RAM or VRAM. Migration shadow
-slots, old-epoch leases, transfer staging, graph workspaces, KV cache, and a
-safety reserve consume physical memory but are never routable live capacity.
+slots, old-epoch leases, transfer staging, graph workspaces, and KV cache
+consume physical memory but are never routable live capacity. There is no
+unnamed safety reserve: every excluded byte must have a typed owner and appear
+as a concrete term in the bill of materials.
 
 For each routed layer `l`, let `Q[t,l]` be tier `t`'s fixed live logical-expert
 quota and `E[l]` the model expert count. Setup must establish:
@@ -1185,7 +1400,7 @@ fixed[p]
 The terms have exact meanings:
 
 - `usable_budget[p]` is the smaller of the inventory-reported allocatable
-  memory and any explicit user limit, less a configured safety reserve;
+  memory and any explicit user limit;
 - `fixed[p]` includes continuation/non-expert weights, captured graph arenas,
   activations, KV and prefix-cache reservations, libraries, descriptors, and
   other model-lifetime allocations owned by that participant;
@@ -1204,15 +1419,16 @@ The terms have exact meanings:
 The capacity resolver chooses the integer vectors `Q[t,l]` once, before weight
 preparation and graph materialization. In automatic mode it lexicographically
 maximizes live capacity in strict integer-priority order subject to every
-physical inequality. Thus it uses all safely available capacity at each
+physical inequality. Thus it uses all exactly unallocated capacity at each
 successive priority and assigns the remainder to the coverage tier. An explicit expert cap is an additional
 upper bound, not a substitute for byte admission. An explicitly fixed quota is
 either admitted exactly or rejected; setup must not silently shrink it.
 
 The resolved quota may vary by layer when projection geometry or codebook
 changes. Runtime migration preserves each `(tier, layer)` quota and each
-participant's derived share exactly. Migration headroom is planned separately
-so increasing shadow concurrency cannot silently evict live experts. A tier
+participant's derived share exactly. Migration shadow and transfer capacity
+are planned as named allocations, so increasing concurrency cannot silently
+evict live experts. A tier
 with zero resolved live slots is inactive for residency; tests expecting
 movement through that tier must require a positive quota instead of relying on
 its name being present.
@@ -1554,22 +1770,22 @@ topology matrix is now certified; the remaining gaps are listed explicitly:
 |---|---|---|
 | Priority fill | `OrchestrationRunner` gathers physical rank/device budgets, `MoEOverlayCapacityResolver` resolves layer-varying live quotas in ascending signed `priority`, installs them into the frozen plan, and `MoERoutedExpertPlacementPlanner` consumes those exact quotas. Shared validation rejects duplicate priorities and a coverage tier that is not numerically last. | Installed, name/declaration independent, and real-model topology proven. Complete placement-explanation output remains. |
 | Fixed expert cap | `max_experts_per_layer` is an upper bound on every resolved layer quota. `resolved_live_experts_per_layer` represents the immutable fixed result consumed by placement, distributed plan hashing, and graph diagnostics. | The user-facing scalar cap is still uniform. If explicit layer-varying fixed quotas are to be user selectable, configuration and CLI need a typed spelling rather than exposing the setup-owned resolved field. |
-| Byte cap | The GGUF manifest supplies exact projection geometry and codebook identity. For every one of the 21 catalogued formats, the resolver prices a reusable GPU allocation as the union of the loader's compact representation and the migration-stable CPU-promotion representation, including every required scale, minimum, and embedded-minimum region. `memory_budget_bytes` remains only a legacy tier-local upper bound; zero/`auto` no longer means unbounded because physical admission still applies. | Retire or rename the ambiguous tier-local `memory-mb` spelling and expose physical participant limits/reserves clearly in configuration, CLI help, and `--explain-placement`. |
+| Byte cap | The GGUF manifest supplies exact projection geometry and codebook identity. For every one of the 21 catalogued formats, the resolver prices a reusable GPU allocation as the union of the loader's compact representation and the migration-stable CPU-promotion representation, including every required scale, minimum, and embedded-minimum region. `memory_budget_bytes` remains only a legacy tier-local upper bound; zero/`auto` no longer means unbounded because physical admission still applies. | Retire or rename the ambiguous tier-local `memory-mb` spelling and expose physical participant limits plus every named allocation in configuration, CLI help, and `--explain-placement`. |
 | Fallback capacity | Automatic preferred tiers consume safely admitted slots first; the fallback tier must admit the exact remainder under its physical budgets and upper bounds. A one-expert shortfall fails setup before graph construction. | Installed and real-weight target-topology proven. Campaign-visible failure diagnostics for deliberate one-slot shortfalls remain. |
-| Hardware admission | `MoEOverlayLocalCapacityPlanner` uses the production `MemoryPlanner` to charge dense weights, graph arenas, KV cache, and headroom, joins tier participants to unique physical rank/device authorities, and adds transfer staging and shadow slots. The runner gathers those budgets across ranks and searches resident captured-prefill row candidates before freezing placement. GPU admission uses reported free memory and optional limits. CPU rank inventory publishes both exact owned-NUMA total bytes and current available bytes; admission uses the smaller authority, so another socket or the parity ramdisk cannot be counted as local free capacity. | Installed and proven with both socket-owned CPU endpoints while the inventory binder remains free to place either GPU backend on either MPI rank. Placement-explanation detail remains. |
+| Hardware admission | `MoEOverlayLocalCapacityPlanner` uses the production `MemoryPlanner` to charge dense weights, graph arenas, KV cache, and other named fixed owners, joins tier participants to unique physical rank/device authorities, and adds exact transfer staging and shadow slots. The runner gathers those budgets across ranks and searches resident captured-prefill row candidates before freezing placement. GPU admission uses reported free memory and optional limits. CPU rank inventory publishes both exact owned-NUMA total bytes and current available bytes; admission uses the smaller authority, so another socket or the parity ramdisk cannot be counted as local free capacity. | Installed and proven with both socket-owned CPU endpoints while the inventory binder remains free to place either GPU backend on either MPI rank. Placement-explanation detail remains. |
 | Initial membership | Absent histogram evidence, expert IDs are filled ordinally into the priority tiers. `owner_order` then distributes members ordinally or by a deterministic random permutation within each tier. | There is no separate typed random cold-start membership policy or persisted-profile seed. |
-| Histogram membership | The histogram rotates immutable decode, real-prefill, and accepted grouped-verifier source banks. `HistogramTieredCache` and `RoutedTierRebalanced` consume a total certified per-tier/layer/active-phase service profile and solve the exact fixed-quota assignment, minimizing measured service cost first, incumbent movement second, and expert id last. The residency authority smooths generations and applies measured transfer/interference payoff plus minimum-residency hysteresis before admitting a cycle. The production runner now calibrates representative exact-weight layers with real abort-only transport waves, expands only manifest-equivalent layers, gathers owner-authenticated rows over a private non-blocking MPI lane, and installs the composed certificate before proposal admission. | Installed and local/distributed protocol proven. Real-weight two- and three-tier tests prove complete certification, positive projected service/net benefit, and improving residency scores on every rank. The observed speed gate currently rejects the resulting path. |
-| Within-tier participant skew | After constructing the fixed-quota tier candidate, `MoEOverlayResidencyAuthority` plans paired whole-expert swaps inside each apportioned tier, scores pure same-tier cycles by the reduction in maximum participant makespan, and publishes them through the same candidate epoch and transport as cross-tier cycles. | Installed with explicit proposal/load-spread/`same_priority_moves` evidence and one-tier unit/integration proof. The multi-tier real-weight performance gate must still require same-priority movement in addition to promotion/demotion and correlate both with observed latency. |
+| Histogram membership | The histogram rotates immutable decode, real-prefill, and accepted grouped-verifier source banks. `HistogramTieredCache` and `RoutedTierRebalanced` consume a total certified per-tier/layer/active-phase service profile and solve the exact fixed-quota assignment, minimizing measured service cost first, incumbent movement second, and expert id last. The residency authority smooths generations and applies measured transfer/interference payoff plus minimum-residency hysteresis before admitting a cycle. The production runner now calibrates representative exact-weight layers with real abort-only transport waves, expands only manifest-equivalent layers, gathers owner-authenticated rows over a private non-blocking MPI lane, and installs the composed certificate before proposal admission. | Installed and local/distributed protocol proven. The real-weight three-tier adversarial proof admits 22--23 economical cycles in each of three epochs and improves matched prefill/decode medians by 10.71%/17.36%. The remaining topology cells still require the same observed-economy gate. |
+| Within-tier participant skew | After constructing the fixed-quota tier candidate, `MoEOverlayResidencyAuthority` plans paired whole-expert swaps inside each apportioned tier, scores pure same-tier cycles by the reduction in maximum participant makespan, and publishes them through the same candidate epoch and transport as cross-tier cycles. | Installed with explicit proposal/load-spread/`same_priority_moves` evidence and one-tier unit/integration proof. The real-weight three-tier gate proves one participant-skew cycle and 21--22 tier-residency cycles share every wave and jointly reduce observed latency. |
 | Multi-tier LLEP | Existing CPU and GPU current-batch planners pin a durable epoch, balance one domain, materialize transient expert copies, and restore owner-only residency. | One-tier correctness and movement evidence are installed. A topology-wide lease and batch-local economy planner for resident, same-tier transient, and cross-tier transient destinations are missing; per-domain LLEP switches must not masquerade as this feature. |
-| Physical migration headroom | Production preallocates one inactive RCU shadow slot per endpoint/layer and a 4 MiB chunk per physical lane, retains old/new residency banks, and adopts every loader-owned initial live slot into the recyclable physical arena. `migration_max_cycles_per_wave` is a positive scheduling cap (default `1`). Capacity admission and physical construction now share it: a local directed edge receives `cycles * min(source-device logical multiplicity, destination-device logical multiplicity)` lanes per projection; a remote GPU role receives `cycles * local logical multiplicity`; MPI receives `global participants * cycles * 3` lanes. Every operation in a Started wave reserves a distinct lane before the first byte. | Slot recycling, the public cycle cap, exact lane/staging charging, and fail-closed parallel fan-out are installed. A two-rank real-device CUDA/ROCm/NodeTP integration drives two independent layer cycles over the same physical routes in one wave, verifies every destination byte, observes at least two concurrently outstanding MPI requests through both typed stats and PerfStats, overlaps an independent inference stream, and asserts zero pool exhaustion, serialization, inference waits, and blocking synchronization. The real-weight three-tier cap-`2` campaign additionally proves loader-slot adoption and post-retirement reuse. Local same-process CPU edges now use setup-owned destination-NUMA `SCHED_IDLE` workers and an exact wave-start gate; the focused fabric test proves all six gate/up/down operations of a reciprocal move overlap with zero pool exhaustion. Real-model CPU overlap remains an end-to-end economy gate, not an implementation gap in local dispatch. |
-| Production proof | Dynamic real-weight CUDA/CPU, ROCm/CPU, CUDA/ROCm, and CUDA/ROCm/CPU inference proves seeded-random/adversarial residency, histogram-driven promotions/demotions across domains, ranks, and backend types, repeated improving epochs, tunable cap-`2` waves, non-blocking background preparation, numerical parity, and the canonical CSV artifact set. Static CUDA/ROCm proves zero movement; segmented tri-tier prefill proves its declared heterogeneous capture boundary. | The observed inference gate is now present and red. Endpoint traces show small continuation-GPU packets around 0.62--0.67 ms versus roughly 0.29--0.51 ms for CPU packets because every layer still pays full-bucket host publication and constructs a fresh GPU packet stage. Install the captured local branch, then rerun the same gate. |
+| Physical migration capacity | Production preallocates inactive RCU shadow slots per endpoint/layer and a 4 MiB chunk per physical lane, retains old/new residency banks, and adopts every loader-owned initial live slot into the recyclable physical arena. `migration_transfer_slots` is the positive setup-time physical concurrency authority (default `1`): a local directed edge receives `slots * min(source-device logical multiplicity, destination-device logical multiplicity)` lanes per projection; a remote GPU role receives `slots * local logical multiplicity`; MPI receives `global participants * slots * 3` lanes. `migration_cycles_per_wave` is an optional positive active-policy cap which defaults to all physical slots and may only reduce that width. Every Started-wave operation reserves a distinct lane before the first byte. | Slot recycling, both typed limits, exact lane/staging charging, and fail-closed parallel fan-out are installed. A retained model authority can therefore serve policies with different active wave widths without re-solving physical tier capacity. Focused real-device tests prove concurrent MPI and local paths. The real-weight three-tier campaign materializes 24 slots and admits every conflict-free positive-payoff cycle (22--23 per wave), while telemetry classifies the remaining candidates as policy-bounded rather than capacity-bounded. It records zero pool exhaustion, inference waits, blocking synchronization, or capacity rejection. |
+| Production proof | Dynamic real-weight CUDA/CPU, ROCm/CPU, CUDA/ROCm, and CUDA/ROCm/CPU inference proves seeded-random/adversarial residency, histogram-driven promotions/demotions across domains, ranks, and backend types, repeated improving epochs, tunable transfer-slot waves, non-blocking background preparation, numerical parity, and the canonical CSV artifact set. Static CUDA/ROCm proves zero movement; segmented tri-tier prefill proves its declared heterogeneous capture boundary. | The exact CUDA/ROCm/NodeTP-CPU adversarial cell is green across repeated runs: three epochs commit 65 promotions, 65 demotions, and three paired CPU skew cycles, then improve matched prefill/decode medians by 10.71%/17.36%. Unsummed HF route evidence compares moved experts independently of unrelated top-k drift: all 294 comparable observations pass, with seven true route divergences retained as non-voting evidence. The remaining topology and MTP cells must pass the same mathematical and economy contracts before the campaign is complete. |
 
 Therefore the answer to "does it work that way now?" is: **priority-ordered
 capacity budgeting, phase-aware cross-tier movement, and within-tier
 participant skew correction are implemented under one multi-tier Dynamic
-authority and real-model correctness is certified, but the current segmented
-execution path fails the observed performance requirement; topology-wide
-multi-tier LLEP is not implemented**.
+authority. The exact three-tier adversarial path now passes mathematical and
+observed-performance gates; the remaining generated topology/MTP matrix and
+topology-wide multi-tier LLEP are not yet certified**.
 The implementation determines exact layer quotas from the model and
 per-participant physical budgets, then admits only cycles whose measured phase
 benefit pays for measured transfer and interference. For MTP-disabled
@@ -1582,7 +1798,7 @@ improves measured inference latency on the target hardware.
 
 The configuration model must represent these concepts independently with typed
 fields: strict tier priority, fixed-versus-automatic live capacity, per-physical
-participant memory limit/reserve, optional per-layer expert caps, cold-start
+participant memory limit, optional per-layer expert caps, cold-start
 membership policy, participant owner order, shadow concurrency, and migration
 payoff/hysteresis policy. `fallback=true` means final coverage responsibility;
 it must not imply unlimited memory. Before retaining the existing CLI spelling,
@@ -1590,8 +1806,8 @@ the parser must stop treating `memory-mb=auto` as the same value as "no cap".
 
 `--validate-only`, `--dry-run`, and `--explain-placement` must print, for every
 participant and layer, the budget source, fixed bytes, exact expert bytes,
-resolved live quota, replica/shard multiplier, shadow/staging bytes, reserve,
-and remaining headroom. The same resolved-plan identity and BOM are included in
+resolved live quota, replica/shard multiplier, shadow/staging bytes, and exact
+unallocated bytes. The same resolved-plan identity and BOM are included in
 graph-cache identity and distributed consensus. Setup and every migration
 proposal publish `PerfStats` for quota occupancy, phase-specific hit rate,
 expected service-time gain, transfer cost, hysteresis rejection, and the
@@ -1777,8 +1993,9 @@ the transport atomically reserves every requirement and pins every source in
 the selected cycle set. A simple cycle needs one inactive expert slot in every
 participating endpoint. Multiple independent cycles may share one background
 wave only when the sum of their endpoint requirements fits the currently free
-adopted-plus-shadow arena and the configured
-`migration_max_cycles_per_wave` scheduling cap. Otherwise the planner emits a
+adopted-plus-shadow arena, the configured `migration_transfer_slots` physical
+concurrency budget, and the resolved `migration_cycles_per_wave` active-policy
+cap. Otherwise the planner emits a
 smaller capacity-preserving cycle wave or defers it; it never exposes a
 path-shaped partial placement.
 
@@ -1789,12 +2006,12 @@ never waits for command `N` to finish before dispatching command `N+1`.
 Hardware copy engines and links may still arbitrate their shared bandwidth,
 while publication of residency epochs remains serialized. At least one
 preallocated inactive slot per participating endpoint permits a single simple
-cycle to make progress. The cycle cap is independently tunable and is never
+cycle to make progress. The transfer-slot count is tunable and is never
 assumed to be one by the protocol; actual admission is still bounded by the
 resolved per-endpoint/layer arena BOM. Raising it can exploit disjoint cycles
 without increasing memory, while a topology requiring multiple simultaneous
 arrivals at one endpoint must first provision and readmit deeper shadow
-capacity. The cycle cap, participant-to-device multiplicity, local lane pools,
+capacity. The transfer-slot count, participant-to-device multiplicity, local lane pools,
 remote GPU pools, MPI payload pools, capacity admission, and measurement journal
 all use the same setup-time factors. Pool exhaustion after admission is fatal,
 not runtime backpressure or permission to queue. Runtime allocation is
@@ -2953,7 +3170,7 @@ conversion, promotion, and demotion counters remain exactly zero.
 5. Campaign orchestration enforces one aggregate wall-clock budget below one
    hour across every backend, precision, model, and test type.
 
-## Real-weight migration proof (2026-08-14)
+## Real-weight migration proof (2026-08-14 baseline; 2026-08-23 update)
 
 The isolated Qwen 3.5 MoE graph-native campaigns now certify every backend
 pairing plus the three-tier topology under real weights and two production MPI
@@ -2967,36 +3184,42 @@ instances:
 | Dynamic seeded-random | CUDA + ROCm + CPU | 124.245 | Numerical/path pass; convergence-speed gate red |
 | Static seeded-random control | CUDA + ROCm | 11.015 | Pass, zero movement |
 | Segmented prefill | CUDA + ROCm + CPU | 14.072 | Pass |
+| Dynamic adversarial, 24 slots and three epochs (2026-08-23) | CUDA + ROCm + NodeTP CPU | 152.02 | Repeated full mathematical/path/economy pass; prefill +10.71%, decode +17.36% |
 
 Every cell stayed within the shared campaign wall-time target and emitted the
-seven required CSV artifacts: decode layers, decode stages, decode steps,
-prefill layers, prefill stages, prefill summary, and production path. Every
-live checkpoint remained within the authenticated Hugging Face tolerances.
-That is not an economy pass: once the campaign added a required observed
-convergence improvement of at least two percent, the current dynamic path was
-roughly 36--50% slower after movement. The segmented cell still certifies its
-ordered heterogeneous capture boundary and full-prompt reconstruction; the
-captured continuation-local branch is the next implementation dependency.
+canonical CSV evidence. Every live checkpoint remained within authenticated
+Hugging Face tolerances. The first four Dynamic measurements above preserve the
+original two-slot baseline that exposed both hot-path telemetry cardinality and
+an underpowered convergence wave; they are historical red results, not the
+current three-tier outcome. After bounding ordered PerfStats evidence and
+materializing 24 transfer slots, the exact adversarial three-tier cell admitted
+every positive-payoff conflict-free cycle over three epochs and cleared the same
+two-percent observed-economy gate.
+The segmented cell still certifies its ordered heterogeneous capture boundary
+and full-prompt reconstruction.
 
-The dynamic cells used real CUDA, ROCm, and/or NodeLocalTP CPU participants as
+The dynamic cells used real CUDA, ROCm, and/or NodeTP CPU participants as
 declared. `PerfStats` proved seeded-random or authenticated adversarial initial
-layouts, at least two improving residency epochs per rank, positive projected
+layouts, repeated improving residency epochs per rank, positive projected
 service gain and net benefit, balanced promotions and demotions, all applicable
 cross-domain/rank/backend traffic, background physical preparation,
 inactive-bank publication, old-epoch retirement, loader-slot adoption, and
-subsequent bootstrap-slot recycling. The public
-`migration_max_cycles_per_wave` value was `2`; every rank published that value
-and no wave exceeded it. The three-tier cell admitted a full two-cycle wave on
-every rank. There were no inference-stream migration waits, blocking migration
-synchronizations, active-slot overwrites, or migration failures.
+subsequent bootstrap-slot recycling. In the current three-tier proof the public
+`migration_transfer_slots` value is `24`; every rank publishes that value and
+the three epochs admit 23, 23, and 22 cycles. Each contains one same-priority
+participant swap plus 21--22 cross-priority swaps. The unfilled slots are
+explicitly policy-bounded, not capacity-bounded. There were no inference-stream
+migration waits, blocking migration synchronizations, active-slot overwrites,
+capacity rejections, or migration failures.
 
 Transport capacity follows that public knob rather than assuming one cycle.
 `MoEOverlayRemoteProjectionLaneBudget` materializes exactly
 `maximum_participants_per_cycle * maximum_concurrent_cycles * 3` projection
-lanes per rank, with checked zero/overflow rejection. The tri-tier proof thus
-used 24 preallocated remote projection lanes per rank (four participants, two
-cycles, three projections). Config parser tests cover other positive values,
-and changing the cap requires model-aware slot admission rather than a source
+lanes per rank, with checked zero/overflow rejection. The current tri-tier proof
+therefore uses 288 preallocated remote projection lanes per rank (four
+participants, 24 slots, three projections). Config parser tests cover other
+positive values, and changing the slot count requires model-aware admission
+rather than a source
 change. Local GPU/CPU, same-backend peer, and heterogeneous CUDA/ROCm pools use
 the tighter per-edge logical-participant multiplicity bound described above.
 The capacity resolver prices those exact device and pinned chunks with the same
@@ -3186,6 +3409,91 @@ prepared-weight reuse campaigns.  There is no `is_preloaded`, `is_prepared`, or
 test-owned compatibility boolean: construction overload and contract type make
 the only legal transitions explicit.
 
+### Retained MTP capacity and initial-bank finalization lifecycle re-audit (2026-08-24)
+
+The 122B process campaign then exposed one remaining conflation inside an
+otherwise valid reuse contract. The MTP-off cell described only its active
+request geometry, so it prepared 48 main layers and a one-row transaction.
+The next depth-enabled cell required the model's routed MTP predictor layer and
+16-row verifier family. Treating `mtp.enabled` as both execution policy and
+physical model capacity made two requests for the same model appear to own two
+different model contexts.
+
+The first separation correctly retained the sidecar weights and follower graph,
+but revealed a second implicit edge: continuation graph construction happened
+not to visit the dormant predictor layer, so the CUDA participants never
+published layer 48 into their initial residency banks. An unsynchronized local
+readiness check then let one MPI rank return while its peer entered the next
+maintenance subphase. Both defects came from allowing graph visitation order to
+stand in for an explicit setup transition.
+
+There are now two orthogonal typed inputs and one shared physical authority:
+
+```mermaid
+flowchart TB
+    C[Typed ModelParityCase]
+    C --> R[Retained MTP draft capacity]
+    C --> A[Active MTP execution policy]
+
+    subgraph Physical[Model-context physical identity]
+        R --> G[Retained rows and graph-family identity]
+        R --> L[Main plus routed predictor layer manifest]
+        R --> W[Prepared expert-engine registry]
+        R --> H[Mapped activation channels and transaction slots]
+        R --> B[Memory and placement capacity BOM]
+    end
+
+    W --> E[Graph builders may register exact visited layers early]
+    E --> F[Synchronized FinalizeInitialPreparedResidencyBanks]
+    W --> F
+    F --> P[Complete immutable initial-bank certificate]
+    P --> M[Compose maintenance and seal retained graph families]
+    M --> Ready[Ready for inference]
+
+    subgraph Request[Request-time device-owned selection]
+        A -->|off| Main[Select main family only]
+        A -->|fixed or dynamic depth| Sidecar[Select retained sidecar and verifier buckets]
+    end
+    Ready --> Main
+    Ready --> Sidecar
+```
+
+`MTPRuntimeConfig::graph_capacity_draft_tokens` owns the retained physical
+envelope. `enabled`, `draft_tokens`, and the depth policy own only request-time
+selection. The prepared-weight reuse identity includes retained depth, request
+batch capacity, and terminal-head authority; it deliberately ignores active
+depth inside that envelope. Consequently the off control retains exactly the
+same 49-layer, 16-row model authority as depths 1 through 15, while PerfStats
+must prove that it selects the dormant sidecar zero times.
+
+Initial-bank publication is also one explicit state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PreparedRegistryComplete
+    PreparedRegistryComplete --> EarlyLayerRegistration: graph resolves a visited layer
+    PreparedRegistryComplete --> Finalizing
+    EarlyLayerRegistration --> Finalizing
+    Finalizing --> LocalBanksReady: every frozen participant/layer lifetime resolves
+    Finalizing --> Fatal: missing engine, identity drift, or stale geometry
+    LocalBanksReady --> RankConsensus
+    RankConsensus --> MaintenanceComposed
+    MaintenanceComposed --> FamilySealed
+    FamilySealed --> Ready
+    Fatal --> [*]
+```
+
+`MoEOverlayParticipantResidencyRegistry` is the sole publication authority.
+Graph-local registration remains an idempotent early contribution, not a
+completion signal. Finalization walks the frozen owner map and model-owned
+`ExpertGemmRegistry` deterministically, refuses to fabricate missing engines,
+and participates in rank consensus before any rank can enter the next phase.
+This removes the readiness boolean race without adding an eager sidecar launch,
+recapture, host mirror, or fallback. The device-free dormant-layer regression
+and the real CUDA2/ROCm4 Static/Ordinal six-cell campaign prove off-to-on reuse,
+fixed depths 1/2/3/15, dynamic depth, mandatory prefix restore, and unchanged
+mathematical CSV parity through one tmpfs-backed model context.
+
 ### Activation-channel planning lifecycle re-audit (2026-08-21)
 
 The next CPU NodeTP production cell localized a second setup defect.  A
@@ -3330,41 +3638,46 @@ is deliberately not conflated with this durable Static/Dynamic transaction and
 still fails closed until its separate multi-rank child protocol is completed.
 
 Graph construction then completed on both CPU ranks and exposed a setup-policy
-leak.  Distributed orchestration unconditionally called
-`materializeServingGraphFamilyWithoutLaunch()`, although that API's contract is
-specifically native GPU capture/instantiation.  The CPU graph was already
-fully materialized, so probing the GPU method could only fail:
+leak. Distributed orchestration originally treated
+`materializeServingGraphFamilyWithoutLaunch()` as a GPU-only capture method and
+let an eager CPU graph bypass the common admission seal. That was incorrect:
+native executable capture is backend-specific work, but certifying the retained
+endpoint family and sealing ticket admission is a shared lifecycle transition.
 
 ```mermaid
 flowchart LR
     A[Distributed overlay graph built] --> D{Distributed?}
-    D -->|yes| M[Invoke native family materialization]
-    M --> G{Runner is GPU with graph cache?}
-    G -->|no: CPU NodeTP| X[Fatal after successful eager graph build]
+    D -->|yes| K{Preparation kind}
+    K -->|EagerHostGraph| X[Old path skipped family seal]
+    K -->|NativeDeviceExecutableFamily| M[Capture and instantiate family]
+    X --> Y[Ticket authority sees an unsealed CPU participant]
 ```
 
-The runner interface now publishes one typed setup transition.  Orchestration
-switches on it before request-ticket authority is installed:
+The runner interface now publishes one typed preparation kind, while every
+resolved kind crosses one common family-seal operation before request-ticket
+authority is installed:
 
 ```mermaid
 stateDiagram-v2
     [*] --> GraphBuilt
     GraphBuilt --> EagerHostGraph: CPU runner
     GraphBuilt --> NativeDeviceExecutableFamily: CUDA or ROCm runner
-    GraphBuilt --> Unresolved: composite children disagree
-    EagerHostGraph --> Ready: admitted eager graph already materialized
-    NativeDeviceExecutableFamily --> FamilyMaterialized: capture every bucket and serial decode
-    FamilyMaterialized --> Ready
+    GraphBuilt --> Unresolved: child has no declared lifecycle
+    EagerHostGraph --> FamilyPreparing: certify retained CPU endpoints
+    NativeDeviceExecutableFamily --> FamilyPreparing: capture every bucket and serial decode
+    FamilyPreparing --> FamilySealed: one common admission transition
     Unresolved --> Fatal
-    Ready --> TicketAuthorityInstalled
+    FamilySealed --> RankConsensus
+    RankConsensus --> TicketAuthorityInstalled
 ```
 
 `DeviceGraphOrchestrator`, `RankOrchestrator`, and the expert-only participant
 runner own this declaration.  A participant runner containing any GPU reports
 the stronger native-family transition, even when it also contains CPU
-endpoints; an all-CPU runner reports the eager host transition.  A composite
-LocalTP runner whose children disagree reports `Unresolved` and fails rather
-than guessing.  This keeps native capture mandatory for GPU execution while
+endpoints; an all-CPU runner reports the eager host transition. A composite
+runner reports `Unresolved` only when a child has not declared any preparation
+contract. Preparation kind selects the internal work, never whether the common
+seal occurs. This keeps native capture mandatory for GPU execution while
 removing backend knowledge and failed capability probes from orchestration.
 
 Successful graph preparation exposed one final collapse of two different
@@ -3629,6 +3942,178 @@ private controller state nor supplies a calibration workload.  Static remains
 ready immediately and proves zero movement; Dynamic may serve during profiling
 but cannot publish a migration until certification completes.
 
+#### Economy activation and routing-demand rebase (2026-08-25)
+
+The first distributed 122B Dynamic production cell exposed one remaining
+implicit edge in that join. Service certification deliberately uses real
+prefill, decode, and grouped-verifier requests. The host controller composed
+the resulting cost profile and made it visible to policy immediately, while
+the routing histogram still contained those measurement requests. A full
+calibration-era window could therefore publish epoch two inside the first
+post-certification timing cohort.
+
+The buggy lifecycle was short, but semantically incomplete:
+
+```mermaid
+flowchart LR
+    S[Required live service rows complete] --> C[Compose immutable economy profiles]
+    C --> I[Install certificate and mark Dynamic active]
+    I --> H[Planner consumes still-full calibration routing histogram]
+    H --> P[Epoch publishes inside first production cohort]
+```
+
+The host path now uses the same activation invariant as the device-resident
+controller. Profile composition and policy activation are separate typed
+states. Maintenance starts the existing asynchronous runtime-histogram drain,
+freezes and discards that generation, rotates the preallocated RCU bank, and
+only then installs the certificate. Inference continues to write and execute
+while this edge is pending; no benchmark pause, stream synchronization,
+synthetic request, or second histogram protocol exists.
+
+```mermaid
+stateDiagram-v2
+    [*] --> CollectingEvidence
+    CollectingEvidence --> ProfilesComposed: complete migration plus service evidence
+    ProfilesComposed --> RebasingRoutingEvidence: begin existing async drain generation
+    RebasingRoutingEvidence --> RebasingRoutingEvidence: device or CPU source pending
+    RebasingRoutingEvidence --> ReadyForCertification: freeze, discard, and rotate generation
+    ReadyForCertification --> Certified: install immutable profiles
+    Certified --> DynamicProposalEligible: fresh production window becomes full
+    RebasingRoutingEvidence --> Failed: drain or geometry failure
+    ReadyForCertification --> Failed: profile installation failure
+```
+
+There is one histogram drain lane with a typed purpose:
+`ProposalWindow` or `CertificationRebase`. A purpose cannot change while its
+generation is active, and `installEconomyCertification()` rejects callers that
+have not reached `ReadyForCertification`. This removes both the prior timing
+assumption and the possibility of a future caller bypassing the rebase. For a
+distributed host authority every rank rotates before its first policy-bearing
+window; only the continuation authority needs the policy evidence used to
+author the canonical proposal. The executable proposal remains identical on
+followers because calibration profiles are not transport identity.
+
+#### Convergence publication lifecycle re-audit (2026-08-25)
+
+The first post-rebase 122B run exposed a test-lifecycle ambiguity rather than
+a production movement defect. One asynchronous publication contained two
+independent closed cycles: a cross-priority promotion/demotion cycle and a
+same-priority participant-rebalance cycle. The authority correctly reported
+one published wave, one physically completed transaction, two cycles, four
+edges, and placement epoch two. The convergence fixture compared that one wave
+with the 35B workload's four-window taper constant and rejected the otherwise
+complete epoch.
+
+The old flow allowed four distinct quantities to collapse into one integer:
+
+```mermaid
+flowchart LR
+    H[Histogram window closes] --> P[Proposal wave]
+    P --> C[One or more independent closed cycles]
+    C --> E[One durable placement epoch]
+    E --> B{Raw wave count at later timing boundary is at least global window target?}
+    B -->|no| F[Reject valid model-specific convergence]
+    B -->|yes| T[Measure converged cohort]
+```
+
+Convergence is now one typed objective composed once from the model workload
+and frozen topology. Its publication target and required logical axes remain
+separate. Progress is derived from `MoEOptimizationStatus` plus the durable
+`MoEOptimizationMovementLedger`; PerfStats only mirrors the result. The 122B
+objective accepts one wide wave only when its ledger proves every expressible
+axis. The 35B objective still requires four successive publications because
+that workload needs the observed taper; several cycles in one wave do not
+masquerade as several publications.
+
+```mermaid
+stateDiagram-v2
+    [*] --> AwaitingPublication
+    AwaitingPublication --> AwaitingPhysicalCompletion: required RCU publications visible
+    AwaitingPhysicalCompletion --> AwaitingTierResidency: matching retirement transactions complete
+    AwaitingTierResidency --> AwaitingParticipantPlacement: durable ledger proves tier objective
+    AwaitingTierResidency --> Satisfied: topology has no participant-balance degree of freedom
+    AwaitingParticipantPlacement --> Satisfied: durable ledger proves participant objective
+    Satisfied --> ConvergedCohort: pin one nonzero immutable placement epoch
+
+    AwaitingPublication --> InvalidAuthorityEvidence: counter or ledger regression
+    AwaitingPhysicalCompletion --> InvalidAuthorityEvidence: truncated or malformed ledger
+    AwaitingTierResidency --> InvalidAuthorityEvidence: truncated or malformed ledger
+    AwaitingParticipantPlacement --> InvalidAuthorityEvidence: truncated or malformed ledger
+```
+
+The parity proof phase is now `ConvergenceTargetSatisfied`, not the weaker
+`MovementPublished`. A later timing boundary checks only that the cohort is in
+the initial epoch or a nonzero post-publication epoch; it cannot re-derive a
+model target from another raw constant. This removes the duplicated gate while
+retaining the important event distinction: device-selectable publication may
+precede source retirement, and convergence is not satisfied until the matching
+physical transaction and complete typed ledger are both durable.
+
+#### Between-wave boundary and economy-ownership re-audit (2026-08-25)
+
+The next 122B ROCm/CPU run proved the numerical path and all required movement
+axes, then exposed two smaller observation errors. First, publication wrote the
+generic `Waiting` state before maintenance checked whether inference had
+already filled the next histogram bank. The timing driver could therefore
+start its converged cohort during the narrow interval before an already-queued
+wave began preparation. Second, the final gate treated per-rank PerfStats
+mirrors as independent economic decisions even though only the continuation
+coordinator owns the policy inputs and admission arithmetic.
+
+```mermaid
+flowchart LR
+    P[Publish residency epoch N] --> W[Waiting]
+    W --> T[Test starts converged timing]
+    W --> H[Poll already-full histogram N plus 1]
+    H --> M[Move weights during timed cohort]
+    C[Coordinator admits profitable wave] --> R[Per-rank PerfStats mirrors]
+    R --> F[Followers incorrectly judged as economy authorities]
+```
+
+No new orchestration protocol is required. `MoEOptimizationStatus` now
+projects one typed activity state from the existing host or device owner.
+Publication and dynamic no-movement return to `ReconcilingDemand`; only a poll
+that actually observes no complete demand window may enter
+`CollectingDemand`. The convergence driver stops adding demand and passively
+waits for that real between-wave boundary. It neither pauses maintenance nor
+introduces synchronization into inference.
+
+The same authority-owned movement ledger now retains one immutable economy
+record per committed transaction. All participants retain physical movement
+edges, while exactly one host coordinator or device-policy leader retains the
+admitting service gain, transfer/repack cost, interference cost, and exact net
+benefit. PerfStats remains an observability mirror and is cross-checked, but it
+cannot manufacture authority when enabled or erase correctness when filtered.
+
+```mermaid
+stateDiagram-v2
+    [*] --> CollectingDemand: poll proves no full window
+    CollectingDemand --> ReconcilingDemand: wake or completed publication
+    ReconcilingDemand --> ExchangingProposal: full window admitted
+    ReconcilingDemand --> CollectingDemand: poll proves no full window
+    ExchangingProposal --> MovingWeights: canonical plan acknowledged
+    MovingWeights --> PublishingResidency: prepared banks ready
+    PublishingResidency --> ReconcilingDemand: epoch becomes selectable
+    ReconcilingDemand --> BetweenWaveBoundary: no queued window
+    BetweenWaveBoundary --> ConvergedCohort: typed convergence objective satisfied
+```
+
+```mermaid
+flowchart TD
+    A[Single policy authority admits transaction] --> E[Typed economy record]
+    A --> P[Canonical movement plan]
+    P --> L[Complete movement edges on every participant]
+    E --> G[Correctness and economy gate]
+    L --> G
+    P -. optional mirror .-> S[PerfStats on each rank]
+    S -. diagnostic cross-check only .-> G
+```
+
+This keeps the lifecycle at one policy decision, one distributed physical
+transaction, and one post-publication demand reconciliation. It removes the
+false idle edge and the fabricated follower authorities instead of adding a
+calibration phase, barrier, test-side collective, or special topology branch.
+
 ### Graph-cache handoff lifecycle re-audit (2026-08-22)
 
 The intermittent 122B Static parity failure was not quantisation drift.  Its
@@ -3815,35 +4300,56 @@ completed in 57.4 seconds; it began with snapshot execution depth 15 and
 reported a last transaction depth of 14 after the controller adapted, while
 retaining exact serial-token equivalence.
 
-### Restored-prefix bridge authority and retained capacity audit
+### Restored-prefix suffix authority and retained capacity audit
 
-The restored-prefix bridge is one typed transaction with exactly one state
-authority selected by the execution device. It is not two loosely coupled
-prefix and MTP lifecycle flags. CPU keeps token, logical position, KV, and
-shifted-MTP advancement host-owned. CUDA and ROCm admit the token once, compose
-it with the canonical device KV count, and publish the resulting logical row by
-event before replaying the captured bridge. Both branches rejoin only after the
-same serial-decode mathematical transition has completed.
+Request intent and mathematical phase are separate typed facts. A public
+prefill request may restore a cached prefix and leave exactly one uncached row;
+that row is serial decode, not a one-row prefill padded to the smallest capture
+bucket. The old padded route was Hugging Face-close but produced different
+terminal-logit bytes from ordinary serial decode. The production path now opens
+one serial graph sequence inside the already-admitted outer command and runs
+decode arithmetic. It neither opens a second command nor falls back to eager
+execution.
+
+MTP changes only the state carried by that decode transaction. With MTP off,
+the main model advances normally. With MTP on, the existing typed bridge also
+advances depth-zero shifted KV and the terminal-hidden archive. CPU keeps those
+values host-owned. CUDA and ROCm admit the token once, compose it with the
+canonical device KV count, and publish the resulting logical row by event before
+replaying the captured bridge. All branches rejoin at the same byte-equivalent
+committed boundary.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PrefixRestored
-    PrefixRestored --> BridgeAdmitted: RestoredPrefixMTPDecodeBridge request
+    [*] --> OuterCommandAdmitted
+    OuterCommandAdmitted --> PrefixLookedUp
+    PrefixLookedUp --> PrefixRestored: matched tokens greater than zero
+    PrefixRestored --> CommandComplete: no suffix and terminal state restored
+    PrefixRestored --> SegmentedPrefill: suffix has two or more rows
+    SegmentedPrefill --> CommandComplete: prefill graphs self-admit
+    PrefixRestored --> SerialSequenceAdmitted: suffix has exactly one row
     state AuthorityChoice <<choice>>
-    BridgeAdmitted --> AuthorityChoice
-    AuthorityChoice --> CPUDecode: CPU host authority
-    AuthorityChoice --> GPUAdmission: CUDA or ROCm device authority
-    CPUDecode --> CPUShiftedAdvance: one row serial decode
-    CPUShiftedAdvance --> BridgeComplete: advance host shifted MTP cache
+    SerialSequenceAdmitted --> AuthorityChoice
+    AuthorityChoice --> MainOnlyDecode: MTP disabled
+    AuthorityChoice --> CPUDecode: MTP enabled and CPU authority
+    AuthorityChoice --> GPUAdmission: MTP enabled and CUDA or ROCm authority
+    MainOnlyDecode --> SuffixCommitted: ordinary serial decode state
+    CPUDecode --> CPUShiftedAdvance: main decode then shifted MTP row
+    CPUShiftedAdvance --> SuffixCommitted
     GPUAdmission --> DeviceLogicalMailbox: token plus canonical device KV position
     DeviceLogicalMailbox --> CapturedBridge: event-ordered publication
-    CapturedBridge --> BridgeComplete: one complete captured transaction
-    BridgeComplete --> [*]
+    CapturedBridge --> SuffixCommitted: main and shifted state in one graph
+    SuffixCommitted --> CommandComplete
+    CommandComplete --> [*]
 ```
 
-The backend choice happens once at the typed bridge boundary. In particular,
-CPU must not enter the GPU logical-mailbox transition, and GPU must not create
-a host shadow of its live KV position.
+The sequence admission happens once before the phase-changing graph; the
+participant scope and follower ticket then use the ordinary sparse transaction
+protocol. The backend choice happens once at the typed state boundary. CPU must
+not enter the GPU logical-mailbox transition, and GPU must not create a host
+shadow of its live KV position. PerfStats records the decode mathematical phase,
+one logical row, outer-command identity, and whether the transaction advanced
+main-only or main-and-shifted-MTP state.
 
 Graph admission has an adjacent but independent invariant. The exact prefill
 bucket is a throughput/snapshot shape; it is not necessarily the largest row
@@ -3854,6 +4360,388 @@ on CUDA, ROCm, and captured routed-expert participants. This prevents a small
 nine-token parity prompt from approving a nine-row hidden arena while the
 depth-15 family subsequently materializes sixteen-row terminal-hidden
 publication graphs.
+
+### Complete retained-runtime publication audit (2026-08-24)
+
+Retained graph capacity can add routed layers that are not executed by the
+ordinary main graph. Qwen 3.5 MTP, for example, retains the NextN routed layer
+beside the main-model layers even when a particular request selects MTP-off.
+The durable runtime table is sized for that complete retained family, so setup
+must publish ownership, routing, and prepared-engine state for every table
+layer—not merely every layer visited while building the active main graph.
+
+The old setup path violated that rule asymmetrically. Continuation graphs
+initialized only their active main-model layers while remote follower graph
+families happened to initialize the complete retained table. Static policy
+could traverse the lifecycle without interpreting those missing ownership
+words; Dynamic policy correctly rejected the resulting snapshot as invalid.
+That made the first Dynamic cell fail only after all Static MTP depths had
+passed, and the host follower then hid the precise device error behind a
+command-acquisition deadline.
+
+No policy-specific initialization phase or repair flag is required. The
+installed lifecycle has one typed publication transition shared by every
+policy:
+
+```mermaid
+flowchart TD
+    A[PreparedWeightStore seals stable expert handles] --> D
+    B[Canonical owner map and tier quotas] --> D
+    C[Retained graph capacity fixes runtime-table layer count] --> D
+    D[Build participant-local active graphs] --> E[InitialRuntimePublication role]
+    E --> F[Record graph-build producer event]
+    F --> G[Controller stream waits on exact producer event]
+    G --> H[Finalize every runtime layer 0 through layerCount minus 1]
+    H --> I{Ownership routing and prepared engines complete?}
+    I -- no --> X[Fail setup before controller capture]
+    I -- yes --> J[Publish exact completion event]
+    J --> K[Capture controller and follower graph families]
+    K --> L[Controller enters Idle]
+    L --> M{Policy selected for transaction}
+    M -- Static --> S[Snapshot and prove zero movement]
+    M -- Dynamic --> Y[Snapshot then author economical movement]
+    M -- LLEP when installed --> P[Snapshot then author request lease]
+    Y --> Q{Command or terminal error published}
+    Q -- command --> R[Physical follower acquires immutable batch]
+    Q -- error --> T[Physical follower reports authority error immediately]
+```
+
+`IMoEOverlayDeviceInitialRuntimePublisher` is the only setup boundary allowed
+to complete this transition. It joins exact non-null streams with events,
+finalizes the canonical table on the controller stream, and publishes a
+completion event consumed before capture. CUDA, ROCm, continuation, and mapped
+follower participants implement the same contract. The controller service
+rejects a binding without it, and `DeviceMoERuntimeTable` exposes a total
+completeness predicate so a dormant retained layer cannot silently pass setup.
+
+The resulting state space is smaller: policy selection happens only after one
+complete runtime publication, and all policies consume the same immutable
+snapshot shape. A device-authored terminal error before command publication is
+also an explicit transport observation; it is never represented as “still
+waiting for a command.”
+
+Migration concurrency has two typed inputs with different lifetimes.
+`migration_transfer_slots` is the setup-time number of independently runnable
+physical cycle lanes; it belongs to model-context capacity identity, memory
+admission, and transport materialization. Optional
+`migration_cycles_per_wave` is the active scheduler ceiling, defaults to the
+physical count, and must lie in `[1, migration_transfer_slots]`. Device and host
+policy may use fewer lanes without invalidating prepared weights, while
+marginal economics, residency conflicts, or shadow capacity may reduce the
+observed width further. Both values are tunable per deployment and parity
+definition; no topology-specific move count is hardcoded.
+
+### Terminal-hidden publication lifecycle re-audit (2026-08-24)
+
+The retained MTP family consumes one durable terminal-hidden mailbox from
+several production entry points: ordinary decode, restored-prefix decode,
+resident logical-state correction, verifier-outcome catch-up, and shifted
+prefill construction. The mailbox has one physical tensor, but its current row
+may be authored by four distinct lifecycle transitions. Treating “current” as
+a boolean, or acquiring a read lease in only one caller, made both provenance
+and coverage incomplete.
+
+The complete lifecycle is now one typed publication state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unavailable
+    Unavailable --> MainForward: exact main-forward producer publishes generation N
+    Unavailable --> PrefixRestore: restored terminal row publishes generation N
+    Unavailable --> AcceptedVerifier: accepted grouped row publishes generation N
+    Unavailable --> CheckpointRestore: rollback restores row and publishes generation N
+
+    MainForward --> MainForward: later main row publishes N plus 1
+    PrefixRestore --> MainForward: suffix decode publishes N plus 1
+    AcceptedVerifier --> MainForward: next serial target publishes N plus 1
+    CheckpointRestore --> MainForward: resumed decode publishes N plus 1
+
+    MainForward --> AcceptedVerifier: grouped commit publishes N plus 1
+    AcceptedVerifier --> CheckpointRestore: rollback publishes N plus 1
+    MainForward --> Unavailable: request reset invalidates and advances generation
+    PrefixRestore --> Unavailable: request reset invalidates and advances generation
+    AcceptedVerifier --> Unavailable: request reset invalidates and advances generation
+    CheckpointRestore --> Unavailable: request reset invalidates and advances generation
+```
+
+Every retained sidecar reaches the same executor boundary regardless of which
+public operation selected it:
+
+```mermaid
+flowchart TD
+    P[Typed producer writes canonical terminal row on exact stream] --> E[Publish producer event]
+    E --> S[Sidecar stream waits on exact event]
+    S --> C{Bound buffer identity}
+    C -->|persistent prefix terminal hidden| L[Acquire source plus generation ReadLease]
+    C -->|transient MTP hidden| T[Use transaction-local buffer contract]
+    L --> V[Verify retained graph declares mailbox read-only]
+    V --> G[Submit retained sidecar graph]
+    T --> G
+    G --> O{Same source and generation still current after submission?}
+    O -->|no| F[Fail transaction; publication edge was crossed]
+    O -->|yes| R[Record sidecar read-lease evidence]
+    R --> H[Publish logits or shifted-KV completion event]
+    H --> N[Next typed transaction may replace the mailbox]
+```
+
+The read lease protects the finite host submission recipe; the producer and
+consumer events protect the asynchronous device read itself. It is not a
+reader-counted residency epoch and does not introduce a host wait. Graph
+construction independently proves that no sidecar stage writes the persistent
+mailbox, so repeated recursive sidecars can share the same publication until a
+real model-state transition replaces it.
+
+This collapses two accidental protocols into one. The old resident-logical-
+state caller acquired a lease and emitted a caller-specific counter, while the
+device-outcome and prefix paths reached the same graph without that evidence.
+Lease acquisition, generation verification, and the
+`sidecar_terminal_hidden_read_leases` counter now live only in
+`executeMTPDepth0Batched()`, immediately around graph submission. Callers name
+their input buffer and transaction geometry; they cannot reconstruct
+publication provenance or bypass the common ownership check. No new boolean,
+retry path, row replay, copy, stream synchronization, or graph variant is
+needed.
+
+### Dynamic wave-geometry authority re-audit (2026-08-25)
+
+The 122B convergence proof exposed a split authority between the typed campaign
+definition and its fixture. The fixture read the authenticated 48-layer model
+metadata and derived a model-wide wave, but stored that value only in a local
+diagnostic member. `ModelParityCase::applyRuntimePolicy()` subsequently
+installed the centrally declared two-cycle policy and the fixture copied that
+value back over its derived member. Capacity admission, transport
+materialization, and the real controller therefore all correctly built two
+lanes, while the proof narrative incorrectly described 49.
+
+```mermaid
+flowchart TD
+    M[Authenticated model metadata: 48 routed layers] --> F[Fixture derives 49 desired cycles]
+    F --> S[Store only in fixture diagnostic mirror]
+    D[Central Qwen122 definition: two slots] --> A[applyRuntimePolicy]
+    A --> O[Overwrite fixture mirror with two]
+    A --> C[Capacity admission prices two]
+    C --> T[Materialize two physical lane families]
+    T --> P[Planner can publish one economical tier cycle]
+    P --> W[Wait another 256-token window]
+    W --> P
+    P --> E[Four-window two-axis proof]
+    E --> R[Thermal and prefix-tier drift contaminate early versus late timing]
+```
+
+The corrected lifecycle gives wave geometry one authority: the typed
+model/topology definition. A wave owns one conflict-free tier cycle for every
+serial routed layer and, when any tier has a genuine participant exchange
+degree, one additional participant-placement cycle. Its command envelope is
+the wave width multiplied by the maximum number of participants a closed cycle
+may visit. The per-layer arrival bound remains separate: it is one tier arrival
+plus at most one independent participant arrival. These values flow unchanged
+through runtime policy, capacity preflight, physical lane construction,
+planner admission, movement evidence, and the convergence gate.
+
+```mermaid
+flowchart TD
+    T[Typed model plus topology definition] --> G[Derive WaveGeometry]
+    G --> G1[cycle slots = routed layers plus optional participant axis]
+    G --> G2[command entries = cycle slots times maximum cycle edges]
+    G --> G3[layer arrival slots = tier arrival plus optional participant arrival]
+    G1 --> R1[Physical migration_transfer_slots]
+    G1 --> R2[Active migration_cycles_per_wave]
+    G2 --> R
+    G3 --> R
+    R1 --> R[MoERebalanceRuntimeConfig]
+    R2 --> R
+    R --> C[Single capacity and preflight accounting]
+    C -->|insufficient BOM| X[Fail before materialization with exact deficit]
+    C -->|admitted| L[Materialize the exact transfer lane and shadow BOM]
+    L --> P[Economy planner scores all independent layer cycles]
+    P --> A[Admit every conflict-free positive marginal cycle]
+    A --> B[Prepare transfers concurrently in background]
+    B --> U[One cheap atomic epoch publication]
+    U --> V[Durable ledger proves physical completion and both required axes]
+    V --> Q[Measure converged production inference]
+```
+
+This is not a mandate to fill every lane. `migration_transfer_slots` remains
+the tunable physical upper bound, `migration_cycles_per_wave` may deliberately
+activate only a subset, and marginal economics may leave active capacity idle.
+A model-parity policy claiming a model-wide convergence wave must still
+materialize and price the physical width that backs it; a fixture-side integer
+can no longer advertise concurrency absent from production. Broad parallel
+movement also shortens the causal A/B horizon, so cache-pressure and thermal
+drift are less able to masquerade as the effect of changing two experts out of
+a 48-layer model.
+
+### Routed-contribution evidence-state re-audit (2026-08-25)
+
+The widened 122B movement wave first exposed a parity-evidence failure after
+both movement axes, full-model parity, and the convergence economy gate had
+passed. The original comparator treated any norm product below `1e-10` as
+zero, so the first correction separated exact row presence from magnitude and
+computed every positive cosine in FP64. That correction was necessary: a
+proportional low-energy pair must still pass, while a low-energy orthogonal
+pair must still fail its per-route comparison.
+
+The next exact ROCm1/CPU2 soak exposed the remaining ambiguity rather than a
+movement or transport defect. One returned CPU addend had 3,072 nonzero FP32
+values. Production/reference L2 norms were `9.081e-6`/`8.334e-6`, cosine was
+`0.906348`, and per-element RMSE was only `6.925e-8`; the independently
+completed `MOE_EXPERT_OUTPUT` cosine was `0.999008`. The route signal therefore
+sat below the canonical parity comparator's established `1e-10` norm-product
+resolution. Treating its unstable angle as either a missing execution or a
+fully resolvable mismatch was incorrect.
+
+```mermaid
+flowchart TD
+    F[Captured production forward completes] --> P[Pinned route bank names expert and participant]
+    P --> C{Typed publication form}
+    C -->|continuation or returned canonical| J[Join canonical slot by row and expert with HF]
+    C -->|deferred remote aggregate| D[Prove intentional empty slot plus completed dense return]
+    J --> R{Typed contribution state}
+    R -->|one-sided zero| X[Fail missing canonical execution]
+    R -->|exact zero equality| E[Exact equality proof]
+    R -->|nonzero above resolution| K[Apply per-route cosine gate]
+    R -->|nonzero below resolution| L{Per-route cosine passes?}
+    L -->|yes| K
+    L -->|no| A[Require independently passing completed MoE output]
+    D --> A
+    K --> Q[Typed proof outcome]
+    E --> Q
+    A --> Q
+    Q --> O[CSV state, proof, norms, L2 error, RMSE]
+```
+
+A subsequent soak chose a different but valid dynamic placement and exposed a
+second, independent authority error in the test. During decode step 1,
+production and Hugging Face first selected different low-weight experts in an
+earlier layer. At layer 27 every individually observable same-expert addend was
+still close (`0.994`--`0.999` cosine), including the promoted ROCm expert, but
+the different expert sets made the completed routed sum a different operation.
+That branch difference propagated into later hidden states. The old epilogue
+then treated 39 later same-expert comparisons, now evaluated on different
+inputs, as independent evidence against the moved experts. Seven implicated
+promotions independently passed during prefill and other decode steps. The
+production LM-head/KL gate also passed. The failures therefore identified a
+test-authority defect, not a weight-transfer or expert-kernel defect.
+
+```mermaid
+flowchart LR
+    A[HF and production enter a layer] --> B{Any prior discrete route differed?}
+    B -->|no: canonical lineage| C[Per-expert HF comparison is authoritative]
+    B -->|yes: branched lineage| D[Per-expert HF comparison is diagnostic]
+    C --> E{Typed numerical proof passes?}
+    E -->|yes| P[Certified positive witness]
+    E -->|no| F[Fail numerical parity]
+    D --> G{Comparison happens to pass?}
+    G -->|yes| P
+    G -->|no| I[Inconclusive; cannot convict with different inputs]
+    I --> J[Require another certified publication-path witness]
+    P --> K[Movement path certified]
+    J --> K
+    K --> L[Global downstream HF checkpoints remain authoritative]
+```
+
+Reference lineage is advanced only *after* the current layer's routing
+decision, because that decision changes the residual consumed by the next
+layer. A branched-lineage mismatch is neither success nor failure: it cannot
+satisfy the required positive movement witness. Invalid geometry, non-finite
+evidence, and one-sided zero remain fatal regardless of lineage. Every
+observed destination participant must still have at least one independent
+certified same-expert witness, and the ordinary branch-aware stage, layer,
+LM-head, KL, and token gates remain unchanged.
+
+Magnitude is not execution state: exact zero, one-sided zero, and nonzero
+publication remain distinct. Resolution is nevertheless a numerical property.
+The comparator now assigns one `RoutedExpertContributionState`, retains cosine
+for every positive norm, and records production/reference norms, absolute L2
+error, and RMSE. A second typed `RoutedExpertContributionProof` then states
+which independent authority certified the result. A resolvable mismatch can
+never be rescued by aggregate parity. Only a nonzero contribution below the
+same cosine-resolution boundary already used by the canonical parity suite may
+use a passing completed semantic output, and only the explicitly declared
+deferred publication may use that output with an empty canonical slot.
+
+```mermaid
+stateDiagram-v2
+    [*] --> InvalidGeometry
+    InvalidGeometry --> InvalidEvidence: malformed ID / duplicate route / non-finite value
+    InvalidGeometry --> NoComparableRows: geometry and encodings valid
+    NoComparableRows --> NoComparableRows: no shared expert row
+    NoComparableRows --> OneSidedZero: shared row, exactly one canonical side nonzero
+    NoComparableRows --> ExactZeroEquality: every shared row exactly zero on both sides
+    NoComparableRows --> ComparableNonzeroBelowCosineResolution: both nonzero; norm product <= canonical resolution
+    NoComparableRows --> ComparableNonzero: both nonzero; norm product above canonical resolution
+    ExactZeroEquality --> ExactProof
+    ComparableNonzero --> PerRouteProof: cosine meets model threshold
+    ComparableNonzero --> CheckLineage: cosine misses model threshold
+    ComparableNonzeroBelowCosineResolution --> PerRouteProof: cosine meets model threshold
+    ComparableNonzeroBelowCosineResolution --> AggregateProof: cosine misses; completed semantic output passes
+    ComparableNonzeroBelowCosineResolution --> CheckLineage: completed semantic output misses
+    OneSidedZero --> DeferredAggregateProof: publication explicitly deferred and completed output passes
+    OneSidedZero --> Failed: canonical publication required
+    CheckLineage --> Failed: canonical reference-input lineage
+    CheckLineage --> Inconclusive: prior discrete routing diverged
+    InvalidEvidence --> Failed
+```
+
+FP32 inputs are squared and accumulated in FP64, so every positive norm still
+receives the same cosine calculation. Focused regressions cover proportional
+and orthogonal pairs below the resolution boundary, require the latter to fail
+without a passing completed-output witness, and prove that an above-resolution
+mismatch cannot be rescued even by perfect aggregate cosine. The production
+capture path and artifact filenames remain unchanged; the two route-evidence
+CSVs append the explicit state/proof, input lineage, three-state disposition,
+and error metrics needed to diagnose this decision without another
+instrumented model run.
+
+### Distributed maintenance terminal-drain lifecycle re-audit (2026-08-25)
+
+The ROCm/CPU production soak exposed a teardown race after all numerical work
+had completed. The arbitrary continuation rank began publishing histogram
+generation 3 just as the command root announced terminal shutdown. The peer
+treated its preposted receive as disposable process-local state, cancelled it,
+and entered prepared-context restoration. The continuation rank then waited
+for an acknowledgement that could no longer be produced. Proposal publication
+and prepared-weight restoration had therefore been given two independent
+shutdown authorities.
+
+```mermaid
+flowchart LR
+    S[Command root publishes terminal shutdown] --> C[Continuation rank admits proposal N]
+    S --> F[Peer stops local worker]
+    F --> X[Peer cancels matched receive]
+    F --> R[Peer starts prepared-context restoration]
+    C --> A[Continuation waits for peer acknowledgement]
+    X --> A
+    A --> T[Canonical 30-second protocol failure]
+```
+
+The consolidated terminal transition is topology-owned and mirrors the
+device-controller drain. The process-local scope exists only for a prepared,
+partial, or genuinely local composition. A live production distributed worker
+rejects that scope; destructors cannot silently enter an MPI collective, and
+setup rollback cannot accidentally acquire terminal authority.
+
+```mermaid
+stateDiagram-v2
+    [*] --> InferenceClosed: every rank receives terminal shutdown
+    InferenceClosed --> WorkersLiveBarrier: all proposal workers still runnable
+    WorkersLiveBarrier --> CoordinatorDraining: arbitrary proposal authority closes admission
+    CoordinatorDraining --> CoordinatorDraining: finish admitted proposal, movement, publication, retirement
+    CoordinatorDraining --> CoordinatorQuiescent: exact worker join completes
+    CoordinatorQuiescent --> FollowersDraining: topology barrier proves no later proposal
+    FollowersDraining --> FollowersQuiescent: finish adopted wave; cancel only passive next receive
+    FollowersQuiescent --> TopologyQuiescent: final topology barrier
+    TopologyQuiescent --> PublishersReleased
+    PublishersReleased --> PreparedPlacementRestored
+    PreparedPlacementRestored --> [*]
+```
+
+All proposal, transfer, prepare, publication, and retirement progress inside
+this transition remains event- or `MPI_Test`-polled on the maintenance worker;
+there is no inference-stream synchronization or hot-path wait. A real two-rank
+regression uses rank 1 as coordinator, admits a genuine MPI proposal, gates the
+poll/ack edge until terminal drain is active, and proves the coordinator drains
+while the follower remains live before either publisher is released.
 
 ## Performance certification baseline (2026-08-13)
 
@@ -3914,7 +4802,7 @@ capacity resolver, quota installation, and setup-time physical BOM are complete
 foundations rather than remaining design work.
 
 1. Finish the capacity system's user-facing boundary: replace the legacy
-   tier-local byte-cap wording with typed physical participant limits/reserves,
+   tier-local byte-cap wording with typed physical participant limits,
    expose the installed per-layer quotas and complete BOM in
    `--explain-placement`. Retain the now-green per-NUMA available-memory
    admission cells for the real two- and three-tier model topologies.
@@ -3926,7 +4814,7 @@ foundations rather than remaining design work.
    for complete phase evidence, identical identities, abort-only calibration
    waves, and identical proposals on every rank.
 3. Retain the installed all-codebook capacity, apportioned/replicated, shared
-   resource, fallback-failure, shadow-headroom, and captured-graph admission
+   resource, fallback-failure, shadow-capacity, and captured-graph admission
    sweeps. Extend policy coverage with ordinal and seeded-random membership and
    ownership, varying NUMA/VRAM availability, strict integer-priority fill, and
    noisy-window non-oscillation. Add focused configuration/parser and
@@ -3945,7 +4833,7 @@ foundations rather than remaining design work.
    backpressure, migration deferral, quota hit rate, projected-versus-observed
    benefit, and zero inference-stream waits through `PerfStats`.
 7. Fold those cells into the aggregate parity campaign, skill, precommit, and
-   CI gate while preserving the sub-one-hour whole-matrix performance target.
+   CI gate while preserving the 75-minute whole-matrix performance target.
 
 Remote endpoint and distributed-runner composition are no longer remaining
 design work. The two-/three-tier real-weight matrix now certifies correct live

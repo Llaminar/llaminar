@@ -572,6 +572,28 @@ namespace llaminar2
         return getROCmTensorValidator(device_id);
     }
 
+    /**
+     * @brief Destroy one validator before its HIP runtime generation resets.
+     *
+     * Registry publication is removed before destructor work enters HIP, so no
+     * caller can acquire a validator whose device allocation or completion
+     * event is in the process of retirement.
+     */
+    bool retireROCmTensorValidatorRuntimeGeneration(int device_id)
+    {
+        std::unique_ptr<ROCmTensorValidator> retired;
+        {
+            std::lock_guard<std::mutex> lock(g_rocm_validator_mutex);
+            const auto iterator = g_rocm_validators.find(device_id);
+            if (iterator == g_rocm_validators.end())
+                return true;
+            retired = std::move(iterator->second);
+            g_rocm_validators.erase(iterator);
+        }
+        retired.reset();
+        return true;
+    }
+
 } // namespace llaminar2
 
 // C linkage export for cross-TU factory
@@ -583,4 +605,11 @@ extern "C" llaminar2::ITensorValidator *llaminar2_getROCmTensorValidator()
 extern "C" llaminar2::ITensorValidator *llaminar2_getROCmTensorValidatorForDevice(int device_id)
 {
     return llaminar2::getROCmTensorValidator(device_id);
+}
+
+/** @brief C-linkage retirement hook owned by ROCm backend lifecycle code. */
+extern "C" bool llaminar2_retireROCmTensorValidatorRuntimeGeneration(
+    int device_id)
+{
+    return llaminar2::retireROCmTensorValidatorRuntimeGeneration(device_id);
 }

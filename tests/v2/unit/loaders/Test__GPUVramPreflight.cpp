@@ -91,39 +91,27 @@ namespace llaminar2::test
             << message;
     }
 
-    TEST(Test__GPUVramPreflight, GpuDirectRebalanceUsesSmallRuntimeMargin)
-    {
-        EXPECT_EQ(gpuDirectRebalanceVramSafetyMarginBytes(), 16ULL * kMiB);
-    }
-
     TEST(Test__GPUVramPreflight,
-         InitialLoadBomOwnsRingReserveAndExactFitEquation)
+         InitialLoadBomOwnsEveryRingSlotAndExactFitEquation)
     {
-        constexpr size_t kTotal = 24124ULL * kMiB;
         constexpr size_t kWeights = 16971ULL * kMiB;
         constexpr size_t kLargestSource = 2ULL * 1024ULL * kMiB;
         const GPUWeightLoadMemoryPolicy policy{
             .staging_stream_count = 3,
             .staging_budget_bytes = 512ULL * kMiB,
-            .safety_margin_percent = 5,
-            .minimum_safety_margin_bytes = 512ULL * kMiB,
         };
         const size_t expected_slot = (512ULL * kMiB) / 3ULL;
         const size_t expected_staging = expected_slot * 3ULL;
-        const size_t expected_safety = (kTotal * 5ULL) / 100ULL;
-        const size_t expected_required =
-            kWeights + expected_staging + expected_safety;
+        const size_t expected_required = kWeights + expected_staging;
 
         const auto exact = gpuWeightLoadMemoryBOM(
             kWeights,
             kLargestSource,
             expected_required,
-            kTotal,
             policy);
         EXPECT_EQ(exact.staging_slot_bytes, expected_slot);
         EXPECT_EQ(exact.staging_bytes, expected_staging);
         EXPECT_EQ(exact.load_bytes, kWeights + expected_staging);
-        EXPECT_EQ(exact.safety_margin_bytes, expected_safety);
         EXPECT_EQ(exact.required_bytes, expected_required);
         EXPECT_TRUE(exact.fits());
 
@@ -131,12 +119,8 @@ namespace llaminar2::test
             kWeights,
             kLargestSource,
             expected_required - 1,
-            kTotal,
             policy);
         EXPECT_FALSE(one_byte_short.fits());
-        EXPECT_EQ(
-            one_byte_short.availableAfterSafetyReserve(),
-            expected_required - 1 - expected_safety);
     }
 
     TEST(Test__GPUVramPreflight,
@@ -145,19 +129,16 @@ namespace llaminar2::test
         const GPUWeightLoadMemoryPolicy policy{
             .staging_stream_count = 4,
             .staging_budget_bytes = 0,
-            .safety_margin_override_bytes = 17,
         };
         const auto bill = gpuWeightLoadMemoryBOM(
             /*planned_weight_bytes=*/23,
             /*maximum_source_bytes=*/101,
             /*free_vram_bytes=*/1000,
-            /*total_vram_bytes=*/2000,
             policy);
 
         EXPECT_EQ(bill.staging_slot_bytes, 101u);
         EXPECT_EQ(bill.staging_bytes, 404u);
-        EXPECT_EQ(bill.safety_margin_bytes, 17u);
-        EXPECT_EQ(bill.required_bytes, 444u);
+        EXPECT_EQ(bill.required_bytes, 427u);
         EXPECT_TRUE(bill.fits());
     }
 
@@ -172,7 +153,6 @@ namespace llaminar2::test
                 /*planned_weight_bytes=*/0,
                 std::numeric_limits<size_t>::max(),
                 /*free_vram_bytes=*/0,
-                /*total_vram_bytes=*/0,
                 policy),
             std::overflow_error);
     }

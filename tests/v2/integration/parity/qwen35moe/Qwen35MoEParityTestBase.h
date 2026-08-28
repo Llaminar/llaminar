@@ -57,6 +57,23 @@ namespace llaminar2::test::parity::qwen35moe
         }
 
         /**
+         * @brief Classify the unsummed expert oracle as reference-only.
+         *
+         * Direct single-participant MoE kernels preserve serial route order
+         * while accumulating straight into the final routed row. They do not
+         * materialize a `[token, route, hidden]` bank. ExpertOverlay does own
+         * that bank as part of its sparse publication protocol and its focused
+         * movement proof compares it explicitly. Keeping this classification
+         * here prevents generic MTP discovery from demanding a tensor that the
+         * optimized standalone graph never produces.
+         */
+        bool productionParityMTPCheckpointIsLive(
+            std::string_view suffix) const override
+        {
+            return !suffix.ends_with("MOE_ROUTE_CONTRIBUTIONS");
+        }
+
+        /**
          * @brief Return whether this fixture compares recursive MTP sidecars.
          *
          * Ordinary Qwen3.5 MoE parity packs do not pay the additional
@@ -124,12 +141,15 @@ namespace llaminar2::test::parity::qwen35moe
         }
 
         /**
-         * @brief Reject authenticated packs with the retired raw-logit key.
+         * @brief Authenticate router semantics and per-route expert evidence.
          *
          * Production CUDA and ROCm routing reuse their full probability
          * workspace after softmax. The CPU PyTorch oracle must therefore bind
          * `MOE_ROUTER_OUTPUT` to that same distribution, not reconstruct the
-         * pre-softmax projection under an identical filename.
+         * pre-softmax projection under an identical filename. Movement parity
+         * additionally requires an unsummed Hugging Face contribution for
+         * every selected route, so a moved expert remains comparable when an
+         * unrelated low-weight top-k member differs.
          */
         typename Base::ReferenceSnapshotValidation
         validateMoEMainReferenceSnapshotMetadata(
@@ -145,6 +165,24 @@ namespace llaminar2::test::parity::qwen35moe
                     false,
                     "moe_router_snapshot_schema is missing or does not publish "
                     "the post-softmax production boundary"};
+            }
+
+            constexpr int kMoERouteContributionSnapshotSchema = 1;
+            const auto contribution_schema =
+                Base::readSnapshotMetadataValue(
+                    metadata_path,
+                    "moe_route_contribution_snapshot_schema");
+            if (!contribution_schema ||
+                *contribution_schema !=
+                    std::to_string(kMoERouteContributionSnapshotSchema) ||
+                !std::filesystem::is_regular_file(
+                    metadata_path.parent_path() /
+                    "layer0_MOE_ROUTE_CONTRIBUTIONS.npy"))
+            {
+                return {
+                    false,
+                    "moe_route_contribution_snapshot_schema is missing or "
+                    "does not publish per-route expert contributions"};
             }
 
             return {true, {}};

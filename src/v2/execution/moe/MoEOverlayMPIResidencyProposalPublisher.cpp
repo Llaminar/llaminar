@@ -1,9 +1,9 @@
 /**
- * @file MoEOverlayMPIHistogramPublisher.cpp
- * @brief Private non-blocking MPI transport for frozen routing evidence.
+ * @file MoEOverlayMPIResidencyProposalPublisher.cpp
+ * @brief Private non-blocking MPI transport for canonical residency proposals.
  */
 
-#include "MoEOverlayMPIHistogramPublisher.h"
+#include "MoEOverlayMPIResidencyProposalPublisher.h"
 
 #include "MoEOverlayMPIFatal.h"
 
@@ -23,8 +23,8 @@ namespace llaminar2
 {
     namespace
     {
-        constexpr int kHistogramPublicationTag = 0;
-        constexpr int kHistogramAcknowledgementTag = 1;
+        constexpr int kProposalPublicationTag = 0;
+        constexpr int kProposalAcknowledgementTag = 1;
 
         /** @brief Assign one optional diagnostic. */
         void setError(std::string *error, std::string message)
@@ -34,7 +34,8 @@ namespace llaminar2
         }
     } // namespace
 
-    MoEOverlayMPIHistogramPublisher::MoEOverlayMPIHistogramPublisher(
+    MoEOverlayMPIResidencyProposalPublisher::
+        MoEOverlayMPIResidencyProposalPublisher(
         Config config)
         : config_(std::move(config))
     {
@@ -45,24 +46,24 @@ namespace llaminar2
                 config_.mpi_context->world_size())
         {
             throw std::invalid_argument(
-                "ExpertOverlay histogram publisher requires valid multi-rank MPI membership");
+                "ExpertOverlay proposal publisher requires valid multi-rank MPI membership");
         }
         if (config_.coordinator_world_rank < 0 ||
             config_.coordinator_world_rank >=
                 config_.mpi_context->world_size())
         {
             throw std::invalid_argument(
-                "ExpertOverlay histogram coordinator is outside the MPI world");
+                "ExpertOverlay proposal coordinator is outside the MPI world");
         }
         if (config_.num_layers <= 0 || config_.num_experts <= 0)
         {
             throw std::invalid_argument(
-                "ExpertOverlay histogram publisher requires positive model geometry");
+                "ExpertOverlay proposal publisher requires positive model geometry");
         }
         if (config_.mpi_context->communicator() == MPI_COMM_NULL)
         {
             throw std::invalid_argument(
-                "ExpertOverlay histogram publisher requires a live communicator");
+                "ExpertOverlay proposal publisher requires a live communicator");
         }
         if (config_.perf_device.empty())
             config_.perf_device = "expert_overlay_distributed";
@@ -76,16 +77,16 @@ namespace llaminar2
             thread_support < MPI_THREAD_MULTIPLE)
         {
             throw std::runtime_error(
-                "ExpertOverlay histogram publisher requires live MPI_THREAD_MULTIPLE support");
+                "ExpertOverlay proposal publisher requires live MPI_THREAD_MULTIPLE support");
         }
 
         const std::size_t wire_bytes =
-            moeOverlayDistributedHistogramWireBytes(
+            moeOverlayDistributedResidencyProposalWireBytes(
                 config_.num_layers, config_.num_experts);
         if (wire_bytes > static_cast<std::size_t>(INT_MAX))
         {
             throw std::overflow_error(
-                "ExpertOverlay histogram packet exceeds the MPI count ABI");
+                "ExpertOverlay proposal packet exceeds the MPI count ABI");
         }
         wire_buffer_.resize(wire_bytes);
         send_requests_.resize(
@@ -120,10 +121,11 @@ namespace llaminar2
                 throw std::runtime_error(error);
             }
         }
-        recordCounter("histogram_publication_lanes_materialized");
+        recordCounter("proposal_publication_lanes_materialized");
     }
 
-    MoEOverlayMPIHistogramPublisher::~MoEOverlayMPIHistogramPublisher()
+    MoEOverlayMPIResidencyProposalPublisher::
+        ~MoEOverlayMPIResidencyProposalPublisher()
     {
         try
         {
@@ -141,18 +143,18 @@ namespace llaminar2
             MPI_Comm_free(&private_communicator_) != MPI_SUCCESS)
         {
             LOG_ERROR(
-                "[MoEOverlayMPIHistogramPublisher] Private communicator outlived MPI or failed to free");
+                "[MoEOverlayMPIResidencyProposalPublisher] Private communicator outlived MPI or failed to free");
             std::terminate();
         }
     }
 
-    bool MoEOverlayMPIHistogramPublisher::isCoordinator() const noexcept
+    bool MoEOverlayMPIResidencyProposalPublisher::isCoordinator() const noexcept
     {
         return config_.mpi_context->rank() ==
                config_.coordinator_world_rank;
     }
 
-    std::string MoEOverlayMPIHistogramPublisher::mpiError(
+    std::string MoEOverlayMPIResidencyProposalPublisher::mpiError(
         const char *operation,
         int mpi_error)
     {
@@ -168,7 +170,7 @@ namespace llaminar2
         return message.str();
     }
 
-    void MoEOverlayMPIHistogramPublisher::recordCounter(
+    void MoEOverlayMPIResidencyProposalPublisher::recordCounter(
         const char *name,
         double value) const
     {
@@ -187,35 +189,33 @@ namespace llaminar2
     }
 
     MoEOverlayResidencyWaveProgress
-    MoEOverlayMPIHistogramPublisher::fail(
+    MoEOverlayMPIResidencyProposalPublisher::fail(
         std::string message,
         std::string *error)
     {
         if (failure_.empty())
             failure_ = std::move(message);
-        state_ = MoEOverlayMPIHistogramPublisherState::Failed;
+        state_ = MoEOverlayMPIResidencyProposalPublisherState::Failed;
         setError(error, failure_);
         return MoEOverlayResidencyWaveProgress::Failed;
     }
 
-    bool MoEOverlayMPIHistogramPublisher::armReceive(std::string *error)
+    bool MoEOverlayMPIResidencyProposalPublisher::armReceive(std::string *error)
     {
         if (isCoordinator())
         {
             setError(
                 error,
-                "ExpertOverlay histogram coordinator cannot arm a peer receive");
+                "ExpertOverlay proposal coordinator cannot arm a peer receive");
             return false;
         }
-        if (state_ == MoEOverlayMPIHistogramPublisherState::Stopped ||
-            state_ == MoEOverlayMPIHistogramPublisherState::Failed ||
+        if (state_ != MoEOverlayMPIResidencyProposalPublisherState::Idle ||
             receive_request_ != MPI_REQUEST_NULL ||
-            acknowledgement_send_request_ != MPI_REQUEST_NULL ||
-            received_window_pending_acknowledgement_)
+            acknowledgement_send_request_ != MPI_REQUEST_NULL)
         {
             setError(
                 error,
-                "ExpertOverlay histogram receive cannot be armed in the current lane state");
+                "ExpertOverlay proposal receive cannot be armed in the current lane state");
             return false;
         }
 
@@ -224,7 +224,7 @@ namespace llaminar2
             static_cast<int>(wire_buffer_.size()),
             MPI_BYTE,
             config_.coordinator_world_rank,
-            kHistogramPublicationTag,
+            kProposalPublicationTag,
             private_communicator_,
             &receive_request_);
         if (mpi_result != MPI_SUCCESS ||
@@ -233,21 +233,90 @@ namespace llaminar2
             ++stats_.mpi_failures;
             receive_request_ = MPI_REQUEST_NULL;
             failure_ = mpiError("MPI_Irecv", mpi_result);
-            state_ = MoEOverlayMPIHistogramPublisherState::Failed;
+            state_ = MoEOverlayMPIResidencyProposalPublisherState::Failed;
             setError(error, failure_);
             return false;
         }
         operation_started_at_ = std::chrono::steady_clock::now();
-        state_ = MoEOverlayMPIHistogramPublisherState::Receiving;
+        state_ = MoEOverlayMPIResidencyProposalPublisherState::Receiving;
         ++stats_.receives_armed;
-        recordCounter("histogram_receives_armed");
+        recordCounter("proposal_receives_armed");
         if (error)
             error->clear();
         return true;
     }
 
-    bool MoEOverlayMPIHistogramPublisher::beginPublish(
-        const DecodeExpertHistogramWindow &window,
+    bool MoEOverlayMPIResidencyProposalPublisher::acceptReceivedProposal(
+        std::uint64_t histogram_generation,
+        std::string *error)
+    {
+        if (isCoordinator() ||
+            state_ !=
+                MoEOverlayMPIResidencyProposalPublisherState::AwaitingValidation ||
+            awaiting_validation_generation_ == 0u ||
+            histogram_generation != awaiting_validation_generation_ ||
+            acknowledgement_send_request_ != MPI_REQUEST_NULL)
+        {
+            ++stats_.validation_failures;
+            setError(
+                error,
+                "ExpertOverlay proposal acceptance does not match the decoded peer generation");
+            return false;
+        }
+
+        acknowledgement_send_generation_ = histogram_generation;
+        const int acknowledgement_result = MPI_Isend(
+            &acknowledgement_send_generation_,
+            1,
+            MPI_UINT64_T,
+            config_.coordinator_world_rank,
+            kProposalAcknowledgementTag,
+            private_communicator_,
+            &acknowledgement_send_request_);
+        if (acknowledgement_result != MPI_SUCCESS ||
+            acknowledgement_send_request_ == MPI_REQUEST_NULL)
+        {
+            ++stats_.mpi_failures;
+            acknowledgement_send_request_ = MPI_REQUEST_NULL;
+            failure_ = mpiError(
+                "MPI_Isend proposal semantic acknowledgement",
+                acknowledgement_result);
+            state_ = MoEOverlayMPIResidencyProposalPublisherState::Failed;
+            setError(error, failure_);
+            return false;
+        }
+
+        awaiting_validation_generation_ = 0u;
+        operation_started_at_ = std::chrono::steady_clock::now();
+        state_ = MoEOverlayMPIResidencyProposalPublisherState::Acknowledging;
+        ++stats_.acknowledgements_started;
+        recordCounter("proposal_acknowledgements_started");
+        if (error)
+            error->clear();
+        return true;
+    }
+
+    void MoEOverlayMPIResidencyProposalPublisher::rejectReceivedProposal(
+        std::uint64_t histogram_generation,
+        std::string diagnostic)
+    {
+        std::ostringstream fatal;
+        fatal << "Peer rejected authoritative proposal after semantic adoption"
+              << " generation=" << histogram_generation
+              << " expected_generation=" << awaiting_validation_generation_
+              << " state=" << static_cast<int>(state_)
+              << " reason="
+              << (diagnostic.empty() ? "unspecified" : diagnostic);
+        ++stats_.validation_failures;
+        abortMoEOverlayMPI(
+            private_communicator_,
+            config_.mpi_context->rank(),
+            "proposal_semantic_adoption",
+            fatal.str());
+    }
+
+    bool MoEOverlayMPIResidencyProposalPublisher::beginPublish(
+        const MoEOverlayDistributedResidencyProposal &proposal,
         std::string *error)
     {
         if (!isCoordinator())
@@ -255,28 +324,29 @@ namespace llaminar2
             ++stats_.validation_failures;
             setError(
                 error,
-                "Only the declared ExpertOverlay coordinator may publish routing evidence");
+                "Only the declared ExpertOverlay coordinator may publish residency proposals");
             return false;
         }
-        if (state_ != MoEOverlayMPIHistogramPublisherState::Idle)
+        if (state_ != MoEOverlayMPIResidencyProposalPublisherState::Idle)
         {
             ++stats_.validation_failures;
             setError(
                 error,
-                "ExpertOverlay histogram publisher already owns an active generation");
+                "ExpertOverlay proposal publisher already owns an active generation");
             return false;
         }
-        if (window.num_layers != config_.num_layers ||
-            window.num_experts != config_.num_experts || !window.valid())
+        if (!proposal.valid() ||
+            proposal.plan.num_layers != config_.num_layers ||
+            proposal.plan.num_experts != config_.num_experts)
         {
             ++stats_.validation_failures;
             setError(
                 error,
-                "ExpertOverlay coordinator histogram does not match model geometry");
+                "ExpertOverlay coordinator proposal does not match model geometry");
             return false;
         }
-        if (!encodeMoEOverlayDistributedHistogramWindow(
-                window, wire_buffer_, error))
+        if (!encodeMoEOverlayDistributedResidencyProposal(
+                proposal, wire_buffer_, error))
         {
             ++stats_.validation_failures;
             return false;
@@ -290,7 +360,8 @@ namespace llaminar2
             acknowledgement_receive_generations_.begin(),
             acknowledgement_receive_generations_.end(),
             0u);
-        publishing_generation_ = window.generation;
+        publishing_generation_ =
+            proposal.plan.histogram_window->generation;
         for (int rank = 0; rank < config_.mpi_context->world_size(); ++rank)
         {
             if (rank == config_.coordinator_world_rank)
@@ -307,7 +378,7 @@ namespace llaminar2
                 1,
                 MPI_UINT64_T,
                 rank,
-                kHistogramAcknowledgementTag,
+                kProposalAcknowledgementTag,
                 private_communicator_,
                 &acknowledgement_receive_requests_[
                     static_cast<std::size_t>(rank)]);
@@ -317,8 +388,8 @@ namespace llaminar2
             {
                 ++stats_.mpi_failures;
                 failure_ = mpiError(
-                    "MPI_Irecv histogram acknowledgement", mpi_result);
-                state_ = MoEOverlayMPIHistogramPublisherState::Failed;
+                    "MPI_Irecv proposal acknowledgement", mpi_result);
+                state_ = MoEOverlayMPIResidencyProposalPublisherState::Failed;
                 setError(error, failure_);
                 return false;
             }
@@ -327,7 +398,7 @@ namespace llaminar2
                 static_cast<int>(wire_buffer_.size()),
                 MPI_BYTE,
                 rank,
-                kHistogramPublicationTag,
+                kProposalPublicationTag,
                 private_communicator_,
                 &send_requests_[static_cast<std::size_t>(rank)]);
             if (mpi_result != MPI_SUCCESS ||
@@ -336,55 +407,62 @@ namespace llaminar2
             {
                 ++stats_.mpi_failures;
                 failure_ = mpiError("MPI_Isend", mpi_result);
-                state_ = MoEOverlayMPIHistogramPublisherState::Failed;
+                state_ = MoEOverlayMPIResidencyProposalPublisherState::Failed;
                 setError(error, failure_);
                 return false;
             }
         }
 
         operation_started_at_ = std::chrono::steady_clock::now();
-        state_ = MoEOverlayMPIHistogramPublisherState::Publishing;
+        state_ = MoEOverlayMPIResidencyProposalPublisherState::Publishing;
         ++stats_.publications_started;
         stats_.bytes_sent +=
             static_cast<std::uint64_t>(wire_buffer_.size()) *
             static_cast<std::uint64_t>(
                 config_.mpi_context->world_size() - 1);
-        recordCounter("histogram_publications_started");
+        recordCounter("proposal_publications_started");
         if (error)
             error->clear();
         return true;
     }
 
     MoEOverlayResidencyWaveProgress
-    MoEOverlayMPIHistogramPublisher::poll(
-        std::shared_ptr<const DecodeExpertHistogramWindow>
-            *received_window,
+    MoEOverlayMPIResidencyProposalPublisher::poll(
+        std::shared_ptr<const MoEOverlayDistributedResidencyProposal>
+            *received_proposal,
         std::string *error)
     {
         ++stats_.progress_polls;
-        if (received_window)
-            received_window->reset();
-        if (state_ == MoEOverlayMPIHistogramPublisherState::Failed)
+        if (received_proposal)
+            received_proposal->reset();
+        if (state_ == MoEOverlayMPIResidencyProposalPublisherState::Failed)
             return fail(failure_, error);
-        if (state_ != MoEOverlayMPIHistogramPublisherState::Receiving &&
-            state_ != MoEOverlayMPIHistogramPublisherState::Acknowledging &&
-            state_ != MoEOverlayMPIHistogramPublisherState::Publishing)
+        if (state_ ==
+            MoEOverlayMPIResidencyProposalPublisherState::AwaitingValidation)
         {
             return fail(
-                "ExpertOverlay histogram lane was polled without active traffic",
+                "ExpertOverlay decoded proposal was polled before semantic acceptance or rejection",
+                error);
+        }
+        if (state_ != MoEOverlayMPIResidencyProposalPublisherState::Receiving &&
+            state_ != MoEOverlayMPIResidencyProposalPublisherState::Acknowledging &&
+            state_ != MoEOverlayMPIResidencyProposalPublisherState::Publishing)
+        {
+            return fail(
+                "ExpertOverlay proposal lane was polled without active traffic",
                 error);
         }
 
         int complete = 0;
         int mpi_result = MPI_SUCCESS;
-        if (state_ == MoEOverlayMPIHistogramPublisherState::Receiving)
+        if (state_ == MoEOverlayMPIResidencyProposalPublisherState::Receiving)
         {
             mpi_result = MPI_Test(
                 &receive_request_, &complete, MPI_STATUS_IGNORE);
         }
         else if (
             state_ ==
-            MoEOverlayMPIHistogramPublisherState::Acknowledging)
+            MoEOverlayMPIResidencyProposalPublisherState::Acknowledging)
         {
             mpi_result = MPI_Test(
                 &acknowledgement_send_request_,
@@ -419,7 +497,7 @@ namespace llaminar2
             abortMoEOverlayMPI(
                 private_communicator_,
                 config_.mpi_context->rank(),
-                "histogram_publication",
+                "proposal_publication",
                 message);
         }
 
@@ -434,7 +512,7 @@ namespace llaminar2
              * publication and peer acknowledgement both retain the canonical
              * deadline because their counterpart has promised progress.
              */
-            if (moeOverlayHistogramOwnsProgressDeadline(state_) &&
+            if (moeOverlayProposalOwnsProgressDeadline(state_) &&
                 elapsed >= std::chrono::milliseconds(
                                collective_timeout_policy::
                                    kDefaultCollectiveTimeoutMs))
@@ -451,13 +529,13 @@ namespace llaminar2
                 abortMoEOverlayMPI(
                     private_communicator_,
                     config_.mpi_context->rank(),
-                    "histogram_publication",
+                    "proposal_publication",
                     diagnostic.str());
             }
             return MoEOverlayResidencyWaveProgress::Pending;
         }
 
-        if (state_ == MoEOverlayMPIHistogramPublisherState::Publishing)
+        if (state_ == MoEOverlayMPIResidencyProposalPublisherState::Publishing)
         {
             for (int rank = 0;
                  rank < config_.mpi_context->world_size();
@@ -472,7 +550,7 @@ namespace llaminar2
                     ++stats_.validation_failures;
                     std::ostringstream diagnostic;
                     diagnostic
-                        << "Histogram peer acknowledged the wrong generation"
+                        << "Proposal peer acknowledged the wrong generation"
                         << " peer_rank=" << rank
                         << " expected_generation=" << publishing_generation_
                         << " received_generation="
@@ -482,16 +560,16 @@ namespace llaminar2
                     abortMoEOverlayMPI(
                         private_communicator_,
                         config_.mpi_context->rank(),
-                        "histogram_publication",
+                        "proposal_publication",
                         diagnostic.str());
                 }
                 ++stats_.acknowledgements_received;
             }
-            state_ = MoEOverlayMPIHistogramPublisherState::Idle;
+            state_ = MoEOverlayMPIResidencyProposalPublisherState::Idle;
             ++stats_.publications_completed;
-            recordCounter("histogram_publications_completed");
+            recordCounter("proposal_publications_completed");
             recordCounter(
-                "histogram_acknowledgements_received",
+                "proposal_acknowledgements_received",
                 static_cast<double>(
                     config_.mpi_context->world_size() - 1));
             if (error)
@@ -499,84 +577,60 @@ namespace llaminar2
             return MoEOverlayResidencyWaveProgress::Ready;
         }
 
-        if (state_ == MoEOverlayMPIHistogramPublisherState::Acknowledging)
+        if (state_ == MoEOverlayMPIResidencyProposalPublisherState::Acknowledging)
         {
-            auto window =
-                std::move(received_window_pending_acknowledgement_);
-            if (!window ||
-                window->generation != acknowledgement_send_generation_)
+            if (acknowledgement_send_generation_ == 0u)
             {
                 ++stats_.validation_failures;
                 return fail(
-                    "Histogram acknowledgement completed without its exact immutable window",
+                    "Proposal acknowledgement completed without its accepted generation",
                     error);
             }
-            state_ = MoEOverlayMPIHistogramPublisherState::Idle;
+            state_ = MoEOverlayMPIResidencyProposalPublisherState::Idle;
             ++stats_.acknowledgements_completed;
-            ++stats_.windows_received;
-            recordCounter("histogram_acknowledgements_completed");
-            recordCounter("histogram_windows_received");
-            if (received_window)
-                *received_window = std::move(window);
+            recordCounter("proposal_acknowledgements_completed");
+            acknowledgement_send_generation_ = 0u;
             if (error)
                 error->clear();
             return MoEOverlayResidencyWaveProgress::Ready;
         }
 
-        auto window = std::make_shared<DecodeExpertHistogramWindow>();
-        window->expert_counts.reserve(
-            static_cast<std::size_t>(config_.num_layers) *
-            static_cast<std::size_t>(config_.num_experts));
-        window->source_expert_counts.reserve(
-            kExpertHistogramProductionSourceCount *
-            static_cast<std::size_t>(config_.num_layers) *
-            static_cast<std::size_t>(config_.num_experts));
+        auto proposal =
+            std::make_shared<MoEOverlayDistributedResidencyProposal>();
         std::string decode_error;
-        if (!decodeMoEOverlayDistributedHistogramWindow(
+        if (!decodeMoEOverlayDistributedResidencyProposal(
                 wire_buffer_,
                 config_.num_layers,
                 config_.num_experts,
-                window.get(),
+                proposal.get(),
                 &decode_error))
         {
             ++stats_.validation_failures;
-            return fail(std::move(decode_error), error);
+            fail(decode_error, error);
+            abortMoEOverlayMPI(
+                private_communicator_,
+                config_.mpi_context->rank(),
+                "proposal_authentication",
+                decode_error);
         }
 
-        acknowledgement_send_generation_ = window->generation;
-        received_window_pending_acknowledgement_ = std::move(window);
-        const int acknowledgement_result = MPI_Isend(
-            &acknowledgement_send_generation_,
-            1,
-            MPI_UINT64_T,
-            config_.coordinator_world_rank,
-            kHistogramAcknowledgementTag,
-            private_communicator_,
-            &acknowledgement_send_request_);
-        if (acknowledgement_result != MPI_SUCCESS ||
-            acknowledgement_send_request_ == MPI_REQUEST_NULL)
-        {
-            ++stats_.mpi_failures;
-            acknowledgement_send_request_ = MPI_REQUEST_NULL;
-            return fail(
-                mpiError(
-                    "MPI_Isend histogram acknowledgement",
-                    acknowledgement_result),
-                error);
-        }
-        operation_started_at_ = std::chrono::steady_clock::now();
-        state_ = MoEOverlayMPIHistogramPublisherState::Acknowledging;
-        ++stats_.acknowledgements_started;
+        awaiting_validation_generation_ =
+            proposal->plan.histogram_window->generation;
+        state_ =
+            MoEOverlayMPIResidencyProposalPublisherState::AwaitingValidation;
+        ++stats_.windows_received;
         stats_.bytes_received += wire_buffer_.size();
-        recordCounter("histogram_acknowledgements_started");
+        recordCounter("proposals_received");
+        if (received_proposal)
+            *received_proposal = std::move(proposal);
         if (error)
             error->clear();
-        return MoEOverlayResidencyWaveProgress::Pending;
+        return MoEOverlayResidencyWaveProgress::Ready;
     }
 
-    void MoEOverlayMPIHistogramPublisher::stopAndDrain()
+    void MoEOverlayMPIResidencyProposalPublisher::stopAndDrain()
     {
-        if (state_ == MoEOverlayMPIHistogramPublisherState::Stopped)
+        if (state_ == MoEOverlayMPIResidencyProposalPublisherState::Stopped)
             return;
 
         if (receive_request_ != MPI_REQUEST_NULL)
@@ -587,7 +641,7 @@ namespace llaminar2
             if (cancel_result != MPI_SUCCESS || wait_result != MPI_SUCCESS)
             {
                 throw std::runtime_error(
-                    "Failed to drain ExpertOverlay histogram receive during runner shutdown");
+                    "Failed to drain ExpertOverlay proposal receive during runner shutdown");
             }
         }
 
@@ -598,7 +652,7 @@ namespace llaminar2
             if (wait_result != MPI_SUCCESS)
             {
                 throw std::runtime_error(
-                    "Failed to drain ExpertOverlay histogram acknowledgement during runner shutdown");
+                    "Failed to drain ExpertOverlay proposal acknowledgement during runner shutdown");
             }
         }
 
@@ -614,7 +668,7 @@ namespace llaminar2
             if (wait_result != MPI_SUCCESS)
             {
                 throw std::runtime_error(
-                    "Failed to drain ExpertOverlay histogram sends during runner shutdown");
+                    "Failed to drain ExpertOverlay proposal sends during runner shutdown");
             }
         }
         for (auto &request : acknowledgement_receive_requests_)
@@ -626,10 +680,11 @@ namespace llaminar2
             if (cancel_result != MPI_SUCCESS || wait_result != MPI_SUCCESS)
             {
                 throw std::runtime_error(
-                    "Failed to drain ExpertOverlay histogram readiness receive during runner shutdown");
+                    "Failed to drain ExpertOverlay proposal readiness receive during runner shutdown");
             }
         }
-        received_window_pending_acknowledgement_.reset();
-        state_ = MoEOverlayMPIHistogramPublisherState::Stopped;
+        awaiting_validation_generation_ = 0u;
+        acknowledgement_send_generation_ = 0u;
+        state_ = MoEOverlayMPIResidencyProposalPublisherState::Stopped;
     }
 } // namespace llaminar2

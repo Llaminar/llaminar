@@ -11,11 +11,13 @@
 #include "execution/moe/MoEOverlayInferenceTransaction.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <stdexcept>
 
@@ -33,6 +35,76 @@ namespace llaminar2::test
                 .target_world_rank = target_rank,
             };
         }
+
+        /** @brief Sealed CPU-only stand-in for coordinator lifecycle tests. */
+        MoEOverlayInferenceCoordinatorGraphPlan coordinatorGraphPlan(
+            int continuation_participants,
+            std::vector<int> follower_ranks = {1})
+        {
+            std::vector<
+                MoEOverlayInferenceCoordinatorGraphPlan::Segment>
+                segments;
+            segments.reserve(1u + follower_ranks.size());
+            segments.push_back({
+                .role =
+                    MoEOverlayInferenceCoordinatorSegmentRole::Continuation,
+                .materialization =
+                    MoEOverlayInferenceSegmentMaterializationKind::
+                        NativeDeviceExecutable,
+                .world_rank = 0,
+                .local_participant_count =
+                    static_cast<std::size_t>(continuation_participants),
+            });
+            for (const int follower_rank : follower_ranks)
+            {
+                segments.push_back({
+                    .role = MoEOverlayInferenceCoordinatorSegmentRole::
+                        ExpertFollower,
+                    .materialization =
+                        MoEOverlayInferenceSegmentMaterializationKind::
+                            EagerHostGraph,
+                    .world_rank = follower_rank,
+                    .local_participant_count = 1u,
+                });
+            }
+            return MoEOverlayInferenceCoordinatorGraphPlan::
+                sealAfterSynchronizedMaterialization(
+                    /*graph_family_generation=*/71u,
+                    std::move(segments));
+        }
+
+        /** @brief Restore one process environment value after a focused test. */
+        class ScopedEnvironmentVariable final
+        {
+        public:
+            /** @brief Set @p name to @p value for this object's lifetime. */
+            ScopedEnvironmentVariable(const char *name, const char *value)
+                : name_(name),
+                  had_old_value_(std::getenv(name) != nullptr),
+                  old_value_(had_old_value_ ? std::getenv(name) : "")
+            {
+                setenv(name_.c_str(), value, 1);
+            }
+
+            /** @brief Restore the exact prior environment state. */
+            ~ScopedEnvironmentVariable()
+            {
+                if (had_old_value_)
+                    setenv(name_.c_str(), old_value_.c_str(), 1);
+                else
+                    unsetenv(name_.c_str());
+            }
+
+            ScopedEnvironmentVariable(
+                const ScopedEnvironmentVariable &) = delete;
+            ScopedEnvironmentVariable &operator=(
+                const ScopedEnvironmentVariable &) = delete;
+
+        private:
+            std::string name_;
+            bool had_old_value_ = false;
+            std::string old_value_;
+        };
 
         /** @brief Device/MPI-free publisher used to test rank-wide coordination. */
         class RecordingPublisher final
@@ -225,7 +297,8 @@ namespace llaminar2::test
             });
         }
 
-        MoEExpertOwnerMap heterogeneousOwnerMap()
+        /** @brief Complete two-domain plan used by host-RCU protocol tests. */
+        MoERoutedExpertPlacementPlan heterogeneousPlan()
         {
             RoutedExpertDomain continuation;
             continuation.name = "continuation";
@@ -273,7 +346,25 @@ namespace llaminar2::test
                     .routed_expert_tier = {0, 0, 1, 1},
                 });
             }
-            return MoEExpertOwnerMap::build(plan);
+            return plan;
+        }
+
+        MoEExpertOwnerMap heterogeneousOwnerMap()
+        {
+            return MoEExpertOwnerMap::build(heterogeneousPlan());
+        }
+
+        /** @brief Metadata matching @ref heterogeneousPlan. */
+        MoERoutedExpertModelMetadata heterogeneousMetadata()
+        {
+            MoERoutedExpertModelMetadata metadata;
+            metadata.num_layers = 3;
+            metadata.main_inference_layer_count = 2;
+            metadata.num_experts = 4;
+            metadata.d_model = 16;
+            metadata.routed_intermediate_size = 8;
+            metadata.routed_quant_type = "F32";
+            return metadata;
         }
 
         void completeSlot(
@@ -366,6 +457,134 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoEOverlayInferenceTransaction,
+         CoordinatorGraphPlanSealsOneDeterministicRankTransactionPerSegment)
+    {
+        const auto plan = coordinatorGraphPlan(
+            /*continuation_participants=*/2,
+            /*follower_ranks=*/{3, 1});
+        ASSERT_TRUE(plan.valid());
+        EXPECT_EQ(plan.graphFamilyGeneration(), 71u);
+        EXPECT_EQ(plan.segmentCount(), 3u);
+        EXPECT_EQ(plan.followerSegmentCount(), 2u);
+        EXPECT_EQ(plan.nativeSegmentCount(), 1u);
+        EXPECT_EQ(plan.eagerHostSegmentCount(), 2u);
+        EXPECT_EQ(plan.nativeParticipantCount(), 2u);
+        EXPECT_EQ(plan.continuationWorldRank(), 0);
+        ASSERT_EQ(plan.segments().size(), 3u);
+        EXPECT_EQ(
+            plan.segments()[0].role,
+            MoEOverlayInferenceCoordinatorSegmentRole::Continuation);
+        EXPECT_EQ(plan.segments()[1].world_rank, 1);
+        EXPECT_EQ(plan.segments()[2].world_rank, 3);
+
+        EXPECT_THROW(
+            (void)MoEOverlayInferenceCoordinatorGraphPlan::
+                sealAfterSynchronizedMaterialization(
+                    71u,
+                    {{.role = MoEOverlayInferenceCoordinatorSegmentRole::
+                                  Continuation,
+                      .materialization =
+                          MoEOverlayInferenceSegmentMaterializationKind::
+                              NativeDeviceExecutable,
+                      .world_rank = 0,
+                      .local_participant_count = 1u}}),
+            std::invalid_argument)
+            << "A plan without a remote transaction boundary is incomplete";
+        EXPECT_THROW(
+            (void)MoEOverlayInferenceCoordinatorGraphPlan::
+                sealAfterSynchronizedMaterialization(
+                    71u,
+                    {{.role = MoEOverlayInferenceCoordinatorSegmentRole::
+                                  Continuation,
+                      .materialization =
+                          MoEOverlayInferenceSegmentMaterializationKind::
+                              NativeDeviceExecutable,
+                      .world_rank = 0,
+                      .local_participant_count = 1u},
+                     {.role = MoEOverlayInferenceCoordinatorSegmentRole::
+                                  ExpertFollower,
+                      .materialization =
+                          MoEOverlayInferenceSegmentMaterializationKind::
+                              EagerHostGraph,
+                      .world_rank = 0,
+                      .local_participant_count = 1u}}),
+            std::invalid_argument)
+            << "Two segment roles may never alias one MPI rank";
+    }
+
+    TEST(Test__MoEOverlayInferenceTransaction,
+         CoordinatorGraphPlanMirrorsSetupAndExactSparseReturnRetirement)
+    {
+        ScopedEnvironmentVariable perf_export(
+            "LLAMINAR_PERF_STATS_JSON", "1");
+        ScopedEnvironmentVariable perf_filter(
+            "LLAMINAR_PERF_STATS_FILTER", "forward_graph");
+        PerfStatsCollector::reset();
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        MoEOverlayInferenceTransactionCoordinator coordinator(
+            MoEOverlayInferenceTransactionCoordinator::Config{
+                .publishers = {publisher},
+                .graph_plan = coordinatorGraphPlan(1),
+                .continuation_participant_count = 1,
+                .ticket_authority_participant_index = 0,
+                .participant_completion_boundaries = {
+                    MoEOverlayInferenceCompletionBoundaryKind::
+                        HostSynchronous,
+                },
+                .max_transactions_per_command = 1,
+                .max_mtp_draft_depth = 0,
+            });
+        ASSERT_TRUE(coordinator.beginCommand(command()));
+        ASSERT_TRUE(coordinator.beginGraphSequence(/*draft_depth=*/0));
+        const auto binding = coordinator.beginParticipantGraph(
+            MoEOverlayInferenceExecutionDescriptor{
+                .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+                .placement_epoch = 41,
+                .request_count = 1,
+                .logical_rows_per_request = 1,
+                .physical_rows_per_request = 1,
+            },
+            /*participant_index=*/0);
+        ASSERT_TRUE(binding.ok) << binding.error;
+        ASSERT_TRUE(coordinator.armParticipantGraph(binding));
+        ASSERT_TRUE(coordinator.finishParticipantGraph(binding, true));
+
+        auto before_retirement =
+            PerfStatsCollector::snapshot({"forward_graph"});
+        EXPECT_EQ(
+            std::count_if(
+                before_retirement.begin(),
+                before_retirement.end(),
+                [](const PerfStatRecord &record)
+                {
+                    return record.name == "segmented_replay_segments";
+                }),
+            0)
+            << "graph submission is not the exact sparse-return retirement";
+
+        ASSERT_TRUE(coordinator.retireCompletedGraphSequence());
+        const auto records =
+            PerfStatsCollector::snapshot({"forward_graph"});
+        const auto value_for = [&](const char *name)
+        {
+            const auto found = std::find_if(
+                records.begin(),
+                records.end(),
+                [name](const PerfStatRecord &record)
+                {
+                    return record.name == name;
+                });
+            EXPECT_NE(found, records.end()) << name;
+            return found == records.end() ? 0.0 : found->value;
+        };
+        EXPECT_DOUBLE_EQ(value_for("segmented_plan_segments"), 2.0);
+        EXPECT_DOUBLE_EQ(
+            value_for("segmented_graph_capture_segments"), 1.0);
+        EXPECT_DOUBLE_EQ(value_for("segmented_replay_segments"), 2.0);
+        PerfStatsCollector::reset();
+    }
+
+    TEST(Test__MoEOverlayInferenceTransaction,
          RankCoordinatorPublishesOnceAcrossSymmetricParticipantsAndTargets)
     {
         auto first_target = std::make_shared<RecordingPublisher>(1);
@@ -374,6 +593,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {first_target, second_target},
+                    .graph_plan = coordinatorGraphPlan(2, {1, 2}),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -458,6 +678,69 @@ namespace llaminar2::test
         EXPECT_EQ(second_target->completeCount(), 1u);
     }
 
+    /**
+     * @brief A numeric sequence epoch must own its host-RCU lifetime.
+     *
+     * Maintenance may publish a successor between sparse layers or retained
+     * graph segments. The coordinator therefore holds one authority lease from
+     * sequence admission through exact sparse-return retirement; relying only
+     * on the short per-layer dispatch lease would let the old bank disappear
+     * before the next layer reacquired the same epoch.
+     */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         RankCoordinatorPinsHostResidencyForCompleteGraphSequence)
+    {
+        auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
+            MoEOverlayResidencyAuthority::Config{
+                .initial_plan = heterogeneousPlan(),
+                .model_metadata = heterogeneousMetadata(),
+                .maintenance_mode = MoERebalanceRuntimeMode::Off,
+            });
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        MoEOverlayInferenceTransactionCoordinator coordinator(
+            MoEOverlayInferenceTransactionCoordinator::Config{
+                .publishers = {publisher},
+                .graph_plan = coordinatorGraphPlan(1),
+                .continuation_participant_count = 1,
+                .ticket_authority_participant_index = 0,
+                .participant_completion_boundaries = {
+                    MoEOverlayInferenceCompletionBoundaryKind::
+                        HostSynchronous,
+                },
+                .max_transactions_per_command = 2,
+                .max_mtp_draft_depth = 0,
+                .residency_authority = authority,
+            });
+
+        ASSERT_TRUE(coordinator.beginCommand(command(
+            /*request_generation=*/9,
+            /*command_id=*/3,
+            /*placement_epoch=*/1)));
+        EXPECT_EQ(authority->activeTicketCount(), 0u);
+        ASSERT_TRUE(coordinator.beginGraphSequence(/*draft_depth=*/0));
+        EXPECT_EQ(authority->activeTicketCount(), 1u)
+            << "the complete sequence, not an individual layer, owns the RCU lease";
+        EXPECT_EQ(coordinator.currentPlacementEpoch(), 1u);
+
+        const MoEOverlayInferenceExecutionDescriptor decode{
+            .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+            .placement_epoch = coordinator.currentPlacementEpoch(),
+            .request_count = 1,
+            .logical_rows_per_request = 1,
+            .physical_rows_per_request = 1,
+        };
+        const auto binding = coordinator.beginParticipantGraph(decode, 0);
+        ASSERT_TRUE(binding.ok) << binding.error;
+        ASSERT_TRUE(coordinator.armParticipantGraph(binding));
+        ASSERT_TRUE(coordinator.finishParticipantGraph(binding, true));
+        EXPECT_EQ(authority->activeTicketCount(), 1u)
+            << "graph submission alone is not the sparse-return retirement edge";
+
+        ASSERT_TRUE(coordinator.completeCommand(1));
+        EXPECT_EQ(authority->activeTicketCount(), 0u)
+            << "the exact command terminal retires the final sequence lease";
+    }
+
     TEST(Test__MoEOverlayInferenceTransaction,
          RankCoordinatorRejectsDivergentParticipantGeometry)
     {
@@ -466,6 +749,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -516,6 +800,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 1,
                     .participant_completion_boundaries = {
@@ -565,6 +850,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -637,6 +923,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -718,6 +1005,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -815,6 +1103,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -902,6 +1191,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -1025,6 +1315,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -1116,6 +1407,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -1198,6 +1490,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(1),
                     .continuation_participant_count = 1,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -1261,6 +1554,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(1),
                     .continuation_participant_count = 1,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -1296,6 +1590,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(1),
                     .continuation_participant_count = 1,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -1341,6 +1636,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -1437,6 +1733,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
                     .continuation_participant_count = 2,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {
@@ -1528,6 +1825,7 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
                     .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(1),
                     .continuation_participant_count = 1,
                     .ticket_authority_participant_index = 0,
                     .participant_completion_boundaries = {

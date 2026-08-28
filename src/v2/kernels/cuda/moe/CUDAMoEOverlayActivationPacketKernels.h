@@ -34,6 +34,12 @@ extern "C"
         int device_ordinal,
         void *stream);
 
+    /** @brief Acquire and materialize one colocated CPU canonical ticket. */
+    bool cudaMoEOverlayConsumeCanonicalRouteTicket(
+        const llaminar2::MoEOverlayCanonicalRouteTicketConsumeLaunch *launch,
+        int device_ordinal,
+        void *stream);
+
     /** @brief Enqueue one fused one-row dispatch and system publication. */
     bool cudaMoEOverlayActivationPackSingleRowDispatch(
         const llaminar2::MoEOverlayActivationSingleRowDispatchPackLaunch *launch,

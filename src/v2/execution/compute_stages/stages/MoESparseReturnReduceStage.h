@@ -34,6 +34,11 @@ namespace llaminar2
         {
             ContinuationAccumulator, ///< Scatter rows into the continuation tensor or ticket.
             ProtocolParticipant,     ///< Enter the collective but own no returned dense state.
+            /**
+             * Colocated CPU producer already published compact canonical rows;
+             * this boundary certifies that publication without dense scatter.
+             */
+            CanonicalRouteTicketCompletion,
         };
 
         /** @brief Immutable construction and ownership contract for return/reduce. */
@@ -64,6 +69,9 @@ namespace llaminar2
                 InboundConsumerRole::ContinuationAccumulator;
             /** Fixed pinned return destination for a following captured H2D ingress. */
             std::shared_ptr<MoEOverlayDispatchTicketStorage> ticket_storage;
+            /** Typed colocated CPU canonical-route publication to certify. */
+            std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage>
+                canonical_route_ticket_storage;
             /**
              * @brief Publish completion of the one fully accumulated ticket.
              *
@@ -138,10 +146,17 @@ namespace llaminar2
                  last_collective_result_.collective_complete);
             if (!collective_complete)
                 return false;
-            return !params_.ticket_storage ||
-                   !params_.publish_ticket_completion ||
-                   !params_.manual_boundary_requires_collective_completion ||
-                   params_.ticket_storage->ticket().returnPayloadReady();
+            if (params_.ticket_storage &&
+                params_.publish_ticket_completion &&
+                params_.manual_boundary_requires_collective_completion &&
+                !params_.ticket_storage->ticket().returnPayloadReady())
+            {
+                return false;
+            }
+            return !params_.canonical_route_ticket_storage ||
+                   (params_.outbound_rows &&
+                    params_.canonical_route_ticket_storage->payloadReadyFor(
+                        params_.outbound_rows->residency_epoch));
         }
         bool allowsZeroOutput() const override { return true; }
         CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }

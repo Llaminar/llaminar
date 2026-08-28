@@ -209,6 +209,31 @@ namespace llaminar2::test
             return votes;
         }
 
+        /** @brief Advance every rank through publication with unanimous votes. */
+        void advanceProtocolsToPublished(
+            std::vector<std::unique_ptr<
+                MoEOverlayDistributedResidencyProtocol>> &protocols)
+        {
+            for (int phase = 0; phase < 4; ++phase)
+            {
+                const auto votes = readyVotes(protocols);
+                for (auto &protocol : protocols)
+                {
+                    std::string error;
+                    ASSERT_TRUE(protocol->acceptConsensus(votes, &error))
+                        << error;
+                }
+            }
+            for (auto &protocol : protocols)
+            {
+                ASSERT_EQ(
+                    protocol->state(),
+                    MoEOverlayDistributedResidencyProtocolState::
+                        ReadyForAuthorityPublication);
+                protocol->markAuthorityPublished();
+            }
+        }
+
         /** @brief Build one exact remote projection identity for protocol tests. */
         MoEOverlayRemoteProjectionIdentity remoteProjectionIdentity(
             const MoEOverlayResidencyTransaction &transaction,
@@ -218,8 +243,8 @@ namespace llaminar2::test
             return {
                 .expected_epoch = transaction.expected_epoch,
                 .candidate_epoch = transaction.candidate->epoch,
-                .transaction_fingerprint =
-                    fingerprintMoEOverlayResidencyTransaction(transaction),
+                .execution_fingerprint =
+                    fingerprintMoEOverlayResidencyExecutionPlan(transaction),
                 .migration_index = 0,
                 .layer_idx = 0,
                 .expert_id = 4,
@@ -474,7 +499,7 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
-        RemoteFloatingGpuManifestAuthenticatesPrecisionGeometryAndRawBytes)
+        RemoteFloatingManifestAuthenticatesEveryEndpointPairAndRawBytes)
     {
         auto fixture = makeTransaction();
         const auto identity = remoteProjectionIdentity(
@@ -490,18 +515,45 @@ namespace llaminar2::test
             .bytes = sizeof(bytes),
         };
         const auto manifest =
-            makeMoEOverlayRemoteGpuFloatingProjectionManifest(
+            makeMoEOverlayRemoteFloatingProjectionManifest(
                 identity,
                 source,
                 /*maximum_chunk_bytes=*/37u);
         ASSERT_TRUE(manifest.valid());
-        EXPECT_TRUE(manifest.carriesGpuFloatingBytes());
+        EXPECT_TRUE(manifest.carriesFloatingBytes());
         EXPECT_EQ(manifest.format_kind, ExpertWeightFormatKind::BF16);
         EXPECT_EQ(manifest.N_padded, n);
         EXPECT_EQ(manifest.blocks_per_row, 0);
         EXPECT_EQ(
             manifest.region_bytes,
             (std::array<std::uint64_t, 4>{sizeof(bytes), 0u, 0u, 0u}));
+
+        /*
+         * Floating scalar bytes are representation-compatible across tiers.
+         * Exercise every CPU/GPU endpoint shape so the wire contract cannot
+         * regress to assuming that both ranks own accelerators.
+         */
+        const std::array<std::pair<DeviceId, DeviceId>, 3> endpoint_pairs{
+            std::pair{DeviceId::cpu(), DeviceId::cpu()},
+            std::pair{DeviceId::cpu(), DeviceId::cuda(0)},
+            std::pair{DeviceId::rocm(0), DeviceId::cpu()},
+        };
+        for (const auto &[source_device, destination_device] : endpoint_pairs)
+        {
+            const auto pair_manifest =
+                makeMoEOverlayRemoteFloatingProjectionManifest(
+                    remoteProjectionIdentity(
+                        fixture.transaction,
+                        source_device,
+                        destination_device),
+                    source,
+                    /*maximum_chunk_bytes=*/37u);
+            EXPECT_TRUE(pair_manifest.valid())
+                << source_device.to_string() << " -> "
+                << destination_device.to_string();
+            EXPECT_TRUE(pair_manifest.carriesFloatingBytes());
+            EXPECT_EQ(pair_manifest.region_bytes, manifest.region_bytes);
+        }
 
         std::array<
             std::uint8_t,
@@ -784,22 +836,28 @@ namespace llaminar2::test
             identity_zero.cycle_count,
             rank_zero.transaction.migration_cycles.size());
 
-        auto altered = rank_zero.transaction;
-        altered.migrations.front().activation_count += 1;
-        ASSERT_TRUE(altered.valid());
-        EXPECT_NE(
-            fingerprintMoEOverlayResidencyTransaction(altered),
-            identity_zero.transaction_fingerprint);
+        auto incoherent = rank_zero.transaction;
+        incoherent.migrations.front().activation_count += 1;
+        EXPECT_FALSE(incoherent.valid())
+            << "migration execution metadata cannot name different evidence from its transaction";
 
-        auto altered_window = std::make_shared<
-            DecodeExpertHistogramWindow>(*rank_zero.transaction.histogram_window);
-        altered_window->expert_counts.front() += 1;
-        altered_window->source_expert_counts.front() += 1;
+        auto altered = rank_zero.transaction;
+        auto altered_window = std::make_shared<DecodeExpertHistogramWindow>(
+            *rank_zero.transaction.histogram_window);
+        const auto &altered_migration = altered.migrations.front();
+        const std::size_t altered_index =
+            static_cast<std::size_t>(altered_migration.layer_idx) *
+                static_cast<std::size_t>(altered_window->num_experts) +
+            static_cast<std::size_t>(altered_migration.expert_id);
+        ++altered.migrations.front().activation_count;
+        ++altered_window->expert_counts[altered_index];
+        /* Source zero occupies the first dense layer/expert plane. */
+        ++altered_window->source_expert_counts[altered_index];
         altered.histogram_window = std::move(altered_window);
         ASSERT_TRUE(altered.valid());
         EXPECT_NE(
-            fingerprintMoEOverlayResidencyTransaction(altered),
-            identity_zero.transaction_fingerprint);
+            fingerprintMoEOverlayResidencyExecutionPlan(altered),
+            identity_zero.execution_fingerprint);
     }
 
     TEST(
@@ -833,6 +891,15 @@ namespace llaminar2::test
         const auto measured_fingerprint =
             fingerprintMoEOverlayResidencyTransaction(measured);
         EXPECT_NE(measured_fingerprint, baseline);
+        EXPECT_EQ(
+            fingerprintMoEOverlayResidencyExecutionPlan(measured),
+            fingerprintMoEOverlayResidencyExecutionPlan(
+                fixture.transaction));
+        EXPECT_EQ(
+            makeMoEOverlayDistributedResidencyWaveIdentity(measured),
+            makeMoEOverlayDistributedResidencyWaveIdentity(
+                fixture.transaction))
+            << "Root policy evidence is audited separately from the plan every rank executes";
 
         auto different_profile = measured;
         different_profile.economy.migration_profile_identity =
@@ -852,7 +919,7 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
-        CoordinatorFrozenWindowProducesIdenticalRankLocalTransactions)
+        CoordinatorProposalRoundTripsAndPeerAdoptsExactExecutionPlan)
     {
         auto coordinator_histogram = makeHistogram();
         auto peer_histogram = makeHistogram();
@@ -878,8 +945,53 @@ namespace llaminar2::test
         const auto coordinator_transaction =
             coordinator.proposeFromFrozenHistogramWindow(
                 published_window);
+        const auto root_proposal =
+            makeMoEOverlayDistributedResidencyProposal(
+                coordinator.exportAuthoritativeResidencyPlan(
+                    coordinator_transaction),
+                coordinator_transaction);
+        ASSERT_TRUE(root_proposal.valid());
+
+        const std::size_t packet_bytes =
+            moeOverlayDistributedResidencyProposalWireBytes(
+                modelMetadata().num_layers,
+                modelMetadata().num_experts);
+        std::vector<std::uint8_t> packet(packet_bytes);
+        std::string error;
+        ASSERT_TRUE(encodeMoEOverlayDistributedResidencyProposal(
+            root_proposal, packet, &error))
+            << error;
+        /* Magic 0x504f4f4d is emitted as canonical little-endian "MOOP". */
+        EXPECT_EQ(packet[0], static_cast<std::uint8_t>('M'));
+        EXPECT_EQ(packet[1], static_cast<std::uint8_t>('O'));
+        EXPECT_EQ(packet[2], static_cast<std::uint8_t>('O'));
+        EXPECT_EQ(packet[3], static_cast<std::uint8_t>('P'));
+
+        MoEOverlayDistributedResidencyProposal decoded_proposal;
+        ASSERT_TRUE(decodeMoEOverlayDistributedResidencyProposal(
+            packet,
+            modelMetadata().num_layers,
+            modelMetadata().num_experts,
+            &decoded_proposal,
+            &error))
+            << error;
+        ASSERT_TRUE(decoded_proposal.valid());
+        EXPECT_EQ(
+            decoded_proposal.plan.entries,
+            root_proposal.plan.entries);
+        EXPECT_EQ(
+            fingerprintDecodeExpertHistogramWindow(
+                *decoded_proposal.plan.histogram_window),
+            fingerprintDecodeExpertHistogramWindow(*published_window));
+        EXPECT_EQ(
+            decoded_proposal.execution_fingerprint,
+            root_proposal.execution_fingerprint);
+        EXPECT_EQ(
+            decoded_proposal.policy_fingerprint,
+            root_proposal.policy_fingerprint);
+
         const auto peer_transaction =
-            peer.proposeFromFrozenHistogramWindow(published_window);
+            peer.adoptAuthoritativeResidencyPlan(decoded_proposal.plan);
 
         EXPECT_EQ(
             makeMoEOverlayDistributedResidencyWaveIdentity(
@@ -887,22 +999,37 @@ namespace llaminar2::test
             makeMoEOverlayDistributedResidencyWaveIdentity(
                 peer_transaction));
         EXPECT_EQ(
+            fingerprintMoEOverlayResidencyExecutionPlan(peer_transaction),
+            decoded_proposal.execution_fingerprint);
+        EXPECT_EQ(
+            decoded_proposal.policy_fingerprint,
+            fingerprintMoEOverlayResidencyTransaction(
+                coordinator_transaction));
+        EXPECT_EQ(
             coordinator_histogram->windowGeneration(),
             published_window->generation + 1);
         EXPECT_EQ(
             peer_histogram->windowGeneration(),
             published_window->generation)
-            << "A peer must consume coordinator evidence without rotating its local partial window";
+            << "A peer must adopt root policy without rotating its local partial window";
 
-        auto wrong_geometry =
-            std::make_shared<DecodeExpertHistogramWindow>(*published_window);
-        wrong_geometry->num_experts -= 1;
-        EXPECT_THROW(
-            {
-                [[maybe_unused]] const auto rejected =
-                    peer.proposeFromFrozenHistogramWindow(wrong_geometry);
-            },
-            std::invalid_argument);
+        auto corrupted = packet;
+        corrupted.back() ^= 0x80u;
+        EXPECT_FALSE(decodeMoEOverlayDistributedResidencyProposal(
+            corrupted,
+            modelMetadata().num_layers,
+            modelMetadata().num_experts,
+            &decoded_proposal,
+            &error));
+        EXPECT_NE(error.find("authentication"), std::string::npos);
+
+        EXPECT_FALSE(decodeMoEOverlayDistributedResidencyProposal(
+            packet,
+            modelMetadata().num_layers,
+            modelMetadata().num_experts - 1,
+            &decoded_proposal,
+            &error));
+        EXPECT_NE(error.find("size"), std::string::npos);
     }
 
     TEST(
@@ -983,10 +1110,30 @@ namespace llaminar2::test
             EXPECT_FALSE(protocol->abort());
         }
 
-        const auto retirement_votes = readyVotes(protocols);
+        const auto retirement_admission_votes = readyVotes(protocols);
         for (auto &protocol : protocols)
         {
             EXPECT_THROW(protocol->markRetired(), std::logic_error);
+            std::string error;
+            EXPECT_TRUE(
+                protocol->acceptConsensus(retirement_admission_votes, &error))
+                << error;
+            EXPECT_EQ(
+                protocol->state(),
+                MoEOverlayDistributedResidencyProtocolState::
+                    ReadyToCloseRetirementAdmission);
+            EXPECT_THROW(protocol->markRetired(), std::logic_error);
+            protocol->markRetirementAdmissionClosed();
+            EXPECT_EQ(
+                protocol->state(),
+                MoEOverlayDistributedResidencyProtocolState::
+                    RetirementAdmissionClosed);
+            EXPECT_FALSE(protocol->abort());
+        }
+
+        const auto retirement_votes = readyVotes(protocols);
+        for (auto &protocol : protocols)
+        {
             std::string error;
             EXPECT_TRUE(protocol->acceptConsensus(retirement_votes, &error))
                 << error;
@@ -998,6 +1145,80 @@ namespace llaminar2::test
                 protocol->state(),
                 MoEOverlayDistributedResidencyProtocolState::Retired);
             EXPECT_FALSE(protocol->abort());
+        }
+    }
+
+    TEST(
+        Test__MoEOverlayDistributedResidencyProtocol,
+        RetirementWaitingGenerationsRetryBothBarriersInOrder)
+    {
+        auto fixture = makeTransaction();
+        auto protocols = makeProtocols(
+            makeMoEOverlayDistributedResidencyWaveIdentity(
+                fixture.transaction));
+        advanceProtocolsToPublished(protocols);
+
+        std::vector<MoEOverlayDistributedResidencyVote> waiting_votes;
+        waiting_votes.push_back(protocols[0]->makeLocalVote(
+            MoEOverlayDistributedResidencyVoteDecision::Waiting));
+        waiting_votes.push_back(protocols[1]->makeLocalVote(
+            MoEOverlayDistributedResidencyVoteDecision::Ready));
+        waiting_votes.push_back(protocols[2]->makeLocalVote(
+            MoEOverlayDistributedResidencyVoteDecision::Ready));
+        for (auto &protocol : protocols)
+        {
+            std::string error;
+            EXPECT_FALSE(protocol->acceptConsensus(waiting_votes, &error));
+            EXPECT_TRUE(error.empty());
+            EXPECT_EQ(
+                protocol->state(),
+                MoEOverlayDistributedResidencyProtocolState::Published);
+            EXPECT_THROW(protocol->markRetired(), std::logic_error);
+        }
+
+        const auto ready_votes = readyVotes(protocols);
+        for (auto &protocol : protocols)
+        {
+            std::string error;
+            ASSERT_TRUE(protocol->acceptConsensus(ready_votes, &error))
+                << error;
+            EXPECT_EQ(
+                protocol->state(),
+                MoEOverlayDistributedResidencyProtocolState::
+                    ReadyToCloseRetirementAdmission);
+            protocol->markRetirementAdmissionClosed();
+        }
+
+        std::vector<MoEOverlayDistributedResidencyVote> final_waiting_votes;
+        final_waiting_votes.push_back(protocols[0]->makeLocalVote(
+            MoEOverlayDistributedResidencyVoteDecision::Ready));
+        final_waiting_votes.push_back(protocols[1]->makeLocalVote(
+            MoEOverlayDistributedResidencyVoteDecision::Waiting));
+        final_waiting_votes.push_back(protocols[2]->makeLocalVote(
+            MoEOverlayDistributedResidencyVoteDecision::Ready));
+        for (auto &protocol : protocols)
+        {
+            std::string error;
+            EXPECT_FALSE(
+                protocol->acceptConsensus(final_waiting_votes, &error));
+            EXPECT_TRUE(error.empty());
+            EXPECT_EQ(
+                protocol->state(),
+                MoEOverlayDistributedResidencyProtocolState::
+                    RetirementAdmissionClosed);
+            EXPECT_THROW(protocol->markRetired(), std::logic_error);
+        }
+
+        const auto final_ready_votes = readyVotes(protocols);
+        for (auto &protocol : protocols)
+        {
+            std::string error;
+            ASSERT_TRUE(protocol->acceptConsensus(final_ready_votes, &error))
+                << error;
+            EXPECT_EQ(
+                protocol->state(),
+                MoEOverlayDistributedResidencyProtocolState::ReadyToRetire);
+            protocol->markRetired();
         }
     }
 
@@ -1134,7 +1355,7 @@ namespace llaminar2::test
         auto votes = readyVotes(protocols);
 
         /* Keep the foreign identity structurally valid while changing its digest. */
-        votes[2].identity.transaction_fingerprint.low ^= 0x100u;
+        votes[2].identity.execution_fingerprint.low ^= 0x100u;
         ASSERT_TRUE(votes[2].valid(3));
 
         std::string error;

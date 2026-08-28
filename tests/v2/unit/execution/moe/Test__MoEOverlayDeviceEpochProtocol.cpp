@@ -241,6 +241,46 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoEOverlayDeviceEpochProtocol,
+         ExactPreparedPeerPinsCandidateDuringParallelPublicationFanout)
+    {
+        DeviceMoEOverlayEpochControl control;
+        MoEOverlayDeviceEpochProtocol::initialize(control, 1u);
+        MoEOverlayDeviceEpochProtocol protocol(control);
+
+        ASSERT_EQ(protocol.reserveCandidate(2u), 1u);
+        protocol.markCandidateReady(2u);
+        ASSERT_EQ(
+            protocol.bankState(1u),
+            DeviceMoEOverlayEpochBankState::Ready);
+
+        /* Ordinary admission remains on E and may not treat a merely prepared
+         * bank as the topology publication floor. */
+        EXPECT_FALSE(protocol.tryAcquireAdmitted(2u).has_value());
+        auto old_ticket = protocol.tryAcquirePublished();
+        ASSERT_TRUE(old_ticket.has_value());
+        EXPECT_EQ(old_ticket->epoch, 1u);
+
+        /* A validated activation descriptor from a peer whose selector already
+         * flipped may name E+1 during fan-out. Its exact lease must pin the
+         * globally prepared bank using the generation that publication will
+         * install, without changing local ordinary admission. */
+        auto prepared_ticket = protocol.tryAcquirePreparedExact(2u);
+        ASSERT_TRUE(prepared_ticket.has_value());
+        EXPECT_EQ(prepared_ticket->epoch, 2u);
+        EXPECT_EQ(prepared_ticket->bank(), 1u);
+        EXPECT_EQ(prepared_ticket->generation(), 2u);
+        EXPECT_EQ(protocol.bankReaderCount(1u), 1u);
+        EXPECT_EQ(protocol.publishedEpoch(), 1u);
+
+        const auto publication = protocol.publishReadyCandidate(2u);
+        ASSERT_TRUE(publication.valid());
+        EXPECT_EQ(publication.generation, prepared_ticket->generation());
+        EXPECT_TRUE(protocol.release(*prepared_ticket));
+        EXPECT_TRUE(protocol.release(*old_ticket));
+        EXPECT_TRUE(protocol.tryRetire(1u));
+    }
+
+    TEST(Test__MoEOverlayDeviceEpochProtocol,
          PublicCPUKernelConsumesExternalAdmissionEpoch)
     {
         DeviceMoEOverlayEpochControl control;

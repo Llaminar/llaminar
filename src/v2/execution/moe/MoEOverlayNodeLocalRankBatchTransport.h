@@ -209,6 +209,10 @@ namespace llaminar2
             rows.entry_offsets_host = payload.packet.entry_offsets;
             rows.expert_ids_host = payload.packet.expert_ids;
             rows.route_weights_host = payload.packet.route_weights;
+            rows.original_route_slots_host =
+                payload.packet.original_route_slots;
+            rows.compact_route_slots_host =
+                payload.packet.compact_route_slots;
             rows.hidden_rows_fp32 = payload.packet.hidden_rows_fp32;
             return rows;
         }

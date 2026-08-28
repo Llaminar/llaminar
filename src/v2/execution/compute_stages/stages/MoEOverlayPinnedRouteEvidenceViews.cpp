@@ -63,6 +63,14 @@ namespace llaminar2
                 static_cast<std::size_t>(expert_count_),
                 TensorType::INT32,
                 params.device);
+        overlay_route_bank0_epoch_device_view_ =
+            std::make_unique<GpuTensorView>(
+                const_cast<std::uint32_t *>(
+                    params.overlay_route_placement.banks[0].epoch),
+                1u,
+                1u,
+                TensorType::INT32,
+                params.device);
         overlay_route_participants_bank1_device_view_ =
             std::make_unique<GpuTensorView>(
                 const_cast<std::int32_t *>(
@@ -70,6 +78,14 @@ namespace llaminar2
                         .route_participants),
                 1u,
                 static_cast<std::size_t>(expert_count_),
+                TensorType::INT32,
+                params.device);
+        overlay_route_bank1_epoch_device_view_ =
+            std::make_unique<GpuTensorView>(
+                const_cast<std::uint32_t *>(
+                    params.overlay_route_placement.banks[1].epoch),
+                1u,
+                1u,
                 TensorType::INT32,
                 params.device);
         overlay_route_selected_bank_device_view_ =
@@ -101,10 +117,20 @@ namespace llaminar2
                 1u,
                 static_cast<std::size_t>(expert_count_))
             .addOutput(
+                "overlay_route_bank0_epoch",
+                overlay_route_bank0_epoch_device_view_.get(),
+                1u,
+                1u)
+            .addOutput(
                 "overlay_route_participants_bank1",
                 overlay_route_participants_bank1_device_view_.get(),
                 1u,
                 static_cast<std::size_t>(expert_count_))
+            .addOutput(
+                "overlay_route_bank1_epoch",
+                overlay_route_bank1_epoch_device_view_.get(),
+                1u,
+                1u)
             .addOutput(
                 "overlay_route_selected_bank",
                 overlay_route_selected_bank_device_view_.get(),

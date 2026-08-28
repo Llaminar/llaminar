@@ -128,6 +128,14 @@ namespace llaminar2
 
             std::vector<IMoEGroupedVerifierHistogramPublisher *>
                 moe_histogram_publishers;
+            /**
+             * Table-owned stream shared by every deferred MoE publisher.
+             *
+             * Null is valid only when @ref moe_histogram_publishers is empty.
+             * The graph cache borrows this immutable identity and therefore
+             * cannot create a late producer after histogram topology sealing.
+             */
+            void *moe_histogram_publication_stream = nullptr;
             std::vector<MainKVBinding> main_kv_bindings;
 
             bool publish_shifted_kv = false;
@@ -149,6 +157,30 @@ namespace llaminar2
         static_assert(StageParamsRequired<Params>);
 
         explicit MTPSpeculativeStatePublicationStage(Params params);
+
+        /**
+         * @brief Admit every deferred MoE histogram writer before capture.
+         *
+         * The accepted-state graph borrows the exact table-owned stream used by
+         * all retained per-layer route ledgers. Each publisher certifies that
+         * immutable identity here; execute() then performs only capture-safe
+         * validation and kernel enqueue operations.
+         */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+
+        /**
+         * @brief Require exact-stream producer admission before native capture.
+         *
+         * The accepted-state graph retains one immutable capture stream for its
+         * lifetime.  Histogram maintenance allocates the producer rendezvous
+         * events once while that graph is materialized; replay needs no host
+         * preparation because the stream identity cannot change without a new
+         * graph family.
+         */
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return GraphLaunchPreparationPolicy::CaptureOnly;
+        }
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override

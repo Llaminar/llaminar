@@ -102,6 +102,16 @@ namespace llaminar2
         uint32_t slot_count = 0;
         uint32_t invalid_runtime_layers = 0;
         uint32_t first_invalid_runtime_layer = 0xffffffffu;
+        /** Active-bank selector observed for the first invalid runtime layer. */
+        uint32_t first_invalid_runtime_active_bank = 0xffffffffu;
+        /** Active epoch observed for the first invalid runtime layer. */
+        uint32_t first_invalid_runtime_active_epoch = 0;
+        /** Expert geometry observed for the first invalid runtime layer. */
+        uint32_t first_invalid_runtime_expert_count = 0;
+        /** Domain-local participant observed for the first invalid layer. */
+        uint32_t first_invalid_runtime_participant_id = 0xffffffffu;
+        /** Domain participant count observed for the first invalid layer. */
+        uint32_t first_invalid_runtime_participant_count = 0;
         uint32_t first_invalid_claim_flat = 0xffffffffu;
         uint32_t first_duplicate_claim_flat = 0xffffffffu;
         DeviceMoETransferSlotClaimSummary summary{};

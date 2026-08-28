@@ -30,6 +30,38 @@ namespace llaminar2
     class MappedTransferProgressEpoch;
 
     /**
+     * @brief Publish a complete model-lifetime runtime image to one controller stream.
+     *
+     * Graph construction may initialize only the routed layers that participate
+     * in the currently selected executable while the physical model retains a
+     * larger family (for example a dormant MTP/NextN source layer).  The
+     * selected controller snapshots the complete retained family, so its first
+     * graph must be ordered after every such layer has a durable placement
+     * bank. The controller may be a topology-wide service or the retained
+     * participant-local maintenance stream used by a homogeneous single-domain
+     * topology. This setup-only interface gives both regimes the same explicit
+     * transition.
+     *
+     * Implementations join their exact graph-build producer stream to
+     * @p controller_stream with a device event, publish any missing runtime
+     * layers on @p controller_stream, and return without synchronizing either
+     * stream.  Repeated calls must remain idempotent and event ordered.
+     */
+    class IMoEOverlayDeviceInitialRuntimePublisher
+    {
+    public:
+        virtual ~IMoEOverlayDeviceInitialRuntimePublisher() = default;
+
+        /**
+         * @brief Order and complete initial runtime publication for a controller.
+         * @param controller_stream Exact non-null retained controller stream.
+         * @return True only after every required event/write was enqueued.
+         */
+        [[nodiscard]] virtual bool publishMoEOverlayDeviceInitialRuntime(
+            void *controller_stream) = 0;
+    };
+
+    /**
      * @brief Lock-free lifecycle receipt for mapped follower inference terminals.
      *
      * A heterogeneous mapped follower necessarily observes one exact terminal
@@ -364,6 +396,9 @@ namespace llaminar2
         DeviceMoEOverlayEpochStatus *maintenance_status = nullptr;
         /** Participant-local owner of the live inference reader boundary. */
         IMoEOverlayDeviceInferenceBoundary *inference_boundary = nullptr;
+        /** Setup-only owner of complete retained-layer runtime publication. */
+        IMoEOverlayDeviceInitialRuntimePublisher *initial_runtime_publisher =
+            nullptr;
 
         /**
          * @return Whether global identity, local runtime identity, and geometry
@@ -420,6 +455,16 @@ namespace llaminar2
         }
 
         /**
+         * @return Whether the controller can order its first snapshot after a
+         *         complete retained-layer runtime image.
+         */
+        [[nodiscard]] constexpr bool initialRuntimePublicationValid()
+            const noexcept
+        {
+            return valid() && initial_runtime_publisher != nullptr;
+        }
+
+        /**
          * @return Whether a host authority can prepare and publish GPU banks.
          *
          * Device-resident homogeneous controllers deliberately need no host
@@ -429,6 +474,7 @@ namespace llaminar2
         [[nodiscard]] constexpr bool hostPublicationValid() const noexcept
         {
             return backgroundPublicationValid() &&
+                   initialRuntimePublicationValid() &&
                    runtime_table_host != nullptr;
         }
     };

@@ -269,6 +269,12 @@ namespace llaminar2
         return std::string(WS_CONTROLLER_STATE) + "_" + workspaceSuffix();
     }
 
+    std::string MoEDeviceRebalanceStage::placementPlanScratchBufferName() const
+    {
+        return std::string(WS_PLACEMENT_PLAN_SCRATCH) + "_" +
+               workspaceSuffix();
+    }
+
     std::string MoEDeviceRebalanceStage::llepLayerPlansBufferName() const
     {
         return std::string(WS_LLEP_LAYER_PLANS) + "_" + workspaceSuffix();
@@ -859,6 +865,8 @@ namespace llaminar2
             bound_workspace_->getBuffer(commandHeaderBufferName()));
         auto *controller_state = static_cast<DeviceMoERebalanceGraphControllerState *>(
             bound_workspace_->getBuffer(controllerStateBufferName()));
+        auto *placement_plan_scratch = static_cast<DeviceMoEPlacementBank *>(
+            bound_workspace_->getBuffer(placementPlanScratchBufferName()));
         auto *wave_state = static_cast<DeviceMoERebalanceWaveState *>(
             bound_workspace_->getBuffer(waveStateBufferName()));
         DeviceMoELLEPLayerPlanScratch *llep_layer_plans = nullptr;
@@ -868,13 +876,16 @@ namespace llaminar2
                 static_cast<DeviceMoELLEPLayerPlanScratch *>(
                     bound_workspace_->getBuffer(llepLayerPlansBufferName()));
         }
-        if (!plan_entries || !plan_count || !command_header || !controller_state || !wave_state)
+        if (!plan_entries || !plan_count || !command_header || !controller_state ||
+            !placement_plan_scratch || !wave_state)
         {
             LOG_ERROR("[MoEDeviceRebalanceStage] Missing workspace buffers"
                       << " plan_entries=" << static_cast<void *>(plan_entries)
                       << " plan_count=" << static_cast<void *>(plan_count)
                       << " command_header=" << static_cast<void *>(command_header)
                       << " controller_state=" << static_cast<void *>(controller_state)
+                      << " placement_plan_scratch="
+                      << static_cast<void *>(placement_plan_scratch)
                       << " wave_state=" << static_cast<void *>(wave_state)
                       << " phase=" << phaseName(params_.phase));
             return false;
@@ -1697,7 +1708,8 @@ namespace llaminar2
                         static_cast<uint32_t>(commandBufferCount()),
                         params_.local_transfer_slots,
                         params_.local_transfer_slot_count,
-                        llep_layer_plans))
+                        llep_layer_plans,
+                        placement_plan_scratch))
                 {
                     LOG_ERROR("[MoEDeviceRebalanceStage] Device rebalance controller failed");
                     return false;
@@ -1830,6 +1842,7 @@ namespace llaminar2
             commandBufferCount() * sizeof(uint32_t) +
             commandBufferCount() * sizeof(DeviceMoERebalanceCommandBufferHeader) +
             sizeof(DeviceMoERebalanceGraphControllerState) +
+            sizeof(DeviceMoEPlacementBank) +
             commandBufferCount() * sizeof(DeviceMoERebalanceWaveState) +
             sizeof(DeviceMoERebalanceStatus);
         if (usesReadyWaveApply())
@@ -2055,6 +2068,16 @@ namespace llaminar2
                                 true});
         reqs.buffers.push_back({controllerStateBufferName(),
                                 sizeof(DeviceMoERebalanceGraphControllerState),
+                                256,
+                                true});
+        /*
+         * Deferred planning is speculative and may overlap readers that still
+         * pin either durable RCU bank. One graph-lifetime bank is sufficient:
+         * the controller visits its bounded layer wave serially and emits all
+         * durable effects into immutable command records before reuse.
+         */
+        reqs.buffers.push_back({placementPlanScratchBufferName(),
+                                sizeof(DeviceMoEPlacementBank),
                                 256,
                                 true});
         if (usesParallelLLEPPlanning())

@@ -3966,18 +3966,57 @@ namespace llaminar2
                     const size_t batched_partial_bytes =
                         workspace_->getBufferSize(batched_partial_name);
                     if (!impl_->d_scatter_partial_batched ||
-                        batched_partial_bytes == 0 ||
-                        batched_partial_bytes %
-                                ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS !=
-                            0)
+                        batched_partial_bytes == 0)
                     {
                         throw std::runtime_error(
                             "[ConcurrentDecode] Missing graph-planned batched "
                             "scatter workspace");
                     }
-                    const size_t scatter_slot_bytes =
-                        batched_partial_bytes /
-                        ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS;
+
+                    /*
+                     * Match appendFusedProjectionWorkspaceRequirements(): a
+                     * stream reused by later projections owns one slice sized
+                     * to the widest projection assigned to it.  Prefix offsets
+                     * avoid the old equal-quarter layout, which forced a narrow
+                     * Q/K/V or GDN bundle to reserve four copies of its widest
+                     * member.
+                     */
+                    std::array<size_t,
+                               ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS>
+                        scatter_slot_columns{};
+                    for (int pi = 0; pi < num_proj; ++pi)
+                    {
+                        const int width = projections[static_cast<size_t>(pi)].n;
+                        if (width <= 0)
+                        {
+                            throw std::runtime_error(
+                                "[ConcurrentDecode] Fused projection has a non-positive width");
+                        }
+                        const size_t stream =
+                            static_cast<size_t>(pi % pool.count);
+                        scatter_slot_columns[stream] = std::max(
+                            scatter_slot_columns[stream],
+                            static_cast<size_t>(width));
+                    }
+                    std::array<size_t,
+                               ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS>
+                        scatter_slot_offsets{};
+                    size_t required_batched_bytes = 0;
+                    for (int stream = 0; stream < pool.count; ++stream)
+                    {
+                        scatter_slot_offsets[static_cast<size_t>(stream)] =
+                            required_batched_bytes;
+                        required_batched_bytes +=
+                            static_cast<size_t>(ROCM_NATIVE_SMALL_M_GRAPH_SAFE_KB_CAP) *
+                            scatter_slot_columns[static_cast<size_t>(stream)] *
+                            sizeof(float);
+                    }
+                    if (required_batched_bytes > batched_partial_bytes)
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentDecode] Graph-planned batched scatter "
+                            "workspace is smaller than the fused projection layout");
+                    }
 
                     // Record event after quantization completes on main stream
                     (void)hipEventRecord(pool.quant_ready,
@@ -4045,14 +4084,17 @@ namespace llaminar2
 
                         if (rocm_kernel->impl_->has_native_vnni)
                         {
-                            // Each stream receives one disjoint graph-planned
-                            // scatter slot. Mixed-width projections use the
-                            // maximum merged stride, so slots cannot overlap.
-                            constexpr int SCATTER_KB_MAX = 64;
+                            // Each stream receives its exact disjoint prefix
+                            // slice; a reused stream retains the widest width
+                            // assigned to that stream.
                             const size_t required_partial_bytes =
-                                static_cast<size_t>(SCATTER_KB_MAX) *
+                                static_cast<size_t>(ROCM_NATIVE_SMALL_M_GRAPH_SAFE_KB_CAP) *
                                 static_cast<size_t>(n) * sizeof(float);
-                            if (required_partial_bytes > scatter_slot_bytes)
+                            const size_t stream_slot_bytes =
+                                static_cast<size_t>(ROCM_NATIVE_SMALL_M_GRAPH_SAFE_KB_CAP) *
+                                scatter_slot_columns[static_cast<size_t>(stream_idx)] *
+                                sizeof(float);
+                            if (required_partial_bytes > stream_slot_bytes)
                             {
                                 throw std::runtime_error(
                                     "[ConcurrentDecode] Batched scatter workspace "
@@ -4063,8 +4105,8 @@ namespace llaminar2
                                 reinterpret_cast<float *>(
                                     reinterpret_cast<unsigned char *>(
                                         impl_->d_scatter_partial_batched) +
-                                    static_cast<size_t>(stream_idx) *
-                                        scatter_slot_bytes);
+                                    scatter_slot_offsets[
+                                        static_cast<size_t>(stream_idx)]);
 
                             proj_ok = rocmGemv_native_vnni_fp32_with_policy(
                                 impl_->d_A_int8,
@@ -5305,11 +5347,6 @@ namespace llaminar2
                                            static_cast<size_t>(scatter_rows) *
                                            static_cast<size_t>(n) * sizeof(float);
             reqs.buffers.push_back({scatterPartialBufferName(), scatter_partial_bytes, 256, true});
-            reqs.buffers.push_back({
-                scatterPartialBatchedBufferName(),
-                scatter_partial_bytes * ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS,
-                256,
-                true});
 
             constexpr int SCATTER_TILE_N = 128;
             const size_t selfreduce_counter_bytes =
@@ -5328,6 +5365,62 @@ namespace llaminar2
                       << "acc=" << (acc_int32_bytes / 1024) << "KB");
 
             return reqs;
+        }
+
+        void ROCmQuantisedGemmKernel::appendFusedProjectionWorkspaceRequirements(
+            WorkspaceRequirements &requirements,
+            int m,
+            std::span<const int> projection_columns,
+            int k) const
+        {
+            (void)k;
+            if (projection_columns.empty())
+                return;
+            if (m <= 0)
+            {
+                throw std::invalid_argument(
+                    "ROCm fused projection workspace requires a positive row capacity");
+            }
+
+            /*
+             * At most four side streams execute concurrently.  A larger MoE
+             * decode bundle reuses a stream only after its preceding projection
+             * has completed, so each stream needs the widest projection mapped
+             * to that stream rather than one slice for every logical member.
+             * Small-M verifier bundles contain at most four projections and are
+             * therefore the same layout without stream reuse.
+             */
+            const size_t stream_count = std::min<size_t>(
+                projection_columns.size(),
+                ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS);
+            std::array<size_t, ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS>
+                stream_widths{};
+            for (size_t projection = 0;
+                 projection < projection_columns.size();
+                 ++projection)
+            {
+                const int width = projection_columns[projection];
+                if (width <= 0)
+                {
+                    throw std::invalid_argument(
+                        "ROCm fused projection workspace requires positive output widths");
+                }
+                const size_t stream = projection % stream_count;
+                stream_widths[stream] = std::max(
+                    stream_widths[stream], static_cast<size_t>(width));
+            }
+
+            const int rows = std::clamp(
+                m, 1, kDefaultNativeVNNIVerifierRowCapacity);
+            size_t simultaneous_columns = 0;
+            for (size_t stream = 0; stream < stream_count; ++stream)
+                simultaneous_columns += stream_widths[stream];
+
+            const size_t bytes =
+                static_cast<size_t>(ROCM_NATIVE_SMALL_M_GRAPH_SAFE_KB_CAP) *
+                static_cast<size_t>(rows) * simultaneous_columns * sizeof(float);
+            requirements.buffers.push_back({
+                scatterPartialBatchedBufferName(), bytes, 256, true});
         }
 
         void ROCmQuantisedGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
@@ -6055,12 +6148,17 @@ namespace llaminar2
                     scatter_partial_name);
             }
             const std::string batched_scatter_partial_name = scatterPartialBatchedBufferName();
-            if (!workspace_->hasBuffer(batched_scatter_partial_name))
-            {
-                throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: " +
-                    batched_scatter_partial_name);
-            }
+            /*
+             * The batched arena is conditional graph topology, not a scalar
+             * GEMM requirement. appendFusedProjectionWorkspaceRequirements()
+             * declares it for graphs that can launch two or more projections
+             * concurrently; ordinary decode, LM-head, and standalone kernel
+             * harnesses deliberately omit it. Fused launch sites validate the
+             * pointer and exact capacity before publishing any work, so making
+             * it optional here preserves the single source of workspace
+             * accounting truth instead of forcing every scalar GEMM to reserve
+             * the largest fused bundle.
+             */
             if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_SELFREDUCE_COUNTERS))
             {
                 throw std::runtime_error(
@@ -6076,7 +6174,11 @@ namespace llaminar2
             impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_A_FP32));
             impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
             impl_->d_scatter_partial = static_cast<float *>(workspace_->getBuffer(scatter_partial_name));
-            impl_->d_scatter_partial_batched = static_cast<float *>(workspace_->getBuffer(batched_scatter_partial_name));
+            impl_->d_scatter_partial_batched =
+                workspace_->hasBuffer(batched_scatter_partial_name)
+                    ? static_cast<float *>(workspace_->getBuffer(
+                          batched_scatter_partial_name))
+                    : nullptr;
             impl_->d_selfreduce_counters =
                 static_cast<int *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SELFREDUCE_COUNTERS));
 

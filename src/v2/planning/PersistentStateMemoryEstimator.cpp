@@ -185,6 +185,34 @@ namespace llaminar2
                     geometry.local_recurrence_floats) *
                    sizeof(float);
         }
+
+        /**
+         * @brief Size the exact GPU-side hybrid payload serialized per prefix.
+         *
+         * GPU hybrid caches retain both local and full state banks only when
+         * their geometries differ. Prefix export writes those distinct banks
+         * without arena alignment, matching CUDA and ROCm byte-for-byte.
+         */
+        size_t prefixHybridDeviceStateBytes(
+            const RecurrentGeometry &geometry,
+            int layer_count)
+        {
+            size_t floats_per_layer =
+                geometry.local_conv_floats +
+                geometry.local_recurrence_floats;
+            if (geometry.full_conv_floats !=
+                geometry.local_conv_floats)
+            {
+                floats_per_layer += geometry.full_conv_floats;
+            }
+            if (geometry.full_recurrence_floats !=
+                geometry.local_recurrence_floats)
+            {
+                floats_per_layer += geometry.full_recurrence_floats;
+            }
+            return static_cast<size_t>(std::max(0, layer_count)) *
+                   floats_per_layer * sizeof(float);
+        }
     } // namespace
 
     PersistentStateEstimate PersistentStateMemoryEstimator::estimate(
@@ -273,6 +301,10 @@ namespace llaminar2
                     result.main_gdn_layers +
                     result.mtp_gdn_layers) *
                 bytes_per_gdn_layer;
+            result.prefix_hybrid_device_state_bytes =
+                prefixHybridDeviceStateBytes(
+                    geometry,
+                    result.main_gdn_layers);
         }
         else
         {

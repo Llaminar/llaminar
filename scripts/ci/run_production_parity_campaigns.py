@@ -8,7 +8,10 @@ decode parity. CTest combines all precision cells for one test type/backend in
 one process so immutable model and prepared-weight ownership is amortized while
 runner, arena, graph, stream, and KV state remain exact per cell.
 
-The performance target belongs to the whole selected matrix. This driver prepares the model
+The performance target belongs to the whole selected matrix. Before model
+staging, the driver runs the CMake-owned ``ProductionParityPreflight`` label: a
+fast, model-free integration gate for MPI lifecycle, orchestration, graph,
+stream/event, collective, and movement invariants. It then prepares the model
 fixture once, capacity-checks and atomically stages the complete selected GGUF
 corpus into tmpfs, gives CPU, CUDA, and ROCm exclusive resource identities, and
 overlaps only campaigns whose backend sets are disjoint. Every production child
@@ -19,14 +22,19 @@ atomically published, source-identity-bound read-only GGUFs and authenticated
 digest evidence for rapid iteration; the driver never removes that cache.
 Hybrid campaigns claim every backend they name. Crossing the target is recorded
 as a performance failure after the complete matrix has run; it never stops
-campaign admission or truncates correctness evidence. A separate, deliberately
-generous completion timeout exists only to terminate a genuinely stuck run. No
-campaign gets an independent hour and no concurrent launch may oversubscribe a
-backend.
+campaign admission or truncates correctness evidence. A separate completion
+timeout bounds the complete run, while every exact GTest matrix cell has an
+independent ten-minute progress deadline. The driver observes the fresh
+per-cell log publication already owned by the artifact contract, so this
+watchdog preserves one-process model-context amortization and still terminates
+a stuck CTest/MPI process group with the exact cell identity. No campaign gets
+an independent hour and no concurrent launch may oversubscribe a backend.
 
 CTest/GTest registration remains the matrix source of truth.  The driver never
 copies model, topology, backend, or precision tables into another manifest.
 Use ``--list`` for a deterministic coverage inventory without running models.
+Use ``--stage-models-only`` with an explicit persistent cache to prepare that
+same authenticated corpus for repeated focused production-path debugging.
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -55,12 +64,15 @@ from typing import Any, Iterable, Iterator
 BACKEND_ORDER = ("CPU", "CUDA", "ROCm")
 KV_PRECISIONS = ("FP16", "FP32", "Q8_1", "Q16_1", "TQ")
 PRODUCTION_CAMPAIGN_NAME = re.compile(r"(?:^|_)ProductionCampaign(?:_|$)")
-GLOBAL_TARGET_SECONDS = 3600.0
+GLOBAL_TARGET_SECONDS = 4500.0
 COMPLETION_TIMEOUT_SECONDS = 21600.0
+EXACT_CELL_TIMEOUT_SECONDS = 600.0
 REGISTERED_TIMEOUT_SECONDS = COMPLETION_TIMEOUT_SECONDS
 MODEL_FIXTURE_NAME = "V2_Models"
 MODEL_FIXTURE_TEST = "V2_FetchModelsFixture"
+PRODUCTION_PARITY_PREFLIGHT_LABEL = "ProductionParityPreflight"
 MODEL_RAMDISK_ROOT = Path("/dev/shm")
+SESSION_IPC_RAMDISK_ROOT = Path("/dev/shm")
 PERSISTENT_MODEL_CACHE_SCHEMA_VERSION = 1
 MODEL_COPY_CHUNK_BYTES = 16 * 1024 * 1024
 MODEL_RAMDISK_MINIMUM_RESERVE_BYTES = 1024 * 1024 * 1024
@@ -127,7 +139,30 @@ REQUIRED_CSV_HEADERS = {
         "matched_tokens,matched_blocks,terminal_logits_restored,"
         "terminal_hidden_restored,mtp_state_restored,hybrid_state_restored,"
         "storage_tier,current_position,state_compared,state_equivalent,"
-        "state_detail,observed_terminal_hidden_hash_available,"
+        "state_detail,observed_moe_movement_epoch,"
+        "oracle_moe_movement_epoch,main_kv_policy,"
+        "main_kv_numerically_compared,"
+        "main_kv_exact_prefix_segments,"
+        "main_kv_numerical_suffix_payloads,"
+        "main_kv_numerical_elements,"
+        "main_kv_minimum_cosine,"
+        "main_kv_maximum_relative_l2,"
+        "main_kv_maximum_abs,"
+        "main_kv_numerically_passed,terminal_hidden_policy,"
+        "terminal_hidden_numerically_compared,"
+        "terminal_hidden_numerical_elements,"
+        "terminal_hidden_numerical_cosine,"
+        "terminal_hidden_numerical_rel_l2,"
+        "terminal_hidden_numerical_max_abs,"
+        "terminal_hidden_numerical_passed,"
+        "terminal_logits_policy,"
+        "terminal_logits_numerically_compared,"
+        "terminal_logits_numerical_elements,"
+        "terminal_logits_numerical_cosine,"
+        "terminal_logits_numerical_rel_l2,"
+        "terminal_logits_numerical_max_abs,"
+        "terminal_logits_numerical_passed,"
+        "observed_terminal_hidden_hash_available,"
         "observed_terminal_hidden_bytes,observed_terminal_hidden_hash,"
         "observed_terminal_logits_hash_available,"
         "observed_terminal_logits_bytes,observed_terminal_logits_hash,"
@@ -139,7 +174,7 @@ REQUIRED_CSV_HEADERS = {
         "checkpoint_passed,passed"
     ),
     "production_path.csv": (
-        "backend,device,execution_path,homogeneous_gpu,"
+        "backend,device,execution_path,execution_topology,graph_contract,"
         "forward_full_graph_capture,forward_full_graph_replay,"
         "full_graph_capture,full_graph_replay,decode_graph_capture,"
         "decode_graph_replay,device_generation_controller,"
@@ -160,7 +195,13 @@ MTP_TRANSACTIONS_HEADER = (
     "verifier_identity_depth,production_verifier_draft_tokens,"
     "before_position,after_position,"
     "before_draft_steps,after_draft_steps,before_verifier_runs,"
-    "after_verifier_runs"
+    "after_verifier_runs,dynamic_policy_witness_executed,"
+    "dynamic_policy_witness_serial_token_exact,"
+    "dynamic_policy_witness_window_delta,"
+    "dynamic_policy_witness_attempted_draft_tokens,"
+    "dynamic_policy_witness_verifier_transactions,"
+    "dynamic_policy_witness_emitted_tokens,"
+    "dynamic_policy_witness_serial_oracle_tokens"
 )
 CSV_ARTIFACTS_REQUIRING_DATA = frozenset(
     {
@@ -176,12 +217,12 @@ REQUIRED_CAMPAIGN_LABELS = {
     "Campaign",
     "ProductionPath",
     "AllPrecisions",
-    "WholeMatrixOneHourTarget",
+    "WholeMatrix75MinuteTarget",
 }
 REQUIRED_CAMPAIGN_ENV = {
     "LLAMINAR_PRODUCTION_PARITY=1",
     "LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN=1",
-    "LLAMINAR_PRODUCTION_PARITY_TARGET_SECONDS=3600",
+    "LLAMINAR_PRODUCTION_PARITY_TARGET_SECONDS=4500",
     "LLAMINAR_GPU_GRAPHS=1",
     "LLAMINAR_PERF_STATS_SUMMARY=1",
 }
@@ -235,6 +276,37 @@ class CampaignCell:
         return tuple(present) if present else ("TOPOLOGY_DEFAULT",)
 
 
+class ProcessTimeoutKind(str, Enum):
+    """Typed reason that the campaign driver terminated a process group."""
+
+    NONE = "none"
+    COMPLETION = "completion"
+    EXACT_CELL = "exact_cell"
+
+
+@dataclass(frozen=True)
+class ExactCellTimeoutWatch:
+    """Progress files and deadline used to watch one aggregate GTest process.
+
+    Each tuple maps an exact generated GTest identity to the fresh
+    ``test_log.txt`` created when that cell enters its parity fixture. A new
+    file transfers watchdog authority to that cell without splitting the
+    process or reloading immutable model weights.
+    """
+
+    timeout_seconds: float
+    progress_files: tuple[tuple[str, Path], ...]
+    not_before_wall_time_ns: int
+
+
+@dataclass
+class ProcessTimeoutEvidence:
+    """Evidence published when ``_run_process`` times out a process group."""
+
+    kind: ProcessTimeoutKind = ProcessTimeoutKind.NONE
+    exact_gtest_case: str = ""
+
+
 @dataclass(frozen=True)
 class CampaignResult:
     """Outcome and global-timeline evidence for one test-type campaign."""
@@ -252,6 +324,8 @@ class CampaignResult:
     started_offset_seconds: float = 0.0
     finished_offset_seconds: float = 0.0
     completion_timeout_seconds: float = 0.0
+    exact_cell_timeout_seconds: float = 0.0
+    timed_out_gtest_case: str = ""
     outcome: str = "completed"
     artifact_contract_passed: bool = True
     validated_artifact_file_count: int = 0
@@ -283,6 +357,11 @@ class CampaignMatrixResult:
     correctness_passed: bool
     performance_requirements_met: bool
     completion_timeout_seconds: float
+    exact_cell_timeout_seconds: float
+    preflight_return_code: int
+    preflight_elapsed_seconds: float
+    preflight_test_count: int
+    preflight_tests: tuple[str, ...]
     fixture_return_code: int
     fixture_elapsed_seconds: float
     model_staging_return_code: int
@@ -329,6 +408,86 @@ def _as_string_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
     return []
+
+
+def discover_production_parity_preflight_tests(
+    build_dir: Path,
+) -> tuple[str, ...]:
+    """Discover and validate the model-free integration preflight from CTest.
+
+    CMake labels are the inventory authority. The campaign driver validates
+    that every selected test is an Integration test, has no model fixture or
+    required file, and has a short per-test timeout before it executes the
+    label. This prevents a future registration edit from turning preflight into
+    another model campaign or an unbounded wait.
+    """
+
+    completed = subprocess.run(
+        [
+            "ctest",
+            "--test-dir",
+            str(build_dir),
+            "--show-only=json-v1",
+            "-L",
+            f"^{PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "CTest production parity preflight discovery failed:\n"
+            + (completed.stderr or completed.stdout)
+        )
+
+    document = json.loads(completed.stdout)
+    names: list[str] = []
+    for test in document.get("tests", []):
+        name = str(test.get("name", ""))
+        properties = _property_map(test)
+        labels = _as_string_list(properties.get("LABELS", []))
+        if PRODUCTION_PARITY_PREFLIGHT_LABEL not in labels:
+            continue
+        if not name.startswith("V2_Integration_") or "Integration" not in labels:
+            raise RuntimeError(
+                f"production parity preflight is not an Integration test: {name}"
+            )
+        if "Campaign" in labels or "FullModel" in labels:
+            raise RuntimeError(
+                f"production parity preflight contains a model campaign: {name}"
+            )
+        if _as_string_list(properties.get("FIXTURES_REQUIRED", [])):
+            raise RuntimeError(
+                f"production parity preflight requires a fixture: {name}"
+            )
+        if _as_string_list(properties.get("REQUIRED_FILES", [])):
+            raise RuntimeError(
+                f"production parity preflight requires model/files: {name}"
+            )
+        try:
+            timeout = float(properties.get("TIMEOUT", 0.0))
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"production parity preflight timeout is not numeric: {name}"
+            ) from error
+        if timeout <= 0.0 or timeout > 120.0:
+            raise RuntimeError(
+                f"production parity preflight timeout must be in (0, 120] seconds: "
+                f"{name} has {timeout}"
+            )
+        names.append(name)
+
+    names.sort()
+    if not names:
+        raise RuntimeError(
+            "no model-free ProductionParityPreflight integration tests discovered"
+        )
+    if len(set(names)) != len(names):
+        raise RuntimeError(
+            "CTest returned duplicate ProductionParityPreflight tests"
+        )
+    return tuple(names)
 
 
 def _exact_gtest_cases(test: dict[str, Any]) -> tuple[str, ...]:
@@ -581,6 +740,71 @@ class ModelStagingWorkspace:
     mode: str
     persistent: bool
 
+    def protect_published_models(self) -> None:
+        """Seal persistent model metadata while child campaigns may write digests.
+
+        The cache lock remains held by the driver.  Removing owner-write from
+        the root and model directory makes an unrelated ``rm -rf /dev/shm/*``
+        fail before it can unlink the published manifest or GGUFs.  The digest
+        directory stays writable because production children publish their
+        independently authenticated SHA evidence there.
+        """
+
+        if self.persistent:
+            _set_persistent_cache_write_access(
+                self.root,
+                writable=False,
+                digest_writable=True,
+            )
+
+
+def _set_persistent_cache_write_access(
+    root: Path,
+    *,
+    writable: bool,
+    digest_writable: bool = False,
+) -> None:
+    """Apply the portable same-owner deletion guard for a persistent cache.
+
+    A tmpfs cannot survive a reboot, remount, or container replacement.  This
+    guard instead prevents accidental same-mount cleanup by ordinary processes:
+    directories are owner read/execute while idle, then made owner-writable only
+    after the campaign has acquired the cache's exclusive lock.  Symlinks and
+    non-directory cache components fail closed.
+
+    Args:
+        root: Exact persistent cache root.
+        writable: Whether staging metadata and model entries may be mutated.
+        digest_writable: Keep only the digest directory writable while model
+            files are consumed by active child campaigns.
+    """
+
+    if not root.exists() or root.is_symlink() or not root.is_dir():
+        raise ModelStagingError(
+            f"persistent cache root disappeared or changed type: {root}"
+        )
+
+    paths = [root, root / "models", root / "digests"]
+    existing: list[Path] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        if path.is_symlink() or not path.is_dir():
+            raise ModelStagingError(
+                f"persistent cache component is not a real directory: {path}"
+            )
+        existing.append(path)
+
+    # Make the root traversable/writable before its children on admission.  On
+    # sealing, protect children first so there is never a window in which a
+    # writable model directory sits below an already advertised protected root.
+    ordered = existing if writable else list(reversed(existing))
+    for path in ordered:
+        mode = 0o700 if writable else 0o500
+        if not writable and digest_writable and path == root / "digests":
+            mode = 0o700
+        path.chmod(mode)
+
 
 def _reclaim_interrupted_persistent_transactions(root: Path) -> tuple[int, int]:
     """Remove unpublished cache transactions while holding the cache lock.
@@ -695,6 +919,26 @@ def model_staging_workspace(
             "persistent model cache must be a child directory, not the "
             "ramdisk mount root itself"
         )
+
+    # `/dev/shm` is an IPC namespace, not a durable cache authority.  On hosts
+    # with systemd-logind RemoveIPC, the complete namespace can be reclaimed
+    # when a login session ends; directory mode sealing cannot protect against
+    # that privileged lifecycle.  Persistent campaigns therefore require the
+    # repository-owned named tmpfs (or another explicit memory mount) outside
+    # `/dev/shm`.  Run-scoped staging remains valid there for isolated CI
+    # containers whose IPC namespace is itself the intended lifetime.
+    session_ipc_root = SESSION_IPC_RAMDISK_ROOT.resolve(strict=True)
+    try:
+        root.relative_to(session_ipc_root)
+    except ValueError:
+        pass
+    else:
+        raise ModelStagingError(
+            "persistent model cache requires a dedicated tmpfs mount outside "
+            f"{session_ipc_root}; session IPC cleanup may remove /dev/shm "
+            "during a campaign. Run scripts/ci/setup_production_parity_tmpfs.sh "
+            "and use --model-ramdisk-root /mnt/llaminar-production-parity"
+        )
     filesystem_type = _filesystem_type(root)
     if filesystem_type not in {"tmpfs", "ramfs"}:
         raise ModelStagingError(
@@ -707,10 +951,12 @@ def model_staging_workspace(
     if hasattr(os, "O_NOFOLLOW"):
         open_flags |= os.O_NOFOLLOW
     lock_fd = os.open(lock_path, open_flags, 0o600)
+    lock_acquired = False
     try:
         while True:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_acquired = True
                 break
             except BlockingIOError:
                 if (
@@ -722,6 +968,7 @@ def model_staging_workspace(
                         f"model cache lock: {lock_path}"
                     )
                 time.sleep(0.05)
+        _set_persistent_cache_write_access(root, writable=True)
         reclaimed_count, reclaimed_bytes = (
             _reclaim_interrupted_persistent_transactions(root)
         )
@@ -746,7 +993,12 @@ def model_staging_workspace(
         )
     finally:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            if lock_acquired:
+                # Seal every cache-owned directory before releasing the lock.
+                # A later campaign can unseal it only after acquiring this same
+                # authority; ordinary cleanup cannot unlink published GGUFs.
+                _set_persistent_cache_write_access(root, writable=False)
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
 
@@ -1297,6 +1549,34 @@ def _gtest_artifact_directory_name(gtest_case: str) -> str:
     return re.sub(r'[/\\:*?"<>|]', "_", raw_name)
 
 
+def _exact_cell_timeout_watch(
+    cell: CampaignCell,
+    artifact_results_root: Path | None,
+    timeout_seconds: float,
+    not_before_wall_time_ns: int,
+) -> ExactCellTimeoutWatch | None:
+    """Build the file-backed watchdog contract for one discovered campaign."""
+
+    if not cell.gtest_cases:
+        return None
+    root = artifact_results_root
+    if root is None:
+        root = PARITY_RESULTS_DIRECTORY / _current_git_short_hash()
+    return ExactCellTimeoutWatch(
+        timeout_seconds=timeout_seconds,
+        progress_files=tuple(
+            (
+                gtest_case,
+                root
+                / _gtest_artifact_directory_name(gtest_case)
+                / "test_log.txt",
+            )
+            for gtest_case in cell.gtest_cases
+        ),
+        not_before_wall_time_ns=not_before_wall_time_ns,
+    )
+
+
 def _required_csv_headers_for_case(gtest_case: str) -> dict[str, str]:
     """Return the exact artifact contract for one typed matrix cell."""
 
@@ -1461,12 +1741,53 @@ def select_runnable_campaigns(
     return selected
 
 
+def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
+    """Terminate one exact process group, escalating after a short grace."""
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
 def _run_process(
     command: list[str],
     timeout_seconds: float | None,
     environment_overrides: dict[str, str] | None = None,
+    *,
+    exact_cell_watch: ExactCellTimeoutWatch | None = None,
+    timeout_evidence: ProcessTimeoutEvidence | None = None,
 ) -> int:
-    """Run one process group, terminating it only at the safety timeout."""
+    """Run one process group under global and optional exact-cell deadlines.
+
+    The exact-cell watchdog is deliberately file-driven. CTest buffers child
+    output, whereas the parity fixture publishes its unique ``test_log.txt``
+    synchronously when a generated cell starts. Observing that existing
+    artifact boundary keeps the watchdog independent of MPI stdout ordering
+    and avoids splitting an aggregate that shares immutable prepared weights.
+    """
+
+    if exact_cell_watch is not None:
+        if exact_cell_watch.timeout_seconds <= 0.0:
+            raise ValueError("exact-cell timeout must be positive")
+        cases = [case for case, _ in exact_cell_watch.progress_files]
+        paths = [path for _, path in exact_cell_watch.progress_files]
+        if len(set(cases)) != len(cases):
+            raise ValueError("exact-cell timeout watch contains duplicate cases")
+        if len(set(paths)) != len(paths):
+            raise ValueError("exact-cell timeout watch contains duplicate paths")
+
+    if timeout_evidence is not None:
+        timeout_evidence.kind = ProcessTimeoutKind.NONE
+        timeout_evidence.exact_gtest_case = ""
 
     environment = None
     if environment_overrides:
@@ -1477,24 +1798,135 @@ def _run_process(
         start_new_session=True,
         env=environment,
     )
-    try:
-        if timeout_seconds is None:
-            return process.wait()
-        return process.wait(timeout=max(timeout_seconds, 0.001))
-    except subprocess.TimeoutExpired:
+    started = time.monotonic()
+    completion_deadline = (
+        None if timeout_seconds is None else started + max(timeout_seconds, 0.001)
+    )
+
+    if exact_cell_watch is None:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=5.0)
+            if completion_deadline is None:
+                return process.wait()
+            return process.wait(
+                timeout=max(completion_deadline - time.monotonic(), 0.001)
+            )
         except subprocess.TimeoutExpired:
+            if timeout_evidence is not None:
+                timeout_evidence.kind = ProcessTimeoutKind.COMPLETION
+            _terminate_process_group(process)
+            return 124
+
+    # Startup belongs to the first exact cell. Creating its progress file does
+    # not restart the clock; only publication of a different cell transfers
+    # watchdog authority and begins a fresh ten-minute budget.
+    current_case = (
+        exact_cell_watch.progress_files[0][0]
+        if exact_cell_watch.progress_files
+        else ""
+    )
+    cell_deadline = started + exact_cell_watch.timeout_seconds
+    observed_any_cell = False
+    observed_paths: set[Path] = set()
+
+    while True:
+        now = time.monotonic()
+        newly_started: list[tuple[int, str, Path]] = []
+        for case, path in exact_cell_watch.progress_files:
+            if path in observed_paths:
+                continue
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-        return 124
+                modified_ns = path.stat().st_mtime_ns
+            except FileNotFoundError:
+                continue
+            if modified_ns < exact_cell_watch.not_before_wall_time_ns:
+                continue
+            newly_started.append((modified_ns, case, path))
+
+        for _, case, path in sorted(newly_started):
+            observed_paths.add(path)
+            if not observed_any_cell:
+                current_case = case
+                observed_any_cell = True
+            elif case != current_case:
+                current_case = case
+                cell_deadline = now + exact_cell_watch.timeout_seconds
+
+        return_code = process.poll()
+        if return_code is not None:
+            return return_code
+
+        now = time.monotonic()
+        exact_cell_expired = now >= cell_deadline
+        completion_expired = (
+            completion_deadline is not None and now >= completion_deadline
+        )
+        if exact_cell_expired and (
+            completion_deadline is None or cell_deadline <= completion_deadline
+        ):
+            if timeout_evidence is not None:
+                timeout_evidence.kind = ProcessTimeoutKind.EXACT_CELL
+                timeout_evidence.exact_gtest_case = current_case
+            print(
+                "[production-parity] exact_cell_timeout "
+                f"seconds={exact_cell_watch.timeout_seconds:.3f} "
+                f"gtest_case={current_case or '<before-first-cell>'}",
+                file=sys.stderr,
+                flush=True,
+            )
+            _terminate_process_group(process)
+            return 124
+        if completion_expired:
+            if timeout_evidence is not None:
+                timeout_evidence.kind = ProcessTimeoutKind.COMPLETION
+            _terminate_process_group(process)
+            return 124
+
+        deadlines = [cell_deadline]
+        if completion_deadline is not None:
+            deadlines.append(completion_deadline)
+        poll_seconds = min(0.25, max(min(deadlines) - now, 0.001))
+        try:
+            return process.wait(timeout=poll_seconds)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def run_production_parity_preflight(
+    build_dir: Path,
+    timeout_seconds: float | None,
+) -> tuple[int, float, tuple[str, ...]]:
+    """Run the CMake-owned model-free integration gate before model staging."""
+
+    tests = discover_production_parity_preflight_tests(build_dir)
+    timeout_text = (
+        "disabled" if timeout_seconds is None else f"{timeout_seconds:.3f}"
+    )
+    print(
+        "[production-parity] preflight_status=RUNNING "
+        f"test_count={len(tests)} "
+        f"completion_timeout_remaining_seconds={timeout_text}",
+        flush=True,
+    )
+    command = [
+        "ctest",
+        "--test-dir",
+        str(build_dir),
+        "--output-on-failure",
+        "--parallel",
+        "--no-tests=error",
+        "-L",
+        f"^{PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
+    ]
+    started = time.monotonic()
+    return_code = _run_process(command, timeout_seconds)
+    elapsed = time.monotonic() - started
+    print(
+        "[production-parity] preflight_status="
+        f"{'PASS' if return_code == 0 else 'FAIL'} "
+        f"test_count={len(tests)} elapsed_seconds={elapsed:.3f}",
+        flush=True,
+    )
+    return return_code, elapsed, tests
 
 
 def prepare_model_fixture(
@@ -1522,6 +1954,7 @@ def run_campaign(
     cell: CampaignCell,
     completion_timeout_seconds: float | None,
     *,
+    exact_cell_timeout_seconds: float = EXACT_CELL_TIMEOUT_SECONDS,
     global_started_at: float | None = None,
     target_seconds: float = GLOBAL_TARGET_SECONDS,
     environment_overrides: dict[str, str] | None = None,
@@ -1549,15 +1982,24 @@ def run_campaign(
     print(
         f"[production-parity] campaign={cell.name} "
         f"resources={'+'.join(sorted(campaign_resources(cell)))} "
-        f"completion_timeout_remaining_seconds={timeout_text}",
+        f"completion_timeout_remaining_seconds={timeout_text} "
+        f"exact_cell_timeout_seconds={exact_cell_timeout_seconds:.3f}",
         flush=True,
     )
     started = time.monotonic()
     started_wall_time_ns = time.time_ns()
+    timeout_evidence = ProcessTimeoutEvidence()
     process_return_code = _run_process(
         command,
         completion_timeout_seconds,
         environment_overrides=environment_overrides,
+        exact_cell_watch=_exact_cell_timeout_watch(
+            cell,
+            artifact_results_root,
+            exact_cell_timeout_seconds,
+            started_wall_time_ns,
+        ),
+        timeout_evidence=timeout_evidence,
     )
     try:
         artifact_count, artifact_directories, artifact_errors = (
@@ -1573,7 +2015,15 @@ def run_campaign(
         artifact_errors = (f"artifact validation failed: {error}",)
 
     return_code = process_return_code
-    outcome = "completion_timeout" if process_return_code == 124 else "completed"
+    if (
+        process_return_code == 124
+        and timeout_evidence.kind is ProcessTimeoutKind.EXACT_CELL
+    ):
+        outcome = "exact_cell_timeout"
+    elif process_return_code == 124:
+        outcome = "completion_timeout"
+    else:
+        outcome = "completed"
     if process_return_code == 0 and artifact_errors:
         return_code = 126
         outcome = "artifact_contract_failed"
@@ -1609,6 +2059,8 @@ def run_campaign(
         ),
         finished_offset_seconds=finished_offset,
         completion_timeout_seconds=(completion_timeout_seconds or 0.0),
+        exact_cell_timeout_seconds=exact_cell_timeout_seconds,
+        timed_out_gtest_case=timeout_evidence.exact_gtest_case,
         outcome=outcome,
         artifact_contract_passed=not artifact_errors,
         validated_artifact_file_count=artifact_count,
@@ -1653,6 +2105,7 @@ def run_campaign_matrix(
     target_seconds: float,
     completion_timeout_seconds: float | None,
     *,
+    exact_cell_timeout_seconds: float = EXACT_CELL_TIMEOUT_SECONDS,
     global_started_at: float | None = None,
     global_completion_deadline: float | None = None,
     environment_overrides: dict[str, str] | None = None,
@@ -1707,6 +2160,7 @@ def run_campaign_matrix(
                         build_dir,
                         cell,
                         timeout_seconds,
+                        exact_cell_timeout_seconds=exact_cell_timeout_seconds,
                         global_started_at=started,
                         target_seconds=target_seconds,
                         environment_overrides=environment_overrides,
@@ -1870,11 +2324,113 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=(
             "stable child directory of --model-ramdisk-root; authenticated "
             "GGUFs and digest evidence are reused idempotently and never "
-            "removed automatically"
+            "removed automatically, then owner-write-sealed between campaigns "
+            "on the same tmpfs mount"
         ),
     )
-    parser.add_argument("--list", action="store_true", help="print coverage without running")
-    return parser.parse_args(argv)
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument(
+        "--stage-models-only",
+        action="store_true",
+        help=(
+            "prepare and seal the selected campaign corpus in the explicit "
+            "persistent model cache without launching inference"
+        ),
+    )
+    operation.add_argument(
+        "--list",
+        action="store_true",
+        help="print coverage without running",
+    )
+    arguments = parser.parse_args(argv)
+    if (
+        arguments.stage_models_only
+        and arguments.persistent_model_cache_dir is None
+    ):
+        parser.error(
+            "--stage-models-only requires --persistent-model-cache-dir"
+        )
+    return arguments
+
+
+def stage_selected_models_only(
+    args: argparse.Namespace,
+    selected: tuple[CampaignCell, ...],
+) -> int:
+    """Prepare the selected real-weight corpus without starting inference.
+
+    This is the campaign-owned setup lifecycle used for focused iteration. It
+    intentionally retains model discovery, fixture preparation, tmpfs capacity
+    proof, cache locking, atomic publication, and idle sealing from the full
+    runner. The CLI requires a persistent cache because a run-scoped workspace
+    would be deleted as this function returns.
+
+    Args:
+        args: Validated campaign-runner arguments.
+        selected: Exact registered campaigns whose declared models are staged.
+
+    Returns:
+        Zero after every model is published and sealed, otherwise the fixture
+        or staging failure code.
+    """
+
+    started = time.monotonic()
+    completion_deadline = started + args.completion_timeout_seconds
+    fixture_return_code, fixture_elapsed = prepare_model_fixture(
+        args.build_dir,
+        max(completion_deadline - time.monotonic(), 0.001),
+    )
+    if fixture_return_code != 0:
+        print(
+            "[production-parity] stage_models_only_status=FAIL "
+            f"fixture_return_code={fixture_return_code} "
+            f"fixture_elapsed_seconds={fixture_elapsed:.3f}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return fixture_return_code
+
+    try:
+        with model_staging_workspace(
+            args.model_ramdisk_root,
+            args.persistent_model_cache_dir,
+            completion_deadline,
+        ) as workspace:
+            staged_models, filesystem_type = stage_models_in_ramdisk(
+                selected,
+                workspace.models,
+                completion_deadline,
+                persistent=workspace.persistent,
+            )
+            workspace.digests.mkdir(mode=0o700, parents=True, exist_ok=True)
+            workspace.protect_published_models()
+            print(
+                "[production-parity] stage_models_only_status=PASS "
+                f"staged_model_count={len(staged_models)} "
+                f"staged_model_bytes="
+                f"{sum(model.size_bytes for model in staged_models)} "
+                f"filesystem={filesystem_type} "
+                f"cache_root={workspace.root} "
+                f"elapsed_seconds={time.monotonic() - started:.3f}",
+                flush=True,
+            )
+        return 0
+    except TimeoutError as error:
+        print(
+            "[production-parity] stage_models_only_status=FAIL "
+            f"error={error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 124
+    except (OSError, ModelStagingError) as error:
+        print(
+            "[production-parity] stage_models_only_status=FAIL "
+            f"error={error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1911,6 +2467,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
         return 0
 
+    if args.stage_models_only:
+        return stage_selected_models_only(args, tuple(selected))
+
     try:
         artifact_root = create_campaign_artifact_root(args.report)
     except OSError as error:
@@ -1928,13 +2487,36 @@ def main(argv: list[str] | None = None) -> int:
         f"[production-parity] global_campaigns={len(selected)} "
         f"exact_matrix_cells={sum(len(cell.gtest_cases) for cell in selected)} "
         f"global_target_seconds={args.target_seconds:.3f} "
-        f"completion_timeout_seconds={args.completion_timeout_seconds:.3f}",
+        f"completion_timeout_seconds={args.completion_timeout_seconds:.3f} "
+        f"exact_cell_timeout_seconds={EXACT_CELL_TIMEOUT_SECONDS:.3f}",
         flush=True,
     )
-    fixture_return_code, fixture_elapsed = prepare_model_fixture(
-        args.build_dir,
-        max(global_completion_deadline - time.monotonic(), 0.001),
-    )
+    try:
+        (
+            preflight_return_code,
+            preflight_elapsed,
+            preflight_tests,
+        ) = run_production_parity_preflight(
+            args.build_dir,
+            max(global_completion_deadline - time.monotonic(), 0.001),
+        )
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        print(
+            f"production parity preflight error: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        preflight_return_code = 2
+        preflight_elapsed = time.monotonic() - global_started
+        preflight_tests = ()
+
+    fixture_return_code = 125
+    fixture_elapsed = 0.0
+    if preflight_return_code == 0:
+        fixture_return_code, fixture_elapsed = prepare_model_fixture(
+            args.build_dir,
+            max(global_completion_deadline - time.monotonic(), 0.001),
+        )
     authenticated_model_digest_count = 0
     model_staging_return_code = 125
     model_staging_elapsed = 0.0
@@ -1945,7 +2527,11 @@ def main(argv: list[str] | None = None) -> int:
         else "run_scoped"
     )
     model_staging_location = args.model_ramdisk_root
-    model_staging_error = "not attempted because the model fixture failed"
+    model_staging_error = (
+        "not attempted because the model fixture failed"
+        if preflight_return_code == 0
+        else "not attempted because production parity preflight failed"
+    )
     staged_models: tuple[StagedModelEvidence, ...] = ()
     if fixture_return_code == 0:
         staging_started = time.monotonic()
@@ -1983,11 +2569,13 @@ def main(argv: list[str] | None = None) -> int:
                     parents=True,
                     exist_ok=workspace.persistent,
                 )
+                workspace.protect_published_models()
                 results, global_elapsed = run_campaign_matrix(
                     args.build_dir,
                     selected,
                     args.target_seconds,
                     args.completion_timeout_seconds,
+                    exact_cell_timeout_seconds=EXACT_CELL_TIMEOUT_SECONDS,
                     global_started_at=global_started,
                     global_completion_deadline=global_completion_deadline,
                     environment_overrides={
@@ -2043,13 +2631,23 @@ def main(argv: list[str] | None = None) -> int:
             ]
     else:
         global_elapsed = time.monotonic() - global_started
+        prerequisite_return_code = (
+            preflight_return_code
+            if preflight_return_code != 0
+            else fixture_return_code
+        )
+        prerequisite_outcome = (
+            "production_parity_preflight_failed"
+            if preflight_return_code != 0
+            else "model_fixture_failed"
+        )
         results = [
             _not_run_result(
                 cell,
                 args.target_seconds,
                 global_elapsed,
-                return_code=fixture_return_code,
-                outcome="model_fixture_failed",
+                return_code=prerequisite_return_code,
+                outcome=prerequisite_outcome,
             )
             for cell in selected
         ]
@@ -2059,7 +2657,8 @@ def main(argv: list[str] | None = None) -> int:
         result.artifact_contract_passed for result in results
     )
     correctness_passed = (
-        fixture_return_code == 0
+        preflight_return_code == 0
+        and fixture_return_code == 0
         and model_staging_return_code == 0
         and all_campaigns_passed
         and artifact_contract_passed
@@ -2067,13 +2666,18 @@ def main(argv: list[str] | None = None) -> int:
     global_target_met = global_elapsed <= args.target_seconds
     performance_requirements_met = global_target_met
     report = CampaignMatrixResult(
-        schema_version=8,
+        schema_version=10,
         global_target_seconds=args.target_seconds,
         global_elapsed_seconds=global_elapsed,
         global_target_met=global_target_met,
         correctness_passed=correctness_passed,
         performance_requirements_met=performance_requirements_met,
         completion_timeout_seconds=args.completion_timeout_seconds,
+        exact_cell_timeout_seconds=EXACT_CELL_TIMEOUT_SECONDS,
+        preflight_return_code=preflight_return_code,
+        preflight_elapsed_seconds=preflight_elapsed,
+        preflight_test_count=len(preflight_tests),
+        preflight_tests=preflight_tests,
         fixture_return_code=fixture_return_code,
         fixture_elapsed_seconds=fixture_elapsed,
         model_staging_return_code=model_staging_return_code,
@@ -2087,6 +2691,7 @@ def main(argv: list[str] | None = None) -> int:
         staged_model_bytes=sum(model.size_bytes for model in staged_models),
         staged_models=staged_models,
         scheduling_policy=(
+            "model_free_integration_preflight_"
             "exclusive_backend_sets_maximal_disjoint_"
             "identity_bound_tmpfs_model_staging_"
             f"{model_staging_mode}_reference_authenticated_model_digests"

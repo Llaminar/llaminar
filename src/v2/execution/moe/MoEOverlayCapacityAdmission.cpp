@@ -457,6 +457,11 @@ namespace llaminar2
         std::map<std::string, std::size_t> budget_by_id;
         MoEOverlayCapacityResolverInput input;
         input.num_experts = num_experts;
+        input.initial_residency_policy =
+            policy.materialize_migration_fabric
+                ? MoEOverlayInitialResidencyPolicy::
+                      MigrationSourcePerParticipant
+                : MoEOverlayInitialResidencyPolicy::PriorityFillOnly;
         input.layer_weight_manifest = layer_weight_manifest;
         input.physical_budgets.reserve(physical_budgets.size());
         for (const auto &budget : physical_budgets)
@@ -483,7 +488,6 @@ namespace llaminar2
                     canonical_staging,
                     budget.additional_transfer_staging_bytes,
                     "physical transfer staging"),
-                .safety_reserve_bytes = budget.safety_reserve_bytes,
             });
         }
         if (input.physical_budgets.empty())

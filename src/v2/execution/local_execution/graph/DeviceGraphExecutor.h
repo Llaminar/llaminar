@@ -1744,8 +1744,10 @@ namespace llaminar2
              * replacing a cache-owned stream is rejected so capture identity
              * cannot change behind a live executable.
              *
-             * @param ctx Live GPU context that owns @p stream.
-             * @param stream Exact non-null context-owned stream.
+             * @param ctx Live GPU context used to operate on @p stream. A
+             *        longer-lived graph or runtime-table authority may own the
+             *        stream itself.
+             * @param stream Exact non-null stream owned outside this cache.
              * @param device GPU device represented by the context.
              * @param context_from_process_pool Whether teardown should
              *        re-resolve @p ctx from the process-wide context pool.

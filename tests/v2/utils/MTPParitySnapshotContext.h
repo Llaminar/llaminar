@@ -197,6 +197,52 @@ namespace llaminar2::test::parity
     };
 
     /**
+     * @brief Immutable placement epoch inherited by one complete request.
+     *
+     * Recurrent GDN, short-convolution, and KV state encodes arithmetic from
+     * every preceding token. A final row's execution epoch is therefore not
+     * sufficient serial-equivalence evidence after expert movement. This value
+     * remains engaged only while prefill and every later production boundary
+     * begin, execute, and retire in one identical residency epoch.
+     */
+    struct MTPParityPlacementEpochTrajectory
+    {
+        std::optional<uint64_t> epoch;
+
+        /**
+         * @brief Extend the request history with one authenticated boundary.
+         *
+         * Once invalidated, a trajectory remains invalid: a stable suffix does
+         * not erase state inherited from a different earlier placement.
+         */
+        constexpr void observe(
+            uint64_t movement_epoch_begin,
+            uint64_t movement_epoch_end,
+            uint64_t execution_epoch) noexcept
+        {
+            if (!epoch.has_value() || execution_epoch == 0u ||
+                movement_epoch_begin != movement_epoch_end ||
+                movement_epoch_begin != execution_epoch ||
+                *epoch != execution_epoch)
+            {
+                epoch.reset();
+            }
+        }
+
+        /** @brief Mark inherited placement provenance as unavailable. */
+        constexpr void invalidate() noexcept
+        {
+            epoch.reset();
+        }
+
+        /** @return Whether the complete request history used @p candidate. */
+        [[nodiscard]] constexpr bool matches(uint64_t candidate) const noexcept
+        {
+            return candidate != 0u && epoch == candidate;
+        }
+    };
+
+    /**
      * @brief Exact grouped-response comparison against a serial Llaminar oracle.
      *
      * Hugging Face remains the numerical checkpoint oracle, but a quantized
@@ -308,6 +354,29 @@ namespace llaminar2::test::parity
     {
         return after.verifier_runs >= before.verifier_runs
                    ? after.verifier_runs - before.verifier_runs
+                   : 0;
+    }
+
+    /**
+     * @brief Return the smallest public budget that leaves one depth window unclipped.
+     *
+     * Draft depth @p draft_depth executes one condition row plus that many
+     * speculative rows. A finite public budget equal to those verifier rows
+     * must leave its final visible token pending for the next serial boundary,
+     * so production shortens the live-state publication by one row and marks
+     * the observation budget-limited. One additional response slot makes the
+     * complete verifier unable to exhaust the public budget and therefore
+     * permits the device depth controller to evaluate its full-width window.
+     *
+     * @param draft_depth Positive number of speculative comparison rows.
+     * @return `draft_depth + 2`, or zero for invalid/overflowing input.
+     */
+    [[nodiscard]] constexpr int mtpParityFullWidthPolicyWitnessBudget(
+        int draft_depth) noexcept
+    {
+        return draft_depth > 0 &&
+                       draft_depth <= std::numeric_limits<int>::max() - 2
+                   ? draft_depth + 2
                    : 0;
     }
 

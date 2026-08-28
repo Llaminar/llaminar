@@ -114,6 +114,7 @@ namespace llaminar2
         int vocabSize() const override;
         int currentPosition() const override;
         void clearCache() override;
+        bool purgePrefixCache() override;
         PrefixRuntimeStateSnapshot prefixStateProbe() const override;
         DeviceId primaryDeviceId() const override;
         const float *lastLogits() const override;

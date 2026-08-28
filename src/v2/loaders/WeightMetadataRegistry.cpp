@@ -11,6 +11,29 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Join host policies without losing a live CPU consumer.
+         *
+         * The ordinary lifecycle gate resolves every transient `RequiredUntil*`
+         * policy before the release sweep. CPU execution is different: its
+         * floating-point engines continue reading the source bytes during every
+         * inference. It consequently dominates every reclaimable policy.
+         */
+        WeightHostPolicy mergeHostPolicies(
+            WeightHostPolicy current,
+            WeightHostPolicy incoming)
+        {
+            if (current == WeightHostPolicy::RequiredForCPUExecution ||
+                incoming == WeightHostPolicy::RequiredForCPUExecution)
+            {
+                return WeightHostPolicy::RequiredForCPUExecution;
+            }
+            return incoming;
+        }
+    }
+
     uint64_t WeightMetadataRegistry::nextInstanceIdLocked()
     {
         return next_instance_id_++;
@@ -34,6 +57,9 @@ namespace llaminar2
             it->second.identity.derivation == WeightDerivationKind::Source &&
             it->second.identity.canonical_name == canonical_name)
         {
+            residency.host_policy = mergeHostPolicies(
+                it->second.residency.host_policy,
+                residency.host_policy);
             it->second.residency = residency;
             return false;
         }
@@ -57,6 +83,13 @@ namespace llaminar2
             identity.instance_id = nextInstanceIdLocked();
         if (identity.logical_id == 0 && !identity.canonical_name.empty())
             identity.logical_id = stableWeightLogicalId(identity.canonical_name);
+        if (const auto existing = metadata_.find(tensor);
+            existing != metadata_.end())
+        {
+            residency.host_policy = mergeHostPolicies(
+                existing->second.residency.host_policy,
+                residency.host_policy);
+        }
         metadata_[tensor] = WeightMetadata{std::move(identity), slice, residency};
         return true;
     }
@@ -133,7 +166,30 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = metadata_.find(tensor);
         if (it != metadata_.end())
+        {
+            residency.host_policy = mergeHostPolicies(
+                it->second.residency.host_policy,
+                residency.host_policy);
             it->second.residency = residency;
+        }
+    }
+
+    bool WeightMetadataRegistry::mergeHostPolicy(
+        const TensorBase *tensor,
+        WeightHostPolicy policy)
+    {
+        if (!tensor)
+            return false;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = metadata_.find(tensor);
+        if (it == metadata_.end())
+            return false;
+
+        it->second.residency.host_policy = mergeHostPolicies(
+            it->second.residency.host_policy,
+            policy);
+        return true;
     }
 
     std::string WeightMetadataRegistry::describe(const TensorBase *tensor) const

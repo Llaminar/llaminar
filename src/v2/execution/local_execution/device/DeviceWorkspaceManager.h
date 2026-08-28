@@ -382,6 +382,44 @@ namespace llaminar2
         bool zeroAll(void *stream);
 
         /**
+         * @brief Retire graph-visible metadata while retaining the primary block.
+         *
+         * This transition is legal only after every graph executable and stage
+         * that borrowed a named workspace address has been destroyed. It drops
+         * the old name/publication namespace but deliberately keeps the one
+         * contiguous backend allocation alive for the next exclusive runner.
+         * Append-only extension blocks are rejected because they cannot be
+         * represented as one deterministic serial-family allocation.
+         *
+         * @param error Optional precise rejection diagnostic.
+         * @return True when the manager is empty or owns one reusable primary
+         *         block and no graph-visible metadata remains.
+         */
+        bool sealPrimaryBlockForReuse(std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Publish a new serial-family layout over retained device bytes.
+         *
+         * No backend allocation or copy occurs. The caller must hold exclusive
+         * ownership of a manager previously sealed by
+         * @ref sealPrimaryBlockForReuse. A plan larger than the retained block
+         * is a hard capacity mismatch; this method never allocates a second
+         * block to conceal an incomplete reusable-storage envelope.
+         *
+         * @param plan Complete new graph-family layout.
+         * @return True when every named address was republished in the retained
+         *         block.
+         */
+        bool reusePrimaryBlockForSerialFamily(
+            const SerialWorkspaceFamilyPlan &plan);
+
+        /** @return Whether only a sealed, reusable primary block is published. */
+        [[nodiscard]] bool hasReusablePrimaryBlock() const noexcept
+        {
+            return reusable_primary_block_;
+        }
+
+        /**
          * @brief Check if buffers have been allocated
          */
         bool isAllocated() const { return allocated_; }
@@ -582,6 +620,14 @@ namespace llaminar2
         size_t budget_bytes_;
         size_t used_bytes_ = 0;
         bool allocated_ = false;
+
+        /**
+         * @brief True after graph metadata retirement and before republishing.
+         *
+         * The backing allocation remains authoritative, but no named pointer
+         * may be consumed in this state.
+         */
+        bool reusable_primary_block_ = false;
 
         // Main allocation block
         void *block_ = nullptr;

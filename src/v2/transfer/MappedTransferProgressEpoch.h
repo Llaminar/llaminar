@@ -2,9 +2,9 @@
  * @file MappedTransferProgressEpoch.h
  * @brief Node-local asynchronous-DMA scheduler for background expert movement.
  *
- * A physical ExpertOverlay fabric owns one epoch per local GPU. Permanent lane
- * slots publish typed D2H or H2D commands. The maintenance service submits
- * those commands on setup-owned background streams and observes per-slot
+ * A physical ExpertOverlay fabric owns one epoch per local GPU. Permanent
+ * command slots publish typed D2H or H2D work, while a separately bounded pool
+ * of setup-owned execution lanes submits that work and observes terminal
  * events. Inference graphs never capture, join, or wait for this scheduler.
  */
 
@@ -150,12 +150,13 @@ namespace llaminar2
     /**
      * @brief One finite asynchronous-DMA scheduler shared by GPU relay lanes.
      *
-     * Construction allocates every stream and event. Maintenance publishes
-     * fixed commands and invokes @ref submitOutstandingProgress; the exact GPU
-     * worker then queries prior events and enqueues every newly visible command.
-     * A stream per permanent slot preserves topology-declared parallelism and
-     * lets backend copy engines overlap opposite directions without allowing
-     * movement kernels to occupy inference compute units.
+     * Construction allocates the complete command directory plus a bounded
+     * execution-lane pool. Maintenance publishes fixed commands and invokes
+     * @ref submitOutstandingProgress; the exact GPU worker then queries prior
+     * lane events and assigns queued commands to free lanes. Keeping topology
+     * identity separate from physical submission concurrency prevents a large
+     * heterogeneous edge/projection BOM from materializing thousands of GPU
+     * streams and events while preserving every permanent command lease.
      */
     class MappedTransferProgressEpoch final
         : public std::enable_shared_from_this<
@@ -166,7 +167,15 @@ namespace llaminar2
         struct Config
         {
             DeviceId device = DeviceId::invalid();
+            /** Permanent topology-addressable command identities. */
             std::size_t slot_capacity = 0u;
+            /**
+             * Independently runnable DMA submissions on @ref device.
+             *
+             * This is a physical resource bound, not a command-directory size.
+             * It must be positive and no larger than @ref slot_capacity.
+             */
+            std::size_t execution_lane_capacity = 0u;
             std::size_t maximum_bytes = 0u;
             std::string name;
             std::string perf_device;
@@ -257,6 +266,12 @@ namespace llaminar2
             return config_.slot_capacity;
         }
 
+        /** @return Immutable number of materialized stream/event lane pairs. */
+        [[nodiscard]] std::size_t executionLaneCapacity() const noexcept
+        {
+            return execution_lanes_.size();
+        }
+
         /** @return Immutable positive payload limit for each slot. */
         [[nodiscard]] std::size_t maximumBytes() const noexcept
         {
@@ -266,9 +281,9 @@ namespace llaminar2
         /** @return First persistent background stream, for diagnostics only. */
         [[nodiscard]] void *executionStream() const noexcept
         {
-            return slot_runtimes_.empty()
+            return execution_lanes_.empty()
                        ? nullptr
-                       : slot_runtimes_.front().stream;
+                       : execution_lanes_.front().stream;
         }
 
         /** @return Race-safe cumulative proof counters. */
@@ -280,7 +295,7 @@ namespace llaminar2
         /** Store validated identity before the factory performs GPU setup. */
         explicit MappedTransferProgressEpoch(Config config);
 
-        /** Allocate command arrays plus one background stream/event per slot. */
+        /** Allocate command arrays plus the bounded stream/event execution pool. */
         void materialize();
 
         /** Publish one direction-checked command for a validated permanent slot. */
@@ -313,19 +328,43 @@ namespace llaminar2
         IWorkerGPUContext *context_ = nullptr;
         std::unique_ptr<MappedTransferProgressCommand[]> commands_;
         std::unique_ptr<MappedTransferProgressCompletion[]> completions_;
-        /** Worker-owned runtime for one independently schedulable DMA slot. */
+        /** Explicit lifecycle of one permanent command identity. */
+        enum class SlotLifecycle : std::uint8_t
+        {
+            Unreserved,          ///< Topology construction has not leased it.
+            Idle,                ///< Reserved and ready for one publication.
+            Published,           ///< A command is queued for an execution lane.
+            InFlight,            ///< One exact execution lane owns its DMA.
+            CompletionPublished, ///< Device completion awaits owner polling.
+        };
+
+        /** Host runtime for one topology-addressable command slot. */
         struct SlotRuntime
         {
             MappedTransferDirection direction =
                 MappedTransferDirection::DeviceToHost;
             std::shared_ptr<MappedHostTransferRegion> mapped_region;
+            std::uint64_t launched_generation = 0u;
+            std::size_t execution_lane_index = static_cast<std::size_t>(-1);
+            SlotLifecycle lifecycle = SlotLifecycle::Unreserved;
+        };
+
+        /** Worker-owned stream/event pair leased by at most one command. */
+        struct ExecutionLaneRuntime
+        {
             void *stream = nullptr;
             void *terminal_event = nullptr;
-            std::uint64_t launched_generation = 0u;
-            bool reserved = false;
-            bool in_flight = false;
+            std::size_t active_slot = static_cast<std::size_t>(-1);
+
+            /** @return Whether one submitted command owns this lane. */
+            [[nodiscard]] bool busy() const noexcept
+            {
+                return active_slot != static_cast<std::size_t>(-1);
+            }
         };
+
         std::vector<SlotRuntime> slot_runtimes_;
+        std::vector<ExecutionLaneRuntime> execution_lanes_;
         mutable std::mutex reservation_mutex_;
         std::size_t reserved_slots_ = 0u;
         /** Setup-only labels indexed by permanent command-slot identity. */

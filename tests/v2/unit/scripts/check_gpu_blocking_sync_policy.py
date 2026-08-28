@@ -353,7 +353,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "MoEOverlayDeviceControllerGraphService::releaseEndpoint", "worker_event", 1),
         ("src/v2/execution/moe/MoEOverlayDevicePreparedArrivalInbox.cpp", "MoEOverlayDevicePreparedArrivalInbox::release", "backend_event", 1),
         ("src/v2/execution/moe/MoEOverlayDeviceServiceTelemetryPublisher.cpp", "MoEOverlayDeviceServiceTelemetryPublisher::releaseEndpoint", "worker_event", 1),
-        ("src/v2/execution/moe/MoERuntimeTable.cpp", "DeviceMoERuntimeTable::releaseRuntimeHistogramDrainResources", "worker_stream", 1),
+        ("src/v2/execution/moe/MoERuntimeTable.cpp", "retireRuntimeHistogramProducerStreamsLocked", "worker_stream", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "synchronizeMirror", "worker_stream", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "copyHostToMirror", "backend_sync_copy", 1),
         ("src/v2/execution/runner/OrchestrationRunner.cpp", "synchronizeRunnerDevicesBeforeRelease", "backend_device", 1),

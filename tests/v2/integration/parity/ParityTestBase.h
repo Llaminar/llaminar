@@ -86,6 +86,8 @@
 #include "execution/mtp/MTPStateTransaction.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "utils/MTPParitySnapshotContext.h"
+#include "integration/parity/ParityCellLifecycle.h"
+#include "integration/parity/ProductionParityModelPath.h"
 
 // Pipeline parallelism support
 #include "config/PipelineConfig.h"
@@ -95,6 +97,7 @@
 // Modern orchestration runner support (for incremental migration)
 #include "utils/TestOrchestrationHelper.h"
 #include "../../utils/ParityGDNHeadPermutation.h"
+#include "../../utils/MoERoutingBoundary.h"
 #include "../../utils/ParityNumericalAggregation.h"
 #include "../../utils/ParitySnapshotSelection.h"
 #include "execution/runner/IOrchestrationRunner.h"
@@ -169,6 +172,21 @@ namespace llaminar2::test::parity
         PartialHit,
     };
 
+    /**
+     * @brief Rank participation contract for additive reference generation.
+     *
+     * Symmetric parity runners execute test control flow on every rank and may
+     * collectively publish one generated reference. A server-shaped MPI
+     * runner instead keeps peer ranks inside the production command loop; in
+     * that regime only the artifact authority may touch the reference lease or
+     * test-only coordination primitives.
+     */
+    enum class ParityReferenceGenerationCoordination : std::uint8_t
+    {
+        SymmetricRanks,
+        ArtifactAuthorityOnly,
+    };
+
     /** @return Stable CSV spelling for a prefix lifecycle proof phase. */
     inline const char *prefixRestoreProofPhaseName(
         PrefixRestoreProofPhase phase)
@@ -181,6 +199,36 @@ namespace llaminar2::test::parity
             return "complete_hit";
         case PrefixRestoreProofPhase::PartialHit:
             return "partial_hit";
+        }
+        return "unknown";
+    }
+
+    /** @return Stable CSV spelling for a terminal-payload comparison policy. */
+    inline const char *mtpTerminalPayloadComparisonPolicyName(
+        MTPTerminalPayloadComparisonPolicy policy)
+    {
+        switch (policy)
+        {
+        case MTPTerminalPayloadComparisonPolicy::ExactBytes:
+            return "exact_bytes";
+        case MTPTerminalPayloadComparisonPolicy::
+            ExactUnlessMoEPlacementChanged:
+            return "exact_unless_moe_placement_changed";
+        }
+        return "unknown";
+    }
+
+    /** @return Stable CSV spelling for a main-KV comparison policy. */
+    inline const char *mtpMainKVPayloadComparisonPolicyName(
+        MTPMainKVPayloadComparisonPolicy policy)
+    {
+        switch (policy)
+        {
+        case MTPMainKVPayloadComparisonPolicy::ExactBytes:
+            return "exact_bytes";
+        case MTPMainKVPayloadComparisonPolicy::
+            ExactPrefixNumericalSuffixAfterMoEPlacementChange:
+            return "exact_prefix_numerical_suffix_after_moe_placement_change";
         }
         return "unknown";
     }
@@ -247,45 +295,10 @@ namespace llaminar2::test::parity
         }
     };
 
-    /**
-     * @brief Structured proof emitted by one live production parity campaign.
-     *
-     * A campaign runs prefill and decode through one production runner.  The
-     * numerical CSVs remain the mathematical oracle; this record separately
-     * proves the backend's complete production generation policy: one native
-     * conditional parent on CUDA, or HIP's authenticated ticket selecting
-     * retained captured transactions. It also records the wall-time target
-     * that makes the matrix practical in CI.
-     */
-    struct ProductionParityEvidence
-    {
-        bool graph_execution = false;
-        bool homogeneous_gpu = false;
-        bool forward_full_graph_capture = false;
-        bool forward_full_graph_replay = false;
-        bool full_graph_capture = false;
-        bool full_graph_replay = false;
-        bool decode_graph_capture = false;
-        bool decode_graph_replay = false;
-        bool device_generation_controller = false;
-        ProductionDeviceGenerationPolicy generation_execution_policy =
-            ProductionDeviceGenerationPolicy::NotObserved;
-        bool native_generation_parent = false;
-        bool hosted_ticket_boundary_certified = false;
-        bool generation_loop_certified = false;
-        std::string generation_certification_detail = "not_observed";
-        bool segmented_plan = false;
-        bool segmented_capture = false;
-        bool segmented_replay = false;
-        bool model_context_reused = false;
-        double elapsed_seconds = 0.0;
-        double target_seconds = 3600.0;
-    };
-
     /** @brief Resolve the shared soft wall-time target reported by matrix cells. */
     inline double productionParityTargetSecondsFromEnvironment()
     {
-        constexpr double default_target_seconds = 3600.0;
+        constexpr double default_target_seconds = 4500.0;
         const char *raw =
             std::getenv("LLAMINAR_PRODUCTION_PARITY_TARGET_SECONDS");
         if (!raw || !*raw)
@@ -307,10 +320,11 @@ namespace llaminar2::test::parity
     /**
      * @brief Resolve the aggregate runner's trusted model-digest cache.
      *
-     * The directory is deliberately optional so a directly invoked campaign
-     * still authenticates the entire GGUF in its own process. The aggregate
-     * runner creates a private, run-scoped directory and sibling campaign
-     * processes coalesce only identical device/inode/size/mtime/ctime keys.
+     * The directory is deliberately optional for focused diagnostics outside
+     * the process-campaign lifecycle. The aggregate runner creates a private,
+     * run-scoped directory and sibling campaign processes coalesce only
+     * identical device/inode/size/mtime/ctime keys. Registered process
+     * campaigns themselves cannot bypass the aggregate runner's tmpfs staging.
      */
     inline std::optional<std::filesystem::path>
     productionParityDigestCacheFromEnvironment()
@@ -320,90 +334,6 @@ namespace llaminar2::test::parity
         if (!raw || !*raw)
             return std::nullopt;
         return std::filesystem::path(raw);
-    }
-
-    /**
-     * @brief Resolve a declared production GGUF to its authenticated RAM copy.
-     *
-     * The aggregate campaign stages every selected model before any inference
-     * process starts. A test may use either the repository `models` symlink or
-     * the canonical `/opt/llaminar-models` path, so membership is checked by
-     * canonical source identity while the collision-checked basename selects
-     * the staged file. Direct focused invocations have no staging environment
-     * and retain their configured path unchanged.
-     *
-     * @param configured_path Model path selected by the concrete parity case.
-     * @return The tmpfs path during an aggregate campaign, otherwise the input.
-     * @throws std::runtime_error if the aggregate manifest or staged file is
-     *         missing, stale, or does not authorize the configured model.
-     */
-    inline std::string productionParityResolvedModelPath(
-        const std::string &configured_path)
-    {
-        const char *raw_ramdisk =
-            std::getenv("LLAMINAR_PRODUCTION_PARITY_MODEL_RAMDISK");
-        if (!raw_ramdisk || !*raw_ramdisk)
-            return configured_path;
-
-        const char *raw_manifest =
-            std::getenv("LLAMINAR_PRODUCTION_PARITY_DECLARED_MODELS");
-        if (!raw_manifest || !*raw_manifest)
-        {
-            throw std::runtime_error(
-                "RAM-staged production parity has no declared GGUF manifest");
-        }
-
-        std::error_code error;
-        const auto ramdisk = std::filesystem::canonical(raw_ramdisk, error);
-        if (error || !std::filesystem::is_directory(ramdisk))
-        {
-            throw std::runtime_error(
-                "production parity RAM model directory is unavailable: " +
-                std::string(raw_ramdisk));
-        }
-        const auto configured = std::filesystem::canonical(
-            configured_path, error);
-        if (error)
-        {
-            throw std::runtime_error(
-                "cannot canonicalize declared production GGUF '" +
-                configured_path + "': " + error.message());
-        }
-
-        bool declared = false;
-        std::istringstream manifest(raw_manifest);
-        std::string entry;
-        while (std::getline(manifest, entry, '|'))
-        {
-            if (entry.empty())
-                continue;
-            error.clear();
-            const auto candidate = std::filesystem::canonical(entry, error);
-            if (!error &&
-                (candidate == configured ||
-                 (configured.parent_path() == ramdisk &&
-                  candidate.filename() == configured.filename())))
-            {
-                declared = true;
-                break;
-            }
-        }
-        if (!declared)
-        {
-            throw std::runtime_error(
-                "production parity configured an undeclared GGUF: " +
-                configured_path);
-        }
-
-        const auto staged = ramdisk / configured.filename();
-        error.clear();
-        if (!std::filesystem::is_regular_file(staged, error) || error)
-        {
-            throw std::runtime_error(
-                "declared production GGUF was not staged in RAM: " +
-                staged.string());
-        }
-        return staged.string();
     }
 
     /** @brief Return whether request-local evidence contains a graph counter. */
@@ -469,13 +399,15 @@ namespace llaminar2::test::parity
     inline ProductionParityEvidence collectProductionParityEvidence(
         const std::vector<PerfStatRecord> &records,
         bool graph_execution,
-        bool homogeneous_gpu,
+        ProductionParityExecutionTopology execution_topology,
+        ProductionParityGraphContract graph_contract,
         bool model_context_reused,
         double elapsed_seconds)
     {
         ProductionParityEvidence evidence;
         evidence.graph_execution = graph_execution;
-        evidence.homogeneous_gpu = homogeneous_gpu;
+        evidence.execution_topology = execution_topology;
+        evidence.graph_contract = graph_contract;
         evidence.forward_full_graph_capture = parityForwardGraphHasCounter(
             records, "full_graph_capture_executable_nodes");
         evidence.forward_full_graph_replay = parityForwardGraphHasCounter(
@@ -531,6 +463,8 @@ namespace llaminar2::test::parity
             evidence.segmented_plan &&
             (parityForwardGraphHasCounter(
                  records, "segmented_graph_capture_executable_nodes") ||
+             parityForwardGraphHasCounter(
+                 records, "segmented_graph_capture_segments") ||
              retained_parent_capture);
         evidence.segmented_replay =
             evidence.segmented_plan &&
@@ -545,25 +479,41 @@ namespace llaminar2::test::parity
     }
 
     /**
-     * @brief Return whether the selected generation policy ran captured work.
+     * @brief Classify a fully qualified production participant inventory.
      *
-     * A native conditional parent owns the complete generation graph. HIP's
-     * ticket policy has no representable outer graph, so its truthful proof is
-     * the full captured transaction body plus the independently certified
-     * dispatch protocol.
+     * This overload keeps model-family fixtures from independently rebuilding
+     * the homogeneous/heterogeneous decision and accidentally omitting CPU or
+     * one GPU vendor.
      */
-    inline bool productionParityHasRequiredGenerationGraph(
-        const ProductionParityEvidence &evidence)
+    inline ProductionParityExecutionTopology
+    classifyProductionParityExecutionTopology(
+        const std::vector<GlobalDeviceAddress> &devices)
     {
-        if (evidence.device_generation_controller &&
-            evidence.generation_execution_policy ==
-                ProductionDeviceGenerationPolicy::
-                    HostScheduledCapturedTransactions)
-        {
-            return evidence.forward_full_graph_capture ||
-                   evidence.forward_full_graph_replay;
-        }
-        return evidence.full_graph_capture || evidence.full_graph_replay;
+        const std::size_t cpu_count = static_cast<std::size_t>(std::count_if(
+            devices.begin(),
+            devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isCPU();
+            }));
+        const std::size_t cuda_count = static_cast<std::size_t>(std::count_if(
+            devices.begin(),
+            devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isCUDA();
+            }));
+        const std::size_t rocm_count = static_cast<std::size_t>(std::count_if(
+            devices.begin(),
+            devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isROCm();
+            }));
+        return classifyProductionParityExecutionTopology(
+            cpu_count,
+            cuda_count,
+            rocm_count);
     }
 
     /** Request-lifetime physical expert-movement contract for one parity cell. */
@@ -605,6 +555,16 @@ namespace llaminar2::test::parity
 
         // LM_HEAD thresholds
         float kl_threshold = 0.15f;      ///< Maximum KL divergence for logits
+        /**
+         * @brief Optional KL budget for recursively conditioned MTP logits.
+         *
+         * An unset value deliberately inherits @ref kl_threshold so adding MTP
+         * to a model cannot silently weaken its existing logit contract.  A
+         * model may set this only when its typed parity definition separately
+         * certifies the bounded numerical accumulation of its recursive
+         * predictor.
+         */
+        std::optional<float> mtp_kl_threshold;
         float min_top1_accuracy = 60.0f; ///< Minimum Top-1 accuracy percentage
         float min_top5_accuracy = 80.0f; ///< Minimum Top-5 accuracy percentage
         int pytorch_top1_in_topk = 3;    ///< PyTorch's top-1 must be in llaminar's top-K (0=disabled)
@@ -667,10 +627,11 @@ namespace llaminar2::test::parity
         ParityMoEMovementExpectation moe_movement_expectation =
             ParityMoEMovementExpectation::NotApplicable;
 
-        /** MTP controller mode and depth that runtime probes must prove. */
+        /** MTP controller mode and active depth that runtime probes must prove. */
         ParityMTPExpectation mtp_expectation =
             ParityMTPExpectation::Disabled;
         int mtp_expected_draft_depth = 0;
+        /** Setup-time draft capacity retained even when execution is disabled. */
         int mtp_expected_graph_capacity = 0;
 
         /// Optional execution contract used by GPU parity suites that must run
@@ -894,6 +855,20 @@ namespace llaminar2::test::parity
         bool serial_token_exact = false;
         uint64_t attempted_draft_tokens = 0;
         uint64_t verifier_transactions = 0;
+        /** Whether a separate full-budget adaptive-policy transaction ran. */
+        bool dynamic_policy_witness_executed = false;
+        /** Exact serial-token proof for the adaptive-policy transaction. */
+        bool dynamic_policy_witness_serial_token_exact = false;
+        /** Controller windows evaluated by the adaptive-policy transaction. */
+        uint64_t dynamic_policy_witness_window_delta = 0;
+        /** Predictor rows attempted by the adaptive-policy transaction. */
+        uint64_t dynamic_policy_witness_attempted_draft_tokens = 0;
+        /** Grouped verifiers run by the adaptive-policy transaction. */
+        uint64_t dynamic_policy_witness_verifier_transactions = 0;
+        /** Production tokens emitted by the adaptive-policy transaction. */
+        std::vector<int32_t> dynamic_policy_witness_emitted_tokens;
+        /** Matching serial-oracle suffix for the adaptive-policy transaction. */
+        std::vector<int32_t> dynamic_policy_witness_serial_oracle_tokens;
         PrefixRuntimeStateSnapshot before;
         PrefixRuntimeStateSnapshot after;
     };
@@ -955,6 +930,19 @@ namespace llaminar2::test::parity
         bool state_compared = false;
         bool state_equivalent = false;
         std::string state_detail;
+        uint64_t observed_moe_movement_epoch = 0;
+        uint64_t oracle_moe_movement_epoch = 0;
+        MTPMainKVPayloadComparisonPolicy main_kv_policy =
+            MTPMainKVPayloadComparisonPolicy::ExactBytes;
+        MTPStateValidationResult::MainKVNumericalEvidence main_kv_numerical;
+        MTPTerminalPayloadComparisonPolicy terminal_hidden_policy =
+            MTPTerminalPayloadComparisonPolicy::ExactBytes;
+        MTPStateValidationResult::TerminalPayloadNumericalEvidence
+            terminal_hidden_numerical;
+        MTPTerminalPayloadComparisonPolicy terminal_logits_policy =
+            MTPTerminalPayloadComparisonPolicy::ExactBytes;
+        MTPStateValidationResult::TerminalPayloadNumericalEvidence
+            terminal_logits_numerical;
         TerminalPayloadIdentity observed_payload;
         TerminalPayloadIdentity oracle_payload;
         bool checkpoint_compared = false;
@@ -1258,7 +1246,14 @@ namespace llaminar2::test::parity
                    "verifier_identity_transaction_count,verifier_identity_depth,"
                    "production_verifier_draft_tokens,"
                    "before_position,after_position,before_draft_steps,"
-                   "after_draft_steps,before_verifier_runs,after_verifier_runs\n";
+                   "after_draft_steps,before_verifier_runs,after_verifier_runs,"
+                   "dynamic_policy_witness_executed,"
+                   "dynamic_policy_witness_serial_token_exact,"
+                   "dynamic_policy_witness_window_delta,"
+                   "dynamic_policy_witness_attempted_draft_tokens,"
+                   "dynamic_policy_witness_verifier_transactions,"
+                   "dynamic_policy_witness_emitted_tokens,"
+                   "dynamic_policy_witness_serial_oracle_tokens\n";
             for (const auto &row : rows)
             {
                 out << csvEscape(backend) << ','
@@ -1284,7 +1279,20 @@ namespace llaminar2::test::parity
                     << row.before.mtp_draft_steps << ','
                     << row.after.mtp_draft_steps << ','
                     << row.before.mtp_verifier_runs << ','
-                    << row.after.mtp_verifier_runs << '\n';
+                    << row.after.mtp_verifier_runs << ','
+                    << boolText(row.dynamic_policy_witness_executed) << ','
+                    << boolText(
+                           row.dynamic_policy_witness_serial_token_exact)
+                    << ','
+                    << row.dynamic_policy_witness_window_delta << ','
+                    << row.dynamic_policy_witness_attempted_draft_tokens << ','
+                    << row.dynamic_policy_witness_verifier_transactions << ','
+                    << csvEscape(tokenList(
+                           row.dynamic_policy_witness_emitted_tokens))
+                    << ','
+                    << csvEscape(tokenList(
+                           row.dynamic_policy_witness_serial_oracle_tokens))
+                    << '\n';
             }
             return out.good();
         }
@@ -1313,7 +1321,30 @@ namespace llaminar2::test::parity
                    "terminal_logits_restored,terminal_hidden_restored,"
                    "mtp_state_restored,hybrid_state_restored,storage_tier,"
                    "current_position,state_compared,state_equivalent,"
-                   "state_detail,observed_terminal_hidden_hash_available,"
+                   "state_detail,observed_moe_movement_epoch,"
+                   "oracle_moe_movement_epoch,main_kv_policy,"
+                   "main_kv_numerically_compared,"
+                   "main_kv_exact_prefix_segments,"
+                   "main_kv_numerical_suffix_payloads,"
+                   "main_kv_numerical_elements,"
+                   "main_kv_minimum_cosine,"
+                   "main_kv_maximum_relative_l2,"
+                   "main_kv_maximum_abs,"
+                   "main_kv_numerically_passed,terminal_hidden_policy,"
+                   "terminal_hidden_numerically_compared,"
+                   "terminal_hidden_numerical_elements,"
+                   "terminal_hidden_numerical_cosine,"
+                   "terminal_hidden_numerical_rel_l2,"
+                   "terminal_hidden_numerical_max_abs,"
+                   "terminal_hidden_numerical_passed,"
+                   "terminal_logits_policy,"
+                   "terminal_logits_numerically_compared,"
+                   "terminal_logits_numerical_elements,"
+                   "terminal_logits_numerical_cosine,"
+                   "terminal_logits_numerical_rel_l2,"
+                   "terminal_logits_numerical_max_abs,"
+                   "terminal_logits_numerical_passed,"
+                   "observed_terminal_hidden_hash_available,"
                    "observed_terminal_hidden_bytes,observed_terminal_hidden_hash,"
                    "observed_terminal_logits_hash_available,"
                    "observed_terminal_logits_bytes,observed_terminal_logits_hash,"
@@ -1348,6 +1379,39 @@ namespace llaminar2::test::parity
                     << boolText(row.state_compared) << ','
                     << boolText(row.state_equivalent) << ','
                     << csvEscape(row.state_detail) << ','
+                    << row.observed_moe_movement_epoch << ','
+                    << row.oracle_moe_movement_epoch << ','
+                    << mtpMainKVPayloadComparisonPolicyName(
+                           row.main_kv_policy)
+                    << ','
+                    << boolText(row.main_kv_numerical.compared) << ','
+                    << row.main_kv_numerical.exact_prefix_segments << ','
+                    << row.main_kv_numerical.numerical_suffix_payloads << ','
+                    << row.main_kv_numerical.elements << ','
+                    << row.main_kv_numerical.minimum_cosine << ','
+                    << row.main_kv_numerical.maximum_relative_l2 << ','
+                    << row.main_kv_numerical.maximum_abs << ','
+                    << boolText(row.main_kv_numerical.passed) << ','
+                    << mtpTerminalPayloadComparisonPolicyName(
+                           row.terminal_hidden_policy)
+                    << ','
+                    << boolText(row.terminal_hidden_numerical.compared)
+                    << ','
+                    << row.terminal_hidden_numerical.elements << ','
+                    << row.terminal_hidden_numerical.cosine << ','
+                    << row.terminal_hidden_numerical.relative_l2 << ','
+                    << row.terminal_hidden_numerical.max_abs << ','
+                    << boolText(row.terminal_hidden_numerical.passed) << ','
+                    << mtpTerminalPayloadComparisonPolicyName(
+                           row.terminal_logits_policy)
+                    << ','
+                    << boolText(row.terminal_logits_numerical.compared)
+                    << ','
+                    << row.terminal_logits_numerical.elements << ','
+                    << row.terminal_logits_numerical.cosine << ','
+                    << row.terminal_logits_numerical.relative_l2 << ','
+                    << row.terminal_logits_numerical.max_abs << ','
+                    << boolText(row.terminal_logits_numerical.passed) << ','
                     << boolText(
                            row.observed_payload.hidden_hash_available)
                     << ','
@@ -1449,7 +1513,8 @@ namespace llaminar2::test::parity
             std::ofstream out(dir / "production_path.csv", std::ios::trunc);
             if (!out.is_open())
                 return false;
-            out << "backend,device,execution_path,homogeneous_gpu,"
+            out << "backend,device,execution_path,execution_topology,"
+                   "graph_contract,"
                    "forward_full_graph_capture,forward_full_graph_replay,"
                    "full_graph_capture,full_graph_replay,decode_graph_capture,"
                    "decode_graph_replay,device_generation_controller,"
@@ -1465,7 +1530,11 @@ namespace llaminar2::test::parity
             out << csvEscape(backend) << ','
                 << csvEscape(device) << ','
                 << (evidence.graph_execution ? "graph" : "non_graph") << ','
-                << boolText(evidence.homogeneous_gpu) << ','
+                << productionParityExecutionTopologyName(
+                       evidence.execution_topology)
+                << ','
+                << productionParityGraphContractName(evidence.graph_contract)
+                << ','
                 << boolText(evidence.forward_full_graph_capture) << ','
                 << boolText(evidence.forward_full_graph_replay) << ','
                 << boolText(evidence.full_graph_capture) << ','
@@ -1930,6 +1999,10 @@ namespace llaminar2::test::parity
         int early_layers_count = 4;                     ///< Number of early layers to check
         int min_early_layers_passed = 4;                ///< Min early layers that must pass
         float kl_threshold = 0.05f;                     ///< Max KL divergence for logits
+        /**
+         * @brief Optional MTP-only KL budget; unset preserves @ref kl_threshold.
+         */
+        std::optional<float> mtp_kl_threshold;
         std::vector<std::string> excluded_stages = {};  ///< Stages to exclude from parity comparison
         std::vector<std::string> allreduce_stages = {}; ///< Stages to allreduce across MPI ranks before comparison
         float min_top1_accuracy = 80.0f;                ///< Min Top-1 accuracy %
@@ -2014,6 +2087,7 @@ namespace llaminar2::test::parity
         ParityMTPExpectation mtp_expectation =
             ParityMTPExpectation::Disabled;
         int mtp_expected_draft_depth = 0;
+        /** Setup-time draft capacity retained even when execution is disabled. */
         int mtp_expected_graph_capacity = 0;
 
         /// Physical and semantic MoE policy consumed by production runner setup.
@@ -2396,7 +2470,7 @@ namespace llaminar2::test::parity
         }
         const double norm_product =
             std::sqrt(norm_actual_sq) * std::sqrt(norm_expected_sq);
-        if (norm_product > 1.0e-10)
+        if (norm_product > kParityCosineNormProductResolution)
         {
             result.cosine_similarity = static_cast<float>(
                 dot_product / norm_product);
@@ -2461,7 +2535,7 @@ namespace llaminar2::test::parity
         }
 
         double denominator = std::sqrt(norm_a) * std::sqrt(norm_b);
-        if (denominator < 1e-10)
+        if (denominator <= kParityCosineNormProductResolution)
         {
             return 0.0f;
         }
@@ -3748,7 +3822,10 @@ namespace llaminar2::test::parity
         std::unordered_map<std::string, ParityProfileRecord> parity_profile_records_;
         std::vector<SavedEnvValue> parity_env_overrides_;
 
-        // MPI context for tensor-parallel tests (optional, null for single-rank)
+        /** Sole owner of the fixture's isolated test-control protocol. */
+        ParityCellLifecycle parity_cell_lifecycle_;
+
+        // Stable production MPI context (optional, null for single-rank).
         std::shared_ptr<IMPIContext> mpi_ctx_;
 
         // Modern orchestration runner (for incremental migration from IInferenceRunner)
@@ -3860,6 +3937,103 @@ namespace llaminar2::test::parity
         // MPI Helper Methods
         // =============================================================================
 
+    private:
+        /**
+         * @brief Enter the one base-owned MPI lifecycle for this fixture.
+         *
+         * The derived fixture may install `mpi_ctx_` first when production
+         * execution spans ranks.  Single-rank runners intentionally keep that
+         * production pointer null, but their test lifecycle still duplicates
+         * `MPI_COMM_WORLD` (of size one).  Production runners never receive the
+         * duplicated test channels.
+         *
+         * @throws std::logic_error for re-entry or an unavailable MPI runtime.
+         * @throws std::runtime_error when MPI cannot create the isolated scope.
+         */
+        void enterParityCellLifecycle()
+        {
+            int initialized = 0;
+            int finalized = 0;
+            if (MPI_Initialized(&initialized) != MPI_SUCCESS || !initialized ||
+                MPI_Finalized(&finalized) != MPI_SUCCESS || finalized)
+            {
+                throw std::logic_error(
+                    "Parity cell lifecycle requires an active MPI runtime");
+            }
+
+            MPI_Comm source = MPI_COMM_WORLD;
+            if (mpi_ctx_)
+            {
+                source = mpi_ctx_->communicator();
+                if (source == MPI_COMM_NULL)
+                {
+                    throw std::logic_error(
+                        "Parity production context has no live communicator");
+                }
+            }
+
+            parity_cell_lifecycle_.enter(source);
+        }
+
+        /**
+         * @brief Retire both test-only channels after the final rendezvous.
+         *
+         * The base fixture is the sole lifecycle authority.  Retiring while a
+         * production runner is live would free communicator handles beneath
+         * active state and is therefore a fatal transition error.
+         */
+        void retireParityCellLifecycle()
+        {
+            if (runner_ || orch_runner_ || borrowed_runner_)
+            {
+                throw std::logic_error(
+                    "Parity cell lifecycle cannot retire while execution state is live");
+            }
+            parity_cell_lifecycle_.retire();
+        }
+
+        /**
+         * @brief Rendezvous on the teardown-only lifecycle channel.
+         *
+         * No setup, evidence, production, or CSV collective may use this
+         * channel. Consequently its entry and exit barriers have one exact
+         * sequence and cannot be satisfied by a different logical phase.
+         *
+         * @throws std::logic_error when no typed lifecycle channel is active.
+         */
+        void parityLifecycleBarrier()
+        {
+            parity_cell_lifecycle_.teardownBarrier();
+        }
+
+    protected:
+
+        /**
+         * @return Test-control context when a cell scope is active, otherwise
+         *         the stable production context for legacy parity fixtures.
+         */
+        const std::shared_ptr<IMPIContext> &parityCoordinationMPIContext() const
+        {
+            return parity_cell_lifecycle_.active()
+                       ? parity_cell_lifecycle_.controlContext()
+                       : mpi_ctx_;
+        }
+
+        /**
+         * @return Exact communicator for test barriers and evidence exchange.
+         * @throws std::logic_error when the fixture has no MPI coordination.
+         */
+        MPI_Comm parityCoordinationCommunicator() const
+        {
+            const auto &context = parityCoordinationMPIContext();
+            if (!context || context->communicator() == MPI_COMM_NULL)
+            {
+                throw std::logic_error(
+                    "Parity MPI coordination has no live communicator");
+            }
+            return context->communicator();
+        }
+
         /**
          * @brief Return the rank that owns comparison and CSV artifact output.
          *
@@ -3872,6 +4046,17 @@ namespace llaminar2::test::parity
         virtual int parityArtifactAuthorityRank() const
         {
             return 0;
+        }
+
+        /**
+         * @brief Declare which ranks share reference-generation control flow.
+         * @return Symmetric participation unless a production command loop
+         *         owns peer ranks.
+         */
+        virtual ParityReferenceGenerationCoordination
+        parityReferenceGenerationCoordination() const
+        {
+            return ParityReferenceGenerationCoordination::SymmetricRanks;
         }
 
         /**
@@ -3905,9 +4090,10 @@ namespace llaminar2::test::parity
          */
         void mpiBarrier()
         {
-            if (mpi_ctx_)
+            const auto &context = parityCoordinationMPIContext();
+            if (context)
             {
-                mpi_ctx_->barrier();
+                context->barrier();
             }
         }
 
@@ -4055,6 +4241,14 @@ namespace llaminar2::test::parity
             mutableDebugEnv().reload();
             auto parity_profile_scope = profileParityScope("set_up.total");
 
+            /*
+             * Every parity topology, including a one-rank CPU/GPU case, owns
+             * the same isolated evidence and teardown channels.  Starting the
+             * lifecycle here prevents individual model/topology fixtures from
+             * partially adopting the protocol.
+             */
+            enterParityCellLifecycle();
+
             // Resolve only after the derived fixture has selected its exact
             // model. The RAM copy remains immutable for the complete aggregate
             // run and is re-authenticated against reference metadata below.
@@ -4120,17 +4314,28 @@ namespace llaminar2::test::parity
                 results_dir_ready = ec ? 0 : 1;
             }
             if (mpi_ctx_ && mpiWorldSize() > 1)
-                mpi_ctx_->broadcast_int32(&results_dir_ready, 1, 0);
+                parityCoordinationMPIContext()->broadcast_int32(
+                    &results_dir_ready, 1, 0);
             mpiBarrier();
             ASSERT_EQ(results_dir_ready, 1)
                 << "Cannot prepare a fresh parity artifact directory for "
                 << getTestName();
 
-            // Start log file capture for this test run (rank 0 only)
-            if (isRank0())
+            /*
+             * Every rank owns a separate diagnostic stream. The artifact
+             * authority retains the canonical `test_log.txt` progress marker
+             * consumed by the campaign watchdog; peers publish rank-qualified
+             * logs so a local setup failure is visible even when another rank
+             * is blocked in a production initialization consensus.
+             */
             {
                 auto dir = ensureResultsDir();
-                auto log_path = dir / "test_log.txt";
+                const auto log_path =
+                    dir /
+                    (isRank0()
+                         ? std::string("test_log.txt")
+                         : "rank_" + std::to_string(mpiRank()) +
+                               "_test_log.txt");
                 if (Logger::getInstance().setLogFile(log_path.string()))
                 {
                     LOG_INFO("[Parity] Log file: " << log_path.string());
@@ -4294,7 +4499,8 @@ namespace llaminar2::test::parity
                 }
 
                 if (mpi_ctx_ && mpiWorldSize() > 1)
-                    mpi_ctx_->broadcast_int32(&snapshots_ready, 1, 0);
+                    parityCoordinationMPIContext()->broadcast_int32(
+                        &snapshots_ready, 1, 0);
             }
             {
                 auto scope = profileParityScope("set_up.snapshot_barrier");
@@ -4308,10 +4514,27 @@ namespace llaminar2::test::parity
 
         void TearDown() override
         {
+            /*
+             * GoogleTest invokes TearDown after a derived SetUp skips or fails
+             * before calling this base.  That is the only valid no-lifecycle
+             * state; once base setup has entered, every teardown transition is
+             * strict and must retire exactly once.
+             */
+            if (parity_cell_lifecycle_.state() ==
+                ParityCellLifecycleState::NotEntered)
+            {
+                return;
+            }
+            if (!parity_cell_lifecycle_.active())
+            {
+                throw std::logic_error(
+                    "Parity teardown entered from an invalid lifecycle state");
+            }
+
             // Barrier before teardown to ensure all ranks are done
             {
                 auto scope = profileParityScope("tear_down.initial_barrier");
-                mpiBarrier();
+                parityLifecycleBarrier();
             }
 
             // Ensure all GPU work that may reference graph stages or cached
@@ -4443,8 +4666,9 @@ namespace llaminar2::test::parity
              */
             {
                 auto scope = profileParityScope("tear_down.final_barrier");
-                mpiBarrier();
+                parityLifecycleBarrier();
             }
+            retireParityCellLifecycle();
         }
 
         /**
@@ -5973,25 +6197,53 @@ namespace llaminar2::test::parity
         }
 
         /**
-         * @brief Return whether every configured participant is the same GPU type.
+         * @brief Resolve the graph contract from the complete participant set.
          *
-         * Homogeneous GPU cells must execute a certified backend-native
-         * generation policy. CUDA owns one conditional parent; ROCm owns the
-         * authenticated ticket-selected captured-transaction protocol.
-         * Heterogeneous cells may expose explicit graph/collective segmentation.
+         * The typed result prevents accelerator-bearing heterogeneous cells
+         * from falling through the homogeneous-GPU branch and being certified
+         * by declarative graph entry alone.
          */
-        bool productionParityUsesHomogeneousGPU() const
+        ProductionParityExecutionTopology
+        productionParityExecutionTopology() const
         {
-            const auto &devices = cfg().devices;
-            if (devices.empty() || devices.front() == ParityDeviceType::CPU)
-                return false;
-            return std::all_of(
-                devices.begin(),
-                devices.end(),
-                [first = devices.front()](ParityDeviceType device)
+            std::size_t cpu_count = 0;
+            std::size_t cuda_count = 0;
+            std::size_t rocm_count = 0;
+            for (const ParityDeviceType device : cfg().devices)
+            {
+                switch (device)
                 {
-                    return device == first;
-                });
+                case ParityDeviceType::CPU:
+                    ++cpu_count;
+                    break;
+                case ParityDeviceType::CUDA:
+                    ++cuda_count;
+                    break;
+                case ParityDeviceType::ROCm:
+                    ++rocm_count;
+                    break;
+                }
+            }
+            return classifyProductionParityExecutionTopology(
+                cpu_count,
+                cuda_count,
+                rocm_count);
+        }
+
+        /**
+         * @brief Resolve this rank's graph proof after topology binding.
+         *
+         * `isRank0()` names the inventory-resolved continuation/artifact
+         * authority, not a hard-coded MPI rank. Moving accelerators between
+         * sockets therefore moves the segmented-coordinator obligation with
+         * the production authority.
+         */
+        ProductionParityGraphContract productionParityGraphContract() const
+        {
+            return resolveProductionParityGraphContract(
+                productionParityExecutionTopology(),
+                isRank0(),
+                activePrimaryDevice().is_gpu());
         }
 
         static bool productionParityHasCounter(
@@ -6030,8 +6282,35 @@ namespace llaminar2::test::parity
              */
             setScopedParityEnvOverride(
                 "LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1");
+            if (config_.moe_movement_expectation ==
+                ParityMoEMovementExpectation::PhysicalMovement)
+            {
+                /*
+                 * A dynamic placement cell can recompute its one uncached row
+                 * on a different device type.  Retain only that bounded row;
+                 * the leading digest remains the exact cached-prefix proof.
+                 * Static and non-overlay cells pay no extra segment export.
+                 */
+                setScopedParityEnvOverride(
+                    "LLAMINAR_PREFIX_PROBE_HASH_KV_SEGMENTS", "1");
+                setScopedParityEnvOverride(
+                    "LLAMINAR_PREFIX_PROBE_KV_SEGMENT_SPLIT",
+                    std::to_string(config_.token_ids.size()));
+                setScopedParityEnvOverride(
+                    "LLAMINAR_PREFIX_PROBE_KV_SEGMENTS",
+                    "recomputed_suffix=" +
+                        std::to_string(config_.token_ids.size()) + ":1");
+                setScopedParityEnvOverride(
+                    "LLAMINAR_PREFIX_PROBE_CAPTURE_KV_SEGMENT_PAYLOADS", "1");
+            }
             setScopedParityEnvOverride(
                 "LLAMINAR_PREFIX_PROBE_HASH_TERMINAL_STATE", "1");
+            setScopedParityEnvOverride(
+                "LLAMINAR_PREFIX_PROBE_CAPTURE_TERMINAL_HIDDEN_VALUES",
+                "1");
+            setScopedParityEnvOverride(
+                "LLAMINAR_PREFIX_PROBE_CAPTURE_TERMINAL_LOGITS_VALUES",
+                "1");
             setScopedParityEnvOverride(
                 "LLAMINAR_PREFIX_PROBE_CAPTURE_DEVICE_LOGICAL_STATE", "1");
             PerfStatsCollector::reset();
@@ -6126,6 +6405,8 @@ namespace llaminar2::test::parity
                 .cache_bypass_reason = state.prefix_cache_bypass_reason,
                 .request = state.prefix_request,
                 .current_position = state.current_position,
+                .observed_moe_movement_epoch =
+                    state.moe_runtime_movement_epoch,
                 .observed_payload =
                     PrefixRestoreEvidence::TerminalPayloadIdentity::fromSnapshot(
                         state),
@@ -6197,6 +6478,10 @@ namespace llaminar2::test::parity
                 .state_compared = true,
                 .state_equivalent = static_cast<bool>(state_match),
                 .state_detail = state_match.reason,
+                .observed_moe_movement_epoch =
+                    restored.moe_runtime_movement_epoch,
+                .oracle_moe_movement_epoch =
+                    fresh_state.moe_runtime_movement_epoch,
                 .observed_payload =
                     PrefixRestoreEvidence::TerminalPayloadIdentity::fromSnapshot(
                         restored),
@@ -6214,11 +6499,167 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Payload contract for a complete current-fingerprint restore.
+         *
+         * Ordinary decode needs the main-model KV, hybrid state, and terminal
+         * logits. An MTP oracle additionally needs the shifted sidecar state
+         * and terminal hidden row. Naming that distinction prevents callers
+         * from inferring the required payload from a backend or test name.
+         */
+        enum class ProductionParityCompletePrefixPayload : std::uint8_t
+        {
+            MainModel,      ///< Restore the ordinary main-model request state.
+            MainModelAndMTP ///< Restore main-model and shifted-MTP state.
+        };
+
+        /**
+         * @brief Completed cache boundary owned by the current fingerprint.
+         */
+        struct ProductionParityCompletePrefixBoundary
+        {
+            PrefixRuntimeStateSnapshot state; ///< Deep state after the hit.
+            bool seeded_current_fingerprint = false; ///< A miss first seeded it.
+        };
+
+        /**
+         * @brief Establish one complete restore under the current cache key.
+         *
+         * Dynamic ExpertOverlay may publish a new placement between two
+         * independent parity phases. `InvalidateOnRebalance` intentionally
+         * gives that placement a new cache fingerprint, so a proof cannot
+         * assume that an entry seeded by an earlier phase still names the
+         * current epoch. This transition admits at most one seed request and
+         * then requires the immediately following request to be a complete
+         * production hit. A second miss is a hard lifecycle failure rather
+         * than permission to retry, disable cache, or execute an eager path.
+         *
+         * Snapshot validation is deliberately disabled for these two
+         * admissions: a complete hit launches no model graph by construction,
+         * while the canonical prefill proof has already certified the captured
+         * compute path. The subsequent decode/MTP proof re-enables its normal
+         * graph and snapshot policy.
+         *
+         * @param prompt Exact authenticated prompt for this proof transaction.
+         * @param payload Required persistent payload family.
+         * @param error Receives a precise lifecycle diagnostic on failure.
+         * @return Complete current-fingerprint boundary, or nullopt on failure.
+         */
+        std::optional<ProductionParityCompletePrefixBoundary>
+        restoreProductionParityCompletePrefixAtCurrentFingerprint(
+            const std::vector<int32_t> &prompt,
+            ProductionParityCompletePrefixPayload payload,
+            std::string *error)
+        {
+            const auto fail = [error](std::string message)
+                -> std::optional<ProductionParityCompletePrefixBoundary>
+            {
+                if (error)
+                    *error = std::move(message);
+                return std::nullopt;
+            };
+            if (!orch_runner_)
+            {
+                return fail(
+                    "current-fingerprint prefix restore requires the production runner");
+            }
+            if (prompt.empty())
+            {
+                return fail(
+                    "current-fingerprint prefix restore requires a non-empty prompt");
+            }
+
+            auto restore_policy =
+                parityGraphSnapshotPolicy(ParityForwardPhase::Prefill);
+            restore_policy.require_graph_execution_on_gpu = false;
+            restore_policy.require_snapshot_publication = false;
+            restore_policy.require_prefill_graph_capture_on_gpu = false;
+            restore_policy.retry_prefill_after_warmup_for_capture = false;
+
+            const auto complete = [&](const PrefixRuntimeStateSnapshot &state)
+            {
+                const bool common =
+                    state.prefix_cache_ready &&
+                    !state.prefix_cache_bypassed &&
+                    state.prefix_request.enabled &&
+                    !state.prefix_request.bypassed &&
+                    state.prefix_request.hit &&
+                    !state.prefix_request.partial_hit &&
+                    state.prefix_request.matched_tokens ==
+                        static_cast<int>(prompt.size()) &&
+                    state.prefix_request.terminal_logits_restored;
+                if (!common)
+                    return false;
+                return payload ==
+                           ProductionParityCompletePrefixPayload::MainModel ||
+                       (state.prefix_request.terminal_hidden_restored &&
+                        state.prefix_request.mtp_state_restored);
+            };
+
+            std::optional<std::uint64_t> seed_movement_epoch;
+            for (int admission = 0; admission < 2; ++admission)
+            {
+                activeClearSnapshots();
+                activeClearCache();
+                if (!runParityForwardWithPolicy(
+                        ParityForwardPhase::Prefill,
+                        prompt.data(),
+                        static_cast<int>(prompt.size()),
+                        restore_policy))
+                {
+                    return fail(
+                        "current-fingerprint prefix admission failed: " +
+                        orch_runner_->lastError());
+                }
+
+                PrefixRuntimeStateSnapshot state = activePrefixStateProbe();
+                if (seed_movement_epoch &&
+                    state.moe_runtime_movement_epoch !=
+                        *seed_movement_epoch)
+                {
+                    return fail(
+                        "ExpertOverlay movement advanced while establishing one current-fingerprint prefix boundary");
+                }
+                if (complete(state))
+                {
+                    return ProductionParityCompletePrefixBoundary{
+                        .state = std::move(state),
+                        .seeded_current_fingerprint = admission != 0,
+                    };
+                }
+                if (admission != 0)
+                {
+                    return fail(
+                        "current-fingerprint seed was not followed by one complete prefix restore");
+                }
+                if (!state.prefix_cache_ready ||
+                    state.prefix_cache_bypassed ||
+                    !state.prefix_request.enabled ||
+                    state.prefix_request.bypassed)
+                {
+                    return fail(
+                        "current-fingerprint seed request did not own an enabled prefix cache: " +
+                        (state.prefix_request.bypass_reason.empty()
+                             ? state.prefix_cache_bypass_reason
+                             : state.prefix_request.bypass_reason));
+                }
+                seed_movement_epoch = state.moe_runtime_movement_epoch;
+            }
+
+            return fail(
+                "current-fingerprint prefix restore exhausted its typed admission lifecycle");
+        }
+
+        /**
          * @brief Prove cached prompt plus one authenticated token is partial.
          *
          * Ordinary decode has already certified every stage for the same
-         * prompt-plus-token boundary. This replay requires byte-equivalent
-         * state and independently compares its recomputed live LM-head row.
+         * prompt-plus-token boundary. This replay requires exact persistent
+         * state while physical placement is unchanged. If production moved an
+         * expert between device types in the meantime, the complete retained
+         * terminal-hidden and terminal-logits rows must instead satisfy the
+         * same strict numerical contract as the real-weight MTP checkpoints;
+         * all other state remains exact. The recomputed live LM-head row is
+         * independently compared to Hugging Face in either case.
          */
         void assertProductionParityPartialPrefixRestore()
         {
@@ -6226,15 +6667,53 @@ namespace llaminar2::test::parity
                 readDecodeTokensFromMetadata();
             ASSERT_FALSE(decode_tokens.empty())
                 << "Partial prefix proof requires one authenticated decode token";
-            ASSERT_FALSE(productionParityDecodeBoundaries().empty())
-                << "Decode parity retained no state for the partial-hit oracle";
+
+            std::vector<int32_t> prompt(
+                config_.token_ids.begin(), config_.token_ids.end());
+            std::string restore_error;
+            const auto complete_prefix =
+                restoreProductionParityCompletePrefixAtCurrentFingerprint(
+                    prompt,
+                    config_.mtp_expectation == ParityMTPExpectation::Disabled
+                        ? ProductionParityCompletePrefixPayload::MainModel
+                        : ProductionParityCompletePrefixPayload::MainModelAndMTP,
+                    &restore_error);
+            ASSERT_TRUE(complete_prefix.has_value())
+                << "Could not establish the partial-prefix oracle boundary: "
+                << restore_error;
+
+            activeClearSnapshots();
+            const int first_decode_token = decode_tokens.front();
+            ASSERT_TRUE(runParityForward(
+                ParityForwardPhase::Decode,
+                &first_decode_token,
+                1))
+                << "Current-fingerprint partial-prefix oracle decode failed";
+
+            std::optional<int32_t> pending_condition_token;
+            if (orchestration_parity_force_mode_ ==
+                ParityForcedTokenCommitMode::Deferred)
+            {
+                ASSERT_LT(
+                    orchestration_parity_decode_trajectory_index_,
+                    orchestration_parity_decode_trajectory_.size())
+                    << "Deferred partial-prefix oracle has no pending condition";
+                pending_condition_token =
+                    orchestration_parity_decode_trajectory_[
+                        orchestration_parity_decode_trajectory_index_];
+            }
 
             std::vector<int> extended_prompt = config_.token_ids;
             extended_prompt.push_back(decode_tokens.front());
             const int expected_position =
                 static_cast<int>(extended_prompt.size());
-            const ProductionParityDecodeBoundary &oracle =
-                productionParityDecodeBoundaries().front();
+            const ProductionParityDecodeBoundary oracle{
+                .reference_step = 0u,
+                .committed_token = first_decode_token,
+                .pending_condition_token = pending_condition_token,
+                .expected_current_position = expected_position,
+                .runtime_state = activePrefixStateProbe(),
+            };
             ASSERT_EQ(oracle.reference_step, 0u);
             ASSERT_EQ(oracle.committed_token, decode_tokens.front());
             ASSERT_EQ(oracle.expected_current_position, expected_position);
@@ -6313,9 +6792,31 @@ namespace llaminar2::test::parity
             EXPECT_FALSE(restored.prefix_request.terminal_logits_restored)
                 << "A partial hit must recompute the uncached suffix";
 
+            MTPRuntimeSnapshotComparisonOptions state_options;
+            state_options.main_kv_payload_policy =
+                MTPMainKVPayloadComparisonPolicy::
+                    ExactPrefixNumericalSuffixAfterMoEPlacementChange;
+            state_options.main_kv_exact_prefix_tokens =
+                static_cast<int>(config_.token_ids.size());
+            state_options.main_kv_suffix_min_cosine = std::max(
+                static_cast<double>(config_.decode_cosine_threshold),
+                kMinimumProductionRecursiveMTPAggregateCosine);
+            state_options.terminal_hidden_policy =
+                MTPTerminalPayloadComparisonPolicy::
+                    ExactUnlessMoEPlacementChanged;
+            state_options.terminal_hidden_min_cosine = std::max(
+                static_cast<double>(config_.decode_cosine_threshold),
+                kMinimumProductionRecursiveMTPAggregateCosine);
+            state_options.terminal_logits_policy =
+                MTPTerminalPayloadComparisonPolicy::
+                    ExactUnlessMoEPlacementChanged;
+            state_options.terminal_logits_min_cosine =
+                state_options.terminal_hidden_min_cosine;
             const MTPStateValidationResult state_match =
                 compareMTPRuntimeStateSnapshots(
-                    oracle.runtime_state, restored);
+                    oracle.runtime_state,
+                    restored,
+                    state_options);
             EXPECT_TRUE(state_match) << state_match.reason;
 
             struct PartialCheckpointProof
@@ -6379,7 +6880,7 @@ namespace llaminar2::test::parity
                 ASSERT_NE(mpi_ctx_, nullptr);
                 checkpoint_proofs.resize(
                     static_cast<size_t>(mpiWorldSize()));
-                mpi_ctx_->allgather_bytes(
+                parityCoordinationMPIContext()->allgather_bytes(
                     &local_checkpoint,
                     checkpoint_proofs.data(),
                     sizeof(PartialCheckpointProof));
@@ -6435,6 +6936,20 @@ namespace llaminar2::test::parity
                 .state_compared = true,
                 .state_equivalent = static_cast<bool>(state_match),
                 .state_detail = state_match.reason,
+                .observed_moe_movement_epoch =
+                    restored.moe_runtime_movement_epoch,
+                .oracle_moe_movement_epoch =
+                    oracle.runtime_state.moe_runtime_movement_epoch,
+                .main_kv_policy = state_options.main_kv_payload_policy,
+                .main_kv_numerical = state_match.main_kv_numerical,
+                .terminal_hidden_policy =
+                    state_options.terminal_hidden_policy,
+                .terminal_hidden_numerical =
+                    state_match.terminal_hidden_numerical,
+                .terminal_logits_policy =
+                    state_options.terminal_logits_policy,
+                .terminal_logits_numerical =
+                    state_match.terminal_logits_numerical,
                 .observed_payload =
                     PrefixRestoreEvidence::TerminalPayloadIdentity::fromSnapshot(
                         restored),
@@ -6556,11 +7071,14 @@ namespace llaminar2::test::parity
             std::array<float, 4> local = {
                 static_cast<float>(
                     counter("moe_overlay_residency", "committed_expert_migrations") +
+                    counter("moe_overlay_controller", "dynamic_movement_transactions") +
                     counter("moe_rebalance", "device_rebalance_dynamic_ownership_swap_accepts") +
                     counter("moe_rebalance", "device_rebalance_selected_replicas")),
                 static_cast<float>(
                     counter("moe_overlay_residency", "cpu_native_copy_bytes") +
                     counter("moe_overlay_residency", "remote_projection_payload_bytes_completed") +
+                    counter("moe_overlay_residency", "placement_transfer_operations_completed") +
+                    counter("moe_overlay_residency", "device_physical_destinations_staged") +
                     counter("moe_rebalance", "cpu_llep_weight_transfers") +
                     counter("moe_rebalance", "weight_transfer_outgoing_entries") +
                     counter("moe_rebalance", "weight_transfer_incoming_entries") +
@@ -6572,6 +7090,8 @@ namespace llaminar2::test::parity
                 static_cast<float>(
                     counter("moe_overlay_residency", "cpu_native_copy_bytes") +
                     counter("moe_overlay_residency", "remote_projection_payload_bytes_completed") +
+                    counter("moe_overlay_residency", "placement_transfer_payload_bytes_completed") +
+                    counter("moe_overlay_controller", "dynamic_physical_bytes") +
                     counter("moe_rebalance", "cpu_llep_weight_transfer_incoming_bytes") +
                     counter("moe_rebalance", "cpu_llep_weight_transfer_outgoing_bytes") +
                     counter("moe_rebalance", "weight_transfer_incoming_bytes") +
@@ -6581,6 +7101,7 @@ namespace llaminar2::test::parity
                     counter("moe_rebalance", "device_rebalance_request_useful_payload_bytes_lower_bound")),
                 static_cast<float>(
                     counter("moe_overlay_residency", "expert_migration_edges") +
+                    counter("moe_overlay_residency", "device_physical_epoch_published") +
                     counter("moe_rebalance", "cpu_llep_weight_transfers") +
                     counter("moe_rebalance", "ownership_change_entries") +
                     counter("moe_rebalance", "replica_arrivals") +
@@ -6592,12 +7113,14 @@ namespace llaminar2::test::parity
             };
             std::array<float, 4> global = local;
             if (mpi_ctx_ && mpiWorldSize() > 1)
-                mpi_ctx_->allreduce_sum(local.data(), global.data(), global.size());
+                parityCoordinationMPIContext()->allreduce_sum(
+                    local.data(), global.data(), global.size());
 
             const float movement_total =
                 global[0] + global[1] + global[2] + global[3];
             const std::string summary = PerfStatsCollector::summaryString(
-                {"moe_rebalance", "moe_overlay_residency"});
+                {"moe_rebalance", "moe_overlay_residency",
+                 "moe_overlay_controller"});
             if (config_.moe_movement_expectation ==
                 ParityMoEMovementExpectation::NoMovement)
             {
@@ -6630,11 +7153,15 @@ namespace llaminar2::test::parity
          * graph could accidentally retain their ordinal default and still agree
          * numerically. Setup publishes one record only after a prepared expert
          * bank exists. This result-boundary audit consumes only immutable
-         * initial-epoch bank publications, requires every bank to name the
-         * requested order/layout and typed model role, and requires global
-         * coverage of every ordinary and enabled MTP routed layer across MPI
-         * ranks. Loader-selection diagnostics are deliberately insufficient:
-         * they prove which rows were read, not which prepared bank went live.
+         * initial-epoch bank publications, requires every resident bank to name
+         * the requested order and exactly match the corresponding frozen
+         * owner-map row, and requires global coverage of every ordinary and
+         * enabled MTP routed layer across MPI ranks. Automatic capacity may
+         * publish a well-formed zero-sized selection for a configured idle
+         * endpoint; that record is validated but is not treated as a physical
+         * bank or layer-coverage witness. Loader-selection diagnostics are
+         * deliberately insufficient: they prove which rows were read, not
+         * which prepared bank went live.
          *
          * @param records Process-local placement records for this campaign cell.
          */
@@ -6654,11 +7181,6 @@ namespace llaminar2::test::parity
             const std::string expected_order =
                 routedExpertOwnerOrderToString(
                     cfg().routed_expert_owner_order);
-            const std::string expected_layout =
-                cfg().routed_expert_owner_order ==
-                        RoutedExpertOwnerOrder::Random
-                    ? "noncontiguous"
-                    : "contiguous";
             const int main_layer_count = parityLayerCount();
             ASSERT_GT(main_layer_count, 0);
 
@@ -6667,7 +7189,7 @@ namespace llaminar2::test::parity
             for (int layer = 0; layer < main_layer_count; ++layer)
                 expected_layers.push_back(layer);
 
-            if (config_.mtp_expectation != ParityMTPExpectation::Disabled)
+            if (config_.mtp_expected_graph_capacity > 0)
             {
                 const ModelContext *active_model =
                     activeModelContextForDiagnostics();
@@ -6715,21 +7237,57 @@ namespace llaminar2::test::parity
 
                 const auto order = record.tags.find("owner_order");
                 const auto layout = record.tags.find("selection_layout");
+                const auto frozen_owner_map_match =
+                    record.tags.find("frozen_owner_map_match");
+                const auto tier_participant_count =
+                    record.tags.find("tier_participant_count");
                 const auto layer = record.tags.find("layer");
                 const auto layer_role = record.tags.find("layer_role");
+                int participants_in_tier = 0;
+                if (tier_participant_count != record.tags.end())
+                {
+                    const char *const begin =
+                        tier_participant_count->second.data();
+                    const char *const end =
+                        begin + tier_participant_count->second.size();
+                    const auto [next, parse_error] = std::from_chars(
+                        begin, end, participants_in_tier, 10);
+                    if (parse_error != std::errc{} || next != end)
+                        participants_in_tier = 0;
+                }
+                /*
+                 * Contiguity is observational, not an ownership invariant.
+                 * A typed initial-order override can select an adversarial,
+                 * non-contiguous tier subset before ordinal participant
+                 * partitioning.  The exact frozen owner-map comparison proves
+                 * both that selection and the requested ordinal/random
+                 * participant order without reconstructing planner policy in
+                 * this generic campaign harness.
+                 */
                 const bool valid_tags =
                     order != record.tags.end() &&
                     layout != record.tags.end() &&
+                    frozen_owner_map_match != record.tags.end() &&
+                    tier_participant_count != record.tags.end() &&
                     layer != record.tags.end() &&
                     layer_role != record.tags.end() &&
                     order->second == expected_order &&
-                    layout->second == expected_layout &&
-                    record.value > 0.0;
+                    !layout->second.empty() &&
+                    frozen_owner_map_match->second == "true" &&
+                    participants_in_tier > 0 &&
+                    std::isfinite(record.value) &&
+                    record.value >= 0.0;
                 if (!valid_tags)
                 {
                     local_invalid_records += 1.0f;
                     continue;
                 }
+
+                // An automatic-capacity tier can be configured yet own no
+                // expert. Its explicit idle publication validates topology
+                // and owner order but cannot stand in for a resident bank.
+                if (record.value == 0.0)
+                    continue;
 
                 int layer_index = -1;
                 const char *begin = layer->second.data();
@@ -6767,12 +7325,12 @@ namespace llaminar2::test::parity
             {
                 if (!local_layer_coverage.empty())
                 {
-                    mpi_ctx_->allreduce_sum(
+                    parityCoordinationMPIContext()->allreduce_sum(
                         local_layer_coverage.data(),
                         global_layer_coverage.data(),
                         local_layer_coverage.size());
                 }
-                mpi_ctx_->allreduce_sum(
+                parityCoordinationMPIContext()->allreduce_sum(
                     local_totals.data(),
                     global_totals.data(),
                     global_totals.size());
@@ -6813,6 +7371,25 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Decide whether a reference-only MTP tensor is live in production.
+         *
+         * A Hugging Face pack may retain extra oracle tensors used by a more
+         * observable production topology. Automatic checkpoint discovery must
+         * not turn such reference-only diagnostics into fictional graph
+         * boundaries on a fused topology. Model families override this hook
+         * narrowly; every unclassified tensor remains mandatory.
+         *
+         * @param suffix Reference checkpoint suffix after `MTP<n>_`.
+         * @return `true` only when the optimized production graph owns the value.
+         */
+        virtual bool productionParityMTPCheckpointIsLive(
+            std::string_view suffix) const
+        {
+            (void)suffix;
+            return true;
+        }
+
+        /**
          * @brief List every required authenticated stage for one recursive MTP row.
          *
          * The reference directory is already authenticated during fixture
@@ -6845,7 +7422,11 @@ namespace llaminar2::test::parity
                 }
                 const std::string stem = entry.path().stem().string();
                 if (stem.rfind(prefix, 0) == 0)
-                    suffixes.push_back(stem.substr(prefix.size()));
+                {
+                    const std::string suffix = stem.substr(prefix.size());
+                    if (productionParityMTPCheckpointIsLive(suffix))
+                        suffixes.push_back(suffix);
+                }
             }
             std::sort(suffixes.begin(), suffixes.end());
             suffixes.erase(
@@ -6906,11 +7487,13 @@ namespace llaminar2::test::parity
         /**
          * @brief Publish one missing branch reference under a node-wide lease.
          *
-         * Every rank reaches this boundary with the same device-owned proposal
-         * identity. Only the artifact authority may run Python; peer ranks wait
-         * for its status and then validate the immutable files themselves. The
-         * lease coalesces concurrent CTest processes that observed the same
-         * branch while preserving production inference concurrency elsewhere.
+         * Symmetric fixtures reach this boundary on every rank with the same
+         * device-owned proposal identity. Only the artifact authority runs
+         * Python; peer ranks consume its status and validate the immutable
+         * files. Server-shaped fixtures declare `ArtifactAuthorityOnly`
+         * because their peers remain inside the production command loop and
+         * cannot participate in a test-only collective. The filesystem lease
+         * coalesces concurrent CTest processes in both regimes.
          *
          * @return True when every rank can consume the complete branch pack.
          */
@@ -6924,6 +7507,19 @@ namespace llaminar2::test::parity
                     branch_prefix, suffixes))
             {
                 return true;
+            }
+
+            const auto coordination =
+                parityReferenceGenerationCoordination();
+            if (coordination ==
+                    ParityReferenceGenerationCoordination::
+                        ArtifactAuthorityOnly &&
+                !isRank0())
+            {
+                LOG_ERROR(
+                    "[Parity] Non-authority rank attempted authority-only "
+                    "MTP reference generation");
+                return false;
             }
 
             int32_t generation_succeeded = 1;
@@ -6956,14 +7552,16 @@ namespace llaminar2::test::parity
                     generation_succeeded = 0;
                 }
             }
-            if (mpi_ctx_ && mpiWorldSize() > 1)
+            if (coordination ==
+                    ParityReferenceGenerationCoordination::SymmetricRanks &&
+                mpi_ctx_ && mpiWorldSize() > 1)
             {
-                mpi_ctx_->broadcast_int32(
+                parityCoordinationMPIContext()->broadcast_int32(
                     &generation_succeeded,
                     1,
                     parityArtifactAuthorityRank());
+                mpiBarrier();
             }
-            mpiBarrier();
             return generation_succeeded != 0 &&
                    productionParityMTPBranchReferenceUsable(
                        branch_prefix, suffixes);
@@ -7216,6 +7814,7 @@ namespace llaminar2::test::parity
                 const std::string stage_name =
                     "MTP" + std::to_string(reference_depth) + "_" + suffix;
                 StageComparisonResult comparison;
+                std::optional<MoERoutingBoundaryResult> routing_boundary;
                 if (suffix.ends_with("MOE_ROUTING_INDICES"))
                 {
                     ASSERT_GT(moe.top_k, 0)
@@ -7226,6 +7825,50 @@ namespace llaminar2::test::parity
                         actual_size,
                         moe.top_k,
                         stage_name);
+
+                    /*
+                     * Literal expert IDs are not a mathematically stable
+                     * oracle when two router probabilities straddle the
+                     * top-k cutoff within the measured backend error.  Bind
+                     * both index rows to the live full router distributions
+                     * and accept a substitution only when each row is its
+                     * own valid top-k, the leading expert is exact, and the
+                     * reference cutoff gap can actually flip.  This is the
+                     * same typed authority used by the detailed MoE parity
+                     * diagnostic, so the canonical CSV and generic MTP gate
+                     * cannot publish contradictory verdicts.
+                     */
+                    const std::string router_suffix =
+                        suffix.substr(
+                            0,
+                            suffix.size() -
+                                std::string("MOE_ROUTING_INDICES").size()) +
+                        "MOE_ROUTER_OUTPUT";
+                    const std::vector<float> reference_router =
+                        loadPyTorchSnapshot(*reference_prefix + router_suffix);
+                    size_t actual_router_size = 0;
+                    const float *actual_router = activeSnapshot(
+                        runtime_prefix + "MTP0_" + router_suffix,
+                        actual_router_size);
+                    ASSERT_FALSE(reference_router.empty())
+                        << "MTP routing indices require their authenticated "
+                           "router distribution";
+                    ASSERT_NE(actual_router, nullptr)
+                        << "Production MTP routing indices omitted their live "
+                           "router distribution";
+                    ASSERT_EQ(actual_router_size, reference_router.size());
+                    routing_boundary = compareMoERoutingBoundarySelections(
+                        reference.data(),
+                        actual,
+                        actual_size,
+                        reference_router.data(),
+                        reference_router.size(),
+                        actual_router,
+                        actual_router_size,
+                        static_cast<size_t>(moe.top_k));
+                    comparison.passed =
+                        routing_boundary->evaluated &&
+                        routing_boundary->equivalent;
                 }
                 else if (suffix.ends_with("MOE_ROUTING_WEIGHTS"))
                 {
@@ -7277,7 +7920,9 @@ namespace llaminar2::test::parity
                             actual_size);
                         comparison.passed =
                             comparison.passed ||
-                            comparison.kl_divergence < config_.kl_threshold;
+                            comparison.kl_divergence <
+                                config_.mtp_kl_threshold.value_or(
+                                    config_.kl_threshold);
                         EXPECT_GE(
                             pytorchTop1InLlaminarTopK(
                                 actual,
@@ -7296,7 +7941,19 @@ namespace llaminar2::test::parity
                     << comparison.cosine_similarity
                     << " rel_l2=" << comparison.rel_l2_norm
                     << " max_abs=" << comparison.max_abs_diff
-                    << " kl=" << comparison.kl_divergence;
+                    << " kl=" << comparison.kl_divergence
+                    << " routing_boundary_evaluated="
+                    << (routing_boundary.has_value()
+                            ? routing_boundary->evaluated
+                            : false)
+                    << " routing_boundary_gap="
+                    << (routing_boundary.has_value()
+                            ? routing_boundary->maximum_boundary_gap
+                            : 0.0)
+                    << " routing_boundary_error_limit="
+                    << (routing_boundary.has_value()
+                            ? routing_boundary->maximum_error_limit
+                            : 0.0);
                 appendProductionParityMTPStage(
                     summary,
                     boundary.reference_step,
@@ -7369,19 +8026,21 @@ namespace llaminar2::test::parity
             if (output_count <= 0)
                 return fail("serial MTP oracle requires a positive output count");
 
-            activeClearSnapshots();
-            activeClearCache();
-            activeSetSnapshotCaptureFilter(
-                paritySnapshotSetupCaptureFilter());
-            if (!orch_runner_->prefill(prompt))
+            std::string restore_error;
+            const auto complete_prefix =
+                restoreProductionParityCompletePrefixAtCurrentFingerprint(
+                    prompt,
+                    ProductionParityCompletePrefixPayload::MainModelAndMTP,
+                    &restore_error);
+            if (!complete_prefix)
             {
                 return fail(
                     "serial MTP oracle prefix restore failed: " +
-                    orch_runner_->lastError());
+                    restore_error);
             }
 
-            const PrefixRuntimeStateSnapshot restored =
-                activePrefixStateProbe();
+            const PrefixRuntimeStateSnapshot &restored =
+                complete_prefix->state;
             if (!restored.mtp_config_enabled ||
                 !restored.mtp_request.enabled ||
                 restored.mtp_bypassed || restored.mtp_request.bypassed)
@@ -7485,11 +8144,13 @@ namespace llaminar2::test::parity
          *
          * Every sweep crosses the public request boundary, restores the same
          * authenticated prompt (including shifted-MTP state), and admits one
-         * bounded generation call. A depth-N case executes limits 1..N so the
-         * reused chained graph exposes each recursive reference row exactly
-         * once. Dynamic policy is reset by ordinary request admission and
-         * therefore begins each sweep at its declared depth-15 controller
-         * capacity, exactly as a new serving request does.
+         * bounded generation call. Every numerical proof uses one stop-isolated
+         * transaction. Dynamic policy then opens a fresh production request,
+         * retires any initially due MoE maintenance with one ordinary token,
+         * and runs one full-budget transaction to prove the adaptive
+         * controller. Keeping those roles explicit prevents a maintenance
+         * boundary from either overwriting numerical evidence or masquerading
+         * as a dynamic-depth observation.
          */
         void runProductionParityMTPProof(DecodeParitySummary &summary)
         {
@@ -7507,18 +8168,32 @@ namespace llaminar2::test::parity
 
             std::vector<int32_t> prompt(
                 config_.token_ids.begin(), config_.token_ids.end());
+            const bool dynamic_depth =
+                config_.mtp_expectation ==
+                ParityMTPExpectation::DynamicDepth;
+            const int dynamic_policy_witness_budget =
+                dynamic_depth
+                    ? mtpParityFullWidthPolicyWitnessBudget(
+                          config_.mtp_expected_draft_depth)
+                    : 0;
+            ASSERT_FALSE(dynamic_depth && dynamic_policy_witness_budget <= 0)
+                << "Dynamic MTP proof has invalid witness geometry";
+            const int serial_oracle_output_count =
+                dynamic_depth
+                    ? dynamic_policy_witness_budget + 1
+                    : config_.mtp_expected_draft_depth + 1;
             std::string serial_oracle_error;
             const auto serial_oracle =
                 captureProductionParityMTPSerialOracle(
                     prompt,
-                    config_.mtp_expected_draft_depth + 1,
+                    serial_oracle_output_count,
                     &serial_oracle_error);
             ASSERT_TRUE(serial_oracle.has_value())
                 << "Could not establish the production serial MTP oracle: "
                 << serial_oracle_error;
             ASSERT_EQ(
                 serial_oracle->size(),
-                static_cast<size_t>(config_.mtp_expected_draft_depth + 1));
+                static_cast<size_t>(serial_oracle_output_count));
 
             /*
              * Each generated matrix cell owns one declared MTP policy depth.
@@ -7530,15 +8205,17 @@ namespace llaminar2::test::parity
              * zero and the chained slot from the terminal transaction.
              *
              * The HTTP/server surface already supports request stop tokens.
-             * For the numerical proof, install the serial first output as the
-             * sole stop token before request admission.  GPU sampling remains
-             * device-owned and deferred, so the complete depth-N proposal and
-             * grouped verifier execute before the compact outcome discovers
-             * the stop; the resident controller then retires after exactly one
-             * transaction.  CPU MTP already returns one host-owned transaction
-             * per decodeStep() and therefore needs no artificial stop.  This
-             * isolates one production transaction without a test-only launch,
-             * host shadow, eager replay, or snapshot lifecycle extension.
+             * Fixed policy installs the serial first output as the sole stop
+             * token before request admission. GPU sampling remains device-owned
+             * and deferred, so the complete depth-N proposal and grouped
+             * verifier execute before the compact outcome discovers the stop.
+             *
+             * Dynamic policy cannot use that same transaction for both
+             * numerical and economics evidence when ExpertOverlay maintenance
+             * is due: the placement boundary deliberately clips publication
+             * and an adaptive selector must not learn from clipped work. A
+             * separate request below first retires that maintenance boundary,
+             * then admits a complete adaptive transaction.
              */
             const int limited_depth = config_.mtp_expected_draft_depth;
             {
@@ -7677,6 +8354,143 @@ namespace llaminar2::test::parity
                 EXPECT_GT(boundary.verifier_transactions, 0u);
 
                 compareProductionParityMTPCheckpoints(boundary, summary);
+
+                if (dynamic_depth)
+                {
+                    /*
+                     * Numerical snapshots have already been consumed. Start a
+                     * fresh server-facing request without a stop token, then
+                     * use a one-token public call to retire the initially due
+                     * movement boundary. A one-token budget intentionally runs
+                     * serial decode; it is not counted as the adaptive witness.
+                     * The following public call reserves one slot beyond the
+                     * complete depth-N verifier response. Production can then
+                     * leave its final visible token pending without clipping
+                     * the verifier-state publication, so the device controller
+                     * receives one economically valid adaptive observation.
+                     */
+                    orch_runner_->setStopTokens({});
+                    activeClearSnapshots();
+                    activeClearCache();
+                    activeSetSnapshotCaptureFilter(
+                        paritySnapshotSetupCaptureFilter());
+                    ASSERT_TRUE(orch_runner_->prefill(prompt))
+                        << orch_runner_->lastError();
+                    const PrefixRuntimeStateSnapshot witness_prefill =
+                        activePrefixStateProbe();
+                    ASSERT_TRUE(witness_prefill.prefix_request.hit)
+                        << "Dynamic MTP witness must consume the production "
+                           "complete-prefix restore path";
+
+                    orch_runner_->setDecodeStepTokenBudget(1);
+                    GenerationResult maintenance_result =
+                        orch_runner_->decodeStep();
+                    orch_runner_->setDecodeStepTokenBudget(0);
+                    ASSERT_TRUE(maintenance_result.success())
+                        << maintenance_result.error;
+                    ASSERT_EQ(maintenance_result.tokens.size(), 1u);
+                    ASSERT_FALSE(maintenance_result.is_complete)
+                        << "Dynamic MTP witness cannot publish maintenance "
+                           "after a terminal generation result";
+                    ASSERT_EQ(
+                        maintenance_result.tokens.front(),
+                        serial_oracle->front())
+                        << "Dynamic MTP maintenance warmup diverged from the "
+                           "serial oracle";
+                    ASSERT_TRUE(orch_runner_->maybeApplyMoERebalance(
+                        maintenance_result.tokens.size()))
+                        << "Dynamic MTP maintenance warmup could not publish "
+                           "its ordinary production boundary: "
+                        << orch_runner_->lastError();
+                    activeDrainCompletedDecodeBoundaryMaintenanceDiagnostics();
+
+                    const PrefixRuntimeStateSnapshot witness_before =
+                        activePrefixStateProbe();
+                    const MTPParityTransactionCounters
+                        witness_counters_before{
+                            .draft_steps = witness_before.mtp_draft_steps,
+                            .verifier_runs = witness_before.mtp_verifier_runs,
+                    };
+                    orch_runner_->setDecodeStepTokenBudget(
+                        dynamic_policy_witness_budget);
+                    GenerationResult witness_result =
+                        orch_runner_->decodeStep();
+                    orch_runner_->setDecodeStepTokenBudget(0);
+                    ASSERT_TRUE(witness_result.success())
+                        << witness_result.error;
+                    ASSERT_FALSE(witness_result.tokens.empty());
+                    ASSERT_FALSE(witness_result.is_complete)
+                        << "Dynamic MTP proof requires a nonterminal "
+                           "full-budget transaction so the production "
+                           "maintenance boundary remains legal";
+                    ASSERT_TRUE(orch_runner_->maybeApplyMoERebalance(
+                        witness_result.tokens.size()))
+                        << "Dynamic MTP policy witness could not publish its "
+                           "ordinary production boundary: "
+                        << orch_runner_->lastError();
+                    activeDrainCompletedDecodeBoundaryMaintenanceDiagnostics();
+                    const PrefixRuntimeStateSnapshot witness_after =
+                        activePrefixStateProbe();
+                    const MTPParityTransactionCounters
+                        witness_counters_after{
+                            .draft_steps = witness_after.mtp_draft_steps,
+                            .verifier_runs = witness_after.mtp_verifier_runs,
+                        };
+                    ASSERT_EQ(
+                        classifyMTPParityTransactionActivity(
+                            witness_counters_before,
+                            witness_counters_after),
+                        MTPParityTransactionActivity::Speculative)
+                        << "Dynamic MTP policy witness executed no coherent "
+                           "predictor/verifier transaction";
+
+                    const size_t oracle_offset =
+                        maintenance_result.tokens.size();
+                    ASSERT_LE(
+                        oracle_offset + witness_result.tokens.size(),
+                        serial_oracle->size())
+                        << "Dynamic MTP policy witness exceeded its serial "
+                           "oracle suffix";
+                    std::vector<int32_t> witness_serial_tokens(
+                        serial_oracle->begin() +
+                            static_cast<std::ptrdiff_t>(oracle_offset),
+                        serial_oracle->begin() +
+                            static_cast<std::ptrdiff_t>(
+                                oracle_offset +
+                                witness_result.tokens.size()));
+                    const MTPParityTokenComparison witness_comparison =
+                        compareMTPGroupedTokensToSerialOracle(
+                            witness_serial_tokens,
+                            witness_result.tokens);
+                    ASSERT_TRUE(witness_comparison.exact)
+                        << "Dynamic MTP policy witness diverged from serial "
+                           "Llaminar at output token "
+                        << witness_comparison.mismatch_index
+                        << ": serial=" << witness_comparison.serial_token
+                        << " grouped=" << witness_comparison.grouped_token;
+
+                    ASSERT_GE(
+                        witness_after.mtp_depth_policy_windows,
+                        witness_before.mtp_depth_policy_windows);
+                    boundary.dynamic_policy_witness_executed = true;
+                    boundary.dynamic_policy_witness_serial_token_exact =
+                        witness_comparison.exact;
+                    boundary.dynamic_policy_witness_window_delta =
+                        witness_after.mtp_depth_policy_windows -
+                        witness_before.mtp_depth_policy_windows;
+                    boundary.dynamic_policy_witness_attempted_draft_tokens =
+                        mtpParityAttemptedDraftTokenCount(
+                            witness_counters_before,
+                            witness_counters_after);
+                    boundary.dynamic_policy_witness_verifier_transactions =
+                        mtpParityExecutedTransactionCount(
+                            witness_counters_before,
+                            witness_counters_after);
+                    boundary.dynamic_policy_witness_emitted_tokens =
+                        std::move(witness_result.tokens);
+                    boundary.dynamic_policy_witness_serial_oracle_tokens =
+                        std::move(witness_serial_tokens);
+                }
                 production_parity_mtp_transaction_boundaries_.push_back(
                     std::move(boundary));
             }
@@ -7694,6 +8508,22 @@ namespace llaminar2::test::parity
          */
         void assertProductionParityMTPEvidence() const
         {
+            /*
+             * A server-shaped MPI fixture keeps follower ranks inside the
+             * production command loop. Those ranks execute participant graphs
+             * and publish their own PerfStats/sparse-endpoint evidence, but
+             * only the continuation authority receives the public response
+             * boundary from which `ProductionParityMTPTransactionBoundary` is
+             * constructed. Do not ask a follower to mirror that live value.
+             */
+            if (parityReferenceGenerationCoordination() ==
+                    ParityReferenceGenerationCoordination::
+                        ArtifactAuthorityOnly &&
+                !isRank0())
+            {
+                return;
+            }
+
             const auto &serial_boundaries =
                 productionParityDecodeBoundaries();
             const auto &mtp_boundaries =
@@ -7752,7 +8582,15 @@ namespace llaminar2::test::parity
                      boundary.before.mtp_min_depth == 1 &&
                      boundary.before.mtp_max_depth ==
                          config_.mtp_expected_draft_depth &&
-                     state.mtp_depth_policy_windows > 0);
+                     boundary.dynamic_policy_witness_executed &&
+                     boundary.dynamic_policy_witness_serial_token_exact &&
+                     boundary.dynamic_policy_witness_window_delta > 0 &&
+                     boundary
+                             .dynamic_policy_witness_attempted_draft_tokens >
+                         0 &&
+                     boundary
+                             .dynamic_policy_witness_verifier_transactions >
+                         0);
                 EXPECT_EQ(
                     boundary.response_limited_draft_depth,
                     config_.mtp_expected_draft_depth)
@@ -7804,8 +8642,8 @@ namespace llaminar2::test::parity
             }
 
             EXPECT_TRUE(dynamic_controller_observed)
-                << "Dynamic MTP did not publish an adaptive depth window with "
-                   "the declared ceiling "
+                << "Dynamic MTP did not publish a serial-exact, full-budget "
+                   "adaptive depth window with the declared ceiling "
                 << config_.mtp_expected_draft_depth;
         }
 
@@ -7819,30 +8657,43 @@ namespace llaminar2::test::parity
 
             const auto records = PerfStatsCollector::snapshot(
                 {"forward_graph", "mtp", "moe_rebalance",
-                 "moe_overlay_residency", "moe_placement"});
+                 "moe_overlay_controller", "moe_overlay_residency",
+                 "moe_placement"});
             const ProductionParityEvidence evidence =
                 collectProductionParityEvidence(
                     records,
                     activeExecutionPath() == ExecutionPath::GRAPH,
-                    productionParityUsesHomogeneousGPU(),
+                    productionParityExecutionTopology(),
+                    productionParityGraphContract(),
                     production_parity_model_context_reused_,
                     std::chrono::duration<double>(
                         std::chrono::steady_clock::now() -
                         parity_fixture_started_at_)
                         .count());
 
-            EXPECT_TRUE(evidence.graph_execution)
-                << "Production parity must execute the declarative graph path";
-            if (evidence.homogeneous_gpu)
+            if (evidence.hasAccelerator())
             {
                 ASSERT_TRUE(PerfStatsCollector::isEnabled())
-                    << "Homogeneous GPU production parity requires PerfStats graph evidence";
-                EXPECT_TRUE(productionParityHasRequiredGenerationGraph(evidence))
-                    << "Homogeneous GPU parity did not capture/replay the graph body required by policy '"
-                    << productionDeviceGenerationPolicyName(
-                           evidence.generation_execution_policy)
-                    << "'.\n"
-                    << PerfStatsCollector::summaryString({"forward_graph", "mtp"});
+                    << "Accelerator production parity requires PerfStats graph evidence";
+            }
+
+            const ProductionParityGraphCertification graph_certification =
+                certifyProductionParityGraphExecution(evidence);
+            EXPECT_TRUE(
+                graph_certification ==
+                ProductionParityGraphCertification::Certified)
+                << "Production parity graph certification failed: topology='"
+                << productionParityExecutionTopologyName(
+                       evidence.execution_topology)
+                << "' contract='"
+                << productionParityGraphContractName(evidence.graph_contract)
+                << "' result='"
+                << productionParityGraphCertificationName(graph_certification)
+                << "'.\n"
+                << PerfStatsCollector::summaryString({"forward_graph", "mtp"});
+
+            if (evidence.usesHomogeneousGPU())
+            {
                 if (evidence.device_generation_controller)
                 {
                     EXPECT_TRUE(evidence.generation_loop_certified)
@@ -7855,36 +8706,6 @@ namespace llaminar2::test::parity
                         << PerfStatsCollector::summaryString(
                                {"forward_graph", "mtp"});
                 }
-                EXPECT_TRUE(evidence.decode_graph_capture || evidence.decode_graph_replay)
-                    << "Homogeneous GPU decode produced no native graph capture/replay evidence.\n"
-                    << PerfStatsCollector::summaryString({"forward_graph"});
-                EXPECT_FALSE(evidence.segmented_plan)
-                    << "Homogeneous GPU parity planned segmented execution.\n"
-                    << PerfStatsCollector::summaryString({"forward_graph"});
-                EXPECT_FALSE(evidence.segmented_capture)
-                    << "Homogeneous GPU parity captured segmented execution.\n"
-                    << PerfStatsCollector::summaryString({"forward_graph"});
-                EXPECT_FALSE(evidence.segmented_replay)
-                    << "Homogeneous GPU parity replayed segmented execution.\n"
-                    << PerfStatsCollector::summaryString({"forward_graph"});
-            }
-            else if (evidence.segmented_plan)
-            {
-                ASSERT_TRUE(PerfStatsCollector::isEnabled())
-                    << "Heterogeneous segmented production parity requires PerfStats evidence";
-                EXPECT_TRUE(evidence.segmented_capture)
-                    << "Heterogeneous parity planned segments but captured no segmented executable.\n"
-                    << PerfStatsCollector::summaryString({"forward_graph"});
-                EXPECT_TRUE(evidence.decode_graph_capture)
-                    << "Heterogeneous decode produced no segmented graph capture phase.\n"
-                    << PerfStatsCollector::summaryString({"forward_graph"});
-                EXPECT_TRUE(evidence.decode_graph_replay)
-                    << "Heterogeneous decode never reached steady graph replay. Repeated capture "
-                       "does not certify the production hot path.\n"
-                    << PerfStatsCollector::summaryString({"forward_graph"});
-                EXPECT_TRUE(evidence.segmented_replay)
-                    << "Heterogeneous decode published no segmented replay launches.\n"
-                    << PerfStatsCollector::summaryString({"forward_graph"});
             }
 
             assertProductionParityMTPEvidence();
@@ -7917,7 +8738,7 @@ namespace llaminar2::test::parity
                     << "Cannot write production_path.csv";
             }
 
-            // The one-hour requirement is measured across the aggregate matrix,
+            // The 75-minute target is measured across the aggregate matrix,
             // including fixture and RAM staging. A cell may finish after that
             // point and must still publish complete numerical diagnostics; the
             // aggregate driver reports the performance miss after all cells run.
@@ -8473,8 +9294,40 @@ namespace llaminar2::test::parity
                 {
                     if (std::find(keys.begin(), keys.end(), key) == keys.end())
                     {
+                        std::ostringstream present;
+                        constexpr size_t kInventoryLimit = 24;
+                        for (size_t index = 0;
+                             index < keys.size() && index < kInventoryLimit;
+                             ++index)
+                        {
+                            if (index > 0)
+                                present << ',';
+                            present << keys[index];
+                        }
+                        if (keys.size() > kInventoryLimit)
+                            present << ",...(" << keys.size() << " total)";
+                        std::ostringstream related;
+                        size_t related_count = 0;
+                        for (const auto &published_key : keys)
+                        {
+                            if (published_key.find("DOMAIN_ROUTE") ==
+                                    std::string::npos &&
+                                published_key.find("RUNTIME_ROUTE") ==
+                                    std::string::npos &&
+                                published_key.find("OVERLAY_ROUTE") ==
+                                    std::string::npos)
+                            {
+                                continue;
+                            }
+                            if (related_count++ > 0)
+                                related << ',';
+                            related << published_key;
+                        }
                         ADD_FAILURE() << "Parity " << parityForwardPhaseName(phase)
-                                      << " missing required snapshot '" << key << "'";
+                                      << " missing required snapshot '" << key
+                                      << "'; published={" << present.str()
+                                      << "}; related_route_keys={"
+                                      << related.str() << '}';
                         return false;
                     }
                 }
@@ -9019,7 +9872,8 @@ namespace llaminar2::test::parity
                             continue;
                         }
                         float local_has_snapshot = ranks_with_snapshot;
-                        mpi_ctx_->allreduce_sum(&local_has_snapshot, &ranks_with_snapshot, 1);
+                        parityCoordinationMPIContext()->allreduce_sum(
+                            &local_has_snapshot, &ranks_with_snapshot, 1);
                     }
 
                     if (!has_local_snapshot)
@@ -9055,7 +9909,10 @@ namespace llaminar2::test::parity
                         static_cast<int>(ranks_with_snapshot + 0.5f) == mpiWorldSize())
                     {
                         allreduced_buf.resize(llaminar_size);
-                        mpi_ctx_->allreduce_sum(compare_data, allreduced_buf.data(), llaminar_size);
+                        parityCoordinationMPIContext()->allreduce_sum(
+                            compare_data,
+                            allreduced_buf.data(),
+                            llaminar_size);
                         compare_data = allreduced_buf.data();
                         did_allreduce = true;
                     }
@@ -10503,7 +11360,10 @@ namespace llaminar2::test::parity
                                     continue;
                                 }
                                 float local_has_snapshot = ranks_with_snapshot;
-                                mpi_ctx_->allreduce_sum(&local_has_snapshot, &ranks_with_snapshot, 1);
+                                parityCoordinationMPIContext()->allreduce_sum(
+                                    &local_has_snapshot,
+                                    &ranks_with_snapshot,
+                                    1);
                             }
 
                             if (!has_local_snapshot)
@@ -10544,7 +11404,10 @@ namespace llaminar2::test::parity
                                 static_cast<int>(ranks_with_snapshot + 0.5f) == mpiWorldSize())
                             {
                                 allreduced_decode_buf.resize(llaminar_size);
-                                mpi_ctx_->allreduce_sum(decode_compare, allreduced_decode_buf.data(), llaminar_size);
+                                parityCoordinationMPIContext()->allreduce_sum(
+                                    decode_compare,
+                                    allreduced_decode_buf.data(),
+                                    llaminar_size);
                                 decode_compare = allreduced_decode_buf.data();
                                 did_allreduce_decode = true;
                             }
@@ -10976,12 +11839,21 @@ namespace llaminar2::test::parity
         }
 
         /**
-         * @brief Assert decode parity criteria
+         * @brief Complete the canonical decode proof and assert its criteria.
+         *
+         * MTP is a typed campaign dimension, so an enabled cell must run its
+         * production predictor/verifier transaction before any decode result
+         * can be accepted. Keeping that transition here makes omission
+         * impossible for model-specific fixtures: callers provide the mutable
+         * teacher-forced summary, this method appends the recursive MTP
+         * checkpoints, and only then exports and judges the complete artifact.
+         * Disabled cells pay no additional work.
          *
          * Call this after runSingleDeviceDecodeParity() or runTPDecodeParity()
-         * to apply standard assertions. MPI-aware: Only renders table on rank 0.
+         * to apply standard assertions. MPI-aware: Only renders tables on the
+         * configured artifact-authority rank.
          */
-        void assertDecodeParity(const DecodeParitySummary &summary)
+        void assertDecodeParity(DecodeParitySummary &summary)
         {
             auto assert_scope = profileParityScope("assert_decode.total");
             // Skip if no decode steps were tested
@@ -10989,6 +11861,8 @@ namespace llaminar2::test::parity
             {
                 GTEST_SKIP() << "No decode snapshots found - skipping decode parity assertions";
             }
+
+            runProductionParityMTPProof(summary);
 
             // For cross-rank PP, only the tail rank has valid logits for decode comparison.
             // Detect by checking if any decode step actually produced metrics (not whether they're good).
@@ -11206,7 +12080,7 @@ namespace llaminar2::test::parity
 
             std::vector<RankPrefillSummary> rank_summaries(
                 static_cast<size_t>(mpiWorldSize()));
-            mpi_ctx_->allgather_bytes(
+            parityCoordinationMPIContext()->allgather_bytes(
                 &local,
                 rank_summaries.data(),
                 sizeof(RankPrefillSummary));
@@ -11221,7 +12095,7 @@ namespace llaminar2::test::parity
                     : 0;
             std::vector<int32_t> write_status(
                 static_cast<size_t>(mpiWorldSize()));
-            mpi_ctx_->allgather_bytes(
+            parityCoordinationMPIContext()->allgather_bytes(
                 &local_write_ok,
                 write_status.data(),
                 sizeof(local_write_ok));
@@ -11284,7 +12158,8 @@ namespace llaminar2::test::parity
                         ? 1
                         : 0;
             }
-            mpi_ctx_->broadcast_int32(&merge_ok, 1, 0);
+            parityCoordinationMPIContext()->broadcast_int32(
+                &merge_ok, 1, 0);
             mpiBarrier();
 
             std::error_code cleanup_error;
@@ -11327,7 +12202,7 @@ namespace llaminar2::test::parity
                     : 0;
             std::vector<int32_t> write_status(
                 static_cast<size_t>(mpiWorldSize()));
-            mpi_ctx_->allgather_bytes(
+            parityCoordinationMPIContext()->allgather_bytes(
                 &local_write_ok,
                 write_status.data(),
                 sizeof(local_write_ok));
@@ -11358,7 +12233,8 @@ namespace llaminar2::test::parity
                         ? 1
                         : 0;
             }
-            mpi_ctx_->broadcast_int32(&merge_ok, 1, 0);
+            parityCoordinationMPIContext()->broadcast_int32(
+                &merge_ok, 1, 0);
             mpiBarrier();
 
             std::error_code cleanup_error;

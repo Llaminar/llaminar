@@ -160,6 +160,47 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoERuntimeTable,
+         CompleteInitialRuntimeRequiresDormantRetainedLayers)
+    {
+        constexpr int kLayers = 3;
+        constexpr int kExperts = 4;
+        MoERuntimeTable table(
+            DeviceId::cpu(), kLayers, kExperts, /*top_k=*/2);
+
+        const auto publish_layer = [&](int layer)
+        {
+            MoEPlacementUpdate update;
+            update.epoch = 1u;
+            update.expert_count = kExperts;
+            update.participant_id = 0u;
+            update.participant_count = 1u;
+            update.experts.reserve(kExperts);
+            update.local_compute_mask.assign(kExperts, 1u);
+            update.replica_role.assign(
+                kExperts,
+                static_cast<std::uint8_t>(
+                    DeviceMoEReplicaRole::Primary));
+            update.resident_participant_mask.assign(kExperts, 1u);
+            for (int expert = 0; expert < kExperts; ++expert)
+                update.experts.push_back(expertDesc(expert, 0, expert));
+            ASSERT_TRUE(table.prepareInactiveBank(layer, update));
+            ASSERT_TRUE(table.flipActiveBank(layer, update.epoch, nullptr));
+        };
+
+        EXPECT_FALSE(table.hasInitialRuntimeState());
+        EXPECT_FALSE(table.hasCompleteInitialRuntimeState());
+        publish_layer(0);
+        publish_layer(1);
+        EXPECT_TRUE(table.hasInitialRuntimeState());
+        EXPECT_FALSE(table.hasCompleteInitialRuntimeState())
+            << "An inactive retained MTP/NextN layer cannot be omitted from "
+               "the controller snapshot merely because the current request "
+               "does not execute it";
+        publish_layer(2);
+        EXPECT_TRUE(table.hasCompleteInitialRuntimeState());
+    }
+
+    TEST(Test__MoERuntimeTable,
          OverlayEpochTicketIsStableTopologyAcrossEveryResetTemplate)
     {
         auto arena = std::make_shared<DeviceMoEOverlayEpochArena>(

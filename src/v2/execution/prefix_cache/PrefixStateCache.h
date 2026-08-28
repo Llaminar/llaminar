@@ -25,6 +25,52 @@ namespace llaminar2
     class DeviceHotPrefixStorageBackend;
     class DiskPrefixStorageBackend;
 
+    /**
+     * @brief Total result of attempting to lease one preallocated hot slot.
+     *
+     * Busy is an ordinary concurrency outcome: an evicted cache key may still
+     * be retained by the request currently restoring it. The caller continues
+     * from the configured RAM tier without turning that temporary lease into a
+     * correctness failure. Error denotes a broken lifecycle or backend edge.
+     */
+    enum class PrefixDeviceHotLeaseResult
+    {
+        Acquired,
+        Ineligible,
+        Busy,
+        Error,
+    };
+
+    /**
+     * @brief Total state transition produced by a runtime fingerprint rebase.
+     *
+     * `InvalidateOnRebalance` creates a new request namespace when the sole
+     * MoE placement authority publishes. Old RAM and device-hot records cannot
+     * satisfy the new namespace and must stop consuming the live capacity
+     * budget. Durable disk records remain in the append-only archive so this
+     * request-boundary transition never performs synchronous storage I/O; they
+     * are merely removed from this runtime's lookup index and are reclaimed by
+     * the disk tier's ordinary bounded-LRU policy.
+     */
+    struct PrefixFingerprintRebase
+    {
+        uint64_t previous_fingerprint = 0;
+        uint64_t active_fingerprint = 0;
+        size_t invalidated_ram_entries = 0;
+        size_t invalidated_device_entries = 0;
+        size_t unindexed_disk_entries = 0;
+        size_t released_ram_bytes = 0;
+        size_t released_device_bytes = 0;
+
+        /** @return True when at least one stale tier record was retired. */
+        bool changed() const noexcept
+        {
+            return invalidated_ram_entries != 0 ||
+                   invalidated_device_entries != 0 ||
+                   unindexed_disk_entries != 0;
+        }
+    };
+
     class PrefixStateCache
     {
     public:
@@ -50,9 +96,15 @@ namespace llaminar2
          * The caller fills the returned block by D2D copies and passes it back
          * to insert(). This split lets serialized per-layer staging be copied
          * before the staging slot is reused.
+         *
+         * @param ram_archive Durable lower-tier payload and exact layout.
+         * @param producer_stream Explicit GPU stream that will populate the slot.
+         * @param device_hot_handle Receives the unfilled arena-backed replica.
+         * @return Typed acquisition, eligibility, contention, or error result.
          */
-        bool prepareDeviceHotCopy(
+        PrefixDeviceHotLeaseResult prepareDeviceHotCopy(
             const PrefixBlockHandle &ram_archive,
+            void *producer_stream,
             PrefixBlockHandle *device_hot_handle);
 
         /**
@@ -61,9 +113,9 @@ namespace llaminar2
          * Eligibility depends only on the immutable tier configuration and the
          * block's charged size. It deliberately ignores current occupancy:
          * prepareDeviceHotCopy() applies device-hot LRU pressure before it asks
-         * the backend to allocate. Callers use this distinction to treat an
-         * eligible allocation failure as a real error while allowing blocks
-         * larger than the entire hot tier to remain in a lower tier.
+         * the arena for a lease. Callers use this distinction to separate a
+         * block that can never enter the tier from a temporarily Busy slot and
+         * a genuine lifecycle Error.
          */
         bool deviceHotCapacityEligible(size_t bytes) const;
 
@@ -135,6 +187,29 @@ namespace llaminar2
         bool clear();
 
         /**
+         * @brief Retire volatile records outside one active fingerprint.
+         *
+         * This is the typed publication boundary for
+         * `InvalidateOnRebalance`. It never writes or fsyncs the disk archive:
+         * obsolete disk records are no longer addressable by this runtime and
+         * remain subject to the archive's ordinary capacity eviction. Shared
+         * payload owners held by an already-admitted request remain valid even
+         * after the cache drops its copies.
+         *
+         * The method first verifies that no legacy explicit cache lease is
+         * held, then applies the transition atomically with respect to this
+         * single-thread-owned cache. A zero fingerprint is rejected.
+         *
+         * @param previous_fingerprint Fingerprint being superseded.
+         * @param active_fingerprint Newly published request fingerprint.
+         * @return Transition evidence, or `std::nullopt` for an invalid/busy
+         *         lifecycle that must not be hidden as a cache miss.
+         */
+        std::optional<PrefixFingerprintRebase> rebaseFingerprint(
+            uint64_t previous_fingerprint,
+            uint64_t active_fingerprint);
+
+        /**
          * @brief Reserve RAM for a newly archived block and retire an old key.
          *
          * Terminal harvest can enrich an existing nonterminal block with
@@ -181,7 +256,6 @@ namespace llaminar2
         bool insertResident(PrefixBlockHandle handle, bool count_store, bool preserve_disk_entry = false);
         bool evictResident(const PrefixCacheKey &key);
         bool evictUntilFits(size_t incoming_bytes);
-        bool evictDeviceHotUntilFits(size_t incoming_bytes);
         bool removeDeviceHotEntry(
             const PrefixCacheKey &key,
             bool capacity_eviction);

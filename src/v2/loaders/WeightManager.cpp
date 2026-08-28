@@ -56,6 +56,7 @@
 #include <iomanip>
 #include <thread>
 #include <future>
+#include <limits>
 #include <numeric>
 #include <unordered_map>
 #include <vector>
@@ -373,6 +374,14 @@ namespace llaminar2
                    value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
         }
 
+        /** @return Whether a canonical name denotes a tiny GDN SSM projection. */
+        bool isGdnTinySsmProjectionName(const std::string &name)
+        {
+            return endsWith(name, "ssm_alpha.weight") ||
+                   endsWith(name, "ssm_beta.weight");
+        }
+
+        /** @return Whether this source needs the model-owned FP32 GDN form. */
         bool isGdnTinySsmProjectionOverride(
             const std::string &name,
             const TensorBase *tensor)
@@ -381,55 +390,121 @@ namespace llaminar2
                 return false;
             if (tensor->native_type() != TensorType::Q8_0 || tensor->shape().size() != 2)
                 return false;
-            return endsWith(name, "ssm_alpha.weight") ||
-                   endsWith(name, "ssm_beta.weight");
+            return isGdnTinySsmProjectionName(name);
         }
 
-        /**
-         * @brief Materialize weights whose graph-native representation is FP32.
-         *
-         * The returned tensor is immutable model-owned storage created during
-         * weight materialization. Execution stages therefore never dequantize,
-         * allocate, or maintain host mirrors. Semantic role controls the shared
-         * expert input gate; the narrowly named predicate preserves the existing
-         * Q8_0 GDN alpha/beta override.
-         *
-         * @param name Canonical model weight name used for diagnostics.
-         * @param role Semantic graph role selected by the weight plan.
-         * @param source Loaded source tensor.
-         * @param target_device Device that will consume the prepared tensor.
-         * @return Owned FP32 replacement, or nullptr when no override is required.
+    }
+
+    std::shared_ptr<TensorBase> WeightManager::createModelPreparedFp32Override(
+        const std::string &name,
+        WeightRole role,
+        const TensorBase *source,
+        DeviceId target_device)
+    {
+        if (!source)
+            return nullptr;
+
+        const bool shared_expert_input_gate =
+            role == WeightRole::SharedExpertInputGate;
+        const bool gdn_tiny_projection_name =
+            isGdnTinySsmProjectionName(name);
+        if (!shared_expert_input_gate && !gdn_tiny_projection_name)
+            return nullptr;
+
+        const ModelPreparedFp32OverrideKey key{
+            .canonical_name = name,
+            .role = role,
+            .target_device = target_device,
+        };
+
+        /*
+         * The same mutex serializes raw-source release.  Holding it across this
+         * tiny one-row conversion makes the cache-miss transition atomic: a
+         * release sweep cannot reclaim source bytes between validation and
+         * conversion, and every concurrent runner observes one authority.
          */
-        std::shared_ptr<TensorBase> createModelPreparedFp32Override(
-            const std::string &name,
-            WeightRole role,
-            const TensorBase *source,
-            DeviceId target_device)
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (const auto cached = model_prepared_fp32_overrides_.find(key);
+            cached != model_prepared_fp32_overrides_.end())
         {
-            if (!source || source->native_type() == TensorType::FP32)
-                return nullptr;
-
-            const bool shared_expert_input_gate =
-                role == WeightRole::SharedExpertInputGate;
-            const bool gdn_tiny_projection =
-                isGdnTinySsmProjectionOverride(name, source);
-            if (!shared_expert_input_gate && !gdn_tiny_projection)
-                return nullptr;
-
-            auto fp32 = std::make_shared<FP32Tensor>(source->shape(), DeviceId::cpu());
-            source->to_fp32(fp32->mutable_data());
-            const char *purpose = shared_expert_input_gate
-                                      ? "shared-expert-input-gate"
-                                      : "ssm-projection";
-            fp32->setDebugName(name + "@fp32-" + purpose);
-            LOG_DEBUG("[WeightManager] Dequantized " << name
-                                                      << " from " << source->dtype_name()
-                                                      << " to FP32 for "
-                                                      << target_device.to_string()
-                                                      << " " << purpose << " path");
-            return fp32;
+            if (!cached->second ||
+                cached->second->native_type() != TensorType::FP32 ||
+                cached->second->shape() != source->shape())
+            {
+                throw std::runtime_error(
+                    "[WeightManager] Invalid cached FP32 override for " + name +
+                    " role=" + toString(role) +
+                    " device=" + target_device.to_string());
+            }
+            if (cached->second->is_raw_data_released() ||
+                cached->second->raw_data() == nullptr)
+            {
+                throw std::runtime_error(
+                    "[WeightManager] Model-owned FP32 override lost its host "
+                    "source lifetime for " +
+                    name + " role=" + toString(role) +
+                    " device=" + target_device.to_string());
+            }
+            if (PerfStatsCollector::isDomainEnabled("weight_loading"))
+            {
+                PerfStatsCollector::addCounter(
+                    "weight_loading",
+                    "model_prepared_fp32_override_cache_hits",
+                    1.0,
+                    "materialize",
+                    target_device.to_string(),
+                    {{"weight_role", toString(role)}});
+            }
+            return cached->second;
         }
 
+        /*
+         * A frozen binding may already point at an FP32 source that was
+         * prepared by an earlier materialization pass.  With no matching cache
+         * entry it is an ordinary native-FP32 model weight, not a new derived
+         * representation for this authority.
+         */
+        if (source->native_type() == TensorType::FP32)
+            return nullptr;
+
+        const bool gdn_tiny_projection =
+            isGdnTinySsmProjectionOverride(name, source);
+        if (!shared_expert_input_gate && !gdn_tiny_projection)
+            return nullptr;
+
+        if (source->is_raw_data_released() || source->raw_data() == nullptr)
+        {
+            throw std::runtime_error(
+                "[WeightManager] Cannot create model-owned FP32 override for " +
+                name + " role=" + toString(role) +
+                " device=" + target_device.to_string() +
+                ": raw source bytes were released before the override was materialized");
+        }
+
+        auto fp32 = std::make_shared<FP32Tensor>(source->shape(), DeviceId::cpu());
+        source->to_fp32(fp32->mutable_data());
+        const char *purpose = shared_expert_input_gate
+                                  ? "shared-expert-input-gate"
+                                  : "ssm-projection";
+        fp32->setDebugName(name + "@fp32-" + purpose);
+        model_prepared_fp32_overrides_.emplace(key, fp32);
+
+        if (PerfStatsCollector::isDomainEnabled("weight_loading"))
+        {
+            PerfStatsCollector::addCounter(
+                "weight_loading",
+                "model_prepared_fp32_override_creations",
+                1.0,
+                "materialize",
+                target_device.to_string(),
+                {{"weight_role", toString(role)}});
+        }
+        LOG_DEBUG("[WeightManager] Dequantized " << name
+                                                  << " from " << source->dtype_name()
+                                                  << " to FP32 for "
+                                                  << target_device.to_string()
+                                                  << " " << purpose << " path");
+        return fp32;
     }
 
     const char *WeightManager::weightPrepStateName(WeightPrepState state)
@@ -605,7 +680,8 @@ namespace llaminar2
                                  WeightPrecision weight_precision)
         : loader_(loader), mpi_ctx_(mpi_ctx), placement_map_(placement_map),
           strategy_(strategy), weight_precision_(weight_precision),
-          weight_metadata_(std::make_shared<WeightMetadataRegistry>())
+          weight_metadata_(std::make_shared<WeightMetadataRegistry>()),
+          mmap_reclaim_lifecycle_([this]() { return performMmapReclaim(); })
     {
         int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
 
@@ -659,6 +735,26 @@ namespace llaminar2
                 LOG_DEBUG("[WeightManager] Input-parallel: Wo (split input dim to match column-parallel QKV, allreduce after)");
                 LOG_DEBUG("[WeightManager] Replicated: QKV (column-parallel via head sharding), norms, biases, embeddings, LM head");
             }
+        }
+    }
+
+    WeightManager::~WeightManager()
+    {
+        try
+        {
+            // The worker may borrow cache tensors and loader mappings. Join it
+            // while every WeightManager member and the owning ModelLoader are
+            // still alive, before ordinary member destruction begins.
+            (void)mmap_reclaim_lifecycle_.awaitBeforeHostAllocation();
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[WeightManager] asynchronous mmap reclaim failed during teardown: "
+                      << error.what());
+        }
+        catch (...)
+        {
+            LOG_ERROR("[WeightManager] asynchronous mmap reclaim failed during teardown with an unknown error");
         }
     }
 
@@ -2028,6 +2124,29 @@ namespace llaminar2
                    .countOwnedEnginesForDeviceAcrossScopes(device);
     }
 
+    size_t WeightManager::retainedPreparedDeviceBytes(
+        DeviceId device) const
+    {
+        if (!device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "Retained prepared-device byte accounting requires an exact GPU");
+        }
+
+        size_t bytes = prepared_device_allocations_.liveBytes(device);
+
+        const auto store = preparedWeightStoreIfInitialized();
+        const size_t embedding_bytes = store
+            ? store->preparedEmbeddingAllocationBytesForDevice(device)
+            : 0u;
+        if (embedding_bytes > std::numeric_limits<size_t>::max() - bytes)
+        {
+            throw std::overflow_error(
+                "Prepared device model-allocation BOM overflows size_t");
+        }
+        return bytes + embedding_bytes;
+    }
+
     void WeightManager::setPreparedWeightStore(std::shared_ptr<PreparedWeightStore> store)
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -2203,6 +2322,23 @@ namespace llaminar2
             }
 
             binding.slice = mergeRequirementSlice(binding.slice, requirement.slice);
+
+            /*
+             * Register the binding's consumption policy against the physical
+             * source before any prepared representation can make that source
+             * look reclaimable. ExpertOverlay may bind disjoint accelerator and
+             * CPU participants through the same model authority; the metadata
+             * registry performs the monotonic policy join so registration order
+             * cannot retire bytes still read by a CPU floating-point engine.
+             */
+            if (weight_metadata_ &&
+                !weight_metadata_->mergeHostPolicy(
+                    tensor.get(), requirement.host_policy))
+            {
+                throw std::runtime_error(
+                    "[WeightManager] Materialized binding has no source metadata for host-policy accounting: " +
+                    requirement.canonical_name);
+            }
 
             if (auto fp32_override = createModelPreparedFp32Override(
                     requirement.canonical_name,
@@ -4353,7 +4489,8 @@ namespace llaminar2
         const MoEExpertOverlayRuntimePlan &runtime_plan,
         DeviceId target_device,
         const FrozenModelWeightSet *frozen_weights,
-        const MoEExpertOverlayExecutionPlan *execution_plan)
+        const MoEExpertOverlayExecutionPlan *execution_plan,
+        PreparedWeightAdmission admission)
     {
         if (!runtime_plan.sourcePlan().usesExpertOverlayAuthority())
             return true;
@@ -4393,6 +4530,109 @@ namespace llaminar2
         preparation_plan = preparation_plan.filteredForDevices(
             graph_execution_devices);
 
+        if (admission ==
+            PreparedWeightAdmission::ReuseCertifiedCompleteSet)
+        {
+            /*
+             * A reusable ModelContext has already crossed the typed
+             * Sealing -> Reusable -> RunnerExclusive boundary.  Its terminal
+             * physical seal atomically rebound both participant and domain
+             * registry keys to the canonical prepared slots.  The 3-D GGUF
+             * selections are no longer an authority here: a migrated logical
+             * expert may occupy a different loader-era slot, and rebuilding a
+             * tensor selection would both copy gigabytes and reinterpret that
+             * physical identity incorrectly.
+             */
+            if (!lifecycle_gates_.device_preparation_complete ||
+                !lifecycle_gates_.graph_materialization_complete)
+            {
+                LOG_ERROR(
+                    "[WeightManager] Certified ExpertOverlay reuse reached "
+                    "weight preparation before the model-owned preparation "
+                    "and graph lifecycle gates completed");
+                return false;
+            }
+
+            if (frozen_weights)
+            {
+                const bool contains_routed_source = std::any_of(
+                    frozen_weights->bindings().begin(),
+                    frozen_weights->bindings().end(),
+                    [](const WeightBinding &binding)
+                    { return isRoutedExpertRole(binding.identity.role); });
+                if (contains_routed_source)
+                {
+                    LOG_ERROR(
+                        "[WeightManager] Certified ExpertOverlay reuse received "
+                        "a frozen routed-expert source binding; retained engines "
+                        "must be the sole weight authority");
+                    return false;
+                }
+            }
+
+            size_t adopted_requests = 0u;
+            for (const auto &request : preparation_plan.requests())
+            {
+                const int participant_world_rank =
+                    request.participant_world_rank_known
+                        ? request.participant_world_rank
+                        : -1;
+                const auto participant_engine =
+                    expert_gemm_registry_.getEngineLifetimeForParticipant(
+                        request.domain_name,
+                        request.device,
+                        participant_world_rank,
+                        request.participant_index,
+                        request.layer,
+                        request.expert_id,
+                        request.role);
+                const auto domain_engine =
+                    expert_gemm_registry_.getEngineLifetimeForDomain(
+                        request.domain_name,
+                        request.device,
+                        request.layer,
+                        request.expert_id,
+                        request.role);
+                const bool same_owner =
+                    participant_engine && domain_engine &&
+                    !participant_engine.owner_before(domain_engine) &&
+                    !domain_engine.owner_before(participant_engine);
+                if (!same_owner ||
+                    participant_engine.get() != domain_engine.get())
+                {
+                    LOG_ERROR(
+                        "[WeightManager] Certified ExpertOverlay reuse has a "
+                        "missing or torn prepared registry entry for domain="
+                        << request.domain_name
+                        << " device=" << request.device.to_string()
+                        << " participant_world_rank="
+                        << participant_world_rank
+                        << " participant=" << request.participant_index
+                        << " layer=" << request.layer
+                        << " expert=" << request.expert_id
+                        << " role=" << moeWeightRoleName(request.role));
+                    return false;
+                }
+                ++adopted_requests;
+            }
+
+            PerfStatsCollector::addCounter(
+                "weight_loading",
+                "overlay_certified_prepared_registry_reuses",
+                1.0,
+                "load",
+                target_device.to_string(),
+                {{"requests", std::to_string(adopted_requests)},
+                 {"source_materialization", "false"}});
+            LOG_DEBUG(
+                "[WeightManager] Adopted " << adopted_requests
+                                             << " certified ExpertOverlay "
+                                                "prepared registry entries for "
+                                             << target_device.to_string()
+                                             << " without source materialization");
+            return true;
+        }
+
         /**
          * Accelerator expert preparation must consume the same immutable bindings
          * that the graph will later resolve. Falling back to WeightManager's mutable
@@ -4414,24 +4654,6 @@ namespace llaminar2
 
         LOG_DEBUG("[WeightManager] participant-local overlay preparation device="
                   << target_device.to_string() << " " << preparation_plan.diagnostics().render());
-
-        {
-            std::unordered_set<std::string> cpu_owned_parent_names;
-            for (const auto &request : preparation_plan.requests())
-            {
-                if (!request.device.is_cpu())
-                    continue;
-                auto parent_name = moeParentNameForRole(request.layer, request.role);
-                if (!parent_name.empty())
-                    cpu_owned_parent_names.insert(std::move(parent_name));
-            }
-
-            for (const auto &parent_name : cpu_owned_parent_names)
-            {
-                markPrepState(parent_name, DeviceId::cpu(), WeightPrepState::LOADED_HOST, true,
-                              "MoE overlay CPU fallback owns routed expert host parent");
-            }
-        }
 
         bool ok = true;
 
@@ -4502,6 +4724,100 @@ namespace llaminar2
             for (auto &group : groups)
             {
                 std::sort(group.experts.begin(), group.experts.end());
+
+                /**
+                 * A reusable model context has already sealed its migrated
+                 * physical slots and atomically rebound both participant and
+                 * domain registry keys to those exact slots.  The loader's 3D
+                 * parent tensor is no longer a logical-expert authority after
+                 * that point: recycled slots may contain a different expert
+                 * than their cold-start index.  Adopt a complete scoped bank
+                 * unchanged, and reject a partial or disagreeing bank instead
+                 * of silently combining sealed state with loader offsets.
+                 */
+                enum class ExistingCpuPreparation : uint8_t
+                {
+                    Empty,
+                    Complete,
+                    Invalid,
+                };
+                const auto existing_preparation = [&]()
+                {
+                    size_t present_roles = 0u;
+                    const size_t expected_roles = group.experts.size() * 3u;
+                    for (const int expert_id : group.experts)
+                    {
+                        for (const auto role : {
+                                 ExpertGemmRegistry::WeightRole::GATE,
+                                 ExpertGemmRegistry::WeightRole::UP,
+                                 ExpertGemmRegistry::WeightRole::DOWN})
+                        {
+                            auto *const participant_engine =
+                                expert_gemm_registry_.getEngineForParticipant(
+                                    group.domain_name,
+                                    group.device,
+                                    group.participant_world_rank,
+                                    group.participant_index,
+                                    group.layer,
+                                    expert_id,
+                                    role);
+                            auto *const domain_engine =
+                                expert_gemm_registry_.getEngineForDomain(
+                                    group.domain_name,
+                                    group.device,
+                                    group.layer,
+                                    expert_id,
+                                    role);
+                            if ((participant_engine == nullptr) !=
+                                    (domain_engine == nullptr) ||
+                                (participant_engine != nullptr &&
+                                 participant_engine != domain_engine))
+                            {
+                                return ExistingCpuPreparation::Invalid;
+                            }
+                            present_roles += participant_engine != nullptr ? 1u : 0u;
+                        }
+                    }
+                    if (present_roles == 0u)
+                        return ExistingCpuPreparation::Empty;
+                    return present_roles == expected_roles
+                               ? ExistingCpuPreparation::Complete
+                               : ExistingCpuPreparation::Invalid;
+                }();
+
+                if (existing_preparation == ExistingCpuPreparation::Complete)
+                {
+                    LOG_DEBUG(
+                        "[WeightManager] Reusing sealed MoE overlay CPU expert bank for domain "
+                        << group.domain_name << " layer " << group.layer
+                        << " participant=" << group.participant_index
+                        << " experts=" << group.experts.size());
+                    continue;
+                }
+                if (existing_preparation == ExistingCpuPreparation::Invalid)
+                {
+                    LOG_ERROR(
+                        "[WeightManager] MoE overlay CPU expert registry is partial or disagrees between participant and domain scopes for domain "
+                        << group.domain_name << " layer " << group.layer
+                        << " participant=" << group.participant_index);
+                    ok = false;
+                    continue;
+                }
+
+                for (const auto role : {
+                         ExpertGemmRegistry::WeightRole::GATE,
+                         ExpertGemmRegistry::WeightRole::UP,
+                         ExpertGemmRegistry::WeightRole::DOWN})
+                {
+                    const auto parent_name =
+                        moeParentNameForRole(group.layer, role);
+                    markPrepState(
+                        parent_name,
+                        DeviceId::cpu(),
+                        WeightPrepState::LOADED_HOST,
+                        true,
+                        "MoE overlay CPU fallback owns routed expert host parent");
+                }
 
                 struct CpuExpertParent
                 {
@@ -4808,10 +5124,26 @@ namespace llaminar2
         // ------------------------------------------------------------------
         struct DenseGemmJob
         {
+            /**
+             * @brief Lifetime promised by the job's immutable host source.
+             *
+             * Transaction sources may be reclaimed after their one device
+             * kernel owns the payload. ModelContext sources are cached derived
+             * representations shared by later frozen graph families and must
+             * remain readable until the WeightManager itself is destroyed.
+             */
+            enum class HostSourceLifetime
+            {
+                Transaction,
+                ModelContext,
+            };
+
             std::string name;
             TensorBase *tensor = nullptr;
             std::shared_ptr<TensorBase> owner;
             std::optional<WeightBinding> binding;
+            HostSourceLifetime host_source_lifetime =
+                HostSourceLifetime::Transaction;
         };
 
         std::vector<DenseGemmJob> gemm_weights;
@@ -5259,20 +5591,69 @@ namespace llaminar2
                                         std::to_string(tier_index) + "_L" + std::to_string(layer_idx) +
                                         "_" + rt.tag + "_e" + std::to_string(global_expert);
 
-                            const bool domain_ready =
+                            auto *domain_engine =
                                 expert_gemm_registry_.getEngineForDomain(
-                                    domain_name, target_device, layer_idx, global_expert, rt.role) != nullptr ||
-                                expert_gemm_registry_.aliasEngineForDomainFromDevice(
-                                    domain_name, target_device, layer_idx, global_expert, rt.role);
-                            const bool participant_ready =
+                                    domain_name, target_device, layer_idx,
+                                    global_expert, rt.role);
+                            auto *participant_engine =
                                 expert_gemm_registry_.getEngineForParticipant(
-                                    domain_name, target_device, participant_world_rank, participant_index,
-                                    layer_idx, global_expert, rt.role) != nullptr ||
-                                expert_gemm_registry_.aliasEngineForParticipantFromDevice(
-                                    domain_name, target_device, participant_world_rank, participant_index,
+                                    domain_name, target_device,
+                                    participant_world_rank, participant_index,
                                     layer_idx, global_expert, rt.role);
-                            if (domain_ready && participant_ready)
+                            if ((domain_engine == nullptr) !=
+                                    (participant_engine == nullptr) ||
+                                (domain_engine != nullptr &&
+                                 domain_engine != participant_engine))
                             {
+                                throw std::runtime_error(
+                                    "[WeightManager] GPU overlay registry is partial or disagrees between participant and domain scopes for " +
+                                    domain_name + " layer=" +
+                                    std::to_string(layer_idx) + " expert=" +
+                                    std::to_string(global_expert));
+                            }
+                            if (domain_engine != nullptr)
+                            {
+                                ++moe_jobs_already_satisfied;
+                                continue;
+                            }
+
+                            /* A fresh overlay may adopt a legacy device-scoped
+                             * engine exactly once. Both scoped aliases must be
+                             * published from that same owner; accepting only
+                             * one would create a torn bank that later context
+                             * sealing cannot certify. */
+                            const bool domain_aliased =
+                                expert_gemm_registry_.aliasEngineForDomainFromDevice(
+                                    domain_name, target_device, layer_idx,
+                                    global_expert, rt.role);
+                            const bool participant_aliased =
+                                expert_gemm_registry_.aliasEngineForParticipantFromDevice(
+                                    domain_name, target_device,
+                                    participant_world_rank, participant_index,
+                                    layer_idx, global_expert, rt.role);
+                            if (domain_aliased || participant_aliased)
+                            {
+                                domain_engine =
+                                    expert_gemm_registry_.getEngineForDomain(
+                                        domain_name, target_device, layer_idx,
+                                        global_expert, rt.role);
+                                participant_engine =
+                                    expert_gemm_registry_.getEngineForParticipant(
+                                        domain_name, target_device,
+                                        participant_world_rank,
+                                        participant_index, layer_idx,
+                                        global_expert, rt.role);
+                                if (!domain_aliased || !participant_aliased ||
+                                    domain_engine == nullptr ||
+                                    domain_engine != participant_engine)
+                                {
+                                    throw std::runtime_error(
+                                        "[WeightManager] GPU overlay could not atomically adopt one device-scoped expert into both registry scopes for " +
+                                        domain_name + " layer=" +
+                                        std::to_string(layer_idx) +
+                                        " expert=" +
+                                        std::to_string(global_expert));
+                                }
                                 ++moe_jobs_already_satisfied;
                                 continue;
                             }
@@ -5353,6 +5734,8 @@ namespace llaminar2
 
             dense_job.owner = fp32_override;
             dense_job.tensor = fp32_override.get();
+            dense_job.host_source_lifetime =
+                DenseGemmJob::HostSourceLifetime::ModelContext;
             if (dense_job.binding.has_value())
             {
                 dense_job.binding->tensor_owner = fp32_override;
@@ -5864,36 +6247,44 @@ namespace llaminar2
                 if (moe_job.domain_name.empty())
                     continue;
 
-                bool has_domain_engine = expert_gemm_registry_.getEngineForDomain(
-                                             moe_job.domain_name,
-                                             target_device,
-                                             moe_job.layer_idx,
-                                             moe_job.expert_idx,
-                                             moe_job.role) != nullptr;
-                if (!has_domain_engine)
-                {
-                    has_domain_engine = expert_gemm_registry_.aliasEngineForDomainFromDevice(
+                auto *domain_engine =
+                    expert_gemm_registry_.getEngineForDomain(
                         moe_job.domain_name,
                         target_device,
                         moe_job.layer_idx,
                         moe_job.expert_idx,
                         moe_job.role);
-                }
-
-                bool has_participant_engine = true;
-                if (moe_job.participant_world_rank >= 0 || moe_job.participant_index >= 0)
+                auto *participant_engine =
+                    expert_gemm_registry_.getEngineForParticipant(
+                        moe_job.domain_name,
+                        target_device,
+                        moe_job.participant_world_rank,
+                        moe_job.participant_index,
+                        moe_job.layer_idx,
+                        moe_job.expert_idx,
+                        moe_job.role);
+                if ((domain_engine == nullptr) !=
+                        (participant_engine == nullptr) ||
+                    (domain_engine != nullptr &&
+                     domain_engine != participant_engine))
                 {
-                    has_participant_engine = expert_gemm_registry_.getEngineForParticipant(
-                                                 moe_job.domain_name,
-                                                 target_device,
-                                                 moe_job.participant_world_rank,
-                                                 moe_job.participant_index,
-                                                 moe_job.layer_idx,
-                                                 moe_job.expert_idx,
-                                                 moe_job.role) != nullptr;
-                    if (!has_participant_engine)
-                    {
-                        has_participant_engine = expert_gemm_registry_.aliasEngineForParticipantFromDevice(
+                    throw std::runtime_error(
+                        "[WeightManager] Released-source GPU overlay registry is partial or disagrees between participant and domain scopes for " +
+                        moe_job.domain_name + " layer=" +
+                        std::to_string(moe_job.layer_idx) + " expert=" +
+                        std::to_string(moe_job.expert_idx));
+                }
+                if (domain_engine == nullptr)
+                {
+                    const bool domain_aliased =
+                        expert_gemm_registry_.aliasEngineForDomainFromDevice(
+                            moe_job.domain_name,
+                            target_device,
+                            moe_job.layer_idx,
+                            moe_job.expert_idx,
+                            moe_job.role);
+                    const bool participant_aliased =
+                        expert_gemm_registry_.aliasEngineForParticipantFromDevice(
                             moe_job.domain_name,
                             target_device,
                             moe_job.participant_world_rank,
@@ -5901,10 +6292,38 @@ namespace llaminar2
                             moe_job.layer_idx,
                             moe_job.expert_idx,
                             moe_job.role);
+                    domain_engine =
+                        expert_gemm_registry_.getEngineForDomain(
+                            moe_job.domain_name,
+                            target_device,
+                            moe_job.layer_idx,
+                            moe_job.expert_idx,
+                            moe_job.role);
+                    participant_engine =
+                        expert_gemm_registry_.getEngineForParticipant(
+                            moe_job.domain_name,
+                            target_device,
+                            moe_job.participant_world_rank,
+                            moe_job.participant_index,
+                            moe_job.layer_idx,
+                            moe_job.expert_idx,
+                            moe_job.role);
+                    if (domain_aliased != participant_aliased ||
+                        (domain_aliased &&
+                         (domain_engine == nullptr ||
+                          domain_engine != participant_engine)))
+                    {
+                        throw std::runtime_error(
+                            "[WeightManager] Released-source GPU overlay could not publish one coherent scoped alias for " +
+                            moe_job.domain_name + " layer=" +
+                            std::to_string(moe_job.layer_idx) +
+                            " expert=" +
+                            std::to_string(moe_job.expert_idx));
                     }
                 }
 
-                if (has_domain_engine && has_participant_engine)
+                if (domain_engine != nullptr &&
+                    domain_engine == participant_engine)
                 {
                     ++aliased_experts;
                 }
@@ -5942,12 +6361,10 @@ namespace llaminar2
          */
         const auto *planned_pool = orchestrator->getPool(target_device.ordinal);
         const size_t planned_weight_bytes = planned_pool ? planned_pool->totalPlannedBytes() : 0;
-        const size_t total_vram_bytes = backend->deviceMemoryTotal(target_device.ordinal);
         const auto load_bom = gpuWeightLoadMemoryBOM(
             planned_weight_bytes,
             max_raw_bytes,
             /*free_vram_bytes=*/0,
-            total_vram_bytes,
             configuredGPUWeightLoadMemoryPolicy(
                 staging_budget_bytes_override));
         const int repack_streams = load_bom.staging_stream_count;
@@ -6274,7 +6691,11 @@ namespace llaminar2
                     // later by releaseAllHostWeightData().
                     const bool tied_alias = dense_job.binding.has_value() &&
                                             dense_job.binding->identity.derivation == WeightDerivationKind::TiedAlias;
-                    if (name != "token_embd.weight" && !tied_alias)
+                    const bool model_context_host_source =
+                        dense_job.host_source_lifetime ==
+                        DenseGemmJob::HostSourceLifetime::ModelContext;
+                    if (name != "token_embd.weight" && !tied_alias &&
+                        !model_context_host_source)
                     {
                         try
                         {
@@ -6596,6 +7017,26 @@ namespace llaminar2
         // The VRAM pool is kept alive by the GEMM kernels' lifetime_owner_ shared_ptrs,
         // but the staging buffers (pinned ring) are no longer needed.
         orchestrator->finalize();
+
+        /*
+         * Publish only the finalized persistent region. The registry retains a
+         * weak owner, so this record cannot keep an abandoned or Dynamic-only
+         * pool alive. At the reusable-model seal, live kernel ownership is the
+         * exact predicate deciding whether these bytes remain in the retirement
+         * BOM; loader staging has already been released and is never counted.
+         */
+        const auto *finalized_pool =
+            orchestrator->getPool(target_device.ordinal);
+        if (!finalized_pool || !finalized_pool->isAllocated() ||
+            finalized_pool->totalPlannedBytes() == 0u)
+        {
+            throw std::runtime_error(
+                "WeightManager GPU pipeline finalized without a persistent prepared-weight pool");
+        }
+        prepared_device_allocations_.registerAllocation(
+            target_device,
+            std::shared_ptr<void>(orchestrator),
+            finalized_pool->totalPlannedBytes());
 
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -7119,10 +7560,6 @@ namespace llaminar2
         {
             LOG_DEBUG("[WeightManager] Post-upload host-resident release: "
                       << released_count << " tensors (" << (released_bytes / (1024 * 1024)) << " MB) freed");
-
-#if defined(__GLIBC__)
-            ::malloc_trim(0);
-#endif
         }
         if (skipped_views > 0)
         {
@@ -7138,50 +7575,97 @@ namespace llaminar2
          * leave the runtime with a stale DMA mapping and corrupt an unrelated
          * host consumer such as the parity snapshot bank.
          *
-         * The explicit adviseMmapDontneed() phase owns that second half of the
-         * protocol: it first releases every remaining mmap host registration,
-         * then advises the shared file mapping exactly once. Callers must use
-         * the two phases in that order after the completed first-prefill
-         * producer; keeping the boundaries separate makes the unsafe ordering
+         * The exactly-once scheduleMmapReclaim() phase owns that second half of
+         * the protocol on its background worker: it first releases every
+         * remaining mmap host registration, then applies backing-aware advice.
+         * Callers publish that phase only after the completed first-prefill
+         * producer; the typed lifecycle makes duplicate or inline work
          * unrepresentable in normal runner code.
          */
 
         return released_count;
     }
 
-    size_t WeightManager::adviseMmapDontneed()
+    MmapReclaimLifecycle::Submission WeightManager::scheduleMmapReclaim()
     {
+        return mmap_reclaim_lifecycle_.schedule();
+    }
+
+    MmapReclaimLifecycle::Completion
+    WeightManager::awaitMmapReclaimBeforeHostAllocation()
+    {
+        return mmap_reclaim_lifecycle_.awaitBeforeHostAllocation();
+    }
+
+    size_t WeightManager::performMmapReclaim()
+    {
+        /*
+         * First-prefill reclamation is one complete worker-owned operation.
+         * Releasing residual embedding/sidecar host buffers here, rather than
+         * immediately before scheduleMmapReclaim(), keeps both destructor work
+         * and glibc arena scans off the inference authority thread.  The
+         * completed load pipeline and first successful prefill are the exact
+         * producer boundary that makes these bytes unreachable by execution.
+         */
+        const size_t released_host_tensors =
+            releaseHostResidentWeightData();
+
+        std::vector<std::shared_ptr<TensorBase>> mapped_tensors;
         size_t mmap_tensors_unregistered = 0;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
             std::unordered_set<TensorBase *> visited;
 
-            auto release_registration = [&](const std::shared_ptr<TensorBase> &tensor)
+            auto retain_mapped_tensor = [&](const std::shared_ptr<TensorBase> &tensor)
             {
                 TensorBase *ptr = tensor.get();
                 if (!ptr || !visited.insert(ptr).second || !ptr->is_mmap_data())
                     return;
-
-                ptr->releaseMmapHostRegistration();
-                ++mmap_tensors_unregistered;
+                mapped_tensors.push_back(tensor);
             };
 
             for (const auto &[_, tensor] : cache_)
-                release_registration(tensor);
+                retain_mapped_tensor(tensor);
             for (const auto &[_, tensor] : per_device_cache_)
-                release_registration(tensor);
+                retain_mapped_tensor(tensor);
             for (const auto &[_, tensor] : decode_cache_)
-                release_registration(tensor);
+                retain_mapped_tensor(tensor);
+        }
+
+        // Host registration retirement can enter CUDA/HIP runtime locks and
+        // durable-file advice can walk very large page tables. Both operations
+        // stay on this background worker; the shared_ptr snapshot preserves
+        // tensor lifetimes without holding cache_mutex_ against inference.
+        for (const auto &tensor : mapped_tensors)
+        {
+            tensor->releaseMmapHostRegistration();
+            ++mmap_tensors_unregistered;
         }
 
         if (mmap_tensors_unregistered > 0)
         {
             LOG_DEBUG("[WeightManager] Released host registrations for "
                       << mmap_tensors_unregistered
-                      << " mmap-backed tensors before MADV_DONTNEED");
+                      << " mmap-backed tensors before backing-aware reclaim");
         }
 
-        return loader_.adviseMmapDontneed();
+        const size_t advised_bytes = loader_.adviseMmapDontneed();
+
+#if defined(__GLIBC__)
+        /*
+         * malloc_trim() can walk every process arena and issue anonymous
+         * MADV_DONTNEED operations.  It is therefore maintenance work even
+         * when the individual ranges are small.  Run it only on this worker,
+         * after all model-owned frees, and let later model/JIT admission cross
+         * awaitMmapReclaimBeforeHostAllocation() before it needs the capacity.
+         */
+        if (released_host_tensors > 0u)
+            ::malloc_trim(0);
+#else
+        (void)released_host_tensors;
+#endif
+
+        return advised_bytes;
     }
 
     size_t WeightManager::releaseMoEExpertHostWeightData()

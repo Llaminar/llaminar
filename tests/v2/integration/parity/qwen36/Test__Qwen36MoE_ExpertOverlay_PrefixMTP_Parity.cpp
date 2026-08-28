@@ -263,7 +263,8 @@ namespace
             config.window_size = 4;
             config.max_window_size = 4;
             config.window_growth_factor = 1.0f;
-            config.dynamic_imbalance_threshold_per_mille = 0;
+            /* 1000 per-mille is the valid neutral imbalance ratio. */
+            config.dynamic_imbalance_threshold_per_mille = 1000;
             config.dynamic_min_improvement_per_mille = 0;
             config.dynamic_max_swaps_per_layer = 20;
             config.dynamic_max_plan_entries_per_wave = 20;

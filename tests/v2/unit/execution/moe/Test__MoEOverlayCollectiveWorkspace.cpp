@@ -7,8 +7,10 @@
  */
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
+#include "execution/moe/MoEOverlayActivationPacketABI.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
+#include "execution/moe/MoESparseRequestIdentity.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "collective/ITPContext.h"
@@ -24,11 +26,101 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
 
 using namespace llaminar2;
+
+TEST(
+    Test__MoEOverlayCollectiveWorkspace,
+    SparseRequestIdentityKeepsLocalAndOverlayAuthoritiesDistinct)
+{
+    EXPECT_FALSE(MoESparseRequestIdentity::localRequestState(0));
+    EXPECT_FALSE(MoESparseRequestIdentity::expertOverlayRoot(0));
+
+    const auto local =
+        MoESparseRequestIdentity::localRequestState(17);
+    const auto overlay =
+        MoESparseRequestIdentity::expertOverlayRoot(17);
+    ASSERT_TRUE(local.has_value());
+    ASSERT_TRUE(overlay.has_value());
+    EXPECT_EQ(local->generation(), 17u);
+    EXPECT_EQ(overlay->generation(), 17u);
+    EXPECT_EQ(
+        local->authority(),
+        MoESparseRequestAuthority::LocalRequestState);
+    EXPECT_EQ(
+        overlay->authority(),
+        MoESparseRequestAuthority::ExpertOverlayRoot);
+}
+
+TEST(
+    Test__MoEOverlayCollectiveWorkspace,
+    CanonicalRouteTicketAccountsOnlyLiveMappedPayload)
+{
+    constexpr size_t kEntries = 3u;
+    constexpr int kDModel = 32;
+    const size_t expected =
+        sizeof(MoEOverlayCanonicalRouteTicketControl) +
+        kEntries *
+            (2u * sizeof(std::int32_t) +
+             static_cast<size_t>(kDModel) * sizeof(float));
+    EXPECT_EQ(
+        canonicalMoEOverlayTicketReturnBytes(kEntries, kDModel),
+        expected);
+    EXPECT_EQ(canonicalMoEOverlayTicketReturnBytes(0u, kDModel), 0u);
+    EXPECT_EQ(canonicalMoEOverlayTicketReturnBytes(kEntries, 0), 0u);
+    EXPECT_EQ(
+        canonicalMoEOverlayTicketReturnBytes(
+            std::numeric_limits<size_t>::max(),
+            kDModel),
+        0u)
+        << "Overflow must fail accounting instead of wrapping into plausible evidence";
+}
+
+/**
+ * @brief Lock down the monotonic single-producer/single-consumer ticket state.
+ *
+ * A reusable zero/one publication flag admits the classic ABA sequence across
+ * retained graph replays. These device-free ABI assertions prove that an idle
+ * ticket, one outstanding publication, and every skipped/reversed cursor have
+ * distinct semantics before the real-device tests exercise system atomics.
+ */
+TEST(
+    Test__MoEOverlayCollectiveWorkspace,
+    CanonicalRouteTicketSequenceRejectsABAAndSkippedPublications)
+{
+    MoEOverlayCanonicalRouteTicketControl control{
+        .workspace_generation = 9u,
+        .layer_idx = 3,
+        .route_capacity = 8,
+        .d_model = 16,
+    };
+    ASSERT_TRUE(control.valid());
+    EXPECT_TRUE(control.sequenceStateValid());
+    EXPECT_FALSE(control.publicationPending());
+
+    control.published_sequence = 1u;
+    EXPECT_TRUE(control.sequenceStateValid());
+    EXPECT_TRUE(control.publicationPending());
+
+    control.consumed_sequence = 1u;
+    EXPECT_TRUE(control.sequenceStateValid());
+    EXPECT_FALSE(control.publicationPending());
+
+    control.published_sequence = 3u;
+    EXPECT_FALSE(control.sequenceStateValid())
+        << "Skipping a producer sequence must not resemble one publication";
+    EXPECT_FALSE(control.publicationPending());
+
+    control.published_sequence = 1u;
+    control.consumed_sequence = 2u;
+    EXPECT_FALSE(control.sequenceStateValid())
+        << "A consumer cursor can never advance beyond its producer";
+    EXPECT_FALSE(control.publicationPending());
+}
 
 namespace
 {
@@ -1520,8 +1612,21 @@ TEST(
     forbidden_params.dispatch_output_lifetime = forbidden_output;
     forbidden_params.inbound_rows = &forbidden_inbound;
 
-    MoESparseDispatchStage forbidden_stage(std::move(forbidden_params));
-    EXPECT_FALSE(forbidden_stage.execute(&ctx));
+    EXPECT_THROW(
+        MoESparseDispatchStage(std::move(forbidden_params)),
+        std::invalid_argument);
+
+    auto forbidden_ticket =
+        std::make_shared<MoEOverlayDispatchTicketStorage>();
+    MoESparseDispatchStage::Params ticket_params;
+    ticket_params.payload_publication_role =
+        MoESparseDispatchStage::PayloadPublicationRole::
+            EmptyCollectiveParticipant;
+    ticket_params.ticket_storage = std::move(forbidden_ticket);
+    EXPECT_THROW(
+        MoESparseDispatchStage(std::move(ticket_params)),
+        std::invalid_argument)
+        << "empty protocol peers must not inherit the graph authority's captured ticket";
 }
 
 TEST(

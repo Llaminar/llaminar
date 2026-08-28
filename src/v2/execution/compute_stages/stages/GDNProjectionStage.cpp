@@ -851,6 +851,17 @@ namespace llaminar2
         mergeFrom(self->params_.w_z, self->params_.gemm_z, "w_z", self->params_.n_z);
         mergeFrom(self->params_.w_a, self->params_.gemm_a, "w_a", self->params_.n_a);
         mergeFrom(self->params_.w_b, self->params_.gemm_b, "w_b", self->params_.n_b);
+
+        const std::array<int, 4> fused_columns = {
+            self->params_.n_qkv > 0 ? self->params_.n_qkv : n,
+            self->params_.n_z > 0 ? self->params_.n_z : n,
+            self->params_.n_a > 0 ? self->params_.n_a : n,
+            self->params_.n_b > 0 ? self->params_.n_b : n};
+        if (auto *anchor = dynamic_cast<IWorkspaceConsumer *>(self->params_.gemm_qkv))
+        {
+            anchor->appendFusedProjectionWorkspaceRequirements(
+                combined, workspace_m, fused_columns, workspace_k);
+        }
         addCudaConcurrentDecodeGemvSideStreamWorkspace(
             combined, self->params_.device_id, workspace_m, /*projection_count=*/4);
         return combined;

@@ -41,7 +41,12 @@ namespace llaminar2
         std::atomic<std::uint64_t> publication_consensus_ready{0};
         std::atomic<std::uint64_t> publication_consensus_failed{0};
         std::atomic<std::uint64_t> local_publication_begin_failed{0};
+        std::atomic<std::uint64_t> retirement_admission_consensus_started{0};
+        std::atomic<std::uint64_t> retirement_admission_consensus_waiting{0};
+        std::atomic<std::uint64_t> retirement_admission_consensus_ready{0};
+        std::atomic<std::uint64_t> retirement_admission_consensus_failed{0};
         std::atomic<std::uint64_t> retirement_consensus_started{0};
+        std::atomic<std::uint64_t> retirement_consensus_waiting{0};
         std::atomic<std::uint64_t> retirement_consensus_ready{0};
         std::atomic<std::uint64_t> retirement_consensus_failed{0};
         std::atomic<std::uint64_t> waves_published{0};
@@ -318,14 +323,8 @@ namespace llaminar2
                          * operator can identify the failed pool, endpoint, or
                          * lane without weakening the fixed-layout protocol.
                          */
-                        if (local_status_ ==
-                                MoEOverlayResidencyStageStartStatus::Failed &&
-                            !local_start_error_.empty())
-                        {
-                            terminal_error_ +=
-                                "; local reservation detail: " +
-                                local_start_error_;
-                        }
+                        appendOriginatingLocalDiagnostic(
+                            "reservation", local_start_error_);
                         stats_->reservation_consensus_failed.fetch_add(
                             1,
                             std::memory_order_relaxed);
@@ -367,9 +366,10 @@ namespace llaminar2
                             MoEOverlayDistributedResidencyVoteDecision::Failed;
                         error_code = static_cast<int>(
                             DistributedResidencyError::LocalStagePoll);
-                        diagnostic = local_error.empty()
-                                         ? "Local ExpertOverlay staging failed"
-                                         : std::move(local_error);
+                        local_stage_error_ = local_error.empty()
+                                                 ? "Local ExpertOverlay staging failed"
+                                                 : std::move(local_error);
+                        diagnostic = local_stage_error_;
                     }
 
                     try
@@ -447,6 +447,8 @@ namespace llaminar2
                     terminal_error_ = protocol_error.empty()
                                           ? "Distributed ExpertOverlay stage consensus failed"
                                           : std::move(protocol_error);
+                    appendOriginatingLocalDiagnostic(
+                        "staging", local_stage_error_);
                     stats_->stage_consensus_failed.fetch_add(
                         1,
                         std::memory_order_relaxed);
@@ -573,9 +575,10 @@ namespace llaminar2
                                 MoEOverlayDistributedResidencyVoteDecision::Failed;
                             error_code = static_cast<int>(
                                 DistributedResidencyError::LocalPreparationPoll);
-                            diagnostic = local_error.empty()
-                                             ? "Local inactive-bank preparation failed"
-                                             : std::move(local_error);
+                            local_prepare_error_ = local_error.empty()
+                                                       ? "Local inactive-bank preparation failed"
+                                                       : std::move(local_error);
+                            diagnostic = local_prepare_error_;
                         }
                     }
 
@@ -642,6 +645,9 @@ namespace llaminar2
                     terminal_error_ = protocol_error.empty()
                                           ? "Distributed ExpertOverlay preparation consensus failed"
                                           : std::move(protocol_error);
+                    appendOriginatingLocalDiagnostic(
+                        "inactive-bank preparation",
+                        local_prepare_error_);
                     stats_->preparation_consensus_failed.fetch_add(
                         1,
                         std::memory_order_relaxed);
@@ -736,9 +742,10 @@ namespace llaminar2
                                 MoEOverlayDistributedResidencyVoteDecision::Failed;
                             error_code = static_cast<int>(
                                 DistributedResidencyError::LocalPublicationPoll);
-                            diagnostic = local_error.empty()
-                                             ? "Local runtime publication failed"
-                                             : std::move(local_error);
+                            local_publication_error_ = local_error.empty()
+                                                           ? "Local runtime publication failed"
+                                                           : std::move(local_error);
+                            diagnostic = local_publication_error_;
                         }
                     }
 
@@ -795,6 +802,9 @@ namespace llaminar2
                     terminal_error_ = protocol_error.empty()
                                           ? "Distributed ExpertOverlay publication consensus failed"
                                           : std::move(protocol_error);
+                    appendOriginatingLocalDiagnostic(
+                        "runtime publication",
+                        local_publication_error_);
                     stats_->publication_consensus_failed.fetch_add(
                         1, std::memory_order_relaxed);
                     setDistributedError(error, terminal_error_);
@@ -931,8 +941,9 @@ namespace llaminar2
                 recordCounter("distributed_waves_published");
             }
 
-            /** @brief Vote that this rank has released every old-epoch ticket. */
-            MoEOverlayResidencyWaveProgress pollRetirementFence(
+            /** @brief Exchange both ordered old-epoch grace-period barriers. */
+            MoEOverlayRetirementFenceProgress pollRetirementFence(
+                MoEOverlayLocalRetirementState local_state,
                 std::string *error) noexcept override
             {
                 if (retired_ || aborted_ || !published_)
@@ -940,68 +951,264 @@ namespace llaminar2
                     setDistributedError(
                         error,
                         "Distributed residency retirement fence has an invalid lifecycle state");
-                    return MoEOverlayResidencyWaveProgress::Failed;
+                    return MoEOverlayRetirementFenceProgress::Failed;
                 }
                 if (retirement_ready_)
                 {
                     if (error)
                         error->clear();
-                    return MoEOverlayResidencyWaveProgress::Ready;
+                    return MoEOverlayRetirementFenceProgress::ReadyToRetire;
                 }
                 if (retirement_failed_)
                 {
                     setDistributedError(error, terminal_error_);
-                    return MoEOverlayResidencyWaveProgress::Failed;
+                    return MoEOverlayRetirementFenceProgress::Failed;
                 }
 
                 /*
-                 * Device readers are a process-local grace period distinct
-                 * from host ticket leases. Complete that exact event-polled
-                 * fence before voting, otherwise another rank could reclaim
-                 * source storage while this rank still has an old GPU bank.
+                 * Phase 5 is entered by every rank immediately after
+                 * publication. A Waiting vote keeps the collective sequence
+                 * aligned while current host readers or device-side producers
+                 * drain. Unanimous readiness permits, but does not itself
+                 * perform, the source-owned exact-admission close.
                  */
-                if (!local_retirement_ready_)
+                if (local_state.admission ==
+                    MoEOverlayRetirementAdmissionState::Open)
                 {
-                    std::string local_error;
-                    const auto local_progress =
-                        local_wave_->pollRetirementFence(&local_error);
-                    if (local_progress ==
+                    if (retirement_admission_ready_)
+                    {
+                        if (error)
+                            error->clear();
+                        return MoEOverlayRetirementFenceProgress::
+                            ReadyToCloseAdmission;
+                    }
+
+                    if (!retirement_admission_consensus_started_)
+                    {
+                        std::string local_error;
+                        const auto local_progress =
+                            local_wave_->pollRetirementFence(
+                                local_state, &local_error);
+                        if (local_progress ==
+                            MoEOverlayRetirementFenceProgress::Failed)
+                        {
+                            retirement_failed_ = true;
+                            terminal_error_ = local_error.empty()
+                                                  ? "Local retirement-admission fence failed"
+                                                  : std::move(local_error);
+                            stats_->retirement_admission_consensus_failed
+                                .fetch_add(1, std::memory_order_relaxed);
+                            setDistributedError(error, terminal_error_);
+                            return MoEOverlayRetirementFenceProgress::Failed;
+                        }
+                        if (local_progress ==
+                            MoEOverlayRetirementFenceProgress::ReadyToRetire)
+                        {
+                            retirement_failed_ = true;
+                            terminal_error_ =
+                                "Local retirement wave reported final readiness while exact admission remained open";
+                            stats_->retirement_admission_consensus_failed
+                                .fetch_add(1, std::memory_order_relaxed);
+                            setDistributedError(error, terminal_error_);
+                            return MoEOverlayRetirementFenceProgress::Failed;
+                        }
+
+                        try
+                        {
+                            const auto vote = protocol_.makeLocalVote(
+                                local_progress ==
+                                        MoEOverlayRetirementFenceProgress::
+                                            ReadyToCloseAdmission
+                                    ? MoEOverlayDistributedResidencyVoteDecision::
+                                          Ready
+                                    : MoEOverlayDistributedResidencyVoteDecision::
+                                          Waiting);
+                            if (!consensus_->begin(vote, &terminal_error_))
+                            {
+                                retirement_failed_ = true;
+                                if (terminal_error_.empty())
+                                {
+                                    terminal_error_ =
+                                        "Failed to begin distributed ExpertOverlay retirement-admission consensus";
+                                }
+                                stats_->retirement_admission_consensus_failed
+                                    .fetch_add(1, std::memory_order_relaxed);
+                                setDistributedError(error, terminal_error_);
+                                return MoEOverlayRetirementFenceProgress::Failed;
+                            }
+                        }
+                        catch (const std::exception &exception)
+                        {
+                            retirement_failed_ = true;
+                            terminal_error_ = exception.what();
+                            stats_->retirement_admission_consensus_failed
+                                .fetch_add(1, std::memory_order_relaxed);
+                            setDistributedError(error, terminal_error_);
+                            return MoEOverlayRetirementFenceProgress::Failed;
+                        }
+                        retirement_admission_consensus_started_ = true;
+                        stats_->retirement_admission_consensus_started.fetch_add(
+                            1, std::memory_order_relaxed);
+                        recordCounter(
+                            "distributed_retirement_admission_consensus_started");
+                    }
+
+                    std::vector<MoEOverlayDistributedResidencyVote> votes;
+                    const auto consensus_progress =
+                        consensus_->poll(&votes, &terminal_error_);
+                    if (consensus_progress ==
                         MoEOverlayResidencyWaveProgress::Pending)
                     {
-                        return local_progress;
+                        return MoEOverlayRetirementFenceProgress::Pending;
                     }
-                    if (local_progress !=
-                        MoEOverlayResidencyWaveProgress::Ready)
+                    if (consensus_progress ==
+                        MoEOverlayResidencyWaveProgress::Failed)
                     {
                         retirement_failed_ = true;
-                        terminal_error_ = local_error.empty()
-                                              ? "Local device retirement fence failed"
-                                              : std::move(local_error);
+                        stats_->retirement_admission_consensus_failed.fetch_add(
+                            1, std::memory_order_relaxed);
                         setDistributedError(error, terminal_error_);
-                        return MoEOverlayResidencyWaveProgress::Failed;
+                        return MoEOverlayRetirementFenceProgress::Failed;
                     }
-                    local_retirement_ready_ = true;
+
+                    std::string protocol_error;
+                    if (!protocol_.acceptConsensus(votes, &protocol_error))
+                    {
+                        if (protocol_.state() ==
+                            MoEOverlayDistributedResidencyProtocolState::Published)
+                        {
+                            retirement_admission_consensus_started_ = false;
+                            stats_->retirement_admission_consensus_waiting
+                                .fetch_add(
+                                1,
+                                std::memory_order_relaxed);
+                            recordCounter(
+                                "distributed_retirement_admission_consensus_waiting");
+                            if (error)
+                                error->clear();
+                            return MoEOverlayRetirementFenceProgress::Pending;
+                        }
+                        retirement_failed_ = true;
+                        terminal_error_ = protocol_error.empty()
+                                              ? "Distributed ExpertOverlay retirement-admission consensus failed"
+                                              : std::move(protocol_error);
+                        stats_->retirement_admission_consensus_failed.fetch_add(
+                            1, std::memory_order_relaxed);
+                        setDistributedError(error, terminal_error_);
+                        recordCounter(
+                            "distributed_retirement_admission_consensus_failed");
+                        return MoEOverlayRetirementFenceProgress::Failed;
+                    }
+                    if (protocol_.state() !=
+                        MoEOverlayDistributedResidencyProtocolState::
+                            ReadyToCloseRetirementAdmission)
+                    {
+                        retirement_failed_ = true;
+                        terminal_error_ =
+                            "Distributed ExpertOverlay retirement-admission consensus advanced to an invalid lifecycle state";
+                        stats_->retirement_admission_consensus_failed.fetch_add(
+                            1, std::memory_order_relaxed);
+                        setDistributedError(error, terminal_error_);
+                        return MoEOverlayRetirementFenceProgress::Failed;
+                    }
+
+                    retirement_admission_ready_ = true;
+                    stats_->retirement_admission_consensus_ready.fetch_add(
+                        1, std::memory_order_relaxed);
+                    recordCounter(
+                        "distributed_retirement_admission_consensus_ready");
+                    if (error)
+                        error->clear();
+                    return MoEOverlayRetirementFenceProgress::
+                        ReadyToCloseAdmission;
+                }
+
+                /*
+                 * Phase 6 begins only after the authority has closed local
+                 * exact admission. A reader that raced the close contributes
+                 * Waiting until it releases; no new reader can enter, so a
+                 * Ready vote is stable for the remainder of the wave.
+                 */
+                if (!retirement_admission_ready_)
+                {
+                    retirement_failed_ = true;
+                    terminal_error_ =
+                        "Distributed retirement admission closed before unanimous quiescence";
+                    stats_->retirement_consensus_failed.fetch_add(
+                        1, std::memory_order_relaxed);
+                    setDistributedError(error, terminal_error_);
+                    return MoEOverlayRetirementFenceProgress::Failed;
+                }
+                if (!retirement_admission_marked_closed_)
+                {
+                    try
+                    {
+                        protocol_.markRetirementAdmissionClosed();
+                    }
+                    catch (const std::exception &exception)
+                    {
+                        retirement_failed_ = true;
+                        terminal_error_ = exception.what();
+                        stats_->retirement_consensus_failed.fetch_add(
+                            1, std::memory_order_relaxed);
+                        setDistributedError(error, terminal_error_);
+                        return MoEOverlayRetirementFenceProgress::Failed;
+                    }
+                    retirement_admission_marked_closed_ = true;
                 }
 
                 if (!retirement_consensus_started_)
                 {
+                    std::string local_error;
+                    const auto local_progress =
+                        local_wave_->pollRetirementFence(
+                            local_state, &local_error);
+                    if (local_progress ==
+                        MoEOverlayRetirementFenceProgress::Failed)
+                    {
+                        retirement_failed_ = true;
+                        terminal_error_ = local_error.empty()
+                                              ? "Local closed-admission retirement fence failed"
+                                              : std::move(local_error);
+                        stats_->retirement_consensus_failed.fetch_add(
+                            1, std::memory_order_relaxed);
+                        setDistributedError(error, terminal_error_);
+                        return MoEOverlayRetirementFenceProgress::Failed;
+                    }
+                    if (local_progress ==
+                        MoEOverlayRetirementFenceProgress::ReadyToCloseAdmission)
+                    {
+                        retirement_failed_ = true;
+                        terminal_error_ =
+                            "Local retirement wave requested an admission close after admission was already closed";
+                        stats_->retirement_consensus_failed.fetch_add(
+                            1, std::memory_order_relaxed);
+                        setDistributedError(error, terminal_error_);
+                        return MoEOverlayRetirementFenceProgress::Failed;
+                    }
+
                     try
                     {
                         const auto vote = protocol_.makeLocalVote(
-                            MoEOverlayDistributedResidencyVoteDecision::Ready);
+                            local_progress ==
+                                    MoEOverlayRetirementFenceProgress::
+                                        ReadyToRetire
+                                ? MoEOverlayDistributedResidencyVoteDecision::
+                                      Ready
+                                : MoEOverlayDistributedResidencyVoteDecision::
+                                      Waiting);
                         if (!consensus_->begin(vote, &terminal_error_))
                         {
                             retirement_failed_ = true;
                             if (terminal_error_.empty())
                             {
                                 terminal_error_ =
-                                    "Failed to begin distributed ExpertOverlay retirement consensus";
+                                    "Failed to begin distributed ExpertOverlay final retirement consensus";
                             }
                             stats_->retirement_consensus_failed.fetch_add(
-                                1,
-                                std::memory_order_relaxed);
+                                1, std::memory_order_relaxed);
                             setDistributedError(error, terminal_error_);
-                            return MoEOverlayResidencyWaveProgress::Failed;
+                            return MoEOverlayRetirementFenceProgress::Failed;
                         }
                     }
                     catch (const std::exception &exception)
@@ -1009,10 +1216,9 @@ namespace llaminar2
                         retirement_failed_ = true;
                         terminal_error_ = exception.what();
                         stats_->retirement_consensus_failed.fetch_add(
-                            1,
-                            std::memory_order_relaxed);
+                            1, std::memory_order_relaxed);
                         setDistributedError(error, terminal_error_);
-                        return MoEOverlayResidencyWaveProgress::Failed;
+                        return MoEOverlayRetirementFenceProgress::Failed;
                     }
                     retirement_consensus_started_ = true;
                     stats_->retirement_consensus_started.fetch_add(
@@ -1027,7 +1233,7 @@ namespace llaminar2
                 if (consensus_progress ==
                     MoEOverlayResidencyWaveProgress::Pending)
                 {
-                    return consensus_progress;
+                    return MoEOverlayRetirementFenceProgress::Pending;
                 }
                 if (consensus_progress ==
                     MoEOverlayResidencyWaveProgress::Failed)
@@ -1037,15 +1243,26 @@ namespace llaminar2
                         1,
                         std::memory_order_relaxed);
                     setDistributedError(error, terminal_error_);
-                    return consensus_progress;
+                    return MoEOverlayRetirementFenceProgress::Failed;
                 }
 
                 std::string protocol_error;
-                if (!protocol_.acceptConsensus(votes, &protocol_error) ||
-                    protocol_.state() !=
-                        MoEOverlayDistributedResidencyProtocolState::
-                            ReadyToRetire)
+                if (!protocol_.acceptConsensus(votes, &protocol_error))
                 {
+                    if (protocol_.state() ==
+                        MoEOverlayDistributedResidencyProtocolState::
+                            RetirementAdmissionClosed)
+                    {
+                        retirement_consensus_started_ = false;
+                        stats_->retirement_consensus_waiting.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                        recordCounter(
+                            "distributed_retirement_consensus_waiting");
+                        if (error)
+                            error->clear();
+                        return MoEOverlayRetirementFenceProgress::Pending;
+                    }
                     retirement_failed_ = true;
                     terminal_error_ = protocol_error.empty()
                                           ? "Distributed ExpertOverlay retirement consensus failed"
@@ -1055,7 +1272,20 @@ namespace llaminar2
                         std::memory_order_relaxed);
                     setDistributedError(error, terminal_error_);
                     recordCounter("distributed_retirement_consensus_failed");
-                    return MoEOverlayResidencyWaveProgress::Failed;
+                    return MoEOverlayRetirementFenceProgress::Failed;
+                }
+                if (protocol_.state() !=
+                    MoEOverlayDistributedResidencyProtocolState::ReadyToRetire)
+                {
+                    retirement_failed_ = true;
+                    terminal_error_ =
+                        "Distributed ExpertOverlay retirement consensus advanced to an invalid lifecycle state";
+                    stats_->retirement_consensus_failed.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                    setDistributedError(error, terminal_error_);
+                    recordCounter("distributed_retirement_consensus_failed");
+                    return MoEOverlayRetirementFenceProgress::Failed;
                 }
 
                 retirement_ready_ = true;
@@ -1065,7 +1295,7 @@ namespace llaminar2
                 recordCounter("distributed_retirement_consensus_ready");
                 if (error)
                     error->clear();
-                return MoEOverlayResidencyWaveProgress::Ready;
+                return MoEOverlayRetirementFenceProgress::ReadyToRetire;
             }
 
             /** @brief Retire only the local bank after all-rank lease drainage. */
@@ -1095,6 +1325,32 @@ namespace llaminar2
             }
 
         private:
+            /**
+             * @brief Attach the full local diagnostic only on its owning rank.
+             *
+             * Votes deliberately carry fixed-size codes and fingerprints. The
+             * rank which authored the first failed vote still owns the exact
+             * backend diagnostic and must retain it in its terminal message;
+             * peers can correlate that message through the shared fingerprint
+             * without putting variable strings into the collective ABI.
+             */
+            void appendOriginatingLocalDiagnostic(
+                const char *phase,
+                const std::string &diagnostic)
+            {
+                const auto &failure = protocol_.failure();
+                if (!failure ||
+                    failure->world_rank != consensus_->worldRank() ||
+                    diagnostic.empty())
+                {
+                    return;
+                }
+                terminal_error_ += "; local ";
+                terminal_error_ += phase;
+                terminal_error_ += " detail: ";
+                terminal_error_ += diagnostic;
+            }
+
             /** @brief Export one rare wave lifecycle fact to PerfStats. */
             void recordCounter(const char *name) const
             {
@@ -1126,6 +1382,7 @@ namespace llaminar2
             std::uint64_t candidate_epoch_ = 0;
             std::chrono::steady_clock::time_point wave_started_at_{};
             MoEOverlayResidencyWaveInterval stage_interval_{};
+            std::string local_stage_error_;
             std::string local_prepare_error_;
             std::string local_publication_error_;
             std::string terminal_error_;
@@ -1146,7 +1403,9 @@ namespace llaminar2
             bool publication_consensus_started_ = false;
             bool publication_ready_ = false;
             bool publication_failed_ = false;
-            bool local_retirement_ready_ = false;
+            bool retirement_admission_consensus_started_ = false;
+            bool retirement_admission_ready_ = false;
+            bool retirement_admission_marked_closed_ = false;
             bool retirement_consensus_started_ = false;
             bool retirement_ready_ = false;
             bool retirement_failed_ = false;
@@ -1312,8 +1571,23 @@ namespace llaminar2
             .local_publication_begin_failed =
                 stats_->local_publication_begin_failed.load(
                     std::memory_order_relaxed),
+            .retirement_admission_consensus_started =
+                stats_->retirement_admission_consensus_started.load(
+                    std::memory_order_relaxed),
+            .retirement_admission_consensus_waiting =
+                stats_->retirement_admission_consensus_waiting.load(
+                    std::memory_order_relaxed),
+            .retirement_admission_consensus_ready =
+                stats_->retirement_admission_consensus_ready.load(
+                    std::memory_order_relaxed),
+            .retirement_admission_consensus_failed =
+                stats_->retirement_admission_consensus_failed.load(
+                    std::memory_order_relaxed),
             .retirement_consensus_started =
                 stats_->retirement_consensus_started.load(
+                    std::memory_order_relaxed),
+            .retirement_consensus_waiting =
+                stats_->retirement_consensus_waiting.load(
                     std::memory_order_relaxed),
             .retirement_consensus_ready =
                 stats_->retirement_consensus_ready.load(
@@ -1331,5 +1605,14 @@ namespace llaminar2
             .inference_thread_waits = 0,
             .blocking_synchronizations = 0,
         };
+    }
+
+    std::uint64_t
+    MoEOverlayDistributedResidencyTransport::completedPlacementPayloadBytes()
+        const noexcept
+    {
+        return config_.local_transport
+                   ? config_.local_transport->completedPlacementPayloadBytes()
+                   : 0u;
     }
 } // namespace llaminar2

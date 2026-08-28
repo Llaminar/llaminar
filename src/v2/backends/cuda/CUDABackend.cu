@@ -9,7 +9,6 @@
  */
 
 #include "CUDABackend.h"
-#include "backends/GPUAllocationPolicy.h"
 #include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -30,14 +29,107 @@
 #include <sstream>
 #include <cstdint>
 #include <exception>
+#include <mutex>
+#include <unordered_map>
 
 namespace llaminar2
 {
+    extern "C" bool llaminar2_retireCUDATensorValidatorRuntimeGeneration(
+        int device_id);
+
     namespace
     {
         constexpr std::uintptr_t kDeviceAllocationAlignment = 256;
         constexpr unsigned int kMappedHostCopyThreads = 256u;
         constexpr unsigned int kMappedHostCopyMaximumBlocks = 4096u;
+
+        /** Logical CUDA allocation tracked by the canonical backend allocator. */
+        struct CUDADeviceAllocationRecord
+        {
+            size_t bytes = 0u; ///< Exact cudaMalloc byte count.
+            int device_id = -1; ///< Owning CUDA ordinal.
+        };
+
+        /** CUDA host allocation or registration whose aliases die on reset. */
+        struct CUDAHostRegistrationRecord
+        {
+            size_t bytes = 0u; ///< Known byte count, or zero for free-only APIs.
+            int device_id = -1; ///< Registration-context CUDA ordinal.
+        };
+
+        /**
+         * @return Mutex serializing resource mutation against runtime reset.
+         *
+         * It is intentionally process-lifetime storage: BackendManager's CUDA
+         * backend is also process-lifetime, and static destruction order must
+         * never recreate an empty authority around still-live resources.
+         */
+        std::mutex &cudaRuntimeResourceLifecycleMutex()
+        {
+            static auto *mutex = new std::mutex();
+            return *mutex;
+        }
+
+        /** @return Exact live allocations made through CUDABackend::allocate. */
+        std::unordered_map<void *, CUDADeviceAllocationRecord> &
+        cudaTrackedDeviceAllocations()
+        {
+            static auto *allocations =
+                new std::unordered_map<void *, CUDADeviceAllocationRecord>();
+            return *allocations;
+        }
+
+        /** @return Exact live CUDA host allocations and registrations. */
+        std::unordered_map<void *, CUDAHostRegistrationRecord> &
+        cudaTrackedHostRegistrations()
+        {
+            static auto *registrations =
+                new std::unordered_map<void *, CUDAHostRegistrationRecord>();
+            return *registrations;
+        }
+
+        /**
+         * @brief Preserve the caller's exact CUDA device across backend work.
+         *
+         * Device-memory accounting is a lifecycle operation and may inspect a
+         * device other than the caller's current one.  Failing to restore the
+         * TLS current-device identity can make a later stream or library handle
+         * appear to belong to the wrong device, so restoration failure is
+         * terminal rather than a warning.
+         */
+        class CUDADeviceSaveRestore final
+        {
+        public:
+            /** @brief Capture the current CUDA device without changing it. */
+            CUDADeviceSaveRestore()
+            {
+                valid_ = cudaGetDevice(&saved_device_) == cudaSuccess &&
+                         saved_device_ >= 0;
+            }
+
+            /** @brief Restore the captured device or terminate on lost identity. */
+            ~CUDADeviceSaveRestore()
+            {
+                if (valid_ && cudaSetDevice(saved_device_) != cudaSuccess)
+                {
+                    (void)cudaGetLastError();
+                    LOG_ERROR(
+                        "[CUDABackend] Could not restore owning CUDA device "
+                        << saved_device_);
+                    std::terminate();
+                }
+            }
+
+            CUDADeviceSaveRestore(const CUDADeviceSaveRestore &) = delete;
+            CUDADeviceSaveRestore &operator=(const CUDADeviceSaveRestore &) = delete;
+
+            /** @return Whether an exact caller device was captured. */
+            [[nodiscard]] bool valid() const noexcept { return valid_; }
+
+        private:
+            int saved_device_ = -1; ///< Exact caller device restored at scope exit.
+            bool valid_ = false; ///< Guards against restoring an unknown identity.
+        };
 
         /** @return System-scope acquire load from a node-local mapped word. */
         __device__ __forceinline__ std::uint64_t mappedSystemAcquire64(
@@ -333,6 +425,8 @@ namespace llaminar2
         }
         penalty_buffers_.resize(
             static_cast<size_t>(std::max(device_count_, 0)));
+        runtime_generations_.assign(
+            static_cast<size_t>(std::max(device_count_, 0)), 1u);
     }
 
     CUDABackend::~CUDABackend()
@@ -682,6 +776,8 @@ namespace llaminar2
 
     void *CUDABackend::allocate(size_t bytes, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
         if (device_id >= device_count_ || device_id < 0)
         {
             LOG_ERROR("[CUDABackend] Invalid device ID " << device_id << " (max: " << device_count_ - 1 << ")");
@@ -696,35 +792,15 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Pre-allocation memory check: verify sufficient free VRAM before attempting cudaMalloc.
-        // This provides a graceful error with actionable diagnostics instead of a raw OOM crash.
-        {
-            size_t free_bytes = 0, total_bytes = 0;
-            cudaError_t mem_err = cudaMemGetInfo(&free_bytes, &total_bytes);
-            if (mem_err == cudaSuccess)
-            {
-                // Preserve the same terminal free-memory invariant priced by
-                // canonical capacity admission and model preflight.
-                if (bytes +
-                        gpu_allocation_policy::kMinimumFreeHeadroomBytes >
-                    free_bytes)
-                {
-                    double req_mb = bytes / (1024.0 * 1024.0);
-                    double free_mb = free_bytes / (1024.0 * 1024.0);
-                    double total_mb = total_bytes / (1024.0 * 1024.0);
-                    double used_mb = (total_bytes - free_bytes) / (1024.0 * 1024.0);
-                    LOG_ERROR("[CUDABackend] Insufficient GPU memory on device " << device_id
-                                                                                 << ": requested " << std::fixed << std::setprecision(1) << req_mb
-                                                                                 << " MB but only " << free_mb << " MB free ("
-                                                                                 << used_mb << " / " << total_mb << " MB used). "
-                                                                                 << "Try reducing context length (-c), using a smaller model, "
-                                                                                 << "or adding more GPUs for tensor parallelism.");
-                    return nullptr;
-                }
-            }
-        }
-
         void *ptr = nullptr;
+        /*
+         * cudaMemGetInfo describes driver-visible free memory, not every byte
+         * the process allocator can reuse after retiring graph-bound storage.
+         * Workload admission owns the complete BOM; cudaMalloc is the exact
+         * authority for this concrete allocation. Rejecting it first through
+         * a second free-byte heuristic can turn reusable allocator backing
+         * into a false OOM and makes CUDA diverge from the ROCm contract.
+         */
         err = cudaMalloc(&ptr, bytes);
         if (err != cudaSuccess)
         {
@@ -749,6 +825,12 @@ namespace llaminar2
         }
 
         LOG_TRACE("[CUDABackend::allocate] ALLOC ptr=" << ptr << " bytes=" << bytes << " device_id=" << device_id);
+        cudaTrackedDeviceAllocations().emplace(
+            ptr,
+            CUDADeviceAllocationRecord{
+                .bytes = bytes,
+                .device_id = device_id,
+            });
         if (vramBomEnabled())
         {
             size_t free_after = 0;
@@ -767,6 +849,8 @@ namespace llaminar2
 
     void CUDABackend::free(void *ptr, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
         if (ptr == nullptr)
         {
             return; // Freeing nullptr is a no-op
@@ -796,17 +880,21 @@ namespace llaminar2
             LOG_DEBUG("[CUDABackend] cudaFree failed for ptr=" << std::hex << ptr << std::dec
                                                                << " on device " << device_id << ": " << cudaGetErrorString(err));
         }
-        else if (vramBomEnabled())
+        else
         {
-            size_t free_after = 0;
-            size_t total_bytes = 0;
-            (void)cudaMemGetInfo(&free_after, &total_bytes);
-            logVramBomLine(
-                "backend_allocation",
-                "backend=cuda action=free device=" + std::to_string(device_id) +
-                    " ptr=" + bom_ptr +
-                    " free_after_bytes=" + std::to_string(free_after) +
-                    " total_bytes=" + std::to_string(total_bytes));
+            cudaTrackedDeviceAllocations().erase(ptr);
+            if (vramBomEnabled())
+            {
+                size_t free_after = 0;
+                size_t total_bytes = 0;
+                (void)cudaMemGetInfo(&free_after, &total_bytes);
+                logVramBomLine(
+                    "backend_allocation",
+                    "backend=cuda action=free device=" + std::to_string(device_id) +
+                        " ptr=" + bom_ptr +
+                        " free_after_bytes=" + std::to_string(free_after) +
+                        " total_bytes=" + std::to_string(total_bytes));
+            }
         }
     }
 
@@ -890,6 +978,8 @@ namespace llaminar2
 
     void *CUDABackend::allocateMapped(size_t bytes, int device_id, void **device_ptr)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
         if (device_id >= device_count_ || device_id < 0)
         {
             LOG_ERROR("[CUDABackend] Invalid device ID " << device_id << " for allocateMapped");
@@ -939,11 +1029,19 @@ namespace llaminar2
                                                        << ", device_ptr=" << *device_ptr);
         }
 
+        cudaTrackedHostRegistrations().emplace(
+            host_ptr,
+            CUDAHostRegistrationRecord{
+                .bytes = bytes,
+                .device_id = device_id,
+            });
         return host_ptr;
     }
 
     void CUDABackend::freeMapped(void *host_ptr, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
         if (host_ptr == nullptr)
         {
             return; // Freeing nullptr is a no-op
@@ -963,6 +1061,10 @@ namespace llaminar2
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend] cudaFreeHost failed: " << cudaGetErrorString(err));
+        }
+        else
+        {
+            cudaTrackedHostRegistrations().erase(host_ptr);
         }
     }
 
@@ -1021,9 +1123,17 @@ namespace llaminar2
             return 0;
         }
 
+        CUDADeviceSaveRestore device_guard;
+        if (!device_guard.valid())
+        {
+            (void)cudaGetLastError();
+            return 0;
+        }
+
         cudaError_t err_set = cudaSetDevice(device_id);
         if (err_set != cudaSuccess)
         {
+            (void)cudaGetLastError();
             return 0;
         }
 
@@ -1036,6 +1146,399 @@ namespace llaminar2
         }
 
         return free_bytes;
+    }
+
+    DeviceAllocationAccounting
+    CUDABackend::deviceAllocationAccounting(int device_id) const
+    {
+        DeviceAllocationAccounting accounting;
+        if (device_id < 0 || device_id >= device_count_)
+        {
+            accounting.diagnostic = "invalid CUDA device ordinal " +
+                                    std::to_string(device_id);
+            return accounting;
+        }
+
+        /* Allocation/free and generation reset take this same lock. The
+         * returned count and byte sum therefore describe one exact canonical
+         * allocator state rather than two observations that could straddle a
+         * concurrent ownership transition. */
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
+        for (const auto &[pointer, allocation] :
+             cudaTrackedDeviceAllocations())
+        {
+            (void)pointer;
+            if (allocation.device_id != device_id)
+                continue;
+            if (allocation.bytes >
+                std::numeric_limits<size_t>::max() - accounting.active_bytes)
+            {
+                accounting.diagnostic =
+                    "CUDA canonical allocation byte accounting overflow";
+                return accounting;
+            }
+            ++accounting.active_allocations;
+            accounting.active_bytes += allocation.bytes;
+        }
+        accounting.supported = true;
+        return accounting;
+    }
+
+    DeviceMemoryCacheReclamationResult
+    CUDABackend::trimUnusedDeviceMemoryCaches(int device_id)
+    {
+        DeviceMemoryCacheReclamationResult result;
+        if (device_id < 0 || device_id >= device_count_)
+        {
+            result.diagnostic = "invalid CUDA device ordinal " +
+                                std::to_string(device_id);
+            return result;
+        }
+
+        CUDADeviceSaveRestore device_guard;
+        if (!device_guard.valid())
+        {
+            (void)cudaGetLastError();
+            result.diagnostic =
+                "cudaGetDevice could not preserve the caller device identity";
+            return result;
+        }
+        const cudaError_t select_error = cudaSetDevice(device_id);
+        if (select_error != cudaSuccess)
+        {
+            result.diagnostic =
+                "cudaSetDevice failed for CUDA:" + std::to_string(device_id) +
+                ": " + cudaGetErrorString(select_error);
+            (void)cudaGetLastError();
+            return result;
+        }
+        result.supported = true;
+
+        cudaMemPool_t default_pool = nullptr;
+        bool default_pool_available = false;
+        const auto query_snapshot =
+            [&](DeviceMemoryCacheSnapshot &snapshot,
+                const char *phase) -> bool
+        {
+            size_t total_bytes = 0u;
+            cudaError_t error = cudaMemGetInfo(
+                &snapshot.driver_free_bytes, &total_bytes);
+            if (error != cudaSuccess)
+            {
+                result.diagnostic = std::string("cudaMemGetInfo failed ") +
+                                    phase + ": " + cudaGetErrorString(error);
+                (void)cudaGetLastError();
+                return false;
+            }
+
+            std::uint64_t graph_used = 0u;
+            std::uint64_t graph_reserved = 0u;
+            error = cudaDeviceGetGraphMemAttribute(
+                device_id, cudaGraphMemAttrUsedMemCurrent, &graph_used);
+            if (error == cudaSuccess)
+            {
+                error = cudaDeviceGetGraphMemAttribute(
+                    device_id,
+                    cudaGraphMemAttrReservedMemCurrent,
+                    &graph_reserved);
+            }
+            if (error != cudaSuccess)
+            {
+                result.diagnostic =
+                    std::string("CUDA graph-memory accounting failed ") +
+                    phase + ": " + cudaGetErrorString(error);
+                (void)cudaGetLastError();
+                return false;
+            }
+            snapshot.graph_accounting_available = true;
+            snapshot.graph_used_bytes = static_cast<size_t>(graph_used);
+            snapshot.graph_reserved_bytes =
+                static_cast<size_t>(graph_reserved);
+
+            if (!default_pool_available)
+            {
+                error = cudaDeviceGetDefaultMemPool(
+                    &default_pool, device_id);
+                if (error == cudaErrorNotSupported)
+                {
+                    (void)cudaGetLastError();
+                    return true;
+                }
+                if (error != cudaSuccess || default_pool == nullptr)
+                {
+                    result.diagnostic =
+                        std::string("CUDA default memory-pool resolution failed ") +
+                        phase + ": " + cudaGetErrorString(error);
+                    (void)cudaGetLastError();
+                    return false;
+                }
+                default_pool_available = true;
+            }
+
+            std::uint64_t pool_used = 0u;
+            std::uint64_t pool_reserved = 0u;
+            error = cudaMemPoolGetAttribute(
+                default_pool, cudaMemPoolAttrUsedMemCurrent, &pool_used);
+            if (error == cudaSuccess)
+            {
+                error = cudaMemPoolGetAttribute(
+                    default_pool,
+                    cudaMemPoolAttrReservedMemCurrent,
+                    &pool_reserved);
+            }
+            if (error != cudaSuccess)
+            {
+                result.diagnostic =
+                    std::string("CUDA default memory-pool accounting failed ") +
+                    phase + ": " + cudaGetErrorString(error);
+                (void)cudaGetLastError();
+                return false;
+            }
+            snapshot.async_pool_accounting_available = true;
+            snapshot.async_pool_used_bytes = static_cast<size_t>(pool_used);
+            snapshot.async_pool_reserved_bytes =
+                static_cast<size_t>(pool_reserved);
+            return true;
+        };
+
+        if (!query_snapshot(result.before, "before trim"))
+            return result;
+
+        const cudaError_t graph_trim_error =
+            cudaDeviceGraphMemTrim(device_id);
+        result.graph_trim_invoked = true;
+        if (graph_trim_error != cudaSuccess)
+        {
+            result.diagnostic =
+                "cudaDeviceGraphMemTrim failed for CUDA:" +
+                std::to_string(device_id) + ": " +
+                cudaGetErrorString(graph_trim_error);
+            (void)cudaGetLastError();
+            return result;
+        }
+
+        if (default_pool_available)
+        {
+            const cudaError_t pool_trim_error =
+                cudaMemPoolTrimTo(default_pool, 0u);
+            result.async_pool_trim_invoked = true;
+            if (pool_trim_error != cudaSuccess)
+            {
+                result.diagnostic =
+                    "cudaMemPoolTrimTo failed for CUDA:" +
+                    std::to_string(device_id) + ": " +
+                    cudaGetErrorString(pool_trim_error);
+                (void)cudaGetLastError();
+                return result;
+            }
+        }
+
+        if (!query_snapshot(result.after, "after trim"))
+            return result;
+
+        result.success = true;
+        return result;
+    }
+
+    DeviceRuntimeGenerationRetirementResult
+    CUDABackend::retireExclusiveDeviceRuntimeGeneration(
+        const DeviceRuntimeGenerationRetirementRequest &request)
+    {
+        DeviceRuntimeGenerationRetirementResult result;
+        result.supported = true;
+        const int device_id = request.deviceOrdinal();
+        if (device_id < 0 || device_id >= device_count_)
+        {
+            result.diagnostic = "invalid CUDA device ordinal " +
+                                std::to_string(device_id);
+            return result;
+        }
+
+        /*
+         * The lifecycle mutex is the reset exclusion edge for canonical
+         * backend allocations and registrations. Ordinary execution has
+         * already ended by construction of request; holding this lock makes a
+         * concurrent new owner fail to interleave allocation with preflight.
+         */
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
+
+        for (const auto &[pointer, allocation] :
+             cudaTrackedDeviceAllocations())
+        {
+            (void)pointer;
+            if (allocation.device_id == device_id)
+            {
+                ++result.tracked_device_allocations;
+                if (allocation.bytes >
+                    std::numeric_limits<size_t>::max() -
+                        result.tracked_device_allocation_bytes)
+                {
+                    result.diagnostic =
+                        "CUDA runtime-generation allocation byte accounting overflow";
+                    return result;
+                }
+                result.tracked_device_allocation_bytes += allocation.bytes;
+            }
+        }
+        result.tracked_host_registrations =
+            cudaTrackedHostRegistrations().size();
+        if (result.tracked_device_allocations != 0u ||
+            result.tracked_host_registrations != 0u)
+        {
+            std::ostringstream diagnostic;
+            diagnostic
+                << "CUDA runtime-generation retirement rejected: live "
+                << "tracked_device_allocations="
+                << result.tracked_device_allocations
+                << " tracked_device_allocation_bytes="
+                << result.tracked_device_allocation_bytes
+                << " tracked_host_registrations="
+                << result.tracked_host_registrations;
+            result.diagnostic = diagnostic.str();
+            return result;
+        }
+
+        {
+            std::lock_guard<std::mutex> generation_lock(
+                runtime_generation_mutex_);
+            result.retired_generation =
+                runtime_generations_[static_cast<size_t>(device_id)];
+            if (result.retired_generation == 0u ||
+                result.retired_generation ==
+                    std::numeric_limits<std::uint64_t>::max())
+            {
+                result.diagnostic =
+                    "CUDA runtime generation is invalid or exhausted";
+                return result;
+            }
+        }
+
+        int previous_device = -1;
+        cudaError_t error = cudaGetDevice(&previous_device);
+        if (error != cudaSuccess || previous_device < 0)
+        {
+            result.diagnostic =
+                "cudaGetDevice failed before runtime reset: " +
+                std::string(cudaGetErrorString(error));
+            (void)cudaGetLastError();
+            return result;
+        }
+        error = cudaSetDevice(device_id);
+        if (error != cudaSuccess)
+        {
+            result.diagnostic =
+                "cudaSetDevice failed before runtime reset: " +
+                std::string(cudaGetErrorString(error));
+            (void)cudaGetLastError();
+            return result;
+        }
+
+        size_t total_bytes = 0u;
+        error = cudaMemGetInfo(
+            &result.driver_free_bytes_before, &total_bytes);
+        if (error != cudaSuccess)
+        {
+            result.diagnostic =
+                "cudaMemGetInfo failed before runtime reset: " +
+                std::string(cudaGetErrorString(error));
+            (void)cudaGetLastError();
+            if (previous_device != device_id)
+                (void)cudaSetDevice(previous_device);
+            return result;
+        }
+
+        if (!llaminar2_retireCUDATensorValidatorRuntimeGeneration(device_id))
+        {
+            result.diagnostic =
+                "CUDA tensor-validator generation could not retire";
+            if (previous_device != device_id)
+                (void)cudaSetDevice(previous_device);
+            return result;
+        }
+
+        result.reset_invoked = true;
+        error = cudaDeviceReset();
+        if (error != cudaSuccess)
+        {
+            result.diagnostic = "cudaDeviceReset failed for CUDA:" +
+                                std::to_string(device_id) + ": " +
+                                cudaGetErrorString(error);
+            (void)cudaGetLastError();
+            if (previous_device != device_id)
+                (void)cudaSetDevice(previous_device);
+            return result;
+        }
+
+        /*
+         * Every pointer/event below belonged to the retired primary context.
+         * cudaDeviceReset destroyed the resources; clearing host identities is
+         * mandatory so lazy setup cannot reuse stale addresses or handles.
+         */
+        if (static_cast<size_t>(device_id) < argmax_buffers_.size())
+            argmax_buffers_[static_cast<size_t>(device_id)] = {};
+        if (static_cast<size_t>(device_id) < topk_buffers_.size())
+            topk_buffers_[static_cast<size_t>(device_id)] = {};
+        if (static_cast<size_t>(device_id) < sample_token_buffers_.size())
+            sample_token_buffers_[static_cast<size_t>(device_id)] = {};
+        if (static_cast<size_t>(device_id) < penalty_buffers_.size())
+            penalty_buffers_[static_cast<size_t>(device_id)] = {};
+
+        /* The native reset is already irrevocable. Publish its new identity
+         * before any diagnostic query so an error cannot leave host caches
+         * keyed to the retired generation. */
+        {
+            std::lock_guard<std::mutex> generation_lock(
+                runtime_generation_mutex_);
+            result.active_generation = result.retired_generation + 1u;
+            runtime_generations_[static_cast<size_t>(device_id)] =
+                result.active_generation;
+        }
+
+        error = cudaSetDevice(device_id);
+        if (error == cudaSuccess)
+        {
+            error = cudaMemGetInfo(
+                &result.driver_free_bytes_after, &total_bytes);
+        }
+        if (error != cudaSuccess)
+        {
+            result.diagnostic =
+                "CUDA runtime could not materialize the fresh generation: " +
+                std::string(cudaGetErrorString(error));
+            (void)cudaGetLastError();
+            if (previous_device != device_id &&
+                cudaSetDevice(previous_device) != cudaSuccess)
+            {
+                (void)cudaGetLastError();
+                std::terminate();
+            }
+            return result;
+        }
+
+        if (previous_device != device_id &&
+            cudaSetDevice(previous_device) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            LOG_ERROR(
+                "[CUDABackend] Failed to restore CUDA device "
+                << previous_device << " after retiring CUDA:" << device_id);
+            std::terminate();
+        }
+
+        result.success = true;
+        result.diagnostic = "CUDA runtime generation retired";
+        return result;
+    }
+
+    std::uint64_t CUDABackend::deviceRuntimeGeneration(
+        int device_id) const
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            return 0u;
+        std::lock_guard<std::mutex> lock(runtime_generation_mutex_);
+        return runtime_generations_[static_cast<size_t>(device_id)];
     }
 
     // ====================================================================
@@ -1125,6 +1628,8 @@ namespace llaminar2
 
     bool CUDABackend::pinHostMemory(void *ptr, size_t bytes, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
         int previous_device = -1;
         cudaError_t err = cudaGetDevice(&previous_device);
         if (!ptr || bytes == 0 || device_id < 0 ||
@@ -1163,11 +1668,19 @@ namespace llaminar2
             }
             std::terminate();
         }
+        cudaTrackedHostRegistrations().emplace(
+            ptr,
+            CUDAHostRegistrationRecord{
+                .bytes = bytes,
+                .device_id = device_id,
+            });
         return true;
     }
 
     bool CUDABackend::unpinHostMemory(void *ptr, int device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
         int previous_device = -1;
         cudaError_t err = cudaGetDevice(&previous_device);
         if (!ptr || device_id < 0 || err != cudaSuccess ||
@@ -1202,6 +1715,7 @@ namespace llaminar2
                       << device_id);
             std::terminate();
         }
+        cudaTrackedHostRegistrations().erase(ptr);
         return true;
     }
 
@@ -1210,6 +1724,8 @@ namespace llaminar2
         size_t bytes,
         int registration_device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
         if (!ptr || bytes == 0u || registration_device_id < 0 ||
             registration_device_id >= device_count_ ||
             cudaSetDevice(registration_device_id) != cudaSuccess)
@@ -1229,6 +1745,12 @@ namespace llaminar2
             (void)cudaGetLastError();
             return false;
         }
+        cudaTrackedHostRegistrations().emplace(
+            ptr,
+            CUDAHostRegistrationRecord{
+                .bytes = bytes,
+                .device_id = registration_device_id,
+            });
         return true;
     }
 
@@ -1263,6 +1785,8 @@ namespace llaminar2
         void *ptr,
         int registration_device_id)
     {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
         if (!ptr || registration_device_id < 0 ||
             registration_device_id >= device_count_ ||
             cudaSetDevice(registration_device_id) != cudaSuccess)
@@ -1277,6 +1801,7 @@ namespace llaminar2
             (void)cudaGetLastError();
             return false;
         }
+        cudaTrackedHostRegistrations().erase(ptr);
         return true;
     }
 
@@ -5190,7 +5715,16 @@ namespace llaminar2
 
     void *CUDABackend::allocatePinned(size_t bytes, int device_id)
     {
-        (void)device_id;
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
+        if (device_id < 0 || device_id >= device_count_ ||
+            cudaSetDevice(device_id) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            LOG_ERROR("[CUDABackend::allocatePinned] invalid CUDA device "
+                      << device_id);
+            return nullptr;
+        }
         void *ptr = nullptr;
         cudaError_t err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
         if (err != cudaSuccess)
@@ -5199,14 +5733,38 @@ namespace llaminar2
                       << ") failed: " << cudaGetErrorString(err));
             return nullptr;
         }
+        cudaTrackedHostRegistrations().emplace(
+            ptr,
+            CUDAHostRegistrationRecord{
+                .bytes = bytes,
+                .device_id = device_id,
+            });
         return ptr;
     }
 
     void CUDABackend::freePinned(void *ptr, int device_id)
     {
-        (void)device_id;
-        if (ptr)
-            CUDA_WARN_IF_FAIL(cudaFreeHost(ptr));
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
+        if (!ptr)
+            return;
+        if (device_id < 0 || device_id >= device_count_ ||
+            cudaSetDevice(device_id) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            LOG_ERROR("[CUDABackend::freePinned] invalid CUDA device "
+                      << device_id << " for ptr=" << ptr);
+            return;
+        }
+        const cudaError_t error = cudaFreeHost(ptr);
+        if (error != cudaSuccess)
+        {
+            LOG_WARN("[CUDABackend::freePinned] cudaFreeHost failed for ptr="
+                     << ptr << ": " << cudaGetErrorString(error));
+            (void)cudaGetLastError();
+            return;
+        }
+        cudaTrackedHostRegistrations().erase(ptr);
     }
 
     // ====================================================================

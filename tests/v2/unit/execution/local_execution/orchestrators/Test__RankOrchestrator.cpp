@@ -15,6 +15,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/local_execution/orchestrators/PipelineGraphExecutionPlan.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/debug/TPSnapshot.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
@@ -1155,6 +1156,15 @@ public:
         return device_id_;
     }
 
+    ServingGraphPreparationKind
+    servingGraphPreparationKind() const noexcept override
+    {
+        return device_id_.is_gpu()
+                   ? ServingGraphPreparationKind::
+                         NativeDeviceExecutableFamily
+                   : ServingGraphPreparationKind::EagerHostGraph;
+    }
+
     int vocab_size() const override
     {
         return config_.vocab_size;
@@ -2057,9 +2067,13 @@ public:
         return prefix_populate_ok_;
     }
 
-    bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override
+    bool harvestPrefix(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        int prompt_token_count) override
     {
         ++prefix_harvest_calls_;
+        harvested_prefix_admission_fingerprint_ = admission.fingerprint_key;
         harvested_prefix_tokens_ = tokens;
         harvested_prompt_token_count_ = prompt_token_count;
         return prefix_harvest_ok_;
@@ -2888,6 +2902,7 @@ private:
     size_t prefix_harvest_calls_ = 0;
     size_t prefix_terminal_restore_calls_ = 0;
     int harvested_prompt_token_count_ = 0;
+    uint64_t harvested_prefix_admission_fingerprint_ = 0;
     std::vector<int> populated_prefix_tokens_;
     std::vector<bool> populated_prefix_restore_model_runtime_state_;
     std::vector<int> terminal_restored_tokens_;
@@ -3400,6 +3415,83 @@ private:
     mutable std::atomic<size_t> collective_sideband_calls_{0};
     mutable std::atomic<size_t> collective_sideband_broadcasts_{0};
 };
+
+TEST(PipelineGraphExecutionPlanTest,
+     HeterogeneousPlanRequiresExactMaterializationAndReplayTraversal)
+{
+    PipelineGraphExecutionPlan plan(
+        std::vector<PipelineGraphExecutionSegment>{
+            {.stage_index = 0u,
+             .primary_device = DeviceId::cuda(0),
+             .execution = PipelineGraphSegmentExecution::
+                 NativeDeviceExecutable},
+            {.stage_index = 1u,
+             .primary_device = DeviceId::cpu(),
+             .execution =
+                 PipelineGraphSegmentExecution::HostDeclarative},
+        });
+
+    EXPECT_TRUE(plan.hasHeterogeneousBoundary());
+    EXPECT_EQ(plan.segmentCount(), 2u);
+    EXPECT_EQ(plan.nativeSegmentCount(), 1u);
+    EXPECT_EQ(plan.hostSegmentCount(), 1u);
+
+    std::string error;
+    EXPECT_FALSE(plan.certifiesReplay(2u, &error));
+    EXPECT_THAT(error, ::testing::HasSubstr("preceded"));
+    EXPECT_FALSE(plan.markMaterialized(0u, &error));
+    EXPECT_THAT(error, ::testing::HasSubstr("requires 1"));
+    EXPECT_TRUE(plan.markMaterialized(1u, &error)) << error;
+    EXPECT_TRUE(plan.certifiesReplay(2u, &error)) << error;
+    EXPECT_FALSE(plan.certifiesReplay(1u, &error));
+    EXPECT_THAT(error, ::testing::HasSubstr("requires 2"));
+}
+
+TEST(PipelineGraphExecutionPlanTest,
+     SameBackendGpuOrdinalsDoNotClaimHeterogeneousSegmentation)
+{
+    PipelineGraphExecutionPlan plan(
+        std::vector<PipelineGraphExecutionSegment>{
+            {.stage_index = 0u,
+             .primary_device = DeviceId::cuda(0),
+             .execution = PipelineGraphSegmentExecution::
+                 NativeDeviceExecutable},
+            {.stage_index = 1u,
+             .primary_device = DeviceId::cuda(1),
+             .execution = PipelineGraphSegmentExecution::
+                 NativeDeviceExecutable},
+        });
+
+    EXPECT_FALSE(plan.hasHeterogeneousBoundary());
+    EXPECT_EQ(plan.nativeSegmentCount(), 2u);
+    std::string error;
+    EXPECT_TRUE(plan.markMaterialized(2u, &error)) << error;
+    EXPECT_TRUE(plan.certifiesReplay(2u, &error)) << error;
+}
+
+TEST(PipelineGraphExecutionPlanTest,
+     RejectsNonContiguousCoordinatesAndOwnerKindMismatch)
+{
+    EXPECT_THROW(
+        PipelineGraphExecutionPlan(
+            std::vector<PipelineGraphExecutionSegment>{
+                {.stage_index = 1u,
+                 .primary_device = DeviceId::cpu(),
+                 .execution =
+                     PipelineGraphSegmentExecution::HostDeclarative},
+            }),
+        std::invalid_argument);
+
+    EXPECT_THROW(
+        PipelineGraphExecutionPlan(
+            std::vector<PipelineGraphExecutionSegment>{
+                {.stage_index = 0u,
+                 .primary_device = DeviceId::cuda(0),
+                 .execution =
+                     PipelineGraphSegmentExecution::HostDeclarative},
+            }),
+        std::invalid_argument);
+}
 
 // =============================================================================
 // Test Fixture
@@ -4793,14 +4885,59 @@ TEST_F(
     EXPECT_NE(
         method.find("runner_->materializeServingGraphFamilyWithoutLaunch"),
         std::string::npos);
-    EXPECT_NE(
+    EXPECT_EQ(
         method.find(
             "preparation_kind ==\n"
-            "                ServingGraphPreparationKind::NativeDeviceExecutableFamily"),
+            "                ServingGraphPreparationKind::NativeDeviceExecutableFamily &&"),
         std::string::npos)
-        << "Only native device families may enter GPU graph materialization.";
+        << "Preparation kind selects runner-owned work; it must not bypass the common serving-family admission transition.";
+    EXPECT_NE(
+        method.find(
+            "if (!runner_->materializeServingGraphFamilyWithoutLaunch(family_plan))"),
+        std::string::npos)
+        << "Both eager CPU followers and native GPU runners must seal their serving family before ticket admission.";
     EXPECT_NE(method.find("\"rank_local\""), std::string::npos)
         << "PerfStats must identify the rank-local setup path.";
+}
+
+/**
+ * @brief Rank-local sparse participants share a typed request identity.
+ *
+ * A one-rank heterogeneous overlay still crosses manual GPU/CPU sparse graph
+ * boundaries. Skipping generation publication for MPI world size one leaves
+ * those production stages without execution semantics during first capture.
+ */
+TEST_F(
+    Test__RankOrchestrator,
+    RankLocalExpertOverlayPublishesCollectiveRequestGeneration)
+{
+    const std::string source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto begin = source.find(
+        "bool OrchestrationRunner::publishMoEOverlayCollectiveRequestGeneration");
+    const auto end = source.find(
+        "bool OrchestrationRunner::advanceMoEOverlayCollectiveRequestGeneration",
+        begin);
+    ASSERT_NE(begin, std::string::npos);
+    ASSERT_NE(end, std::string::npos);
+    const std::string method = source.substr(begin, end - begin);
+
+    EXPECT_EQ(method.find("world_size() <= 1"), std::string::npos)
+        << "Rank-local ExpertOverlay must publish the same typed generation as a distributed overlay.";
+    EXPECT_NE(
+        method.find("runner_->setMoEOverlayCollectiveRequestGeneration"),
+        std::string::npos);
+    EXPECT_NE(
+        method.find("rank_local_continuation_runner"),
+        std::string::npos)
+        << "PerfStats must identify the rank-local generation authority.";
+    EXPECT_NE(
+        method.find("if (overlay_context->world_size() > 1)"),
+        std::string::npos)
+        << "Only cross-rank publication should enter the MPI broadcast.";
 }
 
 TEST_F(Test__RankOrchestrator, RequestResetCannotPublishOrDiscardExpertPlacement)
@@ -9405,35 +9542,64 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeTreatsDenseOutputsAsRe
               (std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f}));
 }
 
-TEST_F(Test__RankOrchestrator, TPSnapshot_RuntimeGQAOverrideTreatsKVCacheAsReplicated)
+/**
+ * @brief Replicated GQA owns one complete K/V checkpoint, not one per TP device.
+ *
+ * The Qwen3.5 122B topology has two KV heads and may use four TP participants.
+ * Production therefore replicates K/V while continuing to shard Q by query
+ * head. Exercise every semantic K/V lifetime boundary so a newly added stage
+ * cannot silently reintroduce TP-degree multiplication in parity artifacts.
+ */
+TEST_F(
+    Test__RankOrchestrator,
+    TPSnapshot_RuntimeGQAOverrideTreatsEveryKVCheckpointAsReplicated)
 {
-    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
-    auto *runner0_ptr = runner0.get();
-    runner0_ptr->set_mock_snapshot(
-        "layer3_KV_CACHE_K",
-        1,
-        4,
-        {1.0f, 2.0f, 3.0f, 4.0f});
-
-    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
-    auto *runner1_ptr = runner1.get();
-    runner1_ptr->set_mock_snapshot(
-        "layer3_KV_CACHE_K",
-        1,
-        4,
-        {1.0f, 2.0f, 3.0f, 4.0f});
+    static constexpr std::array<std::string_view, 10>
+        kReplicatedKVStageTypes = {
+            "K_PROJECTION",
+            "V_PROJECTION",
+            "K_NORM",
+            "K_ROPE",
+            "KV_APPEND_SOURCE_K",
+            "KV_APPEND_SOURCE_V",
+            "KV_CACHE_K",
+            "KV_CACHE_V",
+            "ATTENTION_EFFECTIVE_K",
+            "ATTENTION_EFFECTIVE_V",
+        };
+    const std::vector<float> replica = {1.0f, 2.0f, 3.0f, 4.0f};
 
     std::vector<std::unique_ptr<IInferenceRunner>> runners;
-    runners.push_back(std::move(runner0));
-    runners.push_back(std::move(runner1));
+    for (int participant = 0; participant < 4; ++participant)
+    {
+        auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
+        for (const std::string_view stage_type : kReplicatedKVStageTypes)
+        {
+            runner->set_mock_snapshot(
+                "layer3_" + std::string(stage_type),
+                1,
+                replica.size(),
+                replica);
+        }
+        runner->set_mock_snapshot(
+            "MTP0_K_NORM", 1, replica.size(), replica);
+        runner->set_mock_snapshot(
+            "layer3_Q_NORM", 1, replica.size(), replica);
+        runners.push_back(std::move(runner));
+    }
 
     auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
     model_ctx->setArchitecture("qwen35moe");
-    model_ctx->setHeadCountKV(1);
+    model_ctx->setHeadCountKV(2);
 
     RankOrchestrator::Config rank_config;
-    rank_config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
-    rank_config.weights = {0.5f, 0.5f};
+    rank_config.devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1),
+        GlobalDeviceAddress::cuda(2),
+        GlobalDeviceAddress::cuda(3),
+    };
+    rank_config.weights = {0.25f, 0.25f, 0.25f, 0.25f};
 
     MockLocalTPContext::Config tp_config;
     tp_config.devices = rank_config.devices;
@@ -9445,13 +9611,31 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_RuntimeGQAOverrideTreatsKVCacheAsRepli
         std::make_unique<MockLocalTPContext>(tp_config),
         rank_config);
 
-    auto snapshot = orchestrator->getTPSnapshot("layer3_KV_CACHE_K");
-    EXPECT_EQ(snapshot.mode, SnapshotShardingMode::REPLICATED);
-    ASSERT_TRUE(snapshot.computeCombined());
-    EXPECT_EQ(snapshot.combined_rows, 1);
-    EXPECT_EQ(snapshot.combined_cols, 4);
-    EXPECT_EQ(snapshot.combined_data,
-              (std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f}));
+    for (const std::string_view stage_type : kReplicatedKVStageTypes)
+    {
+        const std::string key = "layer3_" + std::string(stage_type);
+        SCOPED_TRACE(key);
+        auto snapshot = orchestrator->getTPSnapshot(key);
+        EXPECT_EQ(snapshot.mode, SnapshotShardingMode::REPLICATED);
+        EXPECT_EQ(snapshot.device_data.size(), 4u);
+        ASSERT_TRUE(snapshot.computeCombined());
+        EXPECT_EQ(snapshot.combined_rows, 1u);
+        EXPECT_EQ(snapshot.combined_cols, replica.size());
+        EXPECT_EQ(snapshot.combined_data, replica)
+            << "A replicated checkpoint must contribute exactly once";
+    }
+
+    auto mtp_k_norm = orchestrator->getTPSnapshot("MTP0_K_NORM");
+    EXPECT_EQ(mtp_k_norm.mode, SnapshotShardingMode::REPLICATED)
+        << "MTP qualifiers must retain the runtime K/V layout";
+    ASSERT_TRUE(mtp_k_norm.computeCombined());
+    EXPECT_EQ(mtp_k_norm.combined_data, replica);
+
+    auto q_norm = orchestrator->getTPSnapshot("layer3_Q_NORM");
+    EXPECT_EQ(q_norm.mode, SnapshotShardingMode::COLUMN_PARALLEL)
+        << "Replicated GQA must not change query-head sharding";
+    ASSERT_TRUE(q_norm.computeCombined());
+    EXPECT_EQ(q_norm.combined_cols, replica.size() * 4u);
 }
 
 TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutputReplicated)

@@ -12,6 +12,7 @@
 
 #include "MoEExpertOverlayRuntimePlan.h"
 #include "execution/compute_stages/stages/MoEExpertDispatchStage.h"
+#include "utils/Assertions.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
@@ -22,19 +23,62 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <system_error>
+#include <tuple>
 #include <utility>
 
 namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Topology-bounded identity for one aggregate profiler row.
+         *
+         * Request, token, transaction, and generation ids are intentionally
+         * absent. Adding any of them would make diagnostic work grow with the
+         * decode horizon and perturb the production path being measured.
+         */
+        struct ProfileKey
+        {
+            std::string phase;
+            int layer = -1;
+            int tier_index = -1;
+            int participant_id = -1;
+            int source_participant = -1;
+            int target_participant = -1;
+            std::string domain;
+
+            /** @brief Order keys for deterministic map-backed aggregation. */
+            bool operator<(const ProfileKey &other) const
+            {
+                return std::tie(
+                           phase,
+                           layer,
+                           tier_index,
+                           participant_id,
+                           source_participant,
+                           target_participant,
+                           domain) <
+                       std::tie(
+                           other.phase,
+                           other.layer,
+                           other.tier_index,
+                           other.participant_id,
+                           other.source_participant,
+                           other.target_participant,
+                           other.domain);
+            }
+        };
+
         struct ProfilerState
         {
             std::mutex mutex;
             std::vector<MoEExpertOverlayProfileRow> rows;
+            std::map<ProfileKey, size_t> row_index;
             size_t version = 0;
             size_t printed_version = 0;
             size_t csv_version = 0;
@@ -46,19 +90,18 @@ namespace llaminar2
             return instance;
         }
 
-        /**
-         * @brief Decide whether two observations can be safely accumulated.
-         *
-         * Participant identity is part of this key because two NUMA CPU
-         * endpoints can share a device descriptor while owning different
-         * expert ranges.
-         */
-        bool sameKey(const MoEExpertOverlayProfileRow &lhs, const MoEExpertOverlayProfileRow &rhs)
+        /** @brief Build the bounded lookup key for one aggregate row. */
+        ProfileKey profileKey(const MoEExpertOverlayProfileRow &row)
         {
-            return lhs.phase == rhs.phase && lhs.layer == rhs.layer &&
-                   lhs.tier_index == rhs.tier_index &&
-                   lhs.participant_id == rhs.participant_id &&
-                   lhs.domain == rhs.domain;
+            return ProfileKey{
+                .phase = row.phase,
+                .layer = row.layer,
+                .tier_index = row.tier_index,
+                .participant_id = row.participant_id,
+                .source_participant = row.source_participant,
+                .target_participant = row.target_participant,
+                .domain = row.domain,
+            };
         }
 
         void mergeTextField(std::string &target, const std::string &value)
@@ -91,7 +134,17 @@ namespace llaminar2
             target.domain_reduce_ms += row.domain_reduce_ms;
             target.cross_domain_reduce_ms += row.cross_domain_reduce_ms;
             target.participant_count = std::max(target.participant_count, row.participant_count);
-            mergeTextField(target.executed_experts, row.executed_experts);
+            std::vector<int> expert_union;
+            expert_union.reserve(
+                target.observed_expert_ids.size() +
+                row.observed_expert_ids.size());
+            std::set_union(
+                target.observed_expert_ids.begin(),
+                target.observed_expert_ids.end(),
+                row.observed_expert_ids.begin(),
+                row.observed_expert_ids.end(),
+                std::back_inserter(expert_union));
+            target.observed_expert_ids = std::move(expert_union);
             mergeTextField(target.transport_mode, row.transport_mode);
             mergeTextField(target.final_reduce_mode, row.final_reduce_mode);
             mergeTextField(target.accumulation_path, row.accumulation_path);
@@ -146,6 +199,13 @@ namespace llaminar2
             return out.str();
         }
 
+        /** @brief Render a stable device label for one logical sparse edge. */
+        std::string participantEdgeKey(const MoEOverlayProfileEdge &edge)
+        {
+            return "p" + std::to_string(edge.source_participant) + "->p" +
+                   std::to_string(edge.target_participant);
+        }
+
         int countAssignedExperts(const RoutedExpertLayerPlacement &placement, int tier_index)
         {
             return static_cast<int>(std::count(
@@ -161,12 +221,31 @@ namespace llaminar2
             return static_cast<uint64_t>(ms * 1.0e6);
         }
 
+        /** @brief Convert typed endpoint phase to its stable CSV spelling. */
+        const char *endpointPhaseName(MoEOverlayEndpointPhase phase) noexcept
+        {
+            switch (phase)
+            {
+            case MoEOverlayEndpointPhase::Decode:
+                return "decode";
+            case MoEOverlayEndpointPhase::Prefill:
+                return "prefill";
+            case MoEOverlayEndpointPhase::GroupedVerifier:
+                return "grouped_verifier";
+            case MoEOverlayEndpointPhase::SyntheticTest:
+                return "synthetic_test";
+            }
+            return "invalid";
+        }
+
         PerfStatsCollector::Tags unifiedTagsForRow(const MoEExpertOverlayProfileRow &row)
         {
             PerfStatsCollector::Tags tags{
                 {"layer", std::to_string(row.layer)},
                 {"tier", std::to_string(row.tier_index)},
                 {"participant", std::to_string(row.participant_id)},
+                {"source_participant", std::to_string(row.source_participant)},
+                {"target_participant", std::to_string(row.target_participant)},
                 {"domain", row.domain},
                 {"domain_kind", row.domain_kind},
                 {"backend", row.backend},
@@ -175,8 +254,6 @@ namespace llaminar2
             };
             if (!row.final_reduce_mode.empty() && row.final_reduce_mode != "unknown")
                 tags.emplace("final_reduce", row.final_reduce_mode);
-            if (!row.executed_experts.empty() && row.executed_experts != "unknown")
-                tags.emplace("experts", row.executed_experts);
             return tags;
         }
 
@@ -217,7 +294,7 @@ namespace llaminar2
 
         void recordUnified(const MoEExpertOverlayProfileRow &row)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled("moe_overlay"))
                 return;
 
             const auto tags = unifiedTagsForRow(row);
@@ -251,7 +328,7 @@ namespace llaminar2
         return env.profile.enabled ||
                env.moe_expert_overlay.trace ||
                env.moe_expert_overlay.profile_csv_enabled ||
-               PerfStatsCollector::isEnabled();
+               PerfStatsCollector::isDomainEnabled("moe_overlay");
     }
 
     bool MoEExpertOverlayProfiler::shouldPrintSummary()
@@ -265,6 +342,7 @@ namespace llaminar2
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         s.rows.clear();
+        s.row_index.clear();
         ++s.version;
         s.printed_version = 0;
         s.csv_version = 0;
@@ -276,17 +354,26 @@ namespace llaminar2
             row.phase = "unknown";
         if (row.domain.empty())
             row.domain = "unknown";
+        std::sort(row.observed_expert_ids.begin(), row.observed_expert_ids.end());
+        row.observed_expert_ids.erase(
+            std::unique(
+                row.observed_expert_ids.begin(),
+                row.observed_expert_ids.end()),
+            row.observed_expert_ids.end());
 
         recordUnified(row);
 
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
-        auto existing = std::find_if(s.rows.begin(), s.rows.end(), [&](const auto &candidate)
-                                     { return sameKey(candidate, row); });
-        if (existing != s.rows.end())
-            mergeRow(*existing, row);
+        ProfileKey key = profileKey(row);
+        const auto existing = s.row_index.find(key);
+        if (existing != s.row_index.end())
+            mergeRow(s.rows[existing->second], row);
         else
+        {
+            s.row_index.emplace(std::move(key), s.rows.size());
             s.rows.push_back(std::move(row));
+        }
         ++s.version;
     }
 
@@ -294,7 +381,10 @@ namespace llaminar2
     {
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
-        return s.rows;
+        auto snapshot = s.rows;
+        for (auto &row : snapshot)
+            row.executed_experts = joinInts(row.observed_expert_ids);
+        return snapshot;
     }
 
     std::string MoEExpertOverlayProfiler::renderSummary()
@@ -306,7 +396,8 @@ namespace llaminar2
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
         table << fort::header
-              << "Phase" << "Layer" << "Tier" << "Participant" << "Domain" << "Kind" << "Backend"
+              << "Phase" << "Layer" << "Tier" << "Participant" << "Source" << "Target"
+              << "Domain" << "Kind" << "Backend"
               << "Assigned" << "Resident" << "Routed" << "Active routes" << "Rows" << "Bytes"
               << "Compute ms" << "Local reduce ms" << "Final reduce ms"
               << "Participants" << "Transport" << "Accumulation"
@@ -320,6 +411,8 @@ namespace llaminar2
                   << row.layer
                   << row.tier_index
                   << row.participant_id
+                  << row.source_participant
+                  << row.target_participant
                   << row.domain
                   << row.domain_kind
                   << row.backend
@@ -356,7 +449,8 @@ namespace llaminar2
     {
         const auto snapshot = rows();
         std::ostringstream out;
-        out << "phase,layer,tier_index,participant_id,domain,domain_kind,backend,assigned_experts,resident_experts,"
+        out << "phase,layer,tier_index,participant_id,source_participant,target_participant,"
+            << "domain,domain_kind,backend,assigned_experts,resident_experts,"
             << "routed_entries,active_routes,selected_rows,transfer_bytes,outbound_bytes,return_bytes,"
             << "compute_ms,domain_reduce_ms,cross_domain_reduce_ms,participant_count,"
             << "executed_experts,transport_mode,final_reduce_mode,accumulation_path,"
@@ -369,6 +463,8 @@ namespace llaminar2
                 << row.layer << ','
                 << row.tier_index << ','
                 << row.participant_id << ','
+                << row.source_participant << ','
+                << row.target_participant << ','
                 << csvEscape(row.domain) << ','
                 << csvEscape(row.domain_kind) << ','
                 << csvEscape(row.backend) << ','
@@ -465,6 +561,65 @@ namespace llaminar2
         }
     }
 
+    void MoEExpertOverlayProfiler::recordEndpointPacket(
+        const MoEOverlayEndpointIdentity &identity,
+        const MoEOverlayEndpointTimings &timings)
+    {
+        if (!PerfStatsCollector::isDomainEnabled("moe_overlay_endpoint"))
+            return;
+
+        LLAMINAR_ASSERTF(
+            identity.valid(),
+            "Sparse endpoint telemetry requires complete topology and graph-family identity");
+        LLAMINAR_ASSERTF(
+            timings.valid(),
+            "Sparse endpoint telemetry requires positive complete timing intervals");
+
+        /*
+         * Only graph/topology dimensions belong in the key. Payload totals,
+         * routed expert unions, and residency movement are already aggregated
+         * by their dedicated bounded evidence families. Keeping them out of
+         * this map makes the cost of a long decode independent of token count.
+         */
+        const PerfStatsCollector::Tags tags{
+            {"layer", std::to_string(identity.layer)},
+            {"participant", std::to_string(identity.participant_id)},
+            {"row_capacity", std::to_string(identity.row_capacity)},
+            {"route_width", std::to_string(identity.route_width)},
+            {"tier", std::to_string(identity.tier_index)},
+        };
+        const std::string phase = endpointPhaseName(identity.phase);
+        const auto record = [&](const char *name, std::uint64_t duration_ns)
+        {
+            PerfStatsCollector::recordTimingNs(
+                "moe_overlay_endpoint",
+                name,
+                duration_ns,
+                phase,
+                identity.device,
+                tags);
+        };
+
+        record("packet_service", timings.packet_service_ns);
+        record(
+            "route_validation_and_compaction",
+            timings.route_validation_and_compaction_ns);
+        record(
+            "stage_setup_and_transfers",
+            timings.stage_setup_and_transfers_ns);
+        record("compute_submission", timings.compute_submission_ns);
+        record("output_materialization", timings.output_materialization_ns);
+        if (timings.canonical_route_preweight_and_publication_ns)
+        {
+            record(
+                "canonical_route_preweight_and_publication",
+                *timings.canonical_route_preweight_and_publication_ns);
+        }
+        record(
+            "return_validation_and_aggregation",
+            timings.return_validation_and_aggregation_ns);
+    }
+
     void MoEExpertOverlayProfiler::recordDispatch(
         int layer,
         const MoEExpertDispatchOutput &output,
@@ -518,9 +673,7 @@ namespace llaminar2
     void MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
         int layer,
         int tier_index,
-        const std::string &domain_key,
-        int source_participant,
-        int target_participant,
+        MoEOverlayProfileEdge edge,
         size_t outbound_rows,
         size_t outbound_entries,
         size_t inbound_rows,
@@ -530,12 +683,17 @@ namespace llaminar2
     {
         if (!isEnabled())
             return;
+        LLAMINAR_ASSERTF(
+            edge.source_participant >= 0 && edge.target_participant >= 0,
+            "Graph-native sparse dispatch profiling requires non-negative participant endpoints");
 
         MoEExpertOverlayProfileRow row;
         row.phase = "gn_sparse_dispatch";
         row.layer = layer;
         row.tier_index = tier_index;
-        row.domain = domain_key.empty() ? "unknown" : domain_key;
+        row.source_participant = edge.source_participant;
+        row.target_participant = edge.target_participant;
+        row.domain = participantEdgeKey(edge);
         row.participant_count = 2;
         row.selected_rows = outbound_rows;
         row.inbound_rows = inbound_rows;
@@ -548,7 +706,10 @@ namespace llaminar2
                                       : 0;
         row.domain_reduce_ms = wait_ms;
         row.transport_mode = "compact";
-        row.accumulation_path = source_participant == target_participant ? "local" : "remote";
+        row.accumulation_path =
+            edge.source_participant == edge.target_participant
+                ? "local"
+                : "remote";
         recordRow(std::move(row));
     }
 
@@ -590,7 +751,7 @@ namespace llaminar2
         row.transport_mode = "local";
         row.cpu_fallback_rows = is_cpu ? output_rows : 0;
         row.gpu_cached_rows = is_cpu ? 0 : output_rows;
-        row.executed_experts = joinInts(std::move(unique_expert_ids));
+        row.observed_expert_ids = std::move(unique_expert_ids);
         row.accumulation_path = is_cpu ? "CPU" : "GPU";
         recordRow(std::move(row));
     }
@@ -598,9 +759,7 @@ namespace llaminar2
     void MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
         int layer,
         int tier_index,
-        const std::string &domain_key,
-        int source_participant,
-        int target_participant,
+        MoEOverlayProfileEdge edge,
         size_t outbound_rows,
         size_t inbound_rows,
         size_t compact_return_bytes,
@@ -611,12 +770,17 @@ namespace llaminar2
     {
         if (!isEnabled())
             return;
+        LLAMINAR_ASSERTF(
+            edge.source_participant >= 0 && edge.target_participant >= 0,
+            "Graph-native return profiling requires non-negative participant endpoints");
 
         MoEExpertOverlayProfileRow row;
         row.phase = "gn_return_reduce";
         row.layer = layer;
         row.tier_index = tier_index;
-        row.domain = domain_key.empty() ? "unknown" : domain_key;
+        row.source_participant = edge.source_participant;
+        row.target_participant = edge.target_participant;
+        row.domain = participantEdgeKey(edge);
         row.participant_count = 2;
         row.selected_rows = inbound_rows;
         row.inbound_rows = inbound_rows;
@@ -631,7 +795,10 @@ namespace llaminar2
         row.scatter_ms = scatter_ms;
         row.import_broadcast_ms = import_broadcast_ms;
         row.transport_mode = "compact";
-        row.accumulation_path = source_participant == target_participant ? "local" : "remote";
+        row.accumulation_path =
+            edge.source_participant == edge.target_participant
+                ? "local"
+                : "remote";
         recordRow(std::move(row));
     }
 

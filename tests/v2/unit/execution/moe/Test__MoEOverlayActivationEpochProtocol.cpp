@@ -144,7 +144,7 @@ namespace llaminar2::test
     TEST(Test__MoEOverlayActivationEpochProtocol,
          FixedABIAndTwoBanksPreservePipelinedRoundTripsAcrossReset)
     {
-        EXPECT_EQ(kMoEOverlayActivationABIVersion, 4u);
+        EXPECT_EQ(kMoEOverlayActivationABIVersion, 5u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEndpointStatus), 128u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEpochControl), 1152u);
         EXPECT_EQ(alignof(MoEOverlayActivationEpochControl), 64u);
@@ -170,7 +170,7 @@ namespace llaminar2::test
         const auto armed = protocol.arm(
             makeTicket(config),
             /*epoch_generation=*/1u,
-            /*deadline_ns=*/10'000u,
+            /*timeout_not_before_ns=*/10'000u,
             &error);
         ASSERT_TRUE(armed.has_value()) << error;
         EXPECT_EQ(armed->digest, moeOverlayActivationIdentityDigest(*armed));

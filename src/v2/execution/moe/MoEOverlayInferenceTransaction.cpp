@@ -205,7 +205,7 @@ namespace llaminar2
         const IModelLoader &loader,
         const std::string &architecture,
         int raw_layer_count,
-        bool mtp_enabled,
+        MoEOverlayMTPGraphFamilyPolicy mtp_policy,
         std::uint64_t graph_family_generation,
         int max_graph_rows,
         int max_decode_rows,
@@ -221,7 +221,8 @@ namespace llaminar2
         family.max_request_count = max_request_count;
         family.max_mtp_draft_depth = max_mtp_draft_depth;
 
-        if (mtp_enabled)
+        if (mtp_policy ==
+            MoEOverlayMTPGraphFamilyPolicy::RetainModelSidecars)
         {
             const MTPWeightManifest manifest = discoverMTPWeightManifest(
                 loader,

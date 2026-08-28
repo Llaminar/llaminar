@@ -506,8 +506,8 @@ namespace llaminar2
             }
             if (total > 0)
             {
-                LOG_DEBUG("[ModelLoader] Advised DONTNEED on mmap regions ("
-                          << (total / (1024 * 1024)) << " MB) — pages reclaimable by OS");
+                LOG_DEBUG("[ModelLoader] Advised DONTNEED on durable mmap regions ("
+                          << (total / (1024 * 1024)) << " MB)");
             }
             return total;
         }

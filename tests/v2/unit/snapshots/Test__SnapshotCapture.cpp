@@ -255,7 +255,7 @@ TEST(Test__SnapshotCapture_KeyConversion,
         "layer0_moe_expert_ffn_overlay_fast", route_dump);
     EXPECT_EQ(route_keys,
               std::vector<std::string>{
-                  "layer0_MOE_CANONICAL_ROUTE_CONTRIBUTIONS"});
+                  "layer0_MOE_ROUTE_CONTRIBUTIONS"});
     EXPECT_EQ(std::find(route_keys.begin(),
                         route_keys.end(),
                         "layer0_MOE_COMBINED_OUTPUT"),
@@ -289,14 +289,33 @@ TEST(Test__SnapshotCapture_KeyConversion,
      MappedSparseReducerPublishesDeviceRouteAssignmentLedger)
 {
     const std::vector<float> routed = {1.0f, -2.0f, 3.0f, -4.0f};
+    const std::vector<float> local_route_contributions = {
+        1.0f, 2.0f,
+        0.0f, 0.0f,
+        5.0f, 6.0f,
+        0.0f, 0.0f,
+    };
+    const std::vector<float> complete_route_contributions = {
+        1.0f, 2.0f,
+        3.0f, 4.0f,
+        5.0f, 6.0f,
+        7.0f, 8.0f,
+    };
     const std::vector<int32_t> participants = {1, 2, 0, 3};
     const std::vector<float> runtime_weights = {0.4f, 0.3f, 0.2f, 0.1f};
     const std::vector<int32_t> bank0 = {4, 5, 6};
     const std::vector<int32_t> bank1 = {7, 8, 9};
+    const std::vector<int32_t> bank0_epoch = {12};
+    const std::vector<int32_t> bank1_epoch = {13};
     const std::vector<int32_t> selected_bank = {1};
     StageDumpInfo dump;
     dump.outputs.push_back(
         makeFP32Output("output", routed.data(), 1, routed.size()));
+    dump.outputs.push_back(makeFP32Output(
+        "canonical_route_contributions",
+        complete_route_contributions.data(),
+        4,
+        2));
     dump.outputs.push_back(
         makeINT32Output(
             "domain_route_participant_ids", participants.data(), 2, 2));
@@ -306,7 +325,17 @@ TEST(Test__SnapshotCapture_KeyConversion,
     dump.outputs.push_back(makeINT32Output(
         "overlay_route_participants_bank0", bank0.data(), 1, bank0.size()));
     dump.outputs.push_back(makeINT32Output(
+        "overlay_route_bank0_epoch",
+        bank0_epoch.data(),
+        1,
+        bank0_epoch.size()));
+    dump.outputs.push_back(makeINT32Output(
         "overlay_route_participants_bank1", bank1.data(), 1, bank1.size()));
+    dump.outputs.push_back(makeINT32Output(
+        "overlay_route_bank1_epoch",
+        bank1_epoch.data(),
+        1,
+        bank1_epoch.size()));
     dump.outputs.push_back(makeINT32Output(
         "overlay_route_selected_bank",
         selected_bank.data(),
@@ -319,39 +348,71 @@ TEST(Test__SnapshotCapture_KeyConversion,
         SnapshotCapture::possibleKeysForStage(stage, dump),
         (std::vector<std::string>{
             "layer7_MOE_EXPERT_OUTPUT",
+            "layer7_MOE_ROUTE_CONTRIBUTIONS",
             "layer7_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
             "layer7_MOE_RUNTIME_ROUTE_WEIGHTS",
             "layer7_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+            "layer7_MOE_OVERLAY_ROUTE_BANK0_EPOCH",
             "layer7_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+            "layer7_MOE_OVERLAY_ROUTE_BANK1_EPOCH",
             "layer7_MOE_OVERLAY_ROUTE_SELECTED_BANK"}));
 
     SnapshotCapture capture;
+    StageDumpInfo local_expert_dump;
+    local_expert_dump.outputs.push_back(makeFP32Output(
+        "canonical_route_contributions",
+        local_route_contributions.data(),
+        4,
+        2));
+    capture.captureStage(
+        "layer7_moe_expert_ffn_overlay_fast",
+        local_expert_dump);
+    ASSERT_EQ(
+        capture.get("layer7_MOE_ROUTE_CONTRIBUTIONS")->data,
+        local_route_contributions);
+
+    /* The ordered finalizer is the later concrete producer and must replace
+     * the local-only bank under the same stable semantic key. */
     capture.captureStage(stage, dump);
     const auto routed_snapshot =
         capture.get("layer7_MOE_EXPERT_OUTPUT");
+    const auto route_contribution_snapshot = capture.get(
+        "layer7_MOE_ROUTE_CONTRIBUTIONS");
     const auto assignment_snapshot = capture.get(
         "layer7_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS");
     const auto runtime_weight_snapshot = capture.get(
         "layer7_MOE_RUNTIME_ROUTE_WEIGHTS");
     const auto bank0_snapshot = capture.get(
         "layer7_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0");
+    const auto bank0_epoch_snapshot = capture.get(
+        "layer7_MOE_OVERLAY_ROUTE_BANK0_EPOCH");
     const auto bank1_snapshot = capture.get(
         "layer7_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1");
+    const auto bank1_epoch_snapshot = capture.get(
+        "layer7_MOE_OVERLAY_ROUTE_BANK1_EPOCH");
     const auto selected_bank_snapshot = capture.get(
         "layer7_MOE_OVERLAY_ROUTE_SELECTED_BANK");
     ASSERT_NE(routed_snapshot, nullptr);
+    ASSERT_NE(route_contribution_snapshot, nullptr);
     ASSERT_NE(assignment_snapshot, nullptr);
     ASSERT_NE(runtime_weight_snapshot, nullptr);
     ASSERT_NE(bank0_snapshot, nullptr);
+    ASSERT_NE(bank0_epoch_snapshot, nullptr);
     ASSERT_NE(bank1_snapshot, nullptr);
+    ASSERT_NE(bank1_epoch_snapshot, nullptr);
     ASSERT_NE(selected_bank_snapshot, nullptr);
     EXPECT_EQ(routed_snapshot->data, routed);
+    EXPECT_EQ(
+        route_contribution_snapshot->data,
+        complete_route_contributions);
     EXPECT_EQ(
         assignment_snapshot->data,
         (std::vector<float>{1.0f, 2.0f, 0.0f, 3.0f}));
     EXPECT_EQ(runtime_weight_snapshot->data, runtime_weights);
     EXPECT_EQ(bank0_snapshot->data, (std::vector<float>{4.0f, 5.0f, 6.0f}));
+    EXPECT_EQ(bank0_epoch_snapshot->data, (std::vector<float>{12.0f}));
     EXPECT_EQ(bank1_snapshot->data, (std::vector<float>{7.0f, 8.0f, 9.0f}));
+    EXPECT_EQ(bank1_epoch_snapshot->data, (std::vector<float>{13.0f}));
     EXPECT_EQ(selected_bank_snapshot->data, (std::vector<float>{1.0f}));
 }
 
@@ -370,6 +431,8 @@ TEST(Test__SnapshotCapture_KeyConversion,
     const std::vector<float> runtime_weights = {0.7f, 0.0f, 0.3f, 0.0f};
     const std::vector<int32_t> bank0 = {0, 1, 0};
     const std::vector<int32_t> bank1 = {1, 0, 1};
+    const std::vector<int32_t> bank0_epoch = {21};
+    const std::vector<int32_t> bank1_epoch = {22};
     const std::vector<int32_t> selected_bank = {0};
     StageDumpInfo dump;
     dump.outputs.push_back(
@@ -383,7 +446,17 @@ TEST(Test__SnapshotCapture_KeyConversion,
     dump.outputs.push_back(makeINT32Output(
         "overlay_route_participants_bank0", bank0.data(), 1, bank0.size()));
     dump.outputs.push_back(makeINT32Output(
+        "overlay_route_bank0_epoch",
+        bank0_epoch.data(),
+        1,
+        bank0_epoch.size()));
+    dump.outputs.push_back(makeINT32Output(
         "overlay_route_participants_bank1", bank1.data(), 1, bank1.size()));
+    dump.outputs.push_back(makeINT32Output(
+        "overlay_route_bank1_epoch",
+        bank1_epoch.data(),
+        1,
+        bank1_epoch.size()));
     dump.outputs.push_back(makeINT32Output(
         "overlay_route_selected_bank",
         selected_bank.data(),
@@ -410,7 +483,9 @@ TEST(Test__SnapshotCapture_KeyConversion,
             "layer3_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
             "layer3_MOE_RUNTIME_ROUTE_WEIGHTS",
             "layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+            "layer3_MOE_OVERLAY_ROUTE_BANK0_EPOCH",
             "layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+            "layer3_MOE_OVERLAY_ROUTE_BANK1_EPOCH",
             "layer3_MOE_OVERLAY_ROUTE_SELECTED_BANK"}));
     EXPECT_EQ(
         SnapshotCapture::possibleKeysForStageName(stage),
@@ -419,7 +494,9 @@ TEST(Test__SnapshotCapture_KeyConversion,
             "layer3_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
             "layer3_MOE_RUNTIME_ROUTE_WEIGHTS",
             "layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+            "layer3_MOE_OVERLAY_ROUTE_BANK0_EPOCH",
             "layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+            "layer3_MOE_OVERLAY_ROUTE_BANK1_EPOCH",
             "layer3_MOE_OVERLAY_ROUTE_SELECTED_BANK"}));
 
     SnapshotCapture capture;
@@ -438,8 +515,14 @@ TEST(Test__SnapshotCapture_KeyConversion,
         capture.get("layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0")->data,
         (std::vector<float>{0.0f, 1.0f, 0.0f}));
     EXPECT_EQ(
+        capture.get("layer3_MOE_OVERLAY_ROUTE_BANK0_EPOCH")->data,
+        (std::vector<float>{21.0f}));
+    EXPECT_EQ(
         capture.get("layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1")->data,
         (std::vector<float>{1.0f, 0.0f, 1.0f}));
+    EXPECT_EQ(
+        capture.get("layer3_MOE_OVERLAY_ROUTE_BANK1_EPOCH")->data,
+        (std::vector<float>{22.0f}));
     EXPECT_EQ(
         capture.get("layer3_MOE_OVERLAY_ROUTE_SELECTED_BANK")->data,
         (std::vector<float>{0.0f}));
@@ -1207,7 +1290,7 @@ TEST(Test__SnapshotCapture_Capture,
     EXPECT_EQ(aggregation.terminal_or_nonsequence_keys, 0u);
 
     const auto *canonical =
-        capture.get("layer0_MOE_CANONICAL_ROUTE_CONTRIBUTIONS");
+        capture.get("layer0_MOE_ROUTE_CONTRIBUTIONS");
     ASSERT_NE(canonical, nullptr);
     EXPECT_EQ(canonical->rows, 6u);
     EXPECT_EQ(canonical->cols, 2u);

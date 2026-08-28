@@ -268,6 +268,18 @@ namespace
         }
     }
 
+    void MoEExpertDispatchStage::updateMoEOverlayCollectiveRuntimeParams(
+        const MoEOverlayCollectiveRuntimeParams &params)
+    {
+        /*
+         * This manual heterogeneous boundary consumes host control metadata;
+         * retaining these scalars performs no allocation, transfer, or device
+         * state mirroring. The next execute must use the exact epoch when one
+         * was pinned for a multi-graph MTP sequence.
+         */
+        runtime_params_ = params;
+    }
+
     bool MoEExpertDispatchStage::publishRoutingEvidence(
         int logical_seq_len) const
     {
@@ -406,6 +418,14 @@ namespace
                     "[MoEExpertDispatchStage] CPU LLEP dispatch has no complete active child publication");
                 return false;
             }
+            if (runtime_params_.hasPinnedPlacementEpoch() &&
+                runtime_params_.placement_epoch !=
+                    cpu_llep_state->durable_parent_epoch)
+            {
+                LOG_ERROR(
+                    "[MoEExpertDispatchStage] CPU LLEP parent epoch disagrees with the graph-sequence placement epoch");
+                return false;
+            }
             const auto &snapshot =
                 **cpu_llep_state->durable_epoch_lease;
             if (!snapshot.valid() || !snapshot.placement_plan ||
@@ -435,11 +455,27 @@ namespace
         }
         else if (params_.residency_authority)
         {
-            auto acquired =
-                params_.residency_authority->tryAcquireTicketSnapshot();
+            const uint64_t requested_epoch =
+                runtime_params_.placement_epoch;
+            auto acquired = runtime_params_.hasPinnedPlacementEpoch()
+                                ? params_.residency_authority
+                                      ->tryAcquireTicketSnapshot(
+                                          requested_epoch)
+                                : params_.residency_authority
+                                      ->tryAcquireTicketSnapshot();
             if (!acquired.has_value())
             {
-                LOG_ERROR("[MoEExpertDispatchStage] Residency maintenance is active; dispatch admission is closed");
+                if (runtime_params_.hasPinnedPlacementEpoch())
+                {
+                    LOG_ERROR(
+                        "[MoEExpertDispatchStage] Graph-sequence residency epoch is no longer addressable; requested_epoch="
+                        << requested_epoch);
+                }
+                else
+                {
+                    LOG_ERROR(
+                        "[MoEExpertDispatchStage] Residency dispatch admission is unavailable");
+                }
                 return false;
             }
             residency_lease =
@@ -478,6 +514,13 @@ namespace
             effective_tiers = &snapshot.placement_plan->routed_tiers;
             effective_owner_map = &snapshot.owner_map;
             residency_epoch = snapshot.epoch;
+            if (runtime_params_.hasPinnedPlacementEpoch() &&
+                residency_epoch != requested_epoch)
+            {
+                LOG_ERROR(
+                    "[MoEExpertDispatchStage] Residency authority returned an epoch other than the graph-sequence placement epoch");
+                return false;
+            }
         }
 
         const float *indices = nullptr;
@@ -710,11 +753,10 @@ namespace
         if (params_.ticket_storage)
         {
             /*
-             * The present host-dispatch producer acquires the epoch here.  The
-             * captured continuation-local branch will instead populate this
-             * same ABI field from its device epoch slot and use the exact-epoch
-             * authority overload; keeping the field explicit prevents a later
-             * stage from silently consulting a newer publication.
+             * Publish the epoch actually used by this dispatch. The fixed
+             * ticket storage is replayed, so an older non-zero value may be
+             * present when the producer begins; the sequence runtime binding,
+             * not that reusable field, is the admission authority.
              */
             params_.ticket_storage->ticket().header->residency_epoch =
                 result.residency_epoch;

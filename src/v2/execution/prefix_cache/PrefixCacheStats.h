@@ -27,6 +27,10 @@ namespace llaminar2
         uint64_t device_hot_direct_hits = 0;
         uint64_t disk_hydrations = 0;
         uint64_t terminal_state_hits = 0;
+        uint64_t fingerprint_rebases = 0;
+        uint64_t fingerprint_invalidated_ram_entries = 0;
+        uint64_t fingerprint_invalidated_device_entries = 0;
+        uint64_t fingerprint_unindexed_disk_entries = 0;
         uint64_t disk_write_failures = 0;
         uint64_t disk_read_failures = 0;
         uint64_t ram_bytes = 0;

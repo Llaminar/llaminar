@@ -12,6 +12,7 @@
 
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
+#include "execution/local_execution/device/ReusableExecutionWorkspace.h"
 #include "execution/local_execution/device/WorkspaceAllocator.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "interfaces/IWorkspaceConsumer.h"
@@ -24,6 +25,56 @@
 #include <vector>
 
 using namespace llaminar2;
+
+/**
+ * @brief The model-context registry enforces one exact workspace owner.
+ *
+ * The registry itself performs no backend work, so a CUDA structural key is
+ * safe in this device-free unit test. A reusable publication transfers the
+ * same allocator to the next runner; abandoning a lease permanently poisons
+ * the slot instead of permitting a second allocation.
+ */
+TEST(Test__WorkspaceAllocator, ReusableRegistryRejectsConcurrentAndUnsealedOwners)
+{
+    auto registry =
+        std::make_shared<ReusableExecutionWorkspaceRegistry>();
+    const ReusableExecutionWorkspaceKey key{
+        .device = DeviceId::cuda(0),
+        .first_layer = 0,
+        .last_layer = 31,
+        .tensor_parallel_participant = 0,
+        .tensor_parallel_degree = 1,
+        .owns_embedding = true,
+        .owns_terminal_head = true,
+    };
+
+    std::string error;
+    auto first = registry->acquire(key, &error);
+    ASSERT_NE(first, nullptr) << error;
+    const auto allocator = first->allocator();
+    ASSERT_NE(allocator, nullptr);
+
+    EXPECT_EQ(registry->acquire(key, &error), nullptr);
+    EXPECT_NE(error.find("live runner"), std::string::npos) << error;
+
+    ASSERT_TRUE(first->publishReusable(&error)) << error;
+    first.reset();
+    EXPECT_TRUE(registry->valid());
+
+    auto second = registry->acquire(key, &error);
+    ASSERT_NE(second, nullptr) << error;
+    EXPECT_EQ(second->allocator(), allocator)
+        << "A new runner must inherit the existing workspace authority";
+
+    second.reset();
+    EXPECT_FALSE(registry->valid());
+    EXPECT_NE(
+        registry->diagnostic().find("without a reusable seal"),
+        std::string::npos);
+    EXPECT_EQ(registry->acquire(key, &error), nullptr);
+    EXPECT_NE(error.find("without a reusable seal"), std::string::npos)
+        << error;
+}
 
 namespace
 {
@@ -56,9 +107,7 @@ namespace
 
     WorkspaceSizingHints tinyHints()
     {
-        // The allocator currently enforces a 768MB model-aware floor, so keep
-        // all non-floor dimensions tiny to make these tests as light as the
-        // production allocator permits.
+        // Keep all dimensions tiny so device-backed tests remain inexpensive.
         WorkspaceSizingHints hints;
         hints.max_seq_len = 1;
         hints.n_heads = 1;
@@ -75,7 +124,6 @@ namespace
         config.gpu_fraction = 0.8f;
         config.min_budget = 64 * 1024 * 1024;
         config.max_budget = 2ULL * 1024ULL * 1024ULL * 1024ULL;
-        config.headroom = 64 * 1024 * 1024;
         return config;
     }
 
@@ -1848,7 +1896,6 @@ TEST(Test__WorkspaceAllocator, GraphConsumerAllocatesAndBindsCPUWorkspaceForDecl
     config.cpu_fraction = 0.1f;
     config.min_budget = 1 * 1024 * 1024;
     config.max_budget = 8 * 1024 * 1024;
-    config.headroom = 0;
 
     auto stage = std::make_unique<DeclaredShapeWorkspaceStage>(
         DeviceId::cpu(),
@@ -1890,7 +1937,6 @@ TEST(Test__WorkspaceAllocator, ExtraCPUConsumersUseTheSameAppendOnlyWorkspaceLif
     config.cpu_fraction = 0.1f;
     config.min_budget = 1 * 1024 * 1024;
     config.max_budget = 8 * 1024 * 1024;
-    config.headroom = 0;
 
     MockWorkspaceConsumer initial_consumer({
         {"shared_scratch", 1024, 256, true},
