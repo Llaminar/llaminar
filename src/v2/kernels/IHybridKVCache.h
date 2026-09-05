@@ -17,6 +17,9 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
+#include <stdexcept>
+#include <utility>
 
 namespace llaminar2
 {
@@ -57,6 +60,40 @@ namespace llaminar2
     {
     public:
         virtual ~IHybridKVCache() = default;
+
+        /**
+         * @brief Retain the canonical claim for CPU-owned recurrent payloads.
+         *
+         * KernelFactory acquires this claim before constructing a CPU hybrid
+         * cache. Derived recurrent vectors are destroyed before this interface
+         * base, so the lease returns bytes only after their storage is gone.
+         * GPU live state is owned and claimed by HybridGDNDeviceStateArena and
+         * therefore never binds this host-payload lease.
+         *
+         * @param lease Non-null type-erased PhysicalMemoryAllocationLease.
+         * @throws std::invalid_argument for a null lease.
+         * @throws std::logic_error if the cache was already bound.
+         */
+        void bindRecurrentLiveMemoryLease(std::shared_ptr<void> lease)
+        {
+            if (!lease)
+            {
+                throw std::invalid_argument(
+                    "Hybrid KV cache recurrent-state lease cannot be null");
+            }
+            if (recurrent_live_memory_lease_)
+            {
+                throw std::logic_error(
+                    "Hybrid KV cache recurrent-state lease cannot be rebound");
+            }
+            recurrent_live_memory_lease_ = std::move(lease);
+        }
+
+        /** @return Whether CPU recurrent storage has an admitted live claim. */
+        [[nodiscard]] bool hasRecurrentLiveMemoryLease() const noexcept
+        {
+            return recurrent_live_memory_lease_ != nullptr;
+        }
 
         // =====================================================================
         // Layer Type Queries
@@ -125,6 +162,9 @@ namespace llaminar2
             const HybridPrefixStateDescriptor &desc,
             const void *src_host,
             const void *src_device) = 0;
+
+    private:
+        std::shared_ptr<void> recurrent_live_memory_lease_;
     };
 
 } // namespace llaminar2

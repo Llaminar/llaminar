@@ -48,7 +48,6 @@
 #include "stages/GDNProjectionStage.h"
 #include "stages/ShortConv1dStage.h"
 #include "stages/GDNRecurrenceStage.h"
-#include "stages/GDNLiveStateLocalizeStage.h"
 #include "stages/GDNLiveStateAllGatherStage.h"
 #include "stages/GatedRMSNormStage.h"
 #include "stages/AttentionOutputGateStage.h"
@@ -397,12 +396,6 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createGDNRecurrence(
             const GDNRecurrenceStage::Params &params);
-
-        /**
-         * @brief Create a LocalTP GDN live-state localization handoff stage
-         */
-        static std::unique_ptr<IComputeStage> createGDNLiveStateLocalize(
-            const GDNLiveStateLocalizeStage::Params &params);
 
         /**
          * @brief Create a LocalTP GDN live-state allgather handoff stage

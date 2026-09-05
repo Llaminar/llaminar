@@ -256,6 +256,12 @@ namespace
                 throw std::invalid_argument(
                     "MoE ExpertOverlay routing evidence requires positive ticket geometry");
             }
+            if (!params_.placement ||
+                params_.placement->routed_expert_tier.empty())
+            {
+                throw std::invalid_argument(
+                    "MoE ExpertOverlay routing evidence requires complete expert placement geometry");
+            }
             const auto row_capacity = static_cast<std::size_t>(params_.seq_len);
             const auto top_k = static_cast<std::size_t>(params_.top_k);
             if (row_capacity >
@@ -265,6 +271,8 @@ namespace
                     "MoE ExpertOverlay routing evidence capacity overflows size_t");
             }
             routing_evidence_expert_ids_.resize(row_capacity * top_k);
+            routing_evidence_count_scratch_.resize(
+                params_.placement->routed_expert_tier.size());
         }
     }
 
@@ -298,7 +306,8 @@ namespace
                     .top_k = params_.top_k,
                     .route_stride = params_.top_k,
                     .count_window_tokens = true,
-                });
+                },
+                routing_evidence_count_scratch_);
         if (!merged)
         {
             LOG_ERROR(
@@ -762,7 +771,9 @@ namespace
                 result.residency_epoch;
         }
 
-        if (result.residency_lease && PerfStatsCollector::isEnabled())
+        if (result.residency_lease &&
+            (PerfStatsCollector::isDomainEnabled("moe_overlay_residency") ||
+             PerfStatsCollector::isDomainEnabled("moe_overlay")))
         {
             const auto current_snapshot =
                 params_.residency_authority->snapshot();
@@ -784,7 +795,8 @@ namespace
                 });
         }
 
-        if (params_.ticket_storage && PerfStatsCollector::isEnabled())
+        if (params_.ticket_storage &&
+            PerfStatsCollector::isDomainEnabled("moe_overlay"))
         {
             const auto &ticket = params_.ticket_storage->ticket();
             const bool decode_phase =

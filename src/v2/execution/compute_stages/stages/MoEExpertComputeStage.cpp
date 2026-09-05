@@ -2328,6 +2328,44 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEExpertComputeStage::
+        transitionGroupedVerifierHistogramProducerCapture(
+            void *producer_stream,
+            RuntimeHistogramProducerCaptureTransition transition)
+    {
+        void *const publication_stream =
+            groupedVerifierHistogramPublicationStream();
+        if (groupedVerifierHistogramRole() !=
+                MoEGroupedVerifierHistogramRole::DeferredAcceptedRows ||
+            !params_.moe_runtime_table || !producer_stream ||
+            !publication_stream || producer_stream != publication_stream)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Deferred verifier histogram capture "
+                "transition requires the table-owned publication stream"
+                << " layer=" << params_.layer_idx
+                << " stream=" << producer_stream
+                << " expected=" << publication_stream);
+            return false;
+        }
+        try
+        {
+            params_.moe_runtime_table
+                ->transitionDecodeHistogramProducerCapture(
+                    producer_stream, transition);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Deferred verifier histogram capture "
+                "transition failed"
+                << " layer=" << params_.layer_idx
+                << " reason=" << error.what());
+            return false;
+        }
+        return true;
+    }
+
     bool MoEExpertComputeStage::enqueueCommittedGroupedVerifierHistograms(
         const int32_t *accepted_state_counts_device,
         const int32_t *publication_ok_flags_device,
@@ -2680,7 +2718,20 @@ namespace llaminar2
             return MoEOverlayServicePhaseHint::GroupedVerifier;
         }
         if (sparse_overlay_invocation_bound_)
-            return MoEOverlayServicePhaseHint::Auto;
+        {
+            /*
+             * A retained participant-local sparse graph has already named its
+             * immutable semantic phase through the typed binding. In
+             * particular, the one-row predictor sidecar is MTP-routed work,
+             * not ordinary decode. Preserve Auto only for mapped follower
+             * families whose device-owned authenticated graph role changes
+             * between replays; the finish kernel resolves that role before it
+             * considers histogram deltas.
+             */
+            return sparse_overlay_service_phase_;
+        }
+        if (params_.service_phase != MoEOverlayServicePhaseHint::Auto)
+            return params_.service_phase;
         return params_.seq_len == 1
                    ? MoEOverlayServicePhaseHint::Decode
                    : MoEOverlayServicePhaseHint::Prefill;
@@ -4118,16 +4169,26 @@ namespace llaminar2
                         swiglu_scratch_batch_[i].resize(intermediate);
                     }
 
-                    primitives::compute_swiglu_serial(
+                    /*
+                     * Every CPU expert uses the GPU-aligned SwiGLU program.
+                     * Placement, migration eligibility, and local route count
+                     * cannot select arithmetic: a distributed participant may
+                     * see one route while another sees several, yet both must
+                     * materialize the same logical expert activation bytes.
+                     */
+                    primitives::compute_swiglu_gpu_aligned_expert_serial(
                         gate_fp32,
                         up_fp32,
                         swiglu_scratch_batch_[i].data(),
                         intermediate);
                 }
 
-                // Phase 2b: Try fused multi-input down projections.
+                // Phase 2b: Use the canonical expert down-projection launcher
+                // for every non-empty route set.  Route ownership is allowed to
+                // leave a participant with one local expert, so cardinality
+                // must not select a different arithmetic implementation.
                 bool fused_ok = false;
-                if (num_active >= 2)
+                if (num_active >= 1)
                 {
                     ITensorGemm::FusedExpertDownDesc down_descs[16];
                     for (int i = 0; i < num_active && i < 16; ++i)
@@ -9320,7 +9381,8 @@ namespace llaminar2
         const bool valid_service_phase = host_packet_binding
             ? production_service_phase
             : invocation.service_phase ==
-                  MoEOverlayServicePhaseHint::Auto;
+                      MoEOverlayServicePhaseHint::Auto ||
+                  production_service_phase;
         bool valid_cpu_hidden_binding =
             invocation.cpu_transported_hidden.empty();
         if (host_packet_binding)

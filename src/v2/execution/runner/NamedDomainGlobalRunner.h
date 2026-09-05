@@ -104,6 +104,9 @@ namespace llaminar2
 
         const RankExecutionPlan &executionPlan() const override;
         const OrchestrationConfig &config() const override;
+        bool configureMTPRequestPolicy(
+            const MTPRequestPolicy &policy) override;
+        [[nodiscard]] MTPRequestPolicy mtpRequestPolicy() const override;
         bool isInitialized() const override;
         const std::string &lastError() const override;
 
@@ -127,6 +130,17 @@ namespace llaminar2
         const std::string &architecture() const override;
         /** @brief Return the retained model authority used by every local stage. */
         const IModelContext *modelContextForDiagnostics() const override;
+
+        /** @brief Delegate the coordinated follower loop to the common owner. */
+        void runMPIWorkerLoop() override;
+        /** @brief Delegate a nonterminal retained-runner session boundary. */
+        bool yieldMPIWorkersForRetainedRunner() override;
+        /** @brief Delegate terminal coordinated shutdown. */
+        void shutdownMPIWorkers() override;
+        /** @brief Delegate coordinated-mode admission. */
+        void setMPICoordinatedMode(bool enabled) override;
+        /** @return Coordinated request authority selected by the inner runner. */
+        int coordinatedRootRank() const override;
 
         // ==================================================================
         // IOrchestrationRunner: Snapshot

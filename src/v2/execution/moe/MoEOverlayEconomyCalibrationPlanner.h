@@ -36,6 +36,15 @@ namespace llaminar2
     {
         int representative_layer = -1;
         std::vector<int> member_layers;
+        /**
+         * Deterministic ordinal strata used by recurring service telemetry.
+         *
+         * Transfer calibration still needs only @ref representative_layer
+         * because byte movement depends solely on the exact prepared-weight
+         * contract. Runtime service includes route density and fixed launch
+         * cost, so it samples several spatially distributed members instead.
+         */
+        std::vector<int> service_telemetry_layers;
         /** Conservative exact maximum of CPU/GPU prepared live bytes. */
         std::size_t complete_expert_bytes = 0;
 
@@ -51,7 +60,10 @@ namespace llaminar2
      * calibration for every address would add setup latency without adding a
      * distinct transfer contract.  This catalog derives equivalence strictly
      * from the GGUF-owned layer manifest, measures one real representative per
-     * class, and expands its robust evidence back to every member layer before
+     * class for physical transfer calibration. Runtime service uses a bounded
+     * deterministic stratified sample within each class so one unusually sparse
+     * layer cannot turn fixed GPU launch cost into a false per-activation price.
+     * Both evidence forms are expanded back to every exact member layer before
      * the complete economy profile is certified.
      */
     class MoEOverlayEconomyCalibrationLayerCatalog final
@@ -80,11 +92,45 @@ namespace llaminar2
             return groups_;
         }
 
-        /** @return One representative layer index per exact equivalence class. */
+        /** @return One physical-transfer representative per exact class. */
         [[nodiscard]] const std::vector<int> &representativeLayers()
             const noexcept
         {
             return representative_layers_;
+        }
+
+        /**
+         * @brief Test whether one layer is this class partition's representative.
+         * @param layer Exact zero-based model layer index.
+         * @return True only for the canonical member selected for physical
+         *         migration calibration of its exact weight-equivalence class.
+         */
+        [[nodiscard]] bool isRepresentativeLayer(int layer) const noexcept;
+
+        /**
+         * @return Sorted union of deterministic service-telemetry strata.
+         *
+         * A class of N exact-equivalent layers contributes ceil(sqrt(N))
+         * members, one from the midpoint of each equal ordinal stratum. This
+         * gives sublinear graph-marker cost while sampling the full model depth.
+         */
+        [[nodiscard]] const std::vector<int> &serviceTelemetryLayers()
+            const noexcept
+        {
+            return service_telemetry_layers_;
+        }
+
+        /**
+         * @brief Test whether one layer carries recurring service telemetry.
+         * @param layer Exact zero-based model layer index.
+         * @return True only for a deterministic stratum representative.
+         */
+        [[nodiscard]] bool isServiceTelemetryLayer(int layer) const noexcept;
+
+        /** @return Number of model layers covered by the exact partition. */
+        [[nodiscard]] std::size_t layerCount() const noexcept
+        {
+            return complete_expert_bytes_per_layer_.size();
         }
 
         /** @return Conservative complete-expert byte footprints for every layer. */
@@ -110,6 +156,7 @@ namespace llaminar2
         std::string identity_;
         std::vector<MoEOverlayEconomyCalibrationLayerGroup> groups_;
         std::vector<int> representative_layers_;
+        std::vector<int> service_telemetry_layers_;
         std::vector<std::size_t> complete_expert_bytes_per_layer_;
     };
 

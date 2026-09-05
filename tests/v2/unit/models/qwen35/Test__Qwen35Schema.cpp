@@ -364,17 +364,27 @@ TEST(Test__Qwen35Schema, SnapshotShardingDeclaresCapturedDenseSemanticKeys)
     EXPECT_EQ(
         sharding.at("ATTENTION_DEVICE_KV_HEAD_REQUEST_*"),
         SnapshotShardingMode::REPLICATED);
-    EXPECT_EQ(sharding.at("GDN_Z_PROJECTION"), SnapshotShardingMode::COLUMN_PARALLEL);
-    EXPECT_EQ(sharding.at("GDN_ALPHA"), SnapshotShardingMode::COLUMN_PARALLEL);
-    EXPECT_EQ(sharding.at("GDN_BETA"), SnapshotShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(
         sharding.at("QKV_PROJECTION"),
         SnapshotShardingMode::PACKED_COLUMN_PARALLEL);
     EXPECT_EQ(
         sharding.at("GDN_CONV1D_OUTPUT"),
         SnapshotShardingMode::PACKED_COLUMN_PARALLEL);
-    EXPECT_EQ(sharding.at("GDN_DELTA_RULE_OUTPUT"), SnapshotShardingMode::COLUMN_PARALLEL);
-    EXPECT_EQ(sharding.at("GDN_NORM_GATE_OUTPUT"), SnapshotShardingMode::COLUMN_PARALLEL);
+    for (const char *stage : {
+             "GDN_Z_PROJECTION",
+             "GDN_ALPHA",
+             "GDN_BETA",
+             "GDN_RECURRENCE",
+             "GDN_DELTA_RULE_OUTPUT",
+             "GATED_RMSNORM",
+             "GDN_NORM_GATE_OUTPUT",
+         })
+    {
+        EXPECT_EQ(
+            sharding.at(stage),
+            SnapshotShardingMode::PACKED_COLUMN_PARALLEL)
+            << stage;
+    }
 }
 
 TEST(Test__Qwen35Schema, GDNValueHeadWeightsUseProportionalHeadSharding)
@@ -391,55 +401,6 @@ TEST(Test__Qwen35Schema, GDNValueHeadWeightsUseProportionalHeadSharding)
               WeightShardingMode::InputParallel);
     EXPECT_EQ(sharding.getDimensionType("blk.0.ssm_out.weight"),
               WeightDimensionType::ProportionalHeads);
-}
-
-TEST(Test__Qwen35Schema, GDNGlobalVHeadOffsetPrefersValueProjectionSlice)
-{
-    // Qwen3.5-4B dense GDN has 36 FA/Q heads but 32 GDN V heads.
-    // TP=2 rank 1 therefore starts at Q-head 18, but V-head 16.
-    GraphConfig config;
-    config.n_heads = 36;
-    config.head_start = 18;
-    config.local_rank = 1;
-    config.tp_config = std::make_shared<TensorParallelConfig>(
-        TensorParallelConfig::equalSplit(2, 36, 4, 9216, 151936));
-
-    WeightBinding value_projection_binding;
-    value_projection_binding.slice.source_rows = 4096;
-    value_projection_binding.slice.row_start = 16 * 128;
-    value_projection_binding.slice.row_count = 16 * 128;
-
-    const int offset = Qwen35Graph::resolveGDNGlobalVHeadOffset(
-        &value_projection_binding,
-        128,
-        16,
-        32,
-        config,
-        nullptr);
-
-    EXPECT_EQ(offset, 16);
-    EXPECT_NE(offset, config.head_start);
-}
-
-TEST(Test__Qwen35Schema, GDNGlobalVHeadOffsetFallbackMapsQHeadsToVHeads)
-{
-    GraphConfig config;
-    config.n_heads = 36;
-    config.local_rank = 1;
-    config.tp_config = std::make_shared<TensorParallelConfig>(
-        TensorParallelConfig::equalSplit(2, 36, 4, 9216, 151936));
-
-    const int offset = Qwen35Graph::resolveGDNGlobalVHeadOffset(
-        nullptr,
-        128,
-        16,
-        32,
-        config,
-        nullptr);
-
-    EXPECT_EQ(config.tp_config->forRank(1).head_start, 18);
-    EXPECT_EQ(offset, 16);
-    EXPECT_NE(offset, config.tp_config->forRank(1).head_start);
 }
 
 TEST(Test__Qwen35Schema, HasNamedTemplates)
@@ -1702,6 +1663,84 @@ TEST(Test__Qwen35Schema, ResolverConfig_AttnOutputDim_WithTP)
 
     EXPECT_GE(it->second, static_cast<size_t>(1280))
         << "attn_output_dim must also accommodate FA local_qkv_dim";
+}
+
+/**
+ * @brief A replicated MTP predictor reserves full sidecar buffers without
+ *        widening the tensor-parallel main graph.
+ */
+TEST(Test__Qwen35Schema, ResolverConfig_ReplicatedMTPSidecarHasIndependentFullGeometry)
+{
+    GraphConfig config;
+    config.n_layers = 4;
+    config.d_model = 2560;
+    config.n_heads = 20;
+    config.n_kv_heads = 4;
+    config.head_dim = 128;
+    config.d_ff = 8960;
+    config.d_ff_local = 4480;
+    config.vocab_size = 248320;
+    config.vocab_local = 124160;
+    config.default_device = DeviceId::cpu();
+    config.max_seq_len = 2048;
+    config.qkv_column_parallel = true;
+    config.ffn_column_parallel = true;
+    config.dense_tp_enabled = true;
+    config.local_n_heads = 10;
+    config.local_n_kv_heads = 2;
+    config.mtp.enabled = true;
+    config.mtp.sidecar_dense_policy =
+        MTPSidecarDensePolicy::ReplicatedPerParticipant;
+    config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/2,
+            config.n_heads,
+            config.n_kv_heads,
+            config.d_ff,
+            config.vocab_size));
+    config.gdn.conv_kernel_size = 4;
+    config.gdn.state_size = 64;
+    config.gdn.inner_size = 4096;
+    config.gdn.group_count = 16;
+    config.gdn.time_step_rank = 32;
+    config.gdn.full_attention_interval = 4;
+    config.layer_types = {"gdn", "gdn", "gdn", "full_attention"};
+
+    Qwen35Graph graph(config, nullptr);
+    const auto resolver = graph.getResolverConfig(/*seq_len=*/18);
+
+    EXPECT_EQ(resolver.local_n_heads, 10)
+        << "main prefill geometry must remain TP-local";
+    EXPECT_EQ(resolver.local_n_kv_heads, 2)
+        << "main prefill KV geometry must remain TP-local";
+    EXPECT_EQ(resolver.local_d_ff, 4480)
+        << "main prefill FFN geometry must remain TP-local";
+    EXPECT_EQ(resolver.custom_formulas.at("mtp_q_dim"), 2560u);
+    EXPECT_EQ(resolver.custom_formulas.at("mtp_kv_dim"), 512u);
+    EXPECT_EQ(resolver.custom_formulas.at("mtp_fa_q_full_dim"), 5120u);
+    EXPECT_EQ(resolver.custom_formulas.at("mtp_attn_output_dim"), 2560u);
+    EXPECT_EQ(resolver.custom_formulas.at("mtp_d_ff"), 8960u);
+
+    const Qwen35SchemaFactory factory;
+    const auto requirements =
+        BufferAllocator::resolveLayerBuffers(factory.createSchema(), resolver);
+    const auto find_buffer = [&](std::string_view name) -> const BufferDescriptor *
+    {
+        const auto it = std::find_if(
+            requirements.buffers.begin(),
+            requirements.buffers.end(),
+            [&](const BufferDescriptor &buffer)
+            {
+                return buffer.name == name;
+            });
+        return it == requirements.buffers.end() ? nullptr : &*it;
+    };
+    const auto *mtp_k = find_buffer("mtp_k");
+    const auto *main_k = find_buffer("K");
+    ASSERT_NE(mtp_k, nullptr);
+    ASSERT_NE(main_k, nullptr);
+    EXPECT_EQ(mtp_k->shape[1], 512u);
+    EXPECT_EQ(main_k->shape[1], 256u);
 }
 
 TEST_F(Qwen35GraphBuildTest, GDNOutProj_KDimMatchesGDNInner)

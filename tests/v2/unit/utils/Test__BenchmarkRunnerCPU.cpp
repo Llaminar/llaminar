@@ -193,6 +193,17 @@ namespace
             (void)tokens;
             (void)seq_len;
             ++prefill_forward_count_;
+            if (emulate_persistent_prefix_archive_ &&
+                persistent_prefix_archive_populated_)
+            {
+                /*
+                 * A complete prefix restore produces a valid asynchronous
+                 * request completion but submits no prefill graph. This is the
+                 * production failure mode the benchmark regression exercises.
+                 */
+                forward_pending_ = true;
+                return true;
+            }
             if (advance_prefill_graph_on_forward_ &&
                 !snapshot_.prefill_graphs.empty())
             {
@@ -218,11 +229,13 @@ namespace
                     }
                 }
             }
+            persistent_prefix_archive_populated_ =
+                emulate_persistent_prefix_archive_;
             forward_pending_ = true;
             return true;
         }
 
-        bool waitForLastForwardCompletionForBenchmark() override
+        bool waitForLastInferenceCompletionForBenchmark() override
         {
             if (!forward_pending_)
             {
@@ -238,6 +251,12 @@ namespace
         const float *logits() const override { return logits_.data(); }
         int vocab_size() const override { return VOCAB; }
         void clear_cache() override {}
+        bool purgePrefixCache() override
+        {
+            ++prefix_purge_count_;
+            persistent_prefix_archive_populated_ = false;
+            return true;
+        }
 
         // GPU device — GPU argmax available
         DeviceId primaryDeviceId() const override { return DeviceId::cuda(0); }
@@ -291,6 +310,12 @@ namespace
             capture_on_forward_ = forward_count;
         }
 
+        void setEmulatePersistentPrefixArchive(bool enabled)
+        {
+            emulate_persistent_prefix_archive_ = enabled;
+            persistent_prefix_archive_populated_ = false;
+        }
+
         bool skipLogitsGatherDecodeWasEnabled() const { return skip_logits_gather_decode_; }
         bool skipLogitsGatherPrefillWasEnabled() const { return skip_logits_gather_prefill_; }
         int stopPolicyPublicationCount() const { return stop_policy_publication_count_; }
@@ -300,6 +325,7 @@ namespace
         }
         int completionWaitCount() const { return completion_wait_count_; }
         int prefillForwardCount() const { return prefill_forward_count_; }
+        int prefixPurgeCount() const { return prefix_purge_count_; }
         bool completionOrderValid() const { return completion_order_valid_; }
         void setCompletionDelay(std::chrono::milliseconds delay)
         {
@@ -319,8 +345,11 @@ namespace
         int prefill_forward_count_ = 0;
         int capture_on_forward_ = -1;
         bool advance_prefill_graph_on_forward_ = false;
+        bool emulate_persistent_prefix_archive_ = false;
+        bool persistent_prefix_archive_populated_ = false;
         std::chrono::milliseconds completion_delay_{0};
         int stop_policy_publication_count_ = 0;
+        int prefix_purge_count_ = 0;
     };
 
     class MockStatsInferenceRunner : public MockCPUInferenceRunner
@@ -427,7 +456,7 @@ namespace
             return MockOrchestratedDecodeRunner::forward(tokens, seq_len);
         }
 
-        bool waitForLastForwardCompletionForBenchmark() override
+        bool waitForLastInferenceCompletionForBenchmark() override
         {
             events_.push_back("prefill_completion");
             return true;
@@ -1181,6 +1210,59 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureAcceptsCapturedProbe)
     ASSERT_EQ(result.prefix_state.prefill_graphs.size(), 1u);
     EXPECT_EQ(result.prefix_state.prefill_graphs[0].capture_count, 1u);
     EXPECT_EQ(result.prefix_state.prefill_graphs[0].domain_id, "mock_tp");
+}
+
+/**
+ * @brief Repeated throughput samples must execute prefill despite prefix reuse.
+ *
+ * Request reset intentionally preserves the production prefix archive. An
+ * identical warmup prompt can therefore satisfy the measured request without
+ * submitting its retained prefill graph unless benchmark mode also invokes
+ * the explicit archive-purge boundary before each full-prefill sample.
+ */
+TEST(
+    Test__BenchmarkRunnerCPU,
+    FullPrefillSamplesPurgeReusablePrefixArchiveOutsideMeasurement)
+{
+    {
+        ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+        ScopedEnv warmups(
+            "LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "1");
+        mutableDebugEnv().runtime_debug.reload();
+        ScopedGpuGraphsSetting force_gpu_graphs(true);
+        ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
+
+        auto runner = std::make_shared<MockGPUInferenceRunner>();
+        PrefixRuntimeStateSnapshot snapshot;
+        PrefillGraphRuntimeProbe graph;
+        graph.phase = "ready";
+        graph.capture_phase = "capture";
+        graph.capture_count = 1;
+        graph.node_count = 42;
+        graph.domain_id = "persistent_prefix_regression";
+        snapshot.prefill_graphs.push_back(graph);
+        runner->setPrefixRuntimeState(snapshot);
+        runner->setAdvancePrefillGraphOnForward(true);
+        runner->setEmulatePersistentPrefixArchive(true);
+
+        BenchmarkRunner bench(runner, createMockTokenizer());
+        OrchestrationConfig config;
+        config.prompt = "Hello world";
+        config.n_predict = 0;
+
+        const auto result = bench.run(config);
+        ASSERT_TRUE(result.success) << result.failure_reason;
+        EXPECT_EQ(runner->prefillForwardCount(), 3)
+            << "One graph-readiness replay, one ordinary warmup, and one measured "
+               "prefill are required";
+        EXPECT_GE(runner->prefixPurgeCount(), 3)
+            << "Graph preparation, warmup, and measurement must each begin with "
+               "an empty reusable archive";
+        ASSERT_EQ(result.prefix_state.prefill_graphs.size(), 1u);
+        EXPECT_EQ(result.prefix_state.prefill_graphs[0].replay_count, 3u)
+            << "Every full-prefill submission must replay the retained graph";
+    }
+    mutableDebugEnv().runtime_debug.reload();
 }
 
 TEST(
@@ -2313,6 +2395,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
         .decode_tokens_per_sec = 909.090909090909,
         .decode_after_prefill_tokens = 1,
         .decode_after_prefill_tokens_per_sec = 454.5454545454545,
+        .generated_token_ids = {77, 88},
         .moe_runtime_movement_epoch_start = 5,
         .moe_runtime_movement_epoch = 7,
         .dynamic_movement_transactions = 2,
@@ -2321,6 +2404,11 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
         .dynamic_promotions = 3,
         .dynamic_demotions = 3,
         .dynamic_same_priority_moves = 3,
+        .mtp_draft_steps = 4,
+        .mtp_accepted_tokens = 3,
+        .mtp_rejected_tokens = 1,
+        .mtp_verifier_runs = 2,
+        .mtp_verifier_token_count = 5,
         .decode_windows = {
             BenchmarkDecodeWindowResult{
                 .start_token = 0,
@@ -2473,6 +2561,9 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
             .at("decode_after_prefill")
             .get<double>(),
         454.5454545454545);
+    EXPECT_EQ(
+        iteration.at("generated_token_ids"),
+        nlohmann::json::array({77, 88}));
     EXPECT_EQ(iteration.at("moe_runtime_movement_epoch_start"), 5);
     EXPECT_EQ(iteration.at("moe_runtime_movement_epoch"), 7);
     EXPECT_EQ(
@@ -2484,6 +2575,13 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_EQ(
         iteration.at("completed_dynamic_movement").at("same_priority_moves"),
         3);
+    EXPECT_EQ(iteration.at("mtp").at("draft_steps"), 4);
+    EXPECT_EQ(iteration.at("mtp").at("accepted_tokens"), 3);
+    EXPECT_EQ(iteration.at("mtp").at("rejected_tokens"), 1);
+    EXPECT_EQ(iteration.at("mtp").at("verifier_runs"), 2);
+    EXPECT_EQ(iteration.at("mtp").at("verifier_token_count"), 5);
+    EXPECT_DOUBLE_EQ(
+        iteration.at("mtp").at("acceptance_rate").get<double>(), 0.75);
     ASSERT_EQ(iteration.at("decode_windows").size(), 1u);
     EXPECT_EQ(iteration.at("decode_windows").front().at("start_token"), 0);
     EXPECT_EQ(iteration.at("decode_windows").front().at("token_count"), 2);

@@ -3,6 +3,8 @@
 #include "planning/ModelMemoryProfile.h"
 #include "backends/DeviceId.h"
 #include "kernels/common/EmbedQ8Block.h"
+#include "loaders/PreparedWeightRepresentationContract.h"
+#include "../../utils/EmbeddingVerifierFormats.h"
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -18,6 +20,7 @@
  */
 
 using namespace llaminar2;
+using namespace llaminar2::test;
 
 namespace
 {
@@ -89,7 +92,7 @@ namespace
     ModelMemoryProfile createMoEResidencyProfile()
     {
         ModelMemoryProfile profile;
-        profile.architecture = "qwen3.5moe";
+        profile.architecture = "qwen35moe";
         profile.n_layers = 2;
         profile.d_model = 32;
         profile.d_ff = 64;
@@ -309,7 +312,7 @@ TEST(Test__WeightMemoryEstimator, GPUPackedBytesPerWeight_UsesNativeVNNIFormat)
 TEST(Test__WeightMemoryEstimator, SingleDevice_IQProfileUsesCompactGPUPacking)
 {
     ModelMemoryProfile profile;
-    profile.architecture = "qwen3moe";
+    profile.architecture = "qwen3";
     profile.n_layers = 1;
 
     auto addTensor = [&](const std::string &name, const std::string &quant_type,
@@ -366,7 +369,7 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_CUDAPackedBytesGTNative)
 TEST(Test__WeightMemoryEstimator, SingleDevice_Q4KUsesCompactGPUPacking)
 {
     ModelMemoryProfile profile;
-    profile.architecture = "qwen3moe";
+    profile.architecture = "qwen3";
     profile.n_layers = 1;
 
     TensorSizeInfo q4k_tensor;
@@ -390,7 +393,7 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_Q4KUsesCompactGPUPacking)
 TEST(Test__WeightMemoryEstimator, QuantizedEmbeddingUsesPreparedEmbedQ8Bytes)
 {
     ModelMemoryProfile profile;
-    profile.architecture = "qwen3.6";
+    profile.architecture = "qwen35";
     profile.n_layers = 1;
     profile.d_model = 64;
 
@@ -427,7 +430,7 @@ TEST(Test__WeightMemoryEstimator, QuantizedEmbeddingUsesPreparedEmbedQ8Bytes)
 TEST(Test__WeightMemoryEstimator, ExplicitLMHeadPreventsSyntheticTiedCopy)
 {
     ModelMemoryProfile profile;
-    profile.architecture = "qwen3.6";
+    profile.architecture = "qwen35";
     profile.n_layers = 1;
     profile.d_model = 64;
 
@@ -459,7 +462,7 @@ TEST(Test__WeightMemoryEstimator,
      TensorParallelVocabularyViewsAreExactThroughDegreeEight)
 {
     ModelMemoryProfile profile;
-    profile.architecture = "qwen3.6";
+    profile.architecture = "qwen35";
     profile.n_layers = 1;
     profile.d_model = 64;
     profile.vocab_size = 248323;
@@ -545,6 +548,291 @@ TEST(Test__WeightMemoryEstimator, TPSharded_ReplicatesNormWeights)
                    static_cast<double>(est_single.device_bytes);
     EXPECT_GT(ratio, 0.5);
     EXPECT_LT(ratio, 1.0);
+}
+
+/**
+ * @brief Every Qwen3.5 GDN rule must be priced from its registered schema.
+ *
+ * These tensor names were absent from the former generic substring classifier
+ * and were consequently charged as complete replicas during TP admission even
+ * though WeightManager loaded participant-local slices. The aggregate check
+ * proves all sharded payload bytes are conserved while only the declared norm
+ * is replicated.
+ */
+TEST(Test__WeightMemoryEstimator,
+     Qwen35GDNSchemaShardingConservesBytesThroughTP8)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35";
+    profile.n_layers = 1;
+    profile.d_model = 64;
+    profile.d_ff = 256;
+    profile.n_heads = 16;
+    profile.n_kv_heads = 8;
+    profile.head_dim = 4;
+    profile.vocab_size = 256;
+    profile.gdn_group_count = 8;
+    profile.gdn_time_step_rank = 16;
+    profile.gdn_state_size = 8;
+
+    const auto addF32 = [&profile](
+                            const std::string &name,
+                            size_t rows,
+                            size_t columns)
+    {
+        TensorSizeInfo tensor;
+        tensor.name = name;
+        tensor.elements = rows * columns;
+        tensor.K = columns;
+        tensor.quant_type = "F32";
+        tensor.native_bytes = tensor.elements * sizeof(float);
+        tensor.layer_index = 0;
+        profile.total_native_bytes += tensor.native_bytes;
+        profile.tensors.push_back(std::move(tensor));
+    };
+
+    const size_t fused_rows =
+        static_cast<size_t>(
+            2 * profile.gdn_group_count + profile.gdn_time_step_rank) *
+        static_cast<size_t>(profile.gdn_state_size);
+    const size_t value_rows =
+        static_cast<size_t>(profile.gdn_time_step_rank) *
+        static_cast<size_t>(profile.gdn_state_size);
+    addF32("blk.0.attn_qkv.weight", fused_rows, profile.d_model);
+    addF32("blk.0.attn_gate.weight", value_rows, profile.d_model);
+    addF32("blk.0.ssm_out.weight", profile.d_model, value_rows);
+    addF32("blk.0.ssm_alpha.weight", profile.gdn_time_step_rank,
+           profile.d_model);
+    addF32("blk.0.ssm_beta.weight", profile.gdn_time_step_rank,
+           profile.d_model);
+    addF32("blk.0.ssm_conv1d.weight", fused_rows, 4u);
+    addF32("blk.0.ssm_dt.bias", profile.gdn_time_step_rank, 1u);
+    addF32("blk.0.ssm_a", profile.gdn_time_step_rank, 1u);
+    addF32("blk.0.ssm_norm.weight", 1u, profile.gdn_state_size);
+
+    const size_t replicated_bytes =
+        profile.tensors.back().native_bytes;
+    const size_t sharded_bytes =
+        profile.total_native_bytes - replicated_bytes;
+    const auto full = WeightMemoryEstimator::estimate(
+        profile, DeviceId::rocm(0));
+    ASSERT_EQ(full.device_bytes, profile.total_native_bytes);
+
+    for (const int degree : {2, 4, 8})
+    {
+        size_t aggregate = 0u;
+        for (int shard = 0; shard < degree; ++shard)
+        {
+            const auto estimate = WeightMemoryEstimator::estimate(
+                profile,
+                DeviceId::rocm(shard),
+                shard,
+                degree);
+            aggregate += estimate.device_bytes;
+            EXPECT_LT(estimate.device_bytes, full.device_bytes)
+                << "degree=" << degree << " shard=" << shard;
+        }
+        EXPECT_EQ(
+            aggregate,
+            sharded_bytes + replicated_bytes *
+                                 static_cast<size_t>(degree))
+            << "degree=" << degree;
+    }
+}
+
+/**
+ * @brief Q8 GDN alpha/beta tensors are admitted in their runtime FP32 form.
+ *
+ * The optimized deterministic tiny-projection route converts these weights
+ * before GPU upload.  The memory planner must therefore price FP32 bytes, not
+ * the smaller GGUF codebook, for the exact TP-local interval on both GPU
+ * backends.
+ */
+TEST(Test__WeightMemoryEstimator,
+     Qwen35Q8AlphaBetaPricePreparedFP32AcrossCudaRocmAndTP)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35";
+    profile.n_layers = 1;
+    profile.d_model = 1024;
+    profile.d_ff = 1792;
+    profile.n_heads = 16;
+    profile.n_kv_heads = 4;
+    profile.head_dim = 64;
+    profile.vocab_size = 124160;
+    profile.gdn_group_count = 8;
+    profile.gdn_time_step_rank = 16;
+    profile.gdn_state_size = 128;
+
+    for (const std::string suffix : {
+             "ssm_alpha.weight", "ssm_beta.weight"})
+    {
+        TensorSizeInfo tensor;
+        tensor.name = "blk.0." + suffix;
+        tensor.elements = 16u * 1024u;
+        tensor.K = 1024u;
+        tensor.quant_type = "Q8_0";
+        tensor.native_bytes = tensor.elements * 34u / 32u;
+        tensor.layer_index = 0;
+        profile.total_native_bytes += tensor.native_bytes;
+        profile.tensors.push_back(std::move(tensor));
+    }
+
+    constexpr size_t kCompletePreparedBytes =
+        2u * 16u * 1024u * sizeof(float);
+    constexpr size_t kTP2PreparedBytes =
+        2u * 8u * 1024u * sizeof(float);
+    for (const DeviceId device : {
+             DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        EXPECT_EQ(
+            WeightMemoryEstimator::estimate(profile, device).device_bytes,
+            kCompletePreparedBytes);
+        EXPECT_EQ(
+            WeightMemoryEstimator::estimate(
+                profile, device, 0, 2).device_bytes,
+            kTP2PreparedBytes);
+        EXPECT_EQ(
+            WeightMemoryEstimator::estimate(
+                profile, device, 1, 2).device_bytes,
+            kTP2PreparedBytes);
+    }
+}
+
+/**
+ * @brief Shared-expert input-gate accounting covers every source format.
+ *
+ * Runtime converts this non-GEMM gate to FP32 for all non-FP32 sources.  Sweep
+ * the same canonical registry used by grouped verifier coverage so adding a
+ * codebook cannot silently reintroduce planner/materializer disagreement.
+ */
+TEST(Test__WeightMemoryEstimator,
+     SharedExpertInputGatePricesFP32ForEveryCanonicalSourceFormat)
+{
+    constexpr size_t kElements = 256u;
+    for (const auto &format : embeddingVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        const auto source = format.create({1u, kElements}, 731u);
+        ASSERT_TRUE(source);
+
+        ModelMemoryProfile profile;
+        profile.architecture = "qwen35moe";
+        profile.n_layers = 1;
+        TensorSizeInfo tensor;
+        tensor.name = "blk.0.ffn_gate_inp_shexp.weight";
+        tensor.native_bytes = source->size_bytes();
+        tensor.quant_type =
+            source->native_type() == TensorType::FP32
+                ? "F32"
+                : std::string(format.label);
+        tensor.elements = kElements;
+        tensor.K = kElements;
+        tensor.layer_index = 0;
+        profile.total_native_bytes = tensor.native_bytes;
+        profile.tensors.push_back(std::move(tensor));
+
+        constexpr size_t kExpectedBytes =
+            kElements * sizeof(float);
+        for (const DeviceId device : {
+                 DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            EXPECT_EQ(
+                WeightMemoryEstimator::estimate(profile, device).device_bytes,
+                kExpectedBytes)
+                << "device=" << device.to_string();
+        }
+    }
+}
+
+/**
+ * @brief Exact local-TP assignments retain replicated GQA KV heads.
+ *
+ * TP4 over two KV heads is intentionally not a one-quarter byte split. The
+ * same DeviceShardingAssignment used by loading must keep both K/V heads on
+ * every device while query rows remain partitioned.
+ */
+TEST(Test__WeightMemoryEstimator,
+     RankLocalTPAssignmentPricesReplicatedGQAKVHeads)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen2";
+    profile.n_layers = 1;
+    profile.d_model = 896;
+    profile.d_ff = 4864;
+    profile.n_heads = 14;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 64;
+    profile.vocab_size = 151936;
+
+    const auto addF32 = [&profile](
+                            const std::string &name,
+                            size_t rows,
+                            size_t columns)
+    {
+        TensorSizeInfo tensor;
+        tensor.name = name;
+        tensor.elements = rows * columns;
+        tensor.K = columns;
+        tensor.quant_type = "F32";
+        tensor.native_bytes = tensor.elements * sizeof(float);
+        tensor.layer_index = 0;
+        profile.total_native_bytes += tensor.native_bytes;
+        profile.tensors.push_back(std::move(tensor));
+    };
+    addF32("blk.0.attn_q.weight", 896u, 896u);
+    addF32("blk.0.attn_k.weight", 128u, 896u);
+
+    const std::vector<DeviceId> devices{
+        DeviceId::rocm(0), DeviceId::rocm(1),
+        DeviceId::rocm(2), DeviceId::rocm(3)};
+    const auto tp = TensorParallelConfig::proportionalSplit(
+        devices,
+        std::vector<float>(devices.size(), 1.0f),
+        profile.n_heads,
+        profile.n_kv_heads,
+        profile.d_ff,
+        profile.vocab_size);
+    const size_t complete_k_bytes =
+        128u * 896u * sizeof(float);
+
+    size_t aggregate_q_bytes = 0u;
+    for (int shard = 0; shard < 4; ++shard)
+    {
+        ModelMemoryProfile one_q = profile;
+        one_q.tensors = {profile.tensors[0]};
+        one_q.total_native_bytes = one_q.tensors[0].native_bytes;
+        const std::optional<DeviceShardingAssignment> assignment =
+            tp.forRank(shard);
+        const auto q = WeightMemoryEstimator::estimate(
+            one_q,
+            devices[static_cast<size_t>(shard)],
+            shard,
+            4,
+            0,
+            0,
+            {},
+            assignment);
+        aggregate_q_bytes += q.device_bytes;
+
+        ModelMemoryProfile one_k = profile;
+        one_k.tensors = {profile.tensors[1]};
+        one_k.total_native_bytes = one_k.tensors[0].native_bytes;
+        const auto k = WeightMemoryEstimator::estimate(
+            one_k,
+            devices[static_cast<size_t>(shard)],
+            shard,
+            4,
+            0,
+            0,
+            {},
+            assignment);
+        EXPECT_EQ(k.device_bytes, complete_k_bytes)
+            << "shard=" << shard;
+    }
+    EXPECT_EQ(
+        aggregate_q_bytes,
+        896u * 896u * sizeof(float));
 }
 
 TEST(Test__WeightMemoryEstimator, PPSlice_OnlyCountsAssignedLayers)

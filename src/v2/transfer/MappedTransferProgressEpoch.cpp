@@ -236,10 +236,32 @@ namespace llaminar2
         if (!config_.device.is_gpu() || config_.slot_capacity == 0u ||
             config_.execution_lane_capacity == 0u ||
             config_.execution_lane_capacity > config_.slot_capacity ||
+            config_.execution_streams.empty() ||
+            config_.execution_streams.size() >
+                config_.execution_lane_capacity ||
             config_.maximum_bytes == 0u || config_.name.empty())
         {
             throw std::invalid_argument(
-                "Mapped transfer-progress epoch requires one GPU, positive command and execution-lane geometry, execution lanes no greater than command slots, and a stable name");
+                "Mapped transfer-progress epoch requires one GPU, positive command/lane/stream geometry, streams no greater than execution lanes, execution lanes no greater than command slots, and a stable name");
+        }
+        for (std::size_t index = 0u;
+             index < config_.execution_streams.size(); ++index)
+        {
+            const auto &stream = config_.execution_streams[index];
+            if (!stream.valid() || stream.device() != config_.device)
+            {
+                throw std::invalid_argument(
+                    "Mapped transfer-progress stream pool contains an invalid or wrong-device execution lane");
+            }
+            for (std::size_t previous = 0u; previous < index; ++previous)
+            {
+                if (config_.execution_streams[previous].stream() ==
+                    stream.stream())
+                {
+                    throw std::invalid_argument(
+                        "Mapped transfer-progress stream pool contains a duplicate physical stream identity");
+                }
+            }
         }
         if (config_.perf_device.empty())
             config_.perf_device = config_.device.toString();
@@ -336,11 +358,16 @@ namespace llaminar2
                      index < config_.execution_lane_capacity; ++index)
                 {
                     ExecutionLaneRuntime &lane = execution_lanes_[index];
-                    lane.stream = context_->getOrCreateAuxiliaryStream(
-                        "mapped_transfer_progress:" + config_.name +
-                            ":execution_lane:" +
-                            std::to_string(index),
-                        GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance);
+                    /* Every logical lane retains its own completion event, but
+                     * compatible lanes share the setup-owned physical stream
+                     * pool round-robin. All published lanes are therefore
+                     * enqueued in one bounded callback; no later host replay is
+                     * needed merely because runtime queue creation is bounded. */
+                    lane.stream = config_
+                                      .execution_streams[
+                                          index %
+                                          config_.execution_streams.size()]
+                                      .stream();
                     lane.terminal_event = context_->createEvent();
                     if (!lane.stream || !lane.terminal_event)
                     {
@@ -360,6 +387,8 @@ namespace llaminar2
              {"slot_capacity", std::to_string(config_.slot_capacity)},
              {"execution_lane_capacity",
               std::to_string(config_.execution_lane_capacity)},
+             {"execution_stream_capacity",
+              std::to_string(config_.execution_streams.size())},
              {"maximum_bytes", std::to_string(config_.maximum_bytes)},
              {"stream_class", "background_maintenance"},
              {"copy_mechanism", "async_dma"},
@@ -564,7 +593,10 @@ namespace llaminar2
             active_batch_started_ns_.store(
                 steadyNanoseconds(), std::memory_order_release);
             last_pending_warning_ns_.store(0u, std::memory_order_release);
-            LOG_DEBUG(
+            /* A batch boundary occurs for every reusable transfer generation.
+             * Keep this per-buffer traffic at TRACE so stress campaigns do
+             * not turn observability into part of the DMA critical path. */
+            LOG_TRACE(
                 "[MappedTransferProgressEpoch] Command batch became active"
                 << " device=" << config_.device.toString()
                 << " authority=" << config_.name
@@ -714,7 +746,10 @@ namespace llaminar2
         if (batch_drained)
         {
             active_batch_started_ns_.store(0u, std::memory_order_release);
-            LOG_DEBUG(
+            /* Completion is generation-frequency traffic, not a rare
+             * lifecycle summary. TRACE preserves diagnosis without making a
+             * 256-generation integration proof sensitive to log formatting. */
+            LOG_TRACE(
                 "[MappedTransferProgressEpoch] Command batch drained"
                 << " device=" << config_.device.toString()
                 << " authority=" << config_.name
@@ -1025,6 +1060,8 @@ namespace llaminar2
                 {{"device", config_.device.toString()},
                  {"execution_lane_capacity",
                   std::to_string(config_.execution_lane_capacity)},
+                 {"execution_stream_capacity",
+                  std::to_string(config_.execution_streams.size())},
                  {"stream_class", "background_maintenance"},
                  {"copy_mechanism", "async_dma"},
                  {"inference_wait", "false"},

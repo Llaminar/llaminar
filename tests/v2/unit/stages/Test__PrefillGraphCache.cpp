@@ -160,6 +160,7 @@ public:
     GraphUpdateResult tryUpdate() override { return GraphUpdateResult::Success; }
     [[nodiscard]] bool supportsExecutableUpdate() const noexcept override { return true; }
     bool hasExecutable() const override { return executable_; }
+    [[nodiscard]] std::size_t residentMemoryBytes() const noexcept override { return 0u; }
     size_t nodeCount() const override { return 1; }
     void reset() override { executable_ = false; }
     const char *backendName() const override { return "Fake"; }
@@ -220,6 +221,14 @@ public:
     void *collectiveComm() const override { return nullptr; }
     void synchronize() override {}
     void synchronizeStream(void *) override {}
+    GPUStreamExecutionState queryStreamExecutionState(
+        void *stream,
+        std::string_view boundary) override
+    {
+        if (!stream || boundary.empty())
+            throw std::invalid_argument("mock stream query requires an exact stream and boundary");
+        return GPUStreamExecutionState::Complete;
+    }
     bool insertStreamDependency(void *, void *) override { return true; }
 
     std::unique_ptr<IGPUGraphCapture> createGraphCapture() override
@@ -475,6 +484,38 @@ TEST(Test__PrefillGraphCache, SegmentedCandidatesDoNotAdmitFullContextGraphs)
         (std::vector<int>{128}));
     EXPECT_TRUE(
         segmentedPrefillGraphRowCandidates(buckets, 4096, 0).empty());
+}
+
+TEST(Test__PrefillGraphCache,
+     MTPSharedCapacityCannotManufactureAPrefillBucket)
+{
+    const int admitted_prefill_rows =
+        resolvePrefillScheduleRowCapacity(
+            /*admitted_prefill_rows=*/9,
+            /*configured_segment_rows=*/256);
+    ASSERT_EQ(admitted_prefill_rows, 9);
+
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 15;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    const int shared_graph_rows =
+        resolveRetainedGraphRowCapacity(admitted_prefill_rows, mtp);
+    ASSERT_EQ(shared_graph_rows, 16)
+        << "the physical graph arena must still cover depth plus bonus row";
+
+    EXPECT_EQ(
+        retainedRawPrefillGraphBucketLadder(
+            {9},
+            admitted_prefill_rows,
+            /*configured_floor=*/1,
+            /*maximum_bucket_count=*/4u),
+        (std::vector<int>{9}))
+        << "neither the larger verifier arena nor a logical suffix may "
+           "manufacture another prefill executable shape";
+    EXPECT_EQ(resolvePrefillScheduleRowCapacity(9, 4), 4);
+    EXPECT_EQ(resolvePrefillScheduleRowCapacity(0, 4), 0);
+    EXPECT_EQ(resolvePrefillScheduleRowCapacity(9, 0), 0);
 }
 
 TEST(Test__PrefillGraphCache, RawPromptFloorCannotExceedResidentCapacity)

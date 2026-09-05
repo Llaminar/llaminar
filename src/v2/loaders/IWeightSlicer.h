@@ -136,7 +136,10 @@ namespace llaminar2
         /**
          * @brief Compute fused QKV sub-block aware slicing for a device assignment
          *
-         * Like computeFusedQKVSlice but uses DeviceShardingAssignment instead of rank/ws.
+         * Unlike the rank/world overload, this method admits uneven TP widths
+         * by consuming the exact query- and KV-head ranges selected by
+         * TensorParallelConfig.  Replicated GQA KV ranges remain full slices;
+         * modulo-linked GDN returns every dependency-closed value span.
          *
          * @param name Weight tensor name
          * @param total_rows Total rows in the fused weight

@@ -1,50 +1,22 @@
 /**
  * @file GDNLiveStateAllGatherStage.cpp
- * @brief Implementation of GDN live-state LocalTP allgather handoff.
+ * @brief Captured modulo-linked GDN live-state allgather implementation.
+ *
+ * A raw equal-count collective produces `[rank0 groups | rank1 groups | ...]`.
+ * Full mirrored decode consumes `[Q all ranks | K all ranks | V repeat 0 all
+ * ranks | ...]`. The stage retains distinct gathered and full buffers so the
+ * device permutation is race-free and graph replay keeps every address stable.
  */
 
 #include "GDNLiveStateAllGatherStage.h"
 #include "../../../collective/ILocalTPContext.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../kernels/common/GDNLinkedStateLayout.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
-#include "../../../utils/PerfStatsCollector.h"
 
-#include <algorithm>
 #include <utility>
-
-#ifdef HAVE_CUDA
-extern "C"
-{
-    bool cudaGDN_compact_modular_conv_state(
-        const float *gathered,
-        float *full,
-        int degree,
-        int qk_channels,
-        int local_v_channels,
-        int full_v_channels,
-        int history_len,
-        int device_idx,
-        void *stream);
-}
-#endif
-
-#ifdef HAVE_ROCM
-extern "C"
-{
-    bool rocmGDN_compact_modular_conv_state(
-        const float *gathered,
-        float *full,
-        int degree,
-        int qk_channels,
-        int local_v_channels,
-        int full_v_channels,
-        int history_len,
-        int device_idx,
-        void *stream);
-}
-#endif
 
 namespace llaminar2
 {
@@ -55,69 +27,86 @@ namespace llaminar2
 
     std::string GDNLiveStateAllGatherStage::localConvBufferName() const
     {
-        return std::string(WS_LOCAL_CONV_STATE) + "_layer" + std::to_string(params_.layer_idx);
+        return std::string(WS_LOCAL_CONV_STATE) + "_layer" +
+               std::to_string(params_.layer_idx);
     }
 
     std::string GDNLiveStateAllGatherStage::gatheredConvBufferName() const
     {
-        return std::string(WS_GATHERED_CONV_STATE) + "_layer" + std::to_string(params_.layer_idx);
+        return std::string(WS_GATHERED_CONV_STATE) + "_layer" +
+               std::to_string(params_.layer_idx);
     }
 
     std::string GDNLiveStateAllGatherStage::fullConvBufferName() const
     {
-        return std::string(WS_FULL_CONV_STATE) + "_layer" + std::to_string(params_.layer_idx);
+        return std::string(WS_FULL_CONV_STATE) + "_layer" +
+               std::to_string(params_.layer_idx);
     }
 
     std::string GDNLiveStateAllGatherStage::localRecurrenceBufferName() const
     {
-        return std::string(WS_LOCAL_RECURRENCE_STATE) + "_layer" + std::to_string(params_.layer_idx);
+        return std::string(WS_LOCAL_RECURRENCE_STATE) + "_layer" +
+               std::to_string(params_.layer_idx);
+    }
+
+    std::string GDNLiveStateAllGatherStage::gatheredRecurrenceBufferName() const
+    {
+        return std::string(WS_GATHERED_RECURRENCE_STATE) + "_layer" +
+               std::to_string(params_.layer_idx);
     }
 
     std::string GDNLiveStateAllGatherStage::fullRecurrenceBufferName() const
     {
-        return std::string(WS_FULL_RECURRENCE_STATE) + "_layer" + std::to_string(params_.layer_idx);
+        return std::string(WS_FULL_RECURRENCE_STATE) + "_layer" +
+               std::to_string(params_.layer_idx);
     }
 
     bool GDNLiveStateAllGatherStage::execute(IDeviceContext *ctx)
     {
         if (!ensureContext(ctx, "GDNLiveStateAllGatherStage"))
             return false;
-
         return runLiveStateAllGather("graph_execution");
     }
 
-    bool GDNLiveStateAllGatherStage::requiresPostVerifierStatePublication() const
+    bool GDNLiveStateAllGatherStage::reassembleOnDevice(
+        const float *gathered,
+        float *full,
+        const GDNLinkedLiveStateShape &shape,
+        void *stream) const
     {
-        return true;
-    }
-
-    bool GDNLiveStateAllGatherStage::publishPostVerifierStateRestore(void *stream)
-    {
-        if (params_.device_id.is_gpu() && !stream)
+#ifdef HAVE_CUDA
+        if (params_.device_id.is_cuda())
         {
-            LOG_ERROR("[GDNLiveStateAllGatherStage] MTP verifier-state publication requires an explicit stream");
-            return false;
+            return cudaGDN_reassemble_modulo_linked_state(
+                gathered,
+                full,
+                shape.degree,
+                shape.global_key_heads,
+                params_.geometry.global_value_heads,
+                shape.key_elements_per_head,
+                shape.value_elements_per_head,
+                shape.prefix_group_count,
+                params_.device_id.cuda_ordinal(),
+                stream);
         }
-
-        void *previous_stream = gpuStream();
-        if (stream)
-            setGPUStream(stream);
-
-        const bool ok = runLiveStateAllGather("mtp_verifier_state_publication");
-        setGPUStream(previous_stream);
-
-        if (ok)
+#endif
+#ifdef HAVE_ROCM
+        if (params_.device_id.is_rocm())
         {
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "gdn_live_state_allgather_publications",
-                1.0,
-                "decode",
-                params_.device_id.toString(),
-                {{"layer", std::to_string(params_.layer_idx)},
-                 {"tp_device_idx", std::to_string(params_.tp_device_idx)}});
+            return rocmGDN_reassemble_modulo_linked_state(
+                gathered,
+                full,
+                shape.degree,
+                shape.global_key_heads,
+                params_.geometry.global_value_heads,
+                shape.key_elements_per_head,
+                shape.value_elements_per_head,
+                shape.prefix_group_count,
+                params_.device_id.rocm_ordinal(),
+                stream);
         }
-        return ok;
+#endif
+        return false;
     }
 
     bool GDNLiveStateAllGatherStage::runLiveStateAllGather(const char *context)
@@ -133,15 +122,23 @@ namespace llaminar2
             LOG_ERROR("[GDNLiveStateAllGatherStage] Missing LocalTP context");
             return false;
         }
-        if (params_.tp_device_idx < 0 || params_.tp_device_idx >= params_.tp_ctx->degree())
+        const int degree = params_.tp_ctx->degree();
+        if (degree <= 1 || params_.tp_device_idx < 0 ||
+            params_.tp_device_idx >= degree)
         {
-            LOG_ERROR("[GDNLiveStateAllGatherStage] Invalid TP device index "
-                      << params_.tp_device_idx << " degree=" << params_.tp_ctx->degree());
+            LOG_ERROR("[GDNLiveStateAllGatherStage] Invalid TP participant"
+                      << " participant=" << params_.tp_device_idx
+                      << " degree=" << degree);
             return false;
         }
         if (!bound_workspace_)
         {
             LOG_ERROR("[GDNLiveStateAllGatherStage] Workspace was not bound");
+            return false;
+        }
+        if (!params_.conv_kernel || !params_.recurrence_kernel)
+        {
+            LOG_ERROR("[GDNLiveStateAllGatherStage] Both kernel state owners are required");
             return false;
         }
 
@@ -152,268 +149,110 @@ namespace llaminar2
             return false;
         }
 
-        auto gather_conv = [&]() -> bool
+        const auto conv_shape = params_.geometry.resolve(
+            GDNLinkedLiveStateKind::ConvHistory,
+            degree);
+        const auto recurrence_shape = params_.geometry.resolve(
+            GDNLinkedLiveStateKind::Recurrence,
+            degree);
+        if (!conv_shape || !recurrence_shape)
         {
-            if (params_.local_conv_state_floats <= 0 && params_.full_conv_state_floats <= 0)
-                return true;
-            if (!params_.conv_kernel)
+            LOG_ERROR("[GDNLiveStateAllGatherStage] Invalid modulo-linked geometry"
+                      << " key_heads=" << params_.geometry.global_key_heads
+                      << " value_heads=" << params_.geometry.global_value_heads
+                      << " key_width=" << params_.geometry.key_width
+                      << " value_width=" << params_.geometry.value_width
+                      << " history=" << params_.geometry.conv_history_length
+                      << " degree=" << degree);
+            return false;
+        }
+
+        const auto gather_state = [&]<typename Kernel>(
+                                      Kernel *kernel,
+                                      const GDNLinkedLiveStateShape &shape,
+                                      const std::string &local_name,
+                                      const std::string &gathered_name,
+                                      const std::string &full_name,
+                                      const char *collective_suffix) -> bool
+        {
+            auto *local = static_cast<float *>(
+                bound_workspace_->getBuffer(local_name));
+            auto *gathered = static_cast<float *>(
+                bound_workspace_->getBuffer(gathered_name));
+            auto *full = static_cast<float *>(
+                bound_workspace_->getBuffer(full_name));
+            if (!local || !gathered || !full)
             {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Missing short-conv kernel");
+                LOG_ERROR("[GDNLiveStateAllGatherStage] Missing persistent "
+                          << collective_suffix << " workspace buffers");
                 return false;
             }
-            const int degree = params_.tp_ctx->degree();
-            const int gathered_conv_state_floats = params_.local_conv_state_floats * degree;
-            if (params_.local_conv_state_floats <= 0 ||
-                params_.full_conv_state_floats <= 0)
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Invalid conv state sizes"
-                          << " local=" << params_.local_conv_state_floats
-                          << " full=" << params_.full_conv_state_floats
-                          << " degree=" << degree);
-                return false;
-            }
-            if (params_.local_conv_state_floats == params_.full_conv_state_floats)
-            {
-                /*
-                 * Some phase-split paths begin prefill with replicated dense/GDN
-                 * weights already installed.  The short-conv kernel is therefore
-                 * already full-sized and there is nothing to gather.  Returning
-                 * here avoids treating an already-mirrored state as a malformed
-                 * TP-local state and, more importantly, avoids allgathering
-                 * degree * local floats into a full buffer that is only local
-                 * floats wide.
-                 */
-                return true;
-            }
-            if (!params_.modular_conv_state &&
-                params_.full_conv_state_floats != gathered_conv_state_floats)
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Uniform conv state requires full == local * degree"
-                          << " local=" << params_.local_conv_state_floats
-                          << " full=" << params_.full_conv_state_floats
-                          << " degree=" << degree);
-                return false;
-            }
-            if (params_.modular_conv_state)
-            {
-                const int expected_local =
-                    (params_.conv_qk_channels + params_.conv_local_v_channels) *
-                    params_.conv_history_len;
-                const int expected_full =
-                    (params_.conv_qk_channels + params_.conv_full_v_channels) *
-                    params_.conv_history_len;
-                if (params_.conv_history_len <= 0 ||
-                    params_.conv_qk_channels <= 0 ||
-                    params_.conv_local_v_channels <= 0 ||
-                    params_.conv_full_v_channels <= 0 ||
-                    params_.conv_full_v_channels != params_.conv_local_v_channels * degree ||
-                    params_.local_conv_state_floats != expected_local ||
-                    params_.full_conv_state_floats != expected_full)
-                {
-                    LOG_ERROR("[GDNLiveStateAllGatherStage] Invalid modular conv state layout"
-                              << " history=" << params_.conv_history_len
-                              << " qk_channels=" << params_.conv_qk_channels
-                              << " local_v_channels=" << params_.conv_local_v_channels
-                              << " full_v_channels=" << params_.conv_full_v_channels
-                              << " local=" << params_.local_conv_state_floats
-                              << " expected_local=" << expected_local
-                              << " full=" << params_.full_conv_state_floats
-                              << " expected_full=" << expected_full
-                              << " degree=" << degree);
-                    return false;
-                }
-                if (params_.full_conv_state_floats >= gathered_conv_state_floats)
-                {
-                    LOG_ERROR("[GDNLiveStateAllGatherStage] Modular conv state unexpectedly does not need compaction"
-                              << " full=" << params_.full_conv_state_floats
-                              << " gathered=" << gathered_conv_state_floats);
-                    return false;
-                }
-            }
-            else if (params_.conv_history_len != 0 ||
-                     params_.conv_qk_channels != 0 ||
-                     params_.conv_local_v_channels != 0 ||
-                     params_.conv_full_v_channels != 0)
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Uniform conv state must not carry modular layout fields");
-                return false;
-            }
-            const std::string local_name = localConvBufferName();
-            const std::string full_name = fullConvBufferName();
-            const std::string gathered_name = gatheredConvBufferName();
-            auto *local = static_cast<float *>(bound_workspace_->getBuffer(local_name));
-            auto *full = static_cast<float *>(bound_workspace_->getBuffer(full_name));
-            auto *gathered = params_.modular_conv_state
-                                 ? static_cast<float *>(bound_workspace_->getBuffer(gathered_name))
-                                 : full;
-            if (!local || !full)
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Missing conv workspace buffers");
-                return false;
-            }
-            if (params_.modular_conv_state && !gathered)
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Missing gathered modular conv workspace buffer");
-                return false;
-            }
-            if (!params_.conv_kernel->exportStateForSize(
-                    params_.local_conv_state_floats,
+
+            // Export selects the participant-local bank by exact size. No
+            // mutable host-side active-bank shadow participates in authority.
+            if (!kernel->exportStateForSize(
+                    shape.local_state_floats,
                     nullptr,
                     local,
                     stream))
             {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Failed to export short-conv state");
+                LOG_ERROR("[GDNLiveStateAllGatherStage] Failed to export "
+                          << collective_suffix << " state");
                 return false;
             }
             if (!params_.tp_ctx->allgatherRawOnStream(
                     local,
                     gathered,
-                    static_cast<size_t>(params_.local_conv_state_floats),
+                    static_cast<size_t>(shape.local_state_floats),
                     CollectiveDataType::FLOAT32,
                     params_.tp_device_idx,
                     stream,
-                    params_.stage_name + "_conv"))
+                    params_.stage_name + "_" + collective_suffix))
             {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Short-conv state allgather failed");
+                LOG_ERROR("[GDNLiveStateAllGatherStage] "
+                          << collective_suffix << " state allgather failed");
                 return false;
             }
-            if (params_.modular_conv_state)
+
+            // A distinct destination avoids read/write overlap while each
+            // thread maps one global group-major element from rank-major input.
+            if (!reassembleOnDevice(gathered, full, shape, stream))
             {
-                bool compact_ok = false;
-#ifdef HAVE_CUDA
-                if (params_.device_id.is_cuda())
-                {
-                    compact_ok = cudaGDN_compact_modular_conv_state(
-                        gathered,
-                        full,
-                        degree,
-                        params_.conv_qk_channels,
-                        params_.conv_local_v_channels,
-                        params_.conv_full_v_channels,
-                        params_.conv_history_len,
-                        params_.device_id.cuda_ordinal(),
-                        stream);
-                }
-#endif
-#ifdef HAVE_ROCM
-                if (params_.device_id.is_rocm())
-                {
-                    compact_ok = rocmGDN_compact_modular_conv_state(
-                        gathered,
-                        full,
-                        degree,
-                        params_.conv_qk_channels,
-                        params_.conv_local_v_channels,
-                        params_.conv_full_v_channels,
-                        params_.conv_history_len,
-                        params_.device_id.rocm_ordinal(),
-                        stream);
-                }
-#endif
-                if (!compact_ok)
-                {
-                    LOG_ERROR("[GDNLiveStateAllGatherStage] Modular short-conv state compaction failed");
-                    return false;
-                }
+                LOG_ERROR("[GDNLiveStateAllGatherStage] "
+                          << collective_suffix
+                          << " modulo-linked reassembly failed");
+                return false;
             }
-            /*
-             * Kernel construction binds both local-prefill and mirrored-decode
-             * banks before any graph is captured. Importing by exact geometry
-             * selects that stable full-size bank; execution is never allowed to
-             * repair capacity or replace a captured address.
-             */
-            if (!params_.conv_kernel->importStateForSize(
-                    params_.full_conv_state_floats,
+            if (!kernel->importStateForSize(
+                    shape.full_state_floats,
                     nullptr,
                     full,
                     stream))
             {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Failed to import full short-conv state");
+                LOG_ERROR("[GDNLiveStateAllGatherStage] Failed to import full "
+                          << collective_suffix << " state");
                 return false;
             }
             return true;
         };
 
-        auto gather_recurrence = [&]() -> bool
-        {
-            if (params_.local_recurrence_state_floats <= 0 &&
-                params_.full_recurrence_state_floats <= 0)
-                return true;
-            if (!params_.recurrence_kernel)
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Missing recurrence kernel");
-                return false;
-            }
-            if (params_.local_recurrence_state_floats > 0 &&
-                params_.full_recurrence_state_floats > 0 &&
-                params_.local_recurrence_state_floats ==
-                    params_.full_recurrence_state_floats)
-            {
-                /*
-                 * Matching local/full recurrence sizes mean the graph is already
-                 * operating on mirrored dense state.  There is no TP-local
-                 * recurrence bank to gather, so preserve the current kernel
-                 * state and let downstream replicated decode consume it.
-                 */
-                return true;
-            }
-            if (params_.local_recurrence_state_floats <= 0 ||
-                params_.full_recurrence_state_floats <= 0 ||
-                params_.full_recurrence_state_floats !=
-                    params_.local_recurrence_state_floats * params_.tp_ctx->degree())
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Invalid recurrence state sizes"
-                          << " local=" << params_.local_recurrence_state_floats
-                          << " full=" << params_.full_recurrence_state_floats
-                          << " degree=" << params_.tp_ctx->degree());
-                return false;
-            }
-            const std::string local_name = localRecurrenceBufferName();
-            const std::string full_name = fullRecurrenceBufferName();
-            auto *local = static_cast<float *>(bound_workspace_->getBuffer(local_name));
-            auto *full = static_cast<float *>(bound_workspace_->getBuffer(full_name));
-            if (!local || !full)
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Missing recurrence workspace buffers");
-                return false;
-            }
-            if (!params_.recurrence_kernel->exportStateForSize(
-                    params_.local_recurrence_state_floats,
-                    nullptr,
-                    local,
-                    stream))
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Failed to export recurrence state");
-                return false;
-            }
-            if (!params_.tp_ctx->allgatherRawOnStream(
-                    local,
-                    full,
-                    static_cast<size_t>(params_.local_recurrence_state_floats),
-                    CollectiveDataType::FLOAT32,
-                    params_.tp_device_idx,
-                    stream,
-                    params_.stage_name + "_recurrence"))
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Recurrence state allgather failed");
-                return false;
-            }
-            if (!params_.recurrence_kernel->importStateForSize(
-                    params_.full_recurrence_state_floats,
-                    nullptr,
-                    full,
-                    stream))
-            {
-                LOG_ERROR("[GDNLiveStateAllGatherStage] Failed to import full recurrence state");
-                return false;
-            }
-            return true;
-        };
-
-        const bool ok = gather_conv() && gather_recurrence();
+        const bool ok = gather_state(
+                            params_.conv_kernel,
+                            *conv_shape,
+                            localConvBufferName(),
+                            gatheredConvBufferName(),
+                            fullConvBufferName(),
+                            "conv") &&
+                        gather_state(
+                            params_.recurrence_kernel,
+                            *recurrence_shape,
+                            localRecurrenceBufferName(),
+                            gatheredRecurrenceBufferName(),
+                            fullRecurrenceBufferName(),
+                            "recurrence");
         if (ok)
         {
-            LOG_DEBUG("[GDNLiveStateAllGatherStage] Gathered full GDN live state"
+            LOG_DEBUG("[GDNLiveStateAllGatherStage] Published modulo-linked full GDN state"
                       << " layer=" << params_.layer_idx
                       << " device=" << params_.device_id.toString()
                       << " tp_device_idx=" << params_.tp_device_idx
@@ -424,19 +263,26 @@ namespace llaminar2
 
     size_t GDNLiveStateAllGatherStage::estimatedMemoryBytes() const
     {
-        const int gathered_conv_state_floats =
-            params_.modular_conv_state && params_.tp_ctx
-                ? params_.local_conv_state_floats * params_.tp_ctx->degree()
-                : 0;
-        return (static_cast<size_t>(std::max(params_.local_conv_state_floats, 0)) +
-                static_cast<size_t>(std::max(gathered_conv_state_floats, 0)) +
-                static_cast<size_t>(std::max(params_.full_conv_state_floats, 0)) +
-                static_cast<size_t>(std::max(params_.local_recurrence_state_floats, 0)) +
-                static_cast<size_t>(std::max(params_.full_recurrence_state_floats, 0))) *
-               sizeof(float);
+        if (!params_.tp_ctx)
+            return 0;
+        const auto conv = params_.geometry.resolve(
+            GDNLinkedLiveStateKind::ConvHistory,
+            params_.tp_ctx->degree());
+        const auto recurrence = params_.geometry.resolve(
+            GDNLinkedLiveStateKind::Recurrence,
+            params_.tp_ctx->degree());
+        if (!conv || !recurrence)
+            return 0;
+        const size_t total_floats =
+            static_cast<size_t>(conv->local_state_floats) +
+            2ULL * static_cast<size_t>(conv->full_state_floats) +
+            static_cast<size_t>(recurrence->local_state_floats) +
+            2ULL * static_cast<size_t>(recurrence->full_state_floats);
+        return total_floats * sizeof(float);
     }
 
-    bool GDNLiveStateAllGatherStage::supportsBackend(ComputeBackendType backend) const
+    bool GDNLiveStateAllGatherStage::supportsBackend(
+        ComputeBackendType backend) const
     {
         switch (backend)
         {
@@ -455,8 +301,11 @@ namespace llaminar2
 
     bool GDNLiveStateAllGatherStage::isGraphCapturable() const
     {
-        if (!params_.device_id.is_gpu() || !params_.tp_ctx)
+        if (!params_.device_id.is_gpu() || !params_.tp_ctx ||
+            !params_.conv_kernel || !params_.recurrence_kernel)
+        {
             return false;
+        }
         bool backend_supported = false;
 #ifdef HAVE_CUDA
         backend_supported = backend_supported || params_.device_id.is_cuda();
@@ -464,24 +313,17 @@ namespace llaminar2
 #ifdef HAVE_ROCM
         backend_supported = backend_supported || params_.device_id.is_rocm();
 #endif
-        if (!backend_supported)
-            return false;
-        if (params_.tp_device_idx < 0 || params_.tp_device_idx >= params_.tp_ctx->degree())
-            return false;
-        if (params_.tp_ctx->degree() <= 1)
-            return false;
-        if (params_.local_conv_state_floats < 0 ||
-            params_.full_conv_state_floats < 0 ||
-            params_.local_recurrence_state_floats < 0 ||
-            params_.full_recurrence_state_floats < 0)
-            return false;
-        if ((params_.local_conv_state_floats > 0 || params_.full_conv_state_floats > 0) &&
-            !params_.conv_kernel)
-            return false;
-        if ((params_.local_recurrence_state_floats > 0 || params_.full_recurrence_state_floats > 0) &&
-            !params_.recurrence_kernel)
-            return false;
-        return params_.tp_ctx->supportsRawAllgatherOnStreamGraphCapture();
+        const int degree = params_.tp_ctx->degree();
+        return backend_supported && degree > 1 &&
+               params_.tp_device_idx >= 0 &&
+               params_.tp_device_idx < degree &&
+               params_.geometry.resolve(
+                   GDNLinkedLiveStateKind::ConvHistory,
+                   degree).has_value() &&
+               params_.geometry.resolve(
+                   GDNLinkedLiveStateKind::Recurrence,
+                   degree).has_value() &&
+               params_.tp_ctx->supportsRawAllgatherOnStreamGraphCapture();
     }
 
     StageDumpInfo GDNLiveStateAllGatherStage::buildDumpInfoImpl() const
@@ -489,19 +331,43 @@ namespace llaminar2
         StageDumpInfo info;
         info.addScalarInt("layer_idx", params_.layer_idx)
             .addScalarInt("tp_device_idx", params_.tp_device_idx)
-            .addScalarInt("local_conv_state_floats", params_.local_conv_state_floats)
-            .addScalarInt("full_conv_state_floats", params_.full_conv_state_floats)
-            .addScalarBool("modular_conv_state", params_.modular_conv_state)
-            .addScalarInt("conv_history_len", params_.conv_history_len)
-            .addScalarInt("conv_qk_channels", params_.conv_qk_channels)
-            .addScalarInt("conv_local_v_channels", params_.conv_local_v_channels)
-            .addScalarInt("conv_full_v_channels", params_.conv_full_v_channels)
-            .addScalarInt("local_recurrence_state_floats", params_.local_recurrence_state_floats)
-            .addScalarInt("full_recurrence_state_floats", params_.full_recurrence_state_floats);
+            .addScalarInt("global_key_heads", params_.geometry.global_key_heads)
+            .addScalarInt("global_value_heads", params_.geometry.global_value_heads)
+            .addScalarInt("key_width", params_.geometry.key_width)
+            .addScalarInt("value_width", params_.geometry.value_width)
+            .addScalarInt(
+                "conv_history_length",
+                params_.geometry.conv_history_length);
+        if (params_.tp_ctx)
+        {
+            if (const auto conv = params_.geometry.resolve(
+                    GDNLinkedLiveStateKind::ConvHistory,
+                    params_.tp_ctx->degree()))
+            {
+                info.addScalarInt(
+                        "local_conv_state_floats",
+                        conv->local_state_floats)
+                    .addScalarInt(
+                        "full_conv_state_floats",
+                        conv->full_state_floats);
+            }
+            if (const auto recurrence = params_.geometry.resolve(
+                    GDNLinkedLiveStateKind::Recurrence,
+                    params_.tp_ctx->degree()))
+            {
+                info.addScalarInt(
+                        "local_recurrence_state_floats",
+                        recurrence->local_state_floats)
+                    .addScalarInt(
+                        "full_recurrence_state_floats",
+                        recurrence->full_state_floats);
+            }
+        }
         return info;
     }
 
-    StageBufferRequirements GDNLiveStateAllGatherStage::getBufferRequirements() const
+    StageBufferRequirements
+    GDNLiveStateAllGatherStage::getBufferRequirements() const
     {
         return {};
     }
@@ -511,53 +377,67 @@ namespace llaminar2
         return {};
     }
 
-    WorkspaceRequirements GDNLiveStateAllGatherStage::getWorkspaceRequirements(int m, int n, int k) const
+    WorkspaceRequirements
+    GDNLiveStateAllGatherStage::getWorkspaceRequirements(
+        int m,
+        int n,
+        int k) const
     {
         (void)m;
         (void)n;
         (void)k;
-        WorkspaceRequirements reqs;
-        if (params_.local_conv_state_floats > 0)
+        WorkspaceRequirements requirements;
+        if (!params_.tp_ctx)
+            return requirements;
+
+        const auto append_state_buffers = [&requirements](
+                                              const std::string &local,
+                                              const std::string &gathered,
+                                              const std::string &full,
+                                              const GDNLinkedLiveStateShape &shape)
         {
-            reqs.buffers.push_back({localConvBufferName(),
-                                    static_cast<size_t>(params_.local_conv_state_floats) * sizeof(float),
-                                    256,
-                                    true});
-        }
-        if (params_.modular_conv_state && params_.tp_ctx && params_.local_conv_state_floats > 0)
+            requirements.buffers.push_back(
+                {local,
+                 static_cast<size_t>(shape.local_state_floats) * sizeof(float),
+                 256,
+                 true});
+            requirements.buffers.push_back(
+                {gathered,
+                 static_cast<size_t>(shape.full_state_floats) * sizeof(float),
+                 256,
+                 true});
+            requirements.buffers.push_back(
+                {full,
+                 static_cast<size_t>(shape.full_state_floats) * sizeof(float),
+                 256,
+                 true});
+        };
+
+        if (const auto conv = params_.geometry.resolve(
+                GDNLinkedLiveStateKind::ConvHistory,
+                params_.tp_ctx->degree()))
         {
-            reqs.buffers.push_back({gatheredConvBufferName(),
-                                    static_cast<size_t>(params_.local_conv_state_floats) *
-                                        static_cast<size_t>(params_.tp_ctx->degree()) *
-                                        sizeof(float),
-                                    256,
-                                    true});
+            append_state_buffers(
+                localConvBufferName(),
+                gatheredConvBufferName(),
+                fullConvBufferName(),
+                *conv);
         }
-        if (params_.full_conv_state_floats > 0)
+        if (const auto recurrence = params_.geometry.resolve(
+                GDNLinkedLiveStateKind::Recurrence,
+                params_.tp_ctx->degree()))
         {
-            reqs.buffers.push_back({fullConvBufferName(),
-                                    static_cast<size_t>(params_.full_conv_state_floats) * sizeof(float),
-                                    256,
-                                    true});
+            append_state_buffers(
+                localRecurrenceBufferName(),
+                gatheredRecurrenceBufferName(),
+                fullRecurrenceBufferName(),
+                *recurrence);
         }
-        if (params_.local_recurrence_state_floats > 0)
-        {
-            reqs.buffers.push_back({localRecurrenceBufferName(),
-                                    static_cast<size_t>(params_.local_recurrence_state_floats) * sizeof(float),
-                                    256,
-                                    true});
-        }
-        if (params_.full_recurrence_state_floats > 0)
-        {
-            reqs.buffers.push_back({fullRecurrenceBufferName(),
-                                    static_cast<size_t>(params_.full_recurrence_state_floats) * sizeof(float),
-                                    256,
-                                    true});
-        }
-        return reqs;
+        return requirements;
     }
 
-    void GDNLiveStateAllGatherStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    void GDNLiveStateAllGatherStage::bindWorkspace(
+        DeviceWorkspaceManager *workspace)
     {
         bound_workspace_ = workspace;
     }

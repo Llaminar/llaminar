@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Content identity and atomic metadata publication for parity references.
+"""Typed identity and atomic metadata publication for parity references.
 
 Production parity snapshots are expensive, long-lived artifacts.  A directory
-name or model pathname is not sufficient proof that the NumPy checkpoints came
-from the GGUF bytes exercised by the native runner.  This module gives every
-reference pack an exact model, prompt, tokenizer-output, and decode-depth
-identity and publishes ``metadata.txt`` only after all snapshot files exist.
+name alone is not sufficient to diagnose a misselected model fixture. This
+module records a cheap model filename/size descriptor plus exact prompt,
+tokenizer-output, and decode-depth identity, then publishes ``metadata.txt``
+only after all snapshot files exist. Full model hashing is intentionally absent:
+the native campaign's numerical checkpoints prove weight-content equivalence.
 """
 
 from __future__ import annotations
@@ -21,25 +22,6 @@ REFERENCE_IDENTITY_VERSION = 1
 REFERENCE_ENGINE = "pytorch"
 REFERENCE_DEVICE = "cpu"
 REFERENCE_DTYPE = "float32"
-_HASH_CHUNK_BYTES = 8 * 1024 * 1024
-
-
-def sha256_file(path: Path) -> str:
-    """Return the SHA-256 of one regular file using bounded memory."""
-
-    resolved = path.expanduser().resolve(strict=True)
-    if not resolved.is_file():
-        raise ValueError(
-            f"production parity model identity requires a regular file: {resolved}"
-        )
-
-    digest = hashlib.sha256()
-    with resolved.open("rb") as source:
-        while chunk := source.read(_HASH_CHUNK_BYTES):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def sha256_text(value: str) -> str:
     """Hash the exact UTF-8 bytes of a prompt or canonical scalar field."""
 
@@ -50,7 +32,8 @@ def sha256_text(value: str) -> str:
 class ReferenceIdentity:
     """Exact provenance fields shared by every parity snapshot generator."""
 
-    model_sha256: str
+    model_filename: str
+    model_size_bytes: int
     prompt_sha256: str
     token_ids_sha256: str
     decode_steps: int
@@ -63,7 +46,8 @@ class ReferenceIdentity:
             f"reference_engine: {REFERENCE_ENGINE}",
             f"reference_device: {REFERENCE_DEVICE}",
             f"reference_dtype: {REFERENCE_DTYPE}",
-            f"model_sha256: {self.model_sha256}",
+            f"model_filename: {self.model_filename}",
+            f"model_size_bytes: {self.model_size_bytes}",
             f"prompt_sha256: {self.prompt_sha256}",
             f"token_ids_sha256: {self.token_ids_sha256}",
             f"decode_steps: {self.decode_steps}",
@@ -76,15 +60,27 @@ def build_reference_identity(
     token_ids: Iterable[int],
     decode_steps: int,
 ) -> ReferenceIdentity:
-    """Build a reference identity from the exact inference inputs."""
+    """Build a reference identity from the declared inference inputs."""
 
     if decode_steps < 0:
         raise ValueError("decode_steps must be non-negative")
     canonical_tokens = ",".join(str(int(token)) for token in token_ids)
     if not canonical_tokens:
         raise ValueError("reference tokenizer produced no token IDs")
+    resolved_model = Path(model_path).expanduser().resolve(strict=True)
+    if not resolved_model.is_file():
+        raise ValueError(
+            "production parity model identity requires a regular file: "
+            f"{resolved_model}"
+        )
+    model_size_bytes = resolved_model.stat().st_size
+    if model_size_bytes <= 0:
+        raise ValueError(
+            f"production parity model identity requires a nonempty file: {resolved_model}"
+        )
     return ReferenceIdentity(
-        model_sha256=sha256_file(Path(model_path)),
+        model_filename=resolved_model.name,
+        model_size_bytes=model_size_bytes,
         prompt_sha256=sha256_text(prompt),
         token_ids_sha256=sha256_text(canonical_tokens),
         decode_steps=decode_steps,

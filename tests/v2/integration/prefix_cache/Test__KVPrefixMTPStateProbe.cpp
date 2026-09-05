@@ -24,6 +24,7 @@
 #include "execution/mtp/MTPStateTransaction.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/cpu/CPUHybridRingKVCache.h"
 #include "loaders/PreparedWeightStore.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "loaders/ModelLoader.h"
@@ -4558,6 +4559,114 @@ namespace
     };
 } // namespace
 
+/**
+ * @brief Integrate CPU GDN capture with the placement-aware restore contract.
+ *
+ * Dynamic ExpertOverlay may publish a new placement between independent
+ * requests.  The cached prefix remains exact, while its recomputed suffix and
+ * resulting GDN bank may differ in floating-point bytes.  This model-free
+ * integration proof captures real host-owned hybrid-cache state and verifies
+ * that the typed comparison remains exact within one movement epoch, then
+ * admits only complete, bounded numerical state across epochs.
+ */
+TEST(Test__KVPrefixMTPStateProbe,
+     CPUGDNPrefixRestoreComparisonIsExactWithinEpochAndNumericalAcrossMovement)
+{
+    HybridKVCacheConfig hybrid;
+    hybrid.layer_types = {"gdn"};
+    hybrid.gdn_conv_kernel_size = 4;
+    hybrid.gdn_state_size = 8;
+    hybrid.gdn_inner_size = 16;
+    hybrid.gdn_group_count = 2;
+    hybrid.gdn_time_step_rank = 2;
+    hybrid.n_heads = 2;
+
+    MPIContext mpi(/*rank=*/0, /*world_size=*/1, MPI_COMM_WORLD);
+    CPUHybridRingKVCacheFP32 cache(
+        hybrid,
+        mpi,
+        /*n_layers=*/1,
+        /*batch_size=*/1,
+        /*max_seq_len=*/8,
+        /*n_kv_heads=*/2,
+        /*head_dim=*/8,
+        DeviceId::cpu());
+
+    HybridGDNLayerState *state = cache.getGDNState(/*layer=*/0);
+    ASSERT_NE(state, nullptr);
+    ASSERT_FALSE(state->recurrence_state.empty());
+    ASSERT_FALSE(state->conv_state.empty());
+    for (size_t index = 0; index < state->recurrence_state.size(); ++index)
+    {
+        state->recurrence_state[index] =
+            1.0f + static_cast<float>(index) * 0.01f;
+    }
+    for (size_t index = 0; index < state->conv_state.size(); ++index)
+    {
+        state->conv_state[index] =
+            2.0f + static_cast<float>(index) * 0.01f;
+    }
+
+    PrefixProbeCapturePolicy capture_policy;
+    capture_policy.capture_gdn_values = true;
+    PrefixRuntimeStateSnapshot oracle;
+    oracle.initialized = true;
+    oracle.current_position = 7;
+    oracle.positions = {7};
+    oracle.sequence_lengths = {7};
+    oracle.moe_runtime_movement_epoch = 4;
+    oracle.gdn_layers = inspectHybridGDNForPrefixProbe(
+        cache,
+        /*stream=*/nullptr,
+        capture_policy);
+    ASSERT_EQ(oracle.gdn_layers.size(), 1u);
+
+    state->recurrence_state[1] += 1e-4f;
+    state->conv_state[2] += 1e-4f;
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    candidate.gdn_layers = inspectHybridGDNForPrefixProbe(
+        cache,
+        /*stream=*/nullptr,
+        capture_policy);
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.gdn_state_policy =
+        MTPGDNStateComparisonPolicy::ExactUnlessMoEPlacementChanged;
+    options.gdn_relative_l2_tolerance = 1e-3;
+    options.gdn_max_abs_tolerance = 1e-3;
+    options.gdn_min_cosine = 0.999999;
+
+    const auto same_epoch =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(same_epoch);
+    EXPECT_FALSE(same_epoch.gdn_numerical.compared);
+
+    candidate.moe_runtime_movement_epoch = 5;
+    const auto changed_epoch =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_TRUE(changed_epoch) << changed_epoch.reason;
+    EXPECT_TRUE(changed_epoch.gdn_numerical.compared);
+    EXPECT_TRUE(changed_epoch.gdn_numerical.passed);
+    EXPECT_EQ(changed_epoch.gdn_numerical.payloads, 2u);
+    EXPECT_EQ(
+        changed_epoch.gdn_numerical.elements,
+        state->recurrence_state.size() + state->conv_state.size());
+
+    PrefixProbeCapturePolicy hashes_only;
+    PrefixRuntimeStateSnapshot incomplete_candidate = candidate;
+    incomplete_candidate.gdn_layers = inspectHybridGDNForPrefixProbe(
+        cache,
+        /*stream=*/nullptr,
+        hashes_only);
+    const auto missing_values =
+        compareMTPRuntimeStateSnapshots(oracle, incomplete_candidate, options);
+    ASSERT_FALSE(missing_values);
+    EXPECT_NE(
+        missing_values.reason.find("complete retained values"),
+        std::string::npos)
+        << missing_values.reason;
+}
+
 TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_ResetStateInventory)
 {
     if (!std::filesystem::exists(kDenseModelPath))
@@ -5578,7 +5687,8 @@ void runQwen36PaddedPrefillMTPGraphCaptureRegression(
     MTPRuntimeSnapshotComparisonOptions state_compare_options;
     state_compare_options.compare_main_kv_payload_hashes = true;
     state_compare_options.compare_shifted_mtp_kv = true;
-    state_compare_options.compare_gdn_hashes = true;
+    state_compare_options.gdn_state_policy =
+        MTPGDNStateComparisonPolicy::ExactBytes;
     for (const auto &[phase_name, state] :
          std::vector<std::pair<std::string, PrefixRuntimeStateSnapshot>>{
              {"warmup", warmup_state},
@@ -6344,7 +6454,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
     MTPRuntimeSnapshotComparisonOptions compare_options;
     compare_options.compare_main_kv_payload_hashes = true;
     compare_options.compare_shifted_mtp_kv = false;
-    compare_options.compare_gdn_hashes = true;
+    compare_options.gdn_state_policy =
+        MTPGDNStateComparisonPolicy::ExactBytes;
 
     const MTPStateValidationResult full_vs_split =
         compareMTPRuntimeStateSnapshots(
@@ -6724,7 +6835,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
     MTPRuntimeSnapshotComparisonOptions compare_options;
     compare_options.compare_main_kv_payload_hashes = true;
     compare_options.compare_shifted_mtp_kv = false;
-    compare_options.compare_gdn_hashes = true;
+    compare_options.gdn_state_policy =
+        MTPGDNStateComparisonPolicy::ExactBytes;
 
     const MTPStateValidationResult full_vs_split =
         compareMTPRuntimeStateSnapshots(
@@ -7352,7 +7464,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36SingleCUDAPaddedPrefillMatchesExactActiv
     MTPRuntimeSnapshotComparisonOptions compare_options;
     compare_options.compare_main_kv_payload_hashes = true;
     compare_options.compare_shifted_mtp_kv = false;
-    compare_options.compare_gdn_hashes = true;
+    compare_options.gdn_state_policy =
+        MTPGDNStateComparisonPolicy::ExactBytes;
     const MTPStateValidationResult state_equivalence =
         compareMTPRuntimeStateSnapshots(
             exact_state,

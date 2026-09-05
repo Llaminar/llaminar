@@ -94,9 +94,8 @@ namespace llaminar2
                 MoEOverlayEconomyCertificationTarget::ResidencyAuthority;
             MoERoutedExpertModelMetadata model_metadata;
             MoEOverlayMigrationEconomyPolicy economy_policy;
-            /** Immutable phases reachable under this instance's MTP policy. */
-            ExpertHistogramProductionSourceMask active_sources =
-                kAllExpertHistogramProductionSources;
+            /** Graph reachability and economy-priced subset for every layer. */
+            ExpertHistogramProductionTopology production_topology;
             /** Optional all-rank service and attempt evidence lane. */
             std::shared_ptr<IMoEOverlayEconomyEvidenceExchange>
                 evidence_exchange;

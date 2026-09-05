@@ -6,6 +6,7 @@
  */
 
 #include "../../backends/DeviceId.h"
+#include "../../planning/PhysicalMemoryAuthority.h"
 #include "DeviceMoERebalanceController.h"
 #include "GpuExpertSlotPool.h"
 
@@ -19,6 +20,7 @@ namespace llaminar2
 {
     class IBackend;
     class LoadOrchestrator;
+    struct MoEOverlayLayerWeightManifest;
 
     /**
      * @brief Owns stable device allocations used to receive graph-side MoE arrivals.
@@ -43,6 +45,21 @@ namespace llaminar2
         };
 
         /**
+         * @brief Exact physical allocation owned by one transfer directory.
+         *
+         * Payload bytes are the single allocator-owned `WeightVRAMPool`
+         * region. Descriptor bytes cover the mutable table and immutable
+         * request-reset baseline. Keeping both terms together makes setup
+         * admission and runtime claims consume one byte-identical contract.
+         */
+        struct AllocationBOM
+        {
+            size_t payload_bytes = 0;
+            size_t descriptor_bytes = 0;
+            size_t total_bytes = 0;
+        };
+
+        /**
          * @brief Merge exact per-layer formats into one reusable allocation profile.
          *
          * The returned allocation takes the component-wise maximum payload and
@@ -56,6 +73,23 @@ namespace llaminar2
          */
         static FormatProfile profileForLayerFormats(
             const std::vector<std::vector<ProjectionSpec>> &layer_formats);
+
+        /**
+         * @brief Derive the reusable device profile from model-authenticated metadata.
+         *
+         * Every quantized source codebook is converted through the same
+         * NativeVNNI execution/allocation catalog used by CUDA and ROCm weight
+         * preparation. This setup-time form lets physical-memory admission run
+         * before prepared engines and their device pointers exist.
+         *
+         * @param layer_weight_manifest Contiguous gate/up/down model manifest.
+         * @return Cross-layer allocation and wire-capacity union.
+         * @throws std::invalid_argument for floating, malformed, or
+         *         uncatalogued projection formats.
+         */
+        static FormatProfile profileForLayerWeightManifest(
+            const std::vector<MoEOverlayLayerWeightManifest> &
+                layer_weight_manifest);
 
         /**
          * @brief Describe the persistent and transactional capacity of one directory.
@@ -120,7 +154,75 @@ namespace llaminar2
             uint32_t transfer_wave_slots,
             uint32_t transfer_buffer_count);
 
+        /**
+         * @brief Resolve the complete active/staging capacity from runtime policy.
+         * @param config Complete device-side rebalance domain geometry.
+         * @param minimum_active_slots Additional non-durable operation demand,
+         *        such as one current-batch LLEP payload window.
+         * @param transfer_wave_slots Maximum experts prepared by one wave.
+         * @param transfer_buffer_count Independently retained arrival waves.
+         * @return Exact capacity shared by admission and graph materialization.
+         * @throws std::invalid_argument when the resulting capacity is empty
+         *         or exceeds the device transfer-slot ABI.
+         */
+        static BufferedCapacity planRuntimeCapacity(
+            const DeviceMoERebalanceConfig &config,
+            uint64_t minimum_active_slots,
+            uint32_t transfer_wave_slots,
+            uint32_t transfer_buffer_count);
+
+        /**
+         * @brief Price one directory through the concrete allocator contracts.
+         *
+         * The calculation uses `WeightVRAMPool` planning rather than copying
+         * its 256-byte region-alignment arithmetic. No backend or device is
+         * touched, so this method is safe during pure capacity admission.
+         *
+         * @param capacity Typed active/staging directory capacity.
+         * @param format_profile Exact reusable projection profile.
+         * @return Payload, descriptor, and total physical bytes.
+         * @throws std::invalid_argument for incoherent capacity or format data.
+         * @throws std::overflow_error when the complete allocation cannot be
+         *         represented by `size_t`.
+         */
+        static AllocationBOM allocationBOM(
+            BufferedCapacity capacity,
+            const FormatProfile &format_profile);
+
+        /**
+         * @brief Materialize one production directory against admitted VRAM.
+         * @param backend Exact CUDA or ROCm allocation/copy authority.
+         * @param device Physical GPU identity charged by memory admission.
+         * @param device_ordinal Backend-local ordinal matching @p device.
+         * @param participant_id Stable routed-expert participant identity.
+         * @param capacity Exact active and arrival-wave slot capacity.
+         * @param format_profile Allocation union for every runtime layer.
+         * @param memory_authority Canonical admitted physical-memory ledger.
+         * @return Model-lifetime owner of all payload and descriptor storage.
+         * @throws std::invalid_argument for incomplete topology or admission.
+         * @throws std::runtime_error when device materialization fails.
+         */
         static std::shared_ptr<DeviceMoETransferSlotDirectory> create(
+            IBackend *backend,
+            DeviceId device,
+            int device_ordinal,
+            uint32_t participant_id,
+            BufferedCapacity capacity,
+            FormatProfile format_profile,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority);
+
+        /**
+         * @brief Allocate an unadmitted directory at a named device-test boundary.
+         * @param backend Exact test backend.
+         * @param device Physical test GPU.
+         * @param device_ordinal Backend-local ordinal matching @p device.
+         * @param participant_id Test participant identity.
+         * @param slot_count Total fixture slots; active/staging semantics are
+         *        intentionally absent from this test-only boundary.
+         * @param format_profile Exact test allocation profile.
+         * @return Test-owned directory using the unadmitted allocation token.
+         */
+        static std::shared_ptr<DeviceMoETransferSlotDirectory> createForTest(
             IBackend *backend,
             DeviceId device,
             int device_ordinal,
@@ -128,6 +230,7 @@ namespace llaminar2
             uint32_t slot_count,
             FormatProfile format_profile);
 
+        /** @brief Release descriptor arrays before their payload-pool owner. */
         ~DeviceMoETransferSlotDirectory();
 
         DeviceMoETransferSlotDirectory(const DeviceMoETransferSlotDirectory &) = delete;
@@ -171,6 +274,8 @@ namespace llaminar2
             uint32_t expected_participant_id) const;
 
         uint32_t slotCount() const { return slot_count_; }
+        /** @return Typed active/staging capacity admitted for production use. */
+        BufferedCapacity capacity() const noexcept { return capacity_; }
         const std::vector<DeviceMoEExpertDirectoryEntry> &hostEntriesForTest() const { return host_entries_; }
         size_t plannedBytes() const { return planned_bytes_; }
         size_t wirePayloadBytes() const { return wire_payload_bytes_; }
@@ -210,33 +315,59 @@ namespace llaminar2
                                DeviceMoEExpertDescriptor &out) const;
 
     private:
+        /** @brief Retain every already-materialized allocation and its ledger lease. */
         DeviceMoETransferSlotDirectory(
             IBackend *backend,
             DeviceId device,
             int device_ordinal,
             uint32_t participant_id,
-            uint32_t slot_count,
+            BufferedCapacity capacity,
             std::vector<ProjectionSpec> specs,
             std::shared_ptr<LoadOrchestrator> orchestrator,
             DeviceMoEExpertDirectoryEntry *device_entries,
             DeviceMoEExpertDirectoryEntry *device_baseline_entries,
             std::vector<DeviceMoEExpertDirectoryEntry> host_entries,
+            std::optional<PhysicalMemoryAllocationLease>
+                directory_entries_lease,
             size_t planned_bytes,
             size_t wire_payload_bytes,
             size_t slot_storage_capacity_bytes);
 
-        static std::string slotName(uint32_t slot_index, const std::string &label);
+        /**
+         * @brief Shared implementation for admitted and named test setup.
+         * @param explicit_test_allocation Whether the named test-only
+         *        unadmitted allocation contract is active.
+         * @return Fully uploaded stable directory.
+         */
+        static std::shared_ptr<DeviceMoETransferSlotDirectory> createImpl(
+            IBackend *backend,
+            DeviceId device,
+            int device_ordinal,
+            uint32_t participant_id,
+            BufferedCapacity capacity,
+            FormatProfile format_profile,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+            bool explicit_test_allocation);
+
+        /** @return Stable allocator key for one slot/projection pair. */
+        static std::string slotName(
+            uint32_t slot_index,
+            const std::string &label);
 
         IBackend *backend_ = nullptr;
         DeviceId device_;
         int device_ordinal_ = -1;
         uint32_t participant_id_ = 0;
         uint32_t slot_count_ = 0;
+        BufferedCapacity capacity_;
         std::vector<ProjectionSpec> specs_;
         std::shared_ptr<LoadOrchestrator> orchestrator_;
         DeviceMoEExpertDirectoryEntry *device_entries_ = nullptr;
         DeviceMoEExpertDirectoryEntry *device_baseline_entries_ = nullptr;
         std::vector<DeviceMoEExpertDirectoryEntry> host_entries_;
+        /** Live authority claim paired with both device descriptor arrays. */
+        std::optional<PhysicalMemoryAllocationLease>
+            directory_entries_lease_;
         size_t planned_bytes_ = 0;
         size_t wire_payload_bytes_ = 0;
         size_t slot_storage_capacity_bytes_ = 0;

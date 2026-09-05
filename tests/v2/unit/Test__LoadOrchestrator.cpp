@@ -16,8 +16,11 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
@@ -39,6 +42,8 @@ namespace llaminar2
             {
                 ++allocate_calls_;
                 last_allocate_bytes_ = bytes;
+                if (device_id == failing_device_id_)
+                    return nullptr;
                 return test::MockBackend::allocate(bytes, device_id);
             }
 
@@ -69,12 +74,69 @@ namespace llaminar2
             int allocateCalls() const { return allocate_calls_; }
             size_t lastAllocateBytes() const { return last_allocate_bytes_; }
 
+            /** @brief Make every subsequent allocation on one device fail. */
+            void failAllocationsOnDevice(int device_id)
+            {
+                failing_device_id_ = device_id;
+            }
+
         private:
             size_t total_bytes_ = 0;
             size_t free_bytes_ = 0;
             int allocate_calls_ = 0;
             size_t last_allocate_bytes_ = 0;
+            int failing_device_id_ = -1;
         };
+
+        /**
+         * @brief Admit one exact rank-local GPU load before constructing its allocator.
+         *
+         * The helper intentionally consumes the same owner lines as
+         * LoadOrchestrator. Tests therefore exercise the production contract:
+         * aggregate admission happens once, and concrete allocation merely
+         * materializes the certified bytes through RAII leases.
+         */
+        std::shared_ptr<PhysicalMemoryAuthority> makeLoadAuthority(
+            DeviceId gpu,
+            size_t gpu_total_bytes,
+            size_t gpu_available_bytes,
+            std::initializer_list<std::pair<PhysicalMemoryOwner, size_t>>
+                gpu_charges,
+            size_t host_staging_bytes = 0u)
+        {
+            PhysicalMemoryBOMBuilder gpu_bom({
+                .world_rank = 0,
+                .device = gpu,
+                .total_bytes = gpu_total_bytes,
+                .admission_available_bytes = gpu_available_bytes,
+            });
+            for (const auto &[owner, bytes] : gpu_charges)
+            {
+                if (bytes != 0u)
+                    gpu_bom.add(owner, bytes);
+            }
+
+            PhysicalMemoryPlanBuilder plan;
+            plan.add(gpu_bom.build());
+            if (host_staging_bytes != 0u)
+            {
+                PhysicalMemoryBOMBuilder host_bom({
+                    .world_rank = 0,
+                    .device = DeviceId::cpu(),
+                    .total_bytes = 4ULL * 1024ULL * kMiB,
+                    .admission_available_bytes = 4ULL * 1024ULL * kMiB,
+                });
+                host_bom.add(
+                    PhysicalMemoryOwner::WeightLoadStaging,
+                    host_staging_bytes);
+                plan.add(host_bom.build());
+            }
+
+            auto admission = std::make_shared<
+                const PhysicalMemoryPlanAdmissionCertificate>(plan.build());
+            return std::make_shared<PhysicalMemoryAuthority>(
+                std::move(admission), 0);
+        }
     } // namespace
 
     static constexpr int kQ4PayloadBytes = 16;
@@ -167,7 +229,7 @@ namespace llaminar2
     {
         BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
                                   /*free_bytes=*/2ULL * 1024ULL * kMiB);
-        LoadOrchestrator orch(&backend);
+        LoadOrchestrator orch(&backend, kTestOnlyUnadmittedGPUAllocation);
         orch.addDevice(0);
 
         constexpr int rows = 8;
@@ -446,7 +508,7 @@ namespace llaminar2
     {
         BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
                                   /*free_bytes=*/2ULL * 1024ULL * kMiB);
-        LoadOrchestrator orch(&backend);
+        LoadOrchestrator orch(&backend, kTestOnlyUnadmittedGPUAllocation);
         orch.addDevice(0);
 
         constexpr int rows = 2;
@@ -481,29 +543,51 @@ namespace llaminar2
         EXPECT_THROW(orch.allocate(1024, 0), std::runtime_error);
     }
 
-    TEST(Test__LoadOrchestrator, AllocateFailsBeforeBackendAllocationWhenVramBudgetExceeded)
+    TEST(Test__LoadOrchestrator, AdmissionFailsBeforeBackendAllocationWhenVramBudgetExceeded)
     {
+        constexpr size_t weights = 128ULL * kMiB;
+        constexpr size_t staging = 32ULL * kMiB;
         BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
-                                  /*free_bytes=*/160ULL * kMiB - 1u);
-        LoadOrchestrator orch(&backend);
-        orch.addDevice(0);
-        orch.planRawWeight(0, "large_raw_weight", 1, 1, 128ULL * kMiB);
+                                  /*free_bytes=*/weights + staging - 1u);
 
-        // Exact requirement is 128 MiB planned plus one 32 MiB staging slot.
-        EXPECT_THROW(orch.allocate(32ULL * kMiB, 1), std::runtime_error);
+        // Aggregate admission—not the low-level allocator—rejects the exact
+        // 128 MiB weight plus 32 MiB device staging requirement.
+        EXPECT_THROW(
+            (void)makeLoadAuthority(
+                DeviceId::rocm(0),
+                backend.deviceMemoryTotal(0),
+                backend.deviceMemoryFree(0),
+                {
+                    {PhysicalMemoryOwner::PrimaryModelWeights, weights},
+                    {PhysicalMemoryOwner::WeightLoadStaging, staging},
+                },
+                staging),
+            std::invalid_argument);
         EXPECT_EQ(backend.allocateCalls(), 0)
-            << "VRAM preflight should fail before WeightVRAMPool calls backend->allocate()";
+            << "Admission must fail before WeightVRAMPool reaches the backend";
     }
 
     TEST(Test__LoadOrchestrator, AllocateSucceedsAtExactVramBoundary)
     {
+        constexpr size_t weights = 128ULL * kMiB;
+        constexpr size_t staging = 32ULL * kMiB;
         BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
-                                  /*free_bytes=*/160ULL * kMiB);
-        LoadOrchestrator orch(&backend);
+                                  /*free_bytes=*/weights + staging);
+        auto authority = makeLoadAuthority(
+            DeviceId::rocm(0),
+            backend.deviceMemoryTotal(0),
+            backend.deviceMemoryFree(0),
+            {
+                {PhysicalMemoryOwner::PrimaryModelWeights, weights},
+                {PhysicalMemoryOwner::WeightLoadStaging, staging},
+            },
+            staging);
+        LoadOrchestrator orch(
+            &backend, authority, PhysicalMemoryOwner::PrimaryModelWeights);
         orch.addDevice(0);
-        orch.planRawWeight(0, "large_raw_weight", 1, 1, 128ULL * kMiB);
+        orch.planRawWeight(0, "large_raw_weight", 1, 1, weights);
 
-        ASSERT_NO_THROW(orch.allocate(32ULL * kMiB, 1));
+        ASSERT_NO_THROW(orch.allocate(staging, 1));
         EXPECT_GT(backend.allocateCalls(), 0);
         EXPECT_GT(backend.lastAllocateBytes(), 0u);
 
@@ -517,8 +601,13 @@ namespace llaminar2
         const size_t planned_bytes = 8ULL * kMiB;
         BudgetMockBackend backend(/*total_bytes=*/24ULL * 1024ULL * kMiB,
                                   /*free_bytes=*/8ULL * kMiB);
-
-        LoadOrchestrator direct(&backend);
+        auto authority = makeLoadAuthority(
+            DeviceId::rocm(0),
+            backend.deviceMemoryTotal(0),
+            backend.deviceMemoryFree(0),
+            {{PhysicalMemoryOwner::PrimaryModelWeights, planned_bytes}});
+        LoadOrchestrator direct(
+            &backend, authority, PhysicalMemoryOwner::PrimaryModelWeights);
         direct.addDevice(0);
         direct.planRawWeight(0, "arrival_exact_bill", 1, 1, planned_bytes);
 
@@ -531,11 +620,23 @@ namespace llaminar2
     {
         BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
                                   /*free_bytes=*/1024ULL * kMiB);
-        LoadOrchestrator orch(&backend);
+        constexpr size_t weights = 128ULL * kMiB;
+        constexpr size_t staging = 32ULL * kMiB;
+        auto authority = makeLoadAuthority(
+            DeviceId::rocm(0),
+            backend.deviceMemoryTotal(0),
+            backend.deviceMemoryFree(0),
+            {
+                {PhysicalMemoryOwner::PrimaryModelWeights, weights},
+                {PhysicalMemoryOwner::WeightLoadStaging, staging},
+            },
+            staging);
+        LoadOrchestrator orch(
+            &backend, authority, PhysicalMemoryOwner::PrimaryModelWeights);
         orch.addDevice(0);
-        orch.planRawWeight(0, "large_raw_weight", 1, 1, 128ULL * kMiB);
+        orch.planRawWeight(0, "large_raw_weight", 1, 1, weights);
 
-        ASSERT_NO_THROW(orch.allocate(32ULL * kMiB, 1));
+        ASSERT_NO_THROW(orch.allocate(staging, 1));
         auto *pool = orch.getPool(0);
         ASSERT_NE(pool, nullptr);
         auto slot_before = pool->getSlot("large_raw_weight");
@@ -543,6 +644,18 @@ namespace llaminar2
         ASSERT_NE(slot_before->d_native_vnni_payload, nullptr);
         auto *payload_before = slot_before->d_native_vnni_payload;
         EXPECT_NE(pool->getStagingSlot(0), nullptr);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::WeightLoadStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            staging);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::cpu(),
+                PhysicalMemoryOwner::WeightLoadStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            staging);
 
         orch.finalize();
 
@@ -553,6 +666,248 @@ namespace llaminar2
         auto slot_after = pool->getSlot("large_raw_weight");
         ASSERT_TRUE(slot_after.has_value());
         EXPECT_EQ(slot_after->d_native_vnni_payload, payload_before);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::PrimaryModelWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            weights);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::WeightLoadStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::cpu(),
+                PhysicalMemoryOwner::WeightLoadStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
+
+        orch.release();
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::PrimaryModelWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
+    }
+
+    TEST(Test__LoadOrchestrator,
+         MultiOwnerPlanAttributesEveryAlignmentByteAndRetiresByLifetime)
+    {
+        /*
+         * The second weight begins at byte 512 after internal alignment. The
+         * final pool allocation ends at byte 768, so the exact owner split is
+         * 257 primary bytes and 511 routed-expert bytes.
+         */
+        constexpr size_t primary_bytes = 257u;
+        constexpr size_t routed_logical_bytes = 17u;
+        constexpr size_t routed_physical_bytes = 511u;
+        constexpr size_t device_staging_bytes = 1024u;
+        constexpr size_t host_staging_bytes = 514u;
+        BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
+                                  /*free_bytes=*/1024ULL * kMiB);
+        auto authority = makeLoadAuthority(
+            DeviceId::rocm(0),
+            backend.deviceMemoryTotal(0),
+            backend.deviceMemoryFree(0),
+            {
+                {PhysicalMemoryOwner::PrimaryModelWeights, primary_bytes},
+                {PhysicalMemoryOwner::RoutedExpertWeights,
+                 routed_physical_bytes},
+                {PhysicalMemoryOwner::WeightLoadStaging,
+                 device_staging_bytes},
+            },
+            host_staging_bytes);
+        LoadOrchestrator orch(
+            &backend, authority, PhysicalMemoryOwner::PrimaryModelWeights);
+        orch.addDevice(0);
+        orch.planRawWeightForOwner(
+            0,
+            "primary",
+            1,
+            1,
+            primary_bytes,
+            PhysicalMemoryOwner::PrimaryModelWeights);
+        orch.planRawWeightForOwner(
+            0,
+            "routed",
+            1,
+            1,
+            routed_logical_bytes,
+            PhysicalMemoryOwner::RoutedExpertWeights);
+
+        EXPECT_EQ(
+            orch.plannedPersistentBytes(
+                0, PhysicalMemoryOwner::PrimaryModelWeights),
+            primary_bytes);
+        EXPECT_EQ(
+            orch.plannedPersistentBytes(
+                0, PhysicalMemoryOwner::RoutedExpertWeights),
+            routed_physical_bytes);
+
+        ASSERT_NO_THROW(orch.allocate(/*pinned_slot_size=*/257u,
+                                      /*num_h2d_streams=*/2));
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::PrimaryModelWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            primary_bytes);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::RoutedExpertWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            routed_physical_bytes);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::WeightLoadStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            device_staging_bytes);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::cpu(),
+                PhysicalMemoryOwner::WeightLoadStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            host_staging_bytes);
+
+        orch.finalize();
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::WeightLoadStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::cpu(),
+                PhysicalMemoryOwner::WeightLoadStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
+        EXPECT_EQ(backend.getAllocationCount(), 1u);
+
+        orch.release();
+        EXPECT_EQ(backend.getAllocationCount(), 0u);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::PrimaryModelWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::RoutedExpertWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
+    }
+
+    TEST(Test__LoadOrchestrator,
+         LaterOwnerClaimFailureRollsBackEarlierClaimsBeforeAllocation)
+    {
+        constexpr size_t primary_bytes = 257u;
+        constexpr size_t routed_physical_bytes = 511u;
+        BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
+                                  /*free_bytes=*/1024ULL * kMiB);
+        auto authority = makeLoadAuthority(
+            DeviceId::rocm(0),
+            backend.deviceMemoryTotal(0),
+            backend.deviceMemoryFree(0),
+            {
+                {PhysicalMemoryOwner::PrimaryModelWeights, primary_bytes},
+                {PhysicalMemoryOwner::RoutedExpertWeights,
+                 routed_physical_bytes - 1u},
+            });
+        LoadOrchestrator orch(
+            &backend, authority, PhysicalMemoryOwner::PrimaryModelWeights);
+        orch.addDevice(0);
+        orch.planRawWeightForOwner(
+            0, "primary", 1, 1, primary_bytes,
+            PhysicalMemoryOwner::PrimaryModelWeights);
+        orch.planRawWeightForOwner(
+            0, "routed", 1, 1, 17u,
+            PhysicalMemoryOwner::RoutedExpertWeights);
+
+        EXPECT_THROW(
+            orch.allocate(/*pinned_slot_size=*/0,
+                          /*num_h2d_streams=*/0),
+            std::logic_error);
+        EXPECT_EQ(backend.allocateCalls(), 0);
+        EXPECT_EQ(backend.getAllocationCount(), 0u);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::PrimaryModelWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::rocm(0),
+                PhysicalMemoryOwner::RoutedExpertWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
+    }
+
+    TEST(Test__LoadOrchestrator,
+         LaterDeviceAllocationFailureRollsBackWholeTopologyTransaction)
+    {
+        constexpr size_t logical_bytes = 257u;
+        constexpr size_t physical_bytes = 512u;
+        BudgetMockBackend backend(/*total_bytes=*/4ULL * 1024ULL * kMiB,
+                                  /*free_bytes=*/1024ULL * kMiB);
+        PhysicalMemoryPlanBuilder plan;
+        for (const int device_id : {0, 1})
+        {
+            PhysicalMemoryBOMBuilder bom({
+                .world_rank = 0,
+                .device = DeviceId::rocm(device_id),
+                .total_bytes = backend.deviceMemoryTotal(device_id),
+                .admission_available_bytes =
+                    backend.deviceMemoryFree(device_id),
+            });
+            bom.add(
+                PhysicalMemoryOwner::PrimaryModelWeights,
+                physical_bytes);
+            plan.add(bom.build());
+        }
+        auto admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(plan.build());
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            std::move(admission), 0);
+
+        LoadOrchestrator orch(
+            &backend, authority, PhysicalMemoryOwner::PrimaryModelWeights);
+        for (const int device_id : {0, 1})
+        {
+            orch.addDevice(device_id);
+            orch.planRawWeight(
+                device_id,
+                "weight_" + std::to_string(device_id),
+                1,
+                1,
+                logical_bytes);
+        }
+        backend.failAllocationsOnDevice(1);
+
+        EXPECT_THROW(
+            orch.allocate(/*pinned_slot_size=*/0,
+                          /*num_h2d_streams=*/0),
+            std::runtime_error);
+        EXPECT_EQ(backend.allocateCalls(), 2);
+        EXPECT_EQ(backend.getAllocationCount(), 0u);
+        for (const int device_id : {0, 1})
+        {
+            EXPECT_EQ(
+                authority->claimedBytes(
+                    DeviceId::rocm(device_id),
+                    PhysicalMemoryOwner::PrimaryModelWeights,
+                    PhysicalMemoryMaterializationKind::NewAllocation),
+                0u);
+        }
     }
 
     TEST(Test__LoadOrchestrator, LoadAndFinalizeWithNoJobs)

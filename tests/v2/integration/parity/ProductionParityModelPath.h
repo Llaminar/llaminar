@@ -1,9 +1,9 @@
 /**
  * @file ProductionParityModelPath.h
- * @brief Authenticated tmpfs path resolution for production parity children.
+ * @brief Identity-bound tmpfs path resolution for production parity children.
  *
  * The aggregate production-parity driver is the sole authority that stages,
- * authenticates, locks, and publishes real GGUF files. Registered CTest
+ * identity-binds, locks, and publishes real GGUF files. Registered CTest
  * production campaigns are internal children of that driver: allowing one to
  * silently use its source GGUF would make direct CTest execution both slower
  * and materially different from the canonical campaign. These device-free
@@ -26,7 +26,7 @@ namespace llaminar2::test::parity
         kProductionParityProcessCampaignEnvironment =
             "LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN";
 
-    /** Environment contract naming the driver's authenticated GGUF directory. */
+    /** Environment contract naming the driver's identity-bound GGUF directory. */
     inline constexpr std::string_view
         kProductionParityModelRamdiskEnvironment =
             "LLAMINAR_PRODUCTION_PARITY_MODEL_RAMDISK";

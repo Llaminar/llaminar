@@ -90,6 +90,13 @@ namespace llaminar2
         bool enable_validation = false;            ///< Validate outputs after each stage
         DeviceId default_device = DeviceId::cpu(); ///< Default device for stages
 
+        /**
+         * Production GPU snapshots may allocate only through a typed physical
+         * memory reservation. Isolated graph fixtures leave this false and
+         * deliberately own no production admission certificate.
+         */
+        bool require_snapshot_memory_authority = false;
+
         /// Callback invoked after each stage executes (for snapshot capture)
         StageSnapshotCallback snapshot_callback = nullptr;
 

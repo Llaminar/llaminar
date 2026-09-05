@@ -18,6 +18,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "execution/moe/ExpertTierGpuBlobTransferLane.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
+#include "transfer/TransferEngine.h"
 #include "kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
@@ -402,6 +403,12 @@ namespace llaminar2
                     .device = source_device,
                     .slot_capacity = 2u,
                     .execution_lane_capacity = 2u,
+                    .execution_streams =
+                        TransferEngine::instance()
+                            .allocatePersistentTransferExecutionLanes(
+                                2u,
+                                source_device,
+                                "blob_progress_source:" + identity),
                     .maximum_bytes = staging_bytes,
                     .name = "blob_source:" + identity,
                     .perf_device = identity,
@@ -410,6 +417,12 @@ namespace llaminar2
                     .device = destination_device,
                     .slot_capacity = 2u,
                     .execution_lane_capacity = 2u,
+                    .execution_streams =
+                        TransferEngine::instance()
+                            .allocatePersistentTransferExecutionLanes(
+                                2u,
+                                destination_device,
+                                "blob_progress_destination:" + identity),
                     .maximum_bytes = staging_bytes,
                     .name = "blob_destination:" + identity,
                     .perf_device = identity,
@@ -691,12 +704,26 @@ namespace llaminar2
                 destination_device,
                 staging_bytes,
                 identity + ":" + std::to_string(seed));
+            const auto source_mapped_staging =
+                TransferEngine::instance().allocateMappedHostTransferSlices(
+                    staging_bytes, 2u, source_device);
+            const auto destination_mapped_staging =
+                TransferEngine::instance().allocateMappedHostTransferSlices(
+                    staging_bytes, 2u, destination_device);
 
             ExpertTierGpuBlobTransferLane lane({
                 .source_device = source_device,
                 .destination_device = destination_device,
                 .relay_kind = relay_kind,
                 .staging_capacity_bytes = staging_bytes,
+                .source_mapped_staging = {
+                    source_mapped_staging[0],
+                    source_mapped_staging[1],
+                },
+                .destination_mapped_staging = {
+                    destination_mapped_staging[0],
+                    destination_mapped_staging[1],
+                },
                 .source_progress_epoch = progress_epochs.source,
                 .destination_progress_epoch = progress_epochs.destination,
                 .lane_name = "integration:" + identity,
@@ -924,12 +951,26 @@ namespace llaminar2
                 destination_device,
                 staging_bytes,
                 identity + ":" + std::to_string(seed));
+            const auto source_mapped_staging =
+                TransferEngine::instance().allocateMappedHostTransferSlices(
+                    staging_bytes, 2u, source_device);
+            const auto destination_mapped_staging =
+                TransferEngine::instance().allocateMappedHostTransferSlices(
+                    staging_bytes, 2u, destination_device);
 
             {
                 ExpertTierGpuBlobTransferLane lane({
                     .source_device = source_device,
                     .destination_device = destination_device,
                     .staging_capacity_bytes = staging_bytes,
+                    .source_mapped_staging = {
+                        source_mapped_staging[0],
+                        source_mapped_staging[1],
+                    },
+                    .destination_mapped_staging = {
+                        destination_mapped_staging[0],
+                        destination_mapped_staging[1],
+                    },
                     .source_progress_epoch = progress_epochs.source,
                     .destination_progress_epoch =
                         progress_epochs.destination,
@@ -1178,7 +1219,18 @@ namespace llaminar2
                 MoEOverlayGpuRemoteProjectionLane>(
                 MoEOverlayGpuRemoteProjectionLane::Config{
                     .device = source_device,
-                    .staging_capacity_bytes = manifest.maximum_chunk_bytes,
+                    .staging = TransferEngine::instance()
+                                   .allocatePersistentTransferStagingSlices(
+                                       manifest.maximum_chunk_bytes,
+                                       1u,
+                                       source_device)
+                                   .front(),
+                    .execution = TransferEngine::instance()
+                                     .allocatePersistentTransferExecutionLanes(
+                                         1u,
+                                         source_device,
+                                         "remote_blob_source:" + direction)
+                                     .front(),
                     .lane_name = "remote_blob_source:" + direction,
                     .perf_device = source_device.to_string(),
                 });
@@ -1186,7 +1238,18 @@ namespace llaminar2
                 MoEOverlayGpuRemoteProjectionLane>(
                 MoEOverlayGpuRemoteProjectionLane::Config{
                     .device = destination_device,
-                    .staging_capacity_bytes = manifest.maximum_chunk_bytes,
+                    .staging = TransferEngine::instance()
+                                   .allocatePersistentTransferStagingSlices(
+                                       manifest.maximum_chunk_bytes,
+                                       1u,
+                                       destination_device)
+                                   .front(),
+                    .execution = TransferEngine::instance()
+                                     .allocatePersistentTransferExecutionLanes(
+                                         1u,
+                                         destination_device,
+                                         "remote_blob_destination:" + direction)
+                                     .front(),
                     .lane_name = "remote_blob_destination:" + direction,
                     .perf_device = destination_device.to_string(),
                 });
@@ -1525,8 +1588,18 @@ namespace llaminar2
                 MoEOverlayGpuRemoteProjectionLane>(
                     MoEOverlayGpuRemoteProjectionLane::Config{
                         .device = source_device,
-                        .staging_capacity_bytes =
-                            manifest.maximum_chunk_bytes,
+                        .staging = TransferEngine::instance()
+                                       .allocatePersistentTransferStagingSlices(
+                                           manifest.maximum_chunk_bytes,
+                                           1u,
+                                           source_device)
+                                       .front(),
+                        .execution = TransferEngine::instance()
+                                         .allocatePersistentTransferExecutionLanes(
+                                             1u,
+                                             source_device,
+                                             "remote_float_source:" + direction)
+                                         .front(),
                         .lane_name = "remote_float_source:" + direction,
                         .perf_device = source_device.to_string(),
                     });
@@ -1534,8 +1607,18 @@ namespace llaminar2
                 MoEOverlayGpuRemoteProjectionLane>(
                     MoEOverlayGpuRemoteProjectionLane::Config{
                         .device = destination_device,
-                        .staging_capacity_bytes =
-                            manifest.maximum_chunk_bytes,
+                        .staging = TransferEngine::instance()
+                                       .allocatePersistentTransferStagingSlices(
+                                           manifest.maximum_chunk_bytes,
+                                           1u,
+                                           destination_device)
+                                       .front(),
+                        .execution = TransferEngine::instance()
+                                         .allocatePersistentTransferExecutionLanes(
+                                             1u,
+                                             destination_device,
+                                             "remote_float_destination:" + direction)
+                                         .front(),
                         .lane_name = "remote_float_destination:" + direction,
                         .perf_device = destination_device.to_string(),
                     });

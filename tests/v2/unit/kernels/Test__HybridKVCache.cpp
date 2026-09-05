@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include "execution/prefix_cache/PrefixPayloadLayout.h"
 #include "kernels/HybridKVCacheConfig.h"
+#include "kernels/HybridGDNStateGeometry.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
@@ -154,6 +155,91 @@ namespace llaminar2::test
             EXPECT_EQ(map.toKVIndex(i), -1);
             EXPECT_EQ(map.toGDNIndex(i), i);
         }
+    }
+
+    // =============================================================================
+    // Test: canonical GDN geometry and physical byte formulas
+    // =============================================================================
+
+    /** @brief Equal local/full geometry owns one request-backed live bank. */
+    TEST(Test__HybridGDNStateGeometry,
+         UnshardedArenaDoesNotPriceAnImaginaryPrimaryBank)
+    {
+        const HybridGDNStateGeometry geometry =
+            HybridGDNStateGeometry::resolve(
+                /*attention_heads=*/4,
+                /*local_head_start=*/0,
+                /*local_attention_heads=*/0,
+                /*group_count=*/2,
+                /*time_step_rank=*/4,
+                /*state_size=*/2,
+                /*inner_size=*/8,
+                /*conv_kernel_size=*/3);
+
+        EXPECT_TRUE(geometry.hasSingleBankGeometry());
+        EXPECT_EQ(geometry.full_qkv_dim, 16);
+        EXPECT_EQ(geometry.local_qkv_dim, 16);
+        EXPECT_EQ(geometry.local_conv_state_floats, 32);
+        EXPECT_EQ(geometry.local_recurrence_state_floats, 16);
+
+        /*
+         * One 128-byte convolution request bank begins at zero. The 64-byte
+         * recurrence request bank begins at the next 256-byte boundary.
+         */
+        EXPECT_EQ(
+            geometry.deviceArenaBytes(
+                /*gdn_layers=*/1,
+                /*request_capacity=*/1),
+            320u);
+        EXPECT_EQ(geometry.deviceSerializedPayloadBytes(1), 192u);
+        EXPECT_EQ(geometry.localPayloadBytes(1), 192u);
+    }
+
+    /** @brief Modulo-linked K/V sharding uses exact weight/runtime ownership. */
+    TEST(Test__HybridGDNStateGeometry,
+         TensorParallelPartitionKeepsLinkedHeadCountsAndBytesExact)
+    {
+        const HybridGDNStateGeometry geometry =
+            HybridGDNStateGeometry::resolve(
+                /*attention_heads=*/64,
+                /*local_head_start=*/16,
+                /*local_attention_heads=*/16,
+                /*group_count=*/16,
+                /*time_step_rank=*/32,
+                /*state_size=*/128,
+                /*inner_size=*/4096,
+                /*conv_kernel_size=*/4);
+
+        EXPECT_EQ(geometry.local_key_heads, 4);
+        EXPECT_EQ(geometry.local_value_heads, 8);
+        EXPECT_EQ(geometry.local_qkv_dim, 2048);
+        EXPECT_EQ(geometry.full_qkv_dim, 8192);
+        EXPECT_EQ(geometry.local_conv_state_floats, 6144);
+        EXPECT_EQ(geometry.full_conv_state_floats, 24576);
+        EXPECT_EQ(geometry.local_recurrence_state_floats, 131072);
+        EXPECT_EQ(geometry.full_recurrence_state_floats, 524288);
+        EXPECT_FALSE(geometry.hasSingleBankGeometry());
+
+        const size_t one_layer = geometry.deviceArenaBytes(1, 2);
+        EXPECT_EQ(geometry.deviceArenaBytes(3, 2), 3u * one_layer);
+        EXPECT_GT(one_layer, geometry.localPayloadBytes(1));
+    }
+
+    /** @brief Non-integral TP boundaries fail before planning or allocation. */
+    TEST(Test__HybridGDNStateGeometry,
+         RejectsAHeadPartitionThatWouldRequireRounding)
+    {
+        EXPECT_THROW(
+            (void)HybridGDNStateGeometry::resolve(
+                /*attention_heads=*/64,
+                /*local_head_start=*/1,
+                /*local_attention_heads=*/16,
+                /*group_count=*/16,
+                /*time_step_rank=*/32,
+                /*state_size=*/128,
+                /*inner_size=*/4096,
+                /*conv_kernel_size=*/4),
+            std::invalid_argument);
     }
 
     // =============================================================================

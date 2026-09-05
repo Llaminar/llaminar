@@ -159,6 +159,9 @@ namespace llaminar2::test
         {
             auto profile = std::make_shared<MoERoutedTierServiceProfile>();
             profile->identity = "maintenance-service-profile-v1";
+            profile->production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    1, kAllExpertHistogramProductionSources);
             profile->costs = {
                 {.tier_index = 0,
                  .layer = 0,
@@ -941,6 +944,106 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayResidencyMaintenanceService,
+        LogicalInferenceCadenceReconcilesDeviceOnlyDemandAndPublishesMovement)
+    {
+        DecodeExpertHistogramConfig histogram_config;
+        histogram_config.num_layers = 1;
+        histogram_config.num_experts = 6;
+        histogram_config.top_k = 2;
+        histogram_config.window_size = 4;
+        histogram_config.token_boundary_layer_idx = 0;
+        histogram_config.sockets = {
+            DeviceId::cuda(0),
+            DeviceId::rocm(0),
+            DeviceId::cpu(),
+        };
+        histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+            1,
+            3,
+            {0, 0, 1, 1, 2, 2});
+        auto histogram = std::make_shared<DecodeExpertHistogram>(
+            std::move(histogram_config));
+
+        std::atomic<int> drain_polls{0};
+        histogram->registerRuntimeHistogramDrain(
+            [&]()
+            {
+                const int poll = drain_polls.fetch_add(
+                                     1, std::memory_order_relaxed) +
+                                 1;
+                if (poll == 1)
+                    return RuntimeExpertHistogramDrainResult::pending();
+                const uint64_t device_counts[6] = {
+                    90, 20, 80, 10, 100, 70};
+                histogram->mergeLayerCounts(
+                    0,
+                    device_counts,
+                    6,
+                    /*count_window_tokens=*/true,
+                    ExpertHistogramSource::GroupedVerifier);
+                return RuntimeExpertHistogramDrainResult::ready();
+            });
+
+        auto authority = dynamicAuthority(histogram.get());
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setStageReady(true);
+        transport->setPrepareReady(true);
+        transport->setPublicationReady(true);
+        auto service = startService(authority, transport);
+
+        ASSERT_TRUE(waitUntil(
+            [&]
+            { return service->optimizationStatus().quiescentBetweenWaves(); }));
+        service->notifyMaintenanceProgress();
+        ASSERT_TRUE(waitUntil(
+            [&]
+            {
+                const auto status = service->optimizationStatus();
+                return status.quiescentBetweenWaves() &&
+                       status.published_progress_generation ==
+                           status.reconciled_progress_generation;
+            }));
+        EXPECT_EQ(drain_polls.load(std::memory_order_relaxed), 0)
+            << "A wake without inference cadence must not poll device banks";
+
+        service->notifyInferenceProgress({
+            .phase = MoEOverlayInferenceProgressPhase::Decode,
+            .completed_logical_tokens = 3u,
+        });
+        ASSERT_TRUE(waitUntil(
+            [&]
+            {
+                const auto status = service->optimizationStatus();
+                return status.quiescentBetweenWaves() &&
+                       status.published_progress_generation ==
+                           status.reconciled_progress_generation;
+            }));
+        EXPECT_EQ(drain_polls.load(std::memory_order_relaxed), 0)
+            << "The cadence must retain a partial window without eager D2H";
+
+        service->notifyInferenceProgress({
+            .phase = MoEOverlayInferenceProgressPhase::Decode,
+            .completed_logical_tokens = 1u,
+        });
+        ASSERT_TRUE(waitUntil(
+            [&] { return authority->snapshot()->epoch == 2u; }));
+        ASSERT_TRUE(waitUntil(
+            [&] { return service->stats().committed_waves == 1u; }))
+            << "Publication and its typed completion ledger must both settle";
+        EXPECT_EQ(drain_polls.load(std::memory_order_relaxed), 2);
+        EXPECT_EQ(service->stats().inference_progress_tokens, 4u);
+        EXPECT_EQ(service->stats().histogram_runtime_probes, 1u);
+        EXPECT_EQ(service->stats().histogram_runtime_reconciliations, 0u)
+            << "The first reconciled device bank was already proposal-ready";
+        EXPECT_EQ(service->stats().committed_waves, 1u);
+        EXPECT_TRUE(service->healthy()) << service->failureMessage();
+
+        service->stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
         TypedEconomyProofRequiresExactAuthorityArithmetic)
     {
         const MoEOptimizationMovementEconomy valid{
@@ -1025,6 +1128,24 @@ namespace llaminar2::test
         auto mislabeled_capacity = valid;
         mislabeled_capacity.capacity_bounded = true;
         EXPECT_FALSE(mislabeled_capacity.valid());
+
+        /* Dependency cohorts are combinatorial economy-search alternatives,
+         * not candidate cycles. The production 122B stress run exposed a
+         * proof that had three eligible cycles, admitted two, rejected one
+         * remaining cycle, and separately rejected one cohort. Counting that
+         * cohort as a second cycle made an otherwise exact proof invalid. */
+        auto with_rejected_cohort = valid;
+        with_rejected_cohort.dependent_cohort_candidates = 1u;
+        with_rejected_cohort.dependent_cohort_payoff_rejections = 1u;
+        EXPECT_TRUE(with_rejected_cohort.valid());
+
+        auto cohort_mislabeled_as_cycle = with_rejected_cohort;
+        ++cohort_mislabeled_as_cycle.dependent_payoff_rejected_cycles;
+        EXPECT_FALSE(cohort_mislabeled_as_cycle.valid());
+
+        auto impossible_cohort_classification = with_rejected_cohort;
+        impossible_cohort_classification.dependent_cohort_candidates = 0u;
+        EXPECT_FALSE(impossible_cohort_classification.valid());
     }
 
     /**

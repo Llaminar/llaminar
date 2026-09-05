@@ -169,6 +169,25 @@ namespace llaminar2
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
 
         /**
+         * @brief Fence asynchronous histogram maintenance around native capture.
+         *
+         * Every deferred publisher lends this stage the same table-owned
+         * stream. Entering increments each table's capture activity before the
+         * backend begins recording; Completed or Aborted releases those
+         * references only after the backend has closed capture. A partially
+         * accepted Entering edge is unwound in reverse order.
+         *
+         * @param ctx Device context owning @p stream.
+         * @param stream Exact immutable publication/capture stream.
+         * @param transition Typed native-capture lifecycle edge.
+         * @return true when every publisher accepted the transition.
+         */
+        bool transitionGraphCaptureActivity(
+            IDeviceContext *ctx,
+            void *stream,
+            GraphCaptureActivityTransition transition) override;
+
+        /**
          * @brief Require exact-stream producer admission before native capture.
          *
          * The accepted-state graph retains one immutable capture stream for its

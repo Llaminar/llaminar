@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "kernels/common/SamplingMath.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <charconv>
@@ -288,6 +289,37 @@ namespace llaminar2::test::parity
     };
 
     /**
+     * @brief Recognize a completed retained-parent decode replay.
+     *
+     * The retained-parent executor historically exposed two counter spellings:
+     * `retained_parent_replays` is the current production counter, while
+     * `retained_parent_transaction_replays` remains valid evidence from the
+     * explicit transaction path. Keeping the accepted producer vocabulary in
+     * one typed predicate prevents parity fixtures from certifying segmented
+     * replay but rejecting the same record as decode replay.
+     *
+     * @param records Request-local PerfStats snapshot.
+     * @return `true` only for a positive decode-phase counter from either
+     *         retained-parent replay producer.
+     */
+    inline bool productionParityHasRetainedParentDecodeReplay(
+        const std::vector<PerfStatRecord> &records)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [](const PerfStatRecord &record)
+            {
+                return record.kind == PerfStatRecord::Kind::Counter &&
+                       record.domain == "forward_graph" &&
+                       record.phase == "decode" && record.value > 0.0 &&
+                       (record.name == "retained_parent_replays" ||
+                        record.name ==
+                            "retained_parent_transaction_replays");
+            });
+    }
+
+    /**
      * @brief Fail-closed result of validating graph-path evidence.
      *
      * A typed result makes the first violated lifecycle invariant explicit and
@@ -473,9 +505,9 @@ namespace llaminar2::test::parity
         {
             if (value == "native_conditional_graph" ||
                 value == "native_device_controlled_while" ||
-                value == "native_device_controlled_switch_while" ||
+                value == "native_device_controlled_selector_while" ||
                 value == "single_async_native_while_launch" ||
-                value == "single_async_native_switch_while_launch")
+                value == "single_async_native_selector_while_launch")
             {
                 return ProductionDeviceGenerationPolicy::NativeConditionalParent;
             }
@@ -832,7 +864,27 @@ namespace llaminar2::test::parity
                     device.ticket_observed = true;
                     device.tickets_valid =
                         device.tickets_valid &&
-                        tagEquals(record, "bytes", "48") &&
+                        tagEquals(
+                            record,
+                            "bytes",
+                            std::to_string(
+                                sampling_math::
+                                    DeviceGenerationDispatchTicket::
+                                        kWireBytes)) &&
+                        tagEquals(
+                            record,
+                            "abi_version",
+                            std::to_string(
+                                sampling_math::
+                                    DeviceGenerationDispatchTicket::
+                                        kABIVersion)) &&
+                        tagEquals(
+                            record,
+                            "word_count",
+                            std::to_string(
+                                sampling_math::
+                                    DeviceGenerationDispatchTicket::
+                                        kWordCount)) &&
                         tagEquals(
                             record,
                             "authority",

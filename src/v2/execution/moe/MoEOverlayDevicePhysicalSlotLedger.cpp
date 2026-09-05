@@ -68,6 +68,20 @@ namespace llaminar2
         return key.valid() && triplet.complete();
     }
 
+    bool MoEOverlayDeviceActivePhysicalSlot::valid() const noexcept
+    {
+        return key.valid() && entered_epoch != 0u && triplet.complete();
+    }
+
+    bool MoEOverlayDevicePhysicalInventorySnapshot::valid() const noexcept
+    {
+        return epoch != 0u && std::all_of(
+            slots.begin(),
+            slots.end(),
+            [](const MoEOverlayDeviceActivePhysicalSlot &slot)
+            { return slot.valid(); });
+    }
+
     /** @brief Private active inventory and sole pending transaction. */
     struct MoEOverlayDevicePhysicalSlotLedger::Impl
     {
@@ -178,12 +192,14 @@ namespace llaminar2
         if (error)
             error->clear();
         if (!batch.valid() || !batch.movesWeights() ||
-            batch.kind !=
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement)
+            (batch.kind !=
+                 MoEOverlayDeviceControllerTransactionKind::DynamicPlacement &&
+             batch.kind != MoEOverlayDeviceControllerTransactionKind::
+                               PreparedContextRestore))
         {
             return reject(
                 error,
-                "device physical slot ledger requires non-empty durable Dynamic movement");
+                "device physical slot ledger requires non-empty durable placement movement");
         }
 
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -411,6 +427,51 @@ namespace llaminar2
         }
         impl_->pending.reset();
         return true;
+    }
+
+    std::optional<MoEOverlayDevicePhysicalInventorySnapshot>
+    MoEOverlayDevicePhysicalSlotLedger::snapshot(
+        std::uint64_t epoch,
+        std::string *error) const noexcept
+    {
+        if (error)
+            error->clear();
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (epoch == 0u || epoch != impl_->current_epoch)
+        {
+            reject(
+                error,
+                "device physical inventory snapshot requires the exact current durable epoch");
+            return std::nullopt;
+        }
+        if (impl_->pending)
+        {
+            reject(
+                error,
+                "device physical inventory snapshot is forbidden while a wave remains active");
+            return std::nullopt;
+        }
+
+        MoEOverlayDevicePhysicalInventorySnapshot result;
+        result.epoch = epoch;
+        result.slots.reserve(impl_->active.size());
+        for (const auto &[key, slot] : impl_->active)
+        {
+            result.slots.push_back({
+                .key = key,
+                .entered_epoch = slot.entered_epoch,
+                .bootstrap_allocation = slot.bootstrap_allocation,
+                .triplet = slot.triplet,
+            });
+        }
+        if (!result.valid())
+        {
+            reject(
+                error,
+                "device physical inventory snapshot found an incomplete active slot");
+            return std::nullopt;
+        }
+        return result;
     }
 
     std::uint64_t MoEOverlayDevicePhysicalSlotLedger::currentEpoch()

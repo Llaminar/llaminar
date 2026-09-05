@@ -77,6 +77,8 @@ namespace llaminar2
         PublishRuntimeRetirementReadiness = 23u,
         /** Complete a device-authored Dynamic decision with no movement. */
         CompleteEmptyDynamicDecision = 24u,
+        /** Author cycles back to the immutable loader-prepared owner table. */
+        AuthorPreparedContextRestore = 25u,
     };
 
     /** Exact arithmetic result of adding one phase-pure observation window. */
@@ -270,6 +272,8 @@ namespace llaminar2
         MoEOverlayDeviceControllerCommandHeader *command = nullptr;
         MoEOverlayDeviceMovementCommand *command_entries = nullptr;
         const std::uint64_t *payload_bytes_per_layer = nullptr;
+        /** Immutable setup-time target for reusable-context restoration. */
+        const std::uint32_t *initial_owner_participants = nullptr;
         /** Persistent leader-authored history; no host policy can address it. */
         std::uint64_t *demand_history = nullptr;
         /** Host-measured immutable costs acquired before device policy reads. */
@@ -300,6 +304,7 @@ namespace llaminar2
                    participants && groups && controller &&
                    inference_epoch_record && command &&
                    command_entries && payload_bytes_per_layer &&
+                   initial_owner_participants &&
                    demand_history && economy && economy_service_costs &&
                    economy_migration_costs && economy_last_moved &&
                    local_group &&
@@ -379,7 +384,7 @@ namespace llaminar2
                                    StaticCheck) &&
                    kind <= static_cast<std::uint32_t>(
                                MoEOverlayDeviceControllerTransactionKind::
-                                   CurrentBatchLLEP);
+                                   PreparedContextRestore);
         }
     };
 
@@ -440,21 +445,24 @@ namespace llaminar2
         }
 
         const auto op = static_cast<MoEOverlayDeviceMovementOp>(entry.op);
+        const bool durable_placement =
+            kind == MoEOverlayDeviceControllerTransactionKind::
+                        DynamicPlacement ||
+            kind == MoEOverlayDeviceControllerTransactionKind::
+                        PreparedContextRestore;
         const bool physical_movement =
             op == MoEOverlayDeviceMovementOp::DurableMove ||
             op == MoEOverlayDeviceMovementOp::TransientArrival;
         if (physical_movement)
         {
             const bool correct_kind =
-                (kind == MoEOverlayDeviceControllerTransactionKind::
-                             DynamicPlacement &&
+                (durable_placement &&
                  op == MoEOverlayDeviceMovementOp::DurableMove) ||
                 (kind == MoEOverlayDeviceControllerTransactionKind::
                              CurrentBatchLLEP &&
                  op == MoEOverlayDeviceMovementOp::TransientArrival);
             const bool correct_axis =
-                kind == MoEOverlayDeviceControllerTransactionKind::
-                            DynamicPlacement ||
+                durable_placement ||
                 movement_axis ==
                     MoEOverlayDeviceMovementAxis::ParticipantPlacement;
             return correct_kind && correct_axis &&
@@ -546,7 +554,7 @@ namespace llaminar2
                                StaticCheck &&
                        transaction_kind <=
                            MoEOverlayDeviceControllerTransactionKind::
-                               CurrentBatchLLEP;
+                               PreparedContextRestore;
             }
             if (action == MoEOverlayDeviceControllerAction::PublishCommand ||
                 action ==
@@ -558,6 +566,12 @@ namespace llaminar2
                 return binding.authorityLeader() && policy_result != nullptr &&
                        (demand_phase == MoEOverlayDeviceDemandPhase::Prefill ||
                         demand_phase == MoEOverlayDeviceDemandPhase::Decode);
+            }
+            if (action == MoEOverlayDeviceControllerAction::
+                              AuthorPreparedContextRestore)
+            {
+                return binding.authorityLeader() && policy_result != nullptr &&
+                       demand_phase == MoEOverlayDeviceDemandPhase::Invalid;
             }
             if (action ==
                     MoEOverlayDeviceControllerAction::ApplyRuntimeCandidate ||

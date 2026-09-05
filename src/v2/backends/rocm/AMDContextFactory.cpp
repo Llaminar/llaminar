@@ -19,8 +19,8 @@
 #include "AMDDeviceContext.h"
 #include "../GPUDeviceContextPool.h"
 #include "../GPUEnumeration.h"
+#include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
-#include <cstdlib>
 #include <memory>
 
 namespace llaminar2
@@ -50,15 +50,14 @@ namespace llaminar2
          */
         void doRegisterAMDFactory()
         {
-            const char *cpu_only_env = std::getenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
-            if (cpu_only_env && std::atoi(cpu_only_env) != 0)
+            const auto &startup = debugEnv().backend_startup;
+            if (startup.force_cpu_only)
             {
                 LOG_INFO("[AMDContextFactory] Skipping ROCm factory registration (LLAMINAR_FORCE_CPU_ONLY_STARTUP=1)");
                 return;
             }
 
-            const char *skip_rocm_env = std::getenv("LLAMINAR_SKIP_ROCM_STARTUP");
-            if (skip_rocm_env && std::atoi(skip_rocm_env) != 0)
+            if (!startup.rocmEnabled())
             {
                 LOG_INFO("[AMDContextFactory] Skipping ROCm factory registration (LLAMINAR_SKIP_ROCM_STARTUP=1)");
                 return;

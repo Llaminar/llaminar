@@ -289,6 +289,7 @@ namespace llaminar2
                 std::shared_ptr<IMPIContext> mpi_ctx) override
             {
                 create_calls_++;
+                create_calls_by_type_[type]++;
 
                 // Return pre-configured mock if available
                 auto it = mock_backends_.find(type);
@@ -341,9 +342,26 @@ namespace llaminar2
 
             int createCallCount() const { return create_calls_; }
 
+            /**
+             * @brief Return construction calls for one backend type.
+             *
+             * This distinguishes "not initialized" from the stronger
+             * lifecycle invariant that an unselected vendor backend was never
+             * materialized at all.
+             *
+             * @param type Backend type to inspect.
+             * @return Number of createBackend() calls for @p type.
+             */
+            int createCallCount(CollectiveBackendType type) const
+            {
+                const auto found = create_calls_by_type_.find(type);
+                return found == create_calls_by_type_.end() ? 0 : found->second;
+            }
+
         private:
             std::unordered_map<CollectiveBackendType, std::unique_ptr<MockCollectiveBackend>> mock_backends_;
             std::unordered_map<CollectiveBackendType, bool> availability_;
+            std::unordered_map<CollectiveBackendType, int> create_calls_by_type_;
             int create_calls_ = 0;
         };
 

@@ -1406,6 +1406,15 @@ namespace
         if (graph_capture)
         {
 #ifdef HAVE_ROCM
+            /*
+             * The activation upload is a graph-external producer.  Close that
+             * event edge on the exact capture stream before entering HIP
+             * capture, just as DeviceGraphExecutor does for production graph
+             * inputs.  Waiting after capture begins would make the graph depend
+             * on mutable work owned outside its retained transaction.
+             */
+            ASSERT_NO_THROW(TransferEngine::requireDeviceInput(
+                input.get(), device, stream));
             HIPGraphCapture capture(
                 static_cast<hipStream_t>(stream),
                 device.ordinal);
@@ -5243,6 +5252,60 @@ TEST(Test__ROCmQuantisedGemmSmallM, RealQwen36OutputGEMMStageGroupedVerifierRows
         runRealWeightGemmStageGroupedRowsMatchSerial(
             wo_weight.get(), prepared, 4, N, K, input_scale, /*graph_capture=*/true, stream);
     }
+
+    prepared.kernel->clearGPUStreamBinding();
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+/**
+ * @test The Qwen 3.5 122B GDN output-projection shard is batch invariant.
+ *
+ * A four-way LocalTP participant owns a [3072, 2048] Q8_0 slice of
+ * @c blk.0.ssm_out.weight.  The production MTP depth-two verifier presents
+ * three activation rows to that projection (one target plus two drafts), while
+ * ordinary decode presents the same rows independently at M=1.  Exercise the
+ * production prepared-weight and graph-captured GEMMStage route at that exact
+ * geometry so a local projection defect cannot be mistaken for collective
+ * reduction-order drift.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM,
+     Qwen35MoEGDNOutputProjectionQ80TP4ShardM3MatchesSerialDecodeStrict)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    constexpr int M = 3;
+    constexpr int N = 3072;
+    constexpr int K = 2048;
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    auto weight = TestTensorFactory::createQ8_0Random(
+        {static_cast<size_t>(N), static_cast<size_t>(K)},
+        /*seed=*/351223u);
+    auto prepared = makeGpuPreparedGemm(
+        weight.get(),
+        DeviceId::rocm(0),
+        "test.qwen35moe.gdn_output_projection.tp4.rank0",
+        ModelContextId{351223});
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(
+        hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+        hipSuccess);
+
+    runRealWeightGemmStageGroupedRowsMatchSerial(
+        weight.get(),
+        prepared,
+        M,
+        N,
+        K,
+        /*input_scale=*/1.0f,
+        /*graph_capture=*/true,
+        stream);
 
     prepared.kernel->clearGPUStreamBinding();
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);

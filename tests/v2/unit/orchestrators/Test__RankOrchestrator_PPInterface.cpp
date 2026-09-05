@@ -148,7 +148,10 @@ namespace llaminar2::test
         void registerBARBackedOutput(const std::string &, const GlobalDeviceAddress &, TensorBase *) override {}
         bool hasBARBackedOutputs(const std::string &) const override { return false; }
         void clearBARBackedOutputs() override {}
-        bool reserveCollectiveResources(size_t, size_t) override { return true; }
+        bool reserveCollectiveResources(
+            size_t,
+            size_t,
+            const std::shared_ptr<PhysicalMemoryAuthority> &) override { return true; }
         bool broadcast(TensorBase *, int) override { return true; }
 
         void requestAbort() override {}

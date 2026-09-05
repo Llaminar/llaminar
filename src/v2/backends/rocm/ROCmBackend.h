@@ -57,7 +57,8 @@ namespace llaminar2
         bool registerExternalMappedHostMemory(
             void *ptr,
             size_t bytes,
-            int registration_device_id) override;
+            int registration_device_id,
+            MappedHostRegistrationScope scope) override;
         bool externalMappedHostDevicePointer(
             void *host_ptr,
             int device_id,

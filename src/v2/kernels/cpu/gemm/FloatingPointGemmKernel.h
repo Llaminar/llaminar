@@ -486,48 +486,530 @@ namespace llaminar2
         }
 
         /**
-         * @brief Execute the fixed movable-expert FP32 dot-product program.
+         * @brief Decode one GPU-aligned floating-expert weight without changing bits.
+         *
+         * @tparam WeightType Native floating tensor storage type.
+         * @param weights Contiguous row-major weight storage.
+         * @param index Element index in that storage.
+         * @return The exactly represented FP32 value used by device kernels.
+         */
+        template <TensorType WeightType>
+        inline float load_gpu_aligned_expert_weight_scalar(
+            const void *weights,
+            std::size_t index) noexcept
+        {
+            static_assert(
+                WeightType == TensorType::FP32 ||
+                    WeightType == TensorType::FP16 ||
+                    WeightType == TensorType::BF16,
+                "GPU-aligned expert weights must use a floating storage type");
+            if constexpr (WeightType == TensorType::FP32)
+                return static_cast<const float *>(weights)[index];
+            else if constexpr (WeightType == TensorType::FP16)
+                return fp16_to_fp32(
+                    static_cast<const std::uint16_t *>(weights)[index]);
+            else
+                return simd::bf16_to_fp32(
+                    static_cast<const std::uint16_t *>(weights)[index]);
+        }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        /**
+         * @brief Load sixteen contiguous GPU-aligned expert weights as exact FP32 lanes.
+         *
+         * BF16 conversion is the format's exact left shift. FP16 uses the ISA's
+         * IEEE conversion instruction; both produce the same finite binary32
+         * words as the CUDA/HIP load helpers. Masked tail lanes become positive
+         * zero, matching the initialized inactive GPU reduction lanes.
+         *
+         * @tparam WeightType Native floating tensor storage type.
+         * @param weights Contiguous row-major weight storage.
+         * @param index First element index.
+         * @param mask Active lanes for a partial K tail.
+         * @return Sixteen FP32 weight lanes.
+         */
+        template <TensorType WeightType>
+        inline __m512 load_gpu_aligned_expert_weight_avx512(
+            const void *weights,
+            std::size_t index,
+            __mmask16 mask) noexcept
+        {
+            static_assert(
+                WeightType == TensorType::FP32 ||
+                    WeightType == TensorType::FP16 ||
+                    WeightType == TensorType::BF16,
+                "GPU-aligned expert weights must use a floating storage type");
+            if constexpr (WeightType == TensorType::FP32)
+            {
+                return _mm512_maskz_loadu_ps(
+                    mask,
+                    static_cast<const float *>(weights) + index);
+            }
+            else
+            {
+                const __m256i packed = _mm256_maskz_loadu_epi16(
+                    mask,
+                    static_cast<const std::uint16_t *>(weights) + index);
+                if constexpr (WeightType == TensorType::FP16)
+                    return _mm512_cvtph_ps(packed);
+                else
+                    return _mm512_castsi512_ps(
+                        _mm512_slli_epi32(
+                            _mm512_cvtepu16_epi32(packed), 16));
+            }
+        }
+
+        /**
+         * @brief Reduce the 256 logical GPU lanes with the identical add tree.
+         *
+         * Wide instructions process independent nodes from one tree level; a
+         * store/load boundary separates levels. The last four levels use the
+         * scalar explicit-rounding primitive. Consequently vector width changes
+         * throughput without changing a single parenthesization or FP32 edge.
+         *
+         * @param partials Exactly 256 lane accumulators.
+         * @return Root word of the fixed reduction tree.
+         */
+        inline float reduce_gpu_aligned_expert_partials_avx512(
+            float *partials) noexcept
+        {
+            constexpr int kLanes =
+                floating_expert_numerical_contract::kReductionLanes;
+            for (int stride = kLanes / 2; stride >= 16; stride >>= 1)
+            {
+                for (int lane = 0; lane < stride; lane += 16)
+                {
+                    const __m512 lhs = _mm512_load_ps(partials + lane);
+                    const __m512 rhs =
+                        _mm512_load_ps(partials + lane + stride);
+                    _mm512_store_ps(
+                        partials + lane,
+                        _mm512_add_ps(lhs, rhs));
+                }
+            }
+            for (int stride = 8; stride > 0; stride >>= 1)
+            {
+                for (int lane = 0; lane < stride; ++lane)
+                {
+                    partials[lane] = device_fp32_contract::add(
+                        partials[lane], partials[lane + stride]);
+                }
+            }
+            return partials[0];
+        }
+
+        /**
+         * @brief Compute one output column for a fixed number of rows with
+         *        enough independent AVX-512 chains to cover FMA latency.
+         *
+         * The device contract owns 256 independent logical accumulators.  A
+         * naive CPU translation completes all K contributions for one vector
+         * of sixteen lanes before starting the next vector, leaving only
+         * `Rows` dependent FMA chains in flight.  This schedule advances up to
+         * sixteen chains together.  Each individual lane still observes the
+         * identical increasing `base` order, and the final reduction uses the
+         * unchanged device tree, so the optimization cannot alter a result bit.
+         *
+         * @tparam WeightType Native floating tensor storage type.
+         * @tparam Rows Compile-time row count in `[1,4]`.
+         * @param activations First activation row for this tile.
+         * @param weights Complete row-major transposed weight tensor.
+         * @param weight_row Element offset of the selected output column.
+         * @param k Reduction width and activation-row stride.
+         * @param reduced Exact tree root for each row.
+         */
+        template <TensorType WeightType, int Rows>
+        inline void dot_gpu_aligned_expert_rows_avx512(
+            const float *activations,
+            const void *weights,
+            std::size_t weight_row,
+            int k,
+            float *reduced) noexcept
+        {
+            static_assert(Rows >= 1 && Rows <= 4);
+            constexpr int kLanes =
+                floating_expert_numerical_contract::kReductionLanes;
+            constexpr int kVectorLanes = 16;
+            // Bound live accumulators to sixteen, leaving ample registers for
+            // the current weights, activation, masks, and address arithmetic.
+            constexpr int kLaneBlocksPerTile = 16 / Rows;
+            alignas(64) float partials[Rows][kLanes] = {};
+
+            for (int lane_tile = 0; lane_tile < kLanes;
+                 lane_tile += kVectorLanes * kLaneBlocksPerTile)
+            {
+                __m512 accumulators[Rows][kLaneBlocksPerTile];
+                // These dimensions are compile-time constants.  Explicit
+                // unrolling is required here: otherwise GCC leaves the array
+                // compiler-indexed and reloads every accumulator from the
+                // stack inside the FMA loop.
+#pragma GCC unroll 4
+                for (int row = 0; row < Rows; ++row)
+                {
+#pragma GCC unroll 16
+                    for (int block = 0; block < kLaneBlocksPerTile; ++block)
+                        accumulators[row][block] = _mm512_setzero_ps();
+                }
+
+                // Advancing base outside the lane-block loop exposes the
+                // independent chains together and reads neighboring cache
+                // lines before moving to the next 256-lane K stripe.
+                for (int base = 0; base < k; base += kLanes)
+                {
+#pragma GCC unroll 16
+                    for (int block = 0; block < kLaneBlocksPerTile; ++block)
+                    {
+                        const int lane_block =
+                            lane_tile + block * kVectorLanes;
+                        if (lane_block >= kLanes)
+                            continue;
+                        const int first_k = base + lane_block;
+                        if (first_k >= k)
+                            continue;
+                        const int valid = std::min(kVectorLanes, k - first_k);
+                        const __mmask16 mask =
+                            valid == kVectorLanes
+                                ? static_cast<__mmask16>(0xffffu)
+                                : static_cast<__mmask16>(
+                                      (std::uint32_t{1} << valid) - 1u);
+                        const __m512 weight_values =
+                            load_gpu_aligned_expert_weight_avx512<WeightType>(
+                                weights,
+                                weight_row +
+                                    static_cast<std::size_t>(first_k),
+                                mask);
+#pragma GCC unroll 4
+                        for (int row = 0; row < Rows; ++row)
+                        {
+                            const float *activation_values =
+                                activations +
+                                static_cast<std::size_t>(row) * k +
+                                static_cast<std::size_t>(first_k);
+                            accumulators[row][block] = _mm512_fmadd_ps(
+                                _mm512_maskz_loadu_ps(mask, activation_values),
+                                weight_values,
+                                accumulators[row][block]);
+                        }
+                    }
+                }
+
+#pragma GCC unroll 4
+                for (int row = 0; row < Rows; ++row)
+                {
+#pragma GCC unroll 16
+                    for (int block = 0; block < kLaneBlocksPerTile; ++block)
+                    {
+                        const int lane_block =
+                            lane_tile + block * kVectorLanes;
+                        if (lane_block < kLanes)
+                        {
+                            _mm512_store_ps(
+                                partials[row] + lane_block,
+                                accumulators[row][block]);
+                        }
+                    }
+                }
+            }
+
+            for (int row = 0; row < Rows; ++row)
+            {
+                reduced[row] =
+                    reduce_gpu_aligned_expert_partials_avx512(partials[row]);
+            }
+        }
+#endif
+
+#if defined(__AVX2__)
+        /**
+         * @brief Load eight contiguous GPU-aligned expert weights as exact FP32 lanes.
+         *
+         * AVX2 has no masked 16-bit load, so the uncommon partial-K tail is
+         * copied into a zeroed stack word before conversion. Production Qwen
+         * expert dimensions are multiples of 256 and remain on the direct-load
+         * branch. The conversion instructions preserve the same finite FP32
+         * words as the scalar and device loaders.
+         *
+         * @tparam WeightType Native floating tensor storage type.
+         * @param weights Contiguous row-major weight storage.
+         * @param index First element index.
+         * @param valid Number of active lanes in `[1,8]`.
+         * @return Eight FP32 weight lanes with inactive lanes set to zero.
+         */
+        template <TensorType WeightType>
+        inline __m256 load_gpu_aligned_expert_weight_avx2(
+            const void *weights,
+            std::size_t index,
+            int valid) noexcept
+        {
+            static_assert(
+                WeightType == TensorType::FP32 ||
+                    WeightType == TensorType::FP16 ||
+                    WeightType == TensorType::BF16,
+                "GPU-aligned expert weights must use a floating storage type");
+            if constexpr (WeightType == TensorType::FP32)
+            {
+                if (valid == 8)
+                {
+                    return _mm256_loadu_ps(
+                        static_cast<const float *>(weights) + index);
+                }
+                alignas(32) float tail[8] = {};
+                std::memcpy(
+                    tail,
+                    static_cast<const float *>(weights) + index,
+                    static_cast<std::size_t>(valid) * sizeof(float));
+                return _mm256_load_ps(tail);
+            }
+            else
+            {
+                __m128i packed{};
+                if (valid == 8)
+                {
+                    packed = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i *>(
+                            static_cast<const std::uint16_t *>(weights) +
+                            index));
+                }
+                else
+                {
+                    alignas(16) std::uint16_t tail[8] = {};
+                    std::memcpy(
+                        tail,
+                        static_cast<const std::uint16_t *>(weights) + index,
+                        static_cast<std::size_t>(valid) *
+                            sizeof(std::uint16_t));
+                    packed = _mm_load_si128(
+                        reinterpret_cast<const __m128i *>(tail));
+                }
+                if constexpr (WeightType == TensorType::FP16)
+                    return _mm256_cvtph_ps(packed);
+                else
+                    return _mm256_castsi256_ps(
+                        _mm256_slli_epi32(
+                            _mm256_cvtepu16_epi32(packed), 16));
+            }
+        }
+
+        /**
+         * @brief Load eight FP32 activations without crossing a K-row tail.
+         * @param activations Address of the first active activation.
+         * @param valid Number of active lanes in `[1,8]`.
+         * @return Eight activation lanes with inactive lanes set to zero.
+         */
+        inline __m256 load_gpu_aligned_expert_activation_avx2(
+            const float *activations,
+            int valid) noexcept
+        {
+            if (valid == 8)
+                return _mm256_loadu_ps(activations);
+            alignas(32) float tail[8] = {};
+            std::memcpy(
+                tail,
+                activations,
+                static_cast<std::size_t>(valid) * sizeof(float));
+            return _mm256_load_ps(tail);
+        }
+
+        /**
+         * @brief Reduce the 256 logical GPU lanes using AVX2 tree nodes.
+         * @param partials Exactly 256 lane accumulators.
+         * @return Root word of the fixed reduction tree.
+         */
+        inline float reduce_gpu_aligned_expert_partials_avx2(
+            float *partials) noexcept
+        {
+            constexpr int kLanes =
+                floating_expert_numerical_contract::kReductionLanes;
+            for (int stride = kLanes / 2; stride >= 8; stride >>= 1)
+            {
+                for (int lane = 0; lane < stride; lane += 8)
+                {
+                    const __m256 lhs = _mm256_load_ps(partials + lane);
+                    const __m256 rhs =
+                        _mm256_load_ps(partials + lane + stride);
+                    _mm256_store_ps(
+                        partials + lane,
+                        _mm256_add_ps(lhs, rhs));
+                }
+            }
+            for (int stride = 4; stride > 0; stride >>= 1)
+            {
+                for (int lane = 0; lane < stride; ++lane)
+                {
+                    partials[lane] = device_fp32_contract::add(
+                        partials[lane], partials[lane + stride]);
+                }
+            }
+            return partials[0];
+        }
+
+        /**
+         * @brief Compute one output column with a latency-covering AVX2
+         *        schedule while retaining the exact 256-lane device tree.
+         *
+         * AVX2 has half the vector register file available to the AVX-512
+         * implementation, so it keeps eight accumulator chains live.  The
+         * compile-time row count divides that budget between independent rows;
+         * this avoids spills while preserving each lane's K accumulation order.
+         *
+         * @tparam WeightType Native floating tensor storage type.
+         * @tparam Rows Compile-time row count in `[1,4]`.
+         * @param activations First activation row for this tile.
+         * @param weights Complete row-major transposed weight tensor.
+         * @param weight_row Element offset of the selected output column.
+         * @param k Reduction width and activation-row stride.
+         * @param reduced Exact tree root for each row.
+         */
+        template <TensorType WeightType, int Rows>
+        inline void dot_gpu_aligned_expert_rows_avx2(
+            const float *activations,
+            const void *weights,
+            std::size_t weight_row,
+            int k,
+            float *reduced) noexcept
+        {
+            static_assert(Rows >= 1 && Rows <= 4);
+            constexpr int kLanes =
+                floating_expert_numerical_contract::kReductionLanes;
+            constexpr int kVectorLanes = 8;
+            constexpr int kLaneBlocksPerTile = 8 / Rows;
+            alignas(32) float partials[Rows][kLanes] = {};
+
+            for (int lane_tile = 0; lane_tile < kLanes;
+                 lane_tile += kVectorLanes * kLaneBlocksPerTile)
+            {
+                __m256 accumulators[Rows][kLaneBlocksPerTile];
+                // As above, unroll both fixed dimensions so the eight live
+                // chains remain YMM registers rather than stack slots.
+#pragma GCC unroll 4
+                for (int row = 0; row < Rows; ++row)
+                {
+#pragma GCC unroll 8
+                    for (int block = 0; block < kLaneBlocksPerTile; ++block)
+                        accumulators[row][block] = _mm256_setzero_ps();
+                }
+
+                for (int base = 0; base < k; base += kLanes)
+                {
+#pragma GCC unroll 8
+                    for (int block = 0; block < kLaneBlocksPerTile; ++block)
+                    {
+                        const int lane_block =
+                            lane_tile + block * kVectorLanes;
+                        if (lane_block >= kLanes)
+                            continue;
+                        const int first_k = base + lane_block;
+                        if (first_k >= k)
+                            continue;
+                        const int valid = std::min(kVectorLanes, k - first_k);
+                        const __m256 weight_values =
+                            load_gpu_aligned_expert_weight_avx2<WeightType>(
+                                weights,
+                                weight_row +
+                                    static_cast<std::size_t>(first_k),
+                                valid);
+#pragma GCC unroll 4
+                        for (int row = 0; row < Rows; ++row)
+                        {
+                            const float *activation_values =
+                                activations +
+                                static_cast<std::size_t>(row) * k +
+                                static_cast<std::size_t>(first_k);
+                            accumulators[row][block] = _mm256_fmadd_ps(
+                                load_gpu_aligned_expert_activation_avx2(
+                                    activation_values, valid),
+                                weight_values,
+                                accumulators[row][block]);
+                        }
+                    }
+                }
+
+#pragma GCC unroll 4
+                for (int row = 0; row < Rows; ++row)
+                {
+#pragma GCC unroll 8
+                    for (int block = 0; block < kLaneBlocksPerTile; ++block)
+                    {
+                        const int lane_block =
+                            lane_tile + block * kVectorLanes;
+                        if (lane_block < kLanes)
+                        {
+                            _mm256_store_ps(
+                                partials[row] + lane_block,
+                                accumulators[row][block]);
+                        }
+                    }
+                }
+            }
+
+            for (int row = 0; row < Rows; ++row)
+            {
+                reduced[row] =
+                    reduce_gpu_aligned_expert_partials_avx2(partials[row]);
+            }
+        }
+#endif
+
+        /**
+         * @brief Execute the fixed GPU-aligned expert FP32 dot-product program.
          *
          * GPU ExpertOverlay kernels reduce 256 strided K lanes through a fixed
-         * binary tree. CPU-resident movable experts must emulate that exact
-         * tree; otherwise promotion changes the logical model and recursive
-         * MTP amplifies the placement-dependent perturbation. Four runtime
-         * rows share each decoded weight while retaining independent trees.
+         * binary tree. CPU-resident GPU-aligned experts emulate that exact program;
+         * otherwise promotion changes the logical model and recursive MTP
+         * amplifies the placement-dependent perturbation. AVX-512 computes 16
+         * independent logical lanes at once. It never vector-reduces K, so its
+         * result remains byte-identical to the scalar oracle and both GPU
+         * backends. AVX2 computes eight independent lanes per instruction;
+         * runtime dispatch uses the process-wide typed ISA authority.
          *
-         * @tparam WeightFn Callable accepting `(column, k)` and returning FP32.
+         * @tparam WeightType Native floating tensor storage type.
          * @param A Row-major FP32 activations `[M,K]`.
+         * @param B Row-major transposed weights `[N,K]`.
          * @param C Row-major FP32 output `[M,N]`.
          * @param M Runtime row count.
          * @param N Output width.
          * @param K Reduction width.
-         * @param weight Weight accessor for the stored floating format.
          * @param alpha Output scale.
          * @param beta Existing-output scale.
          * @param bias Optional FP32 output-column bias.
          * @return True after every output word is published.
          */
-        template <typename WeightFn>
-        inline bool run_movable_expert_fp32_matmul(
+        template <TensorType WeightType, ISALevel ISA>
+        inline bool run_gpu_aligned_expert_fp32_matmul_isa(
             const float *A,
+            const void *B,
             float *C,
             int M,
             int N,
             int K,
-            WeightFn &&weight,
             float alpha = 1.0f,
             float beta = 0.0f,
             const float *bias = nullptr)
         {
-            if (!A || !C || M < 0 || N < 0 || K <= 0)
+            static_assert(
+                WeightType == TensorType::FP32 ||
+                    WeightType == TensorType::FP16 ||
+                    WeightType == TensorType::BF16,
+                "GPU-aligned expert weights must use a floating storage type");
+            static_assert(
+                ISA == ISALevel::Scalar || ISA == ISALevel::AVX2 ||
+                    ISA == ISALevel::AVX512,
+                "GPU-aligned expert matmul needs a concrete ISA implementation");
+            if (!A || !B || !C || M < 0 || N < 0 || K <= 0)
             {
-                LOG_ERROR("[FloatingPointGemmKernel] Invalid movable-expert matmul geometry"
+                LOG_ERROR("[FloatingPointGemmKernel] Invalid GPU-aligned expert matmul geometry"
                           << " A=" << static_cast<const void *>(A)
+                          << " B=" << B
                           << " C=" << static_cast<void *>(C)
                           << " M=" << M << " N=" << N << " K=" << K);
                 return false;
             }
 
             constexpr int kRowTile = 4;
+            constexpr int kLanes =
+                floating_expert_numerical_contract::kReductionLanes;
+            static_assert(kLanes == 256,
+                          "CPU SIMD schedules implement the 256-lane device tree");
             const int row_tiles = (M + kRowTile - 1) / kRowTile;
             auto work = [&]()
             {
@@ -540,21 +1022,129 @@ namespace llaminar2
                         const int tile_rows =
                             std::min(kRowTile, M - first_row);
                         std::array<float, kRowTile> reduced{};
-                        floating_expert_numerical_contract::dotRows<kRowTile>(
-                            tile_rows,
-                            K,
-                            [&](int tile_row, int k)
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+                        if constexpr (ISA == ISALevel::AVX512)
+                        {
+                            const std::size_t weight_row =
+                                static_cast<std::size_t>(column) * K;
+                            const float *tile_activations =
+                                A + static_cast<std::size_t>(first_row) * K;
+                            // Specializing the small runtime row tail lets the
+                            // scheduler keep several independent logical-lane
+                            // chains live without changing their arithmetic.
+                            switch (tile_rows)
                             {
-                                return A[
-                                    static_cast<std::size_t>(
-                                        first_row + tile_row) * K +
-                                    static_cast<std::size_t>(k)];
-                            },
-                            [&](int k)
+                                case 1:
+                                    dot_gpu_aligned_expert_rows_avx512<
+                                        WeightType,
+                                        1>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                                case 2:
+                                    dot_gpu_aligned_expert_rows_avx512<
+                                        WeightType,
+                                        2>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                                case 3:
+                                    dot_gpu_aligned_expert_rows_avx512<
+                                        WeightType,
+                                        3>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                                case 4:
+                                    dot_gpu_aligned_expert_rows_avx512<
+                                        WeightType,
+                                        4>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                            }
+                        }
+                        else
+#endif
+#if defined(__AVX2__)
+                        if constexpr (ISA == ISALevel::AVX2)
+                        {
+                            const std::size_t weight_row =
+                                static_cast<std::size_t>(column) * K;
+                            const float *tile_activations =
+                                A + static_cast<std::size_t>(first_row) * K;
+                            switch (tile_rows)
                             {
-                                return weight(column, k);
-                            },
-                            reduced);
+                                case 1:
+                                    dot_gpu_aligned_expert_rows_avx2<
+                                        WeightType,
+                                        1>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                                case 2:
+                                    dot_gpu_aligned_expert_rows_avx2<
+                                        WeightType,
+                                        2>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                                case 3:
+                                    dot_gpu_aligned_expert_rows_avx2<
+                                        WeightType,
+                                        3>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                                case 4:
+                                    dot_gpu_aligned_expert_rows_avx2<
+                                        WeightType,
+                                        4>(tile_activations,
+                                           B,
+                                           weight_row,
+                                           K,
+                                           reduced.data());
+                                    break;
+                            }
+                        }
+                        else
+#endif
+                        {
+                            floating_expert_numerical_contract::dotRows<
+                                kRowTile>(
+                                tile_rows,
+                                K,
+                                [&](int tile_row, int k)
+                                {
+                                    return A[
+                                        static_cast<std::size_t>(
+                                            first_row + tile_row) * K +
+                                        static_cast<std::size_t>(k)];
+                                },
+                                [&](int k)
+                                {
+                                    return load_gpu_aligned_expert_weight_scalar<
+                                        WeightType>(
+                                        B,
+                                        static_cast<std::size_t>(column) * K +
+                                            static_cast<std::size_t>(k));
+                                },
+                                reduced);
+                        }
 
                         const float bias_value = bias ? bias[column] : 0.0f;
                         for (int tile_row = 0; tile_row < tile_rows;
@@ -576,6 +1166,115 @@ namespace llaminar2
             };
             OMP_WORKSHARE_REGION(work);
             return true;
+        }
+
+        /**
+         * @brief Execute the portable scalar GPU-aligned expert schedule.
+         * @tparam WeightType Native floating tensor storage type.
+         */
+        template <TensorType WeightType>
+        inline bool run_gpu_aligned_expert_fp32_matmul_scalar(
+            const float *A,
+            const void *B,
+            float *C,
+            int M,
+            int N,
+            int K,
+            float alpha = 1.0f,
+            float beta = 0.0f,
+            const float *bias = nullptr)
+        {
+            return run_gpu_aligned_expert_fp32_matmul_isa<
+                WeightType, ISALevel::Scalar>(
+                A, B, C, M, N, K, alpha, beta, bias);
+        }
+
+#if defined(__AVX2__)
+        /**
+         * @brief Execute the AVX2 GPU-aligned expert schedule.
+         * @tparam WeightType Native floating tensor storage type.
+         */
+        template <TensorType WeightType>
+        inline bool run_gpu_aligned_expert_fp32_matmul_avx2(
+            const float *A,
+            const void *B,
+            float *C,
+            int M,
+            int N,
+            int K,
+            float alpha = 1.0f,
+            float beta = 0.0f,
+            const float *bias = nullptr)
+        {
+            return run_gpu_aligned_expert_fp32_matmul_isa<
+                WeightType, ISALevel::AVX2>(
+                A, B, C, M, N, K, alpha, beta, bias);
+        }
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        /**
+         * @brief Execute the AVX-512 GPU-aligned expert schedule.
+         * @tparam WeightType Native floating tensor storage type.
+         */
+        template <TensorType WeightType>
+        inline bool run_gpu_aligned_expert_fp32_matmul_avx512(
+            const float *A,
+            const void *B,
+            float *C,
+            int M,
+            int N,
+            int K,
+            float alpha = 1.0f,
+            float beta = 0.0f,
+            const float *bias = nullptr)
+        {
+            return run_gpu_aligned_expert_fp32_matmul_isa<
+                WeightType, ISALevel::AVX512>(
+                A, B, C, M, N, K, alpha, beta, bias);
+        }
+#endif
+
+        /**
+         * @brief Dispatch once to the process-selected GPU-aligned expert ISA.
+         *
+         * Dispatch happens before opening the OpenMP team, rather than once per
+         * output column. This is the repository's scalar/AVX2/AVX-512 pattern:
+         * the build controls the maximum compiled ISA and `activeISALevel()`
+         * selects one complete implementation for the process.
+         *
+         * @tparam WeightType Native floating tensor storage type.
+         * @return True after the selected exact-tree implementation completes.
+         */
+        template <TensorType WeightType>
+        inline bool run_gpu_aligned_expert_fp32_matmul(
+            const float *A,
+            const void *B,
+            float *C,
+            int M,
+            int N,
+            int K,
+            float alpha = 1.0f,
+            float beta = 0.0f,
+            const float *bias = nullptr)
+        {
+            switch (activeISALevel())
+            {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            case ISALevel::AVX512:
+                return run_gpu_aligned_expert_fp32_matmul_avx512<WeightType>(
+                    A, B, C, M, N, K, alpha, beta, bias);
+#endif
+#if defined(__AVX2__)
+            case ISALevel::AVX2:
+                return run_gpu_aligned_expert_fp32_matmul_avx2<WeightType>(
+                    A, B, C, M, N, K, alpha, beta, bias);
+#endif
+            case ISALevel::Scalar:
+            default:
+                return run_gpu_aligned_expert_fp32_matmul_scalar<WeightType>(
+                    A, B, C, M, N, K, alpha, beta, bias);
+            }
         }
 
         /**
@@ -1451,14 +2150,13 @@ namespace llaminar2
             }
 
         public:
-            /** Selects the arithmetic identity of one prepared weight engine. */
-            enum class NumericalPolicy
-            {
-                /** Ordinary CPU GEMM semantics for non-movable dense weights. */
-                BackendNative,
-                /** CPU emulation of the GPU movable-expert FP32 tree. */
-                MovableExpert,
-            };
+            /**
+             * @brief Shared arithmetic identity for prepared expert engines.
+             *
+             * Keeping this compatibility name avoids duplicating an enum: the
+             * quantized and floating engines consume the same typed policy.
+             */
+            using NumericalPolicy = CPUProjectionNumericalPolicy;
 
             /**
              * @brief Construct a kernel that borrows a floating-point weight tensor.
@@ -1468,7 +2166,7 @@ namespace llaminar2
              * shared-ownership overload below instead.
              *
              * @param weight_tensor Borrowed weight tensor (FP32, FP16, or BF16).
-             * @param numerical_policy Backend-native or movable-expert arithmetic.
+             * @param numerical_policy Backend-native or GPU-aligned expert arithmetic.
              */
             explicit FloatingPointGemmKernel(
                 const TensorBase *weight_tensor,
@@ -1488,7 +2186,7 @@ namespace llaminar2
              * inference and may be reclaimed independently.
              *
              * @param weight_tensor Shared weight tensor (FP32, FP16, or BF16).
-             * @param numerical_policy Backend-native or movable-expert arithmetic.
+             * @param numerical_policy Backend-native or GPU-aligned expert arithmetic.
              */
             explicit FloatingPointGemmKernel(
                 std::shared_ptr<const TensorBase> weight_tensor,
@@ -1641,22 +2339,24 @@ namespace llaminar2
                     const float *A_data = A->data() + row_offset;
                     float *C_data = C->mutable_data();
                     const float *B_data = weight_tensor_->data();
-                    if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                    if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                     {
                         if (!transpose_B)
                         {
-                            LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                            LOG_ERROR("[FloatingPointGemmKernel] GPU-aligned floating experts require row-major transposed weights");
                             return false;
                         }
-                        return run_movable_expert_fp32_matmul(
-                            A_data, C_data, m, n, k,
-                            [&](int column, int kk)
-                            {
-                                return B_data[
-                                    static_cast<std::size_t>(column) * k +
-                                    static_cast<std::size_t>(kk)];
-                            },
-                            alpha, beta, bias_ptr);
+                        return run_gpu_aligned_expert_fp32_matmul<
+                            TensorType::FP32>(
+                            A_data,
+                            B_data,
+                            C_data,
+                            m,
+                            n,
+                            k,
+                            alpha,
+                            beta,
+                            bias_ptr);
                     }
                     // OneDNN FP32 matmul supports fused bias natively
                     return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta, bias_ptr);
@@ -1678,23 +2378,23 @@ namespace llaminar2
                     }
                     if (mixed_fp32_activation)
                     {
-                        if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                        if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                         {
                             if (!transpose_B)
                             {
-                                LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                                LOG_ERROR("[FloatingPointGemmKernel] GPU-aligned floating experts require row-major transposed weights");
                                 return false;
                             }
-                            return run_movable_expert_fp32_matmul(
-                                A->data() + row_offset, C_data, m, n, k,
-                                [&](int column, int kk)
-                                {
-                                    return fp16_to_fp32(
-                                        B_fp16->typed_data()[
-                                            static_cast<std::size_t>(column) * k +
-                                            static_cast<std::size_t>(kk)]);
-                                },
-                                alpha, beta);
+                            return run_gpu_aligned_expert_fp32_matmul<
+                                TensorType::FP16>(
+                                A->data() + row_offset,
+                                B_fp16->typed_data(),
+                                C_data,
+                                m,
+                                n,
+                                k,
+                                alpha,
+                                beta);
                         }
                         return run_fp32xfp16_skinny_matmul(
                             A->data() + row_offset,
@@ -1742,23 +2442,23 @@ namespace llaminar2
                     }
                     if (mixed_fp32_activation)
                     {
-                        if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                        if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                         {
                             if (!transpose_B)
                             {
-                                LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                                LOG_ERROR("[FloatingPointGemmKernel] GPU-aligned floating experts require row-major transposed weights");
                                 return false;
                             }
-                            return run_movable_expert_fp32_matmul(
-                                A->data() + row_offset, C_data, m, n, k,
-                                [&](int column, int kk)
-                                {
-                                    return simd::bf16_to_fp32(
-                                        B_bf16->typed_data()[
-                                            static_cast<std::size_t>(column) * k +
-                                            static_cast<std::size_t>(kk)]);
-                                },
-                                alpha, beta);
+                            return run_gpu_aligned_expert_fp32_matmul<
+                                TensorType::BF16>(
+                                A->data() + row_offset,
+                                B_bf16->typed_data(),
+                                C_data,
+                                m,
+                                n,
+                                k,
+                                alpha,
+                                beta);
                         }
                         return run_fp32xbf16_skinny_matmul(
                             A->data() + row_offset,
@@ -1863,22 +2563,24 @@ namespace llaminar2
                     const float *A_data = A->data() + row_offset;
                     float *C_data = C->mutable_data();
                     const float *B_data = weight_tensor_->data();
-                    if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                    if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                     {
                         if (!transpose_B)
                         {
-                            LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                            LOG_ERROR("[FloatingPointGemmKernel] GPU-aligned floating experts require row-major transposed weights");
                             return false;
                         }
-                        return run_movable_expert_fp32_matmul(
-                            A_data, C_data, m, n, k,
-                            [&](int column, int kk)
-                            {
-                                return B_data[
-                                    static_cast<std::size_t>(column) * k +
-                                    static_cast<std::size_t>(kk)];
-                            },
-                            alpha, beta, bias_ptr);
+                        return run_gpu_aligned_expert_fp32_matmul<
+                            TensorType::FP32>(
+                            A_data,
+                            B_data,
+                            C_data,
+                            m,
+                            n,
+                            k,
+                            alpha,
+                            beta,
+                            bias_ptr);
                     }
                     // OneDNN FP32 matmul supports fused bias natively
                     return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta, bias_ptr);
@@ -1900,23 +2602,23 @@ namespace llaminar2
                     }
                     if (mixed_fp32_activation)
                     {
-                        if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                        if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                         {
                             if (!transpose_B)
                             {
-                                LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                                LOG_ERROR("[FloatingPointGemmKernel] GPU-aligned floating experts require row-major transposed weights");
                                 return false;
                             }
-                            return run_movable_expert_fp32_matmul(
-                                A->data() + row_offset, C_data, m, n, k,
-                                [&](int column, int kk)
-                                {
-                                    return fp16_to_fp32(
-                                        B_fp16->typed_data()[
-                                            static_cast<std::size_t>(column) * k +
-                                            static_cast<std::size_t>(kk)]);
-                                },
-                                alpha, beta);
+                            return run_gpu_aligned_expert_fp32_matmul<
+                                TensorType::FP16>(
+                                A->data() + row_offset,
+                                B_fp16->typed_data(),
+                                C_data,
+                                m,
+                                n,
+                                k,
+                                alpha,
+                                beta);
                         }
                         return run_fp32xfp16_skinny_matmul(
                             A->data() + row_offset,
@@ -1964,23 +2666,23 @@ namespace llaminar2
                     }
                     if (mixed_fp32_activation)
                     {
-                        if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                        if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                         {
                             if (!transpose_B)
                             {
-                                LOG_ERROR("[FloatingPointGemmKernel] Movable floating experts require row-major transposed weights");
+                                LOG_ERROR("[FloatingPointGemmKernel] GPU-aligned floating experts require row-major transposed weights");
                                 return false;
                             }
-                            return run_movable_expert_fp32_matmul(
-                                A->data() + row_offset, C_data, m, n, k,
-                                [&](int column, int kk)
-                                {
-                                    return simd::bf16_to_fp32(
-                                        B_bf16->typed_data()[
-                                            static_cast<std::size_t>(column) * k +
-                                            static_cast<std::size_t>(kk)]);
-                                },
-                                alpha, beta);
+                            return run_gpu_aligned_expert_fp32_matmul<
+                                TensorType::BF16>(
+                                A->data() + row_offset,
+                                B_bf16->typed_data(),
+                                C_data,
+                                m,
+                                n,
+                                k,
+                                alpha,
+                                beta);
                         }
                         return run_fp32xbf16_skinny_matmul(
                             A->data() + row_offset,
@@ -2085,7 +2787,7 @@ namespace llaminar2
                 thread_local std::vector<float> swiglu_scratch_tls;
                 if (swiglu_scratch_tls.size() < input_elements)
                     swiglu_scratch_tls.resize(input_elements);
-                if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                 {
                     /*
                      * Materialize each SwiGLU word once through the exact
@@ -2099,7 +2801,7 @@ namespace llaminar2
                             floating_expert_numerical_contract::swigluValue(
                                 gate_data[index], up_data[index]);
                     }
-                    return runMovableExpertDownProjection(
+                    return runGPUAlignedExpertDownProjection(
                         swiglu_scratch_tls.data(),
                         out_data,
                         m,
@@ -2259,7 +2961,7 @@ namespace llaminar2
                     PerfStatsCollector::isDomainEnabled("kernel");
                 auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                                : PerfStatsCollector::Clock::time_point{};
-                if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                 {
                     for (std::size_t index = 0; index < elements; ++index)
                     {
@@ -2288,9 +2990,9 @@ namespace llaminar2
                                           : PerfStatsCollector::Clock::time_point{};
                 bool down_ok = false;
                 const char *dtype_tag = "fp32";
-                if (numerical_policy_ == NumericalPolicy::MovableExpert)
+                if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                 {
-                    down_ok = runMovableExpertDownProjection(
+                    down_ok = runGPUAlignedExpertDownProjection(
                         swiglu_scratch_tls.data(),
                         out_data,
                         m,
@@ -2406,10 +3108,11 @@ namespace llaminar2
              * @brief Execute a homogeneous floating-point projection bundle.
              *
              * Every descriptor is authenticated before the first output is
-             * touched. The backend then invokes the native oneDNN primitive for
-             * each independent weight matrix directly; unlike the retired
-             * interface default, this method never calls multiply_tensor() and
-             * cannot silently cross into another kernel implementation.
+             * touched. Backend-native engines invoke the format-specific CPU
+             * primitive directly. GPU-aligned expert engines instead execute the
+             * shared 256-lane CPU/CUDA/ROCm numerical contract; bundle fusion
+             * must not erase the placement-invariant policy carried by each
+             * prepared engine.
              *
              * @param input Shared activation matrix with shape at least `[m,k]`.
              * @param projections Homogeneous FP32, FP16, or BF16 projections.
@@ -2438,6 +3141,8 @@ namespace llaminar2
                     m <= 0 || k <= 0 ||
                     (input->native_type() != weight_type_ &&
                      !mixed_fp32_activation) ||
+                    (numerical_policy_ == NumericalPolicy::GPUAlignedExpert &&
+                     input->native_type() != TensorType::FP32) ||
                     input->numel() < static_cast<size_t>(m) * k)
                 {
                     LOG_ERROR("[FloatingPointGemmKernel] Invalid fused projection bundle"
@@ -2461,6 +3166,7 @@ namespace llaminar2
                             projection.kernel);
                     if (!kernel || !kernel->weight_tensor_ ||
                         kernel->weight_type_ != weight_type_ ||
+                        kernel->numerical_policy_ != numerical_policy_ ||
                         !projection.output || projection.n <= 0 ||
                         projection.output->native_type() != TensorType::FP32 ||
                         projection.output->numel() <
@@ -2489,17 +3195,34 @@ namespace llaminar2
                     switch (weight_type_)
                     {
                     case TensorType::FP32:
-                        succeeded = run_onednn_fp32_matmul(
-                            input->data(),
-                            kernel->weight_tensor_->data(),
-                            output,
-                            m,
-                            projection.n,
-                            k,
-                            /*transpose_B=*/true,
-                            /*alpha=*/1.0f,
-                            /*beta=*/0.0f,
-                            projection.bias ? projection.bias->data() : nullptr);
+                        succeeded =
+                            numerical_policy_ == NumericalPolicy::GPUAlignedExpert
+                                ? run_gpu_aligned_expert_fp32_matmul<
+                                      TensorType::FP32>(
+                                      input->data(),
+                                      kernel->weight_tensor_->data(),
+                                      output,
+                                      m,
+                                      projection.n,
+                                      k,
+                                      /*alpha=*/1.0f,
+                                      /*beta=*/0.0f,
+                                      projection.bias
+                                          ? projection.bias->data()
+                                          : nullptr)
+                                : run_onednn_fp32_matmul(
+                                      input->data(),
+                                      kernel->weight_tensor_->data(),
+                                      output,
+                                      m,
+                                      projection.n,
+                                      k,
+                                      /*transpose_B=*/true,
+                                      /*alpha=*/1.0f,
+                                      /*beta=*/0.0f,
+                                      projection.bias
+                                          ? projection.bias->data()
+                                          : nullptr);
                         break;
                     case TensorType::FP16:
                     {
@@ -2509,16 +3232,26 @@ namespace llaminar2
                         if (mixed_fp32_activation)
                         {
                             succeeded = typed_weight &&
-                                run_fp32xfp16_skinny_matmul(
-                                    input->data(),
-                                    typed_weight->typed_data(),
-                                    output,
-                                    m,
-                                    projection.n,
-                                    k,
-                                    /*transpose_B=*/true,
-                                    /*alpha=*/1.0f,
-                                    /*beta=*/0.0f);
+                                (numerical_policy_ ==
+                                         NumericalPolicy::GPUAlignedExpert
+                                     ? run_gpu_aligned_expert_fp32_matmul<
+                                           TensorType::FP16>(
+                                           input->data(),
+                                           typed_weight->typed_data(),
+                                           output,
+                                           m,
+                                           projection.n,
+                                           k)
+                                     : run_fp32xfp16_skinny_matmul(
+                                           input->data(),
+                                           typed_weight->typed_data(),
+                                           output,
+                                           m,
+                                           projection.n,
+                                           k,
+                                           /*transpose_B=*/true,
+                                           /*alpha=*/1.0f,
+                                           /*beta=*/0.0f));
                         }
                         else
                         {
@@ -2546,16 +3279,26 @@ namespace llaminar2
                         if (mixed_fp32_activation)
                         {
                             succeeded = typed_weight &&
-                                run_fp32xbf16_skinny_matmul(
-                                    input->data(),
-                                    typed_weight->typed_data(),
-                                    output,
-                                    m,
-                                    projection.n,
-                                    k,
-                                    /*transpose_B=*/true,
-                                    /*alpha=*/1.0f,
-                                    /*beta=*/0.0f);
+                                (numerical_policy_ ==
+                                         NumericalPolicy::GPUAlignedExpert
+                                     ? run_gpu_aligned_expert_fp32_matmul<
+                                           TensorType::BF16>(
+                                           input->data(),
+                                           typed_weight->typed_data(),
+                                           output,
+                                           m,
+                                           projection.n,
+                                           k)
+                                     : run_fp32xbf16_skinny_matmul(
+                                           input->data(),
+                                           typed_weight->typed_data(),
+                                           output,
+                                           m,
+                                           projection.n,
+                                           k,
+                                           /*transpose_B=*/true,
+                                           /*alpha=*/1.0f,
+                                           /*beta=*/0.0f));
                         }
                         else
                         {
@@ -2645,6 +3388,12 @@ namespace llaminar2
                               << static_cast<int>(input->native_type())
                               << " for weight type "
                               << static_cast<int>(weight_type_));
+                    return false;
+                }
+                if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert &&
+                    input->native_type() != TensorType::FP32)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] grouped GPU-aligned expert projection requires FP32 transported rows");
                     return false;
                 }
 
@@ -2737,6 +3486,7 @@ namespace llaminar2
                     const auto &proj = projections[i];
                     auto *fp = dynamic_cast<FloatingPointGemmKernel *>(proj.kernel);
                     if (!fp || !fp->weight_tensor_ || fp->weight_type_ != weight_type_ ||
+                        fp->numerical_policy_ != numerical_policy_ ||
                         !proj.output || proj.n <= 0)
                     {
                         LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected at projection "
@@ -2783,31 +3533,54 @@ namespace llaminar2
                     bool projection_ok = false;
                     if (weight_type_ == TensorType::FP32)
                     {
-                        projection_ok = run_fp32_skinny_matmul(
-                            input_fp32,
-                            fp->weight_tensor_->data(),
-                            out_data,
-                            m,
-                            proj.n,
-                            k,
-                            /*transpose_B=*/true,
-                            /*alpha=*/1.0f,
-                            /*beta=*/0.0f,
-                            bias_ptr);
+                        projection_ok =
+                            numerical_policy_ == NumericalPolicy::GPUAlignedExpert
+                                ? run_gpu_aligned_expert_fp32_matmul<
+                                      TensorType::FP32>(
+                                      input_fp32,
+                                      fp->weight_tensor_->data(),
+                                      out_data,
+                                      m,
+                                      proj.n,
+                                      k,
+                                      /*alpha=*/1.0f,
+                                      /*beta=*/0.0f,
+                                      bias_ptr)
+                                : run_fp32_skinny_matmul(
+                                      input_fp32,
+                                      fp->weight_tensor_->data(),
+                                      out_data,
+                                      m,
+                                      proj.n,
+                                      k,
+                                      /*transpose_B=*/true,
+                                      /*alpha=*/1.0f,
+                                      /*beta=*/0.0f,
+                                      bias_ptr);
                     }
                     else if (weight_type_ == TensorType::FP16)
                     {
                         const auto *weight_fp16 = dynamic_cast<const FP16Tensor *>(fp->weight_tensor_);
                         projection_ok = weight_fp16 &&
                             (mixed_fp32_activation
-                                 ? run_fp32xfp16_skinny_matmul(
-                                       input_fp32,
-                                       weight_fp16->typed_data(),
-                                       out_data,
-                                       m,
-                                       proj.n,
-                                       k,
-                                       /*transpose_B=*/true)
+                                 ? (numerical_policy_ ==
+                                            NumericalPolicy::GPUAlignedExpert
+                                        ? run_gpu_aligned_expert_fp32_matmul<
+                                              TensorType::FP16>(
+                                              input_fp32,
+                                              weight_fp16->typed_data(),
+                                              out_data,
+                                              m,
+                                              proj.n,
+                                              k)
+                                        : run_fp32xfp16_skinny_matmul(
+                                              input_fp32,
+                                              weight_fp16->typed_data(),
+                                              out_data,
+                                              m,
+                                              proj.n,
+                                              k,
+                                              /*transpose_B=*/true))
                                  : run_fp16_skinny_matmul(
                                        input_fp16,
                                        weight_fp16->typed_data(),
@@ -2822,14 +3595,24 @@ namespace llaminar2
                         const auto *weight_bf16 = dynamic_cast<const BF16Tensor *>(fp->weight_tensor_);
                         projection_ok = weight_bf16 &&
                             (mixed_fp32_activation
-                                 ? run_fp32xbf16_skinny_matmul(
-                                       input_fp32,
-                                       weight_bf16->typed_data(),
-                                       out_data,
-                                       m,
-                                       proj.n,
-                                       k,
-                                       /*transpose_B=*/true)
+                                 ? (numerical_policy_ ==
+                                            NumericalPolicy::GPUAlignedExpert
+                                        ? run_gpu_aligned_expert_fp32_matmul<
+                                              TensorType::BF16>(
+                                              input_fp32,
+                                              weight_bf16->typed_data(),
+                                              out_data,
+                                              m,
+                                              proj.n,
+                                              k)
+                                        : run_fp32xbf16_skinny_matmul(
+                                              input_fp32,
+                                              weight_bf16->typed_data(),
+                                              out_data,
+                                              m,
+                                              proj.n,
+                                              k,
+                                              /*transpose_B=*/true))
                                  : run_bf16_skinny_matmul(
                                        input_bf16,
                                        weight_bf16->typed_data(),
@@ -3390,7 +4173,7 @@ namespace llaminar2
              * @param beta Existing-output scale.
              * @return True after the format-specific tree completed.
              */
-            bool runMovableExpertDownProjection(
+            bool runGPUAlignedExpertDownProjection(
                 const float *swiglu,
                 float *output,
                 int m,
@@ -3404,45 +4187,49 @@ namespace llaminar2
                 case TensorType::FP32:
                 {
                     const float *weights = weight_tensor_->data();
-                    return weights && run_movable_expert_fp32_matmul(
-                        swiglu, output, m, n, k,
-                        [&](int column, int kk)
-                        {
-                            return weights[
-                                static_cast<std::size_t>(column) * k +
-                                static_cast<std::size_t>(kk)];
-                        },
-                        alpha, beta);
+                    return weights &&
+                           run_gpu_aligned_expert_fp32_matmul<
+                               TensorType::FP32>(
+                               swiglu,
+                               weights,
+                               output,
+                               m,
+                               n,
+                               k,
+                               alpha,
+                               beta);
                 }
                 case TensorType::FP16:
                 {
                     const auto *weights =
                         dynamic_cast<const FP16Tensor *>(weight_tensor_);
-                    return weights && run_movable_expert_fp32_matmul(
-                        swiglu, output, m, n, k,
-                        [&](int column, int kk)
-                        {
-                            return fp16_to_fp32(
-                                weights->typed_data()[
-                                    static_cast<std::size_t>(column) * k +
-                                    static_cast<std::size_t>(kk)]);
-                        },
-                        alpha, beta);
+                    return weights &&
+                           run_gpu_aligned_expert_fp32_matmul<
+                               TensorType::FP16>(
+                               swiglu,
+                               weights->typed_data(),
+                               output,
+                               m,
+                               n,
+                               k,
+                               alpha,
+                               beta);
                 }
                 case TensorType::BF16:
                 {
                     const auto *weights =
                         dynamic_cast<const BF16Tensor *>(weight_tensor_);
-                    return weights && run_movable_expert_fp32_matmul(
-                        swiglu, output, m, n, k,
-                        [&](int column, int kk)
-                        {
-                            return simd::bf16_to_fp32(
-                                weights->typed_data()[
-                                    static_cast<std::size_t>(column) * k +
-                                    static_cast<std::size_t>(kk)]);
-                        },
-                        alpha, beta);
+                    return weights &&
+                           run_gpu_aligned_expert_fp32_matmul<
+                               TensorType::BF16>(
+                               swiglu,
+                               weights->typed_data(),
+                               output,
+                               m,
+                               n,
+                               k,
+                               alpha,
+                               beta);
                 }
                 default:
                     return false;

@@ -663,6 +663,7 @@ namespace llaminar2
      * while still getting the full TensorBase infrastructure.
      */
     class PreparedWeightStore;
+    class MappedHostTransferRegion;
     class TensorSlice;       // Forward declaration for friend
     struct MemoryDescriptor; // Forward declaration for friend
 
@@ -1240,6 +1241,22 @@ namespace llaminar2
          * - Eliminates sync memcpy bottleneck
          */
         bool isMapped() const { return is_mapped_; }
+
+        /**
+         * @brief Return the TransferEngine region backing mapped tensor storage.
+         *
+         * A non-null result is the lifetime and endpoint-identity authority for
+         * @ref mapped_host_ptr_ and @ref mapped_device_ptr_. Ordinary tensors
+         * return null. Exposing the immutable owner lets a graph ticket reuse
+         * the exact tensor allocation without registering the pages again.
+         *
+         * @return Shared mapped-region owner, or null for ordinary storage.
+         */
+        [[nodiscard]] std::shared_ptr<MappedHostTransferRegion>
+        mappedHostTransferRegion() const noexcept
+        {
+            return mapped_transfer_region_;
+        }
 
         /**
          * @brief Check if tensor is host-resident (never uploaded to device)
@@ -2102,7 +2119,7 @@ namespace llaminar2
         void *getOrAllocateDeviceBuffer(DeviceId device);
 
         // ===== Zero-Copy Mapped Memory =====
-        // When a tensor uses mapped memory (hipHostMallocMapped/cudaHostAllocMapped):
+        // When a tensor uses TransferEngine-owned mapped memory:
         // - Host and device share the SAME physical memory via mapped pinned memory
         // - GPU can read/write directly without memcpy
         // - ensureOnDevice()/ensureOnHost() become no-ops
@@ -2116,6 +2133,11 @@ namespace llaminar2
         bool is_mapped_ = false;            // True if using mapped memory
         void *mapped_device_ptr_ = nullptr; // Device-visible pointer for mapped host memory
         void *mapped_host_ptr_ = nullptr;   // Host-visible pointer for mapped memory
+        /**
+         * Exact mapped allocation and endpoint lifetime. TransferEngine owns
+         * native allocation/free; the tensor owns only this shared handle.
+         */
+        std::shared_ptr<MappedHostTransferRegion> mapped_transfer_region_;
 
         // For mapped memory: tracks whether GPU has written since last sync.
         // Set by device-write publication and cleared by ensureOnHost() after sync.
@@ -2125,7 +2147,7 @@ namespace llaminar2
         /**
          * @brief Initialize mapped memory for this tensor (protected helper)
          *
-         * Allocates GPU-visible host memory via backend->allocateMapped().
+         * Allocates GPU-visible host memory through TransferEngine.
          * Sets up is_mapped_, mapped_host_ptr_, mapped_device_ptr_, and gpu_data_ptr_.
          *
          * @param bytes Size in bytes to allocate
@@ -2137,7 +2159,7 @@ namespace llaminar2
         bool initMappedMemory(size_t bytes, DeviceId target_device);
 
         /**
-         * @brief Free mapped memory if allocated (called by destructor)
+         * @brief Release mapped-region ownership if present (called by destructor)
          */
         void freeMappedMemory();
 
@@ -2357,11 +2379,28 @@ namespace llaminar2
          *
          * @note This factory never substitutes ordinary host/device storage.
          *       Callers requesting mapped placement must fail if it is unavailable.
-         * @note Currently supported: ROCm (hipHostMallocMapped)
+         * @note Allocation is delegated to TransferEngine, which selects the
+         *       exact CUDA or ROCm native mapped allocation for the endpoint.
          */
         static std::unique_ptr<FP32Tensor> createMapped(
             const std::vector<size_t> &shape,
             DeviceId target_device);
+
+        /**
+         * @brief Create CPU-owned FP32 storage mapped into one exact GPU.
+         *
+         * CPU kernels remain the value authority and access the host alias;
+         * captured GPU consumers use the immutable device alias published by
+         * TransferEngine. This is distinct from @ref createMapped, whose
+         * logical home is the GPU itself.
+         *
+         * @param shape Tensor dimensions.
+         * @param mapped_device Exact CUDA/ROCm alias endpoint.
+         * @return Host-owned mapped tensor, or null when allocation fails.
+         */
+        static std::unique_ptr<FP32Tensor> createHostOwnedMapped(
+            const std::vector<size_t> &shape,
+            DeviceId mapped_device);
 
         ~FP32Tensor() override;
 
@@ -2520,6 +2559,35 @@ namespace llaminar2
         size_t byte_size() const override { return element_count() * sizeof(float); }
 
     private:
+        /** Tag selecting shape-only construction before mapped allocation. */
+        struct MappedStorageConstructionTag final
+        {
+        };
+
+        /**
+         * @brief Construct tensor metadata without allocating ordinary pages.
+         *
+         * Only @ref createMapped uses this path, immediately followed by a
+         * mandatory TransferEngine mapped allocation. Keeping ordinary host
+         * storage absent avoids transient first-touch and duplicate capacity.
+         */
+        FP32Tensor(
+            const std::vector<size_t> &shape,
+            DeviceId device,
+            MappedStorageConstructionTag);
+
+        /**
+         * @brief Materialize mapped storage with independent logical ownership.
+         * @param shape Tensor dimensions.
+         * @param home_device CPU or exact GPU that owns tensor execution state.
+         * @param mapped_device Exact GPU receiving the mapped alias.
+         * @return Complete mapped tensor, or null when allocation fails.
+         */
+        static std::unique_ptr<FP32Tensor> createMappedWithHome(
+            const std::vector<size_t> &shape,
+            DeviceId home_device,
+            DeviceId mapped_device);
+
         // Private constructor for creating views
         FP32Tensor(const std::vector<size_t> &shape,
                    DeviceId device,

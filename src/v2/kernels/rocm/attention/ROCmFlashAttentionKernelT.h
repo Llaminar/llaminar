@@ -35,6 +35,7 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/config/RuntimeConfig.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "../../attention/AttentionWorkspaceContract.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/MPIContext.h"
@@ -80,17 +81,21 @@ namespace llaminar2
         namespace AttentionWorkspaceBuffers
         {
             /// Partial attention output [batch × n_heads × num_splits × head_dim] FP32
-            constexpr const char *PARTIAL_OUTPUT = "attn_partial_output";
+            constexpr const char *PARTIAL_OUTPUT =
+                attention_workspace::kPartialOutput;
             /// Max scores per split [batch × n_heads × num_splits] FP32
-            constexpr const char *PARTIAL_M = "attn_partial_m";
+            constexpr const char *PARTIAL_M = attention_workspace::kPartialM;
             /// Logsumexp per split [batch × n_heads × num_splits] FP32
-            constexpr const char *PARTIAL_L = "attn_partial_l";
+            constexpr const char *PARTIAL_L = attention_workspace::kPartialL;
             /// Device-resident dynamic params (kv_len, position_offset, mask_stride)
-            constexpr const char *DEVICE_PARAMS = "attn_device_params";
+            constexpr const char *DEVICE_PARAMS =
+                attention_workspace::kDeviceParams;
             /// Temporary FP32 K buffer for mixed-precision KV conversion
-            constexpr const char *K_TMP_FP32 = "attn_k_tmp_fp32";
+            constexpr const char *K_TMP_FP32 =
+                attention_workspace::kKeyTemporaryFP32;
             /// Temporary FP32 V buffer for mixed-precision KV conversion
-            constexpr const char *V_TMP_FP32 = "attn_v_tmp_fp32";
+            constexpr const char *V_TMP_FP32 =
+                attention_workspace::kValueTemporaryFP32;
         }
 
         // Forward declaration of precision element type mapping

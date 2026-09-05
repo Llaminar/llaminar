@@ -26,6 +26,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -38,11 +39,108 @@ namespace llaminar2
     class MoEOverlayPhysicalResidencyFabric;
     class MoEOverlayEconomyCertificationController;
 
+    /** Terminal objective selected before controller workers enter quiescence. */
+    enum class MoEOverlayDeviceControllerDrainIntent : std::uint8_t
+    {
+        ReleaseResources = 0u, ///< Drain admitted work without changing placement.
+        /** Restore and device-certify the loader-prepared owner table. */
+        RestorePreparedContext = 1u,
+    };
+
+    /** Immutable result of one topology-wide controller terminal transition. */
+    struct MoEOverlayDeviceControllerDrainResult
+    {
+        MoEOverlayDeviceControllerDrainIntent intent =
+            MoEOverlayDeviceControllerDrainIntent::ReleaseResources;
+        bool succeeded = false;
+        bool prepared_context_certified = false;
+        std::uint64_t durable_epoch = 0u;
+        std::uint64_t restoration_movement_waves = 0u;
+
+        /** @return Whether the result proves the requested terminal objective. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return succeeded &&
+                (intent != MoEOverlayDeviceControllerDrainIntent::
+                               RestorePreparedContext ||
+                 (prepared_context_certified && durable_epoch != 0u));
+        }
+    };
+
     /** Inference phase whose retired logical rows advance maintenance. */
     enum class MoEOverlayInferencePhase : std::uint8_t
     {
         Prefill = 0u, ///< One retained bucket contributes its real prompt rows.
         Decode = 1u, ///< One committed serial token contributes one row.
+    };
+
+    /** @brief Setup, activation, and terminal state of the device authority. */
+    enum class MoEOverlayDeviceControllerActivationState : std::uint8_t
+    {
+        Prepared, ///< Graphs exist, but no background protocol may progress.
+        Starting, ///< The sole background worker is being created.
+        Running,  ///< Inference progress and maintenance work are admitted.
+        Draining, ///< Admission is closed while accepted work reaches quiescence.
+        Stopped,  ///< Worker and retained graph resources have been released.
+        Failed,   ///< A fatal worker or activation error ended the authority.
+    };
+
+    /**
+     * @brief Typed cadence projection of one authenticated Dynamic transaction.
+     *
+     * The device-owned controller decides whether an economical movement was
+     * published.  The host scheduler may use that immutable outcome only to
+     * decide when to submit the next retained maintenance graph: a movement
+     * keeps the short convergence cadence, while a non-moving transaction with
+     * real observations proves that the current burst may enter cooldown.
+     * PerfStats is deliberately absent from this authority path.
+     */
+    class MoEOverlayMaintenanceCadenceReceipt final
+    {
+    public:
+        /**
+         * @brief Project an already-validated device transaction into cadence.
+         * @param snapshot_observations Exact device-authored routed demand.
+         * @param command_count Exact authenticated movement command count.
+         * @return A receipt that retains rapid cadence until a real no-op.
+         */
+        [[nodiscard]] static constexpr
+        MoEOverlayMaintenanceCadenceReceipt fromDynamicTransaction(
+            std::uint64_t snapshot_observations,
+            std::uint32_t command_count) noexcept
+        {
+            return MoEOverlayMaintenanceCadenceReceipt(
+                snapshot_observations,
+                snapshot_observations != 0u && command_count == 0u);
+        }
+
+        /** @return Exact routed observations consumed by the device policy. */
+        [[nodiscard]] constexpr std::uint64_t snapshotObservations() const
+            noexcept
+        {
+            return snapshot_observations_;
+        }
+
+        /**
+         * @return Whether a real observed no-op certified burst convergence.
+         */
+        [[nodiscard]] constexpr bool permitsCooldown() const noexcept
+        {
+            return permits_cooldown_;
+        }
+
+    private:
+        /** Construct only through the validated Dynamic transaction factory. */
+        constexpr MoEOverlayMaintenanceCadenceReceipt(
+            std::uint64_t snapshot_observations,
+            bool permits_cooldown) noexcept
+            : snapshot_observations_(snapshot_observations),
+              permits_cooldown_(permits_cooldown)
+        {
+        }
+
+        std::uint64_t snapshot_observations_ = 0u;
+        bool permits_cooldown_ = false;
     };
 
     /**
@@ -132,7 +230,7 @@ namespace llaminar2
             bool admission_open = true) noexcept;
 
         /**
-         * @brief Increase the recurring admission window after one transaction.
+         * @brief Advance cadence after device-certified burst convergence.
          *
          * Notifications that arrived while a maintenance transaction was in
          * flight remain pending, but they are evaluated against the new window.
@@ -140,13 +238,22 @@ namespace llaminar2
          * evidence: device histograms retain every observation independently of
          * this host-side retained-graph submission cadence.
          *
+         * A zero-observation transaction is the typed boundary between the
+         * calibration histogram rebase and post-calibration inference. A
+         * movement transaction is likewise not convergence: its newly
+         * published placement may expose a profitable independent objective on
+         * the next layer scan. Only a non-moving transaction with real device
+         * observations may grow the recurring window.
+         *
          * @param maximum_tokens Inclusive adaptive ceiling; zero disables growth.
          * @param growth_factor Multiplicative growth; values at most one disable it.
+         * @param receipt Typed projection of the authenticated device result.
          * @return Effective required-token window after the update.
          */
-        [[nodiscard]] std::uint64_t growRequiredTokens(
+        [[nodiscard]] std::uint64_t advanceAfterReceipt(
             std::uint64_t maximum_tokens,
-            double growth_factor) noexcept;
+            double growth_factor,
+            MoEOverlayMaintenanceCadenceReceipt receipt) noexcept;
 
         /**
          * @brief Observe phase counters without consuming maintenance admission.
@@ -175,7 +282,10 @@ namespace llaminar2
     /**
      * @brief Own captured controller transactions on dedicated GPU streams.
      *
-     * Construction performs setup-only allocation and native graph capture.
+     * Construction performs setup-only allocation and native graph capture,
+     * but deliberately leaves the service in `Prepared`. The runner calls
+     * @ref start only after every serving and MTP transaction graph has been
+     * captured.
      * Replay allocates and copies nothing. A setup certification may wait for
      * one terminal event and copy one fixed controller record for validation;
      * ordinary inference and later background maintenance never wait on the
@@ -238,6 +348,23 @@ namespace llaminar2
         explicit MoEOverlayDeviceControllerGraphService(Config config);
 
         /**
+         * @brief Activate the already-captured controller transaction family.
+         *
+         * This is the only `Prepared -> Running` transition. Dynamic mode
+         * creates its background phase submitter here, after graph capture is
+         * globally complete; Static mode merely opens its certified no-move
+         * authority. Repeated or out-of-order activation is a hard error.
+         *
+         * @throws std::logic_error unless the service is exactly `Prepared`.
+         * @throws std::runtime_error when the background worker cannot start.
+         */
+        void start();
+
+        /** @return Current typed activation state without advancing it. */
+        [[nodiscard]] MoEOverlayDeviceControllerActivationState state() const
+            noexcept;
+
+        /**
          * @brief Drain topology-wide Dynamic work and release GPU resources.
          *
          * This is the explicit collective terminal transition. Every inference
@@ -249,8 +376,16 @@ namespace llaminar2
          *
          * The coordinated runner must publish its worker-loop shutdown command
          * before entering this transition.
+         *
+         * @param intent Whether teardown only releases runtime resources or
+         *        first restores the loader-prepared model-context placement.
+         * @return Immutable terminal evidence naming the requested intent,
+         *         durable epoch, restoration work, and success state.
          */
-        void stopAndDrain() noexcept;
+        [[nodiscard]] MoEOverlayDeviceControllerDrainResult stopAndDrain(
+            MoEOverlayDeviceControllerDrainIntent intent =
+                MoEOverlayDeviceControllerDrainIntent::ReleaseResources)
+            noexcept;
 
         /** @brief Invoke @ref stopAndDrain when ownership was not sealed explicitly. */
         ~MoEOverlayDeviceControllerGraphService();
@@ -331,19 +466,35 @@ namespace llaminar2
         struct Endpoint;
         struct DynamicWorker;
 
-        /** One retained graph for each bounded device-owned Dynamic epoch. */
+        /**
+         * @brief One retained graph for each bounded device-owned Dynamic epoch.
+         *
+         * Publication is intentionally decomposed at every mapped lifecycle
+         * receipt.  A participant graph therefore never occupies a GPU while
+         * waiting for a sibling graph which may still be queued behind live
+         * inference on another device.
+         */
         enum class DynamicGraphEpoch
         {
             ServiceTelemetrySnapshot,
             RebaseHistograms,
             BeginPrefillDecision,
             BeginDecodeDecision,
+            BeginPreparedContextRestore,
             SnapshotPrefillDemand,
             SnapshotDecodeDemand,
+            SnapshotPreparedContextRestore,
             PublishGroupSnapshot,
             AuthorPrefillDecision,
             AuthorDecodeDecision,
-            Publish,
+            AuthorPreparedContextRestore,
+            PrepareRuntimeCandidate,
+            AcknowledgePrepared,
+            BeginCommit,
+            PublishRuntimeCandidate,
+            AcknowledgePublished,
+            PublishAdmission,
+            PublishRetirementReadiness,
             Retire,
             Complete,
         };
@@ -387,7 +538,14 @@ namespace llaminar2
         MoEOptimizationMovementTotals terminal_movement_totals_;
         MoEOptimizationMovementLedger terminal_movement_ledger_;
         std::uint64_t terminal_published_movement_waves_ = 0u;
-        bool stopped_ = false;
+        /** Retained typed receipt for idempotent terminal calls. */
+        MoEOverlayDeviceControllerDrainResult terminal_drain_result_;
+        /** Serializes the one activation edge against terminal teardown. */
+        mutable std::mutex lifecycle_mutex_;
+        /** Publicly observable authority lifecycle; never inferred from a thread. */
+        std::atomic<MoEOverlayDeviceControllerActivationState>
+            activation_state_{
+                MoEOverlayDeviceControllerActivationState::Prepared};
         bool static_certified_ = false;
     };
 } // namespace llaminar2

@@ -29,11 +29,168 @@ namespace llaminar2::moe_rebalance_policy
     constexpr uint32_t kMinimumDynamicImbalanceThresholdPerMille = 1000u;
     constexpr uint32_t kDefaultDynamicImbalanceThresholdPerMille = 1300u;
     constexpr uint32_t kDefaultDynamicMinImprovementPerMille = 50u;
+    /**
+     * Maximum paired ownership swaps considered for one routed layer.
+     *
+     * Four gives the device authority enough candidates to address both tier
+     * residency and participant skew without letting one layer monopolize a
+     * five-cycle physical wave. Keep this policy default independent of the
+     * separately tunable physical transfer-slot capacity.
+     */
     constexpr uint32_t kDefaultDynamicMaxSwapsPerLayer = 4u;
+    /**
+     * Maximum device-authored command records retained for one wave.
+     *
+     * A paired ownership swap can publish two records. Sixteen therefore
+     * leaves room for the ordinary four-swap search plus cross-tier arrival
+     * and ownership records while keeping the captured command bank bounded.
+     */
     constexpr uint32_t kDefaultDynamicMaxPlanEntriesPerWave = 16u;
     constexpr uint64_t kDefaultDynamicMinWindowActivations = 64u;
+    /**
+     * Expected routed-token lifetime used by the migration payoff test.
+     *
+     * This is deliberately finite. A very long horizon can make individually
+     * plausible cycles look profitable long after the layout has converged,
+     * causing continuous background traffic to erase the service-time gain.
+     */
     constexpr uint64_t kDefaultMigrationPayoffHorizonTokens = 2048u;
+    /**
+     * Portable physical migration-cycle capacity retained by default.
+     *
+     * Exact-geometry shadow arenas are shared across routed layers, so this is
+     * a participant-wide concurrency ceiling rather than a per-layer memory
+     * multiplier. Five lanes preserved useful four-cycle waves on the
+     * Qwen-122B ROCm/CPU production topology while avoiding the residency loss
+     * of wider arenas. Deployments may still override the value explicitly.
+     */
+    constexpr uint32_t kDefaultMigrationTransferSlots = 5u;
+    /**
+     * Portable default for the per-GPU background migration stream pool.
+     *
+     * Migration cycle slots retain independent storage, events, and command
+     * identity. They do not require one expensive runtime queue each: a small
+     * pool can enqueue every slot asynchronously and lets the GPU's copy and
+     * compute engines schedule the actual overlap. Four preserves concurrent
+     * upload, download, and repack work on current CUDA/ROCm devices while the
+     * public runtime setting remains available for topology-specific tuning.
+     */
+    constexpr uint32_t kDefaultMigrationExecutionStreams = 4u;
     constexpr uint32_t kDefaultDeviceMinLoadSpreadImprovementDivisor = 15u;
+
+    /** Objective preferred for the next slot in one bounded Dynamic wave. */
+    enum class DynamicPlacementAxisObjective : uint8_t
+    {
+        Any,                  ///< Preserve ordinary measured-economy ordering.
+        TierResidency,        ///< Prefer promotion/demotion across priorities.
+        ParticipantPlacement, ///< Prefer skew reduction inside one priority.
+    };
+
+    /**
+     * @brief Device-owned coverage state for Dynamic's independent objectives.
+     *
+     * A bounded wave can otherwise spend every slot on higher-valued tier
+     * exchanges and indefinitely starve an economical same-tier correction.
+     * Integer priority remains the primary objective: when at least two slots
+     * are available, the first slot prefers tier residency and the next slot
+     * prefers whichever independent objective is still missing.  A combined
+     * cycle satisfies both.  If no candidate advances the preferred objective,
+     * callers retain their best ordinary economy candidate as a fallback.
+     *
+     * This state is shared by the CPU policy oracle and CUDA/HIP policy kernel;
+     * it contains no host-owned inference state.
+     */
+    struct DynamicPlacementAxisProgress
+    {
+        bool tier_residency = false;        ///< This wave advanced priority.
+        bool participant_placement = false; ///< This wave reduced in-tier skew.
+
+        /**
+         * @brief Select the objective for the next bounded cycle slot.
+         * @param maximum_cycles Total configured cycle slots in this wave.
+         * @param accepted_cycles Slots already committed by the authority.
+         * @return Preferred objective, or Any when no reservation is useful.
+         */
+        LLAMINAR_MOE_REBALANCE_HD DynamicPlacementAxisObjective nextObjective(
+            uint32_t maximum_cycles,
+            uint32_t accepted_cycles) const noexcept
+        {
+            const uint32_t remaining = maximum_cycles > accepted_cycles
+                                           ? maximum_cycles - accepted_cycles
+                                           : 0u;
+            if (remaining == 0u)
+                return DynamicPlacementAxisObjective::Any;
+            if (tier_residency && !participant_placement)
+                return DynamicPlacementAxisObjective::ParticipantPlacement;
+            if (!tier_residency && participant_placement)
+                return DynamicPlacementAxisObjective::TierResidency;
+            if (!tier_residency && !participant_placement && remaining >= 2u)
+                return DynamicPlacementAxisObjective::TierResidency;
+            return DynamicPlacementAxisObjective::Any;
+        }
+
+        /**
+         * @brief Test whether one candidate advances the preferred objective.
+         * @param objective Selection returned by @ref nextObjective.
+         * @param advances_tier Candidate reduces integer-priority cost.
+         * @param advances_participant Candidate reduces in-tier makespan.
+         */
+        LLAMINAR_MOE_REBALANCE_HD static bool matches(
+            DynamicPlacementAxisObjective objective,
+            bool advances_tier,
+            bool advances_participant) noexcept
+        {
+            switch (objective)
+            {
+            case DynamicPlacementAxisObjective::Any:
+                return true;
+            case DynamicPlacementAxisObjective::TierResidency:
+                return advances_tier;
+            case DynamicPlacementAxisObjective::ParticipantPlacement:
+                return advances_participant;
+            }
+            return false;
+        }
+
+        /**
+         * @brief Decide whether axis search must continue at the next layer.
+         * @param objective Preferred objective for the current cycle slot.
+         * @param found_preferred Whether this layer exposed a matching cycle.
+         * @param layer_offset Zero-based position in the current cursor scan.
+         * @param layer_count Total number of layers in the scan.
+         * @return True when ordinary economy fallback must remain deferred.
+         *
+         * Axis reservation is wave-wide rather than layer-local.  Spending a
+         * reserved slot on the first layer's fallback before inspecting later
+         * layers can permanently starve a profitable independent objective.
+         * The final layer may use its ordinary fallback when the complete scan
+         * proves that no later layer can satisfy the reservation.
+         */
+        LLAMINAR_MOE_REBALANCE_HD static bool searchesLaterLayerBeforeFallback(
+            DynamicPlacementAxisObjective objective,
+            bool found_preferred,
+            uint32_t layer_offset,
+            uint32_t layer_count) noexcept
+        {
+            return objective != DynamicPlacementAxisObjective::Any &&
+                   !found_preferred && layer_offset + 1u < layer_count;
+        }
+
+        /**
+         * @brief Retain objectives advanced by one accepted cycle.
+         * @param advances_tier Whether priority cost decreased.
+         * @param advances_participant Whether same-priority makespan decreased.
+         */
+        LLAMINAR_MOE_REBALANCE_HD void observe(
+            bool advances_tier,
+            bool advances_participant) noexcept
+        {
+            tier_residency = tier_residency || advances_tier;
+            participant_placement =
+                participant_placement || advances_participant;
+        }
+    };
+
     /**
      * @brief Bit layout for one all-gathered rebalance-state word.
      *

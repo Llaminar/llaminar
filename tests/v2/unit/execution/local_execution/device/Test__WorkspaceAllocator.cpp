@@ -16,6 +16,7 @@
 #include "execution/local_execution/device/WorkspaceAllocator.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include <algorithm>
 #include <optional>
@@ -25,6 +26,31 @@
 #include <vector>
 
 using namespace llaminar2;
+
+namespace
+{
+    /** @brief Build a one-device workspace authority without backend work. */
+    std::shared_ptr<PhysicalMemoryAuthority> makeWorkspaceAuthority(
+        DeviceId device,
+        size_t workspace_bytes)
+    {
+        PhysicalMemoryPlanBuilder builder;
+        builder.add(
+            PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = device,
+                .total_bytes = 1024u * 1024u,
+                .admission_available_bytes = 1024u * 1024u,
+            },
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            workspace_bytes);
+        const auto admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(
+            builder.build());
+        return std::make_shared<PhysicalMemoryAuthority>(
+            admission, 0);
+    }
+}
 
 /**
  * @brief The model-context registry enforces one exact workspace owner.
@@ -49,19 +75,19 @@ TEST(Test__WorkspaceAllocator, ReusableRegistryRejectsConcurrentAndUnsealedOwner
     };
 
     std::string error;
-    auto first = registry->acquire(key, &error);
+    auto first = registry->acquireForTests(key, &error);
     ASSERT_NE(first, nullptr) << error;
     const auto allocator = first->allocator();
     ASSERT_NE(allocator, nullptr);
 
-    EXPECT_EQ(registry->acquire(key, &error), nullptr);
+    EXPECT_EQ(registry->acquireForTests(key, &error), nullptr);
     EXPECT_NE(error.find("live runner"), std::string::npos) << error;
 
     ASSERT_TRUE(first->publishReusable(&error)) << error;
     first.reset();
     EXPECT_TRUE(registry->valid());
 
-    auto second = registry->acquire(key, &error);
+    auto second = registry->acquireForTests(key, &error);
     ASSERT_NE(second, nullptr) << error;
     EXPECT_EQ(second->allocator(), allocator)
         << "A new runner must inherit the existing workspace authority";
@@ -71,9 +97,77 @@ TEST(Test__WorkspaceAllocator, ReusableRegistryRejectsConcurrentAndUnsealedOwner
     EXPECT_NE(
         registry->diagnostic().find("without a reusable seal"),
         std::string::npos);
-    EXPECT_EQ(registry->acquire(key, &error), nullptr);
+    EXPECT_EQ(registry->acquireForTests(key, &error), nullptr);
     EXPECT_NE(error.find("without a reusable seal"), std::string::npos)
         << error;
+}
+
+TEST(Test__WorkspaceAllocator,
+     CanonicalBudgetComesOnlyFromTheAdmittedOwnerLine)
+{
+    auto authority = makeWorkspaceAuthority(DeviceId::cpu(), 4096u);
+    WorkspaceAllocator allocator(authority);
+    WorkspaceBudgetConfig deliberately_conflicting_policy;
+    deliberately_conflicting_policy.cpu_fraction = 0.01f;
+    deliberately_conflicting_policy.min_budget = 1u;
+    deliberately_conflicting_policy.max_budget = 2u;
+
+    EXPECT_EQ(
+        allocator.computeWorkspaceBudget(
+            DeviceId::cpu(), deliberately_conflicting_policy),
+        4096u)
+        << "A production allocator must not reapply a telemetry fraction or clamp";
+
+    auto competing_claim = authority->claimNewAllocation(
+        DeviceId::cpu(),
+        PhysicalMemoryOwner::ExecutionWorkspace,
+        1024u);
+    EXPECT_EQ(
+        allocator.computeWorkspaceBudget(
+            DeviceId::cpu(), deliberately_conflicting_policy),
+        3072u);
+    EXPECT_NO_THROW(
+        allocator.installPhysicalMemoryAuthority(authority));
+    EXPECT_THROW(
+        allocator.installPhysicalMemoryAuthority(
+            makeWorkspaceAuthority(DeviceId::cpu(), 4096u)),
+        std::logic_error);
+}
+
+TEST(Test__WorkspaceAllocator,
+     ReusableRegistryRejectsASecondPhysicalAuthority)
+{
+    auto registry =
+        std::make_shared<ReusableExecutionWorkspaceRegistry>();
+    const ReusableExecutionWorkspaceKey key{
+        .device = DeviceId::cuda(0),
+        .first_layer = 0,
+        .last_layer = 0,
+        .tensor_parallel_participant = 0,
+        .tensor_parallel_degree = 1,
+        .owns_embedding = true,
+        .owns_terminal_head = true,
+    };
+    auto first_authority =
+        makeWorkspaceAuthority(DeviceId::cuda(0), 4096u);
+    auto second_authority =
+        makeWorkspaceAuthority(DeviceId::cuda(0), 4096u);
+    std::string error;
+
+    auto first = registry->acquire(key, first_authority, &error);
+    ASSERT_NE(first, nullptr) << error;
+    EXPECT_EQ(
+        first->allocator()->physicalMemoryAuthority().get(),
+        first_authority.get());
+    ASSERT_TRUE(first->publishReusable(&error)) << error;
+    first.reset();
+
+    EXPECT_EQ(
+        registry->acquire(key, second_authority, &error),
+        nullptr);
+    EXPECT_NE(error.find("replace"), std::string::npos) << error;
+    auto second = registry->acquire(key, first_authority, &error);
+    ASSERT_NE(second, nullptr) << error;
 }
 
 namespace
@@ -470,6 +564,70 @@ TEST(Test__WorkspaceAllocator, TerminalProjectionEnvelopeCoversEverySerialPartic
     EXPECT_EQ(hints.resolveTerminalProjectionColumns(248320), 248320);
     EXPECT_EQ(hints.resolveTerminalProjectionColumns(496640), 496640)
         << "The family envelope must never truncate a wider participant";
+}
+
+/**
+ * @brief Mutually exclusive retained graphs consume one admitted workspace line.
+ *
+ * ExpertOverlay constructs its main graph and learned MTP sidecar in separate
+ * builder calls.  A full first graph can consume the complete workspace BOM;
+ * the second graph must bind that existing allocation rather than asking the
+ * physical-memory authority for the same bytes again.
+ */
+TEST(Test__WorkspaceAllocator,
+     SeparateSerialGraphBuildersReuseOnePhysicalWorkspaceAllocation)
+{
+    if (!hasCPUBackend())
+        initCPUBackend(-1);
+
+    constexpr size_t kCompleteFamilyBytes = 4096u;
+    auto authority = makeWorkspaceAuthority(
+        DeviceId::cpu(), kCompleteFamilyBytes);
+    WorkspaceAllocator allocator(authority);
+    ComputeGraph first_graph;
+    ComputeGraph second_graph;
+    MockWorkspaceConsumer main_graph_consumer({
+        {"shared_graph_family_scratch", kCompleteFamilyBytes, 256, true},
+    });
+    MockWorkspaceConsumer mtp_graph_consumer({
+        {"shared_graph_family_scratch", 1024u, 256, true},
+    });
+    auto hints = tinyHints();
+    hints.graph_family_policy =
+        WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant;
+
+    ASSERT_TRUE(allocator.allocateForGraph(
+        first_graph,
+        hints,
+        {requestFor(main_graph_consumer, DeviceId::cpu())},
+        unitBudgetConfig()));
+    DeviceWorkspaceManager *const first_workspace =
+        main_graph_consumer.boundWorkspace();
+    ASSERT_NE(first_workspace, nullptr);
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        kCompleteFamilyBytes);
+    EXPECT_EQ(
+        authority->remainingAdmittedNewAllocationBytes(
+            DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace),
+        0u);
+
+    ASSERT_TRUE(allocator.allocateForGraph(
+        second_graph,
+        hints,
+        {requestFor(mtp_graph_consumer, DeviceId::cpu())},
+        unitBudgetConfig()));
+    EXPECT_EQ(mtp_graph_consumer.boundWorkspace(), first_workspace);
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        kCompleteFamilyBytes)
+        << "Binding a later serial graph must not mint a second physical claim";
 }
 
 TEST(Test__WorkspaceAllocator, ExtendsExistingWorkspaceWithoutInvalidatingCapturedAddresses)

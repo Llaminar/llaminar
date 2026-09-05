@@ -91,7 +91,7 @@ namespace llaminar2
 
         /**
          * @brief Begin one sole-authority transaction on the leader.
-         * @param kind Static, durable Dynamic, or transient current-batch LLEP.
+         * @param kind Static, durable placement/restoration, or transient LLEP.
          * @param phase Prefill/decode for Dynamic; Invalid for phase-free kinds.
          * @return New positive transaction id, or empty after a fatal violation.
          */
@@ -166,13 +166,14 @@ namespace llaminar2
          * @brief Open topology-wide admission after every local publication.
          * @return False when any group is missing or the command is stale.
          *
-         * Dynamic advances the durable epoch. Static completes without changing
-         * it. LLEP opens a transient assignment lease that must be restored.
+         * Dynamic and prepared-context restoration advance the durable epoch
+         * only when they move weights. Static completes without changing it.
+         * LLEP opens a transient assignment lease that must be restored.
          */
         [[nodiscard]] bool publishAdmission(
             std::uint64_t transaction_id) noexcept;
 
-        /** Begin the Dynamic grace-period retirement fan-out. */
+        /** Begin a durable placement grace-period retirement fan-out. */
         [[nodiscard]] bool beginDynamicRetirement(
             std::uint64_t transaction_id) noexcept;
 
@@ -182,7 +183,7 @@ namespace llaminar2
             std::uint64_t transaction_id,
             std::uint64_t retired_epoch) noexcept;
 
-        /** Complete Dynamic only after every old local bank is reclaimed. */
+        /** Complete durable placement after every old bank is reclaimed. */
         [[nodiscard]] bool completeDynamicRetirement(
             std::uint64_t transaction_id) noexcept;
 

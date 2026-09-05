@@ -334,10 +334,10 @@ namespace llaminar2
             return false;
         }
         if (canonical_ticket_completion &&
-            !params_.canonical_route_ticket_storage->payloadReadyFor(
+            !params_.canonical_route_ticket_storage->publicationSucceededFor(
                 params_.outbound_rows->residency_epoch))
         {
-            LOG_ERROR("[MoESparseReturnReduceStage] Colocated CPU canonical ticket is not complete for the returned residency epoch");
+            LOG_ERROR("[MoESparseReturnReduceStage] Colocated CPU canonical ticket was not successfully published for the returned residency epoch");
             return false;
         }
 

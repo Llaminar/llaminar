@@ -154,6 +154,10 @@ namespace
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
         const char *architecture() const override { return "mock"; }
         int sampleGreedyOnDevice() override { return -1; }
+        uint64_t moeRuntimeMovementEpoch() const override
+        {
+            return runtime_movement_epoch;
+        }
 
         PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override
         {
@@ -181,7 +185,9 @@ namespace
             harvested_fingerprint = admission.fingerprint_key;
             harvested_tokens = tokens;
             harvested_prompt_token_count = prompt_token_count;
-            return true;
+            if (movement_epoch_after_harvest)
+                runtime_movement_epoch = *movement_epoch_after_harvest;
+            return harvest_ok;
         }
 
         bool restorePrefixTerminalState(const PrefixLookupResult &hit) override
@@ -436,6 +442,7 @@ namespace
 
         PrefixLookupResult lookup_result;
         bool populate_ok = true;
+        bool harvest_ok = true;
         bool restore_terminal_ok = true;
         bool mtp_enabled = false;
         bool supports_chained_mtp = true;
@@ -477,6 +484,8 @@ namespace
         int restored_tokens = 0;
         int harvested_prompt_token_count = 0;
         uint64_t harvested_fingerprint = 0;
+        uint64_t runtime_movement_epoch = 0;
+        std::optional<uint64_t> movement_epoch_after_harvest;
         int position = 0;
         int shifted_mtp_rows = 0;
         int last_commit_already_appended = 0;
@@ -696,6 +705,91 @@ TEST(Test__PrefixCachePrefillFlow, FreshPrefixMissDoesNotManufactureRequestReset
     EXPECT_EQ(mock_ptr->forward_calls, 1);
     EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(1, 2, 3, 4));
     EXPECT_EQ(mock_ptr->harvest_calls, 1);
+}
+
+TEST(Test__PrefixCachePrefillFlow,
+     RequestSummaryOwnsExactAsynchronousMovementInterval)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 0;
+    mock_ptr->lookup_result.placement_epoch = 7;
+    mock_ptr->runtime_movement_epoch = 7;
+    mock_ptr->movement_epoch_after_harvest = 8;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_EQ(probe.prefix_request.admission_movement_epoch, 7u);
+    EXPECT_EQ(probe.prefix_request.completion_movement_epoch, 8u);
+    EXPECT_TRUE(probe.prefix_request.crossedMovementEpoch());
+}
+
+TEST(Test__PrefixCachePrefillFlow,
+     MovementAfterLaterAdmissionCannotExplainThatRequestsLookup)
+{
+    const PrefixCacheRequestSummary archived{
+        .admission_movement_epoch = 7,
+        .completion_movement_epoch = 7,
+    };
+    const PrefixCacheRequestSummary restored_then_moved{
+        .hit = true,
+        .matched_tokens = 17,
+        .admission_movement_epoch = 7,
+        .completion_movement_epoch = 8,
+    };
+
+    EXPECT_FALSE(
+        archived.movementPrecededAdmissionOf(restored_then_moved));
+    EXPECT_TRUE(restored_then_moved.crossedMovementEpoch());
+}
+
+TEST(Test__PrefixCachePrefillFlow,
+     MovementBeforeLaterAdmissionCanInvalidateAnArchive)
+{
+    const PrefixCacheRequestSummary movement_crossed_harvest{
+        .admission_movement_epoch = 7,
+        .completion_movement_epoch = 8,
+    };
+    const PrefixCacheRequestSummary next_after_crossed_harvest{
+        .admission_movement_epoch = 8,
+        .completion_movement_epoch = 8,
+    };
+    EXPECT_TRUE(
+        movement_crossed_harvest.movementPrecededAdmissionOf(
+            next_after_crossed_harvest));
+
+    const PrefixCacheRequestSummary archived_before_gap{
+        .admission_movement_epoch = 7,
+        .completion_movement_epoch = 7,
+    };
+    const PrefixCacheRequestSummary next_after_gap{
+        .admission_movement_epoch = 8,
+        .completion_movement_epoch = 8,
+    };
+    EXPECT_TRUE(
+        archived_before_gap.movementPrecededAdmissionOf(next_after_gap));
+}
+
+TEST(Test__PrefixCachePrefillFlow, PrefixHarvestFailureIsFatalToRequest)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 0;
+    mock_ptr->harvest_ok = false;
+
+    auto runner = makeRunner(std::move(mock));
+    EXPECT_FALSE(runner->prefill({1, 2, 3, 4}));
+    EXPECT_THAT(
+        runner->lastError(),
+        HasSubstr("Prefix cache harvest failed after successful request execution"));
 }
 
 TEST(Test__PrefixCachePrefillFlow, LivePrefixMissResetsBeforeFullPrefill)

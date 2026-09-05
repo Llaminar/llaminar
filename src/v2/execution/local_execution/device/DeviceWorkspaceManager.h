@@ -23,6 +23,7 @@
 
 #include "WorkspaceDescriptor.h"
 #include "../../../backends/DeviceId.h"
+#include "../../../planning/PhysicalMemoryAuthority.h"
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -259,6 +260,47 @@ namespace llaminar2
          * @param budget_bytes Maximum bytes available for workspace
          */
         DeviceWorkspaceManager(DeviceId device, size_t budget_bytes);
+
+        /**
+         * @brief Construct under the canonical physical-memory authority.
+         *
+         * Every backend block is claimed immediately before allocation and its
+         * RAII lease is retained until immediately after the corresponding
+         * backend free. This constructor is the production path; the two-argument
+         * form exists for device-free planning and focused backend tests.
+         *
+         * @param device Exact physical allocator.
+         * @param budget_bytes Manager-local workspace ceiling.
+         * @param physical_memory_authority Rank-bound admission ledger.
+         * @throws std::invalid_argument when the authority is null or does not
+         *         own @p device.
+         */
+        DeviceWorkspaceManager(
+            DeviceId device,
+            size_t budget_bytes,
+            std::shared_ptr<PhysicalMemoryAuthority>
+                physical_memory_authority);
+
+        /**
+         * @brief Construct a named stable-block arena for another typed owner.
+         *
+         * DeviceWorkspaceManager supplies placement and stable-address
+         * mechanics, not accounting policy. Persistent state arenas may reuse
+         * those mechanics only when they name their actual BOM owner here;
+         * charging them as generic execution workspace is forbidden.
+         *
+         * @param device Exact physical allocator.
+         * @param budget_bytes Arena-local allocation ceiling.
+         * @param physical_memory_authority Rank-bound admission ledger.
+         * @param physical_memory_owner Exact owner of every backend block.
+         * @throws std::invalid_argument for a missing resource or invalid owner.
+         */
+        DeviceWorkspaceManager(
+            DeviceId device,
+            size_t budget_bytes,
+            std::shared_ptr<PhysicalMemoryAuthority>
+                physical_memory_authority,
+            PhysicalMemoryOwner physical_memory_owner);
 
         ~DeviceWorkspaceManager();
 
@@ -614,6 +656,12 @@ namespace llaminar2
          */
         size_t primaryBlockSize() const { return block_size_; }
 
+        /** @return Typed BOM owner charged by each accounted backend block. */
+        PhysicalMemoryOwner physicalMemoryOwner() const noexcept
+        {
+            return physical_memory_owner_;
+        }
+
     private:
         DeviceId device_;
         uint64_t id_;
@@ -632,6 +680,8 @@ namespace llaminar2
         // Main allocation block
         void *block_ = nullptr;
         size_t block_size_ = 0;
+        /** Exact accounting claim retained for the primary backend block. */
+        PhysicalMemoryAllocationLease primary_block_lease_;
 
         // Named buffer offsets within block
         struct BufferInfo
@@ -649,8 +699,17 @@ namespace llaminar2
         {
             void *base = nullptr;
             size_t size = 0;
+            /** Claim released only after `base` is returned to the backend. */
+            PhysicalMemoryAllocationLease allocation_lease;
         };
         std::vector<ExtensionBlock> extension_blocks_;
+
+        /** Optional only for explicitly device-free/test construction. */
+        std::shared_ptr<PhysicalMemoryAuthority>
+            physical_memory_authority_;
+        /** Exact owner line selected at production construction. */
+        PhysicalMemoryOwner physical_memory_owner_ =
+            PhysicalMemoryOwner::ExecutionWorkspace;
 
         /**
          * @brief Host-only ownership registry for immutable graph metadata.
@@ -699,6 +758,14 @@ namespace llaminar2
         bool allocateExtensionBuffers(
             const std::vector<const WorkspaceDescriptor *> &buffers,
             size_t total_size);
+
+        /**
+         * @brief Claim exact typed-owner bytes before calling a backend allocator.
+         * @return Empty test lease when no authority was supplied.
+         * @throws std::logic_error when the admitted owner line is exhausted.
+         */
+        [[nodiscard]] PhysicalMemoryAllocationLease
+        claimPhysicalAllocation(size_t bytes);
     };
 
 } // namespace llaminar2

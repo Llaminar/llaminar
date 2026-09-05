@@ -1,3 +1,13 @@
+/**
+ * @file PrefixCacheStats.h
+ * @brief Typed cumulative and request-local prefix-cache observations.
+ *
+ * Cumulative counters describe cache economy, while request summaries expose
+ * the exact admission and completion facts needed by serving diagnostics and
+ * parity tests.  Neither structure owns cache policy or mutable inference
+ * state; the prefix-cache implementation remains the sole authority.
+ */
+
 #pragma once
 
 #include <cstddef>
@@ -84,6 +94,15 @@ namespace llaminar2
         uint64_t failures = 0;
     };
 
+    /**
+     * @brief Immutable outcome of the most recent prefix-cache request.
+     *
+     * ExpertOverlay movement may publish while an already admitted request is
+     * executing.  The request remains correct under its RCU lease, but its
+     * completed state cannot be archived under a newer placement fingerprint.
+     * The two movement epochs make that interval explicit without asking a
+     * diagnostic counter to reconstruct lifecycle state after the fact.
+     */
     struct PrefixCacheRequestSummary
     {
         bool enabled = false;
@@ -99,6 +118,43 @@ namespace llaminar2
         bool mtp_state_restored = false;
         bool hybrid_state_restored = false;
         std::string storage_tier = "none";
+        /** Placement epoch selected by the coordinated prefix lookup. */
+        uint64_t admission_movement_epoch = 0;
+        /** Live placement epoch sampled after prefix harvest completed. */
+        uint64_t completion_movement_epoch = 0;
+
+        /**
+         * @return Whether placement publication crossed this request.
+         *
+         * A true result is the typed reason that a successful inference may
+         * deliberately discard its prefix archive and make the next lookup a
+         * cold miss.
+         */
+        [[nodiscard]] bool crossedMovementEpoch() const noexcept
+        {
+            return completion_movement_epoch > admission_movement_epoch;
+        }
+
+        /**
+         * @brief Determine whether movement preceded another request's lookup.
+         *
+         * Movement that crosses this request can discard its harvest. Movement
+         * between this completion and the next admission can invalidate an
+         * already archived entry. Movement that begins only after the next
+         * request was admitted cannot explain that request's lookup result;
+         * its admitted prefix state remains protected by the request lease.
+         *
+         * @param next Immutable summary of the later request.
+         * @return Whether movement could have invalidated this request's
+         *         archive before @p next performed its coordinated lookup.
+         */
+        [[nodiscard]] bool movementPrecededAdmissionOf(
+            const PrefixCacheRequestSummary &next) const noexcept
+        {
+            return crossedMovementEpoch() ||
+                   next.admission_movement_epoch >
+                       completion_movement_epoch;
+        }
     };
 
     struct MTPRequestSummary

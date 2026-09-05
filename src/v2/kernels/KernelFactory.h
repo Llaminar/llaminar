@@ -129,6 +129,7 @@ namespace llaminar2
     class FP16Tensor;
     class BF16Tensor;
     class TurboQuantContext;
+    class PhysicalMemoryAuthority;
     struct HybridKVCacheConfig;
 
     enum class TensorType; // Forward declare from Tensors.h
@@ -270,6 +271,17 @@ namespace llaminar
 
                 /// TurboQuant context (for TQ4 KV cache). Not owned.
                 const ::llaminar2::TurboQuantContext *turboquant_ctx = nullptr;
+
+                /**
+                 * Rank-bound production authority for this cache allocation.
+                 *
+                 * KernelFactory claims @ref estimateBytes from the KVCache BOM
+                 * before constructing any concrete backend object. Null is
+                 * reserved for direct standalone/unit fixtures; production
+                 * orchestrators must always supply the admitted authority.
+                 */
+                std::shared_ptr<::llaminar2::PhysicalMemoryAuthority>
+                    physical_memory_authority;
 
                 /// Hybrid KV cache config (for models with GDN + FA layers). Not owned.
                 /// When non-null, createKVCache() produces a hybrid cache that only allocates

@@ -431,6 +431,32 @@ namespace llaminar2
         256ull * 1024ull * 1024ull;
 
     /**
+     * @brief Resolve physical bytes reserved by a whole-block device tier.
+     *
+     * Prefix device-hot storage allocates a fixed number of immutable slots;
+     * a trailing budget remainder cannot hold a block and is never passed to
+     * the GPU allocator.  Memory admission and runtime construction both use
+     * this function so configured policy and physical ownership cannot drift.
+     *
+     * @param budget_bytes Configured maximum device-tier capacity.
+     * @param block_bytes Exact serialized bytes owned by one slot.
+     * @return Largest whole-block allocation not exceeding the budget, or zero
+     *         when either input cannot represent one slot.
+     */
+    [[nodiscard]] inline constexpr size_t
+    prefixCacheWholeBlockReservationBytes(
+        size_t budget_bytes,
+        size_t block_bytes) noexcept
+    {
+        if (budget_bytes == 0u || block_bytes == 0u ||
+            block_bytes > budget_bytes)
+        {
+            return 0u;
+        }
+        return (budget_bytes / block_bytes) * block_bytes;
+    }
+
+    /**
      * Default bounded durable capacity for prefixes evicted from RAM.
      *
      * Disk storage is sparse and demand-allocated; this value is a retention
@@ -613,6 +639,81 @@ namespace llaminar2
         if (verify_mode == MTPVerifyMode::SpeculativeSampling)
             return config.min_depth;
         return std::clamp(2, config.min_depth, effective_max_depth);
+    }
+
+    /**
+     * @enum MTPSidecarDensePolicy
+     * @brief Physical placement of the learned predictor's dense/shared block.
+     *
+     * The predictor block is a distinct model component from both the primary
+     * transformer and the terminal vocabulary head. Keeping its placement in
+     * a dedicated type prevents dense-TP policy, terminal-head mirroring, and
+     * routed-expert residency from being inferred from one another.
+     */
+    enum class MTPSidecarDensePolicy
+    {
+        /** Inherit the primary transformer's tensor-parallel dense layout. */
+        TensorParallel,
+
+        /**
+         * Bind one complete dense/shared predictor block per participant.
+         *
+         * Routed experts are deliberately excluded: ExpertOverlay remains
+         * their sole placement and execution authority. This policy removes
+         * the tiny row-parallel collectives between recursive predictor depths
+         * and preserves the single-participant Q8 accumulation contract.
+         */
+        ReplicatedPerParticipant,
+    };
+
+    /**
+     * @enum MTPShiftedKVHeadLayout
+     * @brief Physical KV-head ownership of the learned predictor cache.
+     *
+     * The shifted MTP cache is a separate allocation from the committed main
+     * cache. A tensor-parallel predictor inherits the main attention shard,
+     * while a replicated predictor projects and stores every model KV head on
+     * each participant. Naming that distinction prevents memory admission,
+     * prefix archival, and runtime cache construction from independently
+     * inferring incompatible byte geometries.
+     */
+    enum class MTPShiftedKVHeadLayout
+    {
+        /** Store the same participant-local KV-head shard as main attention. */
+        PrimaryTensorParallelShard,
+
+        /** Store every model KV head independently on each TP participant. */
+        FullModelPerParticipant,
+    };
+
+    /** @return Stable CLI/YAML spelling for an MTP sidecar dense policy. */
+    inline const char *mtpSidecarDensePolicyToString(
+        MTPSidecarDensePolicy policy) noexcept
+    {
+        switch (policy)
+        {
+        case MTPSidecarDensePolicy::TensorParallel:
+            return "tensor-parallel";
+        case MTPSidecarDensePolicy::ReplicatedPerParticipant:
+            return "replicated-per-participant";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Parse one canonical MTP sidecar dense placement spelling.
+     * @param value CLI or YAML token.
+     * @return Typed policy, or `std::nullopt` for an unknown spelling.
+     */
+    inline std::optional<MTPSidecarDensePolicy> parseMTPSidecarDensePolicy(
+        const std::string &value)
+    {
+        const std::string normalized = normalizeRoutedExpertPolicyToken(value);
+        if (normalized == "tensor-parallel")
+            return MTPSidecarDensePolicy::TensorParallel;
+        if (normalized == "replicated-per-participant")
+            return MTPSidecarDensePolicy::ReplicatedPerParticipant;
+        return std::nullopt;
     }
 
     /**
@@ -815,6 +916,17 @@ namespace llaminar2
         int max_request_batch = 1;
         MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
         /**
+         * @brief Placement of the predictor block's dense/shared weights.
+         *
+         * A learned sidecar is one compact layer whose output recursively feeds
+         * the next draft. Replication is the production default because it
+         * removes small per-depth dense collectives, keeps quantized accumulation
+         * independent of TP degree, and costs only that one block per participant.
+         * Routed experts continue to follow the ExpertOverlay owner map.
+         */
+        MTPSidecarDensePolicy sidecar_dense_policy =
+            MTPSidecarDensePolicy::ReplicatedPerParticipant;
+        /**
          * @brief Placement of the verifier's final norm and LM-head weights.
          *
          * Tensor-parallel MTP defaults to a complete mirrored terminal head
@@ -882,6 +994,56 @@ namespace llaminar2
     }
 
     /**
+     * @brief Resolve the shifted-cache head layout from the sidecar policy.
+     * @param config Frozen MTP execution and retained-capacity policy.
+     * @param dense_tensor_parallel Whether the predictor runs in a dense TP
+     *        domain rather than on one complete participant.
+     * @param participant_count Number of participants in that dense domain.
+     * @return The exact cache-head ownership used by runtime construction.
+     *
+     * A disabled request can still retain an MTP-capable graph family. Such a
+     * family owns the same cache geometry as a later enabled request, so this
+     * resolver follows retained capacity rather than only `config.enabled`.
+     */
+    [[nodiscard]] inline MTPShiftedKVHeadLayout
+    resolveMTPShiftedKVHeadLayout(
+        const MTPRuntimeConfig &config,
+        bool dense_tensor_parallel,
+        int participant_count) noexcept
+    {
+        return retainsMTPGraphCapacity(config) &&
+                       dense_tensor_parallel &&
+                       participant_count > 1 &&
+                       config.sidecar_dense_policy ==
+                           MTPSidecarDensePolicy::ReplicatedPerParticipant
+                   ? MTPShiftedKVHeadLayout::FullModelPerParticipant
+                   : MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
+    }
+
+    /**
+     * @brief Convert typed shifted-cache ownership to an exact local head count.
+     * @param layout Resolved physical cache layout.
+     * @param model_kv_heads Complete model KV-head count.
+     * @param primary_local_kv_heads KV heads owned by the main attention shard.
+     * @return Number of KV heads physically stored by the shifted cache.
+     * @throws std::invalid_argument when either input geometry is not positive.
+     */
+    [[nodiscard]] inline int resolveMTPShiftedKVLocalHeadCount(
+        MTPShiftedKVHeadLayout layout,
+        int model_kv_heads,
+        int primary_local_kv_heads)
+    {
+        if (model_kv_heads <= 0 || primary_local_kv_heads <= 0)
+        {
+            throw std::invalid_argument(
+                "MTP shifted-KV head geometry must be positive");
+        }
+        return layout == MTPShiftedKVHeadLayout::FullModelPerParticipant
+                   ? model_kv_heads
+                   : primary_local_kv_heads;
+    }
+
+    /**
      * @brief Resolve the retained draft width, or zero for an MTP-incapable setup.
      *
      * This is the canonical setup/admission identity. Execution code continues
@@ -897,9 +1059,184 @@ namespace llaminar2
     }
 
     /**
-     * @brief Resolve the complete retained device-generation fragment family.
+     * @struct MTPRequestPolicy
+     * @brief Request-selectable MTP execution policy over a retained graph family.
+     *
+     * A long-lived production runner owns immutable physical capacity through
+     * @ref MTPRuntimeConfig: graph width, request-batch capacity, predictor
+     * placement, and terminal-head placement are fixed when weights and graphs
+     * are admitted.  The fields below are the strictly smaller policy that may
+     * change between reset request lifetimes without reallocating, rebinding,
+     * or recapturing that physical family.
+     *
+     * Keeping this distinction typed prevents a server or parity campaign from
+     * mutating the setup configuration merely to select no-MTP, fixed-depth,
+     * or adaptive-depth execution for its next request.
+     */
+    struct MTPRequestPolicy
+    {
+        bool enabled = false; ///< Whether the next request executes MTP.
+        int draft_tokens = 1; ///< Fixed depth or adaptive fallback ceiling.
+        MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
+        bool require_terminal_hidden_for_full_hit = true;
+        MTPDepthPolicyConfig depth_policy;
+    };
+
+    /**
+     * @brief Project the request-selectable fields from one startup config.
+     * @param config Immutable runner setup and initial request configuration.
+     * @return Initial request policy with no physical-capacity fields copied.
+     */
+    [[nodiscard]] inline MTPRequestPolicy makeMTPRequestPolicy(
+        const MTPRuntimeConfig &config)
+    {
+        return {
+            .enabled = config.enabled,
+            .draft_tokens = config.draft_tokens,
+            .verify_mode = config.verify_mode,
+            .require_terminal_hidden_for_full_hit =
+                config.require_terminal_hidden_for_full_hit,
+            .depth_policy = config.depth_policy,
+        };
+    }
+
+    /**
+     * @brief Validate a request policy against one immutable physical envelope.
+     * @param policy Candidate policy for the next reset request lifetime.
+     * @param retained_config Setup-time graph and weight capacity authority.
+     * @return Empty on success, otherwise a precise admission diagnostic.
+     */
+    [[nodiscard]] inline std::optional<std::string>
+    validateMTPRequestPolicy(
+        const MTPRequestPolicy &policy,
+        const MTPRuntimeConfig &retained_config)
+    {
+        if (policy.draft_tokens <= 0)
+            return "MTP request draft depth must be positive";
+
+        const bool known_verify_mode =
+            policy.verify_mode == MTPVerifyMode::Greedy ||
+            policy.verify_mode == MTPVerifyMode::SpeculativeSampling;
+        if (!known_verify_mode)
+            return "MTP request verification mode is invalid";
+
+        const MTPDepthPolicyConfig &depth = policy.depth_policy;
+        const bool known_depth_mode =
+            depth.mode == MTPDepthPolicyMode::Fixed ||
+            depth.mode == MTPDepthPolicyMode::Observe ||
+            depth.mode == MTPDepthPolicyMode::Dynamic;
+        if (!known_depth_mode)
+            return "MTP request depth-policy mode is invalid";
+        const bool known_backend =
+            depth.backend == MTPDepthPolicyBackend::Any ||
+            depth.backend == MTPDepthPolicyBackend::CPU ||
+            depth.backend == MTPDepthPolicyBackend::CUDA ||
+            depth.backend == MTPDepthPolicyBackend::ROCm;
+        if (!known_backend)
+            return "MTP request depth-policy backend is invalid";
+        const bool known_model_class =
+            depth.model_class == MTPDepthPolicyModelClass::Any ||
+            depth.model_class == MTPDepthPolicyModelClass::Dense ||
+            depth.model_class == MTPDepthPolicyModelClass::MoE;
+        if (!known_model_class)
+            return "MTP request depth-policy model class is invalid";
+
+        int requested_maximum = policy.draft_tokens;
+        if (depth.mode != MTPDepthPolicyMode::Fixed)
+        {
+            if (depth.min_depth < 0)
+                return "MTP request minimum adaptive depth must be non-negative";
+            requested_maximum =
+                depth.max_depth > 0 ? depth.max_depth : policy.draft_tokens;
+            if (requested_maximum < depth.min_depth)
+                return "MTP request maximum adaptive depth is below its minimum";
+            if (depth.initial_depth < 0 ||
+                (depth.initial_depth > 0 &&
+                 (depth.initial_depth < depth.min_depth ||
+                  depth.initial_depth > requested_maximum)))
+            {
+                return "MTP request initial adaptive depth is outside its admitted range";
+            }
+            if (depth.window_size <= 0 || depth.min_samples <= 0 ||
+                depth.cooldown_steps < 0 ||
+                depth.promote_consecutive_windows <= 0)
+            {
+                return "MTP request adaptive controller geometry is invalid";
+            }
+            const auto probability = [](double value)
+            { return value >= 0.0 && value <= 1.0; };
+            if (!probability(depth.promote_full_accept_rate) ||
+                !probability(depth.demote_zero_accept_rate) ||
+                !probability(depth.demote_acceptance_rate))
+            {
+                return "MTP request adaptive thresholds must be in [0, 1]";
+            }
+        }
+        if (!policy.enabled)
+            return std::nullopt;
+
+        const int retained_depth =
+            resolveMTPRetainedDraftCapacity(retained_config);
+        if (retained_depth <= 0)
+        {
+            return "MTP request execution requires a retained graph-capacity envelope";
+        }
+        if (requested_maximum <= 0 || requested_maximum > retained_depth)
+        {
+            return "MTP request execution depth exceeds the retained graph-capacity envelope";
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Compose one active execution view without changing physical identity.
+     * @param retained_config Immutable setup-time capacity and placement policy.
+     * @param policy Validated request-selectable execution policy.
+     * @return Runtime view consumed by request planning and diagnostics.
+     *
+     * The returned value is deliberately ephemeral.  It is not a second live
+     * configuration authority: every physical field comes from
+     * `retained_config`, and every mutable field comes from `policy`.
+     */
+    [[nodiscard]] inline MTPRuntimeConfig composeMTPRequestConfig(
+        const MTPRuntimeConfig &retained_config,
+        const MTPRequestPolicy &policy)
+    {
+        MTPRuntimeConfig active = retained_config;
+        active.enabled = policy.enabled;
+        active.draft_tokens = policy.draft_tokens;
+        active.verify_mode = policy.verify_mode;
+        active.require_terminal_hidden_for_full_hit =
+            policy.require_terminal_hidden_for_full_hit;
+        active.depth_policy = policy.depth_policy;
+        return active;
+    }
+
+    /**
+     * @brief Count complete model forwards retained by the MTP serving family.
+     * @param config Frozen runtime and graph-capacity policy.
+     * @return Three identities when MTP capacity is retained, otherwise zero.
+     *
+     * The MTP serving family owns one condition forward plus two grouped
+     * verifier forwards (greedy terminal reduction and stochastic/disabled
+     * terminal reduction). These are complete transformer graphs, not small
+     * controller fragments, and must therefore pay the per-layer graph-memory
+     * charge. Keeping this count beside retained-depth resolution prevents the
+     * materializer and memory admission from classifying the same graphs
+     * differently.
+     */
+    [[nodiscard]] inline std::size_t
+    resolveMTPRetainedServingForwardModelGraphIdentityCount(
+        const MTPRuntimeConfig &config) noexcept
+    {
+        return retainsMTPGraphCapacity(config) ? std::size_t{3}
+                                               : std::size_t{0};
+    }
+
+    /**
+     * @brief Resolve semantic device-generation branch-description capacity.
      * @param maximum_draft_depth Largest graph-capacity draft depth.
-     * @return Native fragment slots required for every legal depth branch.
+     * @return Host descriptor slots required for every legal depth branch.
      * @throws std::overflow_error when the inventory exceeds size_t.
      *
      * A dynamic SWITCH parent duplicates the common verifier/publication tail
@@ -907,9 +1244,11 @@ namespace llaminar2
      * common tail after an invalid selector. The largest branch also reserves
      * the optional maintenance fragment and ExpertOverlay acquire/release pair,
      * giving `sum(2*d + 9) = D * (D + 10)`. HIP uses the same semantic family
-     * as independently retained ticket-selected native fragments. Setup
-     * scratch planning and opaque-driver memory admission must call this one
-     * authority so neither can silently retain a larger family than the other.
+     * as independently retained ticket-selected semantic branches. This count
+     * sizes allocation-free host vectors used while composing or dispatching
+     * those branches. It is deliberately not a native-executable inventory:
+     * child graph cache owners are counted by MTPGraphOwnerPlan and opaque
+     * driver-memory admission must never multiply bytes by this value.
      */
     inline std::size_t resolveMTPRetainedDeviceGenerationFragmentCapacity(
         int maximum_draft_depth)
@@ -1581,19 +1920,34 @@ namespace llaminar2
         uint64_t migration_payoff_horizon_tokens =
             moe_rebalance_policy::kDefaultMigrationPayoffHorizonTokens;
         /**
-         * @brief Independently runnable physical migration slots.
+         * @brief Preallocated independently tracked migration-cycle slots.
          *
-         * Setup materializes exactly this many transport lanes and prices
-         * their staging/shadow memory through capacity admission. This is a
-         * model-lifetime capacity identity: changing only the active scheduling
-         * cap below does not invalidate prepared weights or force automatic
-         * tier capacity to be solved again.
+         * Setup materializes exactly this many staging, event, and command
+         * identities and prices their shadow memory through capacity
+         * admission. GPU submission uses the separately bounded stream pool
+         * below, so a layer-wide wave does not require one costly driver queue
+         * per cycle. This is a model-lifetime capacity identity: changing only
+         * the active scheduling cap below does not invalidate prepared weights
+         * or force automatic tier capacity to be solved again.
          */
-        uint32_t migration_transfer_slots = 1;
+        uint32_t migration_transfer_slots =
+            moe_rebalance_policy::kDefaultMigrationTransferSlots;
+        /**
+         * @brief Optional physical background stream count per GPU.
+         *
+         * Every admitted transfer slot remains independently event-tracked and
+         * is enqueued without a host/device wait. Compatible slots share these
+         * exact non-null streams round-robin, allowing the runtime to saturate
+         * finite copy/compute engines without paying driver setup cost linear
+         * in model layer count. The default is the smaller of the transfer-slot
+         * count and @ref moe_rebalance_policy::kDefaultMigrationExecutionStreams.
+         * An explicit value must be positive and no larger than the slot count.
+         */
+        std::optional<uint32_t> migration_execution_streams;
         /**
          * @brief Optional active closed-cycle limit for one publication wave.
          *
-         * An unset value uses every physical @ref migration_transfer_slots
+         * An unset value uses every retained @ref migration_transfer_slots
          * lane, preserving the ordinary one-knob production configuration.
          * Setting a smaller positive value lets a request or test retain a
          * wider preallocated fabric while deliberately admitting fewer
@@ -1606,6 +1960,17 @@ namespace llaminar2
         {
             return migration_cycles_per_wave.value_or(
                 migration_transfer_slots);
+        }
+
+        /** @return Exact setup-time GPU stream-pool width for migration. */
+        [[nodiscard]] uint32_t
+        resolvedMigrationExecutionStreams() const noexcept
+        {
+            return migration_execution_streams.value_or(
+                std::min(
+                    migration_transfer_slots,
+                    moe_rebalance_policy::
+                        kDefaultMigrationExecutionStreams));
         }
         uint32_t dynamic_imbalance_threshold_per_mille =
             moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille;

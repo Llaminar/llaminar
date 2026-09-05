@@ -197,11 +197,19 @@ namespace
 
     TEST(
         Test__DeviceGenerationController,
-        HostedTicketSelectionPreservesTransactionThenMaintenanceOrder)
+        HostedTicketSelectionPreservesDepthPrefixThenMaintenanceOrder)
     {
-        const std::array<DeviceControlledLoopFragment, 3> branch = {{
+        const std::array<DeviceControlledLoopFragment, 5> branch = {{
             {.name = "transaction",
              .execution = DeviceControlledLoopFragmentExecution::Always},
+            {.name = "depth two",
+             .execution = DeviceControlledLoopFragmentExecution::
+                 IfDeviceSelectorAtLeast,
+             .minimum_selector = 2},
+            {.name = "depth three",
+             .execution = DeviceControlledLoopFragmentExecution::
+                 IfDeviceSelectorAtLeast,
+             .minimum_selector = 3},
             {.name = "epoch release",
              .execution = DeviceControlledLoopFragmentExecution::Always},
             {.name = "maintenance",
@@ -214,31 +222,79 @@ namespace
         const DeviceControlledLoopTicketSelection due{
             .iteration_admitted = true,
             .conditional_word_nonzero = true,
+            .selector = 3,
         };
-        ASSERT_EQ(due.countSelected(ordered_branch), 3u);
+        ASSERT_EQ(due.countSelected(ordered_branch), 5u);
         ASSERT_NE(due.selectOrdinal(ordered_branch, 0u), nullptr);
         ASSERT_NE(due.selectOrdinal(ordered_branch, 1u), nullptr);
         ASSERT_NE(due.selectOrdinal(ordered_branch, 2u), nullptr);
+        ASSERT_NE(due.selectOrdinal(ordered_branch, 3u), nullptr);
+        ASSERT_NE(due.selectOrdinal(ordered_branch, 4u), nullptr);
         EXPECT_STREQ(due.selectOrdinal(ordered_branch, 0u)->name,
                      "transaction");
         EXPECT_STREQ(due.selectOrdinal(ordered_branch, 1u)->name,
-                     "epoch release");
+                     "depth two");
         EXPECT_STREQ(due.selectOrdinal(ordered_branch, 2u)->name,
+                     "depth three");
+        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 3u)->name,
+                     "epoch release");
+        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 4u)->name,
                      "maintenance");
 
         const DeviceControlledLoopTicketSelection not_due{
             .iteration_admitted = true,
             .conditional_word_nonzero = false,
+            .selector = 2,
         };
-        EXPECT_EQ(not_due.countSelected(ordered_branch), 2u);
-        EXPECT_EQ(not_due.selectOrdinal(ordered_branch, 2u), nullptr);
+        EXPECT_EQ(not_due.countSelected(ordered_branch), 3u);
+        ASSERT_NE(not_due.selectOrdinal(ordered_branch, 2u), nullptr);
+        EXPECT_STREQ(
+            not_due.selectOrdinal(ordered_branch, 2u)->name,
+            "epoch release");
+        EXPECT_EQ(not_due.selectOrdinal(ordered_branch, 3u), nullptr);
 
         const DeviceControlledLoopTicketSelection terminal{
             .iteration_admitted = false,
             .conditional_word_nonzero = true,
+            .selector = 3,
         };
         EXPECT_EQ(terminal.countSelected(ordered_branch), 0u);
         EXPECT_EQ(terminal.selectOrdinal(ordered_branch, 0u), nullptr);
+    }
+
+    TEST(
+        Test__DeviceGenerationController,
+        SelectorFragmentPolicyRejectsAmbiguousBindingsAndKeysThreshold)
+    {
+        const auto *capture_identity =
+            reinterpret_cast<const llaminar2::IGPUGraphCapture *>(
+                static_cast<std::uintptr_t>(1));
+        const DeviceControlledLoopFragment selector_fragment{
+            .name = "depth prefix",
+            .capture = capture_identity,
+            .execution = DeviceControlledLoopFragmentExecution::
+                IfDeviceSelectorAtLeast,
+            .minimum_selector = 7,
+        };
+        ASSERT_TRUE(selector_fragment.valid());
+
+        DeviceControlledLoopFragment different_threshold =
+            selector_fragment;
+        different_threshold.minimum_selector = 8;
+        ASSERT_TRUE(different_threshold.valid());
+        EXPECT_FALSE(selector_fragment.hasSameExecutionIdentity(
+            different_threshold));
+
+        DeviceControlledLoopFragment ambiguous = selector_fragment;
+        ambiguous.condition_word_device =
+            reinterpret_cast<const uint32_t *>(
+                static_cast<std::uintptr_t>(4));
+        EXPECT_FALSE(ambiguous.valid());
+
+        DeviceControlledLoopFragment missing_threshold =
+            selector_fragment;
+        missing_threshold.minimum_selector = -1;
+        EXPECT_FALSE(missing_threshold.valid());
     }
 
     /**
@@ -452,10 +508,12 @@ TEST(Test__DeviceGenerationController,
         session_epoch,
         workspace_generation));
     EXPECT_EQ(ticket.transaction_count, 0);
+    EXPECT_EQ(ticket.committed_output_tokens, 0);
     EXPECT_EQ(ticket.healthy, 0)
         << "Admission identity alone must not advertise a schedulable row.";
 
     control[kDeviceGenerationControlTransactionCount] = 7;
+    control[kDeviceGenerationControlResponseTokenCount] = 19;
     control[kDeviceGenerationControlCurrentDraftDepth] = 4;
     control[kDeviceGenerationControlRequestComplete] = 0;
     control[kDeviceGenerationControlErrorCode] =
@@ -475,6 +533,7 @@ TEST(Test__DeviceGenerationController,
     EXPECT_EQ(ticket.next_draft_depth, 4);
     EXPECT_EQ(ticket.error_code, static_cast<int>(DeviceGenerationError::None));
     EXPECT_EQ(ticket.maintenance_due, 1);
+    EXPECT_EQ(ticket.committed_output_tokens, 19);
 
     DeviceGenerationDispatchTicket mirrored_ticket = ticket;
     mirrored_ticket.session_epoch_low ^= 0x1u;
@@ -484,6 +543,9 @@ TEST(Test__DeviceGenerationController,
     EXPECT_TRUE(ticket.hasSameDispatchDecision(mirrored_ticket))
         << "Participant-local lifecycle identity is not a dispatch decision.";
     mirrored_ticket.next_draft_depth = 3;
+    EXPECT_FALSE(ticket.hasSameDispatchDecision(mirrored_ticket));
+    mirrored_ticket = ticket;
+    ++mirrored_ticket.committed_output_tokens;
     EXPECT_FALSE(ticket.hasSameDispatchDecision(mirrored_ticket));
 }
 
@@ -548,6 +610,7 @@ TEST(Test__DeviceGenerationController,
          ++depth)
     {
         control[kDeviceGenerationControlTransactionCount] = depth;
+        control[kDeviceGenerationControlResponseTokenCount] = depth + 7;
         control[kDeviceGenerationControlCurrentDraftDepth] = depth;
         control[kDeviceGenerationControlActiveVerifierRowCount] = depth + 1;
         const uint32_t maintenance_due =
@@ -559,6 +622,7 @@ TEST(Test__DeviceGenerationController,
         EXPECT_TRUE(ticket.matchesLifecycle(77, 91));
         EXPECT_EQ(ticket.transaction_count, depth);
         EXPECT_EQ(ticket.next_draft_depth, depth);
+        EXPECT_EQ(ticket.committed_output_tokens, depth + 7);
         EXPECT_EQ(
             ticket.maintenance_due,
             static_cast<int32_t>(maintenance_due));

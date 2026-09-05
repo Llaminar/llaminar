@@ -13,6 +13,7 @@
 #pragma once
 
 #include "MoEOverlayCapacityAdmission.h"
+#include "MoEOverlayNodeLocalActivationLayout.h"
 #include "MoERoutedExpertPlacementPlan.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 
@@ -45,6 +46,8 @@ namespace llaminar2
         DeviceId source_device = DeviceId::invalid();
         std::vector<MoEOverlayActivationLocalLaneBinding> source_lanes;
         std::vector<MoEOverlayActivationLocalLaneBinding> target_lanes;
+        /** Exact shared mapping consumed unchanged by both endpoint ranks. */
+        MoEOverlayNodeLocalActivationLayout mapping_layout;
 
         /**
          * @brief Return target participant IDs in stable packet order.
@@ -71,6 +74,8 @@ namespace llaminar2
         int top_k = 0;
         std::size_t graph_family_count = 0;
         std::size_t payload_matrix_bytes = 0;
+        /** Endpoint-private epoch-grant bytes retained by one logical lane. */
+        std::size_t device_grant_bytes_per_lane = 0;
         /** One max-shape FP32 original-route bank per mapped GPU follower. */
         std::size_t canonical_route_matrix_bytes = 0;
         std::vector<MoEOverlayNodeLocalActivationChannelPlan> channels;

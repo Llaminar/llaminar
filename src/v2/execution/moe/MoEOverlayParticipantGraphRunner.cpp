@@ -51,6 +51,7 @@
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/WeightManager.h"
 #include "memory/BufferArena.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/Tensors.h"
 #include "transfer/MappedTransferProgressEpoch.h"
 #include "transfer/TransferEngine.h"
@@ -314,7 +315,13 @@ namespace llaminar2
         std::unique_ptr<ComputeGraph> graph;
         DeviceGraphExecutor::RetainedMultiDeviceExecutionPlan
             execution_plan; ///< Setup-resolved immutable heterogeneous host schedule.
-        std::unique_ptr<WorkspaceAllocator> workspace_allocator;
+        /**
+         * Runner-owned workspace shared by all mutually exclusive graph
+         * families.  Keeping a shared lifetime here ensures cached stages lose
+         * their embedded pointers before the final runner owner releases the
+         * physical block.
+         */
+        std::shared_ptr<WorkspaceAllocator> workspace_allocator;
         std::vector<std::shared_ptr<TensorBase>> tensor_lifetimes;
         ParticipantGraphFamilyRole role = ParticipantGraphFamilyRole::Main;
         int mtp_graph_depth = -1;
@@ -604,7 +611,9 @@ namespace llaminar2
             reinterpret_cast<uint64_t>(&model_context)};
         strategy.devices = {participant.device};
 
-        WeightPlan plan(strategy);
+        WeightPlan plan(
+            strategy,
+            PhysicalMemoryOwner::RoutedExpertWeights);
         const auto &loader = model_context.concreteLoader();
         const auto &rank = execution_plan.currentRankPlan();
         const auto residency =
@@ -779,6 +788,51 @@ namespace llaminar2
             ScopedWeightLoadDetailTimer timer(
                 "overlay.graph.resolve_families");
             resolveGraphFamilies();
+        }
+        {
+            /*
+             * Every native follower graph on one GPU draws from the same
+             * opaque CUDA/HIP pool. Commit the complete admitted family before
+             * creating contexts or graph owners; an instantiation-time memory
+             * delta is evidence about this pool and cannot become a second
+             * per-executable accounting authority.
+             */
+            const auto weight_manager =
+                config_.model_context->concreteWeightManager();
+            const auto memory_authority = weight_manager
+                                              ? weight_manager
+                                                    ->physicalMemoryAuthority()
+                                              : nullptr;
+            if (!memory_authority)
+            {
+                throw std::logic_error(
+                    "Participant graph has no canonical physical-memory authority for native graph-pool admission");
+            }
+            for (const DeviceId device :
+                 participantDevices(local_participants_))
+            {
+                if (!device.is_gpu())
+                    continue;
+                const std::size_t admitted_graph_bytes =
+                    memory_authority->plannedBytes(
+                        device,
+                        PhysicalMemoryOwner::NativeGraphExecutable);
+                if (admitted_graph_bytes == 0u)
+                {
+                    throw std::logic_error(
+                        "Participant GPU graph family has zero native graph-pool admission for " +
+                        device.toString());
+                }
+                native_graph_memory_reservations_.emplace(
+                    device,
+                    std::make_shared<PhysicalMemoryOwnerReservation>(
+                        memory_authority->reserveNewAllocations(
+                            device,
+                            PhysicalMemoryOwner::NativeGraphExecutable,
+                            admitted_graph_bytes)));
+            }
+            serial_graph_family_workspace_allocator_ =
+                std::make_shared<WorkspaceAllocator>(memory_authority);
         }
         {
             ScopedWeightLoadDetailTimer timer(
@@ -1875,6 +1929,21 @@ namespace llaminar2
                     member->domain_participant_index)] = 1u;
             }
 
+            const bool collect_dynamic_service_telemetry =
+                config_.durable_maintenance_policy ==
+                MoEOverlayDurableMaintenancePolicy::DynamicPlacement;
+            const auto service_telemetry_catalog =
+                collect_dynamic_service_telemetry &&
+                        config_.residency_authority
+                    ? config_.residency_authority->economyLayerCatalog()
+                    : nullptr;
+            if (collect_dynamic_service_telemetry &&
+                !service_telemetry_catalog)
+            {
+                throw std::logic_error(
+                    "Dynamic mapped follower has no canonical economy layer catalog");
+            }
+
             auto runtime = std::make_unique<ParticipantGpuRuntime>();
             runtime->participant_id = participant->participant_id;
             runtime->device = participant->device;
@@ -1955,10 +2024,14 @@ namespace llaminar2
                             .num_experts = num_experts,
                             .top_k = top_k,
                             .mirror_to_device = true,
-                            .collect_overlay_service_telemetry =
-                                config_.durable_maintenance_policy ==
-                                MoEOverlayDurableMaintenancePolicy::
-                                    DynamicPlacement,
+                            .overlay_service_telemetry_coverage =
+                                collect_dynamic_service_telemetry
+                                    ? MoEOverlayServiceTelemetryCoverage::
+                                          CatalogStratifiedSample
+                                    : MoEOverlayServiceTelemetryCoverage::
+                                          Disabled,
+                            .overlay_service_telemetry_catalog =
+                                service_telemetry_catalog,
                             .prefill_token_capacity =
                                 config_.max_graph_activation_rows,
                             .deferred_verifier_token_capacity =
@@ -2152,9 +2225,20 @@ namespace llaminar2
         }
 
         const std::vector<int> local_participant_ids = participantIds();
-        auto &registry =
-            config_.model_context->concreteWeightManager()
-                ->expertGemmRegistry();
+        const auto weight_manager =
+            config_.model_context->concreteWeightManager();
+        if (!weight_manager)
+        {
+            throw std::logic_error(
+                "Participant graph has no model-owned WeightManager");
+        }
+        if (!weight_manager->physicalMemoryAuthority() ||
+            !serial_graph_family_workspace_allocator_)
+        {
+            throw std::logic_error(
+                "Participant graph has no runner-owned serial workspace authority");
+        }
+        auto &registry = weight_manager->expertGemmRegistry();
         const int continuation_root =
             config_.placement_plan->continuation_domain_spec
                 .logical_root_participant;
@@ -2716,18 +2800,15 @@ namespace llaminar2
                 result->mapped_cpu_endpoints.push_back(std::move(endpoint));
             }
 
-            std::unordered_map<
-                DeviceId,
-                std::shared_ptr<WorkspaceAllocator>>
-                mapped_workspace_allocators;
-
             /*
-             * Materialize the largest geometry first. WorkspaceAllocator's
-             * serial-family contract then binds every smaller retained graph
-             * to the already-published maximum buffers and rejects any shape
-             * the setup BOM omitted. Iterating in ascending order would ask a
-             * live serial allocator to grow after its first graph captured
-             * addresses, which is intentionally forbidden.
+             * Materialize the largest geometry first. The runner-owned
+             * WorkspaceAllocator spans main, verifier, and MTP families as
+             * well as every physical-row specialization. It therefore binds
+             * every smaller retained graph to the already-published maximum
+             * buffers and rejects any shape the setup BOM omitted. Iterating
+             * in ascending order would ask a live serial allocator to grow
+             * after its first graph captured addresses, which is intentionally
+             * forbidden.
              */
             for (auto shape_it = row_shapes.rbegin();
                  shape_it != row_shapes.rend();
@@ -3349,15 +3430,8 @@ namespace llaminar2
                     endpoint->graph->addDependency(
                         release_name, previous_layer_return);
 
-                    auto [workspace_it, workspace_inserted] =
-                        mapped_workspace_allocators.try_emplace(
-                            target_device, nullptr);
-                    if (workspace_inserted)
-                    {
-                        workspace_it->second =
-                            std::make_shared<WorkspaceAllocator>();
-                    }
-                    endpoint->workspace_allocator = workspace_it->second;
+                    endpoint->workspace_allocator =
+                        serial_graph_family_workspace_allocator_;
                     if (!endpoint->workspace_allocator)
                     {
                         throw std::runtime_error(
@@ -3888,7 +3962,7 @@ namespace llaminar2
                 "Participant graph contains no sparse protocol stages");
         }
         result->workspace_allocator =
-            std::make_unique<WorkspaceAllocator>();
+            serial_graph_family_workspace_allocator_;
         WorkspaceSizingHints hints;
         hints.max_seq_len = row_capacity;
         hints.serial_family_max_rows = row_capacity;
@@ -4299,6 +4373,64 @@ namespace llaminar2
             const MoEOverlayInferenceTransactionTicket &ticket,
             std::string *error)
     {
+        using Clock = std::chrono::steady_clock;
+        const bool collect_timeline =
+            PerfStatsCollector::isDomainEnabled(
+                "moe_overlay_participant_graph");
+        std::uint64_t cpu_dispatch_wait_ns = 0u;
+        std::uint64_t cpu_packet_prepare_ns = 0u;
+        std::uint64_t cpu_expert_compute_ns = 0u;
+        std::uint64_t cpu_return_publication_ns = 0u;
+        std::uint64_t endpoint_completion_wait_ns = 0u;
+        /**
+         * @brief One deferred CPU-layer timing observation.
+         *
+         * Samples are accumulated in the ticket-service hot path and published
+         * only after the complete heterogeneous transaction has retired. This
+         * keeps PerfStats locking/string work out of the GPU/CPU rendezvous
+         * whose latency the diagnostic is intended to measure.
+         */
+        struct CPULayerTimelineSample
+        {
+            int participant_id = -1;
+            int model_layer_index = -1;
+            std::uint32_t stage_ordinal = 0u;
+            std::size_t live_rows = 0u;
+            std::size_t live_entries = 0u;
+            std::uint64_t dispatch_wait_ns = 0u;
+            std::uint64_t packet_prepare_ns = 0u;
+            std::uint64_t expert_compute_ns = 0u;
+            std::uint64_t return_publication_ns = 0u;
+        };
+        std::vector<CPULayerTimelineSample> cpu_layer_timeline;
+        const auto elapsed_nanoseconds = [](
+                                             Clock::time_point begin,
+                                             Clock::time_point end)
+            -> std::uint64_t
+        {
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    end - begin)
+                    .count();
+            return elapsed > 0
+                       ? static_cast<std::uint64_t>(elapsed)
+                       : 0u;
+        };
+        const auto accumulate_elapsed = [&elapsed_nanoseconds](
+                                            std::uint64_t &total,
+                                            Clock::time_point begin,
+                                            Clock::time_point end)
+            -> std::uint64_t
+        {
+            const std::uint64_t elapsed = elapsed_nanoseconds(begin, end);
+            if (elapsed != 0u &&
+                total <= std::numeric_limits<std::uint64_t>::max() -
+                             elapsed)
+            {
+                total += elapsed;
+            }
+            return elapsed;
+        };
         if (error)
             error->clear();
         const auto reject = [error](std::string message)
@@ -4331,6 +4463,16 @@ namespace llaminar2
         {
             return reject(
                 "Mapped ExpertOverlay follower has no setup-owned executable for the ticket row geometry");
+        }
+        if (collect_timeline)
+        {
+            std::size_t layer_capacity = 0u;
+            for (const auto &endpoint : cached.mapped_cpu_endpoints)
+            {
+                if (endpoint)
+                    layer_capacity += endpoint->layers.size();
+            }
+            cpu_layer_timeline.reserve(layer_capacity);
         }
 
         LOG_DEBUG(
@@ -4737,6 +4879,11 @@ namespace llaminar2
                     return reject(
                         "Mapped ExpertOverlay CPU follower lost a prepared layer endpoint");
                 }
+                CPULayerTimelineSample layer_timing{
+                    .participant_id = endpoint->participant_id,
+                    .model_layer_index = layer.model_layer_index,
+                    .stage_ordinal = layer.stage_ordinal,
+                };
                 const std::uint32_t bank =
                     moeOverlayActivationBufferIndex(layer.stage_ordinal);
                 const std::uint64_t expected_timeline =
@@ -4755,6 +4902,9 @@ namespace llaminar2
                         std::chrono::milliseconds(
                             collective_timeout_policy::
                                 kDefaultCollectiveTimeoutMs));
+                const auto dispatch_wait_begin = collect_timeline
+                                                     ? Clock::now()
+                                                     : Clock::time_point{};
                 while (dispatch_rendezvous.waitingAllowed() &&
                        protocol.dispatchTimeline(bank) < expected_timeline)
                 {
@@ -4771,6 +4921,13 @@ namespace llaminar2
                     lane->identity,
                     layer.stage_ordinal,
                     &protocol_error);
+                if (collect_timeline)
+                {
+                    layer_timing.dispatch_wait_ns = accumulate_elapsed(
+                        cpu_dispatch_wait_ns,
+                        dispatch_wait_begin,
+                        Clock::now());
+                }
                 if (!descriptor)
                 {
                     /*
@@ -4824,12 +4981,30 @@ namespace llaminar2
                         << ",follower_generation=" << follower.generation
                         << ",follower_consumed="
                         << follower.last_consumed_stage << "}";
+                    if (config_.device_controller_fabric)
+                    {
+                        /*
+                         * A missing dispatch can be downstream of the
+                         * continuation group's captured epoch-acquire barrier.
+                         * The barrier lives in mapped host pages, so this
+                         * terminal-only diagnostic can expose every participant
+                         * sequence without submitting GPU work or perturbing
+                         * the inference stream whose failure we are reporting.
+                         */
+                        diagnostic
+                            << ' '
+                            << config_.device_controller_fabric
+                                   ->describeInferenceEpochBarrier();
+                    }
                     abort_armed();
                     return reject(diagnostic.str());
                 }
 
                 auto &input = *endpoint->input_rows;
                 auto &output = *endpoint->output_rows;
+                const auto packet_prepare_begin = collect_timeline
+                                                      ? Clock::now()
+                                                      : Clock::time_point{};
                 if (descriptor->live_rows > physical_rows_u64 ||
                     descriptor->live_rows > input.row_capacity ||
                     descriptor->live_entries > input.entry_capacity ||
@@ -4890,6 +5065,8 @@ namespace llaminar2
                     static_cast<size_t>(descriptor->live_rows);
                 input.live_entry_count =
                     static_cast<size_t>(descriptor->live_entries);
+                layer_timing.live_rows = input.live_row_count;
+                layer_timing.live_entries = input.live_entry_count;
 
                 /*
                  * Match the device consume kernel's structural validation before
@@ -4953,9 +5130,28 @@ namespace llaminar2
                     abort_armed();
                     return reject(diagnostic.str());
                 }
+                if (collect_timeline)
+                {
+                    layer_timing.packet_prepare_ns = accumulate_elapsed(
+                        cpu_packet_prepare_ns,
+                        packet_prepare_begin,
+                        Clock::now());
+                }
 
                 output.live_row_count = 0u;
-                if (!layer.local_expert->execute(context_it->second) ||
+                const auto expert_compute_begin = collect_timeline
+                                                      ? Clock::now()
+                                                      : Clock::time_point{};
+                const bool expert_compute_ok =
+                    layer.local_expert->execute(context_it->second);
+                if (collect_timeline)
+                {
+                    layer_timing.expert_compute_ns = accumulate_elapsed(
+                        cpu_expert_compute_ns,
+                        expert_compute_begin,
+                        Clock::now());
+                }
+                if (!expert_compute_ok ||
                     output.live_row_count != input.live_row_count ||
                     output.residency_epoch != input.residency_epoch ||
                     output.source_participant != endpoint->participant_id ||
@@ -4981,6 +5177,9 @@ namespace llaminar2
                     }
                 }
 
+                const auto return_publication_begin = collect_timeline
+                                                          ? Clock::now()
+                                                          : Clock::time_point{};
                 const std::uint64_t return_bytes =
                     moeOverlayReturnPayloadBytes(
                         input.live_entry_count,
@@ -4997,21 +5196,13 @@ namespace llaminar2
                         std::to_string(layer.model_layer_index) + ": " +
                         protocol_error);
                 }
-                if (debugEnv().execution.gpu_graph_trace_replay)
+                if (collect_timeline)
                 {
-                    /* This host endpoint is the release authority for the
-                     * mapped return.  Capture-time device stalls otherwise
-                     * expose only the consumer's eventual timeout, so retain
-                     * the exact bank/value witness in the opt-in graph trace. */
-                    LOG_DEBUG(
-                        "[MappedCPUTrace] participant="
-                        << endpoint->participant_id
-                        << " layer=" << layer.model_layer_index
-                        << " stage=" << layer.stage_ordinal
-                        << " bank=" << bank
-                        << " return_timeline="
-                        << protocol.returnTimeline(bank)
-                        << " expected=" << expected_timeline);
+                    layer_timing.return_publication_ns = accumulate_elapsed(
+                        cpu_return_publication_ns,
+                        return_publication_begin,
+                        Clock::now());
+                    cpu_layer_timeline.push_back(layer_timing);
                 }
                 ++cpu_layer_dispatches;
             }
@@ -5056,6 +5247,22 @@ namespace llaminar2
             out << "ticket={" << ticket.toString() << "}"
                 << " physical_rows=" << shape->physical_rows
                 << " gpu_endpoint_count=" << shape->endpoints.size();
+            if (config_.device_controller_fabric)
+            {
+                /*
+                 * Continuation participants freeze one exact placement epoch
+                 * through a node-local mapped barrier before they can arm the
+                 * remote sparse lanes.  A follower terminal timeout is often
+                 * the first host-visible symptom of a missing continuation
+                 * arrival, so include the acquire-loaded barrier lanes once
+                 * per topology snapshot.  This reads only the fabric's mapped
+                 * diagnostic alias; it neither submits GPU work nor changes
+                 * the inference/maintenance ordering under investigation.
+                 */
+                out << ' '
+                    << config_.device_controller_fabric
+                           ->describeInferenceEpochBarrier();
+            }
             for (const auto &owned_endpoint : shape->endpoints)
             {
                 const auto *const endpoint = owned_endpoint.get();
@@ -5208,8 +5415,8 @@ namespace llaminar2
                                 << load64(controller.admission_transaction)
                                 << ",completed_transaction="
                                 << load64(controller.completed_transaction)
-                                << ",dynamic_layer_cursor="
-                                << load32(controller.dynamic_layer_cursor)
+                                << ",placement_layer_cursor="
+                                << load32(controller.placement_layer_cursor)
                                 << ",admission_epoch="
                                 << load64(controller.admission_epoch)
                                 << ",command_transaction="
@@ -5300,6 +5507,9 @@ namespace llaminar2
                 std::chrono::milliseconds(
                     collective_timeout_policy::
                         kDefaultCollectiveTimeoutMs));
+        const auto endpoint_completion_begin = collect_timeline
+                                                   ? Clock::now()
+                                                   : Clock::time_point{};
         while (completion_rendezvous.waitingAllowed())
         {
             bool complete = true;
@@ -5416,6 +5626,13 @@ namespace llaminar2
             if (complete)
                 break;
             std::this_thread::yield();
+        }
+        if (collect_timeline)
+        {
+            accumulate_elapsed(
+                endpoint_completion_wait_ns,
+                endpoint_completion_begin,
+                Clock::now());
         }
 
         for (const auto &lane : armed)
@@ -5677,6 +5894,90 @@ namespace llaminar2
              {"return_rows", std::to_string(mapped_return_rows)},
              {"terminal_event_fences",
               std::to_string(shape->endpoints.size())}});
+        if (collect_timeline && !cached.mapped_cpu_endpoints.empty())
+        {
+            const PerfStatsCollector::Tags timeline_tags{
+                {"cpu_endpoints",
+                 std::to_string(cached.mapped_cpu_endpoints.size())},
+                {"cpu_layer_dispatches",
+                 std::to_string(cpu_layer_dispatches)},
+                {"graph_role",
+                 std::to_string(
+                     static_cast<std::uint32_t>(ticket.graph_role))},
+                {"physical_rows", std::to_string(physical_rows_u64)},
+                {"timing_semantics", "aggregate_nonoverlapping_cpu_phases"},
+            };
+            const auto record_timeline = [&](const char *name,
+                                             std::uint64_t ns)
+            {
+                PerfStatsCollector::recordTimingNs(
+                    "moe_overlay_participant_graph",
+                    name,
+                    std::max<std::uint64_t>(1u, ns),
+                    transaction_phase,
+                    participantDeviceList(local_participants_),
+                    timeline_tags);
+            };
+            record_timeline(
+                "mapped_cpu_dispatch_wait", cpu_dispatch_wait_ns);
+            record_timeline(
+                "mapped_cpu_packet_prepare", cpu_packet_prepare_ns);
+            record_timeline(
+                "mapped_cpu_expert_compute", cpu_expert_compute_ns);
+            record_timeline(
+                "mapped_cpu_return_publication",
+                cpu_return_publication_ns);
+            record_timeline(
+                "mapped_endpoint_completion_wait",
+                endpoint_completion_wait_ns);
+
+            /* Emit fine-grained observations after every live endpoint and
+             * terminal event has completed. The recorded values therefore
+             * describe the unperturbed rendezvous rather than PerfStats work
+             * interleaved with the inference transaction. */
+            for (const auto &sample : cpu_layer_timeline)
+            {
+                const PerfStatsCollector::Tags layer_tags{
+                    {"graph_role",
+                     std::to_string(
+                         static_cast<std::uint32_t>(ticket.graph_role))},
+                    {"live_entries", std::to_string(sample.live_entries)},
+                    {"live_rows", std::to_string(sample.live_rows)},
+                    {"model_layer",
+                     std::to_string(sample.model_layer_index)},
+                    {"participant",
+                     std::to_string(sample.participant_id)},
+                    {"physical_rows", std::to_string(physical_rows_u64)},
+                    {"stage_ordinal",
+                     std::to_string(sample.stage_ordinal)},
+                    {"timing_semantics",
+                     "deferred_per_layer_nonoverlapping"},
+                };
+                const auto record_layer_timeline =
+                    [&](const char *name, std::uint64_t ns)
+                {
+                    PerfStatsCollector::recordTimingNs(
+                        "moe_overlay_participant_graph",
+                        name,
+                        std::max<std::uint64_t>(1u, ns),
+                        transaction_phase,
+                        "CPU",
+                        layer_tags);
+                };
+                record_layer_timeline(
+                    "mapped_cpu_layer_dispatch_wait",
+                    sample.dispatch_wait_ns);
+                record_layer_timeline(
+                    "mapped_cpu_layer_packet_prepare",
+                    sample.packet_prepare_ns);
+                record_layer_timeline(
+                    "mapped_cpu_layer_expert_compute",
+                    sample.expert_compute_ns);
+                record_layer_timeline(
+                    "mapped_cpu_layer_return_publication",
+                    sample.return_publication_ns);
+            }
+        }
         return true;
     }
 
@@ -5853,9 +6154,22 @@ namespace llaminar2
                                         &execution_error);
         if (!executed)
         {
-            return fail(
+            std::string diagnostic =
                 "selected retained participant graph execution failed: " +
-                execution_error);
+                execution_error;
+            if (config_.device_controller_fabric)
+            {
+                /*
+                 * The continuation rank owns the mapped LocalTP epoch barrier.
+                 * If its retained parent stalls before publishing layer zero,
+                 * expose each device arrival lane at this terminal boundary;
+                 * the remote follower cannot inspect this rank-local fabric.
+                 */
+                diagnostic += ' ';
+                diagnostic += config_.device_controller_fabric
+                                  ->describeInferenceEpochBarrier();
+            }
+            return fail(std::move(diagnostic));
         }
         if (interference_scope && interference_scope->active())
         {

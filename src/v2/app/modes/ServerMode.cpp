@@ -315,10 +315,14 @@ namespace llaminar2
         int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
-            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
-            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
+            const bool is_authority =
+                ctx.runner &&
+                ctx.coordinatedRequestRole() ==
+                    CoordinatedRequestRole::Authority;
+            const bool notify_workers =
+                has_mpi && ctx.mpi_ctx->world_size() > 1 && is_authority;
 
-            if (is_root)
+            if (is_authority)
                 LOG_ERROR("Server mode failed with unhandled exception: " << detail);
 
             if (ctx.runner)
@@ -362,11 +366,14 @@ namespace llaminar2
         auto &runner = ctx.runner;
         auto &tokenizer = ctx.tokenizer;
 
-        if (mpi_ctx->world_size() > 1 && mpi_ctx->rank() != 0)
+        const bool mpi_coordinated = mpi_ctx->world_size() > 1;
+        const bool is_authority =
+            ctx.coordinatedRequestRole() ==
+            CoordinatedRequestRole::Authority;
+        if (mpi_coordinated && !is_authority)
         {
-            // Non-root ranks: enter MPI worker loop to participate in
-            // inference collectives (allreduce for Global TP) when rank 0
-            // initiates them. Returns when rank 0 sends SHUTDOWN.
+            // Followers enter the MPI command loop and participate in the
+            // exact graph/collective sequence admitted by the authority.
             LOG_DEBUG("Rank " << mpi_ctx->rank()
                               << " entering MPI worker loop for inference participation");
             runner->setMPICoordinatedMode(true);
@@ -377,20 +384,22 @@ namespace llaminar2
             return 0;
         }
 
+        // The authority must open the command channel before any early-exit
+        // path so followers blocked in their receive loop can always observe a
+        // terminal command.
+        if (mpi_coordinated)
+            runner->setMPICoordinatedMode(true);
+
         if (!tokenizer->hasChatTemplate())
         {
             LOG_ERROR("Server mode requires a model with a chat template.");
-            if (mpi_ctx->world_size() > 1)
+            if (mpi_coordinated)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
             flushPerfStatsFromEnv();
             mpiShutdown();
             return 1;
         }
-
-        // Enable coordinated mode so rank 0 broadcasts commands to workers
-        if (mpi_ctx->world_size() > 1)
-            runner->setMPICoordinatedMode(true);
 
         /* Do not bind or advertise the HTTP endpoint until the same generic
          * production-readiness lifecycle used by benchmark mode is complete. */
@@ -399,7 +408,7 @@ namespace llaminar2
             LOG_ERROR(
                 "Inference runtime did not become ready for serving: "
                 << runner->lastError());
-            if (mpi_ctx->world_size() > 1)
+            if (mpi_coordinated)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
             flushPerfStatsFromEnv();
@@ -556,7 +565,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Failed to start server on " << serve_endpoint);
             }
-            if (mpi_ctx->world_size() > 1)
+            if (mpi_coordinated)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
             flushPerfStatsFromEnv();
@@ -588,7 +597,7 @@ namespace llaminar2
             if (!g_shutdown_requested.load())
             {
                 LOG_ERROR("Server stopped unexpectedly while serving on " << serve_endpoint);
-                if (mpi_ctx->world_size() > 1)
+                if (mpi_coordinated)
                     runner->shutdownMPIWorkers();
                 runner->shutdown();
                 flushPerfStatsFromEnv();
@@ -600,8 +609,8 @@ namespace llaminar2
         LOG_INFO("Server shut down.");
         g_server_ptr = nullptr;
 
-        // Signal non-root ranks to exit their worker loops
-        if (mpi_ctx->world_size() > 1)
+        // Release every follower from the coordinated command loop.
+        if (mpi_coordinated)
             runner->shutdownMPIWorkers();
 
         runner->shutdown();

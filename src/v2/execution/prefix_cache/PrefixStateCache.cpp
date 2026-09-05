@@ -12,10 +12,10 @@
 
 #include "execution/prefix_cache/DeviceHotPrefixStorageBackend.h"
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
+#include "execution/prefix_cache/RamPrefixStorageBackend.h"
 
 #include <algorithm>
 #include <cstddef>
-#include <cstring>
 #include <utility>
 
 namespace llaminar2
@@ -211,13 +211,12 @@ namespace llaminar2
             }
 
             const PrefixBlockHandle disk_handle = disk_it->second;
-            PrefixBlockHandle staged;
             std::string error;
-            if (!disk_backend_->readBlock(
+            auto hydration = disk_backend_->beginVerifiedHydration(
                     key,
                     disk_handle.layout,
-                    &staged,
-                    &error))
+                    &error);
+            if (!hydration)
             {
                 ++stats_.disk_read_failures;
                 stats_.misses++;
@@ -226,75 +225,43 @@ namespace llaminar2
             }
 
             /*
-             * Verify and stage the requested disk record before demoting a RAM
-             * victim. If every tier is exactly full, that demotion is allowed
-             * to overwrite even this disk record; the already verified staging
-             * owner keeps the requested bytes alive until RAM publication.
+             * The first pass proved the durable bytes through one bounded,
+             * authority-owned window.  Only now may a victim leave RAM.  The
+             * second pass below fills the final admitted RAM allocation
+             * directly and verifies it again, eliminating both a full-block
+             * staging peak and a redundant whole-block memcpy.
              */
-            if (!evictUntilFits(staged.total_bytes))
+            if (!evictUntilFits(hydration->totalBytes()))
             {
                 stats_.misses++;
                 return std::nullopt;
             }
 
-            PrefixBlockHandle hydrated =
-                ram_backend_->allocate(key, staged.layout);
-            if (!hydrated.valid())
+            auto concrete_ram =
+                std::dynamic_pointer_cast<RamPrefixStorageBackend>(
+                    ram_backend_);
+            if (!concrete_ram)
             {
                 ++stats_.disk_read_failures;
                 stats_.misses++;
                 return std::nullopt;
             }
-
-            const auto copy_section =
-                [](void *destination,
-                   const void *source,
-                   size_t bytes) -> bool
+            PrefixBlockHandle hydrated;
+            if (!disk_backend_->hydrateVerified(
+                    *hydration,
+                    *concrete_ram,
+                    &hydrated,
+                    &error))
             {
-                if (bytes == 0)
-                    return true;
-                if (!destination || !source)
-                    return false;
-                std::memcpy(destination, source, bytes);
-                return true;
-            };
-            if (!copy_section(
-                    hydrated.kv_payload,
-                    staged.kv_payload,
-                    staged.kvBytes()) ||
-                !copy_section(
-                    hydrated.hybrid_payload,
-                    staged.hybrid_payload,
-                    staged.hybridBytes()) ||
-                !copy_section(
-                    hydrated.mtp_payload,
-                    staged.mtp_payload,
-                    staged.layout.mtpKVBytes()) ||
-                !copy_section(
-                    hydrated.terminal_hidden,
-                    staged.terminal_hidden,
-                    staged.terminalHiddenBytes()) ||
-                !copy_section(
-                    hydrated.terminal_logits,
-                    staged.terminal_logits,
-                    staged.terminalLogitsBytes()))
-            {
-                ram_backend_->release(hydrated);
                 ++stats_.disk_read_failures;
-                stats_.misses++;
+                ++stats_.misses;
+                /*
+                 * Another archive writer may have replaced or evicted the
+                 * verified record while RAM capacity was prepared.  Never
+                 * publish different bytes under the stale local index.
+                 */
+                removeDiskEntry(key);
                 return std::nullopt;
-            }
-            hydrated.total_bytes = staged.total_bytes;
-            hydrated.has_hybrid_state = staged.has_hybrid_state;
-            hydrated.has_terminal_hidden = staged.has_terminal_hidden;
-            hydrated.has_terminal_logits = staged.has_terminal_logits;
-            hydrated.has_model_runtime_state =
-                staged.has_model_runtime_state;
-            if (staged.model_runtime_state_storage)
-            {
-                hydrated.model_runtime_state_storage =
-                    std::make_shared<std::vector<uint8_t>>(
-                        *staged.model_runtime_state_storage);
             }
 
             if (!insertResident(hydrated, /*count_store=*/false, /*preserve_disk_entry=*/true))

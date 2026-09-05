@@ -23,12 +23,15 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
+#include "planning/CapturedGraphMemoryEstimator.h"
+#include "planning/MemoryPlanner.h"
 #include "transfer/TransferEngine.h"
 
 #if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
 #include <hip/hip_runtime.h>
 #endif
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -155,8 +158,11 @@ namespace
             receipt.retired_runtime_generation,
             runtime_generation_before);
         EXPECT_EQ(
-            receipt.active_runtime_generation,
+            receipt.successor_runtime_generation,
             runtime_generation_before + 1u);
+        EXPECT_EQ(
+            receipt.runtime_post_reset_state,
+            DeviceRuntimePostResetState::Quiescent);
         EXPECT_EQ(
             backend->deviceRuntimeGeneration(device.gpu_ordinal()),
             runtime_generation_before + 1u);
@@ -208,6 +214,102 @@ namespace
     }
 
     /**
+     * @brief Prove one model retires a same-vendor two-GPU set as one edge.
+     *
+     * Both workers and both canonical allocations are materialized before any
+     * ticket is captured. Completion must destroy/exclude both worker contexts
+     * before the first native reset, preserve ticket order in its receipts,
+     * advance each device generation exactly once, and leave both endpoints
+     * immediately usable by the next model admission.
+     *
+     * @param first First exact physical participant.
+     * @param second Second exact physical participant of the same backend.
+     */
+    void expectExclusiveMultiDeviceRuntimeGenerationRetirement(
+        DeviceId first,
+        DeviceId second)
+    {
+        ASSERT_TRUE(first.is_gpu());
+        ASSERT_TRUE(second.is_gpu());
+        ASSERT_EQ(first.type, second.type);
+        ASSERT_NE(first, second);
+
+        std::array<DeviceId, 2> devices{first, second};
+        std::array<IBackend *, 2> backends{};
+        std::array<std::uint64_t, 2> generations{};
+        std::array<void *, 2> allocations{};
+        auto &pool = GPUDeviceContextPool::instance();
+        for (size_t index = 0u; index < devices.size(); ++index)
+        {
+            backends[index] = getBackendFor(devices[index]);
+            ASSERT_NE(backends[index], nullptr);
+            ASSERT_TRUE(pool.getContext(devices[index]).isInitialized());
+            generations[index] = backends[index]->deviceRuntimeGeneration(
+                devices[index].gpu_ordinal());
+            ASSERT_NE(generations[index], 0u);
+            allocations[index] = backends[index]->allocate(
+                kRuntimeRetirementAllocationBytes,
+                devices[index].gpu_ordinal());
+            ASSERT_NE(allocations[index], nullptr);
+        }
+
+        TransferEngine engine;
+        std::vector<ExclusiveModelRetirementTicket> tickets;
+        tickets.reserve(devices.size());
+        for (const DeviceId device : devices)
+        {
+            tickets.push_back(engine.beginExclusiveModelRetirement(
+                ModelDeviceMemoryRetention{
+                    .device = device,
+                    .prepared_weight_bytes =
+                        kRuntimeRetirementAllocationBytes,
+                    .reusable_workspace_bytes = 0u,
+                }));
+        }
+
+        /* Release every final model allocation as one ownership boundary. No
+         * native runtime may reset until the complete participant set is free. */
+        for (size_t index = 0u; index < devices.size(); ++index)
+        {
+            backends[index]->free(
+                allocations[index],
+                devices[index].gpu_ordinal());
+        }
+
+        const auto receipts = engine.completeExclusiveModelRetirements(
+            std::move(tickets));
+        ASSERT_EQ(receipts.size(), devices.size());
+        for (size_t index = 0u; index < devices.size(); ++index)
+        {
+            EXPECT_EQ(receipts[index].device, devices[index]);
+            EXPECT_TRUE(receipts[index].runtime_reset_invoked);
+            EXPECT_EQ(
+                receipts[index].retired_runtime_generation,
+                generations[index]);
+            EXPECT_EQ(
+                receipts[index].successor_runtime_generation,
+                generations[index] + 1u);
+            EXPECT_EQ(
+                receipts[index].runtime_post_reset_state,
+                DeviceRuntimePostResetState::Quiescent);
+            EXPECT_EQ(
+                backends[index]->deviceRuntimeGeneration(
+                    devices[index].gpu_ordinal()),
+                generations[index] + 1u);
+            EXPECT_GE(
+                receipts[index].releasedCanonicalBytes(),
+                kRuntimeRetirementAllocationBytes);
+
+            ASSERT_TRUE(pool.getContext(devices[index]).isInitialized());
+            void *const fresh_allocation = backends[index]->allocate(
+                4096u, devices[index].gpu_ordinal());
+            ASSERT_NE(fresh_allocation, nullptr);
+            backends[index]->free(
+                fresh_allocation, devices[index].gpu_ordinal());
+        }
+    }
+
+    /**
      * @brief Prove acquisition remains excluded for the whole retirement scope.
      */
     void expectContextAcquisitionExcludedDuringRetirement(DeviceId device)
@@ -229,6 +331,73 @@ namespace
 // ===========================================================================
 // GPUDeviceContextPool Tests
 // ===========================================================================
+
+TEST(Test__GPUDeviceContextPool,
+     RetainedMTPGraphCapacityIsPricedBeforeExecution)
+{
+    MTPRuntimeConfig retained_mtp;
+    retained_mtp.enabled = false;
+    retained_mtp.graph_capacity_draft_tokens = 15;
+
+    const CapturedServingGraphMemoryInventory inventory =
+        resolveCapturedServingGraphMemoryInventory(
+            {32, 64, 128},
+            retained_mtp);
+    const MTPGraphOwnerPlan owner_plan(retained_mtp);
+    ASSERT_EQ(inventory.fixed_executable_count, 5u);
+    ASSERT_EQ(
+        inventory.mtp_graph_owners.auxiliaryExecutableSlotCount(),
+        107u);
+
+    ModelMemoryProfile profile;
+    // Workspace planning consults the production architecture's typed
+    // sharding policy even when this fixture carries no weight inventory.
+    // Keep the synthetic geometry attached to a registered dense schema so
+    // this integration test exercises the same planner boundary as admission.
+    profile.architecture = "qwen3";
+    profile.n_layers = 64;
+    profile.d_model = 1024;
+    profile.d_ff = 4096;
+    profile.n_heads = 16;
+    profile.n_kv_heads = 4;
+    profile.head_dim = 64;
+    profile.vocab_size = 32000;
+    profile.max_seq_len = 4096;
+
+    DevicePlanConfig cfg;
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+    cfg.device = DeviceId::rocm(0);
+#else
+    cfg.device = DeviceId::cuda(0);
+#endif
+    cfg.device_compute_units = 1;
+    cfg.device_total_bytes = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+    cfg.device_free_bytes = cfg.device_total_bytes;
+    cfg.batch_size = 1;
+    cfg.max_seq_len = 4096;
+    cfg.activation_seq_len = 64;
+    cfg.kv_precision = "fp16";
+    cfg.captured_serving_graphs = inventory;
+
+    const MemoryPlan plan = MemoryPlanner::plan(profile, {cfg});
+    ASSERT_EQ(plan.devices.size(), 1u);
+    EXPECT_EQ(
+        plan.devices.front().captured_graph_bytes(),
+        estimateCapturedGraphExecutableBytes(
+            cfg.device,
+            CapturedGraphExecutableInventory{
+                .model_graph_identity_count =
+                    /*two prefill + decode + prefix bridge + three MTP forwards=*/7u,
+                .model_graph_topology_variant_count = 1u,
+                .auxiliary_executable_count =
+                    owner_plan.auxiliaryExecutableSlotCount(),
+            }));
+    EXPECT_GT(
+        plan.devices.front().captured_graph_bytes(),
+        estimateCapturedGraphExecutableBytes(
+            cfg.device,
+            /*two prefill + decode + prefix bridge + three MTP forwards=*/7u));
+}
 
 TEST(Test__GPUDeviceContextPool, SingletonInstance)
 {
@@ -428,14 +597,58 @@ TEST(Test__GPUDeviceContextPool,
      CUDAExclusiveModelRetirementResetsRuntimeGeneration)
 {
     SKIP_IF_NO_CUDA();
-    expectExclusiveRuntimeGenerationRetirement(DeviceId::cuda(0));
+    for (int iteration = 0; iteration < 20; ++iteration)
+    {
+        SCOPED_TRACE("CUDA retirement/admission iteration " +
+                     std::to_string(iteration));
+        expectExclusiveRuntimeGenerationRetirement(DeviceId::cuda(0));
+    }
 }
 
 TEST(Test__GPUDeviceContextPool,
      ROCmExclusiveModelRetirementResetsRuntimeGeneration)
 {
     SKIP_IF_NO_ROCM();
-    expectExclusiveRuntimeGenerationRetirement(DeviceId::rocm(0));
+    for (int iteration = 0; iteration < 20; ++iteration)
+    {
+        SCOPED_TRACE("ROCm retirement/admission iteration " +
+                     std::to_string(iteration));
+        expectExclusiveRuntimeGenerationRetirement(DeviceId::rocm(0));
+    }
+}
+
+TEST(Test__GPUDeviceContextPool,
+     CUDAExclusiveMultiDeviceModelRetirementIsStableForTwentyCycles)
+{
+    SKIP_IF_NO_CUDA();
+    auto &pool = GPUDeviceContextPool::instance();
+    if (pool.nvidiaDeviceCount() < 2)
+        GTEST_SKIP() << "Two CUDA devices are required";
+
+    for (int iteration = 0; iteration < 20; ++iteration)
+    {
+        SCOPED_TRACE("CUDA batch retirement/admission iteration " +
+                     std::to_string(iteration));
+        expectExclusiveMultiDeviceRuntimeGenerationRetirement(
+            DeviceId::cuda(0), DeviceId::cuda(1));
+    }
+}
+
+TEST(Test__GPUDeviceContextPool,
+     ROCmExclusiveMultiDeviceModelRetirementIsStableForTwentyCycles)
+{
+    SKIP_IF_NO_ROCM();
+    auto &pool = GPUDeviceContextPool::instance();
+    if (pool.amdDeviceCount() < 2)
+        GTEST_SKIP() << "Two ROCm devices are required";
+
+    for (int iteration = 0; iteration < 20; ++iteration)
+    {
+        SCOPED_TRACE("ROCm batch retirement/admission iteration " +
+                     std::to_string(iteration));
+        expectExclusiveMultiDeviceRuntimeGenerationRetirement(
+            DeviceId::rocm(0), DeviceId::rocm(1));
+    }
 }
 
 TEST(Test__GPUDeviceContextPool, ConcurrentAccess)
@@ -724,6 +937,35 @@ TEST(Test__NvidiaDeviceContext, EventQueryCheckedReportsCompletion)
     EXPECT_TRUE(query_before_sync_ok);
     EXPECT_TRUE(query_after_sync_ok);
     EXPECT_TRUE(ready_after_sync);
+}
+
+TEST(Test__NvidiaDeviceContext, ExactStreamQueryIsTypedAndNonBlocking)
+{
+    SKIP_IF_NO_CUDA();
+
+    auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(0);
+    ctx.submitAndWait([&]()
+                      {
+        void *stream = ctx.createStream();
+        ASSERT_NE(stream, nullptr);
+
+        const GPUStreamExecutionState before_fence =
+            ctx.queryStreamExecutionState(stream, "cuda stream query integration test");
+        EXPECT_TRUE(before_fence == GPUStreamExecutionState::Pending ||
+                    before_fence == GPUStreamExecutionState::Complete);
+
+        ASSERT_TRUE(ctx.synchronizeStreamChecked(stream));
+        EXPECT_EQ(
+            ctx.queryStreamExecutionState(stream, "cuda stream query completed fence"),
+            GPUStreamExecutionState::Complete);
+        EXPECT_THROW(
+            ctx.queryStreamExecutionState(nullptr, "cuda null stream"),
+            std::invalid_argument);
+        EXPECT_THROW(
+            ctx.queryStreamExecutionState(stream, {}),
+            std::invalid_argument);
+
+        ctx.destroyStream(stream); });
 }
 
 TEST(Test__NvidiaDeviceContext, EventWait)
@@ -1086,6 +1328,35 @@ TEST(Test__AMDDeviceContext, EventQueryCheckedReportsCompletion)
     EXPECT_TRUE(query_before_sync_ok);
     EXPECT_TRUE(query_after_sync_ok);
     EXPECT_TRUE(ready_after_sync);
+}
+
+TEST(Test__AMDDeviceContext, ExactStreamQueryIsTypedAndNonBlocking)
+{
+    SKIP_IF_NO_ROCM();
+
+    auto &ctx = GPUDeviceContextPool::instance().getAMDContext(0);
+    ctx.submitAndWait([&]()
+                      {
+        void *stream = ctx.createStream();
+        ASSERT_NE(stream, nullptr);
+
+        const GPUStreamExecutionState before_fence =
+            ctx.queryStreamExecutionState(stream, "rocm stream query integration test");
+        EXPECT_TRUE(before_fence == GPUStreamExecutionState::Pending ||
+                    before_fence == GPUStreamExecutionState::Complete);
+
+        ASSERT_TRUE(ctx.synchronizeStreamChecked(stream));
+        EXPECT_EQ(
+            ctx.queryStreamExecutionState(stream, "rocm stream query completed fence"),
+            GPUStreamExecutionState::Complete);
+        EXPECT_THROW(
+            ctx.queryStreamExecutionState(nullptr, "rocm null stream"),
+            std::invalid_argument);
+        EXPECT_THROW(
+            ctx.queryStreamExecutionState(stream, {}),
+            std::invalid_argument);
+
+        ctx.destroyStream(stream); });
 }
 
 TEST(Test__AMDDeviceContext, EventWait)

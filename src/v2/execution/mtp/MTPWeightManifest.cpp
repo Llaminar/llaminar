@@ -211,6 +211,52 @@ namespace llaminar2
         return names;
     }
 
+    std::vector<std::string> MTPWeightManifest::participantReplicaNames(
+        MTPRoutedExpertWeightAuthority routed_authority) const
+    {
+        std::vector<std::string> names = requiredNames();
+        if (routed_authority !=
+            MTPRoutedExpertWeightAuthority::ExpertOverlay)
+        {
+            return names;
+        }
+
+        /*
+         * Compare against manifest fields rather than naming heuristics.  A
+         * future architecture may spell its expert parents differently, but
+         * discovery must already populate these typed roles before the model
+         * can advertise an available MTP block.
+         */
+        std::vector<std::string> overlay_owned;
+        overlay_owned.reserve(depths.size() * 3u);
+        for (const auto &depth : depths)
+        {
+            for (const std::string *name : {
+                     &depth.moe_gate_exps,
+                     &depth.moe_up_exps,
+                     &depth.moe_down_exps,
+                 })
+            {
+                if (!name->empty())
+                    overlay_owned.push_back(*name);
+            }
+        }
+
+        names.erase(
+            std::remove_if(
+                names.begin(),
+                names.end(),
+                [&](const std::string &name)
+                {
+                    return std::find(
+                               overlay_owned.begin(),
+                               overlay_owned.end(),
+                               name) != overlay_owned.end();
+                }),
+            names.end());
+        return names;
+    }
+
     int mainLayerCountExcludingMTP(
         const IModelLoader &loader,
         const std::string &architecture,

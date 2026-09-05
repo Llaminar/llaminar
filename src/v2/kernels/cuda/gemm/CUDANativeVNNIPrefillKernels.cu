@@ -4123,7 +4123,7 @@ extern "C" bool cudaNativeVNNIPrefill_fp32_withPolicy(
         return false;
     }
 
-    if (ok && llaminar2::PerfStatsCollector::isEnabled())
+    if (ok && llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
     {
         int tile_id = -1;
         int k_partitions = 1;

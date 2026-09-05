@@ -79,6 +79,24 @@ namespace llaminar2::test::parity
             return plan;
         }
 
+        /** @return Overlay plan with one explicitly typed continuation domain. */
+        std::shared_ptr<const MoERoutedExpertPlacementPlan>
+        makeContinuationOverlayPlan(
+            std::vector<GlobalDeviceAddress> participants)
+        {
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+            plan->enabled = true;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+            plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+            plan->owner_order = RoutedExpertOwnerOrder::Ordinal;
+            plan->continuation_domain = "continuation";
+            RoutedExpertDomain continuation;
+            continuation.name = plan->continuation_domain;
+            continuation.participants = std::move(participants);
+            plan->domains.push_back(std::move(continuation));
+            return plan;
+        }
+
         /**
          * @return Two-rank heterogeneous ExpertOverlay topology.
          *
@@ -319,6 +337,57 @@ namespace llaminar2::test::parity
         }
     }
 
+    /**
+     * @brief MTP movement proof must retain every sidecar route projection.
+     *
+     * The executor filters each named stage output independently. This test
+     * prevents a numerical `MTP0_MOE_EXPERT_OUTPUT` key from being mistaken
+     * for implicit capture of the placement banks and domain assignment.
+     */
+    TEST(ModelParitySnapshotInventory,
+         ExpertOverlayMTPIncludesPinnedSidecarRouteEvidence)
+    {
+        EXPECT_THROW(
+            static_cast<void>(
+                modelParityExpertOverlayRouteSnapshotInventory(
+                    /*main_layer_count=*/0,
+                    ModelParityMTP::Off)),
+            std::invalid_argument);
+
+        const auto without_mtp =
+            modelParityExpertOverlayRouteSnapshotInventory(
+                /*main_layer_count=*/2,
+                ModelParityMTP::Off);
+        const auto with_mtp =
+            modelParityExpertOverlayRouteSnapshotInventory(
+                /*main_layer_count=*/2,
+                ModelParityMTP::Depth1);
+
+        EXPECT_EQ(without_mtp.main_model.size(), 16u);
+        EXPECT_TRUE(without_mtp.mtp_sidecar.empty());
+        EXPECT_EQ(with_mtp.main_model.size(), 16u);
+        EXPECT_EQ(with_mtp.mtp_sidecar.size(), 8u);
+        for (const std::string_view suffix : {
+                 "MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
+                 "MOE_RUNTIME_ROUTE_WEIGHTS",
+                 "MOE_ROUTE_CONTRIBUTIONS",
+                 "MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+                 "MOE_OVERLAY_ROUTE_BANK0_EPOCH",
+                 "MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+                 "MOE_OVERLAY_ROUTE_BANK1_EPOCH",
+                 "MOE_OVERLAY_ROUTE_SELECTED_BANK",
+             })
+        {
+            EXPECT_NE(
+                std::find(
+                    with_mtp.mtp_sidecar.begin(),
+                    with_mtp.mtp_sidecar.end(),
+                    "MTP0_" + std::string(suffix)),
+                with_mtp.mtp_sidecar.end())
+                << suffix;
+        }
+    }
+
     TEST(ModelParityDefinition, FocusedDiagnosticMayUseExplicitModelPath)
     {
         ScopedEnvironmentVariable no_process_campaign(
@@ -449,14 +518,45 @@ namespace llaminar2::test::parity
         EXPECT_EQ(cases.front().mtp, ModelParityMTP::Off);
         EXPECT_EQ(cases.front().retained_mtp_draft_capacity, 0);
         EXPECT_EQ(
-            cases.front().prefix_cache_block_size,
-            kModelParityPrefixRestoreProofBlockSize);
+            cases.front().prefix_restore_geometry,
+            ModelParityPrefixRestoreGeometry::AuthenticatedPromptBlock);
         EXPECT_EQ(
             cases.front().movementEvidence(),
             ModelParityMovementEvidence::NotApplicable);
         EXPECT_EQ(
             cases.front().testName(),
             "QwenTest_CUDA0_ActFP32_KVFP16_MTPOff");
+    }
+
+    TEST(ModelParityDefinition,
+         MandatoryPrefixGeometryArchivesOneAuthenticatedPromptBlock)
+    {
+        EXPECT_EQ(productionParityPrefixRestoreProofBlockSize(1u), 1);
+        EXPECT_EQ(productionParityPrefixRestoreProofBlockSize(9u), 9);
+        EXPECT_THROW(
+            (void)productionParityPrefixRestoreProofBlockSize(0u),
+            std::invalid_argument);
+    }
+
+    TEST(ModelParityDefinition,
+         DynamicSpeedupWitnessRejectsNonOverlayTopology)
+    {
+        auto definition = makeDefinition(makeSingleDeviceTopology());
+        definition.features.dynamic_speedup_witness =
+            ModelParityDynamicSpeedupWitness::Ordinal;
+
+        try
+        {
+            (void)expandModelParityDefinition(definition);
+            FAIL() << "A speed witness without ExpertOverlay must be rejected";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(
+                std::string(error.what()).find(
+                    "requires an ExpertOverlay topology"),
+                std::string::npos);
+        }
     }
 
     TEST(ModelParityDefinition, ExpertOverlayStandardMTPExpandsExactTwentyFourCells)
@@ -479,8 +579,8 @@ namespace llaminar2::test::parity
                 kModelParityRequiredMaximumMTPDepth)
                 << "every active and control cell must share one setup-capacity identity";
             EXPECT_EQ(
-                test_case.prefix_cache_block_size,
-                kModelParityPrefixRestoreProofBlockSize);
+                test_case.prefix_restore_geometry,
+                ModelParityPrefixRestoreGeometry::AuthenticatedPromptBlock);
             names.insert(test_case.testName());
             policies.emplace(
                 static_cast<int>(test_case.expert_overlay->owner_order),
@@ -500,7 +600,62 @@ namespace llaminar2::test::parity
     }
 
     TEST(ModelParityDefinition,
-         CpuOverlayAssignsOneObservedSpeedupWitnessPerPrecisionAndOwnerOrder)
+         CanonicalTPAllreduceDiagnosticsRequireMTPAndHomogeneousTPAboveTwo)
+    {
+        const auto make_case = [](
+                                   std::vector<GlobalDeviceAddress> participants,
+                                   ModelParityMTP mtp)
+        {
+            ModelParityCase test_case;
+            test_case.topology.test_id = "TypedContinuation";
+            test_case.topology.expert_overlay_plan =
+                makeContinuationOverlayPlan(std::move(participants));
+            test_case.expert_overlay = ModelParityExpertOverlayPolicy{};
+            test_case.mtp = mtp;
+            return test_case;
+        };
+
+        EXPECT_FALSE(
+            make_case(
+                {GlobalDeviceAddress::cuda(0)},
+                ModelParityMTP::Depth1)
+                .requiresCanonicalTPAllreduceMTPDiagnostics());
+        EXPECT_FALSE(
+            make_case(
+                {GlobalDeviceAddress::cuda(0),
+                 GlobalDeviceAddress::cuda(1),
+                 GlobalDeviceAddress::cuda(2),
+                 GlobalDeviceAddress::cuda(3)},
+                ModelParityMTP::Off)
+                .requiresCanonicalTPAllreduceMTPDiagnostics());
+        EXPECT_TRUE(
+            make_case(
+                {GlobalDeviceAddress::cuda(0),
+                 GlobalDeviceAddress::cuda(1),
+                 GlobalDeviceAddress::cuda(2),
+                 GlobalDeviceAddress::cuda(3)},
+                ModelParityMTP::Depth1)
+                .requiresCanonicalTPAllreduceMTPDiagnostics());
+        EXPECT_TRUE(
+            make_case(
+                {GlobalDeviceAddress::rocm(0),
+                 GlobalDeviceAddress::rocm(1),
+                 GlobalDeviceAddress::rocm(2),
+                 GlobalDeviceAddress::rocm(3)},
+                ModelParityMTP::DynamicDepth)
+                .requiresCanonicalTPAllreduceMTPDiagnostics());
+        EXPECT_FALSE(
+            make_case(
+                {GlobalDeviceAddress::cuda(0),
+                 GlobalDeviceAddress::cuda(1),
+                 GlobalDeviceAddress::rocm(0),
+                 GlobalDeviceAddress::rocm(1)},
+                ModelParityMTP::Depth1)
+                .requiresCanonicalTPAllreduceMTPDiagnostics());
+    }
+
+    TEST(ModelParityDefinition,
+         ExplicitDynamicWitnessSelectsOneOwnerAndOnePrecisionPair)
     {
         auto topology = makeOverlayTopology();
         topology.test_id = "CUDA2_CPU2_NodeOverlay";
@@ -513,6 +668,8 @@ namespace llaminar2::test::parity
         auto definition = makeDefinition(
             std::move(topology), kModelParityRequiredMaximumMTPDepth);
         definition.features.mtp = ModelParityAxisProfile::Standard;
+        definition.features.dynamic_speedup_witness =
+            ModelParityDynamicSpeedupWitness::Random;
         definition.precisions.activation = {
             ActivationPrecision::FP16,
             ActivationPrecision::BF16,
@@ -553,6 +710,11 @@ namespace llaminar2::test::parity
                     49u);
                 EXPECT_EQ(
                     test_case.dynamic_rebalance
+                        .resolvedMigrationExecutionStreams(),
+                    moe_rebalance_policy::
+                        kDefaultMigrationExecutionStreams);
+                EXPECT_EQ(
+                    test_case.dynamic_rebalance
                         .resolvedMigrationCyclesPerWave(),
                     2u);
                 continue;
@@ -565,6 +727,11 @@ namespace llaminar2::test::parity
                 EXPECT_EQ(
                     test_case.dynamic_rebalance.migration_transfer_slots,
                     49u);
+                EXPECT_EQ(
+                    test_case.dynamic_rebalance
+                        .resolvedMigrationExecutionStreams(),
+                    moe_rebalance_policy::
+                        kDefaultMigrationExecutionStreams);
                 EXPECT_EQ(
                     test_case.dynamic_rebalance
                         .resolvedMigrationCyclesPerWave(),
@@ -582,12 +749,17 @@ namespace llaminar2::test::parity
                     49u);
                 EXPECT_EQ(
                     test_case.dynamic_rebalance
+                        .resolvedMigrationExecutionStreams(),
+                    moe_rebalance_policy::
+                        kDefaultMigrationExecutionStreams);
+                EXPECT_EQ(
+                    test_case.dynamic_rebalance
                         .resolvedMigrationCyclesPerWave(),
                     2u);
             }
         }
-        EXPECT_EQ(witnesses, 8u);
-        EXPECT_EQ(movement_only, 40u);
+        EXPECT_EQ(witnesses, 1u);
+        EXPECT_EQ(movement_only, 47u);
     }
 
     TEST(ModelParityDefinition,
@@ -628,17 +800,27 @@ namespace llaminar2::test::parity
         {
             const auto &speedup = find_dynamic(
                 owner_order, ModelParityPrefillGraphMode::Standard);
-            EXPECT_TRUE(speedup.requiresObservedConvergenceSpeedup());
+            const bool selected =
+                owner_order == RoutedExpertOwnerOrder::Random;
+            EXPECT_EQ(
+                speedup.requiresObservedConvergenceSpeedup(), selected);
             EXPECT_EQ(
                 speedup.dynamic_rebalance.window_size,
-                qwen35moe::kQwen35MoEConvergenceHistogramWindowRows);
+                selected
+                    ? qwen35moe::kQwen35MoEConvergenceHistogramWindowRows
+                    : 256);
             EXPECT_EQ(
                 speedup.dynamic_rebalance.max_window_size,
-                qwen35moe::kQwen35MoEConvergenceHistogramWindowRows);
-            EXPECT_GT(
-                static_cast<std::uint64_t>(
-                    speedup.dynamic_rebalance.window_size),
-                qwen35moe::qwen35MoEConvergenceTimingCohortRoutedRows());
+                selected
+                    ? qwen35moe::kQwen35MoEConvergenceHistogramWindowRows
+                    : 256);
+            if (selected)
+            {
+                EXPECT_GT(
+                    static_cast<std::uint64_t>(
+                        speedup.dynamic_rebalance.window_size),
+                    qwen35moe::qwen35MoEConvergenceTimingCohortRoutedRows());
+            }
 
             const auto &movement = find_dynamic(
                 owner_order,
@@ -661,8 +843,8 @@ namespace llaminar2::test::parity
         for (const auto &test_case : cases)
         {
             EXPECT_EQ(
-                test_case.prefix_cache_block_size,
-                kModelParityPrefixRestoreProofBlockSize);
+                test_case.prefix_restore_geometry,
+                ModelParityPrefixRestoreGeometry::AuthenticatedPromptBlock);
             EXPECT_EQ(
                 test_case.testName().find("Prefix"),
                 std::string::npos)
@@ -865,6 +1047,112 @@ namespace llaminar2::test::parity
             0.06f);
     }
 
+    /**
+     * @brief Recursive/grouped LM-head proofs consume the canonical typed K.
+     *
+     * The reference argmax is rank four in production, while production's
+     * argmax is absent from the reference top four. This catches both a
+     * hardcoded top-three gate and an accidental reverse-direction gate that
+     * the canonical PyTorch-top1-in-production-topK policy does not declare.
+     */
+    TEST(ModelParityDefinition, LMHeadContainmentUsesConfiguredReferenceDirection)
+    {
+        constexpr std::array<float, 6> production{
+            10.0f, 9.0f, 8.0f, 7.0f, 6.0f, 5.0f};
+        constexpr std::array<float, 6> reference{
+            1.0f, 8.0f, 9.0f, 10.0f, 7.0f, 6.0f};
+
+        const ReferenceTopKContainmentResult top3 =
+            evaluateReferenceTopKContainment(
+                production.data(),
+                reference.data(),
+                production.size(),
+                production.size(),
+                3);
+        EXPECT_TRUE(top3.enabled);
+        EXPECT_FALSE(top3.passed);
+        EXPECT_FLOAT_EQ(top3.reference_top1_in_production, 0.0f);
+        EXPECT_FLOAT_EQ(top3.production_top1_in_reference, 0.0f);
+
+        const ReferenceTopKContainmentResult top4 =
+            evaluateReferenceTopKContainment(
+                production.data(),
+                reference.data(),
+                production.size(),
+                production.size(),
+                4);
+        EXPECT_TRUE(top4.enabled);
+        EXPECT_TRUE(top4.passed);
+        EXPECT_FLOAT_EQ(top4.reference_top1_in_production, 1.0f);
+        EXPECT_FLOAT_EQ(top4.production_top1_in_reference, 0.0f);
+
+        const ReferenceTopKContainmentResult disabled =
+            evaluateReferenceTopKContainment(
+                production.data(),
+                reference.data(),
+                production.size(),
+                production.size(),
+                0);
+        EXPECT_FALSE(disabled.enabled);
+        EXPECT_TRUE(disabled.passed);
+    }
+
+    TEST(ModelParityDefinition,
+         RecursiveMTPCosineOverrideChangesOnlyDeepTypedPolicies)
+    {
+        auto definition = makeDefinition(
+            makeOverlayTopology(), kModelParityRequiredMaximumMTPDepth);
+        definition.features.mtp = ModelParityAxisProfile::Standard;
+        definition.features
+            .mtp_recursive_aggregate_cosine_threshold_overrides = {
+            {
+                .policy = ModelParityMTP::Depth15,
+                .minimum_cosine_similarity = 0.98f,
+            },
+            {
+                .policy = ModelParityMTP::DynamicDepth,
+                .minimum_cosine_similarity = 0.981f,
+            },
+        };
+
+        const auto cases = expandModelParityDefinition(definition);
+        const auto &depth_three = findCase(
+            cases,
+            RoutedExpertOwnerOrder::Ordinal,
+            ModelParityExpertMovement::Static,
+            ModelParityMTP::Depth3);
+        const auto &depth_fifteen = findCase(
+            cases,
+            RoutedExpertOwnerOrder::Ordinal,
+            ModelParityExpertMovement::Static,
+            ModelParityMTP::Depth15);
+        const auto &dynamic_depth = findCase(
+            cases,
+            RoutedExpertOwnerOrder::Ordinal,
+            ModelParityExpertMovement::Static,
+            ModelParityMTP::DynamicDepth);
+
+        EXPECT_FALSE(
+            depth_three.mtp_recursive_aggregate_cosine_floor.has_value());
+        ASSERT_TRUE(
+            depth_fifteen.mtp_recursive_aggregate_cosine_floor.has_value());
+        ASSERT_TRUE(
+            dynamic_depth.mtp_recursive_aggregate_cosine_floor.has_value());
+        EXPECT_FLOAT_EQ(
+            *depth_fifteen.mtp_recursive_aggregate_cosine_floor,
+            0.98f);
+        EXPECT_FLOAT_EQ(
+            *dynamic_depth.mtp_recursive_aggregate_cosine_floor,
+            0.981f);
+        ASSERT_TRUE(
+            depth_fifteen.toTestConfig()
+                .mtp_recursive_aggregate_cosine_floor.has_value());
+        EXPECT_FLOAT_EQ(
+            *depth_fifteen.toTestConfig()
+                 .mtp_recursive_aggregate_cosine_floor,
+            0.98f);
+    }
+
     TEST(ModelParityDefinition, TypedCaseProjectsStaticPolicyWithoutMovement)
     {
         auto definition = makeDefinition(
@@ -922,8 +1210,8 @@ namespace llaminar2::test::parity
             runtime.prefix_cache.storage_mode,
             PrefixCacheStorageMode::Tiered);
         EXPECT_EQ(
-            runtime.prefix_cache.block_size,
-            kModelParityPrefixRestoreProofBlockSize);
+            test_case.prefix_restore_geometry,
+            ModelParityPrefixRestoreGeometry::AuthenticatedPromptBlock);
         EXPECT_GT(runtime.prefix_cache.ram_budget_bytes, 0u);
         EXPECT_GT(runtime.prefix_cache.device_budget_bytes, 0u);
         EXPECT_GT(runtime.prefix_cache.disk_budget_bytes, 0u);
@@ -956,8 +1244,8 @@ namespace llaminar2::test::parity
         EXPECT_TRUE(runtime.prefix_cache.enabled);
         EXPECT_EQ(runtime.prefix_cache.storage_mode, PrefixCacheStorageMode::Tiered);
         EXPECT_EQ(
-            runtime.prefix_cache.block_size,
-            kModelParityPrefixRestoreProofBlockSize);
+            test_case.prefix_restore_geometry,
+            ModelParityPrefixRestoreGeometry::AuthenticatedPromptBlock);
         EXPECT_TRUE(runtime.mtp.enabled);
         EXPECT_EQ(runtime.mtp.draft_tokens, 15);
         EXPECT_EQ(runtime.mtp.graph_capacity_draft_tokens, 15);
@@ -1134,6 +1422,23 @@ namespace llaminar2::test::parity
                 disabled_mtp_override)),
             std::invalid_argument);
 
+        auto shallow_recursive_cosine_override = makeDefinition(
+            makeOverlayTopology(),
+            kModelParityRequiredMaximumMTPDepth);
+        shallow_recursive_cosine_override.features.mtp =
+            ModelParityAxisProfile::Standard;
+        shallow_recursive_cosine_override.features
+            .mtp_recursive_aggregate_cosine_threshold_overrides = {
+            {
+                .policy = ModelParityMTP::Depth3,
+                .minimum_cosine_similarity = 0.98f,
+            },
+        };
+        EXPECT_THROW(
+            static_cast<void>(expandModelParityDefinition(
+                shallow_recursive_cosine_override)),
+            std::invalid_argument);
+
         auto clipped_adaptive_mtp = makeDefinition(
             makeOverlayTopology(),
             kModelParityRequiredMaximumMTPDepth);
@@ -1263,6 +1568,13 @@ namespace llaminar2::test::parity
         EXPECT_THROW(
             static_cast<void>(expandModelParityDefinition(
                 missing_pipeline_layers)),
+            std::invalid_argument);
+
+        auto missing_overlay_layers = makeDefinition(makeOverlayTopology());
+        missing_overlay_layers.model.transformer_layers = 0;
+        EXPECT_THROW(
+            static_cast<void>(expandModelParityDefinition(
+                missing_overlay_layers)),
             std::invalid_argument);
 
         auto invalid_uniform_node_tp = makeDefinition(

@@ -10,6 +10,8 @@
 
 #include "MoEOverlayActivationChannelPlan.h"
 
+#include "MoEOverlayActivationPacketABI.h"
+
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -240,6 +242,14 @@ namespace llaminar2
             matrix_bytes,
             input.graph_family_count,
             "retained-family lane bytes");
+        const std::size_t grant_bytes = checkedMultiply(
+            sizeof(MoEOverlayActivationDeviceEpochGrant),
+            input.graph_family_count,
+            "retained-family grant bytes");
+        const std::size_t max_entries = checkedMultiply(
+            input.row_capacity,
+            static_cast<std::size_t>(input.top_k),
+            "maximum routed entries");
 
         using GroupKey = std::tuple<int, int, int>;
         std::map<GroupKey, std::vector<MoEOverlayBoundTierParticipant>> groups;
@@ -288,6 +298,7 @@ namespace llaminar2
         result.top_k = input.top_k;
         result.graph_family_count = input.graph_family_count;
         result.payload_matrix_bytes = matrix_bytes;
+        result.device_grant_bytes_per_lane = grant_bytes;
         result.canonical_route_matrix_bytes =
             canonical_route_matrix_bytes;
         std::map<PhysicalKey, std::size_t> charge_by_resource;
@@ -324,6 +335,22 @@ namespace llaminar2
                 }
                 channel.source_lanes.push_back(source_lane);
                 channel.target_lanes.push_back(target_lane);
+                {
+                    auto &bytes = charge_by_resource[PhysicalKey{
+                        source->world_rank, source->device}];
+                    bytes = checkedAdd(
+                        bytes,
+                        grant_bytes,
+                        "source retained-family grants");
+                }
+                {
+                    auto &bytes = charge_by_resource[PhysicalKey{
+                        participant.world_rank, participant.device}];
+                    bytes = checkedAdd(
+                        bytes,
+                        grant_bytes,
+                        "target retained-family grants");
+                }
                 if (source->device.is_gpu())
                 {
                     auto &bytes = charge_by_resource[PhysicalKey{
@@ -348,6 +375,27 @@ namespace llaminar2
                         "participant canonical route bytes");
                 }
             }
+            channel.mapping_layout =
+                planMoEOverlayNodeLocalActivationLayout({
+                    .participant_count = grouped.size(),
+                    .max_rows_per_participant = input.row_capacity,
+                    .max_entries_per_participant = max_entries,
+                    .d_model = input.d_model,
+                    .activation_graph_family_count =
+                        input.graph_family_count,
+                });
+            auto &source_host_bytes = charge_by_resource[PhysicalKey{
+                source->world_rank, DeviceId::cpu()}];
+            source_host_bytes = checkedAdd(
+                source_host_bytes,
+                channel.mapping_layout.sourceOwnedBytes(),
+                "source first-touch mapping pages");
+            auto &target_host_bytes = charge_by_resource[PhysicalKey{
+                target_world_rank, DeviceId::cpu()}];
+            target_host_bytes = checkedAdd(
+                target_host_bytes,
+                channel.mapping_layout.targetOwnedBytes(),
+                "target first-touch mapping pages");
             result.channels.push_back(std::move(channel));
         }
 

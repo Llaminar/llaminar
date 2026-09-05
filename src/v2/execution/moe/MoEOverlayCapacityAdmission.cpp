@@ -167,6 +167,75 @@ namespace llaminar2
         }
     } // namespace
 
+    MoEOverlayMigrationStorageKind
+    MoEOverlayCapacityAdmission::selectMigrationStorage(
+        const MoERoutedExpertPlacementPlan &plan,
+        MoERebalanceRuntimeMode mode)
+    {
+        if (mode != MoERebalanceRuntimeMode::Dynamic)
+            return MoEOverlayMigrationStorageKind::Disabled;
+        if (!plan.usesExpertOverlayAuthority() ||
+            plan.authority_execution ==
+                MoEOverlayAuthorityExecutionKind::Unresolved)
+        {
+            throw std::invalid_argument(
+                "Dynamic ExpertOverlay migration storage requires a normalized authority plan");
+        }
+
+        if (plan.authority_execution !=
+                MoEOverlayAuthorityExecutionKind::DeviceResident ||
+            plan.routed_tiers.size() != 1u)
+        {
+            return MoEOverlayMigrationStorageKind::
+                PhysicalResidencyFabric;
+        }
+
+        const auto &domain = requireDomain(
+            plan, plan.routed_tiers.front());
+        if (domain.participants.size() < 2u)
+        {
+            return MoEOverlayMigrationStorageKind::
+                PhysicalResidencyFabric;
+        }
+        const DeviceType device_type =
+            domain.participants.front().device_type;
+        const bool homogeneous_gpu = std::all_of(
+            domain.participants.begin(),
+            domain.participants.end(),
+            [device_type](const GlobalDeviceAddress &participant)
+            {
+                return participant.isGPU() &&
+                       participant.device_type == device_type;
+            });
+        const bool native_collective =
+            domain.backend == CollectiveBackendType::AUTO ||
+            (device_type == DeviceType::CUDA &&
+             domain.backend == CollectiveBackendType::NCCL) ||
+            (device_type == DeviceType::ROCm &&
+             domain.backend == CollectiveBackendType::RCCL);
+        const auto owner_rank = domain.primaryWorldRank();
+        if (!homogeneous_gpu || !native_collective || !owner_rank)
+        {
+            return MoEOverlayMigrationStorageKind::
+                PhysicalResidencyFabric;
+        }
+
+        for (std::size_t participant = 0;
+             participant < domain.participants.size();
+             ++participant)
+        {
+            const int rank = participant < domain.world_ranks.size()
+                                 ? domain.world_ranks[participant]
+                                 : domain.owner_rank;
+            if (rank != *owner_rank)
+            {
+                return MoEOverlayMigrationStorageKind::
+                    PhysicalResidencyFabric;
+            }
+        }
+        return MoEOverlayMigrationStorageKind::DeviceTransferDirectory;
+    }
+
     std::vector<MoEOverlayBoundTierParticipant>
     MoEOverlayCapacityAdmission::boundParticipants(
         const MoERoutedExpertPlacementPlan &plan)
@@ -224,11 +293,14 @@ namespace llaminar2
         int world_size,
         const MoEOverlayCapacityAdmissionPolicy &policy)
     {
-        if (!policy.materialize_migration_fabric)
+        if (!policy.usesPhysicalResidencyFabric())
             return {};
         if (world_size <= 0 || policy.staging_capacity_bytes == 0 ||
             policy.shadow_slots_per_endpoint_layer == 0 ||
             policy.maximum_concurrent_cycles == 0 ||
+            policy.maximum_execution_streams == 0 ||
+            policy.maximum_execution_streams >
+                policy.maximum_concurrent_cycles ||
             policy.maximum_cycles_per_layer == 0 ||
             policy.shadow_slots_per_endpoint_layer <
                 MoEOverlayCapacityAdmissionPolicy::
@@ -422,11 +494,27 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay capacity admission requires positive model geometry");
         }
-        if (policy.materialize_migration_fabric &&
+        if (policy.overlay_world_size <= 0 ||
+            (policy.migration_storage !=
+                 MoEOverlayMigrationStorageKind::Disabled &&
+             policy.migration_storage !=
+                 MoEOverlayMigrationStorageKind::DeviceTransferDirectory &&
+             policy.migration_storage !=
+                 MoEOverlayMigrationStorageKind::PhysicalResidencyFabric))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay capacity admission received an invalid migration storage policy");
+        }
+        if (policy.usesPhysicalResidencyFabric() &&
             (policy.shadow_slots_per_endpoint_layer == 0 ||
              policy.staging_capacity_bytes == 0 ||
              policy.maximum_concurrent_cycles == 0 ||
+             policy.maximum_execution_streams == 0 ||
+             policy.maximum_execution_streams >
+                 policy.maximum_concurrent_cycles ||
              policy.maximum_cycles_per_layer == 0 ||
+             policy.device_transfer_directory_capacity.total_slots != 0u ||
+             policy.device_rebalance_workspace_capacity.has_value() ||
              policy.shadow_slots_per_endpoint_layer <
                  MoEOverlayCapacityAdmissionPolicy::
                      requiredShadowSlotsPerEndpointLayer(
@@ -435,6 +523,35 @@ namespace llaminar2
         {
             throw std::invalid_argument(
                 "ExpertOverlay migration admission requires staging and one endpoint/layer shadow slot per admitted same-layer cycle");
+        }
+        if (policy.usesDeviceTransferDirectory())
+        {
+            const auto &capacity =
+                policy.device_transfer_directory_capacity;
+            if (capacity.active_slots == 0u ||
+                capacity.staging_slots == 0u ||
+                capacity.total_slots == 0u ||
+                static_cast<std::uint64_t>(capacity.active_slots) +
+                        static_cast<std::uint64_t>(capacity.staging_slots) !=
+                    capacity.total_slots ||
+                !policy.device_rebalance_workspace_capacity.has_value() ||
+                policy.shadow_slots_per_endpoint_layer != 0u ||
+                policy.staging_capacity_bytes != 0u ||
+                policy.distributed_transport)
+            {
+                throw std::invalid_argument(
+                    "Device transfer-directory admission requires coherent buffered capacity and forbids physical-fabric storage");
+            }
+        }
+        if (!policy.migrationEnabled() &&
+            (policy.device_transfer_directory_capacity.total_slots != 0u ||
+             policy.device_rebalance_workspace_capacity.has_value() ||
+             policy.shadow_slots_per_endpoint_layer != 0u ||
+             policy.staging_capacity_bytes != 0u ||
+             policy.distributed_transport))
+        {
+            throw std::invalid_argument(
+                "Movement-disabled ExpertOverlay admission cannot retain migration storage");
         }
 
         const auto footprints =
@@ -446,11 +563,82 @@ namespace llaminar2
         const auto staging_bom = transferStagingBOM(
             plan, policy.overlay_world_size, policy);
         std::map<PhysicalKey, std::size_t> staging_by_key;
+        std::map<PhysicalKey, std::size_t> workspace_by_key;
         for (const auto &charge : staging_bom)
         {
             staging_by_key.emplace(
                 PhysicalKey{charge.world_rank, charge.device},
                 charge.bytes);
+        }
+        if (policy.usesDeviceTransferDirectory())
+        {
+            if (plan.routed_tiers.size() != 1u ||
+                bound_participants.size() < 2u)
+            {
+                throw std::invalid_argument(
+                    "Device transfer-directory admission requires one multi-participant routed tier");
+            }
+            const int owner_rank = bound_participants.front().world_rank;
+            const DeviceType backend_type =
+                bound_participants.front().device.type;
+            const auto profile =
+                DeviceMoETransferSlotDirectory::
+                    profileForLayerWeightManifest(
+                        layer_weight_manifest);
+            const auto directory_bom =
+                DeviceMoETransferSlotDirectory::allocationBOM(
+                    policy.device_transfer_directory_capacity,
+                    profile);
+            const auto &workspace_capacity =
+                *policy.device_rebalance_workspace_capacity;
+            if (workspace_capacity.num_layers != layer_count ||
+                workspace_capacity.num_experts !=
+                    static_cast<std::uint32_t>(num_experts) ||
+                workspace_capacity.participant_count !=
+                    bound_participants.size() ||
+                workspace_capacity.local_transfer_slot_count !=
+                    policy.device_transfer_directory_capacity.total_slots ||
+                workspace_capacity.phase !=
+                    DeviceMoERebalanceStagePhase::PlanCopyApply ||
+                workspace_capacity.transfer_mode !=
+                    DeviceMoERebalanceTransferMode::CompactTransferSlots)
+            {
+                throw std::invalid_argument(
+                    "Device transfer-directory workspace capacity disagrees with its admitted topology or directory");
+            }
+            const DeviceMoERebalanceWorkspaceBinding workspace_binding{
+                .capacity = workspace_capacity,
+                .collective_payload_slot_bytes =
+                    DeviceMoERebalanceWorkspaceContract::
+                        collectivePayloadSlotBytes(
+                            profile.max_wire_payload_bytes),
+                .workspace_suffix = "capacity_admission",
+            };
+            const std::size_t maintenance_workspace_bytes =
+                DeviceMoERebalanceWorkspaceContract::allocationBytes(
+                    workspace_binding);
+            for (const auto &participant : bound_participants)
+            {
+                if (!participant.device.is_gpu() ||
+                    participant.device.type != backend_type ||
+                    participant.world_rank != owner_rank)
+                {
+                    throw std::invalid_argument(
+                        "Device transfer-directory admission requires one rank-local homogeneous GPU domain");
+                }
+                auto &bytes = staging_by_key[PhysicalKey{
+                    participant.world_rank, participant.device}];
+                bytes = checkedAdd(
+                    bytes,
+                    directory_bom.total_bytes,
+                    "device transfer-directory storage");
+                auto &workspace = workspace_by_key[PhysicalKey{
+                    participant.world_rank, participant.device}];
+                workspace = checkedAdd(
+                    workspace,
+                    maintenance_workspace_bytes,
+                    "device rebalance maintenance workspace");
+            }
         }
 
         std::map<PhysicalKey, std::size_t> budget_by_key;
@@ -458,7 +646,7 @@ namespace llaminar2
         MoEOverlayCapacityResolverInput input;
         input.num_experts = num_experts;
         input.initial_residency_policy =
-            policy.materialize_migration_fabric
+            policy.migrationEnabled()
                 ? MoEOverlayInitialResidencyPolicy::
                       MigrationSourcePerParticipant
                 : MoEOverlayInitialResidencyPolicy::PriorityFillOnly;
@@ -466,12 +654,12 @@ namespace llaminar2
         input.physical_budgets.reserve(physical_budgets.size());
         for (const auto &budget : physical_budgets)
         {
-            const PhysicalKey key{budget.world_rank, budget.device};
-            if (budget.world_rank < 0 || !budget.device.is_valid() ||
-                budget.resource_id.empty() ||
+            const PhysicalKey key{budget.worldRank(), budget.device()};
+            if (budget.worldRank() < 0 || !budget.device().is_valid() ||
+                budget.resourceId().empty() ||
                 !budget_by_key.emplace(key, input.physical_budgets.size()).second ||
                 !budget_by_id.emplace(
-                     budget.resource_id, input.physical_budgets.size()).second)
+                     budget.resourceId(), input.physical_budgets.size()).second)
             {
                 throw std::invalid_argument(
                     "ExpertOverlay bound physical budgets require unique rank/device and resource identities");
@@ -479,16 +667,21 @@ namespace llaminar2
             const auto staging = staging_by_key.find(key);
             const std::size_t canonical_staging =
                 staging == staging_by_key.end() ? 0 : staging->second;
-            input.physical_budgets.push_back({
-                .resource_id = budget.resource_id,
-                .device = budget.device,
-                .usable_budget_bytes = budget.usable_budget_bytes,
-                .fixed_bytes = budget.fixed_bytes,
-                .transfer_staging_bytes = checkedAdd(
-                    canonical_staging,
-                    budget.additional_transfer_staging_bytes,
-                    "physical transfer staging"),
-            });
+            PhysicalMemoryBOMBuilder complete_builder(
+                budget.bom());
+            complete_builder.add(
+                PhysicalMemoryOwner::ExpertMigrationStaging,
+                canonical_staging);
+            const auto workspace = workspace_by_key.find(key);
+            complete_builder.add(
+                PhysicalMemoryOwner::ExecutionWorkspace,
+                workspace == workspace_by_key.end()
+                    ? 0u
+                    : workspace->second);
+            input.physical_budgets.emplace_back(
+                budget.resourceId(),
+                PhysicalMemoryAdmissionCertificate(
+                    complete_builder.build()));
         }
         if (input.physical_budgets.empty())
         {
@@ -502,6 +695,18 @@ namespace llaminar2
             {
                 std::ostringstream error;
                 error << "ExpertOverlay migration staging at rank "
+                      << key.world_rank << " on " << key.device.toString()
+                      << " has no physical memory authority";
+                throw std::invalid_argument(error.str());
+            }
+        }
+        for (const auto &[key, bytes] : workspace_by_key)
+        {
+            (void)bytes;
+            if (budget_by_key.count(key) == 0)
+            {
+                std::ostringstream error;
+                error << "ExpertOverlay maintenance workspace at rank "
                       << key.world_rank << " on " << key.device.toString()
                       << " has no physical memory authority";
                 throw std::invalid_argument(error.str());
@@ -572,9 +777,15 @@ namespace llaminar2
                 request.participants.push_back({
                     .participant_id = bound.participant_id,
                     .resource_id = input.physical_budgets[budget->second]
-                                       .resource_id,
+                                       .resourceId(),
                     .shadow_slots_per_layer =
-                        policy.shadow_slots_per_endpoint_layer,
+                        policy.usesPhysicalResidencyFabric()
+                            ? policy.shadow_slots_per_endpoint_layer
+                            : 0u,
+                    .maximum_concurrent_shadow_slots =
+                        policy.usesPhysicalResidencyFabric()
+                            ? policy.maximum_concurrent_cycles
+                            : 0u,
                 });
                 participant_devices.push_back(device);
             }

@@ -545,6 +545,18 @@ namespace llaminar2
             DeviceMoEOverlayServiceTelemetryBinding
                 overlay_service_telemetry;
             /**
+             * @brief Immutable service phase owned by this graph family.
+             *
+             * Participant-local retained and inline sparse graphs set this at
+             * construction because row geometry cannot distinguish ordinary
+             * decode from an MTP predictor. Leave Auto only when ordinary
+             * dense graph geometry is authoritative or when
+             * @ref runtime_service_graph_role_device supplies a replay-varying
+             * device-owned role.
+             */
+            MoEOverlayServicePhaseHint service_phase =
+                MoEOverlayServicePhaseHint::Auto;
+            /**
              * @brief Optional authenticated device-owned transaction role.
              *
              * Mapped heterogeneous follower graphs reuse one captured row
@@ -718,11 +730,13 @@ namespace llaminar2
             SparseOverlayBindingKind binding_kind =
                 SparseOverlayBindingKind::ResidencyPublication;
             /**
-             * Exact semantic phase of a synchronous CPU transport packet.
+             * Exact semantic phase of this retained sparse invocation.
              *
              * HostPacketPublication must select a production phase. Retained
-             * GPU and setup bindings leave this as Auto because their graph
-             * role owns phase identity independently of the mutable binding.
+             * participant-local GPU graphs may select their immutable phase at
+             * construction. Mapped follower graphs leave this as Auto because
+             * their authenticated device-side graph role changes between
+             * replays and owns phase identity independently of this binding.
              */
             MoEOverlayServicePhaseHint service_phase =
                 MoEOverlayServicePhaseHint::Auto;
@@ -875,6 +889,12 @@ namespace llaminar2
             return overlay_service_runtime_layer_ &&
                    overlay_service_telemetry_layer_ &&
                    overlay_service_sample_;
+        }
+        /** @return Typed service phase that the next telemetry marker publishes. */
+        MoEOverlayServicePhaseHint
+        serviceTelemetryPhaseHintForTesting() const noexcept
+        {
+            return serviceTelemetryPhaseHint();
         }
         /**
          * @brief Expose the immutable runtime-table binding to graph tests.
@@ -1284,6 +1304,11 @@ namespace llaminar2
         bool prepareGroupedVerifierHistogramProducer(
             void *producer_stream) override;
 
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        bool transitionGroupedVerifierHistogramProducerCapture(
+            void *producer_stream,
+            RuntimeHistogramProducerCaptureTransition transition) override;
+
         /**
          * @brief Publish accepted grouped-verifier demand on its producer stream.
          *
@@ -1599,7 +1624,7 @@ namespace llaminar2
         /** @brief Typed authority that supplied the currently bound invocation. */
         SparseOverlayBindingKind sparse_overlay_binding_kind_ =
             SparseOverlayBindingKind::SetupPriming;
-        /** Semantic phase authenticated by the current CPU host packet. */
+        /** @brief Semantic phase authenticated by the current sparse binding. */
         MoEOverlayServicePhaseHint sparse_overlay_service_phase_ =
             MoEOverlayServicePhaseHint::Auto;
         /** Maximum compact route width certified before any host rebind. */
@@ -1854,7 +1879,13 @@ namespace llaminar2
          */
         bool executeWithoutServiceTelemetry(IDeviceContext *ctx);
 
-        /** @return Capture-stable semantic phase for service accounting. */
+        /**
+         * @brief Resolve the sole semantic phase for service accounting.
+         *
+         * A packet-bound sparse phase has precedence over the immutable graph
+         * phase. Auto then permits ordinary graph geometry or the device-owned
+         * runtime role to supply identity at execution.
+         */
         MoEOverlayServicePhaseHint serviceTelemetryPhaseHint() const noexcept;
         const DeviceMoEPlacementBank *activeRuntimePlacementBank() const;
         bool runtimeLocalComputeEnabled(const DeviceMoEPlacementBank *bank, int expert_id) const;
@@ -2479,8 +2510,8 @@ namespace llaminar2
             /** Typed source for routes assigned outside this continuation domain. */
             MoEExternalCanonicalRouteSource external_route_source =
                 MoEExternalCanonicalRouteSource::Unspecified;
-            /** Final post-filter runtime weight for every original route slot. */
-            const float *runtime_route_weights = nullptr;
+            /** Workload-typed final weight publication consumed by execution. */
+            MoERuntimeRouteWeightBinding runtime_route_weights{};
             /**
              * Request-pinned overlay-wide expert placement authority.
              *

@@ -7,6 +7,7 @@
 
 #include "DecodeExpertHistogram.h"
 #include "DeviceMoEOverlayEpochArena.h"
+#include "MoEOverlayEconomyCalibrationPlanner.h"
 #include "../../backends/BackendManager.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -876,8 +877,12 @@ namespace llaminar2
           num_experts_(config.num_experts),
           top_k_(config.top_k),
           mirror_to_device_(config.mirror_to_device),
-          collect_overlay_service_telemetry_(
-              config.collect_overlay_service_telemetry),
+          grouped_verifier_histogram_publication_(
+              config.grouped_verifier_histogram_publication),
+          overlay_service_telemetry_coverage_(
+              config.overlay_service_telemetry_coverage),
+          overlay_service_telemetry_catalog_(
+              std::move(config.overlay_service_telemetry_catalog)),
           prefill_token_capacity_(config.prefill_token_capacity),
           deferred_verifier_token_capacity_(
               config.deferred_verifier_token_capacity),
@@ -899,10 +904,46 @@ namespace llaminar2
                                         std::to_string(kDeviceMoEMaxTopK) + "]");
         if (mirror_to_device_ && !device_id_.is_gpu())
             throw std::runtime_error("[MoERuntimeTable] device mirroring requires a GPU device");
-        if (collect_overlay_service_telemetry_ && !mirror_to_device_)
+        if (grouped_verifier_histogram_publication_ !=
+                GroupedVerifierHistogramPublicationMode::Disabled &&
+            !mirror_to_device_)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] grouped-verifier publication requires a mirrored GPU table");
+        }
+        const bool collects_overlay_service_telemetry =
+            overlay_service_telemetry_coverage_ !=
+            MoEOverlayServiceTelemetryCoverage::Disabled;
+        if (collects_overlay_service_telemetry && !mirror_to_device_)
         {
             throw std::invalid_argument(
                 "[MoERuntimeTable] ExpertOverlay service telemetry requires a mirrored GPU table");
+        }
+        switch (overlay_service_telemetry_coverage_)
+        {
+        case MoEOverlayServiceTelemetryCoverage::Disabled:
+            if (overlay_service_telemetry_catalog_)
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] disabled service telemetry cannot retain a layer catalog");
+            }
+            break;
+        case MoEOverlayServiceTelemetryCoverage::AllRuntimeLayers:
+            if (overlay_service_telemetry_catalog_)
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] all-layer service telemetry cannot also select catalog representatives");
+            }
+            break;
+        case MoEOverlayServiceTelemetryCoverage::CatalogStratifiedSample:
+            if (!overlay_service_telemetry_catalog_ ||
+                overlay_service_telemetry_catalog_->layerCount() <
+                    static_cast<std::size_t>(num_layers_))
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] stratified service telemetry requires a catalog covering every runtime layer");
+            }
+            break;
         }
         if (prefill_token_capacity_ < 0)
             throw std::invalid_argument("[MoERuntimeTable] prefill_token_capacity must be non-negative");
@@ -992,6 +1033,12 @@ namespace llaminar2
         }
         if (overlay_placement_source_)
         {
+            if (grouped_verifier_histogram_publication_ !=
+                GroupedVerifierHistogramPublicationMode::Disabled)
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] an ExpertOverlay child table cannot own the canonical grouped-verifier publication stream");
+            }
             if (!overlay_epoch_arena_ || !mirror_to_device_ ||
                 !overlay_placement_source_->isMirroredToDevice() ||
                 overlay_placement_source_->deviceId() != device_id_ ||
@@ -1008,12 +1055,15 @@ namespace llaminar2
                     "canonical mirrored main table on the same device, cover "
                     "every target layer, and share the exact epoch ticket");
             }
-            if (collect_overlay_service_telemetry_ !=
-                (overlay_placement_source_
-                     ->deviceOverlayServiceTelemetry() != nullptr))
+            if (overlay_service_telemetry_coverage_ !=
+                    overlay_placement_source_
+                        ->overlayServiceTelemetryCoverage() ||
+                overlay_service_telemetry_catalog_.get() !=
+                    overlay_placement_source_
+                        ->overlayServiceTelemetryCatalog().get())
             {
                 throw std::invalid_argument(
-                    "[MoERuntimeTable] child and canonical ExpertOverlay tables must agree on service telemetry collection");
+                    "[MoERuntimeTable] child and canonical ExpertOverlay tables must share one service telemetry coverage authority");
             }
         }
         (void)checkedRouteCapacity(prefill_token_capacity_, top_k_);
@@ -1040,7 +1090,12 @@ namespace llaminar2
             try
             {
                 allocateDeviceMirror();
-                if (collect_overlay_service_telemetry_ &&
+                if (grouped_verifier_histogram_publication_ ==
+                    GroupedVerifierHistogramPublicationMode::AcceptedRows)
+                {
+                    allocateGroupedVerifierHistogramPublicationStream();
+                }
+                if (collects_overlay_service_telemetry &&
                     !overlay_placement_source_)
                 {
                     allocateOverlayServiceTelemetry();
@@ -1066,6 +1121,7 @@ namespace llaminar2
             }
             catch (...)
             {
+                releaseRuntimeHistogramResources();
                 releaseOverlayServiceTelemetry();
                 releaseDeferredVerifierRouteLedger();
                 releasePrefillRouteScratch();
@@ -1090,7 +1146,7 @@ namespace llaminar2
 
     DeviceMoERuntimeTable::~DeviceMoERuntimeTable()
     {
-        releaseRuntimeHistogramDrainResources();
+        releaseRuntimeHistogramResources();
         releaseOverlayServiceTelemetry();
         releaseDeferredVerifierRouteLedger();
         releasePrefillRouteScratch();
@@ -1128,6 +1184,31 @@ namespace llaminar2
         return device_overlay_service_samples_
                    ? device_overlay_service_samples_ + layer_idx
                    : nullptr;
+    }
+
+    bool DeviceMoERuntimeTable::
+        collectsDeviceOverlayServiceTelemetryForLayer(
+            int layer_idx) const noexcept
+    {
+        if (layer_idx < 0 || layer_idx >= num_layers_)
+            return false;
+        if (overlay_placement_source_)
+        {
+            return overlay_placement_source_
+                ->collectsDeviceOverlayServiceTelemetryForLayer(layer_idx);
+        }
+        switch (overlay_service_telemetry_coverage_)
+        {
+        case MoEOverlayServiceTelemetryCoverage::Disabled:
+            return false;
+        case MoEOverlayServiceTelemetryCoverage::AllRuntimeLayers:
+            return true;
+        case MoEOverlayServiceTelemetryCoverage::CatalogStratifiedSample:
+            return overlay_service_telemetry_catalog_ &&
+                   overlay_service_telemetry_catalog_
+                       ->isServiceTelemetryLayer(layer_idx);
+        }
+        return false;
     }
 
     DeviceMoELayerRuntime &DeviceMoERuntimeTable::hostLayerState(int layer_idx)
@@ -1359,6 +1440,60 @@ namespace llaminar2
         decode_histogram_producer_stream_ = stream;
     }
 
+    void DeviceMoERuntimeTable::transitionDecodeHistogramProducerCapture(
+        void *stream,
+        RuntimeHistogramProducerCaptureTransition transition)
+    {
+        if (mirror_to_device_ && !stream)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] mirrored histogram capture transition requires an exact stream");
+        }
+
+        std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        if (runtime_histogram_producer_lifecycle_ !=
+            RuntimeHistogramProducerLifecycle::CollectingProducers)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] histogram capture transition occurred after producer retirement");
+        }
+        if (!mirror_to_device_ || !runtime_histogram_drain_enabled_)
+            return;
+
+        const auto producer = std::find_if(
+            runtime_histogram_producer_streams_.begin(),
+            runtime_histogram_producer_streams_.end(),
+            [stream](const RuntimeHistogramProducerStream &candidate)
+            { return candidate.stream == stream; });
+        if (producer == runtime_histogram_producer_streams_.end())
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] native capture began on a histogram producer that was not admitted before beginCapture");
+        }
+
+        switch (transition)
+        {
+        case RuntimeHistogramProducerCaptureTransition::Entering:
+            if (producer->active_capture_references ==
+                std::numeric_limits<uint32_t>::max())
+            {
+                throw std::overflow_error(
+                    "[MoERuntimeTable] histogram producer capture reference count overflowed");
+            }
+            ++producer->active_capture_references;
+            break;
+        case RuntimeHistogramProducerCaptureTransition::Completed:
+        case RuntimeHistogramProducerCaptureTransition::Aborted:
+            if (producer->active_capture_references == 0u)
+            {
+                throw std::logic_error(
+                    "[MoERuntimeTable] histogram producer received a terminal capture edge without Entering");
+            }
+            --producer->active_capture_references;
+            break;
+        }
+    }
+
     void DeviceMoERuntimeTable::recordDecodeHistogramProducerStream(void *stream)
     {
         if (mirror_to_device_ && !stream)
@@ -1415,6 +1550,19 @@ namespace llaminar2
                 "[MoERuntimeTable] asynchronous histogram drain must own at least one production phase");
         }
 
+        const auto grouped_verifier_source = static_cast<std::size_t>(
+            moe_runtime_abi::HistogramSource::GroupedVerifier);
+        const bool drains_grouped_verifier =
+            sources[grouped_verifier_source];
+        const bool publishes_grouped_verifier =
+            grouped_verifier_histogram_publication_ ==
+            GroupedVerifierHistogramPublicationMode::AcceptedRows;
+        if (drains_grouped_verifier != publishes_grouped_verifier)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] asynchronous grouped-verifier drain ownership must match the table's typed publication policy");
+        }
+
         std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
         if (runtime_histogram_producer_lifecycle_ !=
             RuntimeHistogramProducerLifecycle::CollectingProducers)
@@ -1454,7 +1602,7 @@ namespace llaminar2
         }
         catch (...)
         {
-            releaseRuntimeHistogramDrainResources();
+            releaseRuntimeHistogramResources();
             runtime_histogram_sources_ = {};
             throw;
         }
@@ -1486,6 +1634,15 @@ namespace llaminar2
                        ? RuntimeExpertHistogramDrainResult::ready()
                        : RuntimeExpertHistogramDrainResult::failed(
                              "CPU runtime histogram merge failed");
+        }
+
+        if (hasActiveRuntimeHistogramProducerCaptureLocked())
+        {
+            /* Do not even query a previously submitted completion event while
+             * the producer stream is in native capture. The graph owner has
+             * exclusive backend use of that stream until its terminal edge;
+             * maintenance remains a pure host-side Pending observation. */
+            return RuntimeExpertHistogramDrainResult::pending();
         }
 
         IBackend *backend = mirrorBackend(
@@ -1530,7 +1687,6 @@ namespace llaminar2
             return RuntimeExpertHistogramDrainResult::failed(
                 "Runtime histogram drain began before any exact producer stream was registered");
         }
-
         runtime_histogram_producer_topology_ =
             RuntimeHistogramProducerTopology::Sealed;
         const uint32_t frozen_bank = runtime_histogram_active_bank_host_;
@@ -1626,7 +1782,8 @@ namespace llaminar2
             return true;
         if (runtime_histogram_drain_in_flight_ ||
             runtime_histogram_producer_streams_.empty() ||
-            !host_runtime_histogram_writer_states_)
+            !host_runtime_histogram_writer_states_ ||
+            hasActiveRuntimeHistogramProducerCaptureLocked())
         {
             return false;
         }
@@ -1829,7 +1986,7 @@ namespace llaminar2
                 selected_slots += phase_selected_slots;
                 local_slots += phase_local_slots;
 
-                if (PerfStatsCollector::isEnabled())
+                if (PerfStatsCollector::isDomainEnabled("moe_rebalance"))
                 {
                     const auto &state =
                         host_layers_[static_cast<size_t>(layer_idx)];
@@ -1857,7 +2014,7 @@ namespace llaminar2
                 }
             }
 
-            if (PerfStatsCollector::isEnabled())
+            if (PerfStatsCollector::isDomainEnabled("moe_rebalance"))
             {
                 const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
                 const PerfStatsCollector::Tags tags{
@@ -3500,7 +3657,8 @@ namespace llaminar2
 
     void DeviceMoERuntimeTable::allocateOverlayServiceTelemetry()
     {
-        if (!collect_overlay_service_telemetry_ ||
+        if (overlay_service_telemetry_coverage_ ==
+                MoEOverlayServiceTelemetryCoverage::Disabled ||
             overlay_placement_source_ ||
             device_overlay_service_telemetry_)
         {
@@ -3611,6 +3769,29 @@ namespace llaminar2
         device_overlay_service_samples_ = nullptr;
     }
 
+    void DeviceMoERuntimeTable::allocateGroupedVerifierHistogramPublicationStream()
+    {
+        if (!mirror_to_device_ ||
+            grouped_verifier_histogram_publication_ !=
+                GroupedVerifierHistogramPublicationMode::AcceptedRows ||
+            grouped_verifier_histogram_publication_stream_)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] grouped-verifier publication stream has an invalid setup lifecycle");
+        }
+
+        IBackend *backend = mirrorBackend(
+            device_id_,
+            "[MoERuntimeTable] grouped-verifier publication setup");
+        grouped_verifier_histogram_publication_stream_ =
+            backend->createStream(device_id_.toKernelDeviceIndex());
+        if (!grouped_verifier_histogram_publication_stream_)
+        {
+            throw std::runtime_error(
+                "[MoERuntimeTable] backend failed to allocate the model-lifetime grouped-verifier publication stream");
+        }
+    }
+
     void DeviceMoERuntimeTable::allocateRuntimeHistogramDrainResources()
     {
         if (!mirror_to_device_ ||
@@ -3619,7 +3800,6 @@ namespace llaminar2
             host_runtime_histogram_snapshot_ ||
             host_runtime_histogram_writer_states_ ||
             runtime_histogram_maintenance_stream_ ||
-            grouped_verifier_histogram_publication_stream_ ||
             runtime_histogram_initialization_event_ ||
             runtime_histogram_writer_state_published_event_ ||
             runtime_histogram_drain_complete_event_)
@@ -3662,14 +3842,8 @@ namespace llaminar2
                     backend->allocatePinned(4u * sizeof(uint32_t), ordinal));
             runtime_histogram_maintenance_stream_ =
                 backend->createStream(ordinal);
-            const auto grouped_verifier_source =
-                static_cast<std::size_t>(
-                    moe_runtime_abi::HistogramSource::GroupedVerifier);
-            if (runtime_histogram_sources_[grouped_verifier_source])
-            {
-                grouped_verifier_histogram_publication_stream_ =
-                    backend->createStream(ordinal);
-            }
+            const auto grouped_verifier_source = static_cast<std::size_t>(
+                moe_runtime_abi::HistogramSource::GroupedVerifier);
             runtime_histogram_initialization_event_ =
                 backend->createEvent(ordinal);
             runtime_histogram_writer_state_published_event_ =
@@ -3719,11 +3893,13 @@ namespace llaminar2
                     "[MoERuntimeTable] failed to initialize persistent asynchronous histogram resources");
             }
 
-            /* Accepted-state publication is the one histogram-writing graph
-             * family whose first materialization legitimately occurs after a
-             * verifier has produced an outcome. Admit its table-owned stream
-             * now, before the first maintenance poll can seal the producer
-             * topology. Every later graph identity borrows this exact stream. */
+            /* Accepted-state publication can acquire a new capture identity
+             * after maintenance has started because its verifier bindings are
+             * depth/policy specific. Admit its sole table-owned stream now,
+             * before the first poll can seal producer topology. The graph
+             * owner's typed capture-activity edge then makes every such later
+             * materialization mutually exclusive with maintenance submission;
+             * replay merely borrows the already-proven stream identity. */
             if (grouped_verifier_histogram_publication_stream_)
             {
                 registerRuntimeHistogramProducerStreamLocked(
@@ -3773,7 +3949,7 @@ namespace llaminar2
         }
         catch (...)
         {
-            releaseRuntimeHistogramDrainResources();
+            releaseRuntimeHistogramResources();
             throw;
         }
     }
@@ -3846,6 +4022,16 @@ namespace llaminar2
             { return producer.stream == stream; });
     }
 
+    bool DeviceMoERuntimeTable::
+        hasActiveRuntimeHistogramProducerCaptureLocked() const noexcept
+    {
+        return std::any_of(
+            runtime_histogram_producer_streams_.begin(),
+            runtime_histogram_producer_streams_.end(),
+            [](const RuntimeHistogramProducerStream &producer)
+            { return producer.active_capture_references != 0u; });
+    }
+
     bool DeviceMoERuntimeTable::publishRuntimeHistogramWriterStateLocked(
         uint32_t writer_state,
         std::string &failure)
@@ -3855,6 +4041,12 @@ namespace llaminar2
         {
             failure =
                 "Runtime histogram writer-state publication received an invalid encoded state";
+            return false;
+        }
+        if (hasActiveRuntimeHistogramProducerCaptureLocked())
+        {
+            failure =
+                "Runtime histogram writer-state publication overlapped native producer capture";
             return false;
         }
         if (runtime_histogram_producer_streams_.empty() ||
@@ -3983,6 +4175,13 @@ namespace llaminar2
                 device_id_,
                 "[MoERuntimeTable] runtime histogram producer retirement");
 
+            if (hasActiveRuntimeHistogramProducerCaptureLocked())
+            {
+                throw std::logic_error(
+                    "[MoERuntimeTable] histogram producer retirement overlapped native graph capture on " +
+                    device_id_.to_string());
+            }
+
             /* No graph submission may begin after this terminal transition.
              * Recording each producer's model-lifetime arrival event closes
              * its exact queue without guessing a replacement stream. The one
@@ -4042,7 +4241,7 @@ namespace llaminar2
             RuntimeHistogramProducerLifecycle::ProducersRetired;
     }
 
-    void DeviceMoERuntimeTable::releaseRuntimeHistogramDrainResources() noexcept
+    void DeviceMoERuntimeTable::releaseRuntimeHistogramResources() noexcept
     {
         if (runtime_histogram_producer_lifecycle_ ==
             RuntimeHistogramProducerLifecycle::ResourcesReleased)
@@ -4218,7 +4417,7 @@ namespace llaminar2
                         ExpertHistogramSource::DecodeToken,
                     sources[source]);
 
-                if (PerfStatsCollector::isEnabled())
+                if (PerfStatsCollector::isDomainEnabled("moe_rebalance"))
                 {
                     const uint64_t selected_slots = std::accumulate(
                         bank.selected[source],

@@ -11,6 +11,7 @@
 #pragma once
 
 #include "MappedTransferProgressABI.h"
+#include "TransferEngine.h"
 #include "backends/DeviceId.h"
 #include <atomic>
 #include <cstddef>
@@ -153,10 +154,12 @@ namespace llaminar2
      * Construction allocates the complete command directory plus a bounded
      * execution-lane pool. Maintenance publishes fixed commands and invokes
      * @ref submitOutstandingProgress; the exact GPU worker then queries prior
-     * lane events and assigns queued commands to free lanes. Keeping topology
-     * identity separate from physical submission concurrency prevents a large
-     * heterogeneous edge/projection BOM from materializing thousands of GPU
-     * streams and events while preserving every permanent command lease.
+     * lane events and assigns queued commands to free lanes. Execution lanes
+     * retain independent commands and terminal events, while a smaller typed
+     * stream pool can serve compatible lanes. Keeping all three identities
+     * separate prevents a large heterogeneous edge/projection BOM from
+     * materializing thousands of GPU runtime queues while preserving every
+     * permanent command lease and asynchronously enqueuing each admitted move.
      */
     class MappedTransferProgressEpoch final
         : public std::enable_shared_from_this<
@@ -176,6 +179,16 @@ namespace llaminar2
              * It must be positive and no larger than @ref slot_capacity.
              */
             std::size_t execution_lane_capacity = 0u;
+            /**
+             * Exact setup-owned GPU streams shared by compatible lanes.
+             *
+             * The pool must be non-empty, contain only @ref device, and be no
+             * wider than @ref execution_lane_capacity. Every execution lane
+             * still owns a distinct completion event; sharing only the stream
+             * lets one progress pass enqueue all lanes without a host wait or
+             * a driver queue per model layer.
+             */
+            std::vector<PersistentTransferExecutionLane> execution_streams;
             std::size_t maximum_bytes = 0u;
             std::string name;
             std::string perf_device;
@@ -266,10 +279,16 @@ namespace llaminar2
             return config_.slot_capacity;
         }
 
-        /** @return Immutable number of materialized stream/event lane pairs. */
+        /** @return Immutable number of independently tracked event lanes. */
         [[nodiscard]] std::size_t executionLaneCapacity() const noexcept
         {
             return execution_lanes_.size();
+        }
+
+        /** @return Immutable number of setup-owned physical GPU streams. */
+        [[nodiscard]] std::size_t executionStreamCapacity() const noexcept
+        {
+            return config_.execution_streams.size();
         }
 
         /** @return Immutable positive payload limit for each slot. */
@@ -295,7 +314,7 @@ namespace llaminar2
         /** Store validated identity before the factory performs GPU setup. */
         explicit MappedTransferProgressEpoch(Config config);
 
-        /** Allocate command arrays plus the bounded stream/event execution pool. */
+        /** Allocate command arrays/events and bind the typed stream pool. */
         void materialize();
 
         /** Publish one direction-checked command for a validated permanent slot. */
@@ -349,7 +368,7 @@ namespace llaminar2
             SlotLifecycle lifecycle = SlotLifecycle::Unreserved;
         };
 
-        /** Worker-owned stream/event pair leased by at most one command. */
+        /** Worker-owned event lane bound to one shared exact stream. */
         struct ExecutionLaneRuntime
         {
             void *stream = nullptr;

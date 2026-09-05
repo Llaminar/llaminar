@@ -40,7 +40,7 @@ static const BufferDescriptor *findBuf(
  * mirrored LocalTP lanes need the descriptor for one declarative schema, but a
  * 1x1 placeholder prevents them from wasting a full-vocabulary arena region.
  */
-static void configureNoGlobalTPMTPGather(GraphResolverConfig &config)
+static void configureMTPBufferGeometry(GraphResolverConfig &config)
 {
     if (!config.custom_formulas.contains("mtp_target_query_rows"))
         config.custom_formulas["mtp_target_query_rows"] = 4;
@@ -50,6 +50,37 @@ static void configureNoGlobalTPMTPGather(GraphResolverConfig &config)
             static_cast<size_t>(std::max(1, config.seq_len)),
             config.custom_formulas["mtp_target_query_rows"]);
     }
+    if (!config.custom_formulas.contains("mtp_q_dim"))
+    {
+        config.custom_formulas["mtp_q_dim"] =
+            static_cast<size_t>(config.local_n_heads) *
+            static_cast<size_t>(config.head_dim);
+    }
+    if (!config.custom_formulas.contains("mtp_kv_dim"))
+    {
+        config.custom_formulas["mtp_kv_dim"] =
+            static_cast<size_t>(config.local_n_kv_heads) *
+            static_cast<size_t>(config.head_dim);
+    }
+    if (!config.custom_formulas.contains("mtp_d_ff"))
+        config.custom_formulas["mtp_d_ff"] = static_cast<size_t>(config.local_d_ff);
+    if (!config.custom_formulas.contains("mtp_fa_q_full_dim"))
+        config.custom_formulas["mtp_fa_q_full_dim"] = 2 * config.custom_formulas["mtp_q_dim"];
+    if (!config.custom_formulas.contains("mtp_attn_output_dim"))
+    {
+        config.custom_formulas["mtp_attn_output_dim"] =
+            std::max(
+                config.custom_formulas["mtp_q_dim"],
+                config.custom_formulas.contains("attn_output_dim")
+                    ? config.custom_formulas["attn_output_dim"]
+                    : config.custom_formulas["mtp_q_dim"]);
+    }
+}
+
+/** @brief Add the 1x1 gathered-logits placeholder for non-GlobalTP fixtures. */
+static void configureNoGlobalTPMTPGather(GraphResolverConfig &config)
+{
+    configureMTPBufferGeometry(config);
     config.custom_formulas["mtp_global_gather_rows"] = 1;
     config.custom_formulas["mtp_global_gather_vocab"] = 1;
 }
@@ -524,6 +555,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_CPUGlobalTP2)
     config.custom_formulas["mtp_kv_prefill_rows"] = 4096;
     config.custom_formulas["mtp_global_gather_rows"] = 4;
     config.custom_formulas["mtp_global_gather_vocab"] = 248320;
+    configureMTPBufferGeometry(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 

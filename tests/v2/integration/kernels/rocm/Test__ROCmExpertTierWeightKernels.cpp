@@ -18,6 +18,9 @@
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
 #include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
@@ -527,6 +530,202 @@ namespace llaminar2
         };
 
         /**
+         * @test TransferEngine exposes exactly the requested reusable HIP queues.
+         *
+         * The checked stream pointers are authoritative; PerfStats only makes
+         * the production selection observable to a campaign artifact.
+         */
+        TEST_F(
+            ROCmExpertTierWeightKernelsTest,
+            PersistentTransferExecutionPoolIsBoundedAndIdempotent)
+        {
+            constexpr std::size_t lane_count = 4u;
+            const DeviceId device = DeviceId::rocm(0);
+            const std::string pool_name =
+                "rocm_expert_tier_execution_pool_contract";
+
+            const auto first = TransferEngine::instance()
+                                   .allocatePersistentTransferExecutionLanes(
+                                       lane_count,
+                                       device,
+                                       pool_name);
+            ASSERT_EQ(first.size(), lane_count);
+            for (std::size_t lane = 0u; lane < first.size(); ++lane)
+            {
+                EXPECT_TRUE(first[lane].valid());
+                EXPECT_EQ(first[lane].device(), device);
+                EXPECT_EQ(first[lane].laneIndex(), lane);
+                EXPECT_NE(first[lane].stream(), nullptr);
+                for (std::size_t other = lane + 1u;
+                     other < first.size();
+                     ++other)
+                {
+                    EXPECT_NE(first[lane].stream(), first[other].stream());
+                }
+            }
+
+            const auto reused = TransferEngine::instance()
+                                    .allocatePersistentTransferExecutionLanes(
+                                        lane_count,
+                                        device,
+                                        pool_name);
+            ASSERT_EQ(reused.size(), lane_count);
+            for (std::size_t lane = 0u; lane < reused.size(); ++lane)
+            {
+                EXPECT_TRUE(reused[lane].valid());
+                EXPECT_EQ(reused[lane].laneIndex(), lane);
+                EXPECT_EQ(reused[lane].stream(), first[lane].stream());
+            }
+        }
+
+        /**
+         * @test Independent HIP lane events remain correct on one pooled stream.
+         *
+         * Concurrent host submissions share one exact background queue while
+         * retaining disjoint staging and completion state. Interleaved polling
+         * must preserve every byte without a blocking synchronization.
+         */
+        TEST_F(
+            ROCmExpertTierWeightKernelsTest,
+            SharedPersistentExecutionLanePreservesConcurrentTransfersByteExactly)
+        {
+            constexpr std::size_t bytes = 1u << 20u;
+            constexpr std::size_t staging_bytes = 4096u;
+            constexpr int n = 1;
+            constexpr int k =
+                static_cast<int>(bytes / sizeof(std::uint16_t));
+            const DeviceId device = DeviceId::rocm(0);
+
+            const auto staging = TransferEngine::instance()
+                                     .allocatePersistentTransferStagingSlices(
+                                         staging_bytes,
+                                         2u,
+                                         device);
+            const auto execution = TransferEngine::instance()
+                                       .allocatePersistentTransferExecutionLanes(
+                                           1u,
+                                           device,
+                                           "rocm_shared_execution_race_contract")
+                                       .front();
+            ExpertTierWeightTransferLane first({
+                .device = device,
+                .staging = staging[0],
+                .execution = execution,
+                .lane_name = "rocm_shared_execution_first",
+                .perf_device = "rocm:0",
+            });
+            ExpertTierWeightTransferLane second({
+                .device = device,
+                .staging = staging[1],
+                .execution = execution,
+                .lane_name = "rocm_shared_execution_second",
+                .perf_device = "rocm:0",
+            });
+            std::string setup_error;
+            ASSERT_TRUE(first.materialize(&setup_error)) << setup_error;
+            ASSERT_TRUE(second.materialize(&setup_error)) << setup_error;
+
+            std::array<std::vector<std::uint8_t>, 2> source{
+                std::vector<std::uint8_t>(bytes),
+                std::vector<std::uint8_t>(bytes),
+            };
+            for (std::size_t byte = 0u; byte < bytes; ++byte)
+            {
+                source[0][byte] = static_cast<std::uint8_t>(
+                    (byte * 29u + 7u) & 0xffu);
+                source[1][byte] = static_cast<std::uint8_t>(
+                    (byte * 131u + 19u) & 0xffu);
+            }
+            TestHIPBuffer<std::uint8_t> first_destination(bytes);
+            TestHIPBuffer<std::uint8_t> second_destination(bytes);
+            const std::array<ContiguousFloatingPointWeightDescriptor, 2>
+                destinations{
+                    ContiguousFloatingPointWeightDescriptor{
+                        .data = first_destination.data(),
+                        .type = TensorType::FP16,
+                        .n = n,
+                        .k = k,
+                        .bytes = bytes,
+                    },
+                    ContiguousFloatingPointWeightDescriptor{
+                        .data = second_destination.data(),
+                        .type = TensorType::BF16,
+                        .n = n,
+                        .k = k,
+                        .bytes = bytes,
+                    },
+                };
+            ASSERT_TRUE(destinations[0].valid());
+            ASSERT_TRUE(destinations[1].valid());
+
+            std::array<ExpertTierWeightTransferLane *, 2> lanes{
+                &first,
+                &second,
+            };
+            std::array<bool, 2> started{false, false};
+            std::array<std::string, 2> errors;
+            std::thread first_submitter(
+                [&]
+                {
+                    started[0] = lanes[0]->startCpuToGpuContiguous(
+                        source[0], destinations[0], &errors[0]);
+                });
+            std::thread second_submitter(
+                [&]
+                {
+                    started[1] = lanes[1]->startCpuToGpuContiguous(
+                        source[1], destinations[1], &errors[1]);
+                });
+            first_submitter.join();
+            second_submitter.join();
+            ASSERT_TRUE(started[0]) << errors[0];
+            ASSERT_TRUE(started[1]) << errors[1];
+
+            std::array<ExpertTierWeightTransferProgress, 2> progress{
+                lanes[0]->progress(),
+                lanes[1]->progress(),
+            };
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while ((progress[0] == ExpertTierWeightTransferProgress::Pending ||
+                    progress[1] == ExpertTierWeightTransferProgress::Pending) &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                for (std::size_t lane = 0u; lane < lanes.size(); ++lane)
+                {
+                    if (progress[lane] ==
+                        ExpertTierWeightTransferProgress::Pending)
+                    {
+                        progress[lane] = lanes[lane]->poll(&errors[lane]);
+                    }
+                }
+                std::this_thread::yield();
+            }
+            ASSERT_EQ(progress[0], ExpertTierWeightTransferProgress::Ready)
+                << errors[0];
+            ASSERT_EQ(progress[1], ExpertTierWeightTransferProgress::Ready)
+                << errors[1];
+
+            std::vector<std::uint8_t> first_observed;
+            std::vector<std::uint8_t> second_observed;
+            ASSERT_EQ(
+                first_destination.download(first_observed), hipSuccess);
+            ASSERT_EQ(
+                second_destination.download(second_observed), hipSuccess);
+            EXPECT_EQ(first_observed, source[0]);
+            EXPECT_EQ(second_observed, source[1]);
+            for (const auto *lane : lanes)
+            {
+                const auto stats = lane->stats();
+                EXPECT_EQ(stats.transfers_started, 1u);
+                EXPECT_EQ(stats.transfers_completed, 1u);
+                EXPECT_GT(stats.chunks_submitted, 1u);
+                EXPECT_EQ(stats.inference_stream_waits, 0u);
+                EXPECT_EQ(stats.blocking_synchronizations, 0u);
+            }
+        }
+
+        /**
          * @test All 21 real source formats are byte exact in both directions.
          */
         TEST_F(
@@ -840,7 +1039,18 @@ namespace llaminar2
 
             ExpertTierWeightTransferLane lane({
                 .device = DeviceId::rocm(0),
-                .staging_capacity_bytes = demotion_layout.chunkBytes(2),
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   demotion_layout.chunkBytes(2),
+                                   1u,
+                                   DeviceId::rocm(0))
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     DeviceId::rocm(0),
+                                     "rocm_tier_round_trip")
+                                 .front(),
                 .lane_name = "rocm_tier_round_trip",
                 .perf_device = "rocm:0",
             });
@@ -929,6 +1139,163 @@ namespace llaminar2
         }
 
         /**
+         * @test Qwen-122B Q8_0 projections are byte-exact on CPU and ROCm.
+         *
+         * Tier movement changes the physical executor without changing the
+         * logical expert.  Exercise the production gate/up and down geometries
+         * with one shared Q8 activation publication and require every FP32
+         * output word to match.  Transfer-only and backend-local tests cannot
+         * detect a disagreement in the cross-backend reduction tree.
+         */
+        TEST_F(
+            ROCmExpertTierWeightKernelsTest,
+            Q80ProductionProjectionCPUAndROCmAreByteExact)
+        {
+            const auto &format = test::quantizedVerifierFormat("Q8_0");
+            constexpr std::array<std::pair<int, int>, 2> geometries{{
+                {3072, 1024},
+                {1024, 3072},
+            }};
+
+            ScopedROCmDecodeEquivalentM1 decode_equivalent_scope;
+            for (std::size_t geometry_index = 0;
+                 geometry_index < geometries.size();
+                 ++geometry_index)
+            {
+                const auto [N, K] = geometries[geometry_index];
+                SCOPED_TRACE(
+                    "N=" + std::to_string(N) + " K=" +
+                    std::to_string(K));
+                auto tensor = format.create(
+                    {static_cast<std::size_t>(N),
+                     static_cast<std::size_t>(K)},
+                    static_cast<std::uint32_t>(0x122b000u + geometry_index));
+                ASSERT_NE(tensor, nullptr);
+
+                cpu::native_vnni::CPUNativeVNNIGemmKernel cpu_kernel(
+                    tensor.get(),
+                    0,
+                    -1,
+                    CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                ASSERT_TRUE(cpu_kernel.isValid());
+                const auto &cpu_packed = cpu_kernel.packedWeights();
+                const HostGpuExpertPackedProjection gpu_packed =
+                    packProductionGpuProjection(*tensor);
+                ASSERT_EQ(gpu_packed.source_codebook_id, 19u);
+                ASSERT_EQ(gpu_packed.codebook_id, 19u);
+
+                std::vector<float> input(static_cast<std::size_t>(K));
+                for (std::size_t index = 0; index < input.size(); ++index)
+                {
+                    const int centered = static_cast<int>(
+                        (index * 73u + index / 7u +
+                         geometry_index * 29u) % 509u) - 254;
+                    input[index] =
+                        static_cast<float>(centered) * 0.00390625f +
+                        static_cast<float>(
+                            static_cast<int>(index % 11u) - 5) *
+                            0.000013f;
+                }
+
+                const int blocks_per_row = K / 32;
+                std::vector<Q8_1Block> activation_blocks(
+                    static_cast<std::size_t>(blocks_per_row));
+                std::vector<std::int8_t> activation_q8(
+                    static_cast<std::size_t>(K));
+                std::vector<float> activation_scales(
+                    static_cast<std::size_t>(blocks_per_row));
+                for (int block = 0; block < blocks_per_row; ++block)
+                {
+                    auto &published = activation_blocks[
+                        static_cast<std::size_t>(block)];
+                    cpu::gpu_aligned_expert_q8::quantizeBlock(
+                        input.data() + static_cast<std::size_t>(block) * 32u,
+                        published);
+                    std::memcpy(
+                        activation_q8.data() +
+                            static_cast<std::size_t>(block) * 32u,
+                        published.qs,
+                        32u);
+                    activation_scales[static_cast<std::size_t>(block)] =
+                        cpu::native_vnni::nativeVNNIFP16ScaleToFP32(
+                            published.d);
+                }
+
+                std::vector<float> cpu_output(
+                    static_cast<std::size_t>(N), 0.0f);
+                cpu::native_vnni::gemv_native_vnni_preq(
+                    cpu_packed,
+                    activation_blocks.data(),
+                    cpu_output.data(),
+                    cpu::native_vnni::ISAPath::AUTO);
+
+                TestHIPBuffer<std::uint8_t> payload(
+                    gpu_packed.payload.size());
+                TestHIPBuffer<std::uint16_t> scales(
+                    gpu_packed.scales.size());
+                TestHIPBuffer<std::int8_t> device_activation(
+                    activation_q8.size());
+                TestHIPBuffer<float> device_activation_scales(
+                    activation_scales.size());
+                TestHIPBuffer<float> device_output(
+                    static_cast<std::size_t>(N));
+                TestHIPBuffer<float> partials(
+                    static_cast<std::size_t>(
+                        NativeVNNIGroupedDecodePolicy::maximum_k_partitions) *
+                    static_cast<std::size_t>(N));
+                ASSERT_EQ(payload.upload(gpu_packed.payload), hipSuccess);
+                ASSERT_EQ(scales.upload(gpu_packed.scales), hipSuccess);
+                ASSERT_EQ(device_activation.upload(activation_q8), hipSuccess);
+                ASSERT_EQ(
+                    device_activation_scales.upload(activation_scales),
+                    hipSuccess);
+
+                TestHIPStream stream;
+                ASSERT_TRUE(rocmGemv_native_vnni_fp32_with_policy(
+                    device_activation.data(),
+                    payload.data(),
+                    scales.data(),
+                    nullptr,
+                    nullptr,
+                    device_output.data(),
+                    nullptr,
+                    partials.data(),
+                    N,
+                    K,
+                    gpu_packed.codebook_id,
+                    gpu_packed.source_codebook_id,
+                    0,
+                    stream.opaque(),
+                    device_activation_scales.data()));
+                ASSERT_EQ(stream.synchronize(), hipSuccess);
+
+                std::vector<float> rocm_output;
+                ASSERT_EQ(device_output.download(rocm_output), hipSuccess);
+                ASSERT_EQ(rocm_output.size(), cpu_output.size());
+                if (std::memcmp(
+                        rocm_output.data(),
+                        cpu_output.data(),
+                        cpu_output.size() * sizeof(float)) != 0)
+                {
+                    std::size_t first = 0;
+                    while (first < cpu_output.size() &&
+                           std::memcmp(
+                               &rocm_output[first],
+                               &cpu_output[first],
+                               sizeof(float)) == 0)
+                    {
+                        ++first;
+                    }
+                    ASSERT_LT(first, cpu_output.size());
+                    ADD_FAILURE()
+                        << "Cross-backend Q8_0 projection differs at column "
+                        << first << " CPU=" << cpu_output[first]
+                        << " ROCm=" << rocm_output[first];
+                }
+            }
+        }
+
+        /**
          * @test A shared maintenance thread restores the lane's exact ROCm device.
          *
          * The source arrays and auxiliary stream belong to device one, while
@@ -1002,8 +1369,18 @@ namespace llaminar2
             auto lane = std::make_shared<MoEOverlayGpuRemoteProjectionLane>(
                 MoEOverlayGpuRemoteProjectionLane::Config{
                     .device = DeviceId::rocm(device_ordinal),
-                    .staging_capacity_bytes =
-                        layout.chunkBytes(units_per_chunk),
+                    .staging = TransferEngine::instance()
+                                   .allocatePersistentTransferStagingSlices(
+                                       layout.chunkBytes(units_per_chunk),
+                                       1u,
+                                       DeviceId::rocm(device_ordinal))
+                                   .front(),
+                    .execution = TransferEngine::instance()
+                                     .allocatePersistentTransferExecutionLanes(
+                                         1u,
+                                         DeviceId::rocm(device_ordinal),
+                                         "rocm_secondary_device_remote_projection")
+                                     .front(),
                     .lane_name = "rocm_secondary_device_remote_projection",
                     .perf_device = "rocm:1",
                 });
@@ -1086,7 +1463,18 @@ namespace llaminar2
             ASSERT_NE(backend, nullptr);
             ExpertTierWeightTransferLane lane({
                 .device = DeviceId::rocm(0),
-                .staging_capacity_bytes = staging_bytes,
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   staging_bytes,
+                                   1u,
+                                   DeviceId::rocm(0))
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     DeviceId::rocm(0),
+                                     "rocm_floating_tier_round_trip")
+                                 .front(),
                 .lane_name = "rocm_floating_tier_round_trip",
                 .perf_device = "rocm:0",
             });
@@ -1288,8 +1676,18 @@ namespace llaminar2
                 MoEOverlayGpuRemoteProjectionLane>(
                 MoEOverlayGpuRemoteProjectionLane::Config{
                     .device = DeviceId::rocm(0),
-                    .staging_capacity_bytes =
-                        promotion_manifest.maximum_chunk_bytes,
+                    .staging = TransferEngine::instance()
+                                   .allocatePersistentTransferStagingSlices(
+                                       promotion_manifest.maximum_chunk_bytes,
+                                       1u,
+                                       DeviceId::rocm(0))
+                                   .front(),
+                    .execution = TransferEngine::instance()
+                                     .allocatePersistentTransferExecutionLanes(
+                                         1u,
+                                         DeviceId::rocm(0),
+                                         "rocm_remote_q51_roundtrip")
+                                     .front(),
                     .lane_name = "rocm_remote_q51_roundtrip",
                     .perf_device = "rocm:0",
                 });
@@ -1544,7 +1942,18 @@ namespace llaminar2
             std::string error;
             ExpertTierWeightTransferLane lane({
                 .device = DeviceId::rocm(0),
-                .staging_capacity_bytes = layout.chunkBytes(1),
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   layout.chunkBytes(1),
+                                   1u,
+                                   DeviceId::rocm(0))
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     DeviceId::rocm(0),
+                                     "rocm_asymmetric_promotion_execution")
+                                 .front(),
                 .lane_name = "rocm_asymmetric_promotion_execution",
                 .perf_device = "rocm:0",
             });
@@ -1646,20 +2055,36 @@ namespace llaminar2
 
             constexpr std::size_t activation_elements =
                 static_cast<std::size_t>(prefill_rows) * K;
+            constexpr std::size_t activation_blocks_per_row =
+                static_cast<std::size_t>(K) / 32u;
+            constexpr std::size_t activation_block_elements =
+                static_cast<std::size_t>(prefill_rows) *
+                activation_blocks_per_row;
             std::vector<std::int8_t> host_activation(activation_elements);
             for (std::size_t index = 0; index < activation_elements; ++index)
             {
                 host_activation[index] = static_cast<std::int8_t>(
                     static_cast<int>((index * 11u + 3u) % 29u) - 14);
             }
-            std::vector<float> host_activation_scales(prefill_rows);
+            std::vector<float> host_activation_scales(
+                activation_block_elements);
             for (int row = 0; row < prefill_rows; ++row)
             {
-                host_activation_scales[static_cast<std::size_t>(row)] =
-                    0.03137f + static_cast<float>(row) * 0.00019f;
+                for (std::size_t block = 0;
+                     block < activation_blocks_per_row;
+                     ++block)
+                {
+                    host_activation_scales[
+                        static_cast<std::size_t>(row) *
+                            activation_blocks_per_row +
+                        block] =
+                        0.03137f + static_cast<float>(row) * 0.00019f +
+                        static_cast<float>(block) * 0.000003f;
+                }
             }
             TestHIPBuffer<std::int8_t> activation(activation_elements);
-            TestHIPBuffer<float> activation_scales(prefill_rows);
+            TestHIPBuffer<float> activation_scales(
+                activation_block_elements);
             ASSERT_EQ(activation.upload(host_activation), hipSuccess);
             ASSERT_EQ(
                 activation_scales.upload(host_activation_scales),
@@ -1942,7 +2367,18 @@ namespace llaminar2
 
             ExpertTierWeightTransferLane lane({
                 .device = DeviceId::rocm(0),
-                .staging_capacity_bytes = layout.chunkBytes(1),
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   layout.chunkBytes(1),
+                                   1u,
+                                   DeviceId::rocm(0))
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     DeviceId::rocm(0),
+                                     "rocm_inference_overlap")
+                                 .front(),
                 .lane_name = "rocm_inference_overlap",
                 .perf_device = "rocm:0",
             });

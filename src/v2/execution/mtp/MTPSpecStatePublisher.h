@@ -2,11 +2,11 @@
  * @file MTPSpecStatePublisher.h
  * @brief Verifier-state publication helpers for MTP speculative decode.
  *
- * These helpers move accepted verifier-row state into live model state after a
- * speculative verifier pass.  Host-plan overloads exist for CPU and legacy
- * transaction tests.  GPU resident publication should use the device-indexed
- * request-shape overloads so accepted rows remain device-owned all the way into
- * stage restore hooks.
+ * These helpers move accepted verifier-row state directly into each live state
+ * owner after a speculative verifier pass. Host-plan overloads exist for CPU
+ * and transaction tests. GPU resident publication uses device-indexed request
+ * shapes so accepted rows remain device-owned through the exact stage restore
+ * hook; there is no secondary derived-state publication lifecycle.
  */
 
 #pragma once
@@ -30,7 +30,6 @@ namespace llaminar2
         int request_id = -1;
         int accepted_count = 0;
         int restored_stage_count = 0;
-        int post_restore_stage_count = 0;
         int skipped_stage_count = 0;
     };
 

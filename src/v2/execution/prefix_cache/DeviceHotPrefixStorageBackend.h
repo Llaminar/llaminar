@@ -20,6 +20,7 @@
 
 namespace llaminar2
 {
+    class PhysicalMemoryAuthority;
 
     /**
      * @brief Pre-capture VRAM arena for optional accelerator-hot prefix replicas.
@@ -42,6 +43,7 @@ namespace llaminar2
          * @param device Accelerator that owns the arena.
          * @param budget_bytes Configured maximum VRAM capacity.
          * @param slot_bytes Maximum serialized device payload for one block.
+         * @param memory_authority Rank-local authority that admitted this arena.
          * @param error Optional diagnostic populated on admission/allocation failure.
          * @return A valid backend, or nullptr without retaining a partial arena.
          */
@@ -50,6 +52,7 @@ namespace llaminar2
             DeviceId device,
             size_t budget_bytes,
             size_t slot_bytes,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
             std::string *error = nullptr);
 
         /** @return true when an immediately reusable slot can hold @p bytes. */

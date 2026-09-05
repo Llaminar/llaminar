@@ -374,6 +374,7 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDAEmbeddingKernels.cu      # Embedding lookup kernel
         kernels/cuda/ops/CUDARowSelectKernels.cu      # Graph-capturable one-row hidden-state selection
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
+        kernels/cuda/ops/CUDATPRankOrderedReductionKernels.cu # Batch-invariant rank-ordered TP sums
         kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K kernels for GPU-side sampling
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
         kernels/cuda/ops/CUDATPKVStateKernels.cu       # TP-local K/V state deinterleave for phase-split decode caches
@@ -647,6 +648,7 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmTPKVStateKernels.hip             # TP-local K/V state deinterleave for phase-split decode caches
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip        # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        kernels/rocm/ops/ROCmTPRankOrderedReductionKernels.hip # Batch-invariant rank-ordered TP sums
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
         kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
@@ -1429,7 +1431,6 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/GDNProjectionStage.cpp
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
-    execution/compute_stages/stages/GDNLiveStateLocalizeStage.cpp
     execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp
     execution/compute_stages/stages/TPKVCacheStateAllGatherStage.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp
@@ -1520,6 +1521,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoERuntimeTable.cpp
+    execution/moe/DeviceMoERebalanceWorkspaceContract.cpp
     execution/moe/DeviceMoETransferSlotDirectory.cpp
     execution/moe/GpuExpertSlotPool.cpp
     execution/moe/GpuExpertTransferStagingPool.cpp
@@ -1569,6 +1571,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/graph/StageVerifier.cpp
     execution/local_execution/graph/DeviceGraphExecutor.cpp
     execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp
+    execution/local_execution/graph/RetainedParentTicketServiceWorker.cpp
     execution/local_execution/graph/StageTimeline.cpp
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
@@ -1636,6 +1639,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PersistentStateMemoryEstimator.cpp
     planning/ActivationMemoryEstimator.cpp
     planning/WorkspaceMemoryEstimator.cpp
+    planning/PhysicalMemoryAuthority.cpp
     planning/MemoryPlanner.cpp
     # Execution plan builder (Phase 1 - Plan-to-Graph translation)
     execution/mpi_orchestration/ExecutionPlanBuilder.cpp
@@ -1793,6 +1797,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Collective communication infrastructure
     collective/DeviceGroup.cpp
     collective/BackendRouter.cpp
+    collective/LocalTPCollectiveInventory.cpp
     collective/backends/HostBackend.cpp
     collective/backends/MPIBackend.cpp
     collective/backends/HeterogeneousBackend.cpp
@@ -1839,6 +1844,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/parallelism_tree/TreeToRunnerCompiler.cpp
     # Orchestration runner (Phase 5: end-to-end integration)
     execution/runner/RankInitializationLifecycle.cpp
+    execution/runner/ModelContextRetirement.cpp
     execution/runner/OrchestrationRunner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp
     execution/runner/NamedDomainGlobalRunner.cpp

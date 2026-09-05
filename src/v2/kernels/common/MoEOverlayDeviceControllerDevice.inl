@@ -83,6 +83,9 @@ namespace llaminar2::moe_overlay_controller_device
             kMoEOverlayDeviceControllerFabricMaxParticipants];
         std::uint32_t best_cycle[
             kMoEOverlayDeviceControllerFabricMaxParticipants];
+        /** Best ordinary-economy cycle when no preferred-axis cycle exists. */
+        std::uint32_t fallback_cycle[
+            kMoEOverlayDeviceControllerFabricMaxParticipants];
         std::uint32_t dfs_source[
             kMoEOverlayDeviceControllerFabricMaxParticipants];
         std::uint32_t dfs_next_expert[
@@ -193,6 +196,30 @@ namespace llaminar2::moe_overlay_controller_device
     __device__ __forceinline__ std::uint32_t raw(Enum value) noexcept
     {
         return static_cast<std::uint32_t>(value);
+    }
+
+    /** @return Whether a transaction publishes and later retires a durable epoch. */
+    __device__ __forceinline__ bool durablePlacementTransaction(
+        MoEOverlayDeviceControllerTransactionKind kind) noexcept
+    {
+        return kind ==
+                   MoEOverlayDeviceControllerTransactionKind::
+                       DynamicPlacement ||
+               kind ==
+                   MoEOverlayDeviceControllerTransactionKind::
+                       PreparedContextRestore;
+    }
+
+    /** @return Whether a raw transaction word names a durable placement. */
+    __device__ __forceinline__ bool durablePlacementTransaction(
+        std::uint32_t kind) noexcept
+    {
+        return kind == raw(
+                           MoEOverlayDeviceControllerTransactionKind::
+                               DynamicPlacement) ||
+               kind == raw(
+                           MoEOverlayDeviceControllerTransactionKind::
+                               PreparedContextRestore);
     }
 
     /** @return A cache-volatile mapped-memory load. */
@@ -1604,8 +1631,7 @@ namespace llaminar2::moe_overlay_controller_device
         const std::uint64_t base =
             loadSystemAcquire(&binding.controller->current_durable_epoch);
         if (previous == 0xffffffffffffffffULL || base == 0u ||
-            (launch.transaction_kind ==
-                 MoEOverlayDeviceControllerTransactionKind::DynamicPlacement &&
+            (durablePlacementTransaction(launch.transaction_kind) &&
              base == 0xffffffffffffffffULL))
         {
             failLeader(binding, MoEOverlayDeviceControllerError::EpochOverflow);
@@ -1613,8 +1639,7 @@ namespace llaminar2::moe_overlay_controller_device
         }
         const std::uint64_t transaction = previous + 1u;
         const std::uint64_t candidate =
-            launch.transaction_kind ==
-                    MoEOverlayDeviceControllerTransactionKind::DynamicPlacement
+            durablePlacementTransaction(launch.transaction_kind)
                 ? base + 1u
                 : base;
 
@@ -1985,8 +2010,7 @@ namespace llaminar2::moe_overlay_controller_device
                   MoEOverlayDeviceControllerTransactionKind::StaticCheck &&
               policy.command_count == 0u &&
               policy.packed_weight_bytes == 0u) ||
-             (kind == MoEOverlayDeviceControllerTransactionKind::
-                          DynamicPlacement &&
+             (durablePlacementTransaction(kind) &&
               ((policy.command_count == 0u &&
                 policy.packed_weight_bytes == 0u) ||
                (policy.command_count != 0u &&
@@ -2101,6 +2125,77 @@ namespace llaminar2::moe_overlay_controller_device
         if (left.layer != right.layer)
             return left.layer < right.layer;
         return left.expert < right.expert;
+    }
+
+    /**
+     * @brief Canonicalize and publish one device-authored durable policy result.
+     *
+     * Dynamic optimization and terminal prepared-context restoration share the
+     * same immutable command ABI. Keeping ordering, payload-slot assignment,
+     * digest construction, no-op epoch collapse, and fair cursor publication in
+     * one helper prevents their physical followers from acquiring subtly
+     * different durable transactions.
+     */
+    __device__ __forceinline__ void finalizeDurablePolicyResult(
+        const MoEOverlayDeviceControllerActionLaunch &launch,
+        MoEOverlayDeviceControllerPolicyResult &result) noexcept
+    {
+        const auto &binding = launch.binding;
+        for (std::uint32_t position = 1u;
+             position < result.command_count;
+             ++position)
+        {
+            const auto value = binding.command_entries[position];
+            std::uint32_t cursor = position;
+            while (cursor != 0u && dynamicCommandLess(
+                       value, binding.command_entries[cursor - 1u]))
+            {
+                binding.command_entries[cursor] =
+                    binding.command_entries[cursor - 1u];
+                --cursor;
+            }
+            binding.command_entries[cursor] = value;
+        }
+
+        result.command_digest = moeOverlayCommandDigestSeed(
+            result.command_count);
+        constexpr std::uint32_t kWordsPerCommand =
+            sizeof(MoEOverlayDeviceMovementCommand) /
+            sizeof(std::uint64_t);
+        for (std::uint32_t command = 0u;
+             command < result.command_count;
+             ++command)
+        {
+            binding.command_entries[command].ordinal = command;
+            binding.command_entries[command].payload_slot = command;
+            result.packed_weight_bytes = saturatingAdd(
+                result.packed_weight_bytes,
+                binding.command_entries[command].payload_bytes);
+        }
+        const auto *command_words = reinterpret_cast<const std::uint64_t *>(
+            binding.command_entries);
+        const std::uint64_t word_count =
+            static_cast<std::uint64_t>(result.command_count) *
+            kWordsPerCommand;
+        for (std::uint64_t word = 0u; word < word_count; ++word)
+        {
+            result.command_digest ^= moeOverlayCommandDigestWord(
+                command_words[word], word);
+        }
+
+        // A no-op policy proves the live placement already meets its objective;
+        // it must not manufacture a new durable epoch.
+        if (result.command_count == 0u)
+        {
+            binding.controller->candidate_epoch =
+                loadSystemAcquire(&binding.controller->base_epoch);
+        }
+        storeSystemRelease(
+            &binding.controller->placement_layer_cursor,
+            result.layer_scan_next);
+        __threadfence_system();
+        *launch.policy_result = result;
+        __threadfence_system();
     }
 
     /**
@@ -2298,7 +2393,7 @@ namespace llaminar2::moe_overlay_controller_device
                 ? command_capacity
                 : configured_maximum_commands;
         const std::uint32_t layer_scan_start = loadSystemAcquire(
-            &binding.controller->dynamic_layer_cursor);
+            &binding.controller->placement_layer_cursor);
         if (layer_scan_start >= layer_count)
         {
             failLeader(
@@ -2308,6 +2403,7 @@ namespace llaminar2::moe_overlay_controller_device
         }
         result.layer_scan_start = layer_scan_start;
         result.layer_scan_next = (layer_scan_start + 1u) % layer_count;
+        moe_rebalance_policy::DynamicPlacementAxisProgress axis_progress;
 
         for (std::uint32_t layer_offset = 0u;
              layer_offset < layer_count;
@@ -2611,6 +2707,9 @@ namespace llaminar2::moe_overlay_controller_device
             while (result.accepted_cycles < maximum_cycles &&
                    layer_cycles < maximum_cycles_per_layer)
             {
+                const auto preferred_objective =
+                    axis_progress.nextObjective(
+                        maximum_cycles, result.accepted_cycles);
                 /* Decompose the remaining owner/target multigraph into its
                  * canonical disjoint cycles, then admit the best measured
                  * payoff. Expert-id order is only the final deterministic
@@ -2623,6 +2722,8 @@ namespace llaminar2::moe_overlay_controller_device
                 }
                 std::uint32_t best_cycle_length = 0u;
                 DynamicCycleEconomyScore best_economy{};
+                std::uint32_t fallback_cycle_length = 0u;
+                DynamicCycleEconomyScore fallback_economy{};
                 while (true)
                 {
                     const std::uint32_t cycle_length = findDynamicCycle(
@@ -2715,8 +2816,31 @@ namespace llaminar2::moe_overlay_controller_device
                         }
                         continue;
                     }
-                    if (best_cycle_length == 0u ||
-                        dynamicEconomyScoreBetter(economy, best_economy))
+                    if (fallback_cycle_length == 0u ||
+                        dynamicEconomyScoreBetter(
+                            economy, fallback_economy))
+                    {
+                        fallback_cycle_length = cycle_length;
+                        fallback_economy = economy;
+                        for (std::uint32_t edge = 0u;
+                             edge < cycle_length;
+                             ++edge)
+                        {
+                            scratch.fallback_cycle[edge] =
+                                scratch.cycle[edge];
+                        }
+                    }
+                    const bool advances_participant =
+                        candidate_score.same_priority_makespan <
+                        working_score.same_priority_makespan;
+                    if (moe_rebalance_policy::
+                            DynamicPlacementAxisProgress::matches(
+                                preferred_objective,
+                                improves_priority,
+                                advances_participant) &&
+                        (best_cycle_length == 0u ||
+                         dynamicEconomyScoreBetter(
+                             economy, best_economy)))
                     {
                         best_cycle_length = cycle_length;
                         best_economy = economy;
@@ -2729,6 +2853,33 @@ namespace llaminar2::moe_overlay_controller_device
                     }
                 }
 
+                /* The reservation belongs to the complete wave. A later layer
+                 * gets an admission opportunity before this layer can spend
+                 * the slot on its ordinary economy fallback. */
+                if (moe_rebalance_policy::DynamicPlacementAxisProgress::
+                        searchesLaterLayerBeforeFallback(
+                            preferred_objective,
+                            best_cycle_length != 0u,
+                            layer_offset,
+                            layer_count))
+                {
+                    break;
+                }
+
+                /* The final layer preserves ordinary economy when no layer
+                 * exposed the preferred independent objective. */
+                if (best_cycle_length == 0u)
+                {
+                    best_cycle_length = fallback_cycle_length;
+                    best_economy = fallback_economy;
+                    for (std::uint32_t edge = 0u;
+                         edge < fallback_cycle_length;
+                         ++edge)
+                    {
+                        scratch.best_cycle[edge] =
+                            scratch.fallback_cycle[edge];
+                    }
+                }
                 if (best_cycle_length == 0u)
                     break;
                 for (std::uint32_t edge = 0u;
@@ -2765,6 +2916,8 @@ namespace llaminar2::moe_overlay_controller_device
                 const bool advances_participant =
                     candidate_score.same_priority_makespan <
                     working_score.same_priority_makespan;
+                axis_progress.observe(
+                    advances_priority, advances_participant);
                 const auto movement_axis =
                     advances_priority && advances_participant
                         ? MoEOverlayDeviceMovementAxis::Combined
@@ -2850,63 +3003,305 @@ namespace llaminar2::moe_overlay_controller_device
                 working_score.same_priority_makespan);
         }
 
-        // Canonicalize after every layer contributes. This is the immutable
-        // order consumed independently by every destination prepare graph.
-        for (std::uint32_t position = 1u;
-             position < result.command_count;
-             ++position)
+        finalizeDurablePolicyResult(launch, result);
+    }
+
+    /**
+     * @brief Author bounded cycles back to the immutable prepared owner table.
+     *
+     * Model-context reuse cannot retain shadow-slot allocations or a migrated
+     * runtime selector as an informal host-side placement mirror. At terminal
+     * drain the same device authority that authored Dynamic movement therefore
+     * compares the live participant snapshots with the loader-prepared table
+     * frozen in the mapped fabric. It emits complete capacity-preserving cycles
+     * through the ordinary durable movement pipeline until a final zero-command
+     * transaction certifies exact equality.
+     *
+     * Restoration is a lifecycle objective, not an economy decision. It neither
+     * consumes demand history nor applies payoff/hysteresis gates, and its moves
+     * are excluded from optimization evidence by the host physical follower.
+     */
+    __device__ __forceinline__ void authorPreparedContextRestore(
+        const MoEOverlayDeviceControllerActionLaunch &launch,
+        DynamicPolicyScratch &scratch) noexcept
+    {
+        const auto &binding = launch.binding;
+        const std::uint64_t transaction =
+            loadSystemAcquire(&binding.controller->transaction_id);
+        if (!binding.authorityLeader() || !launch.policy_result ||
+            transaction == 0u ||
+            !waitForState(
+                binding,
+                MoEOverlayDeviceControllerState::CollectingSnapshots) ||
+            !waitForAllGroups(
+                binding,
+                GroupWordField::SnapshotTransaction,
+                transaction) ||
+            loadSystemAcquire(&binding.controller->transaction_kind) !=
+                raw(MoEOverlayDeviceControllerTransactionKind::
+                        PreparedContextRestore) ||
+            loadPeerPublished(&binding.command->demand_phase) !=
+                raw(MoEOverlayDeviceDemandPhase::Invalid))
         {
-            const auto value = binding.command_entries[position];
-            std::uint32_t cursor = position;
-            while (cursor != 0u && dynamicCommandLess(
-                       value, binding.command_entries[cursor - 1u]))
+            if (binding.authorityLeader())
             {
-                binding.command_entries[cursor] =
-                    binding.command_entries[cursor - 1u];
-                --cursor;
+                failLeader(
+                    binding,
+                    MoEOverlayDeviceControllerError::InvalidState);
             }
-            binding.command_entries[cursor] = value;
+            return;
         }
 
-        result.command_digest = moeOverlayCommandDigestSeed(
-            result.command_count);
-        constexpr std::uint32_t kWordsPerCommand =
-            sizeof(MoEOverlayDeviceMovementCommand) /
-            sizeof(std::uint64_t);
-        for (std::uint32_t command = 0u;
-             command < result.command_count;
-             ++command)
+        const std::uint32_t participant_count =
+            loadPeerPublished(&binding.layout->participant_count);
+        const std::uint32_t layer_count =
+            loadPeerPublished(&binding.layout->num_layers);
+        const std::uint32_t expert_count =
+            loadPeerPublished(&binding.layout->num_experts);
+        const std::uint32_t command_capacity =
+            loadPeerPublished(&binding.layout->command_capacity);
+        const std::uint32_t maximum_cycles =
+            loadPeerPublished(&binding.layout->maximum_cycles_per_wave);
+        const std::uint64_t expected_owner_words =
+            static_cast<std::uint64_t>(layer_count) * expert_count;
+        if (participant_count == 0u ||
+            participant_count >
+                kMoEOverlayDeviceControllerFabricMaxParticipants ||
+            layer_count == 0u ||
+            layer_count > kMoEOverlayDeviceControllerFabricMaxLayers ||
+            expert_count == 0u ||
+            expert_count > kMoEOverlayDeviceControllerFabricMaxExperts ||
+            command_capacity < participant_count || maximum_cycles == 0u ||
+            !binding.initial_owner_participants ||
+            loadPeerPublished(
+                &binding.layout->initial_owner_participants_words) !=
+                expected_owner_words)
         {
-            binding.command_entries[command].ordinal = command;
-            binding.command_entries[command].payload_slot = command;
-            result.packed_weight_bytes = saturatingAdd(
-                result.packed_weight_bytes,
-                binding.command_entries[command].payload_bytes);
-        }
-        const auto *command_words = reinterpret_cast<const std::uint64_t *>(
-            binding.command_entries);
-        const std::uint64_t word_count =
-            static_cast<std::uint64_t>(result.command_count) *
-            kWordsPerCommand;
-        for (std::uint64_t word = 0u; word < word_count; ++word)
-        {
-            result.command_digest ^= moeOverlayCommandDigestWord(
-                command_words[word], word);
+            failLeader(
+                binding,
+                MoEOverlayDeviceControllerError::InvalidTopology);
+            return;
         }
 
-        // A no-op observation does not manufacture a new durable epoch. The
-        // remaining protocol still publishes zero-movement evidence to every
-        // group, preserving one lifecycle for Static and Dynamic observation.
-        if (result.command_count == 0u)
-            binding.controller->candidate_epoch = base_epoch;
-        // Persist policy fairness on the device before publishing the result.
-        // The next transaction reads this cursor; no host shadow is involved.
-        storeSystemRelease(
-            &binding.controller->dynamic_layer_cursor,
-            result.layer_scan_next);
-        __threadfence_system();
-        *launch.policy_result = result;
-        __threadfence_system();
+        for (std::uint32_t participant = 0u;
+             participant < participant_count;
+             ++participant)
+        {
+            const auto metadata = snapshotPeerRecord(
+                binding.participants + participant);
+            if (metadata.participant_id != participant ||
+                metadata.group_id >= binding.layout->group_count)
+            {
+                failLeader(
+                    binding,
+                    MoEOverlayDeviceControllerError::InvalidTopology);
+                return;
+            }
+            scratch.participant_priority[participant] =
+                metadata.tier_priority;
+            scratch.participant_tier[participant] = metadata.tier_index;
+            scratch.participant_state_base[participant] =
+                participantStateBase(binding, participant, metadata);
+            if (!scratch.participant_state_base[participant])
+            {
+                failLeader(
+                    binding,
+                    MoEOverlayDeviceControllerError::InvalidTopology);
+                return;
+            }
+        }
+
+        MoEOverlayDeviceControllerPolicyResult result{};
+        result.kind = raw(
+            MoEOverlayDeviceControllerTransactionKind::
+                PreparedContextRestore);
+        const std::uint64_t base_epoch =
+            loadSystemAcquire(&binding.controller->base_epoch);
+        const std::uint64_t candidate_epoch =
+            loadSystemAcquire(&binding.controller->candidate_epoch);
+        const std::uint32_t layer_scan_start = loadSystemAcquire(
+            &binding.controller->placement_layer_cursor);
+        if (layer_scan_start >= layer_count)
+        {
+            failLeader(
+                binding,
+                MoEOverlayDeviceControllerError::InvalidState);
+            return;
+        }
+        result.layer_scan_start = layer_scan_start;
+        // A terminal zero-command proof is observational: it must not mutate
+        // the policy cursor merely because certification inspected the table.
+        // A non-empty wave advances below to the layer after its last cycle.
+        result.layer_scan_next = layer_scan_start;
+
+        for (std::uint32_t layer_offset = 0u;
+             layer_offset < layer_count &&
+             result.accepted_cycles < maximum_cycles;
+             ++layer_offset)
+        {
+            const std::uint32_t layer =
+                (layer_scan_start + layer_offset) % layer_count;
+            for (std::uint32_t participant = 0u;
+                 participant < participant_count;
+                 ++participant)
+            {
+                scratch.quotas[participant] = 0u;
+                scratch.remaining[participant] = 0u;
+            }
+            for (std::uint32_t expert = 0u;
+                 expert < expert_count;
+                 ++expert)
+            {
+                std::uint32_t owner_count = 0u;
+                std::int32_t owner = -1;
+                for (std::uint32_t participant = 0u;
+                     participant < participant_count;
+                     ++participant)
+                {
+                    const std::uint64_t word = loadPeerPublished(
+                        scratch.participant_state_base[participant] +
+                        static_cast<std::uint64_t>(layer) * expert_count +
+                        expert);
+                    if (moe_rebalance_policy::
+                            collectedStateAuthoritativeOwner(word))
+                    {
+                        if (!moe_rebalance_policy::
+                                collectedStatePhysicallyResident(word))
+                        {
+                            failLeader(
+                                binding,
+                                MoEOverlayDeviceControllerError::
+                                    InvalidSnapshot);
+                            return;
+                        }
+                        owner = static_cast<std::int32_t>(participant);
+                        ++owner_count;
+                    }
+                }
+                const std::uint32_t target = loadPeerPublished(
+                    binding.initial_owner_participants +
+                    static_cast<std::uint64_t>(layer) * expert_count +
+                    expert);
+                if (owner_count != 1u || target >= participant_count)
+                {
+                    failLeader(
+                        binding,
+                        MoEOverlayDeviceControllerError::InvalidSnapshot);
+                    return;
+                }
+                scratch.current_owner[expert] = owner;
+                scratch.desired_owner[expert] =
+                    static_cast<std::int32_t>(target);
+                scratch.excluded[expert] = 0u;
+                ++scratch.quotas[static_cast<std::uint32_t>(owner)];
+                ++scratch.remaining[target];
+            }
+            for (std::uint32_t participant = 0u;
+                 participant < participant_count;
+                 ++participant)
+            {
+                if (scratch.quotas[participant] !=
+                    scratch.remaining[participant])
+                {
+                    failLeader(
+                        binding,
+                        MoEOverlayDeviceControllerError::InvalidTopology);
+                    return;
+                }
+            }
+
+            bool changed_layer = false;
+            while (result.accepted_cycles < maximum_cycles)
+            {
+                const std::uint32_t cycle_length = findDynamicCycle(
+                    scratch,
+                    scratch.excluded,
+                    participant_count,
+                    expert_count);
+                if (cycle_length == 0u)
+                    break;
+                if (result.command_count + cycle_length > command_capacity)
+                    break;
+
+                const std::uint64_t payload_bytes = loadPeerPublished(
+                    binding.payload_bytes_per_layer + layer);
+                if (payload_bytes == 0u)
+                {
+                    failLeader(
+                        binding,
+                        MoEOverlayDeviceControllerError::InvalidControl);
+                    return;
+                }
+                bool crosses_tier = false;
+                bool stays_in_tier = false;
+                for (std::uint32_t edge = 0u;
+                     edge < cycle_length;
+                     ++edge)
+                {
+                    const std::uint32_t expert = scratch.cycle[edge];
+                    const auto source = static_cast<std::uint32_t>(
+                        scratch.current_owner[expert]);
+                    const auto destination = static_cast<std::uint32_t>(
+                        scratch.desired_owner[expert]);
+                    const bool same_tier =
+                        scratch.participant_tier[source] ==
+                        scratch.participant_tier[destination];
+                    stays_in_tier = stays_in_tier || same_tier;
+                    crosses_tier = crosses_tier || !same_tier;
+                }
+                const auto movement_axis =
+                    crosses_tier && stays_in_tier
+                        ? MoEOverlayDeviceMovementAxis::Combined
+                        : crosses_tier
+                        ? MoEOverlayDeviceMovementAxis::TierResidency
+                        : MoEOverlayDeviceMovementAxis::ParticipantPlacement;
+
+                for (std::uint32_t edge = 0u;
+                     edge < cycle_length;
+                     ++edge)
+                {
+                    const std::uint32_t expert = scratch.cycle[edge];
+                    const auto source = static_cast<std::uint32_t>(
+                        scratch.current_owner[expert]);
+                    const auto destination = static_cast<std::uint32_t>(
+                        scratch.desired_owner[expert]);
+                    MoEOverlayDeviceMovementCommand command{};
+                    command.op = raw(
+                        MoEOverlayDeviceMovementOp::DurableMove);
+                    command.layer = layer;
+                    command.expert = expert;
+                    command.source_participant = source;
+                    command.destination_participant = destination;
+                    command.flags = raw(movement_axis);
+                    command.payload_bytes = payload_bytes;
+                    command.source_epoch = base_epoch;
+                    command.candidate_epoch = candidate_epoch;
+                    binding.command_entries[result.command_count++] = command;
+
+                    const std::int32_t source_priority =
+                        scratch.participant_priority[source];
+                    const std::int32_t destination_priority =
+                        scratch.participant_priority[destination];
+                    if (destination_priority < source_priority)
+                        ++result.promotions;
+                    else if (destination_priority > source_priority)
+                        ++result.demotions;
+                    else
+                        ++result.same_priority_moves;
+                    scratch.current_owner[expert] =
+                        scratch.desired_owner[expert];
+                }
+                ++result.accepted_cycles;
+                changed_layer = true;
+            }
+            if (changed_layer)
+            {
+                ++result.changed_layers;
+                result.layer_scan_next = (layer + 1u) % layer_count;
+            }
+        }
+
+        finalizeDurablePolicyResult(launch, result);
     }
 
     /** Publish one complete participant-local apply result with code last. */
@@ -3512,9 +3907,7 @@ namespace llaminar2::moe_overlay_controller_device
                 state_ready && transaction != 0u &&
                 command.magic == kMoEOverlayDeviceControllerMagic &&
                 command.version == kMoEOverlayDeviceControllerVersion &&
-                command.kind == raw(
-                    MoEOverlayDeviceControllerTransactionKind::
-                        DynamicPlacement) &&
+                durablePlacementTransaction(command.kind) &&
                 command.transaction_id == transaction &&
                 command.topology_fingerprint == binding.topology_fingerprint &&
                 command.base_epoch ==
@@ -3644,7 +4037,8 @@ namespace llaminar2::moe_overlay_controller_device
             bool entry_valid = moeOverlayMovementCommandValid(
                 entry,
                 ordinal,
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
+                static_cast<MoEOverlayDeviceControllerTransactionKind>(
+                    command.kind),
                 binding.layout->participant_count,
                 publication.layer_count,
                 publication.expert_count,
@@ -4045,9 +4439,7 @@ namespace llaminar2::moe_overlay_controller_device
             prior_bank = static_cast<std::uint32_t>(selector & 1u);
 
             const bool valid = state_ready && transaction != 0u &&
-                command.kind == raw(
-                    MoEOverlayDeviceControllerTransactionKind::
-                        DynamicPlacement) &&
+                durablePlacementTransaction(command.kind) &&
                 command.transaction_id == transaction &&
                 command.topology_fingerprint == binding.topology_fingerprint &&
                 command.base_epoch ==
@@ -4247,9 +4639,7 @@ namespace llaminar2::moe_overlay_controller_device
             prior_status.epoch == command.candidate_epoch &&
             prior_status.bank == active_bank;
         bool valid = state_ready && transaction != 0u &&
-            command.kind == raw(
-                MoEOverlayDeviceControllerTransactionKind::
-                    DynamicPlacement) &&
+            durablePlacementTransaction(command.kind) &&
             command.transaction_id == transaction &&
             command.topology_fingerprint == binding.topology_fingerprint &&
             command.base_epoch ==
@@ -4392,9 +4782,8 @@ namespace llaminar2::moe_overlay_controller_device
             binding,
             MoEOverlayDeviceControllerState::RetiringDurableEpoch);
         if (!state_ready ||
-            loadSystemAcquire(&binding.controller->transaction_kind) !=
-                raw(MoEOverlayDeviceControllerTransactionKind::
-                        DynamicPlacement))
+            !durablePlacementTransaction(loadSystemAcquire(
+                &binding.controller->transaction_kind)))
         {
             failParticipant(
                 binding,
@@ -4427,8 +4816,8 @@ namespace llaminar2::moe_overlay_controller_device
         if (!state_ready)
             return;
         const auto command = snapshotPeerRecord(binding.command);
-        if (loadSystemAcquire(&binding.controller->transaction_kind) !=
-                raw(MoEOverlayDeviceControllerTransactionKind::DynamicPlacement) ||
+        if (!durablePlacementTransaction(loadSystemAcquire(
+                &binding.controller->transaction_kind)) ||
             command.transaction_id !=
                 loadSystemAcquire(&binding.controller->transaction_id) ||
             command.topology_fingerprint != binding.topology_fingerprint)
@@ -4489,8 +4878,7 @@ namespace llaminar2::moe_overlay_controller_device
         if (command.command_count != 0u)
             return;
         if (transaction == 0u ||
-            command.kind != raw(
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement) ||
+            !durablePlacementTransaction(command.kind) ||
             command.transaction_id != transaction ||
             command.topology_fingerprint != binding.topology_fingerprint ||
             command.base_epoch != command.candidate_epoch ||
@@ -4554,8 +4942,7 @@ namespace llaminar2::moe_overlay_controller_device
         {
             return;
         }
-        if (command.kind == raw(
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement) &&
+        if (durablePlacementTransaction(command.kind) &&
             command.command_count != 0u &&
             !waitForAllGroupParticipants(
                 binding,
@@ -4637,8 +5024,7 @@ namespace llaminar2::moe_overlay_controller_device
             }
             return;
         }
-        if (command.kind == raw(
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement) &&
+        if (durablePlacementTransaction(command.kind) &&
             command.command_count != 0u &&
             !waitForAllGroupParticipants(
                 binding,
@@ -4677,8 +5063,7 @@ namespace llaminar2::moe_overlay_controller_device
         const auto kind = static_cast<
             MoEOverlayDeviceControllerTransactionKind>(
             loadSystemAcquire(&binding.controller->transaction_kind));
-        if (kind ==
-            MoEOverlayDeviceControllerTransactionKind::DynamicPlacement)
+        if (durablePlacementTransaction(kind))
         {
             /* Hysteresis changes only at the durable linearization point.
              * Proposal, preparation, and local-bank publication remain
@@ -4686,30 +5071,34 @@ namespace llaminar2::moe_overlay_controller_device
              * command was authenticated before commit and destinations are
              * disjoint, so these mapped words can be release-published in
              * canonical command order immediately before the epoch itself. */
-            const std::uint32_t command_count = loadPeerPublished(
-                &binding.command->command_count);
-            const std::uint32_t expert_count = loadPeerPublished(
-                &binding.layout->num_experts);
-            for (std::uint32_t ordinal = 0u;
-                 ordinal < command_count;
-                 ++ordinal)
+            if (kind ==
+                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement)
             {
-                const auto command = snapshotPeerRecord(
-                    binding.command_entries + ordinal);
-                if (command.layer >= binding.layout->num_layers ||
-                    command.expert >= expert_count)
+                const std::uint32_t command_count = loadPeerPublished(
+                    &binding.command->command_count);
+                const std::uint32_t expert_count = loadPeerPublished(
+                    &binding.layout->num_experts);
+                for (std::uint32_t ordinal = 0u;
+                     ordinal < command_count;
+                     ++ordinal)
                 {
-                    failLeader(
-                        binding,
-                        MoEOverlayDeviceControllerError::InvalidCommand);
-                    return;
+                    const auto command = snapshotPeerRecord(
+                        binding.command_entries + ordinal);
+                    if (command.layer >= binding.layout->num_layers ||
+                        command.expert >= expert_count)
+                    {
+                        failLeader(
+                            binding,
+                            MoEOverlayDeviceControllerError::InvalidCommand);
+                        return;
+                    }
+                    storeSystemRelease(
+                        binding.economy_last_moved +
+                            static_cast<std::uint64_t>(command.layer) *
+                                expert_count +
+                            command.expert,
+                        transaction);
                 }
-                storeSystemRelease(
-                    binding.economy_last_moved +
-                        static_cast<std::uint64_t>(command.layer) *
-                            expert_count +
-                        command.expert,
-                    transaction);
             }
             storeSystemRelease(
                 &binding.controller->current_durable_epoch,
@@ -4754,8 +5143,8 @@ namespace llaminar2::moe_overlay_controller_device
         const auto &binding = launch.binding;
         if (!binding.authorityLeader() || !waitForState(
                 binding, MoEOverlayDeviceControllerState::Admitted) ||
-            loadSystemAcquire(&binding.controller->transaction_kind) !=
-                raw(MoEOverlayDeviceControllerTransactionKind::DynamicPlacement))
+            !durablePlacementTransaction(loadSystemAcquire(
+                &binding.controller->transaction_kind)))
         {
             if (binding.authorityLeader())
                 failLeader(binding, MoEOverlayDeviceControllerError::InvalidState);
@@ -4973,12 +5362,11 @@ namespace llaminar2::moe_overlay_controller_device
         const bool valid = transaction != 0u &&
             loadSystemAcquire(&binding.controller->state) ==
                 raw(dynamicRuntimeActionState(launch.action)) &&
-            loadSystemAcquire(&binding.controller->transaction_kind) ==
-                raw(MoEOverlayDeviceControllerTransactionKind::DynamicPlacement) &&
+            durablePlacementTransaction(loadSystemAcquire(
+                &binding.controller->transaction_kind)) &&
             loadSystemAcquire(&binding.controller->command_transaction) ==
                 transaction &&
-            command.kind == raw(
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement) &&
+            durablePlacementTransaction(command.kind) &&
             command.transaction_id == transaction &&
             command.topology_fingerprint == binding.topology_fingerprint &&
             command.base_epoch ==
@@ -5061,6 +5449,16 @@ namespace llaminar2::moe_overlay_controller_device
         {
             if (threadIdx.x == 0u)
                 authorDynamicPolicy(launch, dynamic_policy_scratch);
+            return;
+        }
+        if (launch.action == MoEOverlayDeviceControllerAction::
+                                 AuthorPreparedContextRestore)
+        {
+            if (threadIdx.x == 0u)
+            {
+                authorPreparedContextRestore(
+                    launch, dynamic_policy_scratch);
+            }
             return;
         }
 
@@ -5171,6 +5569,8 @@ namespace llaminar2::moe_overlay_controller_device
             break; // Handled above by the single-writer policy block.
         case MoEOverlayDeviceControllerAction::AuthorDynamicPolicy:
             break; // Handled above by the deterministic policy block.
+        case MoEOverlayDeviceControllerAction::AuthorPreparedContextRestore:
+            break; // Handled above by the deterministic restoration block.
         case MoEOverlayDeviceControllerAction::ApplyRuntimeCandidate:
             break; // Handled above by the complete all-layer apply block.
         case MoEOverlayDeviceControllerAction::PublishRuntimeCandidate:

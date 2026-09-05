@@ -31,7 +31,8 @@ namespace llaminar2
      *
      * Profilers report already-normalized nanoseconds per routed activation.
      * `sample_count` proves that a positive duration was measured for every
-     * production phase rather than filled with a guessed backend constant.
+     * economy-priced production phase rather than filled with a guessed
+     * backend constant. Reachable but exceptional phases remain exact zero.
      */
     struct MoEOverlayParticipantLayerServiceMeasurement
     {
@@ -54,9 +55,8 @@ namespace llaminar2
     {
         std::string service_measurement_identity;
         std::string migration_measurement_identity;
-        /** Phases reachable under the runtime policy being certified. */
-        ExpertHistogramProductionSourceMask active_sources =
-            kAllExpertHistogramProductionSources;
+        /** Graph reachability and its economy-priced recurring-service subset. */
+        ExpertHistogramProductionTopology production_topology;
         std::vector<MoEOverlayParticipantLayerServiceMeasurement>
             participant_service;
         std::vector<MoEOverlayParticipantLayerMigrationCost>
@@ -111,9 +111,10 @@ namespace llaminar2
      * migration row per directed participant pair/layer.  Participant service
      * costs are retained exactly for live critical-path admission and are also
      * reduced to a tier row with a maximum for conservative cold-start capacity
-     * placement. Runtime-disabled phases must remain explicitly zero throughout
-     * certification; a later non-zero demand in such a phase is therefore a
-     * lifecycle error rather than an invented cost.
+     * placement. Graph-unreachable phases reject service observations and
+     * demand. Reachable but economy-unpriced phases may be observed (for
+     * example fixed-MTP terminal catch-up), yet remain zero in the certified
+     * profile so exceptional traffic cannot distort recurring economics.
      */
     class MoEOverlayEconomyProfileComposer final
     {
@@ -127,11 +128,13 @@ namespace llaminar2
          * The participant accumulator retains integer duration and activation
          * sums so many sub-microsecond GPU observations do not lose precision.
          * Certification rounds each aggregate upward, preserving a non-zero
-         * cost for every runtime-active production phase. Disabled phases must
-         * contain exact zero totals and remain zero in the normalized result.
+         * cost for every economy-priced production phase. Graph-unreachable
+         * phases must contain exact zero totals. Reachable but unpriced phases
+         * may contain real observations but remain zero in the normalized
+         * result.
          *
          * @param totals One coherent row per participant/layer.
-         * @param active_sources Immutable runtime phase availability.
+         * @param production_topology Immutable reachability and economy mask.
          * @return Canonically ordered normalized rows accepted by @ref compose.
          * @throws std::invalid_argument For empty, overflowed, duplicated, or
          *         partially sampled totals.
@@ -140,8 +143,7 @@ namespace llaminar2
             MoEOverlayParticipantLayerServiceMeasurement>
         normalizeServiceTotals(
             std::vector<MoEOverlayParticipantLayerServiceTotals> totals,
-            ExpertHistogramProductionSourceMask active_sources =
-                kAllExpertHistogramProductionSources);
+            const ExpertHistogramProductionTopology &production_topology);
 
         /**
          * @brief Pool live service totals over exact layer-equivalence classes.
@@ -156,19 +158,19 @@ namespace llaminar2
          *
          * @param totals Complete participant/layer geometry. Individual class
          *        members may be coherently empty when sparse traffic did not
-         *        route to them, but every participant/class/active-phase pool
+         *        route to them, but every participant/class/economy-phase pool
          *        must contain at least one real observation.
-         * @param active_sources Immutable runtime phase availability.
+         * @param production_topology Immutable reachability and economy mask.
          * @param catalog Exact manifest-derived partition of model layers.
          * @return Participant/layer rows with one shared cost per exact class.
          * @throws std::invalid_argument For incomplete geometry, overflow,
-         *         disabled-phase evidence, or malformed observations.
+         *         unreachable-phase evidence, or malformed observations.
          */
         [[nodiscard]] static std::vector<
             MoEOverlayParticipantLayerServiceMeasurement>
         normalizeEquivalentServiceTotals(
             std::vector<MoEOverlayParticipantLayerServiceTotals> totals,
-            ExpertHistogramProductionSourceMask active_sources,
+            const ExpertHistogramProductionTopology &production_topology,
             const MoEOverlayEconomyCalibrationLayerCatalog &catalog);
 
         /**

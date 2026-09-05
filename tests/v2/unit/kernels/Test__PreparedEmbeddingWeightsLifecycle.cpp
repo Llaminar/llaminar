@@ -25,6 +25,7 @@
 #include "kernels/common/EmbedQ8Repack.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
 #include "loaders/PreparedWeightStore.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "../../utils/TestTensorFactory.h"
@@ -155,6 +156,63 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, Q8_0TensorGetsPreparation)
     EXPECT_EQ(handle->weights->vocab_size, kVocabSize);
     EXPECT_EQ(handle->weights->d_model, kDModelInt);
     EXPECT_GT(handle->weights->blocks_per_row, 0u);
+}
+
+TEST_F(
+    Test__PreparedEmbeddingWeightsLifecycle,
+    AdditionalEmbeddingClaimsAndReleasesItsExactOwnerLine)
+{
+    const size_t bytes = PreparedEmbeddingWeights::allocationBytes(
+        kVocabSize,
+        kDModelInt);
+    PhysicalMemoryBOMBuilder bom({
+        .world_rank = 0,
+        .device = DeviceId::cpu(),
+        .total_bytes = 1024u * 1024u,
+        .admission_available_bytes = 1024u * 1024u,
+    });
+    bom.add(PhysicalMemoryOwner::AdditionalModelWeights, bytes);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add(bom.build());
+    auto admission = std::make_shared<
+        const PhysicalMemoryPlanAdmissionCertificate>(plan.build());
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        std::move(admission),
+        0);
+
+    PreparedWeightStore store(kModelId);
+    store.installPhysicalMemoryAuthority(authority);
+    auto tensor =
+        TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
+    const auto binding = makeEmbeddingBinding(1, tensor.get());
+    const auto ref = store.prepareEmbedding(
+        binding,
+        kDModelInt,
+        /*vocab_offset=*/0,
+        /*total_vocab=*/0,
+        PhysicalMemoryOwner::AdditionalModelWeights);
+
+    ASSERT_NE(store.embeddingHandle(ref), nullptr);
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::AdditionalModelWeights,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        bytes);
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::PrimaryModelWeights,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
+
+    store.clear();
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::AdditionalModelWeights,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
 }
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, Q4_0TensorGetsPreparation)

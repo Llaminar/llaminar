@@ -20,6 +20,7 @@
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
+#include "transfer/TransferEngine.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -618,6 +619,14 @@ namespace llaminar2
                             .device = DeviceId::cuda(0),
                             .slot_capacity = blob_slots_per_device,
                             .execution_lane_capacity = blob_slots_per_device,
+                            .execution_streams =
+                                TransferEngine::instance()
+                                    .allocatePersistentTransferExecutionLanes(
+                                        std::min<std::size_t>(
+                                            blob_slots_per_device,
+                                            4u),
+                                        DeviceId::cuda(0),
+                                        "three_tier_progress_cuda"),
                             .maximum_bytes = blob_staging_bytes,
                             .name = "three_tier_cuda_relay",
                             .perf_device =
@@ -628,6 +637,14 @@ namespace llaminar2
                             .device = DeviceId::rocm(0),
                             .slot_capacity = blob_slots_per_device,
                             .execution_lane_capacity = blob_slots_per_device,
+                            .execution_streams =
+                                TransferEngine::instance()
+                                    .allocatePersistentTransferExecutionLanes(
+                                        std::min<std::size_t>(
+                                            blob_slots_per_device,
+                                            4u),
+                                        DeviceId::rocm(0),
+                                        "three_tier_progress_rocm"),
                             .maximum_bytes = blob_staging_bytes,
                             .name = "three_tier_rocm_relay",
                             .perf_device =
@@ -705,6 +722,18 @@ namespace llaminar2
                                     throw std::runtime_error(
                                         "CUDA source upload failed for " + identity);
                                 }
+                                const auto cuda_mapped_staging =
+                                    TransferEngine::instance()
+                                        .allocateMappedHostTransferSlices(
+                                            blob_staging_bytes,
+                                            2u,
+                                            DeviceId::cuda(0));
+                                const auto rocm_mapped_staging =
+                                    TransferEngine::instance()
+                                        .allocateMappedHostTransferSlices(
+                                            blob_staging_bytes,
+                                            2u,
+                                            DeviceId::rocm(0));
                                 flow->blob_lane = std::make_shared<
                                     ExpertTierGpuBlobTransferLane>(
                                     ExpertTierGpuBlobTransferLane::Config{
@@ -712,6 +741,14 @@ namespace llaminar2
                                         .destination_device = DeviceId::rocm(0),
                                         .staging_capacity_bytes =
                                             blob_staging_bytes,
+                                        .source_mapped_staging = {
+                                            cuda_mapped_staging[0],
+                                            cuda_mapped_staging[1],
+                                        },
+                                        .destination_mapped_staging = {
+                                            rocm_mapped_staging[0],
+                                            rocm_mapped_staging[1],
+                                        },
                                         .source_progress_epoch =
                                             cuda_progress_epoch_,
                                         .destination_progress_epoch =
@@ -744,8 +781,18 @@ namespace llaminar2
                                     ExpertTierWeightTransferLane>(
                                     ExpertTierWeightTransferLane::Config{
                                         .device = DeviceId::rocm(0),
-                                        .staging_capacity_bytes =
-                                            flow->gpu_to_cpu_layout.chunkBytes(1),
+                                        .staging = TransferEngine::instance()
+                                                       .allocatePersistentTransferStagingSlices(
+                                                           flow->gpu_to_cpu_layout.chunkBytes(1),
+                                                           1u,
+                                                           DeviceId::rocm(0))
+                                                       .front(),
+                                        .execution = TransferEngine::instance()
+                                                         .allocatePersistentTransferExecutionLanes(
+                                                             1u,
+                                                             DeviceId::rocm(0),
+                                                             "three_tier:" + identity)
+                                                         .front(),
                                         .lane_name = "three_tier:" + identity,
                                         .perf_device = "cuda-hot/rocm-warm/cpu-cold",
                                         .collect_timing_measurements = true,
@@ -765,8 +812,18 @@ namespace llaminar2
                                     ExpertTierWeightTransferLane>(
                                     ExpertTierWeightTransferLane::Config{
                                         .device = DeviceId::cuda(0),
-                                        .staging_capacity_bytes =
-                                            flow->cpu_to_gpu_layout.chunkBytes(1),
+                                        .staging = TransferEngine::instance()
+                                                       .allocatePersistentTransferStagingSlices(
+                                                           flow->cpu_to_gpu_layout.chunkBytes(1),
+                                                           1u,
+                                                           DeviceId::cuda(0))
+                                                       .front(),
+                                        .execution = TransferEngine::instance()
+                                                         .allocatePersistentTransferExecutionLanes(
+                                                             1u,
+                                                             DeviceId::cuda(0),
+                                                             "three_tier:" + identity)
+                                                         .front(),
                                         .lane_name = "three_tier:" + identity,
                                         .perf_device = "cuda-hot/rocm-warm/cpu-cold",
                                         .collect_timing_measurements = true,
@@ -1370,8 +1427,18 @@ namespace llaminar2
                                 ExpertTierWeightTransferLane>(
                                 ExpertTierWeightTransferLane::Config{
                                     .device = DeviceId::cuda(0),
-                                    .staging_capacity_bytes =
-                                        layout.chunkBytes(1),
+                                    .staging = TransferEngine::instance()
+                                                   .allocatePersistentTransferStagingSlices(
+                                                       layout.chunkBytes(1),
+                                                       1u,
+                                                       DeviceId::cuda(0))
+                                                   .front(),
+                                    .execution = TransferEngine::instance()
+                                                     .allocatePersistentTransferExecutionLanes(
+                                                         1u,
+                                                         DeviceId::cuda(0),
+                                                         "cuda_cpu_rotation:" + identity)
+                                                     .front(),
                                     .lane_name =
                                         "cuda_cpu_rotation:" + identity,
                                     .perf_device = "cuda-hot/cpu-cold",

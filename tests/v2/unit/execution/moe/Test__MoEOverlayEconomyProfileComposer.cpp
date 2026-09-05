@@ -179,6 +179,10 @@ namespace llaminar2::test
         MoEOverlayEconomyMeasurements completeMeasurements()
         {
             MoEOverlayEconomyMeasurements result;
+            result.production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    metadata().num_layers,
+                    kAllExpertHistogramProductionSources);
             result.service_measurement_identity =
                 "prepared-generation-17/service-events";
             result.migration_measurement_identity =
@@ -441,7 +445,10 @@ namespace llaminar2::test
         const auto model = metadata();
         const auto owner_map = MoEExpertOwnerMap::build(plan);
         auto measurements = completeMeasurements();
-        measurements.active_sources = {true, true, false};
+        measurements.production_topology =
+            ExpertHistogramProductionTopology::uniform(
+                model.num_layers,
+                {true, true, false});
         for (auto &row : measurements.participant_service)
         {
             row.nanoseconds_per_activation[2] = 0;
@@ -455,7 +462,7 @@ namespace llaminar2::test
             {});
         ASSERT_TRUE(profiles.valid());
         EXPECT_EQ(
-            profiles.service->active_sources,
+            profiles.service->production_topology.activeSources(),
             (ExpertHistogramProductionSourceMask{true, true, false}));
         for (const auto &row : profiles.service->costs)
             EXPECT_EQ(row.nanoseconds_per_activation[2], 0u);
@@ -487,7 +494,10 @@ namespace llaminar2::test
             std::logic_error);
 
         auto inconsistent = completeMeasurements();
-        inconsistent.active_sources = {true, true, false};
+        inconsistent.production_topology =
+            ExpertHistogramProductionTopology::uniform(
+                model.num_layers,
+                {true, true, false});
         EXPECT_THROW(
             (void)MoEOverlayEconomyProfileComposer::compose(
                 plan,
@@ -549,6 +559,58 @@ namespace llaminar2::test
 
     TEST(
         MoEOverlayEconomyProfileComposer,
+        FixedMTPTopologyRequiresOnlyPhasesReachableByEachRetainedLayer)
+    {
+        const ExpertHistogramProductionTopology topology(
+            {
+                /* Serial catch-up is reachable on the main-model layer. */
+                ExpertHistogramProductionSourceMask{true, true, true},
+                /* The retained predictor sidecar executes only MTP work. */
+                ExpertHistogramProductionSourceMask{false, false, true},
+            },
+            {
+                /* Fixed positive-depth economics price steady-state phases. */
+                ExpertHistogramProductionSourceMask{false, true, true},
+                ExpertHistogramProductionSourceMask{false, false, true},
+            });
+        std::vector<MoEOverlayParticipantLayerServiceTotals> totals{
+            {.participant_id = 0,
+             .layer = 0,
+             .total_nanoseconds = {101, 201, 301},
+             .activation_count = {1, 4, 5},
+             .sample_count = {1, 3, 3}},
+            {.participant_id = 0,
+             .layer = 1,
+             .total_nanoseconds = {0, 0, 401},
+             .activation_count = {0, 0, 4},
+             .sample_count = {0, 0, 3}},
+        };
+
+        const auto normalized =
+            MoEOverlayEconomyProfileComposer::normalizeServiceTotals(
+                totals, topology);
+        ASSERT_EQ(normalized.size(), 2u);
+        EXPECT_EQ(
+            normalized[0].nanoseconds_per_activation,
+            (std::array<uint64_t,
+                        kExpertHistogramProductionSourceCount>{0, 51, 61}));
+        EXPECT_EQ(
+            normalized[1].nanoseconds_per_activation,
+            (std::array<uint64_t,
+                        kExpertHistogramProductionSourceCount>{0, 0, 101}));
+
+        /* Evidence from a graph that cannot reach this layer is corruption. */
+        totals[1].total_nanoseconds[1] = 1;
+        totals[1].activation_count[1] = 1;
+        totals[1].sample_count[1] = 1;
+        EXPECT_THROW(
+            (void)MoEOverlayEconomyProfileComposer::normalizeServiceTotals(
+                std::move(totals), topology),
+            std::invalid_argument);
+    }
+
+    TEST(
+        MoEOverlayEconomyProfileComposer,
         StaticInitialPlacementCanBeCertifiedForDynamicMaintenance)
     {
         auto plan = arbitraryPriorityPlan();
@@ -586,7 +648,9 @@ namespace llaminar2::test
         };
         const auto normalized =
             MoEOverlayEconomyProfileComposer::normalizeServiceTotals(
-                std::move(totals));
+                std::move(totals),
+                ExpertHistogramProductionTopology::uniform(
+                    2, kAllExpertHistogramProductionSources));
         ASSERT_EQ(normalized.size(), 2u);
         EXPECT_EQ(normalized[0].participant_id, 0);
         EXPECT_EQ(normalized[0].layer, 0);
@@ -614,7 +678,9 @@ namespace llaminar2::test
         };
         EXPECT_THROW(
             (void)MoEOverlayEconomyProfileComposer::normalizeServiceTotals(
-                {missing_phase}),
+                {missing_phase},
+                ExpertHistogramProductionTopology::uniform(
+                    1, kAllExpertHistogramProductionSources)),
             std::invalid_argument);
 
         auto overflowed = missing_phase;
@@ -624,7 +690,9 @@ namespace llaminar2::test
         overflowed.overflowed[2] = true;
         EXPECT_THROW(
             (void)MoEOverlayEconomyProfileComposer::normalizeServiceTotals(
-                {overflowed}),
+                {overflowed},
+                ExpertHistogramProductionTopology::uniform(
+                    1, kAllExpertHistogramProductionSources)),
             std::invalid_argument);
     }
 
@@ -673,7 +741,8 @@ namespace llaminar2::test
         const auto normalized = MoEOverlayEconomyProfileComposer::
             normalizeEquivalentServiceTotals(
                 std::move(totals),
-                kAllExpertHistogramProductionSources,
+                ExpertHistogramProductionTopology::uniform(
+                    3, kAllExpertHistogramProductionSources),
                 catalog);
         ASSERT_EQ(normalized.size(), 6u);
 
@@ -730,7 +799,8 @@ namespace llaminar2::test
         const auto normalized = MoEOverlayEconomyProfileComposer::
             normalizeEquivalentServiceTotals(
                 sparse,
-                kAllExpertHistogramProductionSources,
+                ExpertHistogramProductionTopology::uniform(
+                    2, kAllExpertHistogramProductionSources),
                 catalog);
         ASSERT_EQ(normalized.size(), 2u);
         EXPECT_EQ(
@@ -746,7 +816,8 @@ namespace llaminar2::test
             (void)MoEOverlayEconomyProfileComposer::
                 normalizeEquivalentServiceTotals(
                     sparse,
-                    kAllExpertHistogramProductionSources,
+                    ExpertHistogramProductionTopology::uniform(
+                        2, kAllExpertHistogramProductionSources),
                     catalog),
             std::invalid_argument);
     }

@@ -19,6 +19,9 @@
 #include "backends/IWorkerGPUContext.h"
 #include "backends/IGPUGraphCapture.h"
 
+#include <hip/hip_runtime.h>
+
+#include <array>
 #include <memory>
 #include <string>
 
@@ -140,6 +143,66 @@ TEST_F(Test__HIPGraphCapture, DoubleResetIsSafe)
 
         EXPECT_FALSE(capture->hasExecutable());
         EXPECT_EQ(capture->nodeCount(), 0u);
+    });
+}
+
+/**
+ * @test Ordered-timeline event instrumentation measures the retained child.
+ *
+ * The terminal stream synchronization is test-only observation. Production
+ * collection uses the same event query through the non-blocking snapshot API.
+ */
+TEST_F(Test__HIPGraphCapture, OrderedTimelinePerStepTimingIsConsumable)
+{
+    ctx().submitAndWait([&] {
+        auto *const stream =
+            static_cast<hipStream_t>(ctx().defaultStream());
+        ASSERT_NE(stream, nullptr);
+
+        void *device_bytes = nullptr;
+        ASSERT_EQ(hipMalloc(&device_bytes, 4096u), hipSuccess);
+
+        auto child = ctx().createGraphCapture();
+        ASSERT_NE(child, nullptr);
+        ASSERT_TRUE(child->beginCapture());
+        ASSERT_EQ(
+            hipMemsetAsync(device_bytes, 0x5a, 4096u, stream),
+            hipSuccess);
+        ASSERT_TRUE(child->endCapture());
+        ASSERT_GT(child->nodeCount(), 0u);
+
+        auto parent = ctx().createGraphCapture();
+        ASSERT_NE(parent, nullptr);
+        const std::array<GPUOrderedTimelineStep, 1> steps{{{
+            .name = "timed_memset",
+            .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+            .capture = child.get(),
+        }}};
+        ASSERT_TRUE(parent->buildOrderedTimelineTransaction(
+            steps,
+            GPUOrderedTimelineInstrumentation::PerStepEvents));
+        EXPECT_EQ(parent->nodeCount(), child->nodeCount() + 2u);
+        EXPECT_EQ(
+            parent->consumeOrderedTimelineTiming().state,
+            GPUOrderedTimelineTimingState::AwaitingLaunch);
+
+        ASSERT_TRUE(parent->instantiate());
+        ASSERT_TRUE(parent->launch());
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        const auto snapshot = parent->consumeOrderedTimelineTiming();
+        ASSERT_EQ(snapshot.state, GPUOrderedTimelineTimingState::Complete);
+        ASSERT_EQ(snapshot.samples.size(), 1u);
+        EXPECT_EQ(snapshot.samples.front().name, "timed_memset");
+        EXPECT_EQ(
+            snapshot.samples.front().kind,
+            GPUOrderedTimelineStepKind::CapturedFragment);
+        EXPECT_GE(snapshot.samples.front().elapsed_ms, 0.0);
+        EXPECT_EQ(
+            parent->consumeOrderedTimelineTiming().state,
+            GPUOrderedTimelineTimingState::AwaitingLaunch);
+
+        EXPECT_EQ(hipFree(device_bytes), hipSuccess);
     });
 }
 

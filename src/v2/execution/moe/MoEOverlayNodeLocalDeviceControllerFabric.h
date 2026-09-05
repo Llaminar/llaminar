@@ -72,6 +72,8 @@ namespace llaminar2
         MoEOverlayDeviceControllerCommandHeader *command = nullptr;
         MoEOverlayDeviceMovementCommand *command_entries = nullptr;
         const std::uint64_t *payload_bytes_per_layer = nullptr;
+        /** Immutable restoration target captured from the prepared owner map. */
+        const std::uint32_t *initial_owner_participants = nullptr;
         /** Leader-owned phase-separated demand retained across transactions. */
         std::uint64_t *demand_history = nullptr;
         /** Immutable measured economy published by the host evidence owner. */
@@ -183,6 +185,14 @@ namespace llaminar2
             std::uint64_t initial_durable_epoch = 1u;
             /** Exact complete packed expert bytes; required by Dynamic policy. */
             std::vector<std::uint64_t> payload_bytes_per_layer;
+            /**
+             * Loader-prepared owner table in canonical `[layer][expert]` order.
+             *
+             * Dynamic services require one entry per coordinate. The table is
+             * copied once into immutable mapped pages and is consumed only by
+             * the device authority's terminal context-restoration policy.
+             */
+            std::vector<std::uint32_t> initial_owner_participants;
             /** Observation floor before an epoch is economically meaningful. */
             std::uint64_t minimum_window_activations = 1u;
             /** Tunable complete-cycle budget for one asynchronous epoch wave. */

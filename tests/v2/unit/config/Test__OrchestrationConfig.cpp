@@ -505,6 +505,36 @@ TEST(Test__OrchestrationConfig,
         }));
 }
 
+TEST(Test__OrchestrationConfig,
+     Validate_MigrationExecutionStreamsMustFitTransferSlots)
+{
+    auto config = OrchestrationConfig::defaults();
+    config.moe_rebalance.migration_transfer_slots = 8u;
+    config.moe_rebalance.migration_execution_streams = 9u;
+
+    auto errors = config.validate();
+    EXPECT_TRUE(std::any_of(
+        errors.begin(),
+        errors.end(),
+        [](const std::string &error)
+        {
+            return error.find(
+                       "execution streams cannot exceed transfer slots") !=
+                   std::string::npos;
+        }));
+
+    config.moe_rebalance.migration_execution_streams = 3u;
+    errors = config.validate();
+    EXPECT_FALSE(std::any_of(
+        errors.begin(),
+        errors.end(),
+        [](const std::string &error)
+        {
+            return error.find("migration execution streams") !=
+                   std::string::npos;
+        }));
+}
+
 TEST(Test__OrchestrationConfig, Validate_DynamicRebalanceGeometryAtAdmission)
 {
     const auto contains = [](const auto &errors, const std::string &needle)

@@ -30,6 +30,7 @@ namespace llaminar2
     class IComputeStage;
     class IWorkspaceConsumer;
     class IBackend;
+    class PhysicalMemoryAuthority;
 
     /**
      * @brief Declares the physical lifetime relationship between executable graphs.
@@ -277,7 +278,17 @@ namespace llaminar2
     class WorkspaceAllocator
     {
     public:
+        /** @brief Construct an unbound allocator for device-free/unit tests. */
         WorkspaceAllocator() = default;
+
+        /**
+         * @brief Construct the production allocator under one memory authority.
+         * @param physical_memory_authority Rank-bound CPU/GPU allocation ledger.
+         * @throws std::invalid_argument for a null authority.
+         */
+        explicit WorkspaceAllocator(
+            std::shared_ptr<PhysicalMemoryAuthority>
+                physical_memory_authority);
         ~WorkspaceAllocator() = default;
 
         // Non-copyable
@@ -287,6 +298,24 @@ namespace llaminar2
         // Movable
         WorkspaceAllocator(WorkspaceAllocator &&) = default;
         WorkspaceAllocator &operator=(WorkspaceAllocator &&) = default;
+
+        /**
+         * @brief Bind a test-created or retained allocator before allocation.
+         *
+         * Reinstalling the same object is idempotent. Replacing an authority,
+         * or binding after a manager exists, is rejected because either would
+         * split accounting for live backend blocks.
+         */
+        void installPhysicalMemoryAuthority(
+            std::shared_ptr<PhysicalMemoryAuthority>
+                physical_memory_authority);
+
+        /** @return Installed production authority, or null for test-only use. */
+        [[nodiscard]] std::shared_ptr<PhysicalMemoryAuthority>
+        physicalMemoryAuthority() const noexcept
+        {
+            return physical_memory_authority_;
+        }
 
         // =====================================================================
         // Memory Query
@@ -451,6 +480,10 @@ namespace llaminar2
         size_t deviceCount() const { return device_workspaces_.size(); }
 
     private:
+        /** Sole authority retained by every physical workspace block. */
+        std::shared_ptr<PhysicalMemoryAuthority>
+            physical_memory_authority_;
+
         /// Per-device workspace managers
         std::unordered_map<DeviceId, std::unique_ptr<DeviceWorkspaceManager>> device_workspaces_;
 
@@ -472,6 +505,12 @@ namespace llaminar2
          * @brief Compute model-aware minimum budget floor
          */
         size_t computeModelAwareBudgetFloor(const WorkspaceSizingHints &hints) const;
+
+        /** @brief Construct one manager with the installed authority identity. */
+        [[nodiscard]] std::unique_ptr<DeviceWorkspaceManager>
+        createDeviceWorkspaceManager(
+            DeviceId device,
+            size_t budget_bytes) const;
     };
 
 } // namespace llaminar2

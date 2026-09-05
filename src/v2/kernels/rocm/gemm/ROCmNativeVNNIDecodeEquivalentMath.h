@@ -26,7 +26,7 @@
 /**
  * @brief Commit one single-scale NativeVNNI K block in serial-decode order.
  *
- * Movable-expert projection first rounds the activation/weight scale product,
+ * GPU-aligned expert projection first rounds the activation/weight scale product,
  * then its multiplication by the exact INT32 dot product, and finally adds the
  * persisted contribution to the running accumulator. The shared contract owns
  * the HIP dependency barriers required to retain those rounding edges.

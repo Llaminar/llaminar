@@ -6,7 +6,7 @@
 
 #include "TensorFactory.h"
 #include "BlockStructures.h"
-#include "TensorClasses.h" // For FP32Tensor::createMapped()
+#include "TensorClasses.h"
 #include "../utils/Logger.h"
 #include <cerrno>
 #include <stdexcept>
@@ -45,22 +45,9 @@ namespace llaminar2
             bindToNumaNode();
         }
 
-        // For GPU devices, use mapped memory if enabled
-        // Mapped memory enables zero-copy host access (avoids slow memcpy syncs)
-        if (use_mapped_memory_for_gpu_ && device.is_gpu())
-        {
-            LOG_TRACE("[TensorFactory::createFP32] Using mapped memory for GPU tensor");
-            auto mapped = FP32Tensor::createMapped(shape, device);
-            if (!mapped)
-            {
-                throw std::runtime_error(
-                    "TensorFactory::createFP32 required mapped GPU storage but "
-                    "allocation failed on " +
-                    device.toString());
-            }
-            return mapped;
-        }
-
+        // Generic tensor construction always creates ordinary storage. Shared
+        // GPU-visible host pages are an explicit TransferEngine allocation so
+        // graph activation placement cannot change through factory state.
         return std::make_unique<FP32Tensor>(shape, device);
     }
 

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include "../../../utils/DebugEnv.h"
 
@@ -1963,110 +1964,68 @@ __global__ void rocm_gdn_publish_capture_rows_from_device_indices_kernel(
     }
 }
 
-__global__ void rocm_gdn_compact_modular_conv_state_kernel(
+/**
+ * @brief Convert rank-major allgather output to modulo-linked group order.
+ */
+__global__ void rocm_gdn_reassemble_modulo_linked_state_kernel(
     const float *__restrict__ gathered,
     float *__restrict__ full,
     int degree,
-    int qk_channels,
-    int local_v_channels,
-    int full_v_channels,
-    int history_len)
+    int global_key_heads,
+    int repeat_factor,
+    int key_elements_per_head,
+    int value_elements_per_head,
+    int prefix_group_count)
 {
     if (!gathered || !full ||
-        degree <= 0 || qk_channels <= 0 ||
-        local_v_channels <= 0 || full_v_channels <= 0 ||
-        history_len <= 0)
+        degree <= 0 || global_key_heads <= 0 ||
+        global_key_heads % degree != 0 || repeat_factor <= 0 ||
+        key_elements_per_head < 0 || value_elements_per_head <= 0 ||
+        prefix_group_count < 0)
     {
         return;
     }
 
-    const int local_channels = qk_channels + local_v_channels;
-    const int full_channels = qk_channels + full_v_channels;
-    const int local_state_size = local_channels * history_len;
-    const int full_state_size = full_channels * history_len;
+    const int local_key_heads = global_key_heads / degree;
+    const int local_key_group = local_key_heads * key_elements_per_head;
+    const int full_key_group = global_key_heads * key_elements_per_head;
+    const int local_value_group = local_key_heads * value_elements_per_head;
+    const int full_value_group = global_key_heads * value_elements_per_head;
+    const int local_prefix = prefix_group_count * local_key_group;
+    const int full_prefix = prefix_group_count * full_key_group;
+    const int local_state_size =
+        local_prefix + repeat_factor * local_value_group;
+    const int full_state_size =
+        full_prefix + repeat_factor * full_value_group;
     const int stride = blockDim.x * gridDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < full_state_size;
          idx += stride)
     {
-        const int channel = idx / history_len;
-        const int history = idx - channel * history_len;
-        size_t src_idx = 0;
-        if (channel < qk_channels)
+        int participant = 0;
+        int participant_offset = 0;
+        if (idx < full_prefix)
         {
-            src_idx = static_cast<size_t>(channel) * static_cast<size_t>(history_len) +
-                      static_cast<size_t>(history);
+            const int group = idx / full_key_group;
+            const int within_group = idx - group * full_key_group;
+            participant = within_group / local_key_group;
+            participant_offset =
+                group * local_key_group + within_group % local_key_group;
         }
         else
         {
-            const int v_channel = channel - qk_channels;
-            const int rank = v_channel / local_v_channels;
-            const int local_v_channel = v_channel - rank * local_v_channels;
-            if (rank < 0 || rank >= degree)
-                continue;
-            src_idx = static_cast<size_t>(rank) * static_cast<size_t>(local_state_size) +
-                      static_cast<size_t>(qk_channels + local_v_channel) *
-                          static_cast<size_t>(history_len) +
-                      static_cast<size_t>(history);
+            const int value_offset = idx - full_prefix;
+            const int repeat = value_offset / full_value_group;
+            const int within_group = value_offset - repeat * full_value_group;
+            participant = within_group / local_value_group;
+            participant_offset =
+                local_prefix + repeat * local_value_group +
+                within_group % local_value_group;
         }
-        full[idx] = gathered[src_idx];
-    }
-}
-
-/**
- * @brief Slice one participant's modular short-conv bank from a full bank.
- *
- * Q and K history are replicated in modular GDN TP, while V history is sharded.
- * The grouped verifier needs the economical local layout, so this helper copies
- * all mirrored Q/K channels and only this rank's V slice.
- */
-__global__ void rocm_gdn_slice_modular_conv_state_kernel(
-    const float *__restrict__ full,
-    float *__restrict__ local,
-    int rank,
-    int degree,
-    int qk_channels,
-    int local_v_channels,
-    int full_v_channels,
-    int history_len)
-{
-    if (!full || !local ||
-        rank < 0 || rank >= degree ||
-        degree <= 0 || qk_channels <= 0 ||
-        local_v_channels <= 0 || full_v_channels <= 0 ||
-        history_len <= 0)
-    {
-        return;
-    }
-
-    const int local_channels = qk_channels + local_v_channels;
-    const int full_channels = qk_channels + full_v_channels;
-    const int local_state_size = local_channels * history_len;
-    const int stride = blockDim.x * gridDim.x;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < local_state_size;
-         idx += stride)
-    {
-        const int channel = idx / history_len;
-        const int history = idx - channel * history_len;
-        size_t src_idx = 0;
-        if (channel < qk_channels)
-        {
-            src_idx = static_cast<size_t>(channel) * static_cast<size_t>(history_len) +
-                      static_cast<size_t>(history);
-        }
-        else
-        {
-            const int local_v_channel = channel - qk_channels;
-            const int full_v_channel = rank * local_v_channels + local_v_channel;
-            if (full_v_channel < 0 || full_v_channel >= full_v_channels)
-                continue;
-            src_idx = static_cast<size_t>(qk_channels + full_v_channel) *
-                          static_cast<size_t>(history_len) +
-                      static_cast<size_t>(history);
-        }
-        if (src_idx < static_cast<size_t>(full_channels) * static_cast<size_t>(history_len))
-            local[idx] = full[src_idx];
+        full[idx] = gathered[
+            static_cast<size_t>(participant) *
+                static_cast<size_t>(local_state_size) +
+            static_cast<size_t>(participant_offset)];
     }
 }
 
@@ -2268,22 +2227,37 @@ bool rocmGDN_gpu_publish_capture_terminal_rows_from_device_lengths(
     return true;
 }
 
-bool rocmGDN_compact_modular_conv_state(
+bool rocmGDN_reassemble_modulo_linked_state(
     const float *gathered,
     float *full,
     int degree,
-    int qk_channels,
-    int local_v_channels,
-    int full_v_channels,
-    int history_len,
+    int global_key_heads,
+    int global_value_heads,
+    int key_elements_per_head,
+    int value_elements_per_head,
+    int prefix_group_count,
     int device_idx,
     void *stream)
 {
     if (!gathered || !full || !stream ||
-        degree <= 0 || qk_channels <= 0 ||
-        local_v_channels <= 0 || full_v_channels <= 0 ||
-        full_v_channels != local_v_channels * degree ||
-        history_len <= 0)
+        degree <= 0 || global_key_heads <= 0 ||
+        global_value_heads <= 0 ||
+        global_key_heads % degree != 0 ||
+        global_value_heads % global_key_heads != 0 ||
+        (prefix_group_count != 0 && prefix_group_count != 2) ||
+        (prefix_group_count > 0 && key_elements_per_head <= 0) ||
+        value_elements_per_head <= 0)
+    {
+        return false;
+    }
+
+    const long long full_state_size_wide =
+        static_cast<long long>(prefix_group_count) * global_key_heads *
+            key_elements_per_head +
+        static_cast<long long>(global_value_heads) *
+            value_elements_per_head;
+    if (full_state_size_wide <= 0 ||
+        full_state_size_wide > std::numeric_limits<int>::max())
     {
         return false;
     }
@@ -2292,13 +2266,13 @@ bool rocmGDN_compact_modular_conv_state(
     if (set_err != hipSuccess)
     {
         fprintf(stderr,
-                "[rocmGDN_compact_modular_conv_state] hipSetDevice(%d) failed: %s\n",
+                "[rocmGDN_reassemble_modulo_linked_state] hipSetDevice(%d) failed: %s\n",
                 device_idx,
                 hipGetErrorString(set_err));
         return false;
     }
     (void)hipGetLastError();
-    const int full_state_size = (qk_channels + full_v_channels) * history_len;
+    const int full_state_size = static_cast<int>(full_state_size_wide);
     constexpr int threads = 256;
     int blocks = (full_state_size + threads - 1) / threads;
     if (blocks < 1)
@@ -2306,7 +2280,7 @@ bool rocmGDN_compact_modular_conv_state(
     if (blocks > 1024)
         blocks = 1024;
     hipLaunchKernelGGL(
-        rocm_gdn_compact_modular_conv_state_kernel,
+        rocm_gdn_reassemble_modulo_linked_state_kernel,
         dim3(blocks),
         dim3(threads),
         0,
@@ -2314,79 +2288,16 @@ bool rocmGDN_compact_modular_conv_state(
         gathered,
         full,
         degree,
-        qk_channels,
-        local_v_channels,
-        full_v_channels,
-        history_len);
+        global_key_heads,
+        global_value_heads / global_key_heads,
+        key_elements_per_head,
+        value_elements_per_head,
+        prefix_group_count);
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
         fprintf(stderr,
-                "[rocmGDN_compact_modular_conv_state] %s\n",
-                hipGetErrorString(err));
-        return false;
-    }
-    return true;
-}
-
-bool rocmGDN_slice_modular_conv_state(
-    const float *full,
-    float *local,
-    int rank,
-    int degree,
-    int qk_channels,
-    int local_v_channels,
-    int full_v_channels,
-    int history_len,
-    int device_idx,
-    void *stream)
-{
-    if (!full || !local || !stream ||
-        rank < 0 || rank >= degree ||
-        degree <= 0 || qk_channels <= 0 ||
-        local_v_channels <= 0 || full_v_channels <= 0 ||
-        full_v_channels != local_v_channels * degree ||
-        history_len <= 0)
-    {
-        return false;
-    }
-
-    hipError_t set_err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_idx));
-    if (set_err != hipSuccess)
-    {
-        fprintf(stderr,
-                "[rocmGDN_slice_modular_conv_state] hipSetDevice(%d) failed: %s\n",
-                device_idx,
-                hipGetErrorString(set_err));
-        return false;
-    }
-    (void)hipGetLastError();
-    const int local_state_size = (qk_channels + local_v_channels) * history_len;
-    constexpr int threads = 256;
-    int blocks = (local_state_size + threads - 1) / threads;
-    if (blocks < 1)
-        blocks = 1;
-    if (blocks > 1024)
-        blocks = 1024;
-    hipLaunchKernelGGL(
-        rocm_gdn_slice_modular_conv_state_kernel,
-        dim3(blocks),
-        dim3(threads),
-        0,
-        (hipStream_t)stream,
-        full,
-        local,
-        rank,
-        degree,
-        qk_channels,
-        local_v_channels,
-        full_v_channels,
-        history_len);
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr,
-                "[rocmGDN_slice_modular_conv_state] %s\n",
+                "[rocmGDN_reassemble_modulo_linked_state] %s\n",
                 hipGetErrorString(err));
         return false;
     }

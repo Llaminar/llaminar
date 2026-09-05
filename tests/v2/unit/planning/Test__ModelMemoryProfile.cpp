@@ -246,6 +246,55 @@ TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsExactMoEGeometry)
     EXPECT_EQ(profile.expert_shared_feed_forward_length, 768);
 }
 
+/**
+ * @brief A routed parent's outer expert axis must never masquerade as GEMM K.
+ */
+TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsLogicalMatrixKFrom3DExpertParent)
+{
+    GGUFModel model;
+    model.architecture = "qwen35moe";
+    model.block_count = 1;
+    setUInt32Metadata(model, "qwen35moe.expert_count", 256);
+
+    GGUFTensorInfo gate;
+    gate.name = "blk.0.ffn_gate_exps.weight";
+    // ModelLoader intentionally retains GGUF's [K, N, experts] order for 3-D
+    // parents so expert slicing can operate on the outer axis.
+    gate.dimensions = {3072, 1024, 256};
+    gate.type = GGUFTensorType::Q8_K;
+    gate.size_bytes = 1;
+    model.tensors.push_back(gate);
+
+    const auto profile = ModelMemoryProfile::fromGGUF(model);
+    ASSERT_EQ(profile.tensors.size(), 1u);
+    EXPECT_EQ(profile.tensors.front().elements,
+              3072ULL * 1024ULL * 256ULL);
+    EXPECT_EQ(profile.tensors.front().K, 3072u);
+
+    const auto serialized = profile.serialize();
+    const auto restored = ModelMemoryProfile::deserialize(
+        serialized.data(), serialized.size());
+    ASSERT_EQ(restored.tensors.size(), 1u);
+    EXPECT_EQ(restored.tensors.front().K, 3072u);
+}
+
+/** @brief Reject malformed routed parents before any memory decision is made. */
+TEST(Test__ModelMemoryProfile, FromGGUF_RejectsMismatchedExpertAxis)
+{
+    GGUFModel model;
+    model.architecture = "qwen35moe";
+    setUInt32Metadata(model, "qwen35moe.expert_count", 256);
+
+    GGUFTensorInfo gate;
+    gate.name = "blk.0.ffn_gate_exps.weight";
+    gate.dimensions = {3072, 1024, 255};
+    gate.type = GGUFTensorType::Q8_K;
+    gate.size_bytes = 1;
+    model.tensors.push_back(gate);
+
+    EXPECT_THROW(ModelMemoryProfile::fromGGUF(model), std::invalid_argument);
+}
+
 TEST(Test__ModelMemoryProfile, FromGGUF_SumsTensorBytes)
 {
     auto model = createTestModel();

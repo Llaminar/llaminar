@@ -60,6 +60,7 @@
 #include "fort.hpp"                                    // libfort for TP profiling summary table
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <future>
 #include <iomanip>
 #include <limits>
@@ -79,17 +80,16 @@ namespace llaminar2
     namespace
     {
         /**
-         * @brief Resolve the exact packed LocalTP layout of one GDN Q/K/V row.
+         * @brief Resolve the exact packed LocalTP layout of one GDN checkpoint.
          *
-         * The current linked-head preparation partitions Q, K, and V together;
-         * an older GPU preparation layout replicates Q/K and partitions only V.
-         * Both representations are mathematically valid and have distinct local
-         * row widths.  Authenticate exactly one representation from the global
-         * model geometry plus every participant's captured width, rejecting an
-         * ambiguous or incomplete shape instead of guessing.
+         * Production preparation partitions Q, K, and every modulo-linked V
+         * repeat together. The semantic stage selects whether the captured row
+         * contains fused Q/K/V vectors, value vectors, or value scalars. The
+         * retired replicated-Q/K GPU representation is deliberately rejected.
          *
          * @param device_data Captured participant rows with stable TP indices.
          * @param tp_degree Number of participants required by the LocalTP cell.
+         * @param stage_type Schema-facing semantic checkpoint name.
          * @param key_heads Global GDN Q/K head count.
          * @param value_heads Global GDN V head count.
          * @param state_width Elements per GDN head.
@@ -99,6 +99,7 @@ namespace llaminar2
         std::vector<SnapshotColumnGroup> resolvePackedGDNColumnGroups(
             const std::vector<DeviceSnapshotData> &device_data,
             int tp_degree,
+            const std::string &stage_type,
             int key_heads,
             int value_heads,
             int state_width,
@@ -111,11 +112,8 @@ namespace llaminar2
                 return std::vector<SnapshotColumnGroup>{};
             };
 
-            if (tp_degree <= 0 || key_heads <= 0 || value_heads <= 0 ||
-                state_width <= 0 || value_heads % key_heads != 0)
-            {
-                return fail("invalid global GDN head geometry");
-            }
+            if (tp_degree <= 0)
+                return fail("invalid LocalTP degree");
             if (device_data.size() != static_cast<size_t>(tp_degree))
             {
                 return fail("not every LocalTP participant published the packed checkpoint");
@@ -137,141 +135,38 @@ namespace llaminar2
                 local_row_widths[participant] = device.cols;
             }
 
-            const size_t global_key_cols =
-                static_cast<size_t>(key_heads) *
-                static_cast<size_t>(state_width);
-            const size_t global_value_cols =
-                static_cast<size_t>(value_heads) *
-                static_cast<size_t>(state_width);
-            const size_t repeat_factor =
-                static_cast<size_t>(value_heads / key_heads);
-            const size_t linked_width_factor = 2u + repeat_factor;
-
-            std::vector<size_t> linked_key_cols(local_row_widths.size(), 0);
-            std::vector<size_t> linked_value_cols(local_row_widths.size(), 0);
-            bool linked_partition_valid = true;
-            size_t linked_key_total = 0;
-            size_t linked_value_total = 0;
-            for (size_t participant = 0;
-                 participant < local_row_widths.size(); ++participant)
+            ModuloLinkedGDNSnapshotLayout layout;
+            if (stage_type == "QKV_PROJECTION" ||
+                stage_type == "GDN_CONV1D_OUTPUT")
             {
-                const size_t local_width = local_row_widths[participant];
-                if (local_width == 0 ||
-                    local_width % linked_width_factor != 0)
-                {
-                    linked_partition_valid = false;
-                    break;
-                }
-                const size_t local_key_cols =
-                    local_width / linked_width_factor;
-                const size_t local_value_cols =
-                    local_key_cols * repeat_factor;
-                if (local_key_cols == 0 ||
-                    local_key_cols % static_cast<size_t>(state_width) != 0 ||
-                    local_value_cols % static_cast<size_t>(state_width) != 0)
-                {
-                    linked_partition_valid = false;
-                    break;
-                }
-                linked_key_cols[participant] = local_key_cols;
-                linked_value_cols[participant] = local_value_cols;
-                linked_key_total += local_key_cols;
-                linked_value_total += local_value_cols;
+                layout = ModuloLinkedGDNSnapshotLayout::FusedQKV;
             }
-            linked_partition_valid =
-                linked_partition_valid &&
-                linked_key_total == global_key_cols &&
-                linked_value_total == global_value_cols;
-
-            std::vector<size_t> replicated_key_cols(
-                local_row_widths.size(), global_key_cols);
-            std::vector<size_t> replicated_value_cols(
-                local_row_widths.size(), 0);
-            bool replicated_qk_valid = true;
-            size_t replicated_value_total = 0;
-            for (size_t participant = 0;
-                 participant < local_row_widths.size(); ++participant)
+            else if (stage_type == "GDN_Z_PROJECTION" ||
+                     stage_type == "GDN_RECURRENCE" ||
+                     stage_type == "GDN_DELTA_RULE_OUTPUT" ||
+                     stage_type == "GATED_RMSNORM" ||
+                     stage_type == "GDN_NORM_GATE_OUTPUT")
             {
-                const size_t local_width = local_row_widths[participant];
-                if (global_key_cols >
-                        std::numeric_limits<size_t>::max() / 2u ||
-                    local_width < 2u * global_key_cols)
-                {
-                    replicated_qk_valid = false;
-                    break;
-                }
-                const size_t local_value_cols =
-                    local_width - 2u * global_key_cols;
-                if (local_value_cols == 0 ||
-                    local_value_cols % static_cast<size_t>(state_width) != 0)
-                {
-                    replicated_qk_valid = false;
-                    break;
-                }
-                replicated_value_cols[participant] = local_value_cols;
-                replicated_value_total += local_value_cols;
+                layout = ModuloLinkedGDNSnapshotLayout::ValueVector;
             }
-            replicated_qk_valid =
-                replicated_qk_valid &&
-                replicated_value_total == global_value_cols;
-
-            if (linked_partition_valid == replicated_qk_valid)
+            else if (stage_type == "GDN_ALPHA" || stage_type == "GDN_BETA")
             {
-                std::ostringstream message;
-                message << "packed GDN widths select "
-                        << (linked_partition_valid ? "multiple" : "no")
-                        << " supported ownership layouts: [";
-                for (size_t participant = 0;
-                     participant < local_row_widths.size(); ++participant)
-                {
-                    if (participant != 0)
-                        message << ',';
-                    message << local_row_widths[participant];
-                }
-                message << "]";
-                return fail(message.str());
+                layout = ModuloLinkedGDNSnapshotLayout::ValueScalar;
+            }
+            else
+            {
+                return fail(
+                    "semantic stage has no modulo-linked GDN snapshot layout: " +
+                    stage_type);
             }
 
-            if (error)
-                error->clear();
-            if (linked_partition_valid)
-            {
-                return {
-                    SnapshotColumnGroup{
-                        .name = "Q",
-                        .global_cols = global_key_cols,
-                        .mode = SnapshotColumnGroupMode::PARTITIONED,
-                        .participant_cols = linked_key_cols},
-                    SnapshotColumnGroup{
-                        .name = "K",
-                        .global_cols = global_key_cols,
-                        .mode = SnapshotColumnGroupMode::PARTITIONED,
-                        .participant_cols = linked_key_cols},
-                    SnapshotColumnGroup{
-                        .name = "V",
-                        .global_cols = global_value_cols,
-                        .mode = SnapshotColumnGroupMode::PARTITIONED,
-                        .participant_cols = linked_value_cols},
-                };
-            }
-
-            return {
-                SnapshotColumnGroup{
-                    .name = "Q",
-                    .global_cols = global_key_cols,
-                    .mode = SnapshotColumnGroupMode::REPLICATED,
-                    .participant_cols = replicated_key_cols},
-                SnapshotColumnGroup{
-                    .name = "K",
-                    .global_cols = global_key_cols,
-                    .mode = SnapshotColumnGroupMode::REPLICATED,
-                    .participant_cols = replicated_key_cols},
-                SnapshotColumnGroup{
-                    .name = "V",
-                    .global_cols = global_value_cols,
-                    .mode = SnapshotColumnGroupMode::PARTITIONED,
-                    .participant_cols = replicated_value_cols},
-            };
+            return resolveModuloLinkedGDNSnapshotColumnGroups(
+                local_row_widths,
+                key_heads,
+                value_heads,
+                state_width,
+                layout,
+                error);
         }
 
         /**
@@ -1658,11 +1553,25 @@ namespace llaminar2
             const auto collective_bom =
                 CollectiveMemoryEstimator::localTP(
                     config_.max_seq_len,
-                    static_cast<int>(hidden_size));
+                    static_cast<int>(hidden_size),
+                    tp_ctx_->backend());
+
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority;
+            if (const auto concrete_model =
+                    std::dynamic_pointer_cast<ModelContext>(model_ctx_))
+            {
+                const auto weight_manager =
+                    concrete_model->concreteWeightManager();
+                memory_authority = weight_manager
+                                       ? weight_manager
+                                             ->physicalMemoryAuthority()
+                                       : nullptr;
+            }
 
             const bool reserved = tp_ctx_->reserveCollectiveResources(
-                collective_bom.backend_temp_bytes,
-                collective_bom.fp16_scratch_elements);
+                collective_bom.backend_payload_capacity_bytes,
+                collective_bom.fp16_scratch_elements,
+                memory_authority);
             logVramBomLine(
                 "collective_temp_reservation",
                 "source=RankOrchestrator backend=local_tp max_seq_len=" + std::to_string(config_.max_seq_len) +
@@ -1673,8 +1582,11 @@ namespace llaminar2
                         collective_bom.perDeviceBytes()));
             if (reserved)
             {
-                LOG_DEBUG("RankOrchestrator: Reserved collective temp buffer: "
-                          << collective_bom.backend_temp_bytes << " bytes ("
+                LOG_DEBUG("RankOrchestrator: Reserved collective resources: "
+                          << "logical_payload_capacity="
+                          << collective_bom.backend_payload_capacity_bytes
+                          << " bytes, physical_fp16_scratch="
+                          << collective_bom.fp16_scratch_bytes << " bytes ("
                           << "max_seq_len=" << config_.max_seq_len
                           << ", hidden_size=" << hidden_size
                           << ", precision=" << activationPrecisionToString(config_.activation_precision) << ")");
@@ -1886,7 +1798,6 @@ namespace llaminar2
                                                  runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
                                                  runner_config.moe_routed_prefill = config_.moe_routed_prefill;
                                                  runner_config.moe_rebalance = config_.moe_rebalance;
-                                                 runner_config.use_mapped_memory = config_.use_mapped_memory;
                                                  runner_config.prepared_weight_store = config_.prepared_weight_store;
                                                  runner_config.prepared_weight_admission =
                                                      config_.prepared_weight_admission;
@@ -2190,7 +2101,6 @@ namespace llaminar2
             runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
             runner_config.moe_routed_prefill = config_.moe_routed_prefill;
             runner_config.moe_rebalance = config_.moe_rebalance;
-            runner_config.use_mapped_memory = config_.use_mapped_memory;
             runner_config.prepared_weight_store = config_.prepared_weight_store;
             runner_config.prepared_weight_admission =
                 config_.prepared_weight_admission;
@@ -2254,7 +2164,6 @@ namespace llaminar2
                 nested_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
                 nested_config.moe_routed_prefill = config_.moe_routed_prefill;
                 nested_config.moe_rebalance = config_.moe_rebalance;
-                nested_config.use_mapped_memory = config_.use_mapped_memory;
                 nested_config.prepared_weight_store = config_.prepared_weight_store;
                 nested_config.prepared_weight_admission =
                     config_.prepared_weight_admission;
@@ -3102,8 +3011,24 @@ namespace llaminar2
                     device_runners_[index]->primaryDeviceId();
                 ROCmKernelProfiler::setCurrentDevice(device.ordinal);
                 CUDAKernelProfiler::setCurrentDevice(device.ordinal);
-                return device_runners_[index]
-                    ->materializeServingGraphFamilyWithoutLaunch(plan);
+                const auto started = std::chrono::steady_clock::now();
+                LOG_INFO(
+                    "[ServingGraphMaterialization] LocalTP worker begin"
+                    << " participant=" << index
+                    << " device=" << device.toString());
+                const bool success = device_runners_[index]
+                                         ->materializeServingGraphFamilyWithoutLaunch(
+                                             plan);
+                const auto elapsed = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started);
+                LOG_INFO(
+                    "[ServingGraphMaterialization] LocalTP worker complete"
+                    << " participant=" << index
+                    << " device=" << device.toString()
+                    << " success=" << (success ? "true" : "false")
+                    << " elapsed_ms=" << elapsed.count());
+                return success;
             });
 
         bool all_success = true;
@@ -4590,6 +4515,14 @@ namespace llaminar2
                     collect_timeout_ms,
                     tp_worker_pool_->completedCount(),
                     tp_worker_pool_->numWorkers());
+            }
+
+            if (!all_success && config_.moe_device_controller_fabric)
+            {
+                LOG_ERROR(
+                    "[RankOrchestrator] Fatal LocalTP ExpertOverlay epoch evidence "
+                    << config_.moe_device_controller_fabric
+                           ->describeInferenceEpochBarrier());
             }
 
             // Capture timing for decode breakdown (only in parallel mode)
@@ -8665,7 +8598,7 @@ namespace llaminar2
                             participant_digests.push_back(
                                 device_orchestrator
                                     ? device_orchestrator
-                                          ->captureFailedMirroredMTPDigests()
+                                          ->captureMirroredMTPDigests()
                                     : std::vector<MTPMirroredTensorDigest>{});
                         }
 
@@ -12969,7 +12902,7 @@ namespace llaminar2
                     participant_digests.push_back(
                         device_orchestrator
                             ? device_orchestrator
-                                  ->captureFailedMirroredMTPDigests()
+                                  ->captureMirroredMTPDigests()
                             : std::vector<MTPMirroredTensorDigest>{});
                 }
                 LOG_ERROR("[RankOrchestrator] Mirrored terminal device-generation ledgers disagree"
@@ -15100,7 +15033,7 @@ namespace llaminar2
         applyLogitsGatherSkipFlags();
     }
 
-    bool RankOrchestrator::waitForLastForwardCompletionForBenchmark()
+    bool RankOrchestrator::waitForLastInferenceCompletionForBenchmark()
     {
         const auto &participants =
             !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
@@ -15120,7 +15053,7 @@ namespace llaminar2
         {
             if (!participants[participant] ||
                 !participants[participant]
-                     ->waitForLastForwardCompletionForBenchmark())
+                     ->waitForLastInferenceCompletionForBenchmark())
             {
                 LOG_ERROR("[RankOrchestrator] Benchmark terminal-event wait failed for participant "
                           << participant);
@@ -17522,6 +17455,39 @@ namespace llaminar2
                stage_type == "MOE_SHARED_GATE_OUTPUT";
     }
 
+    bool RankOrchestrator::replicatedMTPSidecarSnapshotsActive() const noexcept
+    {
+        return tp_ctx_ &&
+               tp_ctx_->degree() > 1 &&
+               retainsMTPGraphCapacity(config_.mtp) &&
+               config_.mtp.sidecar_dense_policy ==
+                   MTPSidecarDensePolicy::ReplicatedPerParticipant;
+    }
+
+    bool RankOrchestrator::mtpSnapshotRetainsIndependentSharding(
+        const std::string &stage_type)
+    {
+        /*
+         * Replicating the learned predictor does not replicate its
+         * vocabulary table/head, nor does it replace ExpertOverlay's routed
+         * expert publication protocol.  Those authorities keep the ordinary
+         * schema layout while all other TP-shaped predictor intermediates are
+         * complete per-participant tensors.
+         */
+        static constexpr std::array<std::string_view, 5>
+            kIndependentlyOwnedMTPStages = {
+                "EMBEDDING",
+                "LM_HEAD",
+                "MOE_EXPERT_OUTPUT",
+                "MOE_ROUTE_CONTRIBUTIONS",
+                "MOE_SHARED_RANK_BANK_PUBLISH",
+            };
+        return std::find(
+                   kIndependentlyOwnedMTPStages.begin(),
+                   kIndependentlyOwnedMTPStages.end(),
+                   stage_type) != kIndependentlyOwnedMTPStages.end();
+    }
+
     SnapshotShardingMode RankOrchestrator::resolveSnapshotShardingMode(const std::string &key) const
     {
         /*
@@ -17562,6 +17528,28 @@ namespace llaminar2
 
         SnapshotShardingMode mode =
             getStageShardingMode(semantic_key, stage_sharding_map_);
+
+        /*
+         * Static schemas describe the main transformer's TP layout.  A
+         * replicated MTP predictor deliberately reuses the same semantic stage
+         * names while binding complete dense/shared weights and omitting the
+         * row-parallel collectives.  Reclassify only depth-qualified model
+         * checkpoints whose schema layout denotes a TP partial.  Independent
+         * vocabulary and ExpertOverlay publications retain their own authority
+         * above; UNKNOWN/GATHERED/ROOT_ONLY modes are never guessed here.
+         */
+        const std::string stage_type = extractStageType(semantic_key);
+        const bool schema_mode_is_tp_partial =
+            mode == SnapshotShardingMode::COLUMN_PARALLEL ||
+            mode == SnapshotShardingMode::PACKED_COLUMN_PARALLEL ||
+            mode == SnapshotShardingMode::ROW_PARALLEL;
+        if (mtp_model_snapshot &&
+            replicatedMTPSidecarSnapshotsActive() &&
+            schema_mode_is_tp_partial &&
+            !mtpSnapshotRetainsIndependentSharding(stage_type))
+        {
+            return SnapshotShardingMode::REPLICATED;
+        }
 
         /*
          * Phase-split MoE overlay uses DenseTP for prefill but switches dense and
@@ -17930,12 +17918,10 @@ namespace llaminar2
                  !result.device_data.empty())
         {
             /*
-             * Qwen GDN participants publish local `[Q|K|V]` rows. Resolve the
-             * compound layout from the model's authoritative head geometry and
-             * the shape reported by every real producing stage. This supports
-             * both linked-head partitioning and the older replicated-Q/K GPU
-             * representation without treating either as an ordinary contiguous
-             * column shard.
+             * Qwen GDN participants publish dependency-closed local rows.
+             * Resolve every semantic repeat from the model's authoritative
+             * head geometry and each producing stage's real shape; no retired
+             * replicated-Q/K representation is accepted.
              */
             std::string layout_error;
             if (!model_ctx_ || !model_ctx_->loader())
@@ -17956,6 +17942,7 @@ namespace llaminar2
                 result.column_groups = resolvePackedGDNColumnGroups(
                     result.device_data,
                     result.tp_degree,
+                    extractStageType(key),
                     key_heads,
                     value_heads,
                     state_width,
@@ -17987,6 +17974,30 @@ namespace llaminar2
         }
 
         return result;
+    }
+
+    std::string RankOrchestrator::describeFailedMirroredMTPState() const
+    {
+        if (!DebugEnv::isTruthyEnv(
+                "LLAMINAR_MTP_GRAPH_REUSE_DIAGNOSTICS"))
+        {
+            return {};
+        }
+
+        std::vector<std::vector<MTPMirroredTensorDigest>>
+            participant_digests;
+        participant_digests.reserve(device_runners_.size());
+        for (const auto &participant : device_runners_)
+        {
+            auto *device_orchestrator =
+                dynamic_cast<DeviceGraphOrchestrator *>(participant.get());
+            participant_digests.push_back(
+                device_orchestrator
+                    ? device_orchestrator
+                          ->captureMirroredMTPDigests()
+                    : std::vector<MTPMirroredTensorDigest>{});
+        }
+        return describeMirroredDigestMismatch(participant_digests);
     }
 
     std::vector<std::pair<std::string, SnapshotShardingMode>>

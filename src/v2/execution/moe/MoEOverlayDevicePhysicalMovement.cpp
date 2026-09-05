@@ -20,6 +20,16 @@ namespace llaminar2
     {
         using RequirementKey = std::tuple<int, int, int>;
 
+        /** @return Whether @p kind changes durable expert ownership. */
+        bool durablePlacementKind(
+            MoEOverlayDeviceControllerTransactionKind kind) noexcept
+        {
+            return kind == MoEOverlayDeviceControllerTransactionKind::
+                               DynamicPlacement ||
+                   kind == MoEOverlayDeviceControllerTransactionKind::
+                               PreparedContextRestore;
+        }
+
         /** Mix one canonical word into two independent transaction lanes. */
         void mixWord(
             MoEOverlayResidencyExecutionFingerprint &fingerprint,
@@ -417,8 +427,7 @@ namespace llaminar2
                     migration.destination.owner_participant ||
                 !migration.source.device.is_gpu() ||
                 !migration.destination.device.is_gpu() ||
-                (kind == MoEOverlayDeviceControllerTransactionKind::
-                             DynamicPlacement &&
+                (durablePlacementKind(kind) &&
                  migration.axis ==
                      MoEOptimizationMovementAxis::ParticipantPlacement &&
                  migration.crossesTier()) ||
@@ -430,8 +439,7 @@ namespace llaminar2
             }
             bytes += static_cast<std::uint64_t>(
                 migration.estimated_weight_bytes);
-            if (kind ==
-                    MoEOverlayDeviceControllerTransactionKind::DynamicPlacement &&
+            if (durablePlacementKind(kind) &&
                 !durable_experts.emplace(
                      migration.layer_idx, migration.expert_id).second)
             {
@@ -451,6 +459,7 @@ namespace llaminar2
                    migrations.empty() && migration_cycles.empty() &&
                    shadow_requirements.empty() && packed_weight_bytes == 0u;
         case MoEOverlayDeviceControllerTransactionKind::DynamicPlacement:
+        case MoEOverlayDeviceControllerTransactionKind::PreparedContextRestore:
         {
             if (migrations.empty())
             {
@@ -564,8 +573,7 @@ namespace llaminar2
         }
 
         result.shadow_requirements = shadowRequirements(result.migrations);
-        if (result.kind ==
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement &&
+        if (durablePlacementKind(result.kind) &&
             !result.migrations.empty())
         {
             result.migration_cycles = durableCycles(

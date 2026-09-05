@@ -124,6 +124,12 @@ namespace llaminar2
             throw std::invalid_argument(
                 "GPU peer tier lane requires two same-backend GPU endpoints");
         }
+        if (!config_.execution.valid() ||
+            config_.execution.device() != config_.destination_device)
+        {
+            throw std::invalid_argument(
+                "GPU peer tier lane requires one matching destination execution lane");
+        }
         if (config_.lane_name.empty())
             throw std::invalid_argument(
                 "GPU peer tier lane requires a stable non-empty name");
@@ -216,8 +222,7 @@ namespace llaminar2
                 &GPUDeviceContextPool::instance().getContext(
                     config_.destination_device);
             destination_ordinal_ = config_.destination_device.gpu_ordinal();
-            transfer_stream_ = destination_context_->getOrCreateAuxiliaryStream(
-                "expert_tier_gpu_peer:" + config_.lane_name);
+            transfer_stream_ = config_.execution.stream();
             completion_event_ = backend_->createEvent(destination_ordinal_);
             if (config_.collect_timing_measurements)
             {

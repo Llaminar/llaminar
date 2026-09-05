@@ -3,10 +3,11 @@
  * @brief Captured fixed-capacity GPU publication for heterogeneous MoE rows.
  *
  * The stage is the final producer in a native GPU graph segment. It copies the
- * router outputs, normalized hidden rows, and device-owned logical row count to
- * one model-lifetime pinned ticket and then system-release publishes its
- * isolated mapped timeline word. The following explicitly declared manual
- * participant boundary acquires only that word, never the graph terminal.
+ * router outputs, normalized hidden rows, and device-owned logical row count
+ * through one model-lifetime mapped ticket's device alias, then system-release
+ * publishes its isolated mapped timeline word. The following explicitly
+ * declared manual participant boundary acquires only that word, never the graph
+ * terminal. No captured D2H memcpy node participates in the transaction.
  */
 
 #pragma once

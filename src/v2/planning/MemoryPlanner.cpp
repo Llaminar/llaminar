@@ -18,6 +18,7 @@
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
+#include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
 #include "utils/Logger.h"
 
 #include "fort.hpp"
@@ -26,7 +27,9 @@
 #include <iomanip>
 #include <cmath>
 #include <algorithm>
+#include <filesystem>
 #include <limits>
+#include <set>
 
 namespace llaminar2
 {
@@ -88,6 +91,60 @@ size_t checkedAdd(
             std::string("Memory byte overflow while sizing ") + contribution);
     }
     return left + right;
+}
+
+/**
+ * @brief Merge one logical graph bill into its unique physical allocator row.
+ *
+ * Model topology may expose several serial logical roles on one CPU/GPU. The
+ * memory plan is physical, so emitting duplicate rows would let downstream
+ * callers compare each partial subtotal independently and over-admit the real
+ * allocator. This helper combines typed owner lines while requiring the exact
+ * same rank/device capacity observation.
+ */
+void appendPhysicalPlan(
+    MemoryPlan &plan,
+    DeviceMemoryPlan incoming)
+{
+    const auto &incoming_resource = incoming.bom().resource();
+    const auto found = std::find_if(
+        plan.devices.begin(),
+        plan.devices.end(),
+        [&](const DeviceMemoryPlan &candidate)
+        {
+            const auto &resource = candidate.bom().resource();
+            return resource.world_rank == incoming_resource.world_rank &&
+                   resource.device == incoming_resource.device;
+        });
+    if (found == plan.devices.end())
+    {
+        plan.devices.push_back(std::move(incoming));
+        return;
+    }
+    if (!found->bom().resource().sameAllocator(incoming_resource))
+    {
+        throw std::invalid_argument(
+            "Logical memory plans disagree on one physical allocator observation");
+    }
+
+    PhysicalMemoryBOMBuilder combined(found->bom());
+    for (std::size_t index = 0;
+         index < PhysicalMemoryBOM::ownerCount();
+         ++index)
+    {
+        const auto owner = PhysicalMemoryBOM::ownerAt(index);
+        const auto &charge = incoming.bom().charge(owner);
+        combined.add(
+            owner,
+            charge.planned_bytes,
+            charge.already_resident_bytes);
+    }
+    *found = DeviceMemoryPlan(
+        combined.build(),
+        std::max(found->max_seq_len(), incoming.max_seq_len()),
+        std::max(
+            found->activation_seq_len(),
+            incoming.activation_seq_len()));
 }
 
 /**
@@ -300,12 +357,45 @@ MemoryPlan MemoryPlanner::plan(
     MemoryPlan result;
     result.devices.reserve(device_configs.size());
 
+    /*
+     * openShared() retains one archive object, lock domain, and scratch buffer
+     * for a model archive on each MPI rank.  Several local GPU participants
+     * may reference that same physical host allocation, so price its archive
+     * key once rather than inventing one scratch per logical device plan.
+     */
+    std::set<std::pair<int, std::string>> accounted_prefix_archives;
+
     for (const auto& cfg : device_configs)
     {
-        DeviceMemoryPlan dev_plan;
-        dev_plan.device = cfg.device;
-        dev_plan.device_total_bytes = cfg.device_total_bytes;
-        dev_plan.device_free_bytes = cfg.device_free_bytes;
+        if (cfg.weight_load_staging.enabled() && !cfg.device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "Weight-load staging can only be attached to a GPU device plan");
+        }
+        if ((cfg.weight_load_staging.device_bytes == 0u) !=
+            (cfg.weight_load_staging.host_bytes == 0u))
+        {
+            throw std::invalid_argument(
+                "GPU weight-load staging requires both device and pinned-host byte authorities");
+        }
+        std::size_t captured_graph_bytes = 0u;
+        std::size_t graph_snapshot_bytes = 0u;
+        std::size_t primary_weight_bytes = 0u;
+        std::size_t additional_weight_bytes = 0u;
+        std::size_t retained_primary_weight_bytes = 0u;
+        std::size_t retained_additional_weight_bytes = 0u;
+        std::size_t kv_cache_bytes = 0u;
+        std::size_t live_recurrent_state_bytes = 0u;
+        std::size_t checkpoint_state_bytes = 0u;
+        std::size_t sequence_metadata_bytes = 0u;
+        std::size_t prefix_cache_staging_bytes = 0u;
+        std::size_t prefix_cache_host_staging_bytes = 0u;
+        std::size_t prefix_cache_device_hot_bytes = 0u;
+        std::size_t prefix_cache_host_tier_bytes = 0u;
+        std::size_t collective_bytes = 0u;
+        std::size_t activation_bytes = 0u;
+        std::size_t workspace_bytes = 0u;
+        std::size_t retained_workspace_bytes = 0u;
 
         int last_layer = cfg.last_layer >= 0 ? cfg.last_layer : profile.n_layers - 1;
         int max_seq = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
@@ -333,9 +423,19 @@ MemoryPlan MemoryPlanner::plan(
             : (cfg.local_kv_heads > 0
                    ? cfg.local_kv_heads
                    : profile.n_kv_heads);
-
-        dev_plan.max_seq_len = max_seq;
-        dev_plan.activation_seq_len = activation_seq;
+        const int local_query_heads =
+            cfg.tensor_parallel_assignment.has_value()
+                ? cfg.tensor_parallel_assignment->head_count
+                : std::max(
+                      1,
+                      profile.n_heads /
+                          std::max(1, cfg.total_shards));
+        const int local_query_head_start =
+            cfg.tensor_parallel_assignment.has_value()
+                ? cfg.tensor_parallel_assignment->head_start
+                : (cfg.total_shards > 1
+                       ? cfg.shard_index * local_query_heads
+                       : 0);
 
         if (cfg.device.is_gpu() && cfg.captured_serving_graphs.enabled())
         {
@@ -348,15 +448,23 @@ MemoryPlan MemoryPlanner::plan(
                 prefill_executable_count,
                 cfg.captured_serving_graphs.fixed_executable_count,
                 "captured serving graph executable count");
-            const int planned_model_layers = std::max(
-                1,
-                std::min(profile.n_layers - 1, last_layer) -
-                        std::max(0, cfg.first_layer) +
-                    1);
-            dev_plan.captured_graph_bytes =
+            captured_graph_bytes =
                 estimateCapturedGraphExecutableBytes(
-                    planned_model_layers,
-                    executable_count);
+                    cfg.device,
+                    CapturedGraphExecutableInventory{
+                        .model_graph_identity_count = executable_count,
+                        .model_graph_topology_variant_count = 1u,
+                        .auxiliary_executable_count =
+                            cfg.captured_serving_graphs
+                                .mtp_graph_owners
+                                .auxiliaryExecutableSlotCount(),
+                    });
+        }
+
+        if (cfg.device.is_gpu())
+        {
+            graph_snapshot_bytes =
+                cfg.graph_snapshot_memory.per_accelerator_bytes;
         }
 
         // If TP sharded, divide KV heads
@@ -365,6 +473,13 @@ MemoryPlan MemoryPlanner::plan(
         {
             local_kv_heads = std::max(1, profile.n_kv_heads / cfg.total_shards);
         }
+        const int mtp_local_kv_heads =
+            cfg.mtp_enabled
+                ? resolveMTPShiftedKVLocalHeadCount(
+                      cfg.mtp_shifted_kv_head_layout,
+                      profile.n_kv_heads,
+                      local_kv_heads)
+                : local_kv_heads;
 
         /*
          * The execution plan's layer interval names main-model blocks. MTP
@@ -390,8 +505,9 @@ MemoryPlan MemoryPlanner::plan(
             profile, cfg.device,
             cfg.shard_index, cfg.total_shards,
             cfg.first_layer, weight_last_layer,
-            cfg.weight_residency);
-        dev_plan.weight_bytes = weight_est.device_bytes;
+            cfg.weight_residency,
+            cfg.tensor_parallel_assignment);
+        primary_weight_bytes = weight_est.device_bytes;
 
         for (std::size_t set_index = 0;
              set_index < cfg.additional_weight_sets.size();
@@ -459,8 +575,8 @@ MemoryPlan MemoryPlanner::plan(
                         cfg.first_layer,
                         weight_last_layer,
                         sidecar_residency);
-                dev_plan.additional_weight_bytes = checkedAdd(
-                    dev_plan.additional_weight_bytes,
+                additional_weight_bytes = checkedAdd(
+                    additional_weight_bytes,
                     sidecar_estimate.device_bytes,
                     "additional replicated dense decode weights");
                 break;
@@ -495,14 +611,76 @@ MemoryPlan MemoryPlanner::plan(
                                 MirroredDecodeEmbedding
                         ? mirrored_estimate.prepared_embedding_bytes
                         : mirrored_estimate.lm_head_bytes;
-                dev_plan.additional_weight_bytes = checkedAdd(
-                    dev_plan.additional_weight_bytes,
+                additional_weight_bytes = checkedAdd(
+                    additional_weight_bytes,
                     component_bytes,
                     additional_set ==
                             AdditionalPersistentWeightSet::
                                 MirroredDecodeEmbedding
                         ? "additional mirrored decode embedding"
                         : "additional mirrored MTP terminal head");
+                break;
+            }
+            case AdditionalPersistentWeightSet::ReplicatedMTPSidecarDense:
+            {
+                if (profile.mtp_layer_count <= 0 ||
+                    main_layer_count >= profile.n_layers)
+                {
+                    throw std::invalid_argument(
+                        "Replicated MTP sidecar admission requires trailing predictor-layer metadata");
+                }
+
+                DeviceWeightResidency sidecar_residency;
+                if (profile.expert_count > 0)
+                {
+                    sidecar_residency =
+                        DeviceWeightResidency::
+                            continuationWithSelectedRoutedExperts(
+                                profile.expert_count,
+                                std::vector<int>(
+                                    static_cast<std::size_t>(
+                                        profile.n_layers),
+                                    0));
+                }
+
+                /*
+                 * WeightMemoryEstimator includes non-layer tensors for any
+                 * layer interval because PP endpoints may own them. Price the
+                 * trailing predictor interval and subtract the exact same
+                 * estimator's globals-only view. The remainder is therefore
+                 * precisely the dense/shared predictor block materialized by
+                 * participantReplicaNames(ExpertOverlay), with routed parents
+                 * excluded by the zero-expert residency contract.
+                 */
+                const auto sidecar_and_globals =
+                    WeightMemoryEstimator::estimate(
+                        profile,
+                        cfg.device,
+                        /*shard_index=*/0,
+                        /*total_shards=*/1,
+                        main_layer_count,
+                        profile.n_layers - 1,
+                        sidecar_residency);
+                const auto globals_only =
+                    WeightMemoryEstimator::estimate(
+                        profile,
+                        cfg.device,
+                        /*shard_index=*/0,
+                        /*total_shards=*/1,
+                        profile.n_layers,
+                        profile.n_layers - 1,
+                        sidecar_residency);
+                if (sidecar_and_globals.device_bytes <
+                    globals_only.device_bytes)
+                {
+                    throw std::logic_error(
+                        "Replicated MTP sidecar estimate underflowed its globals-only view");
+                }
+                additional_weight_bytes = checkedAdd(
+                    additional_weight_bytes,
+                    sidecar_and_globals.device_bytes -
+                        globals_only.device_bytes,
+                    "additional replicated MTP sidecar weights");
                 break;
             }
             }
@@ -516,8 +694,8 @@ MemoryPlan MemoryPlanner::plan(
              * previous runner, so only the incremental admission calculation
              * subtracts it.
              */
-            dev_plan.retained_weight_bytes =
-                dev_plan.total_weight_bytes();
+            retained_primary_weight_bytes = primary_weight_bytes;
+            retained_additional_weight_bytes = additional_weight_bytes;
         }
 
         /*
@@ -535,25 +713,21 @@ MemoryPlan MemoryPlanner::plan(
                     cfg.batch_size,
                     max_seq,
                     local_kv_heads,
-                    cfg.tensor_parallel_assignment.has_value()
-                        ? cfg.tensor_parallel_assignment->head_count
-                        : std::max(
-                              1,
-                              profile.n_heads /
-                                  std::max(1, cfg.total_shards)),
-                    cfg.total_shards,
+                    mtp_local_kv_heads,
+                    local_query_head_start,
+                    local_query_heads,
                     cfg.first_layer,
                     last_layer,
                     cfg.kv_precision,
                     cfg.mtp_enabled);
-            dev_plan.kv_cache_bytes =
+            kv_cache_bytes =
                 persistent_state.kv_cache_bytes;
-            dev_plan.live_recurrent_state_bytes =
+            live_recurrent_state_bytes =
                 persistent_state.live_recurrent_state_bytes;
-            dev_plan.checkpoint_state_bytes =
+            checkpoint_state_bytes =
                 persistent_state.checkpoint_state_bytes;
-            dev_plan.persistent_state_bytes =
-                persistent_state.stateBytes();
+            sequence_metadata_bytes =
+                persistent_state.sequence_metadata_bytes;
 
             /*
              * Prefix restore owns a second, concurrent GPU memory surface:
@@ -585,17 +759,28 @@ MemoryPlan MemoryPlanner::plan(
                     logical_block.k_bytes,
                     logical_block.v_bytes,
                     "prefix logical K/V layer");
+                const auto shifted_logical_block =
+                    KVCacheMemoryEstimator::estimateGPULogicalBlock(
+                        prefix_block_tokens,
+                        mtp_local_kv_heads,
+                        profile.head_dim,
+                        cfg.kv_precision,
+                        cfg.device);
+                const size_t one_shifted_fa_layer_bytes = checkedAdd(
+                    shifted_logical_block.k_bytes,
+                    shifted_logical_block.v_bytes,
+                    "prefix shifted logical K/V layer");
 
-                dev_plan.prefix_cache_staging_bytes = checkedAdd(
+                prefix_cache_staging_bytes = checkedAdd(
                     one_fa_layer_bytes,
                     persistent_state.prefix_hybrid_device_state_bytes,
                     "prefix main archive staging");
                 if (cfg.mtp_enabled &&
                     persistent_state.mtp_full_attention_layers > 0)
                 {
-                    dev_plan.prefix_cache_staging_bytes = checkedAdd(
-                        dev_plan.prefix_cache_staging_bytes,
-                        one_fa_layer_bytes,
+                    prefix_cache_staging_bytes = checkedAdd(
+                        prefix_cache_staging_bytes,
+                        one_shifted_fa_layer_bytes,
                         "prefix shifted-MTP archive staging");
                 }
 
@@ -615,13 +800,25 @@ MemoryPlan MemoryPlanner::plan(
                         checkedMultiply(
                             static_cast<size_t>(
                                 persistent_state.mtp_full_attention_layers),
-                            one_fa_layer_bytes,
-                            "prefix shifted-MTP payload"),
+                                one_shifted_fa_layer_bytes,
+                                "prefix shifted-MTP payload"),
                         "prefix main and shifted-MTP payload");
                 }
 
-                if (cfg.prefix_cache.terminal_state !=
-                    PrefixCacheTerminalStateMode::Off)
+                /*
+                 * A pipeline participant archives terminal state only when
+                 * it owns the terminal main-model layer.  Runtime makes the
+                 * same decision from PPStageConfig::has_lm_head.  Charging
+                 * logits on an earlier PP stage changes the fixed-slot size,
+                 * which can paradoxically admit fewer total arena bytes than
+                 * the smaller runtime slots would allocate.  Derive both
+                 * weight and prefix ownership from this one layer-boundary
+                 * fact so the PhysicalMemoryAuthority certificate and the
+                 * materialized device-hot slab remain byte identical.
+                 */
+                if (owns_terminal_main_layer &&
+                    cfg.prefix_cache.terminal_state !=
+                        PrefixCacheTerminalStateMode::Off)
                 {
                     if (cfg.mtp_enabled)
                     {
@@ -668,16 +865,72 @@ MemoryPlan MemoryPlanner::plan(
                     cfg.prefix_cache.device_budget_bytes >=
                         prefix_block_bytes)
                 {
-                    dev_plan.prefix_cache_device_hot_bytes =
-                        cfg.prefix_cache.device_budget_bytes;
+                    prefix_cache_device_hot_bytes =
+                        prefixCacheWholeBlockReservationBytes(
+                            cfg.prefix_cache.device_budget_bytes,
+                        prefix_block_bytes);
+                }
+                prefix_cache_host_tier_bytes =
+                    cfg.prefix_cache.ram_budget_bytes;
+
+                if (cfg.prefix_cache.storage_mode ==
+                        PrefixCacheStorageMode::Tiered &&
+                    cfg.prefix_cache.disk_budget_bytes > 0u)
+                {
+                    const auto archive_key = std::make_pair(
+                        cfg.world_rank,
+                        std::filesystem::path(cfg.prefix_cache.disk_dir)
+                            .lexically_normal()
+                            .string());
+                    if (accounted_prefix_archives.insert(archive_key).second)
+                    {
+                        prefix_cache_host_staging_bytes =
+                            PrefixArchiveIOGeometry::scratchBytes();
+                    }
+                }
+            }
+            else if (
+                cfg.device.is_cpu() && cfg.prefix_cache.enabled &&
+                cfg.prefix_cache.storage_mode !=
+                    PrefixCacheStorageMode::Disabled &&
+                persistent_state.main_full_attention_layers > 0)
+            {
+                /*
+                 * CPU inference archives directly into the same host
+                 * allocator as its live cache. It has no device staging/hot
+                 * tier, but the bounded RAM cache is still a concurrent
+                 * physical owner and must not disappear from admission.
+                 */
+                prefix_cache_host_tier_bytes =
+                    cfg.prefix_cache.ram_budget_bytes;
+                if (cfg.prefix_cache.storage_mode ==
+                        PrefixCacheStorageMode::Tiered &&
+                    cfg.prefix_cache.disk_budget_bytes > 0u)
+                {
+                    const auto archive_key = std::make_pair(
+                        cfg.world_rank,
+                        std::filesystem::path(cfg.prefix_cache.disk_dir)
+                            .lexically_normal()
+                            .string());
+                    if (accounted_prefix_archives.insert(archive_key).second)
+                    {
+                        prefix_cache_host_staging_bytes =
+                            PrefixArchiveIOGeometry::scratchBytes();
+                    }
                 }
             }
             if (cfg.total_shards > 1)
             {
-                dev_plan.collective_bytes =
+                if (cfg.local_tp_backend == CollectiveBackendType::AUTO)
+                {
+                    throw std::invalid_argument(
+                        "Multi-shard memory planning requires a resolved LocalTP collective backend");
+                }
+                collective_bytes =
                     CollectiveMemoryEstimator::localTP(
                         max_seq,
-                        profile.d_model)
+                        profile.d_model,
+                        cfg.local_tp_backend)
                         .perDeviceBytes();
             }
         }
@@ -702,7 +955,7 @@ MemoryPlan MemoryPlanner::plan(
 
         if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph)
         {
-            dev_plan.activation_bytes = ActivationMemoryEstimator::estimate(
+            activation_bytes = ActivationMemoryEstimator::estimate(
                 profile,
                 ActivationGraphMemoryGeometry{
                     .batch_size = cfg.batch_size,
@@ -733,8 +986,8 @@ MemoryPlan MemoryPlanner::plan(
              */
             if (cfg.weight_residency.selectsRoutedExperts())
             {
-                dev_plan.activation_bytes = checkedAdd(
-                    dev_plan.activation_bytes,
+                activation_bytes = checkedAdd(
+                    activation_bytes,
                     routedParticipantActivationBytes(
                         profile,
                         cfg,
@@ -745,7 +998,7 @@ MemoryPlan MemoryPlanner::plan(
             }
 
             // Workspace estimation
-            dev_plan.workspace_bytes = WorkspaceMemoryEstimator::estimate(
+            workspace_bytes = WorkspaceMemoryEstimator::estimate(
                 profile,
                 WorkspaceMemoryGeometry{
                     .device = cfg.device,
@@ -753,12 +1006,33 @@ MemoryPlan MemoryPlanner::plan(
                     .batch_size = cfg.batch_size,
                     .resident_graph_rows = activation_seq,
                     .max_context_rows = max_seq,
+                    .owns_embedding = cfg.owns_embedding,
+                    .shard_index = cfg.shard_index,
+                    .has_exact_tensor_parallel_assignment =
+                        cfg.tensor_parallel_assignment.has_value(),
                     .local_d_ff = local_d_ff,
+                    .local_d_ff_start =
+                        cfg.tensor_parallel_assignment.has_value()
+                            ? cfg.tensor_parallel_assignment->d_ff_start
+                            : 0,
                     .local_query_head_start =
                         cfg.tensor_parallel_assignment.has_value()
                             ? cfg.tensor_parallel_assignment->head_start
                             : cfg.shard_index * local_n_heads,
                     .local_query_heads = local_n_heads,
+                    .local_kv_head_start =
+                        cfg.tensor_parallel_assignment.has_value()
+                            ? cfg.tensor_parallel_assignment->kv_head_start
+                            : cfg.shard_index * local_kv_heads,
+                    .local_kv_heads = local_kv_heads,
+                    .local_vocab_start =
+                        cfg.tensor_parallel_assignment.has_value()
+                            ? cfg.tensor_parallel_assignment->vocab_start
+                            : 0,
+                    .local_vocab =
+                        cfg.tensor_parallel_assignment.has_value()
+                            ? cfg.tensor_parallel_assignment->vocab_count
+                            : 0,
                     .first_layer = cfg.first_layer,
                     .last_layer = last_layer,
                     .total_shards = cfg.total_shards,
@@ -768,9 +1042,11 @@ MemoryPlan MemoryPlanner::plan(
                         cfg.mtp_enabled
                             ? cfg.mtp_target_query_rows
                             : 0,
+                    .mtp_terminal_logits_layout =
+                        cfg.mtp_terminal_logits_layout,
                 });
-            dev_plan.retained_workspace_bytes = std::min(
-                dev_plan.workspace_bytes,
+            retained_workspace_bytes = std::min(
+                workspace_bytes,
                 cfg.retained_workspace_bytes);
         }
         else
@@ -779,13 +1055,13 @@ MemoryPlan MemoryPlanner::plan(
                 cfg.serial_routed_expert_compact_rows > 0
                     ? cfg.serial_routed_expert_compact_rows
                     : activation_seq;
-            dev_plan.activation_bytes = routedParticipantActivationBytes(
+            activation_bytes = routedParticipantActivationBytes(
                 profile,
                 cfg,
                 cfg.first_layer,
                 last_layer,
                 activation_seq);
-            dev_plan.workspace_bytes =
+            workspace_bytes =
                 WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
                     profile,
                     WorkspaceMemoryGeometry{
@@ -794,42 +1070,167 @@ MemoryPlan MemoryPlanner::plan(
                         .batch_size = cfg.batch_size,
                         .resident_graph_rows = participant_graph_rows,
                         .max_context_rows = max_seq,
+                        .owns_embedding = false,
+                        .shard_index = cfg.shard_index,
+                        .has_exact_tensor_parallel_assignment =
+                            cfg.tensor_parallel_assignment.has_value(),
                         .local_d_ff = local_d_ff,
+                        .local_d_ff_start =
+                            cfg.tensor_parallel_assignment.has_value()
+                                ? cfg.tensor_parallel_assignment->d_ff_start
+                                : 0,
                         .local_query_head_start =
                             cfg.tensor_parallel_assignment.has_value()
                                 ? cfg.tensor_parallel_assignment->head_start
                                 : cfg.shard_index * local_n_heads,
                         .local_query_heads = local_n_heads,
+                        .local_kv_head_start =
+                            cfg.tensor_parallel_assignment.has_value()
+                                ? cfg.tensor_parallel_assignment->kv_head_start
+                                : cfg.shard_index * local_kv_heads,
+                        .local_kv_heads = local_kv_heads,
+                        .local_vocab_start =
+                            cfg.tensor_parallel_assignment.has_value()
+                                ? cfg.tensor_parallel_assignment->vocab_start
+                                : 0,
+                        .local_vocab =
+                            cfg.tensor_parallel_assignment.has_value()
+                                ? cfg.tensor_parallel_assignment->vocab_count
+                                : 0,
                         .first_layer = cfg.first_layer,
                         .last_layer = last_layer,
                         .total_shards = cfg.total_shards,
                         .apportioned_routed_experts = true,
                     });
-            dev_plan.retained_workspace_bytes = std::min(
-                dev_plan.workspace_bytes,
+            retained_workspace_bytes = std::min(
+                workspace_bytes,
                 cfg.retained_workspace_bytes);
         }
 
-        // Diagnostics
-        if (!dev_plan.fits())
-        {
-            std::ostringstream msg;
-            msg << cfg.device.to_string() << ": need "
-                << formatMB(dev_plan.incremental_bytes())
-                << " of new allocation but only "
-                << formatMB(dev_plan.device_free_bytes) << " available"
-                << " (deficit: " << formatMB(dev_plan.deficit()) << ")";
-            result.diagnostics.push_back(msg.str());
-        }
-        else if (dev_plan.remaining() < 256ULL * 1024 * 1024)
-        {
-            std::ostringstream msg;
-            msg << cfg.device.to_string() << ": tight fit — only "
-                << formatMB(dev_plan.remaining()) << " unallocated";
-            result.diagnostics.push_back(msg.str());
-        }
+        /*
+         * The builder is the only place estimates become admission bytes.
+         * Every named DeviceMemoryPlan accessor below is a view over these
+         * typed lines, so no later planner can edit a parallel subtotal.
+         */
+        PhysicalMemoryBOMBuilder bom_builder({
+            .world_rank = cfg.world_rank,
+            .device = cfg.device,
+            .total_bytes = cfg.device_total_bytes,
+            .admission_available_bytes = cfg.device_free_bytes,
+        });
+        bom_builder
+            .add(
+                PhysicalMemoryOwner::PrimaryModelWeights,
+                primary_weight_bytes,
+                retained_primary_weight_bytes)
+            .add(
+                PhysicalMemoryOwner::AdditionalModelWeights,
+                additional_weight_bytes,
+                retained_additional_weight_bytes)
+            .add(PhysicalMemoryOwner::KVCache, kv_cache_bytes)
+            .add(
+                PhysicalMemoryOwner::RecurrentLiveState,
+                live_recurrent_state_bytes)
+            .add(
+                PhysicalMemoryOwner::RecurrentCheckpointState,
+                checkpoint_state_bytes)
+            .add(
+                PhysicalMemoryOwner::SequenceMetadata,
+                sequence_metadata_bytes)
+            .add(
+                PhysicalMemoryOwner::PrefixArchiveStaging,
+                cfg.device.is_cpu()
+                    ? prefix_cache_host_staging_bytes
+                    : prefix_cache_staging_bytes)
+            .add(
+                PhysicalMemoryOwner::PrefixDeviceTier,
+                prefix_cache_device_hot_bytes)
+            .add(
+                PhysicalMemoryOwner::PrefixHostTier,
+                cfg.device.is_cpu()
+                    ? prefix_cache_host_tier_bytes
+                    : 0u)
+            .add(
+                PhysicalMemoryOwner::NativeGraphExecutable,
+                captured_graph_bytes)
+            .add(
+                PhysicalMemoryOwner::GraphSnapshotArena,
+                graph_snapshot_bytes)
+            .add(PhysicalMemoryOwner::LocalCollective, collective_bytes)
+            .add(PhysicalMemoryOwner::ActivationArena, activation_bytes)
+            .add(
+                PhysicalMemoryOwner::ExecutionWorkspace,
+                workspace_bytes,
+                retained_workspace_bytes)
+            .add(
+                PhysicalMemoryOwner::WeightLoadStaging,
+                cfg.device.is_gpu()
+                    ? cfg.weight_load_staging.device_bytes
+                    : 0u);
+        DeviceMemoryPlan dev_plan(
+            bom_builder.build(), max_seq, activation_seq);
 
-        result.devices.push_back(std::move(dev_plan));
+        appendPhysicalPlan(result, std::move(dev_plan));
+
+        if (cfg.device.is_gpu() &&
+            (prefix_cache_host_tier_bytes != 0u ||
+             prefix_cache_host_staging_bytes != 0u ||
+             cfg.weight_load_staging.host_bytes != 0u))
+        {
+            if (!cfg.associated_host_memory.has_value() ||
+                !cfg.associated_host_memory->valid() ||
+                !cfg.associated_host_memory->device.is_cpu() ||
+                cfg.associated_host_memory->world_rank != cfg.world_rank)
+            {
+                throw std::invalid_argument(
+                    "GPU memory admission requires the exact rank-local host-memory resource for its CPU-side allocations");
+            }
+            PhysicalMemoryBOMBuilder host_builder(
+                *cfg.associated_host_memory);
+            host_builder.add(
+                PhysicalMemoryOwner::PrefixHostTier,
+                prefix_cache_host_tier_bytes);
+            host_builder.add(
+                PhysicalMemoryOwner::PrefixArchiveStaging,
+                prefix_cache_host_staging_bytes);
+            host_builder.add(
+                PhysicalMemoryOwner::WeightLoadStaging,
+                cfg.weight_load_staging.host_bytes);
+            appendPhysicalPlan(
+                result,
+                DeviceMemoryPlan(
+                    host_builder.build(), max_seq, activation_seq));
+        }
+    }
+
+
+    /* Seal one aggregate before any fit decision. Per-device rows below are
+     * presentation only; allocation authority comes from MemoryPlan::admit(). */
+    result.sealPhysicalPlan();
+
+    /* Diagnose only complete physical rows. A logical sub-plan can fit while
+     * the aggregate allocator does not, which is precisely the split-brain
+     * failure this plan representation is intended to make impossible. */
+    for (const auto &device_plan : result.devices)
+    {
+        if (!device_plan.fits())
+        {
+            std::ostringstream msg;
+            msg << device_plan.bom().resource().id() << ": need "
+                << formatMB(device_plan.incremental_bytes())
+                << " of new allocation but only "
+                << formatMB(device_plan.device_free_bytes()) << " available"
+                << " (deficit: " << formatMB(device_plan.deficit()) << ")";
+            result.diagnostics.push_back(msg.str());
+        }
+        else if (device_plan.remaining() < 256ULL * 1024 * 1024)
+        {
+            std::ostringstream msg;
+            msg << device_plan.bom().resource().id()
+                << ": tight fit — only "
+                << formatMB(device_plan.remaining()) << " unallocated";
+            result.diagnostics.push_back(msg.str());
+        }
     }
 
     return result;
@@ -940,38 +1341,39 @@ std::string MemoryPlan::renderTable() const
     table << fort::header
           << "Device" << "Context" << "Act.Seq" << "Weights" << "Retained"
           << "KV Cache" << "State" << "Prefix Stage" << "Prefix Hot"
-          << "Graphs" << "Collect." << "Activ." << "Wkspace" << "Ret.Wksp"
+          << "Graphs" << "Snapshots" << "Collect." << "Activ." << "Wkspace" << "Ret.Wksp"
           << "Total" << "New" << "Avail." << "OK"
           << fort::endr;
 
     // Column alignments
     table.column(0).set_cell_text_align(fort::text_align::left);
-    for (int c = 1; c <= 16; ++c)
+    for (int c = 1; c <= 17; ++c)
     {
         table.column(c).set_cell_text_align(fort::text_align::right);
     }
-    table.column(17).set_cell_text_align(fort::text_align::center);
+    table.column(18).set_cell_text_align(fort::text_align::center);
 
     // Data rows
     for (const auto& d : devices)
     {
-        table << d.device.to_string()
-              << d.max_seq_len
-              << d.activation_seq_len
-              << formatMB(d.weight_bytes)
-              << formatMB(d.retained_weight_bytes)
-              << formatMB(d.kv_cache_bytes)
-              << formatMB(d.persistent_state_bytes)
-              << formatMB(d.prefix_cache_staging_bytes)
-              << formatMB(d.prefix_cache_device_hot_bytes)
-              << formatMB(d.captured_graph_bytes)
-              << formatMB(d.collective_bytes)
-              << formatMB(d.activation_bytes)
-              << formatMB(d.workspace_bytes)
-              << formatMB(d.retained_workspace_bytes)
+        table << d.device().to_string()
+              << d.max_seq_len()
+              << d.activation_seq_len()
+              << formatMB(d.weight_bytes())
+              << formatMB(d.retained_weight_bytes())
+              << formatMB(d.kv_cache_bytes())
+              << formatMB(d.persistent_state_bytes())
+              << formatMB(d.prefix_cache_staging_bytes())
+              << formatMB(d.prefix_cache_device_hot_bytes())
+              << formatMB(d.captured_graph_bytes())
+              << formatMB(d.graph_snapshot_bytes())
+              << formatMB(d.collective_bytes())
+              << formatMB(d.activation_bytes())
+              << formatMB(d.workspace_bytes())
+              << formatMB(d.retained_workspace_bytes())
               << formatMB(d.total_bytes())
               << formatMB(d.incremental_bytes())
-              << formatMB(d.device_free_bytes)
+              << formatMB(d.device_free_bytes())
               << (d.fits() ? "\xe2\x9c\x93" : "\xe2\x9c\x97")  // ✓ / ✗
               << fort::endr;
     }

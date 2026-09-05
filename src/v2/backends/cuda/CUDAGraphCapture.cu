@@ -1130,6 +1130,27 @@ namespace llaminar2
             condition_word && *condition_word != 0u ? 1u : 0u);
     }
 
+    /**
+     * @brief Publish whether a validated transaction selector reaches one threshold.
+     *
+     * The full definition follows the common fragment appender. Declaring the
+     * exact kernel signature here lets the appender reject selector predicates;
+     * the selector-aware composer groups adjacent fragments behind one launch.
+     */
+    __global__ void updateDeviceControlledSelectorThresholdCondition(
+        cudaGraphConditionalHandle handle,
+        int *control_rows,
+        int control_stride,
+        int request_count,
+        int healthy_index,
+        int complete_index,
+        int selector_index,
+        int error_index,
+        int minimum_selector,
+        int maximum_selector,
+        int invalid_selector_error,
+        int fragment_threshold);
+
     namespace
     {
         /**
@@ -1188,6 +1209,16 @@ namespace llaminar2
                 if (result.error != cudaSuccess)
                     result.operation =
                         "cudaGraphAddChildGraphNode(transaction fragment)";
+                return result;
+            }
+
+            if (fragment.execution ==
+                DeviceControlledLoopFragmentExecution::
+                    IfDeviceSelectorAtLeast)
+            {
+                result.error = cudaErrorInvalidValue;
+                result.operation =
+                    "selector-gated fragment requires selector-aware composer";
                 return result;
             }
 
@@ -1275,16 +1306,115 @@ namespace llaminar2
     }
 #endif
 
-#if CUDART_VERSION >= 13000
+#if CUDART_VERSION >= 12030
+    namespace
+    {
+        /**
+         * @brief Validate one selector batch and poison every live row on error.
+         *
+         * Both the transaction-entry validator and every monotonic depth gate
+         * use this one arithmetic authority. Revalidation is deliberate: if a
+         * prefix fragment illegally mutates the selector, the next gate turns
+         * that lifecycle violation into the same stable terminal error instead
+         * of silently changing transaction width midway through an iteration.
+         *
+         * @return The agreed legal selector, or -1 after publishing failure.
+         */
+        __device__ int validateDeviceControlledSelector(
+            int *control_rows,
+            int control_stride,
+            int request_count,
+            int healthy_index,
+            int complete_index,
+            int selector_index,
+            int error_index,
+            int minimum_selector,
+            int maximum_selector,
+            int invalid_selector_error)
+        {
+            int selected = -1;
+            bool invalid = false;
+            for (int request = 0; request < request_count; ++request)
+            {
+                int *row = control_rows +
+                    static_cast<size_t>(request) * control_stride;
+                if (row[healthy_index] == 0 || row[complete_index] != 0)
+                    continue;
+
+                const int candidate = row[selector_index];
+                if (candidate < minimum_selector ||
+                    candidate > maximum_selector ||
+                    (selected >= 0 && selected != candidate))
+                {
+                    invalid = true;
+                    break;
+                }
+                selected = candidate;
+            }
+
+            if (selected < 0)
+                invalid = true;
+            if (!invalid)
+                return selected;
+
+            for (int request = 0; request < request_count; ++request)
+            {
+                int *row = control_rows +
+                    static_cast<size_t>(request) * control_stride;
+                if (row[complete_index] == 0)
+                {
+                    row[healthy_index] = 0;
+                    row[complete_index] = 1;
+                    row[error_index] = invalid_selector_error;
+                }
+            }
+            return -1;
+        }
+    }
+
     /**
-     * @brief Validate and publish one transaction selector for a CUDA SWITCH node.
+     * @brief Admit one complete linear transaction only for a legal selector.
      *
-     * A native SWITCH controls the whole request batch, so active rows must
-     * agree on one selector. On malformed input this kernel invalidates every
-     * active row and publishes an out-of-range handle value; CUDA consequently
-     * executes no branch, and the following loop predicate terminates replay.
+     * Failure marks the controller terminal before CUDA enters the transaction
+     * IF body, so neither the unconditional prefix nor the shared tail can run.
      */
-    __global__ void updateDeviceControlledSwitchCondition(
+    __global__ void updateDeviceControlledSelectorValidityCondition(
+        cudaGraphConditionalHandle handle,
+        int *control_rows,
+        int control_stride,
+        int request_count,
+        int healthy_index,
+        int complete_index,
+        int selector_index,
+        int error_index,
+        int minimum_selector,
+        int maximum_selector,
+        int invalid_selector_error)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0)
+            return;
+        const int selected = validateDeviceControlledSelector(
+            control_rows,
+            control_stride,
+            request_count,
+            healthy_index,
+            complete_index,
+            selector_index,
+            error_index,
+            minimum_selector,
+            maximum_selector,
+            invalid_selector_error);
+        cudaGraphSetConditional(handle, selected >= 0 ? 1u : 0u);
+    }
+
+    /**
+     * @brief Publish whether the current legal selector reaches one width gate.
+     *
+     * Adjacent fragments with the same threshold share this predicate and one
+     * native IF body. The selector is revalidated before the group so an
+     * accidental prefix mutation fails closed without executing a partial group.
+     */
+    __global__ void updateDeviceControlledSelectorThresholdCondition(
         cudaGraphConditionalHandle handle,
         int *control_rows,
         int control_stride,
@@ -1296,52 +1426,24 @@ namespace llaminar2
         int minimum_selector,
         int maximum_selector,
         int invalid_selector_error,
-        unsigned int branch_count)
+        int fragment_threshold)
     {
         if (blockIdx.x != 0 || threadIdx.x != 0)
             return;
-
-        int selected = -1;
-        bool invalid = false;
-        for (int request = 0; request < request_count; ++request)
-        {
-            int *row =
-                control_rows + static_cast<size_t>(request) * control_stride;
-            if (row[healthy_index] == 0 || row[complete_index] != 0)
-                continue;
-
-            const int candidate = row[selector_index];
-            if (candidate < minimum_selector ||
-                candidate > maximum_selector ||
-                static_cast<unsigned int>(candidate) >= branch_count ||
-                (selected >= 0 && selected != candidate))
-            {
-                invalid = true;
-                break;
-            }
-            selected = candidate;
-        }
-
-        if (selected < 0)
-            invalid = true;
-        if (invalid)
-        {
-            for (int request = 0; request < request_count; ++request)
-            {
-                int *row =
-                    control_rows + static_cast<size_t>(request) * control_stride;
-                if (row[complete_index] == 0)
-                {
-                    row[healthy_index] = 0;
-                    row[complete_index] = 1;
-                    row[error_index] = invalid_selector_error;
-                }
-            }
-            cudaGraphSetConditional(handle, branch_count);
-            return;
-        }
-
-        cudaGraphSetConditional(handle, static_cast<unsigned int>(selected));
+        const int selected = validateDeviceControlledSelector(
+            control_rows,
+            control_stride,
+            request_count,
+            healthy_index,
+            complete_index,
+            selector_index,
+            error_index,
+            minimum_selector,
+            maximum_selector,
+            invalid_selector_error);
+        cudaGraphSetConditional(
+            handle,
+            selected >= fragment_threshold ? 1u : 0u);
     }
 #endif
 
@@ -1390,13 +1492,20 @@ namespace llaminar2
 
     CUDAGraphCapture::CUDAGraphCapture(CUDAGraphCapture &&other) noexcept
         : stream_(other.stream_), device_ordinal_(other.device_ordinal_),
-          graph_(other.graph_), exec_(other.exec_), node_count_(other.node_count_)
+          graph_(other.graph_), exec_(other.exec_), node_count_(other.node_count_),
+          resident_memory_bytes_(other.resident_memory_bytes_),
+          ordered_timeline_timing_events_(
+              std::move(other.ordered_timeline_timing_events_)),
+          ordered_timeline_timing_pending_(
+              other.ordered_timeline_timing_pending_)
     {
         other.stream_ = nullptr;
         other.device_ordinal_ = -1;
         other.graph_ = nullptr;
         other.exec_ = nullptr;
         other.node_count_ = 0;
+        other.resident_memory_bytes_ = 0u;
+        other.ordered_timeline_timing_pending_ = false;
     }
 
     CUDAGraphCapture &CUDAGraphCapture::operator=(CUDAGraphCapture &&other) noexcept
@@ -1409,11 +1518,18 @@ namespace llaminar2
             graph_ = other.graph_;
             exec_ = other.exec_;
             node_count_ = other.node_count_;
+            resident_memory_bytes_ = other.resident_memory_bytes_;
+            ordered_timeline_timing_events_ =
+                std::move(other.ordered_timeline_timing_events_);
+            ordered_timeline_timing_pending_ =
+                other.ordered_timeline_timing_pending_;
             other.stream_ = nullptr;
             other.device_ordinal_ = -1;
             other.graph_ = nullptr;
             other.exec_ = nullptr;
             other.node_count_ = 0;
+            other.resident_memory_bytes_ = 0u;
+            other.ordered_timeline_timing_pending_ = false;
         }
         return *this;
     }
@@ -1460,6 +1576,7 @@ namespace llaminar2
             }
             graph_ = nullptr;
             node_count_ = 0;
+            destroyOrderedTimelineTimingEvents();
         }
 
         cudaError_t err = cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed);
@@ -1522,6 +1639,7 @@ namespace llaminar2
                 return false;
             }
             exec_ = nullptr;
+            resident_memory_bytes_ = 0u;
         }
 
         /*
@@ -1606,16 +1724,21 @@ namespace llaminar2
         }
         /*
          * Native graph storage is opaque to Llaminar's allocators. Measuring
-         * the setup-only free-memory delta gives capacity admission a concrete
-         * device/node-count observation without adding any query to replay or
-         * inference. A positive delta is resident graph/driver storage; an
-         * increase is reported as zero because the CUDA allocator may retire
-         * unrelated deferred state at this exact setup boundary.
+         * the setup-only free-memory delta gives complete-family certification
+         * a concrete observation without adding a query to replay. CUDA owns a
+         * shared graph pool: this delta is pool growth triggered by the current
+         * executable, not memory attributable to that executable alone. The
+         * PhysicalMemoryAuthority therefore commits the admitted family extent;
+         * comparing this value with one per-slot unit would falsely reject the
+         * first graph that grows storage later consumed by its siblings. An
+         * apparent free-memory increase is reported as zero because the driver
+         * may retire unrelated deferred state at this exact setup boundary.
          */
         const std::size_t resident_delta_bytes =
             free_bytes_before > free_bytes_after
                 ? free_bytes_before - free_bytes_after
                 : 0u;
+        resident_memory_bytes_ = resident_delta_bytes;
         LOG_DEBUG(
             "[CUDAGraphCapture] Instantiated graph executable ("
             << node_count_
@@ -1648,6 +1771,8 @@ namespace llaminar2
             LOG_ERROR("[CUDAGraphCapture] cudaGraphLaunch failed: " << cudaGetErrorString(err));
             return false;
         }
+        if (!ordered_timeline_timing_events_.empty())
+            ordered_timeline_timing_pending_ = true;
         return true;
     }
 
@@ -1773,7 +1898,8 @@ namespace llaminar2
     }
 
     bool CUDAGraphCapture::buildOrderedTimelineTransaction(
-        std::span<const GPUOrderedTimelineStep> ordered_steps)
+        std::span<const GPUOrderedTimelineStep> ordered_steps,
+        GPUOrderedTimelineInstrumentation instrumentation)
     {
         if (!activateOwner("buildOrderedTimelineTransaction") ||
             ordered_steps.empty())
@@ -1844,10 +1970,49 @@ namespace llaminar2
         if (context_result != CUDA_SUCCESS || !context)
             return failDriver("cuCtxGetCurrent", context_result);
 
+        if (instrumentation ==
+            GPUOrderedTimelineInstrumentation::PerStepEvents)
+        {
+            ordered_timeline_timing_events_.reserve(ordered_steps.size());
+            for (const auto &step : ordered_steps)
+            {
+                OrderedTimelineTimingEvents timing{
+                    .name = step.name,
+                    .kind = step.kind,
+                };
+                runtime_error = cudaEventCreate(&timing.start);
+                if (runtime_error != cudaSuccess)
+                    return failRuntime("cudaEventCreate(timeline start)", runtime_error);
+                runtime_error = cudaEventCreate(&timing.stop);
+                if (runtime_error != cudaSuccess)
+                {
+                    (void)cudaEventDestroy(timing.start);
+                    return failRuntime("cudaEventCreate(timeline stop)", runtime_error);
+                }
+                ordered_timeline_timing_events_.push_back(
+                    std::move(timing));
+            }
+        }
+
         cudaGraphNode_t tail = nullptr;
         for (std::size_t index = 0u; index < ordered_steps.size(); ++index)
         {
             const auto &step = ordered_steps[index];
+            if (!ordered_timeline_timing_events_.empty())
+            {
+                cudaGraphNode_t timing_start = nullptr;
+                runtime_error = cudaGraphAddEventRecordNode(
+                    &timing_start,
+                    graph_,
+                    tail ? &tail : nullptr,
+                    tail ? 1u : 0u,
+                    ordered_timeline_timing_events_[index].start);
+                if (runtime_error != cudaSuccess)
+                    return failRuntime(
+                        "cudaGraphAddEventRecordNode(timeline start)",
+                        runtime_error);
+                tail = timing_start;
+            }
             if (step.kind ==
                 GPUOrderedTimelineStepKind::CapturedFragment)
             {
@@ -1862,55 +2027,71 @@ namespace llaminar2
                     return failRuntime(
                         "cudaGraphAddChildGraphNode", runtime_error);
                 tail = node;
-                continue;
-            }
-
-            CUstreamBatchMemOpParams operation{};
-            if (step.kind == GPUOrderedTimelineStepKind::WaitValue64)
-            {
-                operation.waitValue.operation =
-                    CU_STREAM_MEM_OP_WAIT_VALUE_64;
-                operation.waitValue.address = static_cast<CUdeviceptr>(
-                    reinterpret_cast<std::uintptr_t>(step.signal));
-                operation.waitValue.value64 = step.value;
-                operation.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
             }
             else
             {
-                cudaGraphNode_t node = nullptr;
-                runtime_error = addSystemReleaseValue64Node(
-                    &node,
-                    graph_,
-                    tail ? &tail : nullptr,
-                    tail ? 1u : 0u,
-                    step.signal,
-                    step.value);
-                if (runtime_error != cudaSuccess)
+                CUstreamBatchMemOpParams operation{};
+                if (step.kind == GPUOrderedTimelineStepKind::WaitValue64)
                 {
-                    return failRuntime(
-                        "addSystemReleaseValue64Node", runtime_error);
+                    operation.waitValue.operation =
+                        CU_STREAM_MEM_OP_WAIT_VALUE_64;
+                    operation.waitValue.address = static_cast<CUdeviceptr>(
+                        reinterpret_cast<std::uintptr_t>(step.signal));
+                    operation.waitValue.value64 = step.value;
+                    operation.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
+                    CUDA_BATCH_MEM_OP_NODE_PARAMS params{
+                        .ctx = context,
+                        .count = 1u,
+                        .paramArray = &operation,
+                        .flags = 0u,
+                    };
+                    CUgraphNode driver_node = nullptr;
+                    CUgraphNode driver_dependency =
+                        reinterpret_cast<CUgraphNode>(tail);
+                    const CUresult result = cuGraphAddBatchMemOpNode(
+                        &driver_node,
+                        reinterpret_cast<CUgraph>(graph_),
+                        tail ? &driver_dependency : nullptr,
+                        tail ? 1u : 0u,
+                        &params);
+                    if (result != CUDA_SUCCESS)
+                        return failDriver("cuGraphAddBatchMemOpNode", result);
+                    tail = reinterpret_cast<cudaGraphNode_t>(driver_node);
                 }
-                tail = node;
-                continue;
+                else
+                {
+                    cudaGraphNode_t node = nullptr;
+                    runtime_error = addSystemReleaseValue64Node(
+                        &node,
+                        graph_,
+                        tail ? &tail : nullptr,
+                        tail ? 1u : 0u,
+                        step.signal,
+                        step.value);
+                    if (runtime_error != cudaSuccess)
+                    {
+                        return failRuntime(
+                            "addSystemReleaseValue64Node", runtime_error);
+                    }
+                    tail = node;
+                }
             }
-            CUDA_BATCH_MEM_OP_NODE_PARAMS params{
-                .ctx = context,
-                .count = 1u,
-                .paramArray = &operation,
-                .flags = 0u,
-            };
-            CUgraphNode driver_node = nullptr;
-            CUgraphNode driver_dependency =
-                reinterpret_cast<CUgraphNode>(tail);
-            const CUresult result = cuGraphAddBatchMemOpNode(
-                &driver_node,
-                reinterpret_cast<CUgraph>(graph_),
-                tail ? &driver_dependency : nullptr,
-                tail ? 1u : 0u,
-                &params);
-            if (result != CUDA_SUCCESS)
-                return failDriver("cuGraphAddBatchMemOpNode", result);
-            tail = reinterpret_cast<cudaGraphNode_t>(driver_node);
+
+            if (!ordered_timeline_timing_events_.empty())
+            {
+                cudaGraphNode_t timing_stop = nullptr;
+                runtime_error = cudaGraphAddEventRecordNode(
+                    &timing_stop,
+                    graph_,
+                    &tail,
+                    1u,
+                    ordered_timeline_timing_events_[index].stop);
+                if (runtime_error != cudaSuccess)
+                    return failRuntime(
+                        "cudaGraphAddEventRecordNode(timeline stop)",
+                        runtime_error);
+                tail = timing_stop;
+            }
         }
 
         std::size_t count = 0u;
@@ -1918,7 +2099,69 @@ namespace llaminar2
         if (runtime_error != cudaSuccess)
             return failRuntime("cudaGraphGetNodes", runtime_error);
         node_count_ = count;
-        return tail != nullptr && node_count_ == ordered_steps.size();
+        const std::size_t expected_node_count =
+            ordered_steps.size() *
+            (ordered_timeline_timing_events_.empty() ? 1u : 3u);
+        return tail != nullptr && node_count_ == expected_node_count;
+    }
+
+    GPUOrderedTimelineTimingSnapshot
+    CUDAGraphCapture::consumeOrderedTimelineTiming()
+    {
+        GPUOrderedTimelineTimingSnapshot snapshot;
+        if (ordered_timeline_timing_events_.empty())
+            return snapshot;
+        if (!ordered_timeline_timing_pending_)
+        {
+            snapshot.state =
+                GPUOrderedTimelineTimingState::AwaitingLaunch;
+            return snapshot;
+        }
+        if (!activateOwner("consumeOrderedTimelineTiming"))
+        {
+            snapshot.state = GPUOrderedTimelineTimingState::Failed;
+            snapshot.error = "could not activate the immutable CUDA graph owner";
+            return snapshot;
+        }
+
+        const cudaError_t query =
+            cudaEventQuery(ordered_timeline_timing_events_.back().stop);
+        if (query == cudaErrorNotReady)
+        {
+            snapshot.state = GPUOrderedTimelineTimingState::Pending;
+            return snapshot;
+        }
+        if (query != cudaSuccess)
+        {
+            snapshot.state = GPUOrderedTimelineTimingState::Failed;
+            snapshot.error = std::string("cudaEventQuery failed: ") +
+                             cudaGetErrorString(query);
+            return snapshot;
+        }
+
+        snapshot.samples.reserve(ordered_timeline_timing_events_.size());
+        for (const auto &timing : ordered_timeline_timing_events_)
+        {
+            float elapsed_ms = 0.0f;
+            const cudaError_t elapsed =
+                cudaEventElapsedTime(&elapsed_ms, timing.start, timing.stop);
+            if (elapsed != cudaSuccess)
+            {
+                snapshot.samples.clear();
+                snapshot.state = GPUOrderedTimelineTimingState::Failed;
+                snapshot.error = std::string("cudaEventElapsedTime failed: ") +
+                                 cudaGetErrorString(elapsed);
+                return snapshot;
+            }
+            snapshot.samples.push_back({
+                .name = timing.name,
+                .kind = timing.kind,
+                .elapsed_ms = static_cast<double>(elapsed_ms),
+            });
+        }
+        ordered_timeline_timing_pending_ = false;
+        snapshot.state = GPUOrderedTimelineTimingState::Complete;
+        return snapshot;
     }
 
     bool CUDAGraphCapture::buildDeviceControlledWhileLoop(
@@ -2134,117 +2377,154 @@ namespace llaminar2
 #endif
     }
 
-    bool CUDAGraphCapture::buildDeviceControlledSwitchWhileLoop(
-        std::span<const DeviceControlledLoopBranch> branches,
+    bool CUDAGraphCapture::buildDeviceControlledSelectorWhileLoop(
+        std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
         const DeviceControlledLoopPredicate &predicate,
-        const DeviceControlledLoopSwitch &switch_policy)
+        const DeviceControlledLoopSelector &selector_policy)
     {
-#if CUDART_VERSION < 13000
-        (void)branches;
+#if CUDART_VERSION < 12030
+        (void)ordered_body_fragments;
         (void)predicate;
-        (void)switch_policy;
-        LOG_ERROR("[CUDAGraphCapture] Device-controlled SWITCH/WHILE graphs require CUDA 13.0 or newer");
+        (void)selector_policy;
+        LOG_ERROR("[CUDAGraphCapture] Device-controlled selector/WHILE graphs require CUDA 12.3 or newer");
         return false;
 #else
-        if (!activateOwner("buildDeviceControlledSwitchWhileLoop"))
+        if (!activateOwner("buildDeviceControlledSelectorWhileLoop"))
             return false;
 
         const bool shared_control_authority =
-            predicate.control_rows_device == switch_policy.control_rows_device &&
-            predicate.control_stride == switch_policy.control_stride &&
-            predicate.request_count == switch_policy.request_count &&
-            predicate.healthy_index == switch_policy.healthy_index &&
-            predicate.complete_index == switch_policy.complete_index;
-        if (branches.empty() || !predicate.valid() ||
-            !switch_policy.valid() || !shared_control_authority ||
-            switch_policy.maximum_selector >=
-                static_cast<int>(branches.size()))
+            predicate.control_rows_device ==
+                selector_policy.control_rows_device &&
+            predicate.control_stride == selector_policy.control_stride &&
+            predicate.request_count == selector_policy.request_count &&
+            predicate.healthy_index == selector_policy.healthy_index &&
+            predicate.complete_index == selector_policy.complete_index;
+        if (ordered_body_fragments.empty() || !predicate.valid() ||
+            !selector_policy.valid() || !shared_control_authority ||
+            selector_policy.maximum_selector <=
+                selector_policy.minimum_selector)
         {
-            LOG_ERROR("[CUDAGraphCapture] Invalid device-controlled SWITCH/WHILE contract"
-                      << " branches=" << branches.size()
+            LOG_ERROR("[CUDAGraphCapture] Invalid device-controlled selector/WHILE contract"
+                      << " fragments=" << ordered_body_fragments.size()
                       << " predicate_valid=" << predicate.valid()
-                      << " switch_valid=" << switch_policy.valid()
+                      << " selector_valid=" << selector_policy.valid()
                       << " shared_authority=" << shared_control_authority
                       << " selector_range=["
-                      << switch_policy.minimum_selector << ','
-                      << switch_policy.maximum_selector << ']');
+                      << selector_policy.minimum_selector << ','
+                      << selector_policy.maximum_selector << ']');
             return false;
         }
 
         size_t transaction_node_count = 0;
-        std::vector<std::vector<const CUDAGraphCapture *>> validated_branches(
-            branches.size());
-        for (size_t branch_index = 0;
-             branch_index < branches.size();
-             ++branch_index)
+        size_t selector_gated_fragment_count = 0;
+        size_t selector_group_count = 0;
+        size_t device_word_fragment_count = 0;
+        bool selector_region_started = false;
+        bool selector_region_closed = false;
+        int previous_threshold = selector_policy.minimum_selector;
+        std::vector<const CUDAGraphCapture *> validated_fragments;
+        validated_fragments.reserve(ordered_body_fragments.size());
+        for (size_t fragment_index = 0;
+             fragment_index < ordered_body_fragments.size();
+             ++fragment_index)
         {
-            const bool implemented =
-                static_cast<int>(branch_index) >=
-                    switch_policy.minimum_selector &&
-                static_cast<int>(branch_index) <=
-                    switch_policy.maximum_selector;
-            const auto fragments = branches[branch_index].ordered_fragments;
-            if (implemented != !fragments.empty())
+            const DeviceControlledLoopFragment &fragment =
+                ordered_body_fragments[fragment_index];
+            const auto *cuda_fragment =
+                dynamic_cast<const CUDAGraphCapture *>(fragment.capture);
+            if (!fragment.valid() || !cuda_fragment ||
+                cuda_fragment == this ||
+                cuda_fragment->deviceOrdinal() != device_ordinal_ ||
+                !cuda_fragment->graph() ||
+                cuda_fragment->nodeCount() == 0)
             {
-                LOG_ERROR("[CUDAGraphCapture] SWITCH branch implementation does not match its declared selector interval"
-                          << " branch=" << branch_index
-                          << " implemented=" << implemented
-                          << " fragments=" << fragments.size());
+                LOG_ERROR("[CUDAGraphCapture] Invalid selector/WHILE transaction fragment"
+                          << " fragment=" << fragment_index
+                          << " name="
+                          << (fragment.name ? fragment.name : "<unnamed>")
+                          << " execution="
+                          << static_cast<int>(fragment.execution)
+                          << " threshold=" << fragment.minimum_selector
+                          << " backend="
+                          << (fragment.capture
+                                  ? fragment.capture->backendName()
+                                  : "<null>")
+                          << " nodes="
+                          << (fragment.capture
+                                  ? fragment.capture->nodeCount()
+                                  : 0)
+                          << " parent_device=" << device_ordinal_
+                          << " fragment_device="
+                          << (cuda_fragment
+                                  ? cuda_fragment->deviceOrdinal()
+                                  : -1));
                 return false;
             }
 
-            for (size_t fragment_index = 0;
-                 fragment_index < fragments.size();
-                 ++fragment_index)
+            if (fragment.execution ==
+                DeviceControlledLoopFragmentExecution::
+                    IfDeviceSelectorAtLeast)
             {
-                const DeviceControlledLoopFragment &fragment =
-                    fragments[fragment_index];
-                const auto *cuda_fragment =
-                    dynamic_cast<const CUDAGraphCapture *>(fragment.capture);
-                if (!fragment.valid() || !cuda_fragment ||
-                    cuda_fragment == this ||
-                    cuda_fragment->deviceOrdinal() != device_ordinal_ ||
-                    !cuda_fragment->graph() ||
-                    cuda_fragment->nodeCount() == 0)
+                if (selector_region_closed ||
+                    fragment.minimum_selector <=
+                        selector_policy.minimum_selector ||
+                    fragment.minimum_selector >
+                        selector_policy.maximum_selector ||
+                    fragment.minimum_selector < previous_threshold)
                 {
-                    LOG_ERROR("[CUDAGraphCapture] Invalid SWITCH transaction fragment"
-                              << " branch=" << branch_index
+                    LOG_ERROR("[CUDAGraphCapture] Selector-gated fragments must form one monotonic region"
                               << " fragment=" << fragment_index
-                              << " name="
-                              << (fragment.name ? fragment.name : "<unnamed>")
-                              << " backend="
-                              << (fragment.capture
-                                      ? fragment.capture->backendName()
-                                      : "<null>")
-                              << " nodes="
-                              << (fragment.capture
-                                      ? fragment.capture->nodeCount()
-                                      : 0)
-                              << " parent_device=" << device_ordinal_
-                              << " fragment_device="
-                              << (cuda_fragment
-                                      ? cuda_fragment->deviceOrdinal()
-                                      : -1));
+                              << " threshold=" << fragment.minimum_selector
+                              << " previous_threshold=" << previous_threshold
+                              << " region_closed=" << selector_region_closed
+                              << " selector_range=["
+                              << selector_policy.minimum_selector << ','
+                              << selector_policy.maximum_selector << ']');
                     return false;
                 }
-                if (!validateCudaConditionalBodyFragmentGraph(
-                        cuda_fragment->graph(),
-                        fragment.name,
-                        fragment_index,
-                        "branch[" + std::to_string(branch_index) + "]"))
+                if (!selector_region_started ||
+                    fragment.minimum_selector != previous_threshold)
                 {
-                    return false;
+                    ++selector_group_count;
                 }
-                validated_branches[branch_index].push_back(cuda_fragment);
-                transaction_node_count += cuda_fragment->nodeCount();
+                selector_region_started = true;
+                previous_threshold = fragment.minimum_selector;
+                ++selector_gated_fragment_count;
             }
+            else
+            {
+                if (selector_region_started)
+                    selector_region_closed = true;
+                if (fragment.execution ==
+                    DeviceControlledLoopFragmentExecution::
+                        IfDeviceWordNonZero)
+                {
+                    ++device_word_fragment_count;
+                }
+            }
+
+            if (!validateCudaConditionalBodyFragmentGraph(
+                    cuda_fragment->graph(),
+                    fragment.name,
+                    fragment_index,
+                    "selector_linear_transaction"))
+            {
+                return false;
+            }
+            validated_fragments.push_back(cuda_fragment);
+            transaction_node_count += cuda_fragment->nodeCount();
+        }
+        if (!selector_region_started || selector_group_count == 0)
+        {
+            LOG_ERROR("[CUDAGraphCapture] Selector/WHILE transaction has no selector-gated prefix groups");
+            return false;
         }
 
         reset();
         cudaError_t error = cudaGraphCreate(&graph_, 0);
         if (error != cudaSuccess)
         {
-            LOG_ERROR("[CUDAGraphCapture] cudaGraphCreate failed for device SWITCH/WHILE: "
+            LOG_ERROR("[CUDAGraphCapture] cudaGraphCreate failed for device selector/WHILE: "
                       << cudaGetErrorString(error));
             return false;
         }
@@ -2252,7 +2532,7 @@ namespace llaminar2
         auto fail = [&](const char *operation, cudaError_t operation_error)
         {
             LOG_ERROR("[CUDAGraphCapture] " << operation
-                      << " failed for device SWITCH/WHILE: "
+                      << " failed for device selector/WHILE: "
                       << cudaGetErrorString(operation_error));
             reset();
             return false;
@@ -2298,7 +2578,9 @@ namespace llaminar2
             /*numDependencies=*/0,
             &predicate_params);
         if (error != cudaSuccess)
-            return fail("cudaGraphAddKernelNode(initial WHILE predicate)", error);
+            return fail(
+                "cudaGraphAddKernelNode(initial WHILE predicate)",
+                error);
 
         cudaGraphNodeParams while_params{};
         while_params.type = cudaGraphNodeTypeConditional;
@@ -2319,141 +2601,245 @@ namespace llaminar2
         if (!while_params.conditional.phGraph_out ||
             !while_params.conditional.phGraph_out[0])
         {
-            LOG_ERROR("[CUDAGraphCapture] CUDA did not return a SWITCH/WHILE body graph");
+            LOG_ERROR("[CUDAGraphCapture] CUDA did not return a selector/WHILE body graph");
             reset();
             return false;
         }
 
         cudaGraph_t loop_body = while_params.conditional.phGraph_out[0];
-        cudaGraphConditionalHandle switch_condition = 0;
+        cudaGraphConditionalHandle transaction_condition = 0;
         error = cudaGraphConditionalHandleCreate(
-            &switch_condition,
+            &transaction_condition,
             loop_body,
             /*defaultLaunchValue=*/0,
             cudaGraphCondAssignDefault);
         if (error != cudaSuccess)
-            return fail("cudaGraphConditionalHandleCreate(SWITCH)", error);
+        {
+            return fail(
+                "cudaGraphConditionalHandleCreate(selector validation IF)",
+                error);
+        }
 
-        cudaGraphConditionalHandle switch_condition_arg = switch_condition;
-        int *switch_rows_arg = switch_policy.control_rows_device;
-        int switch_stride_arg = switch_policy.control_stride;
-        int switch_requests_arg = switch_policy.request_count;
-        int switch_healthy_arg = switch_policy.healthy_index;
-        int switch_complete_arg = switch_policy.complete_index;
-        int switch_selector_arg = switch_policy.selector_index;
-        int switch_error_arg = switch_policy.error_index;
-        int switch_minimum_arg = switch_policy.minimum_selector;
-        int switch_maximum_arg = switch_policy.maximum_selector;
-        int switch_invalid_error_arg =
-            switch_policy.invalid_selector_error;
-        unsigned int branch_count_arg =
-            static_cast<unsigned int>(branches.size());
-        void *switch_args[] = {
-            &switch_condition_arg,
-            &switch_rows_arg,
-            &switch_stride_arg,
-            &switch_requests_arg,
-            &switch_healthy_arg,
-            &switch_complete_arg,
-            &switch_selector_arg,
-            &switch_error_arg,
-            &switch_minimum_arg,
-            &switch_maximum_arg,
-            &switch_invalid_error_arg,
-            &branch_count_arg};
+        cudaGraphConditionalHandle transaction_condition_arg =
+            transaction_condition;
+        int *selector_rows_arg = selector_policy.control_rows_device;
+        int selector_stride_arg = selector_policy.control_stride;
+        int selector_requests_arg = selector_policy.request_count;
+        int selector_healthy_arg = selector_policy.healthy_index;
+        int selector_complete_arg = selector_policy.complete_index;
+        int selector_index_arg = selector_policy.selector_index;
+        int selector_error_arg = selector_policy.error_index;
+        int selector_minimum_arg = selector_policy.minimum_selector;
+        int selector_maximum_arg = selector_policy.maximum_selector;
+        int selector_invalid_error_arg =
+            selector_policy.invalid_selector_error;
+        void *selector_validation_args[] = {
+            &transaction_condition_arg,
+            &selector_rows_arg,
+            &selector_stride_arg,
+            &selector_requests_arg,
+            &selector_healthy_arg,
+            &selector_complete_arg,
+            &selector_index_arg,
+            &selector_error_arg,
+            &selector_minimum_arg,
+            &selector_maximum_arg,
+            &selector_invalid_error_arg};
 
-        cudaKernelNodeParams selector_params{};
-        selector_params.func =
-            reinterpret_cast<void *>(updateDeviceControlledSwitchCondition);
-        selector_params.gridDim = dim3(1, 1, 1);
-        selector_params.blockDim = dim3(1, 1, 1);
-        selector_params.sharedMemBytes = 0;
-        selector_params.kernelParams = switch_args;
-        selector_params.extra = nullptr;
+        cudaKernelNodeParams selector_validation_params{};
+        selector_validation_params.func = reinterpret_cast<void *>(
+            updateDeviceControlledSelectorValidityCondition);
+        selector_validation_params.gridDim = dim3(1, 1, 1);
+        selector_validation_params.blockDim = dim3(1, 1, 1);
+        selector_validation_params.sharedMemBytes = 0;
+        selector_validation_params.kernelParams =
+            selector_validation_args;
+        selector_validation_params.extra = nullptr;
 
-        cudaGraphNode_t selector_node = nullptr;
+        cudaGraphNode_t selector_validation_node = nullptr;
         error = cudaGraphAddKernelNode(
-            &selector_node,
+            &selector_validation_node,
             loop_body,
             /*dependencies=*/nullptr,
             /*numDependencies=*/0,
-            &selector_params);
+            &selector_validation_params);
         if (error != cudaSuccess)
-            return fail("cudaGraphAddKernelNode(SWITCH selector)", error);
+        {
+            return fail(
+                "cudaGraphAddKernelNode(selector validation)",
+                error);
+        }
 
-        cudaGraphNodeParams switch_params{};
-        switch_params.type = cudaGraphNodeTypeConditional;
-        switch_params.conditional.handle = switch_condition;
-        switch_params.conditional.type = cudaGraphCondTypeSwitch;
-        switch_params.conditional.size =
-            static_cast<unsigned int>(branches.size());
+        cudaGraphNodeParams transaction_if_params{};
+        transaction_if_params.type = cudaGraphNodeTypeConditional;
+        transaction_if_params.conditional.handle = transaction_condition;
+        transaction_if_params.conditional.type = cudaGraphCondTypeIf;
+        transaction_if_params.conditional.size = 1;
 
-        cudaGraphNode_t switch_node = nullptr;
+        cudaGraphNode_t transaction_if_node = nullptr;
         error = cudaGraphAddNode(
-            &switch_node,
+            &transaction_if_node,
             loop_body,
-            &selector_node,
+            &selector_validation_node,
             /*dependencyData=*/nullptr,
             /*numDependencies=*/1,
-            &switch_params);
+            &transaction_if_params);
         if (error != cudaSuccess)
-            return fail("cudaGraphAddNode(SWITCH)", error);
-        if (!switch_params.conditional.phGraph_out)
+            return fail("cudaGraphAddNode(selector validation IF)", error);
+        if (!transaction_if_params.conditional.phGraph_out ||
+            !transaction_if_params.conditional.phGraph_out[0])
         {
-            LOG_ERROR("[CUDAGraphCapture] CUDA did not return SWITCH body graphs");
+            LOG_ERROR("[CUDAGraphCapture] CUDA did not return the validated transaction IF body");
             reset();
             return false;
         }
 
-        size_t conditional_fragment_count = 0;
-        for (int branch_index = switch_policy.minimum_selector;
-             branch_index <= switch_policy.maximum_selector;
-             ++branch_index)
+        cudaGraph_t transaction_graph =
+            transaction_if_params.conditional.phGraph_out[0];
+        cudaGraphNode_t transaction_tail = nullptr;
+        size_t fragment_index = 0;
+        while (fragment_index < ordered_body_fragments.size())
         {
-            cudaGraph_t branch_graph =
-                switch_params.conditional.phGraph_out[branch_index];
-            if (!branch_graph)
+            const DeviceControlledLoopFragment &fragment =
+                ordered_body_fragments[fragment_index];
+            if (fragment.execution !=
+                DeviceControlledLoopFragmentExecution::
+                    IfDeviceSelectorAtLeast)
             {
-                LOG_ERROR("[CUDAGraphCapture] CUDA returned a null SWITCH branch graph"
-                          << " branch=" << branch_index);
+                const DeviceControlledFragmentAppendResult appended =
+                    appendDeviceControlledFragment(
+                        transaction_graph,
+                        transaction_tail,
+                        fragment,
+                        *validated_fragments[fragment_index]);
+                if (!appended.succeeded())
+                    return fail(appended.operation, appended.error);
+                transaction_tail = appended.tail;
+                ++fragment_index;
+                continue;
+            }
+
+            const int threshold = fragment.minimum_selector;
+            const size_t group_begin = fragment_index;
+            size_t group_end = group_begin;
+            while (group_end < ordered_body_fragments.size() &&
+                   ordered_body_fragments[group_end].execution ==
+                       DeviceControlledLoopFragmentExecution::
+                           IfDeviceSelectorAtLeast &&
+                   ordered_body_fragments[group_end].minimum_selector ==
+                       threshold)
+            {
+                ++group_end;
+            }
+
+            cudaGraphConditionalHandle group_condition = 0;
+            error = cudaGraphConditionalHandleCreate(
+                &group_condition,
+                transaction_graph,
+                /*defaultLaunchValue=*/0,
+                cudaGraphCondAssignDefault);
+            if (error != cudaSuccess)
+            {
+                return fail(
+                    "cudaGraphConditionalHandleCreate(selector threshold IF)",
+                    error);
+            }
+
+            cudaGraphConditionalHandle group_condition_arg = group_condition;
+            int group_threshold_arg = threshold;
+            void *group_condition_args[] = {
+                &group_condition_arg,
+                &selector_rows_arg,
+                &selector_stride_arg,
+                &selector_requests_arg,
+                &selector_healthy_arg,
+                &selector_complete_arg,
+                &selector_index_arg,
+                &selector_error_arg,
+                &selector_minimum_arg,
+                &selector_maximum_arg,
+                &selector_invalid_error_arg,
+                &group_threshold_arg};
+
+            cudaKernelNodeParams group_condition_params{};
+            group_condition_params.func = reinterpret_cast<void *>(
+                updateDeviceControlledSelectorThresholdCondition);
+            group_condition_params.gridDim = dim3(1, 1, 1);
+            group_condition_params.blockDim = dim3(1, 1, 1);
+            group_condition_params.sharedMemBytes = 0;
+            group_condition_params.kernelParams = group_condition_args;
+            group_condition_params.extra = nullptr;
+
+            cudaGraphNode_t group_condition_node = nullptr;
+            error = cudaGraphAddKernelNode(
+                &group_condition_node,
+                transaction_graph,
+                transaction_tail ? &transaction_tail : nullptr,
+                transaction_tail ? 1 : 0,
+                &group_condition_params);
+            if (error != cudaSuccess)
+            {
+                return fail(
+                    "cudaGraphAddKernelNode(selector threshold)",
+                    error);
+            }
+
+            cudaGraphNodeParams group_if_params{};
+            group_if_params.type = cudaGraphNodeTypeConditional;
+            group_if_params.conditional.handle = group_condition;
+            group_if_params.conditional.type = cudaGraphCondTypeIf;
+            group_if_params.conditional.size = 1;
+
+            cudaGraphNode_t group_if_node = nullptr;
+            error = cudaGraphAddNode(
+                &group_if_node,
+                transaction_graph,
+                &group_condition_node,
+                /*dependencyData=*/nullptr,
+                /*numDependencies=*/1,
+                &group_if_params);
+            if (error != cudaSuccess)
+                return fail("cudaGraphAddNode(selector threshold IF)", error);
+            if (!group_if_params.conditional.phGraph_out ||
+                !group_if_params.conditional.phGraph_out[0])
+            {
+                LOG_ERROR("[CUDAGraphCapture] CUDA did not return a selector threshold IF body");
                 reset();
                 return false;
             }
 
-            cudaGraphNode_t branch_tail = nullptr;
-            const auto branch_fragments =
-                branches[static_cast<size_t>(branch_index)].ordered_fragments;
-            const auto &validated_fragments =
-                validated_branches[static_cast<size_t>(branch_index)];
-            for (size_t fragment_index = 0;
-                 fragment_index < branch_fragments.size();
-                 ++fragment_index)
+            cudaGraph_t group_graph =
+                group_if_params.conditional.phGraph_out[0];
+            cudaGraphNode_t group_tail = nullptr;
+            for (size_t grouped = group_begin;
+                 grouped < group_end;
+                 ++grouped)
             {
-                const DeviceControlledLoopFragment &fragment =
-                    branch_fragments[fragment_index];
-                const DeviceControlledFragmentAppendResult appended =
-                    appendDeviceControlledFragment(
-                    branch_graph,
-                    branch_tail,
-                    fragment,
-                    *validated_fragments[fragment_index]);
-                if (!appended.succeeded())
-                    return fail(appended.operation, appended.error);
-                branch_tail = appended.tail;
-                conditional_fragment_count +=
-                    fragment.execution ==
-                    DeviceControlledLoopFragmentExecution::
-                        IfDeviceWordNonZero
-                        ? 1u
-                        : 0u;
+                cudaGraphNode_t child_node = nullptr;
+                error = cudaGraphAddChildGraphNode(
+                    &child_node,
+                    group_graph,
+                    group_tail ? &group_tail : nullptr,
+                    group_tail ? 1 : 0,
+                    validated_fragments[grouped]->graph());
+                if (error != cudaSuccess)
+                {
+                    return fail(
+                        "cudaGraphAddChildGraphNode(selector threshold group)",
+                        error);
+                }
+                group_tail = child_node;
             }
+
+            transaction_tail = group_if_node;
+            fragment_index = group_end;
         }
 
         cudaGraphNode_t predicate_node = nullptr;
         error = cudaGraphAddKernelNode(
             &predicate_node,
             loop_body,
-            &switch_node,
+            &transaction_if_node,
             /*numDependencies=*/1,
             &predicate_params);
         if (error != cudaSuccess)
@@ -2464,19 +2850,22 @@ namespace llaminar2
         if (error != cudaSuccess)
             return fail("cudaGraphGetNodes", error);
         node_count_ = count;
-        LOG_DEBUG("[CUDAGraphCapture] Built device-controlled SWITCH/WHILE graph"
+        LOG_DEBUG("[CUDAGraphCapture] Built device-controlled selector/WHILE graph"
                   << " parent_nodes=" << node_count_
-                  << " branches=" << branches.size()
-                  << " conditional_fragments=" << conditional_fragment_count
+                  << " fragments=" << ordered_body_fragments.size()
+                  << " selector_gated_fragments="
+                  << selector_gated_fragment_count
+                  << " selector_groups=" << selector_group_count
+                  << " device_word_fragments="
+                  << device_word_fragment_count
                   << " selector_range=["
-                  << switch_policy.minimum_selector << ','
-                  << switch_policy.maximum_selector << ']'
+                  << selector_policy.minimum_selector << ','
+                  << selector_policy.maximum_selector << ']'
                   << " transaction_nodes=" << transaction_node_count
                   << " requests=" << predicate.request_count);
-        return true;
+        return transaction_tail != nullptr;
 #endif
     }
-
     GraphUpdateResult CUDAGraphCapture::tryUpdate()
     {
         if (!activateOwner("tryUpdate"))
@@ -2557,6 +2946,21 @@ namespace llaminar2
         return true;
     }
 
+    void CUDAGraphCapture::destroyOrderedTimelineTimingEvents() noexcept
+    {
+        for (auto &timing : ordered_timeline_timing_events_)
+        {
+            if (timing.start)
+                CUDA_WARN_IF_FAIL(cudaEventDestroy(timing.start));
+            if (timing.stop)
+                CUDA_WARN_IF_FAIL(cudaEventDestroy(timing.stop));
+            timing.start = nullptr;
+            timing.stop = nullptr;
+        }
+        ordered_timeline_timing_events_.clear();
+        ordered_timeline_timing_pending_ = false;
+    }
+
     void CUDAGraphCapture::reset()
     {
         if ((exec_ || graph_) && device_ordinal_ >= 0)
@@ -2568,11 +2972,13 @@ namespace llaminar2
             CUDA_WARN_IF_FAIL(cudaGraphExecDestroy(exec_));
             exec_ = nullptr;
         }
+        resident_memory_bytes_ = 0u;
         if (graph_)
         {
             CUDA_WARN_IF_FAIL(cudaGraphDestroy(graph_));
             graph_ = nullptr;
         }
+        destroyOrderedTimelineTimingEvents();
         node_count_ = 0;
     }
 

@@ -53,7 +53,7 @@ namespace
         kThreads ==
             llaminar2::MoEProjectionNumericalContract::
                 floating_ordered_k_partitions,
-        "CUDA floating MoE launch geometry must retain the movable-expert tree");
+        "CUDA floating MoE launch geometry must retain the GPU-aligned expert tree");
     constexpr unsigned int kCudaGridYDimensionLimit = 65535u;
 
     /**
@@ -1767,14 +1767,34 @@ namespace
 
     __device__ __forceinline__ bool runtime_shape_ok(
         const DeviceMoELayerRuntimeView *runtime,
+        uint32_t execution_bank,
         int num_experts,
         int top_k)
     {
         return runtime &&
-               runtime_execution_bank(runtime) <= 1u &&
+               execution_bank <= 1u &&
                runtime->active_epoch != 0u &&
                runtime->expert_count == static_cast<uint32_t>(num_experts) &&
                runtime->top_k == static_cast<uint32_t>(top_k);
+    }
+
+    /**
+     * @brief Resolve or fatally reject the immutable decode placement bank.
+     *
+     * This check belongs before `shape_ok`: a stale epoch ticket is a broken
+     * ownership edge, not an alternate tensor shape that may skip publication.
+     */
+    __device__ __forceinline__ uint32_t
+    runtime_require_decode_execution_bank(
+        const DeviceMoELayerRuntimeView *runtime)
+    {
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
+        if (execution_bank > 1u)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "ExpertOverlay decode ticket does not name a retained placement bank");
+        }
+        return execution_bank;
     }
 
     /** @return Whether decode can publish one final participant per route. */
@@ -2947,6 +2967,7 @@ namespace
 
     __device__ __forceinline__ void runtime_resolve_decode_dispatch(
         DeviceMoELayerRuntimeView *runtime,
+        uint32_t execution_bank,
         const int *selected_experts,
         int num_experts,
         int top_k,
@@ -2956,7 +2977,8 @@ namespace
         bool *local_compute_flags,
         int *assigned_participants)
     {
-        if (!runtime_shape_ok(runtime, num_experts, top_k) ||
+        if (!runtime_shape_ok(
+                runtime, execution_bank, num_experts, top_k) ||
             !selected_experts ||
             !local_compute_flags ||
             !assigned_participants)
@@ -2970,9 +2992,6 @@ namespace
             assigned_participants[slot] = -1;
         }
 
-        const uint32_t execution_bank = runtime_execution_bank(runtime);
-        if (execution_bank > 1u)
-            return;
         const auto &bank = runtime_placement_banks(runtime)[execution_bank];
         const uint32_t participant_count = runtime->participant_count;
         const uint32_t participant_id = runtime->participant_id;
@@ -13781,7 +13800,12 @@ namespace
 
         if (threadIdx.x == 0)
         {
-            const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
+            const uint32_t execution_bank =
+                runtime_require_decode_execution_bank(runtime);
+            if (execution_bank > 1u)
+                return;
+            const bool shape_ok = runtime_shape_ok(
+                runtime, execution_bank, num_experts, top_k);
             if (!runtime_route_assignment_ledger_ok(runtime, top_k))
             {
                 FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
@@ -13798,6 +13822,7 @@ namespace
             {
                 runtime_resolve_decode_dispatch(
                     runtime,
+                    execution_bank,
                     selected,
                     num_experts,
                     top_k,
@@ -13866,7 +13891,12 @@ namespace
         if (threadIdx.x != 0)
             return;
 
-        const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
+        const uint32_t execution_bank =
+            runtime_require_decode_execution_bank(runtime);
+        if (execution_bank > 1u)
+            return;
+        const bool shape_ok = runtime_shape_ok(
+            runtime, execution_bank, num_experts, top_k);
         if (!runtime_route_assignment_ledger_ok(runtime, top_k))
         {
             FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
@@ -13879,6 +13909,7 @@ namespace
         {
             runtime_resolve_decode_dispatch(
                 runtime,
+                execution_bank,
                 expert_indices,
                 num_experts,
                 top_k,

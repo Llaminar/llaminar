@@ -18,6 +18,7 @@
 #include "../../utils/VramBillOfMaterials.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -118,12 +119,51 @@ namespace llaminar2
                 status = hipGraphMemcpyNodeGetParams(source_node, &params);
                 if (status == hipSuccess)
                 {
-                    status = hipGraphAddMemcpyNode(
-                        &destination_node,
-                        destination_graph,
-                        dependency_data,
-                        dependency_count,
-                        &params);
+                    const bool is_linear_copy =
+                        params.srcArray == nullptr &&
+                        params.dstArray == nullptr &&
+                        params.srcPtr.ptr != nullptr &&
+                        params.dstPtr.ptr != nullptr &&
+                        params.srcPos.x == 0u &&
+                        params.srcPos.y == 0u &&
+                        params.srcPos.z == 0u &&
+                        params.dstPos.x == 0u &&
+                        params.dstPos.y == 0u &&
+                        params.dstPos.z == 0u &&
+                        params.extent.width > 0u &&
+                        params.extent.height == 1u &&
+                        params.extent.depth == 1u;
+                    if (is_linear_copy)
+                    {
+                        /* Stream capture represents hipMemcpyAsync as HIP's
+                         * specialized 1D node. Re-importing that node through
+                         * the generic 3D API loses the runtime's effective
+                         * peer/mapped-memory classification. On gfx906 the
+                         * resulting node advertises AQL packet capture but can
+                         * produce no packet, causing ROCm 7.1 to instantiate a
+                         * successful executable that replays no work. Preserve
+                         * the linear operation as a 1D node so HIP selects the
+                         * exact copy engine and packet-capture policy from the
+                         * source and destination allocations. */
+                        status = hipGraphAddMemcpyNode1D(
+                            &destination_node,
+                            destination_graph,
+                            dependency_data,
+                            dependency_count,
+                            params.dstPtr.ptr,
+                            params.srcPtr.ptr,
+                            params.extent.width,
+                            params.kind);
+                    }
+                    else
+                    {
+                        status = hipGraphAddMemcpyNode(
+                            &destination_node,
+                            destination_graph,
+                            dependency_data,
+                            dependency_count,
+                            &params);
+                    }
                 }
                 break;
             }
@@ -669,13 +709,20 @@ namespace llaminar2
     HIPGraphCapture::HIPGraphCapture(HIPGraphCapture &&other) noexcept
         : stream_(other.stream_), device_ordinal_(other.device_ordinal_),
           graph_(other.graph_), exec_(other.exec_),
-          node_count_(other.node_count_)
+          node_count_(other.node_count_),
+          resident_memory_bytes_(other.resident_memory_bytes_),
+          ordered_timeline_timing_events_(
+              std::move(other.ordered_timeline_timing_events_)),
+          ordered_timeline_timing_pending_(
+              other.ordered_timeline_timing_pending_)
     {
         other.stream_ = nullptr;
         other.device_ordinal_ = -1;
         other.graph_ = nullptr;
         other.exec_ = nullptr;
         other.node_count_ = 0;
+        other.resident_memory_bytes_ = 0u;
+        other.ordered_timeline_timing_pending_ = false;
     }
 
     HIPGraphCapture &HIPGraphCapture::operator=(HIPGraphCapture &&other) noexcept
@@ -688,11 +735,18 @@ namespace llaminar2
             graph_ = other.graph_;
             exec_ = other.exec_;
             node_count_ = other.node_count_;
+            resident_memory_bytes_ = other.resident_memory_bytes_;
+            ordered_timeline_timing_events_ =
+                std::move(other.ordered_timeline_timing_events_);
+            ordered_timeline_timing_pending_ =
+                other.ordered_timeline_timing_pending_;
             other.stream_ = nullptr;
             other.device_ordinal_ = -1;
             other.graph_ = nullptr;
             other.exec_ = nullptr;
             other.node_count_ = 0;
+            other.resident_memory_bytes_ = 0u;
+            other.ordered_timeline_timing_pending_ = false;
         }
         return *this;
     }
@@ -737,6 +791,7 @@ namespace llaminar2
             }
             graph_ = nullptr;
             node_count_ = 0;
+            destroyOrderedTimelineTimingEvents();
         }
 
         hipError_t err = hipStreamBeginCapture(stream_, hipStreamCaptureModeRelaxed);
@@ -752,7 +807,11 @@ namespace llaminar2
     {
         if (!activateOwner("endCapture"))
             return false;
+        const auto end_capture_begin = std::chrono::steady_clock::now();
         hipError_t err = hipStreamEndCapture(stream_, &graph_);
+        const auto end_capture_elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - end_capture_begin);
         if (err != hipSuccess)
         {
             LOG_ERROR("[HIPGraphCapture] hipStreamEndCapture failed: " << hipGetErrorString(err));
@@ -772,7 +831,24 @@ namespace llaminar2
         {
             node_count_ = count;
         }
-        LOG_DEBUG("[HIPGraphCapture] Captured graph with " << node_count_ << " nodes");
+        const double end_capture_ms =
+            static_cast<double>(end_capture_elapsed.count()) / 1000.0;
+        if (end_capture_ms >= 1000.0)
+        {
+            LOG_WARN(
+                "[HIPGraphCapture] Slow hipStreamEndCapture"
+                << " device=ROCm:" << device_ordinal_
+                << " nodes=" << node_count_
+                << " elapsed_ms=" << end_capture_ms);
+        }
+        else
+        {
+            LOG_TRACE(
+                "[HIPGraphCapture] Captured graph"
+                << " device=ROCm:" << device_ordinal_
+                << " nodes=" << node_count_
+                << " elapsed_ms=" << end_capture_ms);
+        }
         return true;
     }
 
@@ -797,6 +873,7 @@ namespace llaminar2
                 return false;
             }
             exec_ = nullptr;
+            resident_memory_bytes_ = 0u;
         }
 
         std::size_t free_bytes_before = 0u;
@@ -812,13 +889,18 @@ namespace llaminar2
             return false;
         }
 
+        const auto instantiate_begin = std::chrono::steady_clock::now();
         hipError_t err = hipGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0);
+        const auto instantiate_elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - instantiate_begin);
         if (err != hipSuccess)
         {
             LOG_ERROR("[HIPGraphCapture] hipGraphInstantiate failed: " << hipGetErrorString(err));
             exec_ = nullptr;
             return false;
         }
+
         std::size_t free_bytes_after = 0u;
         std::size_t total_bytes_after = 0u;
         const hipError_t memory_after_status = hipMemGetInfo(
@@ -844,14 +926,18 @@ namespace llaminar2
         }
         /*
          * HIP owns this storage and exposes no allocation handle. The positive
-         * free-memory delta is the concrete setup observation. Clamp an
-         * apparent increase to zero because unrelated deferred driver state
-         * may be retired at the same boundary.
+         * free-memory delta is evidence for complete-family certification, not
+         * an allocation attributable to this executable: HIP may grow a shared
+         * pool now and satisfy later graph owners from it. Physical admission
+         * therefore commits the complete family extent. Clamp an apparent
+         * increase to zero because unrelated deferred driver state may be
+         * retired at the same boundary.
          */
         const std::size_t resident_delta_bytes =
             free_bytes_before > free_bytes_after
                 ? free_bytes_before - free_bytes_after
                 : 0u;
+        resident_memory_bytes_ = resident_delta_bytes;
         if (vramBomEnabled())
         {
             logVramBomLine(
@@ -866,11 +952,27 @@ namespace llaminar2
                     " free_after_bytes=" +
                     std::to_string(free_bytes_after));
         }
-        LOG_DEBUG(
-            "[HIPGraphCapture] Instantiated graph executable ("
-            << node_count_
-            << " nodes, resident_delta_bytes=" << resident_delta_bytes
-            << ", free_bytes_after=" << free_bytes_after << ")");
+        const double instantiate_ms =
+            static_cast<double>(instantiate_elapsed.count()) / 1000.0;
+        if (instantiate_ms >= 1000.0)
+        {
+            LOG_WARN(
+                "[HIPGraphCapture] Slow hipGraphInstantiate"
+                << " device=ROCm:" << device_ordinal_
+                << " nodes=" << node_count_
+                << " elapsed_ms=" << instantiate_ms
+                << " resident_delta_bytes=" << resident_delta_bytes);
+        }
+        else
+        {
+            LOG_TRACE(
+                "[HIPGraphCapture] Instantiated graph executable"
+                << " device=ROCm:" << device_ordinal_
+                << " nodes=" << node_count_
+                << " elapsed_ms=" << instantiate_ms
+                << " resident_delta_bytes=" << resident_delta_bytes
+                << " free_bytes_after=" << free_bytes_after);
+        }
         return true;
     }
 
@@ -894,11 +996,16 @@ namespace llaminar2
             LOG_ERROR("[HIPGraphCapture] hipGraphLaunch failed: " << hipGetErrorString(err));
             return false;
         }
+
+        if (!ordered_timeline_timing_events_.empty())
+            ordered_timeline_timing_pending_ = true;
+
         return true;
     }
 
     bool HIPGraphCapture::buildOrderedTimelineTransaction(
-        std::span<const GPUOrderedTimelineStep> ordered_steps)
+        std::span<const GPUOrderedTimelineStep> ordered_steps,
+        GPUOrderedTimelineInstrumentation instrumentation)
     {
         if (!activateOwner("buildOrderedTimelineTransaction") ||
             ordered_steps.empty())
@@ -954,11 +1061,50 @@ namespace llaminar2
             return false;
         };
 
+        if (instrumentation ==
+            GPUOrderedTimelineInstrumentation::PerStepEvents)
+        {
+            ordered_timeline_timing_events_.reserve(ordered_steps.size());
+            for (const auto &step : ordered_steps)
+            {
+                OrderedTimelineTimingEvents timing{
+                    .name = step.name,
+                    .kind = step.kind,
+                };
+                error = hipEventCreate(&timing.start);
+                if (error != hipSuccess)
+                    return fail("hipEventCreate(timeline start)", error);
+                error = hipEventCreate(&timing.stop);
+                if (error != hipSuccess)
+                {
+                    (void)hipEventDestroy(timing.start);
+                    return fail("hipEventCreate(timeline stop)", error);
+                }
+                ordered_timeline_timing_events_.push_back(
+                    std::move(timing));
+            }
+        }
+
         std::vector<hipGraphNode_t> frontier;
         std::size_t expected_node_count = 0u;
         for (std::size_t index = 0u; index < ordered_steps.size(); ++index)
         {
             const auto &step = ordered_steps[index];
+            if (!ordered_timeline_timing_events_.empty())
+            {
+                hipGraphNode_t timing_start = nullptr;
+                error = hipGraphAddEventRecordNode(
+                    &timing_start,
+                    graph_,
+                    frontier.empty() ? nullptr : frontier.data(),
+                    frontier.size(),
+                    ordered_timeline_timing_events_[index].start);
+                if (error != hipSuccess)
+                    return fail("hipGraphAddEventRecordNode(timeline start)", error);
+                frontier.assign(1u, timing_start);
+                ++expected_node_count;
+            }
+
             hipGraphNode_t node = nullptr;
             if (step.kind ==
                 GPUOrderedTimelineStepKind::CapturedFragment)
@@ -982,10 +1128,8 @@ namespace llaminar2
                 }
                 frontier = std::move(imported.leaves);
                 expected_node_count += imported.node_count;
-                continue;
             }
-
-            if (step.kind == GPUOrderedTimelineStepKind::WaitValue64)
+            else if (step.kind == GPUOrderedTimelineStepKind::WaitValue64)
             {
                 // HIP's beta batch-memory graph wait may report a dependency
                 // while issuing successor work before peer bytes are visible.
@@ -1017,10 +1161,27 @@ namespace llaminar2
                         "addSystemReleaseValue64Node", error);
                 frontier.assign(1u, node);
                 ++expected_node_count;
-                continue;
             }
-            frontier.assign(1u, node);
-            ++expected_node_count;
+            if (step.kind == GPUOrderedTimelineStepKind::WaitValue64)
+            {
+                frontier.assign(1u, node);
+                ++expected_node_count;
+            }
+
+            if (!ordered_timeline_timing_events_.empty())
+            {
+                hipGraphNode_t timing_stop = nullptr;
+                error = hipGraphAddEventRecordNode(
+                    &timing_stop,
+                    graph_,
+                    frontier.data(),
+                    frontier.size(),
+                    ordered_timeline_timing_events_[index].stop);
+                if (error != hipSuccess)
+                    return fail("hipGraphAddEventRecordNode(timeline stop)", error);
+                frontier.assign(1u, timing_stop);
+                ++expected_node_count;
+            }
         }
 
         std::size_t count = 0u;
@@ -1029,6 +1190,80 @@ namespace llaminar2
             return fail("hipGraphGetNodes", error);
         node_count_ = count;
         return !frontier.empty() && node_count_ == expected_node_count;
+    }
+
+    GPUOrderedTimelineTimingSnapshot
+    HIPGraphCapture::consumeOrderedTimelineTiming()
+    {
+        GPUOrderedTimelineTimingSnapshot snapshot;
+        if (ordered_timeline_timing_events_.empty())
+            return snapshot;
+        if (!ordered_timeline_timing_pending_)
+        {
+            snapshot.state =
+                GPUOrderedTimelineTimingState::AwaitingLaunch;
+            return snapshot;
+        }
+        if (!activateOwner("consumeOrderedTimelineTiming"))
+        {
+            snapshot.state = GPUOrderedTimelineTimingState::Failed;
+            snapshot.error = "could not activate the immutable HIP graph owner";
+            return snapshot;
+        }
+
+        const hipError_t query =
+            hipEventQuery(ordered_timeline_timing_events_.back().stop);
+        if (query == hipErrorNotReady)
+        {
+            snapshot.state = GPUOrderedTimelineTimingState::Pending;
+            return snapshot;
+        }
+        if (query != hipSuccess)
+        {
+            snapshot.state = GPUOrderedTimelineTimingState::Failed;
+            snapshot.error = std::string("hipEventQuery failed: ") +
+                             hipGetErrorString(query);
+            return snapshot;
+        }
+
+        snapshot.samples.reserve(ordered_timeline_timing_events_.size());
+        for (const auto &timing : ordered_timeline_timing_events_)
+        {
+            float elapsed_ms = 0.0f;
+            const hipError_t elapsed =
+                hipEventElapsedTime(&elapsed_ms, timing.start, timing.stop);
+            if (elapsed != hipSuccess)
+            {
+                snapshot.samples.clear();
+                snapshot.state = GPUOrderedTimelineTimingState::Failed;
+                snapshot.error = std::string("hipEventElapsedTime failed: ") +
+                                 hipGetErrorString(elapsed);
+                return snapshot;
+            }
+            snapshot.samples.push_back({
+                .name = timing.name,
+                .kind = timing.kind,
+                .elapsed_ms = static_cast<double>(elapsed_ms),
+            });
+        }
+        ordered_timeline_timing_pending_ = false;
+        snapshot.state = GPUOrderedTimelineTimingState::Complete;
+        return snapshot;
+    }
+
+    void HIPGraphCapture::destroyOrderedTimelineTimingEvents() noexcept
+    {
+        for (auto &timing : ordered_timeline_timing_events_)
+        {
+            if (timing.start)
+                HIP_WARN_IF_FAIL(hipEventDestroy(timing.start));
+            if (timing.stop)
+                HIP_WARN_IF_FAIL(hipEventDestroy(timing.stop));
+            timing.start = nullptr;
+            timing.stop = nullptr;
+        }
+        ordered_timeline_timing_events_.clear();
+        ordered_timeline_timing_pending_ = false;
     }
 
     GraphUpdateResult HIPGraphCapture::tryUpdate()
@@ -1105,11 +1340,13 @@ namespace llaminar2
             HIP_WARN_IF_FAIL(hipGraphExecDestroy(exec_));
             exec_ = nullptr;
         }
+        resident_memory_bytes_ = 0u;
         if (graph_)
         {
             HIP_WARN_IF_FAIL(hipGraphDestroy(graph_));
             graph_ = nullptr;
         }
+        destroyOrderedTimelineTimingEvents();
 
         if (account_vram)
         {

@@ -45,6 +45,8 @@ namespace llaminar2::test
             ON_CALL(*this, lastError()).WillByDefault(testing::ReturnRef(empty_error_));
             ON_CALL(*this, executionPlan()).WillByDefault(testing::ReturnRef(default_plan_));
             ON_CALL(*this, config()).WillByDefault(testing::ReturnRef(default_config_));
+            ON_CALL(*this, mtpRequestPolicy())
+                .WillByDefault(testing::Return(MTPRequestPolicy{}));
             ON_CALL(*this, primaryDeviceId()).WillByDefault(testing::Return(DeviceId::cpu()));
             ON_CALL(*this, moeRuntimeMovementEpoch())
                 .WillByDefault(testing::Return(0u));
@@ -71,6 +73,8 @@ namespace llaminar2::test
                 .WillByDefault(testing::Return(InferenceReadiness{}));
             ON_CALL(*this, prepareForInference())
                 .WillByDefault(testing::Return(true));
+            ON_CALL(*this, coordinatedRootRank())
+                .WillByDefault(testing::Return(0));
         }
 
         // Lifecycle
@@ -98,6 +102,9 @@ namespace llaminar2::test
         // Configuration
         MOCK_METHOD(const RankExecutionPlan &, executionPlan, (), (const, override));
         MOCK_METHOD(const OrchestrationConfig &, config, (), (const, override));
+        MOCK_METHOD(bool, configureMTPRequestPolicy,
+                    (const MTPRequestPolicy &policy), (override));
+        MOCK_METHOD(MTPRequestPolicy, mtpRequestPolicy, (), (const, override));
 
         // Status
         MOCK_METHOD(bool, isInitialized, (), (const, override));
@@ -137,8 +144,10 @@ namespace llaminar2::test
 
         // MPI worker coordination
         MOCK_METHOD(void, runMPIWorkerLoop, (), (override));
+        MOCK_METHOD(bool, yieldMPIWorkersForRetainedRunner, (), (override));
         MOCK_METHOD(void, shutdownMPIWorkers, (), (override));
         MOCK_METHOD(void, abortMPIWorkers, (const std::string &reason), (override));
+        MOCK_METHOD(int, coordinatedRootRank, (), (const, override));
         MOCK_METHOD(void, setMPICoordinatedMode, (bool enabled), (override));
 
         // =====================================================================

@@ -136,6 +136,11 @@ namespace llaminar2::test
             std::vector<MoEOverlayDeviceMovementCommand> entries,
             std::uint64_t topology_fingerprint = kTopologyFingerprint)
         {
+            const bool durable_placement =
+                kind == MoEOverlayDeviceControllerTransactionKind::
+                            DynamicPlacement ||
+                kind == MoEOverlayDeviceControllerTransactionKind::
+                            PreparedContextRestore;
             const auto frozen_topology = topology();
             const auto participantPriority =
                 [&frozen_topology](std::uint32_t participant_id)
@@ -171,8 +176,7 @@ namespace llaminar2::test
             for (const auto &entry : entries)
             {
                 bytes += entry.payload_bytes;
-                if (kind != MoEOverlayDeviceControllerTransactionKind::
-                                DynamicPlacement)
+                if (!durable_placement)
                 {
                     continue;
                 }
@@ -189,9 +193,7 @@ namespace llaminar2::test
                     ++same_priority_moves;
             }
             const std::uint64_t candidate_epoch =
-                kind == MoEOverlayDeviceControllerTransactionKind::
-                            DynamicPlacement &&
-                        !entries.empty()
+                durable_placement && !entries.empty()
                     ? base_epoch + 1u
                     : base_epoch;
             for (std::size_t index = 0u; index < entries.size(); ++index)
@@ -209,6 +211,11 @@ namespace llaminar2::test
             }
             MoEOverlayDeviceTransportCommandBatch result;
             result.header.kind = static_cast<std::uint32_t>(kind);
+            result.header.demand_phase = static_cast<std::uint32_t>(
+                kind == MoEOverlayDeviceControllerTransactionKind::
+                            DynamicPlacement
+                    ? MoEOverlayDeviceDemandPhase::Decode
+                    : MoEOverlayDeviceDemandPhase::Invalid);
             result.header.command_count =
                 static_cast<std::uint32_t>(entries.size());
             result.header.topology_fingerprint = topology_fingerprint;
@@ -220,9 +227,7 @@ namespace llaminar2::test
             result.header.parallel_command_count = result.header.command_count;
             result.header.movement_round_count =
                 entries.empty() ? 0u : 1u;
-            if (kind == MoEOverlayDeviceControllerTransactionKind::
-                            DynamicPlacement &&
-                !entries.empty())
+            if (durable_placement && !entries.empty())
             {
                 result.header.snapshot_observations = entries.size();
                 result.header.accepted_cycles = 1u;
@@ -233,19 +238,23 @@ namespace llaminar2::test
                     std::count(changed_layers.begin(),
                                changed_layers.end(),
                                std::uint8_t{1u}));
-                result.header.projected_service_gain_ns = 1'000u;
-                result.header.projected_transfer_and_repack_ns = 100u;
-                result.header.projected_inference_interference_ns = 100u;
-                result.header.projected_net_benefit_ns = 800u;
-                if (promotions != 0u || demotions != 0u)
+                if (kind == MoEOverlayDeviceControllerTransactionKind::
+                                DynamicPlacement)
                 {
-                    result.header.priority_cost_before = 2u;
-                    result.header.priority_cost_after = 1u;
-                }
-                else
-                {
-                    result.header.same_priority_makespan_before = 2u;
-                    result.header.same_priority_makespan_after = 1u;
+                    result.header.projected_service_gain_ns = 1'000u;
+                    result.header.projected_transfer_and_repack_ns = 100u;
+                    result.header.projected_inference_interference_ns = 100u;
+                    result.header.projected_net_benefit_ns = 800u;
+                    if (promotions != 0u || demotions != 0u)
+                    {
+                        result.header.priority_cost_before = 2u;
+                        result.header.priority_cost_after = 1u;
+                    }
+                    else
+                    {
+                        result.header.same_priority_makespan_before = 2u;
+                        result.header.same_priority_makespan_after = 1u;
+                    }
                 }
             }
             result.entries = std::move(entries);
@@ -531,5 +540,55 @@ namespace llaminar2::test
         EXPECT_TRUE(physical.migration_cycles.empty());
         EXPECT_TRUE(physical.shadow_requirements.empty());
         EXPECT_EQ(physical.base_epoch, physical.candidate_epoch);
+    }
+
+    TEST(Test__MoEOverlayDevicePhysicalMovement,
+         PreparedContextRestoreUsesTheSameCapacityPreservingDurablePipeline)
+    {
+        const auto movement = commandBatch(
+            MoEOverlayDeviceControllerTransactionKind::
+                PreparedContextRestore,
+            31u,
+            {
+                move(
+                    MoEOverlayDeviceMovementOp::DurableMove,
+                    0,
+                    4,
+                    1,
+                    0,
+                    4096u,
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement),
+                move(
+                    MoEOverlayDeviceMovementOp::DurableMove,
+                    0,
+                    5,
+                    0,
+                    1,
+                    4096u,
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement),
+            });
+        ASSERT_TRUE(movement.valid());
+
+        const auto physical = makeMoEOverlayDevicePhysicalMovementBatch(
+            movement, topology());
+        ASSERT_TRUE(physical.valid());
+        ASSERT_TRUE(physical.movesWeights());
+        ASSERT_EQ(physical.migration_cycles.size(), 1u);
+        EXPECT_EQ(
+            physical.kind,
+            MoEOverlayDeviceControllerTransactionKind::
+                PreparedContextRestore);
+
+        const auto certification = commandBatch(
+            MoEOverlayDeviceControllerTransactionKind::
+                PreparedContextRestore,
+            physical.candidate_epoch,
+            {});
+        ASSERT_TRUE(certification.valid());
+        const auto terminal = makeMoEOverlayDevicePhysicalMovementBatch(
+            certification, topology());
+        EXPECT_TRUE(terminal.valid());
+        EXPECT_FALSE(terminal.movesWeights());
+        EXPECT_EQ(terminal.base_epoch, terminal.candidate_epoch);
     }
 } // namespace llaminar2::test

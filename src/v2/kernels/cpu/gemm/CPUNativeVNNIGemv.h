@@ -52,9 +52,11 @@
 #include <string>
 
 #include "CPUNativeVNNIDecode.h"
+#include "CPUNativeVNNIContributionContract.h"
 #include "CPUNativeVNNIFP16.h"
 #include "CPUNativeVNNIWeightPacker.h"
 #include "CPUNativeVNNITileConfig.h"
+#include "kernels/cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "tensors/AlignedVector.h"
 #include "tensors/BlockStructures.h"
@@ -289,6 +291,36 @@ namespace llaminar2::cpu::native_vnni
     }
 
     /**
+     * @brief Select the certified grouped schedule for serial-K-part prefill.
+     *
+     * Serial-K-part prefill is a narrower policy surface than the general MTP
+     * verifier selector: full-K candidates are structurally ineligible, and
+     * every row must reproduce the independent M=1 K-part reduction tree. The
+     * all-codebook production-shape sweep certifies the four-row AVX-512 tile
+     * whenever at least three rows can share decoded weights. M=2 and AVX2 use
+     * the two-row Pairwise tile, which is their only forceable implementation.
+     * Keeping this rule typed prevents a general full-K policy table from being
+     * consulted for an arithmetic regime it does not own.
+     *
+     * @param use_avx512 Whether the exact launch uses native AVX-512 VNNI.
+     * @param rows Number of grouped rows in the prefill transaction.
+     * @return The physical Pairwise or WideRows schedule to execute.
+     */
+    inline VerifierRowsPolicy selectSerialKPartPrefillRowsPolicy(
+        bool use_avx512,
+        int rows)
+    {
+        if (rows < 2)
+        {
+            throw std::invalid_argument(
+                "Serial-K-part prefill policy requires at least two rows");
+        }
+        return use_avx512 && rows >= 3
+                   ? VerifierRowsPolicy::WideRows
+                   : VerifierRowsPolicy::Pairwise;
+    }
+
+    /**
      * @brief Canonicalize an N-grid policy to its unique physical route.
      *
      * A nominal N-block width wider than the complete N inventory produces the
@@ -334,6 +366,52 @@ namespace llaminar2::cpu::native_vnni
     inline bool nativeVNNIUsesKPartitions(int k_tiles)
     {
         return k_tiles > 1;
+    }
+
+    /**
+     * @brief Resolve the serial-row reduction tree for one prepared matrix.
+     *
+     * Backend-native matrices retain the cache/topology-derived CPU schedule.
+     * GPU-aligned experts replace only its arithmetic K partition count with the
+     * immutable CPU/CUDA/ROCm contract; N task width and ISA selection remain
+     * CPU economy decisions and cannot change a dot-product parenthesization.
+     *
+     * @param packed Prepared matrix carrying its typed ownership policy.
+     * @param policy_n Serial-equivalent output width used for task geometry.
+     * @param K Logical reduction width.
+     * @param num_threads Positive ambient OpenMP worker count.
+     * @return Complete serial-row tile configuration.
+     */
+    inline NativeVNNITileConfig serialTileConfigForPackedMatrix(
+        const CPUNativeVNNIPackedWeights &packed,
+        int policy_n,
+        int K,
+        int num_threads)
+    {
+        NativeVNNITileConfig config = computeTileConfig(
+            policy_n, K, 1, packed.preparedFootprint(), num_threads);
+        if (packed.numerical_policy !=
+            CPUProjectionNumericalPolicy::GPUAlignedExpert)
+        {
+            return config;
+        }
+        if (!MoEProjectionNumericalContract::ownsOrderedKPartitionTree(
+                packed.codebook_id))
+        {
+            throw std::invalid_argument(
+                "GPU-aligned CPU NativeVNNI expert has no certified K tree for "
+                "its source arithmetic codebook");
+        }
+        const int partitions =
+            MoEProjectionNumericalContract::orderedKPartitionsForWidth(K);
+        if (partitions <= 0)
+        {
+            throw std::invalid_argument(
+                "GPU-aligned CPU NativeVNNI expert requires a positive, "
+                "32-element-aligned K width");
+        }
+        config.k_tiles = partitions;
+        return config;
     }
 
     /** @brief Physical grouped-verifier implementation selected for execution. */
@@ -734,8 +812,8 @@ namespace llaminar2::cpu::native_vnni
      *
      * Physical pointers, output strides, and launch extents continue to use
      * `actual_n`. Only decisions that could differ from the serial TP shard use
-     * the returned width. Requiring an exact multiple makes a malformed scope a
-     * fatal contract violation rather than silently selecting unrelated rules.
+     * the returned width. A shorter remainder shard is legal, so the physical
+     * width need not be an exact multiple of the canonical partition width.
      *
      * @param actual_n Full physical output width for this projection.
      * @return `actual_n` outside a scope, otherwise the serial partition width.
@@ -749,12 +827,10 @@ namespace llaminar2::cpu::native_vnni
             cpuNativeVNNISerialOutputPartitionN();
         if (serial_partition_n == 0)
             return actual_n;
-        if (serial_partition_n > actual_n ||
-            (actual_n % serial_partition_n) != 0)
+        if (serial_partition_n > actual_n)
         {
             throw std::logic_error(
-                "CPU NativeVNNI physical output width must be an exact multiple "
-                "of its serial output partition");
+                "CPU NativeVNNI serial output partition exceeds physical output width");
         }
         return serial_partition_n;
     }
@@ -1331,8 +1407,9 @@ namespace llaminar2::cpu::native_vnni
     {
         const int policy_n = cpuNativeVNNISerialEquivalentPolicyN(N);
         const int threads = omp_get_max_threads();
-        const NativeVNNITileConfig serial_geometry = computeTileConfig(
-            policy_n, K, 1, packed.preparedFootprint(), threads);
+        const NativeVNNITileConfig serial_geometry =
+            serialTileConfigForPackedMatrix(
+                packed, policy_n, K, threads);
         return selectVerifierRowsPolicy(
             packed,
             M,
@@ -1737,7 +1814,177 @@ namespace llaminar2::cpu::native_vnni
     }
 
     /**
-     * @brief AVX-512 VNNI GEMV for one N-chunk of 64 columns.
+     * @brief Append one native-nibble K block to four 16-lane accumulators.
+     *
+     * This is the sole AVX-512 one-row block implementation used by both a
+     * regular full-K projection and the heterogeneous ordered-partition tree.
+     * Keeping the block primitive shared prevents the economical register-only
+     * reducer from acquiring a second arithmetic implementation.
+     *
+     * @tparam DecodeKind Immutable nibble decoder of the prepared tensor.
+     * @tparam Policy Immutable FP publication policy of the prepared tensor.
+     * @tparam IsAsymmetric Whether scale-and-min correction is present.
+     * @param packed Prepared NativeVNNI weights and metadata.
+     * @param a_blk One Q8_1 activation block.
+     * @param chunk Sixty-four-column output chunk.
+     * @param kb K-block index in the packed matrix.
+     * @param decode_lut Broadcast decoder table for non-linear codebooks.
+     * @param fp_acc0 Running columns 0..15.
+     * @param fp_acc1 Running columns 16..31.
+     * @param fp_acc2 Running columns 32..47.
+     * @param fp_acc3 Running columns 48..63.
+     */
+    template <
+        NibbleDecodeKind DecodeKind,
+        CPUProjectionNumericalPolicy Policy,
+        bool IsAsymmetric>
+    __attribute__((always_inline)) inline void
+    accumulate_native_avx512_nibble_block(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block &a_blk,
+        int chunk,
+        int kb,
+        const __m512i decode_lut,
+        __m512 &fp_acc0,
+        __m512 &fp_acc1,
+        __m512 &fp_acc2,
+        __m512 &fp_acc3)
+    {
+        const __m512i mask_0F = _mm512_set1_epi8(0x0F);
+        const __m512i q4_zero_offset = _mm512_set1_epi8(8);
+        __m512i int_acc0 = _mm512_setzero_si512();
+        __m512i int_acc1 = _mm512_setzero_si512();
+        __m512i int_acc2 = _mm512_setzero_si512();
+        __m512i int_acc3 = _mm512_setzero_si512();
+
+        for (int group = 0; group < 4; ++group)
+        {
+            /*
+             * Consume one subchunk before loading the next so decoded values
+             * do not displace the long-lived FP32 accumulators to the stack.
+             */
+#define NIBBLE_BLOCK_SUBCHUNK(Z, ACC)                                          \
+            {                                                                  \
+                const __m512i raw = _mm512_load_si512(                         \
+                    packed.interleavedB(chunk, kb, group, Z));                 \
+                const __m512i low =                                            \
+                    decode_low_nibbles_avx512_static<DecodeKind>(              \
+                        raw, decode_lut, mask_0F, q4_zero_offset);              \
+                ACC = _mm512_dpbusd_epi32(                                     \
+                    ACC,                                                       \
+                    _mm512_set1_epi32(                                         \
+                        pack_q8_1_unsigned_word(a_blk, group * 4)),            \
+                    low);                                                       \
+                const __m512i high =                                           \
+                    decode_high_nibbles_avx512_static<DecodeKind>(             \
+                        raw, decode_lut, mask_0F, q4_zero_offset);              \
+                ACC = _mm512_dpbusd_epi32(                                     \
+                    ACC,                                                       \
+                    _mm512_set1_epi32(                                         \
+                        pack_q8_1_unsigned_word(                               \
+                            a_blk, group * 4 + 16)),                           \
+                    high);                                                      \
+            }
+            NIBBLE_BLOCK_SUBCHUNK(0, int_acc0)
+            NIBBLE_BLOCK_SUBCHUNK(1, int_acc1)
+            NIBBLE_BLOCK_SUBCHUNK(2, int_acc2)
+            NIBBLE_BLOCK_SUBCHUNK(3, int_acc3)
+#undef NIBBLE_BLOCK_SUBCHUNK
+        }
+
+        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+        const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
+        int_acc0 = _mm512_sub_epi32(
+            int_acc0,
+            _mm512_mullo_epi32(
+                bias_128_i32,
+                _mm512_cvtepi16_epi32(_mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(comp_ptr)))));
+        int_acc1 = _mm512_sub_epi32(
+            int_acc1,
+            _mm512_mullo_epi32(
+                bias_128_i32,
+                _mm512_cvtepi16_epi32(_mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(comp_ptr + 16)))));
+        int_acc2 = _mm512_sub_epi32(
+            int_acc2,
+            _mm512_mullo_epi32(
+                bias_128_i32,
+                _mm512_cvtepi16_epi32(_mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(comp_ptr + 32)))));
+        int_acc3 = _mm512_sub_epi32(
+            int_acc3,
+            _mm512_mullo_epi32(
+                bias_128_i32,
+                _mm512_cvtepi16_epi32(_mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(comp_ptr + 48)))));
+
+        const uint16_t *b_scales = packed.chunkScales(chunk, kb);
+        const __m512 scale0 = _mm512_cvtph_ps(_mm256_load_si256(
+            reinterpret_cast<const __m256i *>(b_scales)));
+        const __m512 scale1 = _mm512_cvtph_ps(_mm256_load_si256(
+            reinterpret_cast<const __m256i *>(b_scales + 16)));
+        const __m512 scale2 = _mm512_cvtph_ps(_mm256_load_si256(
+            reinterpret_cast<const __m256i *>(b_scales + 32)));
+        const __m512 scale3 = _mm512_cvtph_ps(_mm256_load_si256(
+            reinterpret_cast<const __m256i *>(b_scales + 48)));
+        const float a_scale = nativeVNNIFP16ScaleToFP32(a_blk.d);
+
+        if constexpr (IsAsymmetric)
+        {
+            const uint16_t *b_mins = packed.chunkMins(chunk, kb);
+            fp_acc0 = accumulateCorrectedSingleScaleBlockAVX512(
+                fp_acc0,
+                int_acc0,
+                scale0,
+                a_blk.sum_qs,
+                _mm512_cvtph_ps(_mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(b_mins))),
+                a_scale,
+                Policy);
+            fp_acc1 = accumulateCorrectedSingleScaleBlockAVX512(
+                fp_acc1,
+                int_acc1,
+                scale1,
+                a_blk.sum_qs,
+                _mm512_cvtph_ps(_mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(b_mins + 16))),
+                a_scale,
+                Policy);
+            fp_acc2 = accumulateCorrectedSingleScaleBlockAVX512(
+                fp_acc2,
+                int_acc2,
+                scale2,
+                a_blk.sum_qs,
+                _mm512_cvtph_ps(_mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(b_mins + 32))),
+                a_scale,
+                Policy);
+            fp_acc3 = accumulateCorrectedSingleScaleBlockAVX512(
+                fp_acc3,
+                int_acc3,
+                scale3,
+                a_blk.sum_qs,
+                _mm512_cvtph_ps(_mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(b_mins + 48))),
+                a_scale,
+                Policy);
+        }
+        else
+        {
+            fp_acc0 = accumulateSingleScaleBlockAVX512(
+                fp_acc0, int_acc0, scale0, a_scale, Policy);
+            fp_acc1 = accumulateSingleScaleBlockAVX512(
+                fp_acc1, int_acc1, scale1, a_scale, Policy);
+            fp_acc2 = accumulateSingleScaleBlockAVX512(
+                fp_acc2, int_acc2, scale2, a_scale, Policy);
+            fp_acc3 = accumulateSingleScaleBlockAVX512(
+                fp_acc3, int_acc3, scale3, a_scale, Policy);
+        }
+    }
+
+    /**
+     * @brief Specialized AVX-512 VNNI GEMV for one 64-column N-chunk.
      *
      * Reads native-interleaved bytes (1024 B/K-block = native payload size),
      * decodes nibbles to INT8 via vpshufb, and feeds directly into vpdpbusd.
@@ -1749,7 +1996,14 @@ namespace llaminar2::cpu::native_vnni
      * @param accumulate Load `C` as the initial FP32 accumulator. Cache-tiled
      *        prefill uses this mode so a materialized tile boundary preserves
      *        the serial per-K-block FMA sequence exactly.
+     * @tparam DecodeKind Immutable nibble decoder of the prepared tensor.
+     * @tparam Policy Immutable FP publication policy of the prepared tensor.
+     * @tparam IsAsymmetric Whether scale-and-min correction is present.
      */
+    template <
+        NibbleDecodeKind DecodeKind,
+        CPUProjectionNumericalPolicy Policy,
+        bool IsAsymmetric>
     inline void gemv_native_vnni_avx512_chunk_native(
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -1766,7 +2020,6 @@ namespace llaminar2::cpu::native_vnni
         __m512 fp_acc3 = accumulate ? _mm512_loadu_ps(C + 48) : _mm512_setzero_ps();
 
         const __m512i bias_128_i32 = _mm512_set1_epi32(128);
-        const NibbleDecodeKind decode_kind = nibbleDecodeKind(packed.codebook_id);
         const __m512i mask_0F = _mm512_set1_epi8(0x0F);
         const __m512i q4_zero_offset = _mm512_set1_epi8(8);
 
@@ -1787,53 +2040,38 @@ namespace llaminar2::cpu::native_vnni
             //   high nibbles → K-elements [g*4+16 .. g*4+19]  (2nd sub)
             for (int group = 0; group < 4; ++group)
             {
-                // Load 4 ZMMs of interleaved native bytes (64 cols × 4 bytes)
-                __m512i raw0 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 0));
-                __m512i raw1 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 1));
-                __m512i raw2 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 2));
-                __m512i raw3 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 3));
-
-                // Decode low nibbles via vpshufb LUT → signed INT8 in VNNI lane order
-                __m512i lo0 = decode_low_nibbles_avx512(raw0, decode_lut, decode_kind, mask_0F, q4_zero_offset);
-                __m512i lo1 = decode_low_nibbles_avx512(raw1, decode_lut, decode_kind, mask_0F, q4_zero_offset);
-                __m512i lo2 = decode_low_nibbles_avx512(raw2, decode_lut, decode_kind, mask_0F, q4_zero_offset);
-                __m512i lo3 = decode_low_nibbles_avx512(raw3, decode_lut, decode_kind, mask_0F, q4_zero_offset);
-
-                // A broadcast for low-nibble sub (K-elements group*4..group*4+3)
-                uint8_t a_lo[4];
-                a_lo[0] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 0]) + 128);
-                a_lo[1] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 1]) + 128);
-                a_lo[2] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 2]) + 128);
-                a_lo[3] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 3]) + 128);
-                int32_t a_lo_i32;
-                std::memcpy(&a_lo_i32, a_lo, 4);
-                __m512i a_lo_bcast = _mm512_set1_epi32(a_lo_i32);
-
-                int_acc0 = _mm512_dpbusd_epi32(int_acc0, a_lo_bcast, lo0);
-                int_acc1 = _mm512_dpbusd_epi32(int_acc1, a_lo_bcast, lo1);
-                int_acc2 = _mm512_dpbusd_epi32(int_acc2, a_lo_bcast, lo2);
-                int_acc3 = _mm512_dpbusd_epi32(int_acc3, a_lo_bcast, lo3);
-
-                // Decode high nibbles: shift right 4, mask, then vpshufb LUT
-                __m512i hi0 = decode_high_nibbles_avx512(raw0, decode_lut, decode_kind, mask_0F, q4_zero_offset);
-                __m512i hi1 = decode_high_nibbles_avx512(raw1, decode_lut, decode_kind, mask_0F, q4_zero_offset);
-                __m512i hi2 = decode_high_nibbles_avx512(raw2, decode_lut, decode_kind, mask_0F, q4_zero_offset);
-                __m512i hi3 = decode_high_nibbles_avx512(raw3, decode_lut, decode_kind, mask_0F, q4_zero_offset);
-
-                // A broadcast for high-nibble sub (K-elements group*4+16..group*4+19)
-                uint8_t a_hi[4];
-                a_hi[0] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 16]) + 128);
-                a_hi[1] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 17]) + 128);
-                a_hi[2] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 18]) + 128);
-                a_hi[3] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 19]) + 128);
-                int32_t a_hi_i32;
-                std::memcpy(&a_hi_i32, a_hi, 4);
-                __m512i a_hi_bcast = _mm512_set1_epi32(a_hi_i32);
-
-                int_acc0 = _mm512_dpbusd_epi32(int_acc0, a_hi_bcast, hi0);
-                int_acc1 = _mm512_dpbusd_epi32(int_acc1, a_hi_bcast, hi1);
-                int_acc2 = _mm512_dpbusd_epi32(int_acc2, a_hi_bcast, hi2);
-                int_acc3 = _mm512_dpbusd_epi32(int_acc3, a_hi_bcast, hi3);
+                /*
+                 * Decode, consume, and retire one 16-column subchunk before
+                 * loading the next.  Keeping four raw vectors and four
+                 * decoded vectors alive beside both integer and FP32
+                 * accumulators made GCC spill ZMM values in this hottest
+                 * loop.  Low then high remains the exact per-lane arithmetic
+                 * order used by serial decode; only independent output lanes
+                 * are interleaved differently.
+                 */
+#define NIBBLE_1ROW_SUBCHUNK(Z, ACC)                                           \
+                {                                                              \
+                    const __m512i raw = _mm512_load_si512(                     \
+                        packed.interleavedB(chunk, kb, group, Z));             \
+                    const __m512i a_low = _mm512_set1_epi32(                   \
+                        pack_q8_1_unsigned_word(a_blk, group * 4));            \
+                    const __m512i low =                                        \
+                        decode_low_nibbles_avx512_static<DecodeKind>(          \
+                            raw, decode_lut, mask_0F, q4_zero_offset);          \
+                    ACC = _mm512_dpbusd_epi32(ACC, a_low, low);                \
+                    const __m512i a_high = _mm512_set1_epi32(                  \
+                        pack_q8_1_unsigned_word(                               \
+                            a_blk, group * 4 + 16));                           \
+                    const __m512i high =                                       \
+                        decode_high_nibbles_avx512_static<DecodeKind>(         \
+                            raw, decode_lut, mask_0F, q4_zero_offset);          \
+                    ACC = _mm512_dpbusd_epi32(ACC, a_high, high);              \
+                }
+                NIBBLE_1ROW_SUBCHUNK(0, int_acc0)
+                NIBBLE_1ROW_SUBCHUNK(1, int_acc1)
+                NIBBLE_1ROW_SUBCHUNK(2, int_acc2)
+                NIBBLE_1ROW_SUBCHUNK(3, int_acc3)
+#undef NIBBLE_1ROW_SUBCHUNK
             }
 
             // Bias correction: corrected = int_acc - 128 * comp
@@ -1849,33 +2087,47 @@ namespace llaminar2::cpu::native_vnni
             int_acc2 = _mm512_sub_epi32(int_acc2, _mm512_mullo_epi32(bias_128_i32, comp2));
             int_acc3 = _mm512_sub_epi32(int_acc3, _mm512_mullo_epi32(bias_128_i32, comp3));
 
-            // Convert to FP32 and scale: fp_val = int32_val * a_scale * b_scale[n]
-            // scales are FP16 (halved metadata); load via F16C convert to FP32
-            __m512 a_scale_v = _mm512_set1_ps(a_scale);
-
+            // Convert exact integer dots through the selected publication tree.
             const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-            __m512 cs0 = _mm512_mul_ps(a_scale_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales))));
-            __m512 cs1 = _mm512_mul_ps(a_scale_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 16))));
-            __m512 cs2 = _mm512_mul_ps(a_scale_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32))));
-            __m512 cs3 = _mm512_mul_ps(a_scale_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48))));
-
-            fp_acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(int_acc0), cs0, fp_acc0);
-            fp_acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(int_acc1), cs1, fp_acc1);
-            fp_acc2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(int_acc2), cs2, fp_acc2);
-            fp_acc3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(int_acc3), cs3, fp_acc3);
+            const __m512 scale0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales)));
+            const __m512 scale1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 16)));
+            const __m512 scale2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32)));
+            const __m512 scale3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48)));
 
             // Asymmetric correction: acc += a_scale * sum_qs * b_min[n]
             // Formula: weight = scale * int_val + min, so the offset term
             // contributes min * Σ A[k] ≈ min * a_scale * sum_qs per block.
             // mins are FP16; load via F16C convert to FP32
-            if (packed.is_asymmetric)
+            if constexpr (IsAsymmetric)
             {
                 const uint16_t *b_mins = packed.chunkMins(chunk, kb);
-                __m512 a_corr_v = _mm512_set1_ps(static_cast<float>(a_sum) * a_scale);
-                fp_acc0 = _mm512_fmadd_ps(a_corr_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins))), fp_acc0);
-                fp_acc1 = _mm512_fmadd_ps(a_corr_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 16))), fp_acc1);
-                fp_acc2 = _mm512_fmadd_ps(a_corr_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 32))), fp_acc2);
-                fp_acc3 = _mm512_fmadd_ps(a_corr_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48))), fp_acc3);
+                fp_acc0 = accumulateCorrectedSingleScaleBlockAVX512(
+                    fp_acc0, int_acc0, scale0, a_sum,
+                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins))),
+                    a_scale, Policy);
+                fp_acc1 = accumulateCorrectedSingleScaleBlockAVX512(
+                    fp_acc1, int_acc1, scale1, a_sum,
+                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 16))),
+                    a_scale, Policy);
+                fp_acc2 = accumulateCorrectedSingleScaleBlockAVX512(
+                    fp_acc2, int_acc2, scale2, a_sum,
+                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 32))),
+                    a_scale, Policy);
+                fp_acc3 = accumulateCorrectedSingleScaleBlockAVX512(
+                    fp_acc3, int_acc3, scale3, a_sum,
+                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48))),
+                    a_scale, Policy);
+            }
+            else
+            {
+                fp_acc0 = accumulateSingleScaleBlockAVX512(
+                    fp_acc0, int_acc0, scale0, a_scale, Policy);
+                fp_acc1 = accumulateSingleScaleBlockAVX512(
+                    fp_acc1, int_acc1, scale1, a_scale, Policy);
+                fp_acc2 = accumulateSingleScaleBlockAVX512(
+                    fp_acc2, int_acc2, scale2, a_scale, Policy);
+                fp_acc3 = accumulateSingleScaleBlockAVX512(
+                    fp_acc3, int_acc3, scale3, a_scale, Policy);
             }
         }
 
@@ -1883,6 +2135,555 @@ namespace llaminar2::cpu::native_vnni
         _mm512_storeu_ps(C + 16, fp_acc1);
         _mm512_storeu_ps(C + 32, fp_acc2);
         _mm512_storeu_ps(C + 48, fp_acc3);
+    }
+
+    /**
+     * @brief Execute the fixed GPU-aligned K tree without materializing partials.
+     *
+     * One worker owns this output chunk, so all partition accumulators and the
+     * ordered left-fold can remain in registers. Each partition starts from
+     * positive zero and visits exactly its assigned consecutive K blocks; the
+     * resulting partial is then added to the preceding result. This is byte
+     * equivalent to materializing `[partition][64]` and calling
+     * reduceNativeVNNIKTilePartialsExact(), but avoids writing and rereading the
+     * complete partial plane.
+     *
+     * @tparam DecodeKind Immutable nibble decoder of the prepared tensor.
+     * @tparam IsAsymmetric Whether scale-and-min correction is present.
+     * @param packed Prepared NativeVNNI weights and metadata.
+     * @param A_q8 Q8_1 activation row.
+     * @param C Destination for this 64-column chunk.
+     * @param chunk Output chunk index.
+     * @param K_blocks Number of source Q8_1 blocks.
+     * @param k_tiles Fixed ordered partition count.
+     * @param k_blocks_per_tile Consecutive blocks assigned to one partition.
+     * @param decode_lut Broadcast decoder table for non-linear codebooks.
+     */
+    template <NibbleDecodeKind DecodeKind, bool IsAsymmetric>
+    inline void gemv_native_avx512_ordered_partitions(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8,
+        float *C,
+        int chunk,
+        int K_blocks,
+        int k_tiles,
+        int k_blocks_per_tile,
+        const __m512i decode_lut)
+    {
+        __m512 reduced0 = _mm512_setzero_ps();
+        __m512 reduced1 = _mm512_setzero_ps();
+        __m512 reduced2 = _mm512_setzero_ps();
+        __m512 reduced3 = _mm512_setzero_ps();
+
+        for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
+        {
+            __m512 partial0 = _mm512_setzero_ps();
+            __m512 partial1 = _mm512_setzero_ps();
+            __m512 partial2 = _mm512_setzero_ps();
+            __m512 partial3 = _mm512_setzero_ps();
+            const int kb_start = k_tile * k_blocks_per_tile;
+            const int kb_end = std::min(
+                kb_start + k_blocks_per_tile, K_blocks);
+            for (int kb = kb_start; kb < kb_end; ++kb)
+            {
+                accumulate_native_avx512_nibble_block<
+                    DecodeKind,
+                    CPUProjectionNumericalPolicy::GPUAlignedExpert,
+                    IsAsymmetric>(
+                    packed,
+                    A_q8[kb],
+                    chunk,
+                    kb,
+                    decode_lut,
+                    partial0,
+                    partial1,
+                    partial2,
+                    partial3);
+            }
+
+            if (k_tile == 0)
+            {
+                reduced0 = partial0;
+                reduced1 = partial1;
+                reduced2 = partial2;
+                reduced3 = partial3;
+            }
+            else
+            {
+                reduced0 = _mm512_add_ps(reduced0, partial0);
+                reduced1 = _mm512_add_ps(reduced1, partial1);
+                reduced2 = _mm512_add_ps(reduced2, partial2);
+                reduced3 = _mm512_add_ps(reduced3, partial3);
+            }
+        }
+
+        _mm512_storeu_ps(C, reduced0);
+        _mm512_storeu_ps(C + 16, reduced1);
+        _mm512_storeu_ps(C + 32, reduced2);
+        _mm512_storeu_ps(C + 48, reduced3);
+    }
+
+    /**
+     * @brief Dispatch the register-only ordered nibble tree once per chunk.
+     */
+    inline void dispatch_native_avx512_ordered_partitions(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8,
+        float *C,
+        int chunk,
+        int K_blocks,
+        int k_tiles,
+        int k_blocks_per_tile,
+        const __m512i decode_lut)
+    {
+#define DISPATCH_ORDERED_NIBBLE(DECODE_KIND)                                   \
+        if (packed.is_asymmetric)                                              \
+            return gemv_native_avx512_ordered_partitions<                      \
+                DECODE_KIND, true>(                                            \
+                packed, A_q8, C, chunk, K_blocks, k_tiles,                    \
+                k_blocks_per_tile, decode_lut);                                \
+        return gemv_native_avx512_ordered_partitions<                          \
+            DECODE_KIND, false>(                                               \
+            packed, A_q8, C, chunk, K_blocks, k_tiles,                        \
+            k_blocks_per_tile, decode_lut)
+
+        switch (nibbleDecodeKind(packed.codebook_id))
+        {
+        case NibbleDecodeKind::LUT:
+            DISPATCH_ORDERED_NIBBLE(NibbleDecodeKind::LUT);
+        case NibbleDecodeKind::Q4_0_LINEAR:
+            DISPATCH_ORDERED_NIBBLE(NibbleDecodeKind::Q4_0_LINEAR);
+        case NibbleDecodeKind::Q4_1_IDENTITY:
+            DISPATCH_ORDERED_NIBBLE(NibbleDecodeKind::Q4_1_IDENTITY);
+        }
+#undef DISPATCH_ORDERED_NIBBLE
+        throw std::logic_error("Unknown NativeVNNI nibble decode kind");
+    }
+
+    /**
+     * @brief Execute two GPU-aligned rows with shared decode and no partial plane.
+     *
+     * Two 32-column halves bound live state to four running reductions, four
+     * partition accumulators, and four integer dot accumulators. That fits the
+     * AVX-512 register file while each decoded weight vector feeds both rows.
+     * Partition boundaries and the increasing left-fold exactly match the
+     * heterogeneous projection contract.
+     *
+     * @tparam DecodeKind Immutable nibble decoder of the prepared tensor.
+     * @tparam IsAsymmetric Whether scale-and-min correction is present.
+     */
+    template <NibbleDecodeKind DecodeKind, bool IsAsymmetric>
+    inline void gemm_2row_native_avx512_ordered_partitions(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8_row0,
+        const Q8_1Block *A_q8_row1,
+        float *C_row0,
+        float *C_row1,
+        int chunk,
+        int K_blocks,
+        int k_tiles,
+        int k_blocks_per_tile,
+        const __m512i decode_lut)
+    {
+        const __m512i mask_0F = _mm512_set1_epi8(0x0F);
+        const __m512i q4_zero_offset = _mm512_set1_epi8(8);
+        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+
+        for (int zbase = 0; zbase < 4; zbase += 2)
+        {
+            __m512 reduced0_0 = _mm512_setzero_ps();
+            __m512 reduced0_1 = _mm512_setzero_ps();
+            __m512 reduced1_0 = _mm512_setzero_ps();
+            __m512 reduced1_1 = _mm512_setzero_ps();
+
+            /*
+             * Two adjacent 16-column segments bound live state so both rows
+             * share every decoded vector without spilling. Keep the ordered
+             * reduction in registers across all K partitions for this half.
+             */
+            for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
+            {
+                __m512 partial0_0 = _mm512_setzero_ps();
+                __m512 partial0_1 = _mm512_setzero_ps();
+                __m512 partial1_0 = _mm512_setzero_ps();
+                __m512 partial1_1 = _mm512_setzero_ps();
+                const int kb_start = k_tile * k_blocks_per_tile;
+                const int kb_end = std::min(
+                    kb_start + k_blocks_per_tile, K_blocks);
+
+                for (int kb = kb_start; kb < kb_end; ++kb)
+                {
+                    const Q8_1Block &a0 = A_q8_row0[kb];
+                    const Q8_1Block &a1 = A_q8_row1[kb];
+                    __m512i int0_0 = _mm512_setzero_si512();
+                    __m512i int0_1 = _mm512_setzero_si512();
+                    __m512i int1_0 = _mm512_setzero_si512();
+                    __m512i int1_1 = _mm512_setzero_si512();
+
+                    for (int group = 0; group < 4; ++group)
+                    {
+                        const __m512i raw0 = _mm512_load_si512(
+                            packed.interleavedB(
+                                chunk, kb, group, zbase));
+                        const __m512i raw1 = _mm512_load_si512(
+                            packed.interleavedB(
+                                chunk, kb, group, zbase + 1));
+                        const __m512i low0 =
+                            decode_low_nibbles_avx512_static<DecodeKind>(
+                                raw0,
+                                decode_lut,
+                                mask_0F,
+                                q4_zero_offset);
+                        const __m512i low1 =
+                            decode_low_nibbles_avx512_static<DecodeKind>(
+                                raw1,
+                                decode_lut,
+                                mask_0F,
+                                q4_zero_offset);
+                        const __m512i high0 =
+                            decode_high_nibbles_avx512_static<DecodeKind>(
+                                raw0,
+                                decode_lut,
+                                mask_0F,
+                                q4_zero_offset);
+                        const __m512i high1 =
+                            decode_high_nibbles_avx512_static<DecodeKind>(
+                                raw1,
+                                decode_lut,
+                                mask_0F,
+                                q4_zero_offset);
+
+#define ORDERED_2ROW_DOT(ROW, BLOCK)                                           \
+                        {                                                      \
+                            const __m512i a_low = _mm512_set1_epi32(           \
+                                pack_q8_1_unsigned_word(BLOCK, group * 4));    \
+                            int##ROW##_0 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_0, a_low, low0);                    \
+                            int##ROW##_1 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_1, a_low, low1);                    \
+                            const __m512i a_high = _mm512_set1_epi32(          \
+                                pack_q8_1_unsigned_word(                       \
+                                    BLOCK, group * 4 + 16));                   \
+                            int##ROW##_0 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_0, a_high, high0);                  \
+                            int##ROW##_1 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_1, a_high, high1);                  \
+                        }
+                        ORDERED_2ROW_DOT(0, a0)
+                        ORDERED_2ROW_DOT(1, a1)
+#undef ORDERED_2ROW_DOT
+                    }
+
+                    const int16_t *comp =
+                        packed.chunkComp(chunk, kb) + zbase * 16;
+                    const __m512i bias0 = _mm512_mullo_epi32(
+                        bias_128_i32,
+                        _mm512_cvtepi16_epi32(_mm256_load_si256(
+                            reinterpret_cast<const __m256i *>(comp))));
+                    const __m512i bias1 = _mm512_mullo_epi32(
+                        bias_128_i32,
+                        _mm512_cvtepi16_epi32(_mm256_load_si256(
+                            reinterpret_cast<const __m256i *>(comp + 16))));
+                    int0_0 = _mm512_sub_epi32(int0_0, bias0);
+                    int0_1 = _mm512_sub_epi32(int0_1, bias1);
+                    int1_0 = _mm512_sub_epi32(int1_0, bias0);
+                    int1_1 = _mm512_sub_epi32(int1_1, bias1);
+
+                    const uint16_t *scales =
+                        packed.chunkScales(chunk, kb) + zbase * 16;
+                    const __m512 scale0 = _mm512_cvtph_ps(
+                        _mm256_load_si256(
+                            reinterpret_cast<const __m256i *>(scales)));
+                    const __m512 scale1 = _mm512_cvtph_ps(
+                        _mm256_load_si256(
+                            reinterpret_cast<const __m256i *>(scales + 16)));
+                    const float a0_scale =
+                        nativeVNNIFP16ScaleToFP32(a0.d);
+                    const float a1_scale =
+                        nativeVNNIFP16ScaleToFP32(a1.d);
+
+                    if constexpr (IsAsymmetric)
+                    {
+                        const uint16_t *mins =
+                            packed.chunkMins(chunk, kb) + zbase * 16;
+                        const __m512 min0 = _mm512_cvtph_ps(
+                            _mm256_load_si256(
+                                reinterpret_cast<const __m256i *>(mins)));
+                        const __m512 min1 = _mm512_cvtph_ps(
+                            _mm256_load_si256(
+                                reinterpret_cast<const __m256i *>(mins + 16)));
+                        partial0_0 =
+                            accumulateCorrectedSingleScaleBlockAVX512(
+                                partial0_0,
+                                int0_0,
+                                scale0,
+                                a0.sum_qs,
+                                min0,
+                                a0_scale,
+                                CPUProjectionNumericalPolicy::
+                                    GPUAlignedExpert);
+                        partial0_1 =
+                            accumulateCorrectedSingleScaleBlockAVX512(
+                                partial0_1,
+                                int0_1,
+                                scale1,
+                                a0.sum_qs,
+                                min1,
+                                a0_scale,
+                                CPUProjectionNumericalPolicy::
+                                    GPUAlignedExpert);
+                        partial1_0 =
+                            accumulateCorrectedSingleScaleBlockAVX512(
+                                partial1_0,
+                                int1_0,
+                                scale0,
+                                a1.sum_qs,
+                                min0,
+                                a1_scale,
+                                CPUProjectionNumericalPolicy::
+                                    GPUAlignedExpert);
+                        partial1_1 =
+                            accumulateCorrectedSingleScaleBlockAVX512(
+                                partial1_1,
+                                int1_1,
+                                scale1,
+                                a1.sum_qs,
+                                min1,
+                                a1_scale,
+                                CPUProjectionNumericalPolicy::
+                                    GPUAlignedExpert);
+                    }
+                    else
+                    {
+                        partial0_0 = accumulateSingleScaleBlockAVX512(
+                            partial0_0,
+                            int0_0,
+                            scale0,
+                            a0_scale,
+                            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                        partial0_1 = accumulateSingleScaleBlockAVX512(
+                            partial0_1,
+                            int0_1,
+                            scale1,
+                            a0_scale,
+                            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                        partial1_0 = accumulateSingleScaleBlockAVX512(
+                            partial1_0,
+                            int1_0,
+                            scale0,
+                            a1_scale,
+                            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                        partial1_1 = accumulateSingleScaleBlockAVX512(
+                            partial1_1,
+                            int1_1,
+                            scale1,
+                            a1_scale,
+                            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                    }
+                }
+
+                if (k_tile == 0)
+                {
+                    reduced0_0 = partial0_0;
+                    reduced0_1 = partial0_1;
+                    reduced1_0 = partial1_0;
+                    reduced1_1 = partial1_1;
+                }
+                else
+                {
+                    reduced0_0 = _mm512_add_ps(reduced0_0, partial0_0);
+                    reduced0_1 = _mm512_add_ps(reduced0_1, partial0_1);
+                    reduced1_0 = _mm512_add_ps(reduced1_0, partial1_0);
+                    reduced1_1 = _mm512_add_ps(reduced1_1, partial1_1);
+                }
+            }
+
+            _mm512_storeu_ps(C_row0 + zbase * 16, reduced0_0);
+            _mm512_storeu_ps(C_row0 + (zbase + 1) * 16, reduced0_1);
+            _mm512_storeu_ps(C_row1 + zbase * 16, reduced1_0);
+            _mm512_storeu_ps(C_row1 + (zbase + 1) * 16, reduced1_1);
+        }
+    }
+
+    /** @brief Dispatch the two-row ordered nibble tree once per chunk. */
+    inline void dispatch_2row_native_avx512_ordered_partitions(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8_row0,
+        const Q8_1Block *A_q8_row1,
+        float *C_row0,
+        float *C_row1,
+        int chunk,
+        int K_blocks,
+        int k_tiles,
+        int k_blocks_per_tile,
+        const __m512i decode_lut)
+    {
+#define DISPATCH_ORDERED_2ROW(DECODE_KIND)                                     \
+        if (packed.is_asymmetric)                                              \
+            return gemm_2row_native_avx512_ordered_partitions<                 \
+                DECODE_KIND, true>(                                            \
+                packed, A_q8_row0, A_q8_row1, C_row0, C_row1, chunk,          \
+                K_blocks, k_tiles, k_blocks_per_tile, decode_lut);             \
+        return gemm_2row_native_avx512_ordered_partitions<                     \
+            DECODE_KIND, false>(                                               \
+            packed, A_q8_row0, A_q8_row1, C_row0, C_row1, chunk,              \
+            K_blocks, k_tiles, k_blocks_per_tile, decode_lut)
+
+        switch (nibbleDecodeKind(packed.codebook_id))
+        {
+        case NibbleDecodeKind::LUT:
+            DISPATCH_ORDERED_2ROW(NibbleDecodeKind::LUT);
+        case NibbleDecodeKind::Q4_0_LINEAR:
+            DISPATCH_ORDERED_2ROW(NibbleDecodeKind::Q4_0_LINEAR);
+        case NibbleDecodeKind::Q4_1_IDENTITY:
+            DISPATCH_ORDERED_2ROW(NibbleDecodeKind::Q4_1_IDENTITY);
+        }
+#undef DISPATCH_ORDERED_2ROW
+        throw std::logic_error("Unknown NativeVNNI nibble decode kind");
+    }
+
+    /**
+     * @brief Dispatch one immutable policy/decode pair by tensor layout.
+     * @tparam DecodeKind Compile-time nibble decoder.
+     * @tparam Policy Compile-time FP publication policy.
+     */
+    template <
+        NibbleDecodeKind DecodeKind,
+        CPUProjectionNumericalPolicy Policy>
+    inline void dispatch_native_avx512_chunk_layout(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8,
+        float *C,
+        int chunk,
+        int kb_start,
+        int kb_end,
+        const __m512i decode_lut,
+        bool accumulate)
+    {
+        if (packed.is_asymmetric)
+        {
+            return gemv_native_vnni_avx512_chunk_native<
+                DecodeKind, Policy, true>(
+                packed,
+                A_q8,
+                C,
+                chunk,
+                kb_start,
+                kb_end,
+                decode_lut,
+                accumulate);
+        }
+        return gemv_native_vnni_avx512_chunk_native<
+            DecodeKind, Policy, false>(
+            packed,
+            A_q8,
+            C,
+            chunk,
+            kb_start,
+            kb_end,
+            decode_lut,
+            accumulate);
+    }
+
+    /**
+     * @brief Dispatch one compile-time decoder by immutable FP policy.
+     * @tparam DecodeKind Compile-time nibble decoder.
+     */
+    template <NibbleDecodeKind DecodeKind>
+    inline void dispatch_native_avx512_chunk_policy(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8,
+        float *C,
+        int chunk,
+        int kb_start,
+        int kb_end,
+        const __m512i decode_lut,
+        bool accumulate)
+    {
+        switch (packed.numerical_policy)
+        {
+        case CPUProjectionNumericalPolicy::BackendNative:
+            return dispatch_native_avx512_chunk_layout<
+                DecodeKind, CPUProjectionNumericalPolicy::BackendNative>(
+                packed,
+                A_q8,
+                C,
+                chunk,
+                kb_start,
+                kb_end,
+                decode_lut,
+                accumulate);
+        case CPUProjectionNumericalPolicy::GPUAlignedExpert:
+            return dispatch_native_avx512_chunk_layout<
+                DecodeKind, CPUProjectionNumericalPolicy::GPUAlignedExpert>(
+                packed,
+                A_q8,
+                C,
+                chunk,
+                kb_start,
+                kb_end,
+                decode_lut,
+                accumulate);
+        }
+        throw std::logic_error("Unknown CPU projection numerical policy");
+    }
+
+    /**
+     * @brief Dispatch immutable prepared-tensor properties outside the K loop.
+     *
+     * Decode semantics, numerical policy, and asymmetric layout cannot change
+     * after weight preparation. Specializing them once here prevents their
+     * mutually exclusive decode and scale/min programs from adding branches or
+     * competing for vector registers in every block of the regular and
+     * ExpertOverlay kernels.
+     */
+    inline void gemv_native_vnni_avx512_chunk_native(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *A_q8,
+        float *C,
+        int chunk,
+        int kb_start,
+        int kb_end,
+        const __m512i decode_lut,
+        bool accumulate = false)
+    {
+        switch (nibbleDecodeKind(packed.codebook_id))
+        {
+        case NibbleDecodeKind::LUT:
+            return dispatch_native_avx512_chunk_policy<
+                NibbleDecodeKind::LUT>(
+                packed,
+                A_q8,
+                C,
+                chunk,
+                kb_start,
+                kb_end,
+                decode_lut,
+                accumulate);
+        case NibbleDecodeKind::Q4_0_LINEAR:
+            return dispatch_native_avx512_chunk_policy<
+                NibbleDecodeKind::Q4_0_LINEAR>(
+                packed,
+                A_q8,
+                C,
+                chunk,
+                kb_start,
+                kb_end,
+                decode_lut,
+                accumulate);
+        case NibbleDecodeKind::Q4_1_IDENTITY:
+            return dispatch_native_avx512_chunk_policy<
+                NibbleDecodeKind::Q4_1_IDENTITY>(
+                packed,
+                A_q8,
+                C,
+                chunk,
+                kb_start,
+                kb_end,
+                decode_lut,
+                accumulate);
+        }
+        throw std::logic_error("Unknown NativeVNNI nibble decode kind");
     }
 
     // =========================================================================
@@ -1986,31 +2787,45 @@ namespace llaminar2::cpu::native_vnni
             int_acc2 = _mm512_sub_epi32(int_acc2, _mm512_mullo_epi32(bias_128_i32, comp2));
             int_acc3 = _mm512_sub_epi32(int_acc3, _mm512_mullo_epi32(bias_128_i32, comp3));
 
-            // Convert to FP32 and scale: fp_val = int32_val * a_scale * b_scale[n]
-            // scales are FP16 (halved metadata); load via F16C convert to FP32
-            __m512 a_scale_v = _mm512_set1_ps(a_scale);
-
+            // Convert exact integer dots through the selected publication tree.
             const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-            __m512 cs0 = _mm512_mul_ps(a_scale_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales))));
-            __m512 cs1 = _mm512_mul_ps(a_scale_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 16))));
-            __m512 cs2 = _mm512_mul_ps(a_scale_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32))));
-            __m512 cs3 = _mm512_mul_ps(a_scale_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48))));
-
-            fp_acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(int_acc0), cs0, fp_acc0);
-            fp_acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(int_acc1), cs1, fp_acc1);
-            fp_acc2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(int_acc2), cs2, fp_acc2);
-            fp_acc3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(int_acc3), cs3, fp_acc3);
+            const __m512 scale0 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales)));
+            const __m512 scale1 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 16)));
+            const __m512 scale2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32)));
+            const __m512 scale3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48)));
 
             // Asymmetric correction: acc += a_scale * sum_qs * b_min[n]
             // mins are FP16; load via F16C convert to FP32
             if (packed.is_asymmetric)
             {
                 const uint16_t *b_mins = packed.chunkMins(chunk, kb);
-                __m512 a_corr_v = _mm512_set1_ps(static_cast<float>(a_sum) * a_scale);
-                fp_acc0 = _mm512_fmadd_ps(a_corr_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins))), fp_acc0);
-                fp_acc1 = _mm512_fmadd_ps(a_corr_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 16))), fp_acc1);
-                fp_acc2 = _mm512_fmadd_ps(a_corr_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 32))), fp_acc2);
-                fp_acc3 = _mm512_fmadd_ps(a_corr_v, _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48))), fp_acc3);
+                fp_acc0 = accumulateCorrectedSingleScaleBlockAVX512(
+                    fp_acc0, int_acc0, scale0, a_sum,
+                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins))),
+                    a_scale, packed.numerical_policy);
+                fp_acc1 = accumulateCorrectedSingleScaleBlockAVX512(
+                    fp_acc1, int_acc1, scale1, a_sum,
+                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 16))),
+                    a_scale, packed.numerical_policy);
+                fp_acc2 = accumulateCorrectedSingleScaleBlockAVX512(
+                    fp_acc2, int_acc2, scale2, a_sum,
+                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 32))),
+                    a_scale, packed.numerical_policy);
+                fp_acc3 = accumulateCorrectedSingleScaleBlockAVX512(
+                    fp_acc3, int_acc3, scale3, a_sum,
+                    _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48))),
+                    a_scale, packed.numerical_policy);
+            }
+            else
+            {
+                fp_acc0 = accumulateSingleScaleBlockAVX512(
+                    fp_acc0, int_acc0, scale0, a_scale, packed.numerical_policy);
+                fp_acc1 = accumulateSingleScaleBlockAVX512(
+                    fp_acc1, int_acc1, scale1, a_scale, packed.numerical_policy);
+                fp_acc2 = accumulateSingleScaleBlockAVX512(
+                    fp_acc2, int_acc2, scale2, a_scale, packed.numerical_policy);
+                fp_acc3 = accumulateSingleScaleBlockAVX512(
+                    fp_acc3, int_acc3, scale3, a_scale, packed.numerical_policy);
             }
         }
 
@@ -2270,8 +3085,8 @@ namespace llaminar2::cpu::native_vnni
 
         // Compute tile configuration
         int num_threads = omp_get_max_threads();
-        NativeVNNITileConfig cfg = computeTileConfig(
-            policy_n, K, 1, packed.preparedFootprint(), num_threads);
+        NativeVNNITileConfig cfg = serialTileConfigForPackedMatrix(
+            packed, policy_n, K, num_threads);
 
         // Initialize decode LUTs for selected ISA
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -2703,22 +3518,6 @@ namespace llaminar2::cpu::native_vnni
 
             const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
             const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
-            __m512 as0 = _mm512_set1_ps(a0_scale);
-            __m512 cs0_0 = _mm512_mul_ps(as0, bs0), cs0_1 = _mm512_mul_ps(as0, bs1);
-            __m512 cs0_2 = _mm512_mul_ps(as0, bs2), cs0_3 = _mm512_mul_ps(as0, bs3);
-            fp0_0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_0), cs0_0, fp0_0);
-            fp0_1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_1), cs0_1, fp0_1);
-            fp0_2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_2), cs0_2, fp0_2);
-            fp0_3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_3), cs0_3, fp0_3);
-
-            __m512 as1 = _mm512_set1_ps(a1_scale);
-            __m512 cs1_0 = _mm512_mul_ps(as1, bs0), cs1_1 = _mm512_mul_ps(as1, bs1);
-            __m512 cs1_2 = _mm512_mul_ps(as1, bs2), cs1_3 = _mm512_mul_ps(as1, bs3);
-            fp1_0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_0), cs1_0, fp1_0);
-            fp1_1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_1), cs1_1, fp1_1);
-            fp1_2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_2), cs1_2, fp1_2);
-            fp1_3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_3), cs1_3, fp1_3);
-
             if (packed.is_asymmetric)
             {
                 const uint16_t *b_mins = packed.chunkMins(chunk, kb);
@@ -2727,17 +3526,25 @@ namespace llaminar2::cpu::native_vnni
                 __m512 bm2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 32)));
                 __m512 bm3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48)));
 
-                __m512 corr0 = _mm512_set1_ps(static_cast<float>(a0.sum_qs) * a0_scale);
-                fp0_0 = _mm512_fmadd_ps(corr0, bm0, fp0_0);
-                fp0_1 = _mm512_fmadd_ps(corr0, bm1, fp0_1);
-                fp0_2 = _mm512_fmadd_ps(corr0, bm2, fp0_2);
-                fp0_3 = _mm512_fmadd_ps(corr0, bm3, fp0_3);
-
-                __m512 corr1 = _mm512_set1_ps(static_cast<float>(a1.sum_qs) * a1_scale);
-                fp1_0 = _mm512_fmadd_ps(corr1, bm0, fp1_0);
-                fp1_1 = _mm512_fmadd_ps(corr1, bm1, fp1_1);
-                fp1_2 = _mm512_fmadd_ps(corr1, bm2, fp1_2);
-                fp1_3 = _mm512_fmadd_ps(corr1, bm3, fp1_3);
+                fp0_0 = accumulateCorrectedSingleScaleBlockAVX512(fp0_0, ia0_0, bs0, a0.sum_qs, bm0, a0_scale, packed.numerical_policy);
+                fp0_1 = accumulateCorrectedSingleScaleBlockAVX512(fp0_1, ia0_1, bs1, a0.sum_qs, bm1, a0_scale, packed.numerical_policy);
+                fp0_2 = accumulateCorrectedSingleScaleBlockAVX512(fp0_2, ia0_2, bs2, a0.sum_qs, bm2, a0_scale, packed.numerical_policy);
+                fp0_3 = accumulateCorrectedSingleScaleBlockAVX512(fp0_3, ia0_3, bs3, a0.sum_qs, bm3, a0_scale, packed.numerical_policy);
+                fp1_0 = accumulateCorrectedSingleScaleBlockAVX512(fp1_0, ia1_0, bs0, a1.sum_qs, bm0, a1_scale, packed.numerical_policy);
+                fp1_1 = accumulateCorrectedSingleScaleBlockAVX512(fp1_1, ia1_1, bs1, a1.sum_qs, bm1, a1_scale, packed.numerical_policy);
+                fp1_2 = accumulateCorrectedSingleScaleBlockAVX512(fp1_2, ia1_2, bs2, a1.sum_qs, bm2, a1_scale, packed.numerical_policy);
+                fp1_3 = accumulateCorrectedSingleScaleBlockAVX512(fp1_3, ia1_3, bs3, a1.sum_qs, bm3, a1_scale, packed.numerical_policy);
+            }
+            else
+            {
+                fp0_0 = accumulateSingleScaleBlockAVX512(fp0_0, ia0_0, bs0, a0_scale, packed.numerical_policy);
+                fp0_1 = accumulateSingleScaleBlockAVX512(fp0_1, ia0_1, bs1, a0_scale, packed.numerical_policy);
+                fp0_2 = accumulateSingleScaleBlockAVX512(fp0_2, ia0_2, bs2, a0_scale, packed.numerical_policy);
+                fp0_3 = accumulateSingleScaleBlockAVX512(fp0_3, ia0_3, bs3, a0_scale, packed.numerical_policy);
+                fp1_0 = accumulateSingleScaleBlockAVX512(fp1_0, ia1_0, bs0, a1_scale, packed.numerical_policy);
+                fp1_1 = accumulateSingleScaleBlockAVX512(fp1_1, ia1_1, bs1, a1_scale, packed.numerical_policy);
+                fp1_2 = accumulateSingleScaleBlockAVX512(fp1_2, ia1_2, bs2, a1_scale, packed.numerical_policy);
+                fp1_3 = accumulateSingleScaleBlockAVX512(fp1_3, ia1_3, bs3, a1_scale, packed.numerical_policy);
             }
         }
 
@@ -2911,18 +3718,6 @@ namespace llaminar2::cpu::native_vnni
             __m512 bs2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 32)));
             __m512 bs3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_scales + 48)));
 
-            __m512 as0 = _mm512_set1_ps(a0_scale);
-            fp0_0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_0), _mm512_mul_ps(as0, bs0), fp0_0);
-            fp0_1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_1), _mm512_mul_ps(as0, bs1), fp0_1);
-            fp0_2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_2), _mm512_mul_ps(as0, bs2), fp0_2);
-            fp0_3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia0_3), _mm512_mul_ps(as0, bs3), fp0_3);
-
-            __m512 as1 = _mm512_set1_ps(a1_scale);
-            fp1_0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_0), _mm512_mul_ps(as1, bs0), fp1_0);
-            fp1_1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_1), _mm512_mul_ps(as1, bs1), fp1_1);
-            fp1_2 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_2), _mm512_mul_ps(as1, bs2), fp1_2);
-            fp1_3 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ia1_3), _mm512_mul_ps(as1, bs3), fp1_3);
-
             if (packed.is_asymmetric)
             {
                 const uint16_t *b_mins = packed.chunkMins(chunk, kb);
@@ -2931,17 +3726,25 @@ namespace llaminar2::cpu::native_vnni
                 __m512 bm2 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 32)));
                 __m512 bm3 = _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(b_mins + 48)));
 
-                __m512 corr0 = _mm512_set1_ps(static_cast<float>(a0.sum_qs) * a0_scale);
-                fp0_0 = _mm512_fmadd_ps(corr0, bm0, fp0_0);
-                fp0_1 = _mm512_fmadd_ps(corr0, bm1, fp0_1);
-                fp0_2 = _mm512_fmadd_ps(corr0, bm2, fp0_2);
-                fp0_3 = _mm512_fmadd_ps(corr0, bm3, fp0_3);
-
-                __m512 corr1 = _mm512_set1_ps(static_cast<float>(a1.sum_qs) * a1_scale);
-                fp1_0 = _mm512_fmadd_ps(corr1, bm0, fp1_0);
-                fp1_1 = _mm512_fmadd_ps(corr1, bm1, fp1_1);
-                fp1_2 = _mm512_fmadd_ps(corr1, bm2, fp1_2);
-                fp1_3 = _mm512_fmadd_ps(corr1, bm3, fp1_3);
+                fp0_0 = accumulateCorrectedSingleScaleBlockAVX512(fp0_0, ia0_0, bs0, a0.sum_qs, bm0, a0_scale, packed.numerical_policy);
+                fp0_1 = accumulateCorrectedSingleScaleBlockAVX512(fp0_1, ia0_1, bs1, a0.sum_qs, bm1, a0_scale, packed.numerical_policy);
+                fp0_2 = accumulateCorrectedSingleScaleBlockAVX512(fp0_2, ia0_2, bs2, a0.sum_qs, bm2, a0_scale, packed.numerical_policy);
+                fp0_3 = accumulateCorrectedSingleScaleBlockAVX512(fp0_3, ia0_3, bs3, a0.sum_qs, bm3, a0_scale, packed.numerical_policy);
+                fp1_0 = accumulateCorrectedSingleScaleBlockAVX512(fp1_0, ia1_0, bs0, a1.sum_qs, bm0, a1_scale, packed.numerical_policy);
+                fp1_1 = accumulateCorrectedSingleScaleBlockAVX512(fp1_1, ia1_1, bs1, a1.sum_qs, bm1, a1_scale, packed.numerical_policy);
+                fp1_2 = accumulateCorrectedSingleScaleBlockAVX512(fp1_2, ia1_2, bs2, a1.sum_qs, bm2, a1_scale, packed.numerical_policy);
+                fp1_3 = accumulateCorrectedSingleScaleBlockAVX512(fp1_3, ia1_3, bs3, a1.sum_qs, bm3, a1_scale, packed.numerical_policy);
+            }
+            else
+            {
+                fp0_0 = accumulateSingleScaleBlockAVX512(fp0_0, ia0_0, bs0, a0_scale, packed.numerical_policy);
+                fp0_1 = accumulateSingleScaleBlockAVX512(fp0_1, ia0_1, bs1, a0_scale, packed.numerical_policy);
+                fp0_2 = accumulateSingleScaleBlockAVX512(fp0_2, ia0_2, bs2, a0_scale, packed.numerical_policy);
+                fp0_3 = accumulateSingleScaleBlockAVX512(fp0_3, ia0_3, bs3, a0_scale, packed.numerical_policy);
+                fp1_0 = accumulateSingleScaleBlockAVX512(fp1_0, ia1_0, bs0, a1_scale, packed.numerical_policy);
+                fp1_1 = accumulateSingleScaleBlockAVX512(fp1_1, ia1_1, bs1, a1_scale, packed.numerical_policy);
+                fp1_2 = accumulateSingleScaleBlockAVX512(fp1_2, ia1_2, bs2, a1_scale, packed.numerical_policy);
+                fp1_3 = accumulateSingleScaleBlockAVX512(fp1_3, ia1_3, bs3, a1_scale, packed.numerical_policy);
             }
         }
 
@@ -2953,6 +3756,450 @@ namespace llaminar2::cpu::native_vnni
         _mm512_storeu_ps(C_row1 + 16, fp1_1);
         _mm512_storeu_ps(C_row1 + 32, fp1_2);
         _mm512_storeu_ps(C_row1 + 48, fp1_3);
+    }
+
+    /**
+     * @brief Execute two expanded-INT8 rows with an ordered register K tree.
+     *
+     * Two adjacent 16-column segments keep both row partials and reductions in
+     * registers while every prepared weight vector feeds both activation rows.
+     * A K partition begins at positive zero and is folded only after all of its
+     * blocks complete, exactly matching the cross-device projection contract.
+     * Splitting the 64-column chunk in half stays below the AVX-512 register
+     * budget and avoids the staged microkernel's repeated call/spill prologue.
+     *
+     * @tparam IsAsymmetric Whether the prepared matrix carries minimum terms.
+     * @param packed Prepared expanded-INT8 matrix.
+     * @param row0 First Q8_1 activation row.
+     * @param row1 Second Q8_1 activation row.
+     * @param output0 First FP32 destination row.
+     * @param output1 Second FP32 destination row.
+     * @param chunk Sixty-four-column output chunk.
+     * @param K_blocks Number of source Q8_1 blocks.
+     * @param k_tiles Ordered K-partition count.
+     * @param k_blocks_per_tile Consecutive blocks in one partition.
+     */
+    template <bool IsAsymmetric>
+    inline void gemmTwoRowsExpandedAVX512OrderedPartitionsImpl(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *row0,
+        const Q8_1Block *row1,
+        float *output0,
+        float *output1,
+        int chunk,
+        int K_blocks,
+        int k_tiles,
+        int k_blocks_per_tile)
+    {
+        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+        for (int zbase = 0; zbase < 4; zbase += 2)
+        {
+            __m512 reduced0_0 = _mm512_setzero_ps();
+            __m512 reduced0_1 = _mm512_setzero_ps();
+            __m512 reduced1_0 = _mm512_setzero_ps();
+            __m512 reduced1_1 = _mm512_setzero_ps();
+
+            for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
+            {
+                __m512 partial0_0 = _mm512_setzero_ps();
+                __m512 partial0_1 = _mm512_setzero_ps();
+                __m512 partial1_0 = _mm512_setzero_ps();
+                __m512 partial1_1 = _mm512_setzero_ps();
+                const int kb_start = k_tile * k_blocks_per_tile;
+                const int kb_end = std::min(
+                    kb_start + k_blocks_per_tile, K_blocks);
+
+                for (int kb = kb_start; kb < kb_end; ++kb)
+                {
+                    const Q8_1Block &activation0 = row0[kb];
+                    const Q8_1Block &activation1 = row1[kb];
+                    __m512i dot0_0 = _mm512_setzero_si512();
+                    __m512i dot0_1 = _mm512_setzero_si512();
+                    __m512i dot1_0 = _mm512_setzero_si512();
+                    __m512i dot1_1 = _mm512_setzero_si512();
+
+                    for (int group = 0; group < 8; ++group)
+                    {
+                        const __m512i weight0 = _mm512_load_si512(
+                            packed.interleavedB(
+                                chunk, kb, group, zbase));
+                        const __m512i weight1 = _mm512_load_si512(
+                            packed.interleavedB(
+                                chunk, kb, group, zbase + 1));
+                        const __m512i a0 = _mm512_set1_epi32(
+                            pack_q8_1_unsigned_word(
+                                activation0, group * 4));
+                        const __m512i a1 = _mm512_set1_epi32(
+                            pack_q8_1_unsigned_word(
+                                activation1, group * 4));
+                        dot0_0 = _mm512_dpbusd_epi32(dot0_0, a0, weight0);
+                        dot0_1 = _mm512_dpbusd_epi32(dot0_1, a0, weight1);
+                        dot1_0 = _mm512_dpbusd_epi32(dot1_0, a1, weight0);
+                        dot1_1 = _mm512_dpbusd_epi32(dot1_1, a1, weight1);
+                    }
+
+                    const int16_t *compensation =
+                        packed.chunkComp(chunk, kb) + zbase * 16;
+                    const __m512i bias0 = _mm512_mullo_epi32(
+                        bias_128_i32,
+                        _mm512_cvtepi16_epi32(_mm256_load_si256(
+                            reinterpret_cast<const __m256i *>(
+                                compensation))));
+                    const __m512i bias1 = _mm512_mullo_epi32(
+                        bias_128_i32,
+                        _mm512_cvtepi16_epi32(_mm256_load_si256(
+                            reinterpret_cast<const __m256i *>(
+                                compensation + 16))));
+                    dot0_0 = _mm512_sub_epi32(dot0_0, bias0);
+                    dot0_1 = _mm512_sub_epi32(dot0_1, bias1);
+                    dot1_0 = _mm512_sub_epi32(dot1_0, bias0);
+                    dot1_1 = _mm512_sub_epi32(dot1_1, bias1);
+
+                    const uint16_t *scales =
+                        packed.chunkScales(chunk, kb) + zbase * 16;
+                    const __m512 scale0 = _mm512_cvtph_ps(
+                        _mm256_load_si256(
+                            reinterpret_cast<const __m256i *>(scales)));
+                    const __m512 scale1 = _mm512_cvtph_ps(
+                        _mm256_load_si256(
+                            reinterpret_cast<const __m256i *>(scales + 16)));
+                    const float activation_scale0 =
+                        nativeVNNIFP16ScaleToFP32(activation0.d);
+                    const float activation_scale1 =
+                        nativeVNNIFP16ScaleToFP32(activation1.d);
+
+                    if constexpr (IsAsymmetric)
+                    {
+                        const uint16_t *mins =
+                            packed.chunkMins(chunk, kb) + zbase * 16;
+                        const __m512 min0 = _mm512_cvtph_ps(
+                            _mm256_load_si256(
+                                reinterpret_cast<const __m256i *>(mins)));
+                        const __m512 min1 = _mm512_cvtph_ps(
+                            _mm256_load_si256(
+                                reinterpret_cast<const __m256i *>(mins + 16)));
+                        partial0_0 =
+                            accumulateCorrectedSingleScaleBlockAVX512(
+                                partial0_0,
+                                dot0_0,
+                                scale0,
+                                activation0.sum_qs,
+                                min0,
+                                activation_scale0,
+                                CPUProjectionNumericalPolicy::
+                                    GPUAlignedExpert);
+                        partial0_1 =
+                            accumulateCorrectedSingleScaleBlockAVX512(
+                                partial0_1,
+                                dot0_1,
+                                scale1,
+                                activation0.sum_qs,
+                                min1,
+                                activation_scale0,
+                                CPUProjectionNumericalPolicy::
+                                    GPUAlignedExpert);
+                        partial1_0 =
+                            accumulateCorrectedSingleScaleBlockAVX512(
+                                partial1_0,
+                                dot1_0,
+                                scale0,
+                                activation1.sum_qs,
+                                min0,
+                                activation_scale1,
+                                CPUProjectionNumericalPolicy::
+                                    GPUAlignedExpert);
+                        partial1_1 =
+                            accumulateCorrectedSingleScaleBlockAVX512(
+                                partial1_1,
+                                dot1_1,
+                                scale1,
+                                activation1.sum_qs,
+                                min1,
+                                activation_scale1,
+                                CPUProjectionNumericalPolicy::
+                                    GPUAlignedExpert);
+                    }
+                    else
+                    {
+                        partial0_0 = accumulateSingleScaleBlockAVX512(
+                            partial0_0,
+                            dot0_0,
+                            scale0,
+                            activation_scale0,
+                            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                        partial0_1 = accumulateSingleScaleBlockAVX512(
+                            partial0_1,
+                            dot0_1,
+                            scale1,
+                            activation_scale0,
+                            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                        partial1_0 = accumulateSingleScaleBlockAVX512(
+                            partial1_0,
+                            dot1_0,
+                            scale0,
+                            activation_scale1,
+                            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                        partial1_1 = accumulateSingleScaleBlockAVX512(
+                            partial1_1,
+                            dot1_1,
+                            scale1,
+                            activation_scale1,
+                            CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                    }
+                }
+
+                if (k_tile == 0)
+                {
+                    reduced0_0 = partial0_0;
+                    reduced0_1 = partial0_1;
+                    reduced1_0 = partial1_0;
+                    reduced1_1 = partial1_1;
+                }
+                else
+                {
+                    reduced0_0 = _mm512_add_ps(reduced0_0, partial0_0);
+                    reduced0_1 = _mm512_add_ps(reduced0_1, partial0_1);
+                    reduced1_0 = _mm512_add_ps(reduced1_0, partial1_0);
+                    reduced1_1 = _mm512_add_ps(reduced1_1, partial1_1);
+                }
+            }
+
+            _mm512_storeu_ps(output0 + zbase * 16, reduced0_0);
+            _mm512_storeu_ps(output0 + (zbase + 1) * 16, reduced0_1);
+            _mm512_storeu_ps(output1 + zbase * 16, reduced1_0);
+            _mm512_storeu_ps(output1 + (zbase + 1) * 16, reduced1_1);
+        }
+    }
+
+    /**
+     * @brief Dispatch the expanded-INT8 two-row ordered tree by layout.
+     *
+     * @throws std::invalid_argument when the matrix does not own the expanded
+     *         physical encoding.
+     */
+    inline void gemmTwoRowsExpandedAVX512OrderedPartitions(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *row0,
+        const Q8_1Block *row1,
+        float *output0,
+        float *output1,
+        int chunk,
+        int K_blocks,
+        int k_tiles,
+        int k_blocks_per_tile)
+    {
+        if (!packed.usesExpandedInt8())
+        {
+            throw std::invalid_argument(
+                "Ordered expanded-INT8 tree received another encoding");
+        }
+        if (packed.is_asymmetric)
+        {
+            return gemmTwoRowsExpandedAVX512OrderedPartitionsImpl<true>(
+                packed,
+                row0,
+                row1,
+                output0,
+                output1,
+                chunk,
+                K_blocks,
+                k_tiles,
+                k_blocks_per_tile);
+        }
+        return gemmTwoRowsExpandedAVX512OrderedPartitionsImpl<false>(
+            packed,
+            row0,
+            row1,
+            output0,
+            output1,
+            chunk,
+            K_blocks,
+            k_tiles,
+            k_blocks_per_tile);
+    }
+
+    /**
+     * @brief Fold one 64-column AVX-512 partition into an ordered reduction.
+     *
+     * The first partition publishes its value directly. Later partitions are
+     * added strictly in increasing partition order, reproducing the device
+     * projection tree without retaining all partition planes in memory.
+     *
+     * @param destination Running 64-column reduction.
+     * @param partial Newly completed 64-column K-partition.
+     * @param first_partition Whether @p partial initializes the reduction.
+     */
+    inline void foldOrderedAVX512Partition(
+        float *destination,
+        const float *partial,
+        bool first_partition)
+    {
+        for (int segment = 0; segment < 4; ++segment)
+        {
+            const __m512 value = _mm512_load_ps(partial + segment * 16);
+            _mm512_storeu_ps(
+                destination + segment * 16,
+                first_partition
+                    ? value
+                    : _mm512_add_ps(
+                          _mm512_loadu_ps(destination + segment * 16),
+                          value));
+        }
+    }
+
+    /**
+     * @brief Execute a two-row device-ordered tree with the tuned native tile.
+     *
+     * The ordinary two-row microkernel is the measured weight-sharing unit for
+     * every prepared encoding. It computes one K partition from positive zero
+     * into a small task-local plane; this wrapper immediately folds that plane
+     * into the destination before proceeding. Consequently the kernel retains
+     * contiguous packed-weight traversal and shared decode while the FP32 tree
+     * remains byte-identical to CUDA and ROCm. Only one 512-byte partition is
+     * live, rather than the former complete 16-partition plane.
+     *
+     * @param packed Prepared matrix carrying its typed physical encoding.
+     * @param row0 First Q8_1 activation row.
+     * @param row1 Second Q8_1 activation row.
+     * @param output0 First FP32 destination row.
+     * @param output1 Second FP32 destination row.
+     * @param chunk Sixty-four-column output chunk.
+     * @param K_blocks Number of source Q8_1 blocks.
+     * @param k_tiles Ordered K-partition count.
+     * @param k_blocks_per_tile Consecutive blocks in one partition.
+     * @param decode_lut Broadcast nibble decoder for nibble encodings.
+     */
+    inline void gemmTwoRowsAVX512OrderedPartitions(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *row0,
+        const Q8_1Block *row1,
+        float *output0,
+        float *output1,
+        int chunk,
+        int K_blocks,
+        int k_tiles,
+        int k_blocks_per_tile,
+        const __m512i decode_lut)
+    {
+        if (MoEProjectionNumericalContract::
+                oneNativeVNNIBlockPerOrderedPartition(
+                    K_blocks *
+                    MoEProjectionNumericalContract::
+                        native_vnni_values_per_block))
+        {
+            if (packed.usesNibbleLUT())
+            {
+                gemm_2row_native_chunk(
+                    packed,
+                    row0,
+                    row1,
+                    output0,
+                    output1,
+                    chunk,
+                    0,
+                    K_blocks,
+                    decode_lut,
+                    /*accumulate=*/false);
+            }
+            else
+            {
+                gemm_2row_non_nibble_chunk(
+                    packed,
+                    row0,
+                    row1,
+                    output0,
+                    output1,
+                    chunk,
+                    0,
+                    K_blocks,
+                    /*accumulate=*/false);
+            }
+            return;
+        }
+
+        alignas(64) float partial0[64];
+        alignas(64) float partial1[64];
+        for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
+        {
+            const int kb_start = k_tile * k_blocks_per_tile;
+            const int kb_end = std::min(
+                kb_start + k_blocks_per_tile, K_blocks);
+            if (packed.usesNibbleLUT())
+            {
+                gemm_2row_native_chunk(
+                    packed,
+                    row0,
+                    row1,
+                    partial0,
+                    partial1,
+                    chunk,
+                    kb_start,
+                    kb_end,
+                    decode_lut,
+                    /*accumulate=*/false);
+            }
+            else
+            {
+                gemm_2row_non_nibble_chunk(
+                    packed,
+                    row0,
+                    row1,
+                    partial0,
+                    partial1,
+                    chunk,
+                    kb_start,
+                    kb_end,
+                    /*accumulate=*/false);
+            }
+            foldOrderedAVX512Partition(
+                output0, partial0, k_tile == 0);
+            foldOrderedAVX512Partition(
+                output1, partial1, k_tile == 0);
+        }
+    }
+
+    /**
+     * @brief Execute a one-row non-nibble device-ordered AVX-512 tree.
+     *
+     * Expanded INT8 and native Q6 use their established serial microkernel for
+     * each exact device partition. Immediate ordered folding eliminates the
+     * large partial plane while preserving the one implementation of each
+     * physical encoding's dot and scale program.
+     *
+     * @param packed Prepared expanded-INT8 or native-Q6 matrix.
+     * @param row Q8_1 activation row.
+     * @param output FP32 destination row.
+     * @param chunk Sixty-four-column output chunk.
+     * @param K_blocks Number of source Q8_1 blocks.
+     * @param k_tiles Ordered K-partition count.
+     * @param k_blocks_per_tile Consecutive blocks in one partition.
+     */
+    inline void gemvNonNibbleAVX512OrderedPartitions(
+        const CPUNativeVNNIPackedWeights &packed,
+        const Q8_1Block *row,
+        float *output,
+        int chunk,
+        int K_blocks,
+        int k_tiles,
+        int k_blocks_per_tile)
+    {
+        alignas(64) float partial[64];
+        for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
+        {
+            const int kb_start = k_tile * k_blocks_per_tile;
+            const int kb_end = std::min(
+                kb_start + k_blocks_per_tile, K_blocks);
+            gemv_native_vnni_avx512_chunk_non_nibble(
+                packed,
+                row,
+                partial,
+                chunk,
+                kb_start,
+                kb_end,
+                /*accumulate=*/false);
+            foldOrderedAVX512Partition(
+                output, partial, k_tile == 0);
+        }
     }
 
     /**
@@ -3060,23 +4307,6 @@ namespace llaminar2::cpu::native_vnni
                 const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
                 const float a2_scale = nativeVNNIFP16ScaleToFP32(a2.d);
 
-#define FMA_3ROW_NATIVE(ROW, ASCALE)                                            \
-                {                                                               \
-                    const __m512 as = _mm512_set1_ps(ASCALE);                   \
-                    fp##ROW##_0 = _mm512_fmadd_ps(                              \
-                        _mm512_cvtepi32_ps(ia##ROW##_0),                        \
-                        _mm512_mul_ps(as, bscale0),                             \
-                        fp##ROW##_0);                                           \
-                    fp##ROW##_1 = _mm512_fmadd_ps(                              \
-                        _mm512_cvtepi32_ps(ia##ROW##_1),                        \
-                        _mm512_mul_ps(as, bscale1),                             \
-                        fp##ROW##_1);                                           \
-                }
-                FMA_3ROW_NATIVE(0, a0_scale)
-                FMA_3ROW_NATIVE(1, a1_scale)
-                FMA_3ROW_NATIVE(2, a2_scale)
-#undef FMA_3ROW_NATIVE
-
                 if (packed.is_asymmetric)
                 {
                     const uint16_t *min_ptr = packed.chunkMins(chunk, kb) + zbase * 16;
@@ -3085,17 +4315,31 @@ namespace llaminar2::cpu::native_vnni
                     const __m512 bmin1 =
                         _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(min_ptr + 16)));
 
-#define MIN_3ROW_NATIVE(ROW, ABLK, ASCALE)                                      \
-                    {                                                           \
-                        const __m512 corr = _mm512_set1_ps(                     \
-                            static_cast<float>(ABLK.sum_qs) * ASCALE);          \
-                        fp##ROW##_0 = _mm512_fmadd_ps(corr, bmin0, fp##ROW##_0); \
-                        fp##ROW##_1 = _mm512_fmadd_ps(corr, bmin1, fp##ROW##_1); \
-                    }
-                    MIN_3ROW_NATIVE(0, a0, a0_scale)
-                    MIN_3ROW_NATIVE(1, a1, a1_scale)
-                    MIN_3ROW_NATIVE(2, a2, a2_scale)
-#undef MIN_3ROW_NATIVE
+#define CORRECTED_3ROW_NATIVE(ROW, ABLK, ASCALE)                               \
+                    fp##ROW##_0 = accumulateCorrectedSingleScaleBlockAVX512(   \
+                        fp##ROW##_0, ia##ROW##_0, bscale0, ABLK.sum_qs,        \
+                        bmin0, ASCALE, packed.numerical_policy);                \
+                    fp##ROW##_1 = accumulateCorrectedSingleScaleBlockAVX512(   \
+                        fp##ROW##_1, ia##ROW##_1, bscale1, ABLK.sum_qs,        \
+                        bmin1, ASCALE, packed.numerical_policy)
+                    CORRECTED_3ROW_NATIVE(0, a0, a0_scale);
+                    CORRECTED_3ROW_NATIVE(1, a1, a1_scale);
+                    CORRECTED_3ROW_NATIVE(2, a2, a2_scale);
+#undef CORRECTED_3ROW_NATIVE
+                }
+                else
+                {
+#define SYMMETRIC_3ROW_NATIVE(ROW, ASCALE)                                     \
+                    fp##ROW##_0 = accumulateSingleScaleBlockAVX512(            \
+                        fp##ROW##_0, ia##ROW##_0, bscale0, ASCALE,              \
+                        packed.numerical_policy);                               \
+                    fp##ROW##_1 = accumulateSingleScaleBlockAVX512(            \
+                        fp##ROW##_1, ia##ROW##_1, bscale1, ASCALE,              \
+                        packed.numerical_policy)
+                    SYMMETRIC_3ROW_NATIVE(0, a0_scale);
+                    SYMMETRIC_3ROW_NATIVE(1, a1_scale);
+                    SYMMETRIC_3ROW_NATIVE(2, a2_scale);
+#undef SYMMETRIC_3ROW_NATIVE
                 }
             }
 
@@ -3213,23 +4457,6 @@ namespace llaminar2::cpu::native_vnni
                 const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
                 const float a2_scale = nativeVNNIFP16ScaleToFP32(a2.d);
 
-#define FMA_3ROW_INT8(ROW, ASCALE)                                              \
-                {                                                               \
-                    const __m512 as = _mm512_set1_ps(ASCALE);                   \
-                    fp##ROW##_0 = _mm512_fmadd_ps(                              \
-                        _mm512_cvtepi32_ps(ia##ROW##_0),                        \
-                        _mm512_mul_ps(as, bscale0),                             \
-                        fp##ROW##_0);                                           \
-                    fp##ROW##_1 = _mm512_fmadd_ps(                              \
-                        _mm512_cvtepi32_ps(ia##ROW##_1),                        \
-                        _mm512_mul_ps(as, bscale1),                             \
-                        fp##ROW##_1);                                           \
-                }
-                FMA_3ROW_INT8(0, a0_scale)
-                FMA_3ROW_INT8(1, a1_scale)
-                FMA_3ROW_INT8(2, a2_scale)
-#undef FMA_3ROW_INT8
-
                 if (packed.is_asymmetric)
                 {
                     const uint16_t *min_ptr = packed.chunkMins(chunk, kb) + zbase * 16;
@@ -3238,17 +4465,31 @@ namespace llaminar2::cpu::native_vnni
                     const __m512 bmin1 =
                         _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(min_ptr + 16)));
 
-#define MIN_3ROW_INT8(ROW, ABLK, ASCALE)                                        \
-                    {                                                           \
-                        const __m512 corr = _mm512_set1_ps(                     \
-                            static_cast<float>(ABLK.sum_qs) * ASCALE);          \
-                        fp##ROW##_0 = _mm512_fmadd_ps(corr, bmin0, fp##ROW##_0); \
-                        fp##ROW##_1 = _mm512_fmadd_ps(corr, bmin1, fp##ROW##_1); \
-                    }
-                    MIN_3ROW_INT8(0, a0, a0_scale)
-                    MIN_3ROW_INT8(1, a1, a1_scale)
-                    MIN_3ROW_INT8(2, a2, a2_scale)
-#undef MIN_3ROW_INT8
+#define CORRECTED_3ROW_INT8(ROW, ABLK, ASCALE)                                \
+                    fp##ROW##_0 = accumulateCorrectedSingleScaleBlockAVX512(   \
+                        fp##ROW##_0, ia##ROW##_0, bscale0, ABLK.sum_qs,        \
+                        bmin0, ASCALE, packed.numerical_policy);                \
+                    fp##ROW##_1 = accumulateCorrectedSingleScaleBlockAVX512(   \
+                        fp##ROW##_1, ia##ROW##_1, bscale1, ABLK.sum_qs,        \
+                        bmin1, ASCALE, packed.numerical_policy)
+                    CORRECTED_3ROW_INT8(0, a0, a0_scale);
+                    CORRECTED_3ROW_INT8(1, a1, a1_scale);
+                    CORRECTED_3ROW_INT8(2, a2, a2_scale);
+#undef CORRECTED_3ROW_INT8
+                }
+                else
+                {
+#define SYMMETRIC_3ROW_INT8(ROW, ASCALE)                                      \
+                    fp##ROW##_0 = accumulateSingleScaleBlockAVX512(            \
+                        fp##ROW##_0, ia##ROW##_0, bscale0, ASCALE,              \
+                        packed.numerical_policy);                               \
+                    fp##ROW##_1 = accumulateSingleScaleBlockAVX512(            \
+                        fp##ROW##_1, ia##ROW##_1, bscale1, ASCALE,              \
+                        packed.numerical_policy)
+                    SYMMETRIC_3ROW_INT8(0, a0_scale);
+                    SYMMETRIC_3ROW_INT8(1, a1_scale);
+                    SYMMETRIC_3ROW_INT8(2, a2_scale);
+#undef SYMMETRIC_3ROW_INT8
                 }
             }
 
@@ -3358,41 +4599,37 @@ namespace llaminar2::cpu::native_vnni
                 const __m512 bscale =
                     _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scale_ptr)));
 
-#define FMA_4ROW_NATIVE(ROW, ABLK, ASCALE)                                      \
-                {                                                               \
-                    const __m512 as = _mm512_set1_ps(ASCALE);                   \
-                    fp##ROW = _mm512_fmadd_ps(                                 \
-                        _mm512_cvtepi32_ps(ia##ROW),                            \
-                        _mm512_mul_ps(as, bscale),                              \
-                        fp##ROW);                                               \
-                }
                 const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
                 const float a2_scale = nativeVNNIFP16ScaleToFP32(a2.d);
                 const float a3_scale = nativeVNNIFP16ScaleToFP32(a3.d);
-                FMA_4ROW_NATIVE(0, a0, a0_scale)
-                FMA_4ROW_NATIVE(1, a1, a1_scale)
-                FMA_4ROW_NATIVE(2, a2, a2_scale)
-                FMA_4ROW_NATIVE(3, a3, a3_scale)
-#undef FMA_4ROW_NATIVE
-
                 if (packed.is_asymmetric)
                 {
                     const uint16_t *min_ptr = packed.chunkMins(chunk, kb) + z * 16;
                     const __m512 bmin =
                         _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(min_ptr)));
 
-#define MIN_4ROW_NATIVE(ROW, ABLK, ASCALE)                                      \
-                    {                                                           \
-                        const __m512 corr = _mm512_set1_ps(                     \
-                            static_cast<float>(ABLK.sum_qs) * ASCALE);          \
-                        fp##ROW = _mm512_fmadd_ps(corr, bmin, fp##ROW);          \
-                    }
-                    MIN_4ROW_NATIVE(0, a0, a0_scale)
-                    MIN_4ROW_NATIVE(1, a1, a1_scale)
-                    MIN_4ROW_NATIVE(2, a2, a2_scale)
-                    MIN_4ROW_NATIVE(3, a3, a3_scale)
-#undef MIN_4ROW_NATIVE
+#define CORRECTED_4ROW_NATIVE(ROW, ABLK, ASCALE)                               \
+                    fp##ROW = accumulateCorrectedSingleScaleBlockAVX512(       \
+                        fp##ROW, ia##ROW, bscale, ABLK.sum_qs, bmin, ASCALE,   \
+                        packed.numerical_policy)
+                    CORRECTED_4ROW_NATIVE(0, a0, a0_scale);
+                    CORRECTED_4ROW_NATIVE(1, a1, a1_scale);
+                    CORRECTED_4ROW_NATIVE(2, a2, a2_scale);
+                    CORRECTED_4ROW_NATIVE(3, a3, a3_scale);
+#undef CORRECTED_4ROW_NATIVE
+                }
+                else
+                {
+#define SYMMETRIC_4ROW_NATIVE(ROW, ASCALE)                                     \
+                    fp##ROW = accumulateSingleScaleBlockAVX512(                \
+                        fp##ROW, ia##ROW, bscale, ASCALE,                       \
+                        packed.numerical_policy)
+                    SYMMETRIC_4ROW_NATIVE(0, a0_scale);
+                    SYMMETRIC_4ROW_NATIVE(1, a1_scale);
+                    SYMMETRIC_4ROW_NATIVE(2, a2_scale);
+                    SYMMETRIC_4ROW_NATIVE(3, a3_scale);
+#undef SYMMETRIC_4ROW_NATIVE
                 }
             }
 
@@ -3525,24 +4762,10 @@ namespace llaminar2::cpu::native_vnni
                 const __m512 bscale1 =
                     _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(scale_ptr + 16)));
 
-#define FMA_4ROW_INT8(ROW, ABLK, ASCALE)                                           \
-                {                                                                  \
-                    const __m512 as = _mm512_set1_ps(ASCALE);                      \
-                    fp##ROW##_0 = _mm512_fmadd_ps(                                 \
-                        _mm512_cvtepi32_ps(ia##ROW##_0), _mm512_mul_ps(as, bscale0), fp##ROW##_0); \
-                    fp##ROW##_1 = _mm512_fmadd_ps(                                 \
-                        _mm512_cvtepi32_ps(ia##ROW##_1), _mm512_mul_ps(as, bscale1), fp##ROW##_1); \
-                }
                 const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
                 const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
                 const float a2_scale = nativeVNNIFP16ScaleToFP32(a2.d);
                 const float a3_scale = nativeVNNIFP16ScaleToFP32(a3.d);
-                FMA_4ROW_INT8(0, a0, a0_scale)
-                FMA_4ROW_INT8(1, a1, a1_scale)
-                FMA_4ROW_INT8(2, a2, a2_scale)
-                FMA_4ROW_INT8(3, a3, a3_scale)
-#undef FMA_4ROW_INT8
-
                 if (packed.is_asymmetric)
                 {
                     const uint16_t *min_ptr = packed.chunkMins(chunk, kb) + zbase * 16;
@@ -3551,18 +4774,33 @@ namespace llaminar2::cpu::native_vnni
                     const __m512 bmin1 =
                         _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i *>(min_ptr + 16)));
 
-#define MIN_4ROW_INT8(ROW, ABLK, ASCALE)                                  \
-                    {                                                      \
-                        const __m512 corr = _mm512_set1_ps(                \
-                            static_cast<float>(ABLK.sum_qs) * ASCALE);     \
-                        fp##ROW##_0 = _mm512_fmadd_ps(corr, bmin0, fp##ROW##_0); \
-                        fp##ROW##_1 = _mm512_fmadd_ps(corr, bmin1, fp##ROW##_1); \
-                    }
-                    MIN_4ROW_INT8(0, a0, a0_scale)
-                    MIN_4ROW_INT8(1, a1, a1_scale)
-                    MIN_4ROW_INT8(2, a2, a2_scale)
-                    MIN_4ROW_INT8(3, a3, a3_scale)
-#undef MIN_4ROW_INT8
+#define CORRECTED_4ROW_INT8(ROW, ABLK, ASCALE)                                \
+                    fp##ROW##_0 = accumulateCorrectedSingleScaleBlockAVX512(   \
+                        fp##ROW##_0, ia##ROW##_0, bscale0, ABLK.sum_qs,        \
+                        bmin0, ASCALE, packed.numerical_policy);                \
+                    fp##ROW##_1 = accumulateCorrectedSingleScaleBlockAVX512(   \
+                        fp##ROW##_1, ia##ROW##_1, bscale1, ABLK.sum_qs,        \
+                        bmin1, ASCALE, packed.numerical_policy)
+                    CORRECTED_4ROW_INT8(0, a0, a0_scale);
+                    CORRECTED_4ROW_INT8(1, a1, a1_scale);
+                    CORRECTED_4ROW_INT8(2, a2, a2_scale);
+                    CORRECTED_4ROW_INT8(3, a3, a3_scale);
+#undef CORRECTED_4ROW_INT8
+                }
+                else
+                {
+#define SYMMETRIC_4ROW_INT8(ROW, ASCALE)                                      \
+                    fp##ROW##_0 = accumulateSingleScaleBlockAVX512(            \
+                        fp##ROW##_0, ia##ROW##_0, bscale0, ASCALE,              \
+                        packed.numerical_policy);                               \
+                    fp##ROW##_1 = accumulateSingleScaleBlockAVX512(            \
+                        fp##ROW##_1, ia##ROW##_1, bscale1, ASCALE,              \
+                        packed.numerical_policy)
+                    SYMMETRIC_4ROW_INT8(0, a0_scale);
+                    SYMMETRIC_4ROW_INT8(1, a1_scale);
+                    SYMMETRIC_4ROW_INT8(2, a2_scale);
+                    SYMMETRIC_4ROW_INT8(3, a3_scale);
+#undef SYMMETRIC_4ROW_INT8
                 }
             }
 
@@ -3600,12 +4838,64 @@ namespace llaminar2::cpu::native_vnni
     // Shared activation quantization (for multiply_fused quantize-once)
     // =========================================================================
 
+    /**
+     * @brief Publish one Q8 block under the matrix's arithmetic policy.
+     * @param source Source FP32 values.
+     * @param destination Destination Q8_1 block.
+     * @param valid_elements Number of valid source values.
+     * @param policy Backend-native or placement-invariant publication.
+     */
+    inline void quantizeActivationBlock(
+        const float *source,
+        Q8_1Block &destination,
+        int valid_elements,
+        CPUProjectionNumericalPolicy policy)
+    {
+        if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+        {
+            gpu_aligned_expert_q8::quantizeBlock(
+                source, destination, valid_elements);
+            return;
+        }
+        simd::quantize_single_block(
+            source, destination, valid_elements);
+    }
+
+    /**
+     * @brief Publish two complete adjacent Q8 blocks under one policy.
+     * @param source Source pointer containing 64 FP32 values.
+     * @param first First destination block.
+     * @param second Second destination block.
+     * @param policy Backend-native or placement-invariant publication.
+     */
+    inline void quantizeTwoActivationBlocks(
+        const float *source,
+        Q8_1Block &first,
+        Q8_1Block &second,
+        CPUProjectionNumericalPolicy policy)
+    {
+        if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+        {
+            gpu_aligned_expert_q8::quantizeTwoBlocks(source, first, second);
+            return;
+        }
+#if defined(__AVX512F__)
+        simd::quantize_two_blocks_avx512(source, first, second);
+#else
+        simd::quantize_single_block(source, first);
+        simd::quantize_single_block(
+            source + Q8_1Block::BLOCK_SIZE, second);
+#endif
+    }
+
     inline void quantize_activations_to_q8_1(
         const float *A_fp32,
         Q8_1Block *A_q8,
         int M,
         int K,
-        int K_blocks)
+        int K_blocks,
+        CPUProjectionNumericalPolicy policy =
+            CPUProjectionNumericalPolicy::BackendNative)
     {
         const bool k_aligned = (K % 32 == 0);
 
@@ -3622,7 +4912,11 @@ namespace llaminar2::cpu::native_vnni
                 {
                     for (; kb + 1 < K_blocks; kb += 2)
                     {
-                        simd::quantize_two_blocks_avx512(row_a + kb * 32, row_q8[kb], row_q8[kb + 1]);
+                        quantizeTwoActivationBlocks(
+                            row_a + kb * 32,
+                            row_q8[kb],
+                            row_q8[kb + 1],
+                            policy);
                     }
                 }
 #endif
@@ -3630,7 +4924,11 @@ namespace llaminar2::cpu::native_vnni
                 {
                     int block_start = kb * 32;
                     int block_len = std::min(32, K - block_start);
-                    simd::quantize_single_block(row_a + block_start, row_q8[kb], block_len);
+                    quantizeActivationBlock(
+                        row_a + block_start,
+                        row_q8[kb],
+                        block_len,
+                        policy);
                 }
             }
         };
@@ -3670,7 +4968,9 @@ namespace llaminar2::cpu::native_vnni
         Q8_1Block *output_q8,
         int M,
         int K,
-        int K_blocks)
+        int K_blocks,
+        CPUProjectionNumericalPolicy policy =
+            CPUProjectionNumericalPolicy::BackendNative)
     {
         constexpr int kQ8BlockSize =
             static_cast<int>(Q8_1Block::BLOCK_SIZE);
@@ -3718,19 +5018,31 @@ namespace llaminar2::cpu::native_vnni
                  * compiler from forwarding wider intermediate precision.
                  */
                 alignas(64) float activated[kElementsPerTask] = {};
-                primitives::compute_swiglu_serial(
-                    gate + fp32_offset,
-                    up + fp32_offset,
-                    activated,
-                    element_count);
+                if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+                {
+                    primitives::compute_swiglu_gpu_aligned_expert_serial(
+                        gate + fp32_offset,
+                        up + fp32_offset,
+                        activated,
+                        element_count);
+                }
+                else
+                {
+                    primitives::compute_swiglu_serial(
+                        gate + fp32_offset,
+                        up + fp32_offset,
+                        activated,
+                        element_count);
+                }
 
 #if defined(__AVX512F__)
                 if (element_count == kElementsPerTask)
                 {
-                    simd::quantize_two_blocks_avx512(
+                    quantizeTwoActivationBlocks(
                         activated,
                         destination[0],
-                        destination[1]);
+                        destination[1],
+                        policy);
                     continue;
                 }
 #endif
@@ -3744,10 +5056,11 @@ namespace llaminar2::cpu::native_vnni
                     const int block_length = std::min(
                         kQ8BlockSize,
                         element_count - block_begin);
-                    simd::quantize_single_block(
+                    quantizeActivationBlock(
                         activated + block_begin,
                         destination[block],
-                        block_length);
+                        block_length,
+                        policy);
                 }
             }
         };
@@ -3807,8 +5120,9 @@ namespace llaminar2::cpu::native_vnni
             policy_n, packed.K, M, packed.preparedFootprint(), num_threads);
         int k_tile_blocks = cfg.k_tile_blocks > 0 ? cfg.k_tile_blocks : K_blocks;
         int num_k_tiles = (K_blocks + k_tile_blocks - 1) / k_tile_blocks;
-        const NativeVNNITileConfig serial_cfg = computeTileConfig(
-            policy_n, packed.K, 1, packed.preparedFootprint(), num_threads);
+        const NativeVNNITileConfig serial_cfg =
+            serialTileConfigForPackedMatrix(
+                packed, policy_n, packed.K, num_threads);
         const bool use_decode_equivalent_kpart =
             nativeVNNIUsesKPartitions(serial_cfg.k_tiles);
 
@@ -3852,18 +5166,22 @@ namespace llaminar2::cpu::native_vnni
         }
         const int total_n_blocks =
             (N_chunks + n_block_chunks - 1) / n_block_chunks;
-        const VerifierRowsPolicy requested_kpart_policy =
-            use_decode_equivalent_kpart
-                ? (verifier_policy_override == VerifierRowsPolicy::Auto
-                       ? VerifierRowsPolicy::Pairwise
-                       : verifier_policy_override)
-                : VerifierRowsPolicy::Pairwise;
+        VerifierRowsPolicy selected_kpart_policy =
+            VerifierRowsPolicy::Pairwise;
         VerifierRowsScheduleResolution kpart_schedule{};
         if (use_decode_equivalent_kpart)
         {
+            selected_kpart_policy =
+                verifier_policy_override == VerifierRowsPolicy::Auto
+                    ? selectSerialKPartPrefillRowsPolicy(use_avx512, M)
+                    : verifier_policy_override;
+
+            // Auto is a policy request, not an alias for Pairwise. Resolve the
+            // dedicated serial-K-part policy once here, then pass that exact
+            // typed schedule to the worker below without a second lookup.
             kpart_schedule = resolveVerifierRowsSchedule(
-                requested_kpart_policy,
-                requested_kpart_policy,
+                verifier_policy_override,
+                selected_kpart_policy,
                 VerifierRowsScheduleGeometry{
                     .rows = M,
                     .physical_n = N,
@@ -3932,9 +5250,7 @@ namespace llaminar2::cpu::native_vnni
                              ? kpart_schedule.physical_row_tile
                              : (use_row_chunk_grid ? 1 : 2))},
                     {"requested_policy",
-                     requested_kpart_policy == VerifierRowsPolicy::WideRows
-                         ? "WideRows"
-                         : "Pairwise"},
+                     verifierRowsPolicyName(verifier_policy_override)},
                     {"effective_policy",
                      effective_wide_kpart ? "WideRows" : "Pairwise"},
                     {"n_block_chunks",
@@ -3971,7 +5287,7 @@ namespace llaminar2::cpu::native_vnni
                 M,
                 ldc,
                 isa_path,
-                requested_kpart_policy,
+                selected_kpart_policy,
                 /*publish_verifier_route=*/false);
             return;
         }
@@ -4292,8 +5608,8 @@ namespace llaminar2::cpu::native_vnni
                 ? ISALevel::AVX512
                 : (use_avx2 ? ISALevel::AVX2 : ISALevel::Scalar);
         const int num_threads = omp_get_max_threads();
-        NativeVNNITileConfig cfg = computeTileConfig(
-            policy_n, K, 1, packed.preparedFootprint(), num_threads);
+        NativeVNNITileConfig cfg = serialTileConfigForPackedMatrix(
+            packed, policy_n, K, num_threads);
         const VerifierRowsPolicy selected_policy =
             verifier_policy_override == VerifierRowsPolicy::Auto
                 ? selectVerifierRowsPolicy(
@@ -5044,11 +6360,10 @@ namespace llaminar2::cpu::native_vnni
             const int policy_n =
                 cpuNativeVNNISerialEquivalentPolicyN(d.packed->N);
             const NativeVNNITileConfig cfg =
-                computeTileConfig(
+                serialTileConfigForPackedMatrix(
+                    *d.packed,
                     policy_n,
                     d.packed->K,
-                    1,
-                    d.packed->preparedFootprint(),
                     num_threads);
             auto &plan = plans[static_cast<size_t>(p)];
             plan.rows = d.rows > 0 ? d.rows : M;
@@ -5150,6 +6465,46 @@ namespace llaminar2::cpu::native_vnni
             {
                 return !nativeVNNIUsesKPartitions(plan.k_tiles);
             });
+        const bool all_k_partitioned = std::all_of(
+            plans.begin(),
+            plans.begin() + num_descs,
+            [](const FusedVerifierRowsPlan &plan)
+            {
+                return nativeVNNIUsesKPartitions(plan.k_tiles);
+            });
+        size_t layer_local_ordered_tree_tasks = 0;
+        if (all_k_partitioned)
+        {
+            constexpr int kMaximumOrderedKPartitions =
+                MoEProjectionNumericalContract::ordered_k_partitions;
+            for (int projection = 0; projection < num_descs; ++projection)
+            {
+                const auto &plan = plans[static_cast<size_t>(projection)];
+                if (plan.k_tiles > kMaximumOrderedKPartitions)
+                {
+                    throw std::logic_error(
+                        "GPU-aligned CPU expert exceeds its fixed ordered "
+                        "K-partition capacity");
+                }
+                const int row_tile_width =
+                    plan.rows == 1
+                        ? 1
+                        : (use_avx512 &&
+                                   plan.effective_verifier_schedule ==
+                                       VerifierRowsPolicy::WideRows
+                               ? 4
+                               : 2);
+                layer_local_ordered_tree_tasks +=
+                    static_cast<size_t>(
+                        (plan.rows + row_tile_width - 1) /
+                        row_tile_width) *
+                    static_cast<size_t>(plan.n_chunks);
+            }
+        }
+        const bool use_layer_local_ordered_tree =
+            all_k_partitioned &&
+            layer_local_ordered_tree_tasks >=
+                static_cast<size_t>(std::max(1, num_threads));
 
         if ((!omp_in_parallel() || omp_get_thread_num() == 0) &&
             PerfStatsCollector::isDomainEnabled("kernel"))
@@ -5664,15 +7019,933 @@ namespace llaminar2::cpu::native_vnni
          * keeping the layout explicit and easy to audit.
          */
         thread_local AlignedVector<float> fused_partial_sums_tls;
-        if (fused_partial_sums_tls.size() < fused_partial_sum_floats)
-            fused_partial_sums_tls.resize_uninitialized(fused_partial_sum_floats);
-        /*
-         * Capture the caller thread's arena before the OpenMP region.  The arena
-         * itself is thread_local only to amortize allocations between calls; the
-         * grouped verifier work-sharing region needs one shared scratch buffer so
-         * all partial tasks and the later reduction tasks address the same layout.
-         */
-        float *fused_partial_sums_base = fused_partial_sums_tls.data();
+        float *fused_partial_sums_base = nullptr;
+        if (use_layer_local_ordered_tree)
+        {
+            /* Each output-tile owner uses private stack partials below. */
+        }
+        else if (omp_in_parallel())
+        {
+            /*
+             * A complete CPU MoE transaction deliberately calls this function
+             * from every worker in one retained team. A raw thread_local arena
+             * would give each producer and reducer a different address: K-tile
+             * tasks would populate disjoint buffers and the reduction would read
+             * uninitialized partials. One OpenMP single owner therefore grows
+             * its reusable arena and copyprivate publishes that exact pointer to
+             * every participant before any worksharing task can begin.
+             */
+#pragma omp single copyprivate(fused_partial_sums_base)
+            {
+                if (fused_partial_sums_tls.size() < fused_partial_sum_floats)
+                {
+                    fused_partial_sums_tls.resize_uninitialized(
+                        fused_partial_sum_floats);
+                }
+                fused_partial_sums_base = fused_partial_sums_tls.data();
+            }
+        }
+        else
+        {
+            /*
+             * Standalone projection calls create their OpenMP team below, so
+             * the initiating thread can publish its persistent arena directly.
+             */
+            if (fused_partial_sums_tls.size() < fused_partial_sum_floats)
+                fused_partial_sums_tls.resize_uninitialized(fused_partial_sum_floats);
+            fused_partial_sums_base = fused_partial_sums_tls.data();
+        }
+
+        if (all_k_partitioned)
+        {
+            /*
+             * A GPU-aligned expert fixes every projection to the same ordered
+             * K-partial arithmetic contract.  The former implementation still
+             * scheduled each projection independently, imposing one producer
+             * and one reducer barrier per routed matrix.  A layer routinely
+             * contains tens of such matrices, so libgomp coordination could
+             * cost more than the NativeVNNI work itself.
+             *
+             * Flatten only independent task ownership here.  Producers retain
+             * the exact `[row][N chunk][K tile][64 columns]` layout and the
+             * second wave reduces every row in increasing K-tile order through
+             * reduceNativeVNNIKTilePartialsExact().  Consequently the bytes are
+             * identical while the complete layer pays two workshare barriers,
+             * irrespective of its expert count.
+             */
+            std::array<size_t, kMaxFusedVerifierProjections>
+                producer_task_ends = {};
+            std::array<size_t, kMaxFusedVerifierProjections>
+                reduction_task_ends = {};
+            std::array<size_t, kMaxFusedVerifierProjections>
+                local_tree_task_ends = {};
+            size_t total_producer_tasks = 0;
+            size_t total_reduction_tasks = 0;
+            size_t total_local_tree_tasks = 0;
+            for (int projection = 0; projection < num_descs; ++projection)
+            {
+                const auto &plan = plans[static_cast<size_t>(projection)];
+                const int row_tile_width =
+                    plan.rows == 1
+                        ? 1
+                        : (use_avx512 &&
+                                   plan.effective_verifier_schedule ==
+                                       VerifierRowsPolicy::WideRows
+                               ? 4
+                               : 2);
+                const int row_tiles =
+                    (plan.rows + row_tile_width - 1) / row_tile_width;
+                const size_t projection_producers = plan.rows == 1
+                    ? static_cast<size_t>(plan.total_blocks) *
+                          static_cast<size_t>(plan.k_tiles)
+                    : static_cast<size_t>(row_tiles) *
+                          static_cast<size_t>(plan.n_chunks) *
+                          static_cast<size_t>(plan.k_tiles);
+                total_producer_tasks += projection_producers;
+                producer_task_ends[static_cast<size_t>(projection)] =
+                    total_producer_tasks;
+                total_reduction_tasks +=
+                    static_cast<size_t>(plan.rows) *
+                    static_cast<size_t>(plan.n_chunks);
+                reduction_task_ends[static_cast<size_t>(projection)] =
+                    total_reduction_tasks;
+                total_local_tree_tasks +=
+                    static_cast<size_t>(row_tiles) *
+                    static_cast<size_t>(plan.n_chunks);
+                local_tree_task_ends[static_cast<size_t>(projection)] =
+                    total_local_tree_tasks;
+            }
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+            struct alignas(64) AVX512DecodeLut
+            {
+                __m512i value = _mm512_setzero_si512();
+            };
+            std::array<AVX512DecodeLut, kMaxFusedVerifierProjections>
+                decode_luts_512 = {};
+#endif
+            struct alignas(32) AVX2DecodeLut
+            {
+                __m256i value = _mm256_setzero_si256();
+            };
+            std::array<AVX2DecodeLut, kMaxFusedVerifierProjections>
+                decode_luts_256 = {};
+            for (int projection = 0; projection < num_descs; ++projection)
+            {
+                const auto &packed = *descs[projection].packed;
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                if (use_avx512 && packed.usesNibbleLUT())
+                {
+                    decode_luts_512[static_cast<size_t>(projection)].value =
+                        build_decode_lut(packed.codebook_id);
+                }
+#endif
+                if (use_avx2 && packed.usesNibbleLUT())
+                {
+                    decode_luts_256[static_cast<size_t>(projection)].value =
+                        build_decode_lut_avx2_for_codebook(
+                            packed.codebook_id);
+                }
+            }
+
+            const auto execute_partial_tile =
+                [&](int projection,
+                    int first_row,
+                    int tile_rows,
+                    int chunk,
+                    int k_tile,
+                    float *local_partial_sums)
+            {
+                const auto &descriptor = descs[projection];
+                const auto &packed = *descriptor.packed;
+                const auto &plan = plans[static_cast<size_t>(projection)];
+                const Q8_1Block *projection_input =
+                    descriptor.input ? descriptor.input : A_q8_all;
+                const int kb_start = k_tile * plan.k_blocks_per_tile;
+                const int kb_end = std::min(
+                    kb_start + plan.k_blocks_per_tile,
+                    K_blocks);
+                float *partial_sums = local_partial_sums
+                    ? nullptr
+                    : fused_partial_sums_base + plan.partial_sums_offset;
+                const auto partial_for_row = [&](int row)
+                {
+                    if (local_partial_sums)
+                    {
+                        return local_partial_sums +
+                               ((static_cast<size_t>(row - first_row) *
+                                     plan.k_tiles +
+                                 static_cast<size_t>(k_tile)) *
+                                64u);
+                    }
+                    return partial_sums +
+                           (((static_cast<size_t>(row) * plan.n_chunks +
+                              static_cast<size_t>(chunk)) *
+                                 plan.k_tiles +
+                             static_cast<size_t>(k_tile)) *
+                            64u);
+                };
+                const Q8_1Block *row0_q8 = projection_input +
+                    static_cast<size_t>(first_row) * K_blocks;
+                float *dst0 = partial_for_row(first_row);
+
+                if (tile_rows >= 2)
+                {
+                    const Q8_1Block *row1_q8 = row0_q8 + K_blocks;
+                    float *dst1 = partial_for_row(first_row + 1);
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                    if (use_avx512 && tile_rows == 4)
+                    {
+                        const Q8_1Block *row2_q8 = row1_q8 + K_blocks;
+                        const Q8_1Block *row3_q8 = row2_q8 + K_blocks;
+                        float *dst2 = partial_for_row(first_row + 2);
+                        float *dst3 = partial_for_row(first_row + 3);
+                        if (packed.usesNibbleLUT())
+                        {
+                            gemm_4row_native_1z_chunk(
+                                packed,
+                                row0_q8,
+                                row1_q8,
+                                row2_q8,
+                                row3_q8,
+                                dst0,
+                                dst1,
+                                dst2,
+                                dst3,
+                                chunk,
+                                kb_start,
+                                kb_end,
+                                decode_luts_512[
+                                    static_cast<size_t>(projection)].value,
+                                /*accumulate=*/false);
+                        }
+                        else
+                        {
+                            gemm_4row_non_nibble_2z_chunk(
+                                packed,
+                                row0_q8,
+                                row1_q8,
+                                row2_q8,
+                                row3_q8,
+                                dst0,
+                                dst1,
+                                dst2,
+                                dst3,
+                                chunk,
+                                kb_start,
+                                kb_end,
+                                /*accumulate=*/false);
+                        }
+                        return;
+                    }
+                    if (use_avx512 && tile_rows == 3)
+                    {
+                        const Q8_1Block *row2_q8 = row1_q8 + K_blocks;
+                        float *dst2 = partial_for_row(first_row + 2);
+                        if (packed.usesNibbleLUT())
+                        {
+                            gemm_3row_native_2z_chunk(
+                                packed,
+                                row0_q8,
+                                row1_q8,
+                                row2_q8,
+                                dst0,
+                                dst1,
+                                dst2,
+                                chunk,
+                                kb_start,
+                                kb_end,
+                                decode_luts_512[
+                                    static_cast<size_t>(projection)].value,
+                                /*accumulate=*/false);
+                        }
+                        else
+                        {
+                            gemm_3row_non_nibble_2z_chunk(
+                                packed,
+                                row0_q8,
+                                row1_q8,
+                                row2_q8,
+                                dst0,
+                                dst1,
+                                dst2,
+                                chunk,
+                                kb_start,
+                                kb_end,
+                                /*accumulate=*/false);
+                        }
+                        return;
+                    }
+                    if (use_avx512)
+                    {
+                        if (packed.usesNibbleLUT())
+                        {
+                            gemm_2row_native_chunk(
+                                packed,
+                                row0_q8,
+                                row1_q8,
+                                dst0,
+                                dst1,
+                                chunk,
+                                kb_start,
+                                kb_end,
+                                decode_luts_512[
+                                    static_cast<size_t>(projection)].value,
+                                /*accumulate=*/false);
+                        }
+                        else
+                        {
+                            gemm_2row_non_nibble_chunk(
+                                packed,
+                                row0_q8,
+                                row1_q8,
+                                dst0,
+                                dst1,
+                                chunk,
+                                kb_start,
+                                kb_end,
+                                /*accumulate=*/false);
+                        }
+                        return;
+                    }
+#endif
+                    if (packed.usesNibbleLUT())
+                    {
+                        gemm_2row_native_chunk_avx2(
+                            packed,
+                            row0_q8,
+                            row1_q8,
+                            dst0,
+                            dst1,
+                            chunk,
+                            kb_start,
+                            kb_end,
+                            decode_luts_256[
+                                static_cast<size_t>(projection)].value,
+                            /*accumulate=*/false);
+                    }
+                    else
+                    {
+                        gemm_2row_non_nibble_chunk_avx2(
+                            packed,
+                            row0_q8,
+                            row1_q8,
+                            dst0,
+                            dst1,
+                            chunk,
+                            kb_start,
+                            kb_end,
+                            /*accumulate=*/false);
+                    }
+                    return;
+                }
+
+                if (use_avx512)
+                {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                    if (packed.usesNibbleLUT())
+                    {
+                        gemv_native_vnni_avx512_chunk_native(
+                            packed,
+                            row0_q8,
+                            dst0,
+                            chunk,
+                            kb_start,
+                            kb_end,
+                            decode_luts_512[
+                                static_cast<size_t>(projection)].value);
+                    }
+                    else
+                    {
+                        gemv_native_vnni_avx512_chunk_non_nibble(
+                            packed,
+                            row0_q8,
+                            dst0,
+                            chunk,
+                            kb_start,
+                            kb_end);
+                    }
+#endif
+                }
+                else if (packed.usesNibbleLUT())
+                {
+                    gemv_avx2_chunk_native(
+                        packed,
+                        row0_q8,
+                        dst0,
+                        chunk,
+                        kb_start,
+                        kb_end,
+                        decode_luts_256[
+                            static_cast<size_t>(projection)].value);
+                }
+                else
+                {
+                    gemv_avx2_chunk_non_nibble(
+                        packed,
+                        row0_q8,
+                        dst0,
+                        chunk,
+                        kb_start,
+                        kb_end);
+                }
+            };
+
+            if (use_layer_local_ordered_tree)
+            {
+                /*
+                 * Once the layer exposes at least one independent output tile
+                 * per worker, K-parallel producer tasks no longer buy useful
+                 * occupancy.  Let one worker produce all fixed K partitions
+                 * for its output tile and reduce them immediately.  Partials
+                 * retain the exact global layout and increasing reduction
+                 * order, but remain cache-hot and require no producer/reducer
+                 * barrier or cross-core ownership transfer.
+                 */
+                auto execute_layer_local_ordered_tree = [&]()
+                {
+#pragma omp for schedule(static, 1)
+                    for (long long global_task = 0;
+                         global_task <
+                             static_cast<long long>(total_local_tree_tasks);
+                         ++global_task)
+                    {
+                        const size_t task = static_cast<size_t>(global_task);
+                        const auto projection_it = std::lower_bound(
+                            local_tree_task_ends.begin(),
+                            local_tree_task_ends.begin() + num_descs,
+                            task + 1u);
+                        const int projection = static_cast<int>(
+                            projection_it - local_tree_task_ends.begin());
+                        const size_t prior_tasks = projection == 0
+                            ? 0u
+                            : local_tree_task_ends[
+                                  static_cast<size_t>(projection - 1)];
+                        const size_t local_task = task - prior_tasks;
+                        const auto &descriptor = descs[projection];
+                        const auto &plan =
+                            plans[static_cast<size_t>(projection)];
+                        const int row_tile_width =
+                            plan.rows == 1
+                                ? 1
+                                : (use_avx512 &&
+                                           plan.effective_verifier_schedule ==
+                                               VerifierRowsPolicy::WideRows
+                                       ? 4
+                                       : 2);
+                        const int chunk = static_cast<int>(
+                            local_task %
+                            static_cast<size_t>(plan.n_chunks));
+                        const int row_tile = static_cast<int>(
+                            local_task /
+                            static_cast<size_t>(plan.n_chunks));
+                        const int first_row = row_tile * row_tile_width;
+                        const int tile_rows = std::min(
+                            row_tile_width, plan.rows - first_row);
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                        /*
+                         * Sparse routes overwhelmingly own one or two rows.
+                         * Each complete ordered K tree fits in AVX-512
+                         * registers, or in one task-local partition consumed
+                         * immediately, so avoid materializing sixteen partial
+                         * planes. Two-row kernels retain shared weight decode;
+                         * wider tiles continue through the common partial path.
+                         */
+                        const auto &packed = *descriptor.packed;
+                        if (tile_rows <= 2 && use_avx512 &&
+                            packed.numerical_policy ==
+                                CPUProjectionNumericalPolicy::GPUAlignedExpert)
+                        {
+                            const Q8_1Block *projection_input =
+                                descriptor.input
+                                    ? descriptor.input
+                                    : A_q8_all;
+                            const int n_start = chunk * 64;
+                            const int n_columns = std::min(
+                                64, descriptor.N - n_start);
+                            alignas(64) float tails[2][64];
+                            const auto destination_for = [&](int row_offset)
+                            {
+                                const int row = first_row + row_offset;
+                                return n_columns == 64
+                                    ? descriptor.output +
+                                          static_cast<size_t>(row) *
+                                              descriptor.ldc +
+                                          n_start
+                                    : tails[row_offset];
+                            };
+                            if (tile_rows == 2)
+                            {
+                                const Q8_1Block *row0 = projection_input +
+                                    static_cast<size_t>(first_row) * K_blocks;
+                                const Q8_1Block *row1 = projection_input +
+                                    static_cast<size_t>(first_row + 1) *
+                                        K_blocks;
+                                const bool one_block_partitions =
+                                    MoEProjectionNumericalContract::
+                                        oneNativeVNNIBlockPerOrderedPartition(
+                                            K_blocks *
+                                            MoEProjectionNumericalContract::
+                                                native_vnni_values_per_block);
+                                if (one_block_partitions)
+                                {
+                                    gemmTwoRowsAVX512OrderedPartitions(
+                                        packed,
+                                        row0,
+                                        row1,
+                                        destination_for(0),
+                                        destination_for(1),
+                                        chunk,
+                                        K_blocks,
+                                        plan.k_tiles,
+                                        plan.k_blocks_per_tile,
+                                        decode_luts_512[
+                                            static_cast<size_t>(projection)]
+                                                .value);
+                                }
+                                else if (packed.usesNibbleLUT() &&
+                                    nibbleDecodeKind(packed.codebook_id) ==
+                                        NibbleDecodeKind::Q4_0_LINEAR)
+                                {
+                                    dispatch_2row_native_avx512_ordered_partitions(
+                                        packed,
+                                        row0,
+                                        row1,
+                                        destination_for(0),
+                                        destination_for(1),
+                                        chunk,
+                                        K_blocks,
+                                        plan.k_tiles,
+                                        plan.k_blocks_per_tile,
+                                        decode_luts_512[
+                                            static_cast<size_t>(projection)]
+                                                .value);
+                                }
+                                else if (packed.usesExpandedInt8())
+                                {
+                                    gemmTwoRowsExpandedAVX512OrderedPartitions(
+                                        packed,
+                                        row0,
+                                        row1,
+                                        destination_for(0),
+                                        destination_for(1),
+                                        chunk,
+                                        K_blocks,
+                                        plan.k_tiles,
+                                        plan.k_blocks_per_tile);
+                                }
+                                else
+                                {
+                                    gemmTwoRowsAVX512OrderedPartitions(
+                                        packed,
+                                        row0,
+                                        row1,
+                                        destination_for(0),
+                                        destination_for(1),
+                                        chunk,
+                                        K_blocks,
+                                        plan.k_tiles,
+                                        plan.k_blocks_per_tile,
+                                        decode_luts_512[
+                                            static_cast<size_t>(projection)]
+                                                .value);
+                                }
+                            }
+                            else
+                            {
+                                const bool one_block_partitions =
+                                    MoEProjectionNumericalContract::
+                                        oneNativeVNNIBlockPerOrderedPartition(
+                                            K_blocks *
+                                            MoEProjectionNumericalContract::
+                                                native_vnni_values_per_block);
+                                if (one_block_partitions)
+                                {
+                                    if (packed.usesNibbleLUT())
+                                    {
+                                        gemv_native_vnni_avx512_chunk_native(
+                                            packed,
+                                            projection_input +
+                                                static_cast<size_t>(first_row) *
+                                                    K_blocks,
+                                            destination_for(0),
+                                            chunk,
+                                            0,
+                                            K_blocks,
+                                            decode_luts_512[
+                                                static_cast<size_t>(projection)]
+                                                    .value,
+                                            /*accumulate=*/false);
+                                    }
+                                    else
+                                    {
+                                        gemv_native_vnni_avx512_chunk_non_nibble(
+                                            packed,
+                                            projection_input +
+                                                static_cast<size_t>(first_row) *
+                                                    K_blocks,
+                                            destination_for(0),
+                                            chunk,
+                                            0,
+                                            K_blocks,
+                                            /*accumulate=*/false);
+                                    }
+                                }
+                                else if (packed.usesNibbleLUT())
+                                {
+                                    dispatch_native_avx512_ordered_partitions(
+                                        packed,
+                                        projection_input +
+                                            static_cast<size_t>(first_row) *
+                                                K_blocks,
+                                        destination_for(0),
+                                        chunk,
+                                        K_blocks,
+                                        plan.k_tiles,
+                                        plan.k_blocks_per_tile,
+                                        decode_luts_512[
+                                            static_cast<size_t>(projection)]
+                                                .value);
+                                }
+                                else
+                                {
+                                    gemvNonNibbleAVX512OrderedPartitions(
+                                        packed,
+                                        projection_input +
+                                            static_cast<size_t>(first_row) *
+                                                K_blocks,
+                                        destination_for(0),
+                                        chunk,
+                                        K_blocks,
+                                        plan.k_tiles,
+                                        plan.k_blocks_per_tile);
+                                }
+                            }
+                            if (n_columns != 64)
+                            {
+                                for (int row_offset = 0;
+                                     row_offset < tile_rows;
+                                     ++row_offset)
+                                {
+                                    const int row = first_row + row_offset;
+                                    std::memcpy(
+                                        descriptor.output +
+                                            static_cast<size_t>(row) *
+                                            descriptor.ldc +
+                                            n_start,
+                                        tails[row_offset],
+                                        static_cast<size_t>(n_columns) *
+                                            sizeof(float));
+                                }
+                            }
+                            continue;
+                        }
+#endif
+
+                        /*
+                         * AVX2 has only sixteen vector registers, so its exact
+                         * tree uses one short task-local partition at a time.
+                         * The partition is folded immediately and never crosses
+                         * a worker boundary; both rows still share weight decode.
+                         */
+                        const auto &packed_avx2 = *descriptor.packed;
+                        if (tile_rows <= 2 && use_avx2 &&
+                            packed_avx2.numerical_policy ==
+                                CPUProjectionNumericalPolicy::GPUAlignedExpert)
+                        {
+                            const Q8_1Block *projection_input =
+                                descriptor.input
+                                    ? descriptor.input
+                                    : A_q8_all;
+                            const int n_start = chunk * 64;
+                            const int n_columns = std::min(
+                                64, descriptor.N - n_start);
+                            alignas(32) float tails[2][64];
+                            const auto destination_for = [&](int row_offset)
+                            {
+                                const int row = first_row + row_offset;
+                                return n_columns == 64
+                                    ? descriptor.output +
+                                          static_cast<size_t>(row) *
+                                              descriptor.ldc +
+                                          n_start
+                                    : tails[row_offset];
+                            };
+                            const Q8_1Block *row0 = projection_input +
+                                static_cast<size_t>(first_row) * K_blocks;
+                            if (tile_rows == 2)
+                            {
+                                gemmTwoRowsAVX2OrderedPartitions(
+                                    packed_avx2,
+                                    row0,
+                                    row0 + K_blocks,
+                                    destination_for(0),
+                                    destination_for(1),
+                                    chunk,
+                                    K_blocks,
+                                    plan.k_tiles,
+                                    plan.k_blocks_per_tile,
+                                    decode_luts_256[
+                                        static_cast<size_t>(projection)].value);
+                            }
+                            else
+                            {
+                                gemvAVX2OrderedPartitions(
+                                    packed_avx2,
+                                    row0,
+                                    destination_for(0),
+                                    chunk,
+                                    K_blocks,
+                                    plan.k_tiles,
+                                    plan.k_blocks_per_tile,
+                                    decode_luts_256[
+                                        static_cast<size_t>(projection)].value);
+                            }
+                            if (n_columns != 64)
+                            {
+                                for (int row_offset = 0;
+                                     row_offset < tile_rows;
+                                     ++row_offset)
+                                {
+                                    const int row = first_row + row_offset;
+                                    std::memcpy(
+                                        descriptor.output +
+                                            static_cast<size_t>(row) *
+                                                descriptor.ldc +
+                                            n_start,
+                                        tails[row_offset],
+                                        static_cast<size_t>(n_columns) *
+                                            sizeof(float));
+                                }
+                            }
+                            continue;
+                        }
+
+                        alignas(64) float local_partial_sums[
+                            4 * MoEProjectionNumericalContract::
+                                    ordered_k_partitions *
+                            64];
+
+                        for (int k_tile = 0;
+                             k_tile < plan.k_tiles;
+                             ++k_tile)
+                        {
+                            execute_partial_tile(
+                                projection,
+                                first_row,
+                                tile_rows,
+                                chunk,
+                                k_tile,
+                                local_partial_sums);
+                        }
+
+                        const int n_start = chunk * 64;
+                        const int n_columns = std::min(
+                            64, descriptor.N - n_start);
+                        for (int row_offset = 0;
+                             row_offset < tile_rows;
+                             ++row_offset)
+                        {
+                            const int row = first_row + row_offset;
+                            const float *base = local_partial_sums +
+                                static_cast<size_t>(row_offset) *
+                                    plan.k_tiles * 64u;
+                            reduceNativeVNNIKTilePartialsExact(
+                                base,
+                                descriptor.output +
+                                    static_cast<size_t>(row) *
+                                        descriptor.ldc +
+                                    n_start,
+                                n_columns,
+                                plan.k_tiles,
+                                use_avx512);
+                        }
+                    }
+
+#pragma omp for schedule(static)
+                    for (long long global_row = 0;
+                         global_row <
+                             static_cast<long long>(total_output_rows);
+                         ++global_row)
+                    {
+                        const size_t row_index =
+                            static_cast<size_t>(global_row);
+                        const auto projection_it = std::lower_bound(
+                            output_row_ends.begin(),
+                            output_row_ends.begin() + num_descs,
+                            row_index + 1u);
+                        const int projection = static_cast<int>(
+                            projection_it - output_row_ends.begin());
+                        const auto &descriptor = descs[projection];
+                        if (!descriptor.bias)
+                            continue;
+                        const size_t prior_rows = projection == 0
+                            ? 0u
+                            : output_row_ends[
+                                  static_cast<size_t>(projection - 1)];
+                        addNativeVNNIBiasRow(
+                            descriptor.output +
+                                (row_index - prior_rows) *
+                                    static_cast<size_t>(descriptor.ldc),
+                            descriptor.bias,
+                            descriptor.N,
+                            use_avx512);
+                    }
+                };
+
+                OMP_WORKSHARE_REGION(execute_layer_local_ordered_tree);
+                return true;
+            }
+
+            auto execute_layer_k_partitioned = [&]()
+            {
+#pragma omp for schedule(static, 1)
+                for (long long global_task = 0;
+                     global_task <
+                         static_cast<long long>(total_producer_tasks);
+                     ++global_task)
+                {
+                    const size_t task = static_cast<size_t>(global_task);
+                    const auto projection_it = std::lower_bound(
+                        producer_task_ends.begin(),
+                        producer_task_ends.begin() + num_descs,
+                        task + 1u);
+                    const int projection = static_cast<int>(
+                        projection_it - producer_task_ends.begin());
+                    const size_t prior_tasks = projection == 0
+                        ? 0u
+                        : producer_task_ends[
+                              static_cast<size_t>(projection - 1)];
+                    const size_t local_task = task - prior_tasks;
+                    const auto &plan =
+                        plans[static_cast<size_t>(projection)];
+
+                    if (plan.rows == 1)
+                    {
+                        const int k_tile = static_cast<int>(
+                            local_task % static_cast<size_t>(plan.k_tiles));
+                        const int block = static_cast<int>(
+                            local_task / static_cast<size_t>(plan.k_tiles));
+                        const int chunk_start = block * plan.n_block_chunks;
+                        const int chunk_count = std::min(
+                            plan.n_block_chunks,
+                            plan.n_chunks - chunk_start);
+                        for (int offset = 0; offset < chunk_count; ++offset)
+                        {
+                            execute_partial_tile(
+                                projection,
+                                /*first_row=*/0,
+                                /*tile_rows=*/1,
+                                chunk_start + offset,
+                                k_tile,
+                                /*local_partial_sums=*/nullptr);
+                        }
+                        continue;
+                    }
+
+                    const int k_tile = static_cast<int>(
+                        local_task % static_cast<size_t>(plan.k_tiles));
+                    const size_t chunk_and_row_tile =
+                        local_task / static_cast<size_t>(plan.k_tiles);
+                    const int chunk = static_cast<int>(
+                        chunk_and_row_tile %
+                        static_cast<size_t>(plan.n_chunks));
+                    const int row_tile = static_cast<int>(
+                        chunk_and_row_tile /
+                        static_cast<size_t>(plan.n_chunks));
+                    const int row_tile_width =
+                        use_avx512 &&
+                                plan.effective_verifier_schedule ==
+                                    VerifierRowsPolicy::WideRows
+                            ? 4
+                            : 2;
+                    const int first_row = row_tile * row_tile_width;
+                    execute_partial_tile(
+                        projection,
+                        first_row,
+                        std::min(row_tile_width, plan.rows - first_row),
+                        chunk,
+                        k_tile,
+                        /*local_partial_sums=*/nullptr);
+                }
+
+#pragma omp for schedule(static)
+                for (long long global_task = 0;
+                     global_task <
+                         static_cast<long long>(total_reduction_tasks);
+                     ++global_task)
+                {
+                    const size_t task = static_cast<size_t>(global_task);
+                    const auto projection_it = std::lower_bound(
+                        reduction_task_ends.begin(),
+                        reduction_task_ends.begin() + num_descs,
+                        task + 1u);
+                    const int projection = static_cast<int>(
+                        projection_it - reduction_task_ends.begin());
+                    const size_t prior_tasks = projection == 0
+                        ? 0u
+                        : reduction_task_ends[
+                              static_cast<size_t>(projection - 1)];
+                    const size_t local_task = task - prior_tasks;
+                    const auto &descriptor = descs[projection];
+                    const auto &plan =
+                        plans[static_cast<size_t>(projection)];
+                    const int chunk = static_cast<int>(
+                        local_task % static_cast<size_t>(plan.n_chunks));
+                    const int row = static_cast<int>(
+                        local_task / static_cast<size_t>(plan.n_chunks));
+                    const int n_start = chunk * 64;
+                    const int n_columns = std::min(
+                        64, descriptor.N - n_start);
+                    const float *base = fused_partial_sums_base +
+                        plan.partial_sums_offset +
+                        (static_cast<size_t>(row) * plan.n_chunks + chunk) *
+                            plan.k_tiles * 64u;
+                    reduceNativeVNNIKTilePartialsExact(
+                        base,
+                        descriptor.output +
+                            static_cast<size_t>(row) * descriptor.ldc +
+                            n_start,
+                        n_columns,
+                        plan.k_tiles,
+                        use_avx512);
+                }
+
+#pragma omp for schedule(static)
+                for (long long global_row = 0;
+                     global_row < static_cast<long long>(total_output_rows);
+                     ++global_row)
+                {
+                    const size_t row_index =
+                        static_cast<size_t>(global_row);
+                    const auto projection_it = std::lower_bound(
+                        output_row_ends.begin(),
+                        output_row_ends.begin() + num_descs,
+                        row_index + 1u);
+                    const int projection = static_cast<int>(
+                        projection_it - output_row_ends.begin());
+                    const auto &descriptor = descs[projection];
+                    if (!descriptor.bias)
+                        continue;
+                    const size_t prior_rows = projection == 0
+                        ? 0u
+                        : output_row_ends[
+                              static_cast<size_t>(projection - 1)];
+                    const size_t local_row = row_index - prior_rows;
+                    addNativeVNNIBiasRow(
+                        descriptor.output +
+                            local_row *
+                                static_cast<size_t>(descriptor.ldc),
+                        descriptor.bias,
+                        descriptor.N,
+                        use_avx512);
+                }
+            };
+
+            OMP_WORKSHARE_REGION(execute_layer_k_partitioned);
+            return true;
+        }
 
         auto do_fused_rows = [&]()
         {
@@ -6489,7 +8762,8 @@ namespace llaminar2::cpu::native_vnni
             all_A_q8_tls.data(),
             M,
             K,
-            K_blocks);
+            K_blocks,
+            packed.numerical_policy);
 
         // Delegate to pre-quantized compute path
         gemm_native_vnni_preq(

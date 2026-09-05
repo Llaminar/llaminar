@@ -15,6 +15,7 @@
 
 #include "WeightIdentity.h"
 #include "WeightLifecycleTrace.h"
+#include "planning/PhysicalMemoryBOM.h"
 
 #include <functional>
 #include <memory>
@@ -96,11 +97,31 @@ namespace llaminar2
     class WeightPlan
     {
     public:
-        /** @brief Create an empty plan with the execution strategy it serves. */
-        explicit WeightPlan(InferenceStrategy strategy = {});
+        /**
+         * @brief Create an empty plan with its execution and memory authority.
+         *
+         * The owner is a property of the complete frozen set rather than a
+         * call-site hint supplied during allocation. This prevents a mirrored
+         * decode/MTP sidecar from being admitted as
+         * `AdditionalModelWeights` and later materialized against the primary
+         * owner line merely because both sets use the same loader pipeline.
+         *
+         * @param strategy Execution strategy served by the plan.
+         * @param physical_memory_owner Exact persistent-weight BOM owner.
+         * @throws std::invalid_argument for a non-weight memory owner.
+         */
+        explicit WeightPlan(
+            InferenceStrategy strategy = {},
+            PhysicalMemoryOwner physical_memory_owner =
+                PhysicalMemoryOwner::PrimaryModelWeights);
 
         /** @return Immutable execution strategy carried by this plan. */
         const InferenceStrategy &strategy() const { return strategy_; }
+        /** @return Exact physical-memory owner carried into materialization. */
+        PhysicalMemoryOwner physicalMemoryOwner() const noexcept
+        {
+            return physical_memory_owner_;
+        }
         /** @return Ordered requirements that will be materialized. */
         const std::vector<WeightRequirement> &requirements() const { return requirements_; }
         /** @brief Normalize and append one declarative tensor requirement. */
@@ -114,6 +135,8 @@ namespace llaminar2
 
     private:
         InferenceStrategy strategy_;
+        PhysicalMemoryOwner physical_memory_owner_ =
+            PhysicalMemoryOwner::PrimaryModelWeights;
         std::vector<WeightRequirement> requirements_;
     };
 
@@ -154,10 +177,19 @@ namespace llaminar2
          * Call @ref validateForGraph before execution to verify that every
          * binding came from @ref ModelWeightSetBuilder::freezeBindings.
          */
-        FrozenModelWeightSet(InferenceStrategy strategy, std::vector<WeightBinding> bindings);
+        FrozenModelWeightSet(
+            InferenceStrategy strategy,
+            std::vector<WeightBinding> bindings,
+            PhysicalMemoryOwner physical_memory_owner =
+                PhysicalMemoryOwner::PrimaryModelWeights);
 
         /** @return Execution strategy used to materialize these bindings. */
         const InferenceStrategy &strategy() const { return strategy_; }
+        /** @return Exact persistent-weight owner certified by the source plan. */
+        PhysicalMemoryOwner physicalMemoryOwner() const noexcept
+        {
+            return physical_memory_owner_;
+        }
         /** @return All immutable bindings in deterministic plan order. */
         const std::vector<WeightBinding> &bindings() const { return bindings_; }
         /** @brief Return a required model-global binding or throw when absent. */
@@ -189,6 +221,8 @@ namespace llaminar2
         void indexBinding(size_t index, const WeightBinding &binding);
 
         InferenceStrategy strategy_;
+        PhysicalMemoryOwner physical_memory_owner_ =
+            PhysicalMemoryOwner::PrimaryModelWeights;
         std::vector<WeightBinding> bindings_;
         std::unordered_map<std::string, size_t> global_index_;
         std::unordered_map<std::string, size_t> layer_index_;

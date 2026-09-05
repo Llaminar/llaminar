@@ -17,6 +17,7 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../kernels/attention/AttentionDeviceParams.h"
+#include "../../../kernels/attention/AttentionWorkspaceContract.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../kernels/cpu/rotation/ActivationRotation.h"
@@ -617,6 +618,10 @@ namespace llaminar2
             workspace_cardinality.compact_query_rows;
         const int workspace_heads = std::max(n, params_.n_heads);
         const int workspace_head_dim = std::max(k, params_.head_dim);
+        const int workspace_kv_capacity =
+            params_.kv_cache
+                ? params_.kv_cache->max_seq_len()
+                : std::max(params_.kv_len, params_.seq_len);
 
         auto reqs = consumer->getWorkspaceRequirements(
             workspace_partial_rows,
@@ -640,17 +645,13 @@ namespace llaminar2
                     cudaGetErrorString(property_status));
             }
 
-            const int kv_capacity =
-                params_.kv_cache
-                    ? params_.kv_cache->max_seq_len()
-                    : std::max(params_.kv_len, params_.seq_len);
             const cuda::fa2_policy::FA2PrefillParallelPlan prefill_plan =
                 cuda::fa2_policy::selectFA2PrefillParallelPlan({
                     .batch_size = params_.batch_size,
                     .query_rows = params_.seq_len,
                     .local_query_heads = params_.n_heads,
                     .head_dim = params_.head_dim,
-                    .kv_capacity = kv_capacity,
+                    .kv_capacity = workspace_kv_capacity,
                     .sm_count = properties.multiProcessorCount,
                     .requested_axis =
                         params_.execution_policy.prefill_parallel_axis,
@@ -718,17 +719,13 @@ namespace llaminar2
                     rocm::queryROCmFlashAttentionDeviceProperties(
                         device_index);
 
-            const int kv_capacity =
-                params_.kv_cache
-                    ? params_.kv_cache->max_seq_len()
-                    : std::max(params_.kv_len, params_.seq_len);
             const rocm::fa2_policy::ROCmFA2PrefillParallelPlan prefill_plan =
                 rocm::fa2_policy::selectROCmFA2PrefillParallelPlan({
                     .batch_size = params_.batch_size,
                     .query_rows = params_.seq_len,
                     .local_query_heads = params_.n_heads,
                     .head_dim = params_.head_dim,
-                    .kv_capacity = kv_capacity,
+                    .kv_capacity = workspace_kv_capacity,
                     .compute_unit_count = properties.compute_unit_count,
                     .lds_capacity_bytes = properties.lds_capacity_bytes,
                     .requested_axis =
@@ -784,10 +781,10 @@ namespace llaminar2
                     rocm::fa2_policy::
                         selectROCmFA2GeometrySelectedWorkspaceEnvelope({
                             .batch_size = params_.batch_size,
-                            .query_rows = kv_capacity,
+                            .query_rows = workspace_kv_capacity,
                             .local_query_heads = params_.n_heads,
                             .head_dim = params_.head_dim,
-                            .kv_capacity = kv_capacity,
+                            .kv_capacity = workspace_kv_capacity,
                             .compute_unit_count =
                                 properties.compute_unit_count,
                             .lds_capacity_bytes =
@@ -846,23 +843,18 @@ namespace llaminar2
          * grouped partial buffers.  This preserves correctness without paying
          * four complete 4096-token KV conversion buffers for one request.
          */
-        const int workspace_kv_heads = std::max(1, params_.n_kv_heads);
-        const size_t kv_convert_bytes =
-                                        static_cast<size_t>(
-                                            workspace_cardinality
-                                                .request_count) *
-                                        4096ULL *
-                                        static_cast<size_t>(workspace_kv_heads) *
-                                        static_cast<size_t>(workspace_head_dim) *
-                                        sizeof(float);
-        for (auto &buffer : reqs.buffers)
-        {
-            if (buffer.name == "attn_k_tmp_fp32" ||
-                buffer.name == "attn_v_tmp_fp32")
-            {
-                buffer.size_bytes = kv_convert_bytes;
-            }
-        }
+        attention_workspace::applyExactControlAndConversionGeometry(
+            reqs,
+            attention_workspace::Geometry{
+                .compact_query_rows = workspace_partial_rows,
+                .request_count = workspace_cardinality.request_count,
+                .local_query_heads = workspace_heads,
+                .local_kv_heads = std::max(1, params_.n_kv_heads),
+                .head_dim = workspace_head_dim,
+                .context_rows = workspace_kv_capacity,
+                .decode_splits =
+                    attention_workspace::kMaximumDecodeSplits,
+            });
 
         return reqs;
     }
@@ -1927,28 +1919,27 @@ namespace llaminar2
         const ITensor *dump_K = params_.K;
         const ITensor *dump_V = params_.V;
 
-        // Decode graph construction may cache GpuTensorView pointers while the
-        // KV cache still has N rows. The immediately preceding kv_append stage
-        // can replace those wrappers with N+1-row views, leaving params_.K/V
-        // stale before execute() has a chance to re-query the cache. Snapshot
-        // and validation metadata must therefore refresh cache-backed K/V views
-        // here, mirroring the execution path's live-cache read.
-        if (isGraphCaptureActive() && debug_effective_k_tensor_ &&
-            debug_effective_v_tensor_)
+        // GPU dump metadata is assembled twice for a captured transaction:
+        // once while each participant prepares its immutable snapshot manifest,
+        // and again while the copy nodes are recorded.  TP participants may be
+        // in different phases at that instant.  Consequently this descriptor
+        // builder must never observe a GPU cache head/count on the host: a
+        // synchronous observation on one worker can invalidate a peer's HIP or
+        // CUDA capture even though both workers are individually well ordered.
+        //
+        // execute() publishes the exact cache-owned tensors consumed by
+        // attention into these diagnostic fields.  Their allocation and shape
+        // are graph-stable, so they are the one authority in both preparation
+        // and recording phases.  CPU caches remain host-owned and retain their
+        // ordinary synchronous descriptor path below.
+        if (debug_effective_k_tensor_ && debug_effective_v_tensor_)
         {
-            /*
-             * Snapshot capture records this metadata while the GPU stream is
-             * inside beginCapture()/endCapture(). The exact cache-owned views
-             * were resolved by execute() and remain allocation-stable, so use
-             * them directly. Reading a host token count here would violate the
-             * fully device-owned replay contract and can invalidate capture.
-             */
             dump_K = debug_effective_k_tensor_;
             dump_V = debug_effective_v_tensor_;
             total_kv_tokens = debug_effective_k_rows_;
         }
         else if (params_.kv_cache && params_.layer_idx >= 0 &&
-                 !isGraphCaptureActive())
+                 !params_.device_id.is_gpu())
         {
             const int cached_tokens = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
             const bool should_read_cache = cached_tokens > 0 &&

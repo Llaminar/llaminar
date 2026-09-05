@@ -48,15 +48,20 @@ namespace llaminar2
         : public IMoEOverlayEconomyEvidenceExchange
     {
     public:
-        /** @brief Immutable communicator, ownership geometry, and label. */
+        /** @brief Immutable communicator, ownership, graph topology, and label. */
         struct Config
         {
             std::shared_ptr<IMPIContext> mpi_context;
             MoEExpertOwnerMap owner_map;
-            int num_layers = 0;
-            /** Immutable phases reachable under the instance's MTP policy. */
-            ExpertHistogramProductionSourceMask active_sources =
-                kAllExpertHistogramProductionSources;
+            /**
+             * Exact retained-layer reachability and economy semantics.
+             *
+             * The exchange derives packet geometry and its compact wire mask
+             * from this authority. Accepting an independent layer count or
+             * source mask would permit callers to confuse graph-reachable
+             * phases with the narrower economy-priced phase subset.
+             */
+            ExpertHistogramProductionTopology production_topology;
             std::string perf_device;
         };
 

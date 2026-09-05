@@ -11,8 +11,7 @@
 
 #include "MoEOverlayCapacityResolver.h"
 
-#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
-#include "tensors/NativeVnniFormatInfo.h"
+#include "ExpertPreparedMemoryGeometry.h"
 
 #include <algorithm>
 #include <limits>
@@ -28,9 +27,6 @@ namespace llaminar2
 {
     namespace
     {
-        constexpr std::size_t kGpuRegionAlignment = 256;
-        constexpr std::size_t kCpuAllocationAlignment = 4096;
-
         [[nodiscard]] std::size_t checkedAdd(
             std::size_t lhs,
             std::size_t rhs,
@@ -51,119 +47,24 @@ namespace llaminar2
             return lhs * rhs;
         }
 
-        [[nodiscard]] std::size_t alignUp(
-            std::size_t bytes,
-            std::size_t alignment,
-            const char *what)
-        {
-            if (alignment == 0 || (alignment & (alignment - 1)) != 0)
-                throw std::logic_error("ExpertOverlay capacity alignment must be a power of two");
-            return checkedAdd(bytes, alignment - 1, what) & ~(alignment - 1);
-        }
-
-        [[nodiscard]] std::size_t gpuProjectionAllocationBytes(
-            int N,
-            int K,
-            int payload_bytes_per_block,
-            bool is_asymmetric,
-            bool has_emins)
-        {
-            if (N <= 0 || K <= 0 || K % 32 != 0 ||
-                payload_bytes_per_block <= 0)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay GPU footprint requires positive 32-aligned geometry");
-            }
-
-            const std::size_t blocks = checkedMultiply(
-                static_cast<std::size_t>(N),
-                static_cast<std::size_t>(K / 32),
-                "GPU block count");
-            std::size_t cursor = 0;
-            const auto append_region = [&](std::size_t bytes, const char *what)
-            {
-                if (bytes == 0)
-                    return;
-                cursor = alignUp(cursor, kGpuRegionAlignment, what);
-                cursor = checkedAdd(cursor, bytes, what);
-            };
-
-            append_region(
-                checkedMultiply(
-                    blocks,
-                    static_cast<std::size_t>(payload_bytes_per_block),
-                    "GPU payload"),
-                "GPU payload");
-            append_region(
-                checkedMultiply(blocks, sizeof(std::uint16_t), "GPU scales"),
-                "GPU scales");
-            if (is_asymmetric)
-            {
-                append_region(
-                    checkedMultiply(blocks, sizeof(std::uint16_t), "GPU minima"),
-                    "GPU minima");
-            }
-            if (has_emins)
-            {
-                append_region(
-                    checkedMultiply(blocks, sizeof(std::uint32_t), "GPU effective minima"),
-                    "GPU effective minima");
-            }
-            return alignUp(cursor, kGpuRegionAlignment, "GPU projection allocation");
-        }
-
-        [[nodiscard]] std::size_t cpuProjectionAllocationBytes(
-            const MoEOverlayProjectionWeightManifest &projection,
-            const NativeVnniFormatInfo &source)
-        {
-            const auto encoding =
-                cpu::native_vnni::preparedEncodingForCodebook(
-                    source.codebook_id);
-            const std::size_t stride =
-                cpu::native_vnni::preparedInterleavedBlockStride(
-                    encoding, source.is_asymmetric);
-            const std::size_t padded_n =
-                alignUp(static_cast<std::size_t>(projection.N), 64, "CPU padded N");
-            const std::size_t units = checkedMultiply(
-                padded_n / 64,
-                static_cast<std::size_t>(projection.K / 32),
-                "CPU NativeVNNI unit count");
-            const std::size_t logical_bytes = checkedMultiply(
-                units, stride, "CPU NativeVNNI projection");
-
-            /*
-             * CpuExpertSlotPool owns every projection in a separate
-             * AlignedVector. Large vectors are page aligned and page rounded;
-             * NUMA-bound ranges explicitly require the same 4 KiB contract.
-             */
-            return alignUp(
-                logical_bytes,
-                logical_bytes >= kCpuAllocationAlignment
-                    ? kCpuAllocationAlignment
-                    : std::size_t{64},
-                "CPU projection allocation");
-        }
-
-        /** @brief Charge one contiguous floating projection with pool alignment. */
-        [[nodiscard]] std::size_t floatingProjectionAllocationBytes(
-            const MoEOverlayProjectionWeightManifest &projection,
-            std::size_t alignment,
-            const char *description)
-        {
-            const std::size_t elements = checkedMultiply(
-                static_cast<std::size_t>(projection.N),
-                static_cast<std::size_t>(projection.K),
-                description);
-            const std::size_t logical_bytes = checkedMultiply(
-                elements,
-                projection.format.floatingElementBytes(),
-                description);
-            return alignUp(logical_bytes, alignment, description);
-        }
-
+        /** @brief Mutable setup-only extension of one certified base BOM. */
         struct ResourceState
         {
-            MoEOverlayResolvedPhysicalMemory output;
+            std::string resource_id;
+            PhysicalMemoryBOMBuilder memory;
+            std::vector<int> live_copies_per_layer;
+            std::vector<int> shadow_arrival_capacity_per_layer;
+
+            ResourceState(
+                std::string identity,
+                const PhysicalMemoryAdmissionCertificate &base,
+                std::size_t layer_count)
+                : resource_id(std::move(identity)),
+                  memory(base.bom()),
+                  live_copies_per_layer(layer_count, 0),
+                  shadow_arrival_capacity_per_layer(layer_count, 0)
+            {
+            }
         };
 
         struct TierState
@@ -173,25 +74,20 @@ namespace llaminar2
         };
 
         [[nodiscard]] std::size_t resourceUsed(
-            const MoEOverlayResolvedPhysicalMemory &resource)
+            const ResourceState &resource)
         {
-            std::size_t used = 0;
-            used = checkedAdd(used, resource.fixed_bytes, "physical fixed");
-            used = checkedAdd(
-                used, resource.transfer_staging_bytes, "physical staging");
-            used = checkedAdd(used, resource.shadow_bytes, "physical shadows");
-            used = checkedAdd(
-                used, resource.live_expert_bytes, "physical live experts");
-            return used;
+            return resource.memory.build().incrementalBytes();
         }
 
         [[nodiscard]] bool resourceCanAdd(
             const ResourceState &resource,
             std::size_t bytes)
         {
-            const std::size_t used = resourceUsed(resource.output);
-            return used <= resource.output.usable_budget_bytes &&
-                   bytes <= resource.output.usable_budget_bytes - used;
+            const auto bom = resource.memory.build();
+            const std::size_t used = bom.incrementalBytes();
+            const std::size_t available =
+                bom.resource().admission_available_bytes;
+            return used <= available && bytes <= available - used;
         }
 
         [[nodiscard]] std::size_t footprintFor(
@@ -203,25 +99,75 @@ namespace llaminar2
                           : footprint.liveBytes(device);
         }
 
+        /** @brief Build the exact shared-arena key from one layer manifest. */
+        [[nodiscard]] ExpertPreparedTripletGeometryKey geometryKey(
+            const MoEOverlayLayerWeightManifest &layer)
+        {
+            ExpertPreparedTripletGeometryKey key;
+            for (const auto &projection : layer.projections)
+            {
+                const auto role = static_cast<std::size_t>(
+                    projection.projection);
+                if (role >= key.projections.size())
+                {
+                    throw std::invalid_argument(
+                        "ExpertOverlay layer manifest has an unknown projection role");
+                }
+                key.projections[role] = {
+                    .N = projection.N,
+                    .K = projection.K,
+                    .format = projection.format,
+                };
+            }
+            return key;
+        }
+
         [[nodiscard]] std::map<std::string, std::size_t> tierShadowCharges(
             const TierState &tier,
             const std::vector<MoEOverlayPreparedExpertFootprint> &footprints,
+            const std::vector<MoEOverlayLayerWeightManifest> &manifest,
             const std::unordered_map<std::string, std::size_t> &resource_index,
             const std::vector<ResourceState> &resources)
         {
+            if (manifest.size() != footprints.size())
+            {
+                throw std::logic_error(
+                    "ExpertOverlay shadow geometry and footprint inventories disagree");
+            }
+            std::map<ExpertPreparedTripletGeometryKey, std::vector<std::size_t>>
+                layers_by_geometry;
+            for (std::size_t layer = 0; layer < manifest.size(); ++layer)
+                layers_by_geometry[geometryKey(manifest[layer])].push_back(layer);
+
             std::map<std::string, std::size_t> charges;
             for (const auto &participant : tier.request->participants)
             {
                 const auto found = resource_index.find(participant.resource_id);
                 if (found == resource_index.end())
                     throw std::logic_error("Validated ExpertOverlay resource disappeared");
-                const DeviceId device = resources[found->second].output.device;
-                for (const auto &footprint : footprints)
+                const DeviceId device =
+                    resources[found->second].memory.build().resource().device;
+                for (const auto &[_, layers] : layers_by_geometry)
                 {
+                    if (layers.empty() ||
+                        layers.size() >
+                            std::numeric_limits<std::size_t>::max() /
+                                std::max<std::size_t>(
+                                    1, participant.shadow_slots_per_layer))
+                    {
+                        throw std::overflow_error(
+                            "ExpertOverlay shared shadow arena capacity overflows size_t");
+                    }
+                    const std::size_t slots = std::min(
+                        participant.maximum_concurrent_shadow_slots,
+                        layers.size() * participant.shadow_slots_per_layer);
                     const std::size_t bytes = checkedMultiply(
-                        participant.shadow_slots_per_layer,
-                        footprintFor(footprint, device, /*shadow=*/true),
-                        "tier shadow slots");
+                        slots,
+                        footprintFor(
+                            footprints[layers.front()],
+                            device,
+                            /*shadow=*/true),
+                        "tier shared-geometry shadow slots");
                     charges[participant.resource_id] = checkedAdd(
                         charges[participant.resource_id], bytes, "tier shadows");
                 }
@@ -249,7 +195,7 @@ namespace llaminar2
                 const auto resource = resource_index.at(participant.resource_id);
                 charges[participant.resource_id] = footprintFor(
                     footprints[static_cast<std::size_t>(layer_idx)],
-                    resources[resource].output.device,
+                    resources[resource].memory.build().resource().device,
                     /*shadow=*/false);
                 return charges;
             }
@@ -259,7 +205,7 @@ namespace llaminar2
                 const auto resource = resource_index.at(participant.resource_id);
                 const std::size_t bytes = footprintFor(
                     footprints[static_cast<std::size_t>(layer_idx)],
-                    resources[resource].output.device,
+                    resources[resource].memory.build().resource().device,
                     /*shadow=*/false);
                 charges[participant.resource_id] = checkedAdd(
                     charges[participant.resource_id], bytes, "replicated live expert");
@@ -288,12 +234,11 @@ namespace llaminar2
         {
             for (const auto &[resource_id, bytes] : charges)
             {
-                auto &output = resources[resource_index.at(resource_id)].output;
-                if (shadow)
-                    output.shadow_bytes = checkedAdd(output.shadow_bytes, bytes, "committed shadows");
-                else
-                    output.live_expert_bytes = checkedAdd(
-                        output.live_expert_bytes, bytes, "committed live experts");
+                auto &resource = resources[resource_index.at(resource_id)];
+                resource.memory.add(
+                    shadow ? PhysicalMemoryOwner::ExpertShadowSlots
+                           : PhysicalMemoryOwner::RoutedExpertWeights,
+                    bytes);
             }
         }
 
@@ -328,7 +273,7 @@ namespace llaminar2
                     tier.request->participants.size();
                 ++tier.output.participant_live_copies[participant][layer];
                 auto &resource = resources[resource_index.at(
-                    tier.request->participants[participant].resource_id)].output;
+                    tier.request->participants[participant].resource_id)];
                 ++resource.live_copies_per_layer[layer];
             }
             else
@@ -339,7 +284,7 @@ namespace llaminar2
                 {
                     ++tier.output.participant_live_copies[participant][layer];
                     auto &resource = resources[resource_index.at(
-                        tier.request->participants[participant].resource_id)].output;
+                        tier.request->participants[participant].resource_id)];
                     ++resource.live_copies_per_layer[layer];
                 }
             }
@@ -387,21 +332,34 @@ namespace llaminar2
             for (const auto &[resource_id, additional_bytes] : charges)
             {
                 const auto &resource =
-                    resources[resource_index.at(resource_id)].output;
+                    resources[resource_index.at(resource_id)];
+                const auto bom = resource.memory.build();
                 const std::size_t used = resourceUsed(resource);
                 const std::size_t remaining =
-                    used < resource.usable_budget_bytes
-                        ? resource.usable_budget_bytes - used
+                    used < bom.resource().admission_available_bytes
+                        ? bom.resource().admission_available_bytes - used
                         : 0;
+                const std::size_t staging =
+                    bom.bytes(PhysicalMemoryOwner::WeightLoadStaging) +
+                    bom.bytes(
+                        PhysicalMemoryOwner::ActivationTransportStaging) +
+                    bom.bytes(PhysicalMemoryOwner::ExpertMigrationStaging);
                 error << "; resource='" << resource_id
-                      << "' device=" << resource.device.toString()
+                      << "' device=" << bom.resource().device.toString()
                       << " requires_additional_bytes=" << additional_bytes
                       << " remaining_bytes=" << remaining
-                      << " usable_bytes=" << resource.usable_budget_bytes
-                      << " fixed_bytes=" << resource.fixed_bytes
-                      << " staging_bytes=" << resource.transfer_staging_bytes
-                      << " shadow_bytes=" << resource.shadow_bytes
-                      << " live_expert_bytes=" << resource.live_expert_bytes;
+                      << " usable_bytes="
+                      << bom.resource().admission_available_bytes
+                      << " fixed_bytes="
+                      << (used - staging -
+                          bom.bytes(PhysicalMemoryOwner::ExpertShadowSlots) -
+                          bom.bytes(PhysicalMemoryOwner::RoutedExpertWeights))
+                      << " staging_bytes="
+                      << staging
+                      << " shadow_bytes="
+                      << bom.bytes(PhysicalMemoryOwner::ExpertShadowSlots)
+                      << " live_expert_bytes="
+                      << bom.bytes(PhysicalMemoryOwner::RoutedExpertWeights);
             }
             throw std::invalid_argument(error.str());
         }
@@ -445,7 +403,7 @@ namespace llaminar2
         const auto found = std::find_if(
             physical_resources.begin(), physical_resources.end(),
             [&resource_id](const auto &entry)
-            { return entry.resource_id == resource_id; });
+            { return entry.resourceId() == resource_id; });
         return found == physical_resources.end() ? nullptr : &*found;
     }
 
@@ -474,91 +432,26 @@ namespace llaminar2
             footprint.layer_idx = layer.layer_idx;
             for (const auto &projection : layer.projections)
             {
-                if (projection.format.isFloating())
-                {
-                    const std::size_t floating_elements = checkedMultiply(
-                        static_cast<std::size_t>(projection.N),
-                        static_cast<std::size_t>(projection.K),
-                        "floating expert elements");
-                    const std::size_t floating_logical_bytes = checkedMultiply(
-                        floating_elements,
-                        projection.format.floatingElementBytes(),
-                        "floating expert bytes");
-                    const std::size_t cpu_bytes =
-                        floatingProjectionAllocationBytes(
-                            projection,
-                            floating_logical_bytes >= kCpuAllocationAlignment
-                                ? kCpuAllocationAlignment
-                                : std::size_t{64},
-                            "CPU floating expert projection");
-                    const std::size_t gpu_bytes =
-                        floatingProjectionAllocationBytes(
-                            projection,
-                            kGpuRegionAlignment,
-                            "GPU floating expert projection");
-                    footprint.cpu_live_bytes = checkedAdd(
-                        footprint.cpu_live_bytes,
-                        cpu_bytes,
-                        "CPU floating live expert");
-                    footprint.cpu_shadow_bytes = checkedAdd(
-                        footprint.cpu_shadow_bytes,
-                        cpu_bytes,
-                        "CPU floating shadow expert");
-                    footprint.gpu_live_bytes = checkedAdd(
-                        footprint.gpu_live_bytes,
-                        gpu_bytes,
-                        "GPU floating live expert");
-                    footprint.gpu_shadow_bytes = checkedAdd(
-                        footprint.gpu_shadow_bytes,
-                        gpu_bytes,
-                        "GPU floating shadow expert");
-                    continue;
-                }
-
-                const NativeVnniFormatInfo *source =
-                    native_vnni_formats::forSourceIdentity(
-                        projection.format.native_vnni.codebook_id,
-                        projection.format.native_vnni.is_superblock);
-                if (!source)
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay capacity projection source is not in the NativeVNNI catalog");
-                }
-
-                const std::size_t cpu_bytes =
-                    cpuProjectionAllocationBytes(projection, *source);
+                const auto geometry =
+                    resolveExpertPreparedProjectionMemoryGeometry(
+                        projection.N,
+                        projection.K,
+                        projection.format);
                 footprint.cpu_live_bytes = checkedAdd(
-                    footprint.cpu_live_bytes, cpu_bytes, "CPU live expert");
+                    footprint.cpu_live_bytes,
+                    geometry.cpu_bytes,
+                    "CPU live expert");
                 footprint.cpu_shadow_bytes = checkedAdd(
-                    footprint.cpu_shadow_bytes, cpu_bytes, "CPU shadow expert");
-
-                const auto live_allocation =
-                    reusableDeviceVnniAllocationFormat(*source);
+                    footprint.cpu_shadow_bytes,
+                    geometry.cpu_bytes,
+                    "CPU shadow expert");
                 footprint.gpu_live_bytes = checkedAdd(
                     footprint.gpu_live_bytes,
-                    gpuProjectionAllocationBytes(
-                        projection.N,
-                        projection.K,
-                        live_allocation.payload_bytes_per_block,
-                        live_allocation.has_mins,
-                        live_allocation.has_emins),
+                    geometry.gpu_live_bytes,
                     "GPU live expert");
-
-                /*
-                 * The installed physical fabric deliberately provisions every
-                 * GPU arrival slot for the largest catalogued representation:
-                 * signed INT8 payload, minima, and effective minima.  Charging
-                 * exactly that allocation prevents codebook-dependent runtime
-                 * pool construction from escaping the setup BOM.
-                 */
                 footprint.gpu_shadow_bytes = checkedAdd(
                     footprint.gpu_shadow_bytes,
-                    gpuProjectionAllocationBytes(
-                        projection.N,
-                        projection.K,
-                        /*payload_bytes_per_block=*/32,
-                        /*is_asymmetric=*/true,
-                        /*has_emins=*/true),
+                    geometry.gpu_shadow_bytes,
                     "GPU shadow expert");
             }
             footprints.push_back(footprint);
@@ -594,38 +487,19 @@ namespace llaminar2
         std::unordered_map<std::string, std::size_t> resource_index;
         for (const auto &budget : input.physical_budgets)
         {
-            if (budget.resource_id.empty() || !budget.device.is_valid() ||
-                (!budget.device.is_cpu() && !budget.device.is_gpu()) ||
-                budget.usable_budget_bytes == 0 ||
+            const auto &base_bom = budget.certificate().bom();
+            if (budget.resourceId().empty() ||
+                !budget.device().is_valid() ||
+                (!budget.device().is_cpu() && !budget.device().is_gpu()) ||
+                base_bom.resource().admission_available_bytes == 0 ||
                 !resource_index.emplace(
-                     budget.resource_id, resources.size()).second)
+                     budget.resourceId(), resources.size()).second)
             {
                 throw std::invalid_argument(
                     "ExpertOverlay physical budgets require unique non-empty identities, valid devices, and positive usable bytes");
             }
-            ResourceState state;
-            state.output.resource_id = budget.resource_id;
-            state.output.device = budget.device;
-            state.output.usable_budget_bytes = budget.usable_budget_bytes;
-            state.output.fixed_bytes = budget.fixed_bytes;
-            state.output.transfer_staging_bytes =
-                budget.transfer_staging_bytes;
-            state.output.live_copies_per_layer.assign(layer_count, 0);
-            state.output.shadow_copies_per_layer.assign(layer_count, 0);
-            if (resourceUsed(state.output) > budget.usable_budget_bytes)
-            {
-                std::ostringstream error;
-                error
-                    << "ExpertOverlay fixed/staging BOM already exceeds "
-                       "physical resource '"
-                    << budget.resource_id << "': used="
-                    << resourceUsed(state.output) << " usable="
-                    << budget.usable_budget_bytes << " fixed="
-                    << state.output.fixed_bytes << " staging="
-                    << state.output.transfer_staging_bytes;
-                throw std::invalid_argument(error.str());
-            }
-            resources.push_back(std::move(state));
+            resources.emplace_back(
+                budget.resourceId(), budget.certificate(), layer_count);
         }
 
         std::set<int> tier_indices;
@@ -689,10 +563,14 @@ namespace llaminar2
                 if (participant.participant_id < 0 ||
                     participant.resource_id.empty() ||
                     resource_index.count(participant.resource_id) == 0 ||
-                    !participant_ids.insert(participant.participant_id).second)
+                    !participant_ids.insert(participant.participant_id).second ||
+                    ((participant.shadow_slots_per_layer == 0) !=
+                     (participant.maximum_concurrent_shadow_slots == 0)) ||
+                    participant.maximum_concurrent_shadow_slots <
+                        participant.shadow_slots_per_layer)
                 {
                     throw std::invalid_argument(
-                        "ExpertOverlay capacity participants require unique ids, known resources, and positive shadow capacity");
+                        "ExpertOverlay capacity participants require unique ids, known resources, and a coherent shared shadow capacity");
                 }
             }
 
@@ -735,7 +613,11 @@ namespace llaminar2
         for (const auto &tier : tiers)
         {
             const auto tier_charges = tierShadowCharges(
-                tier, footprints, resource_index, resources);
+                tier,
+                footprints,
+                input.layer_weight_manifest,
+                resource_index,
+                resources);
             for (const auto &[resource_id, bytes] : tier_charges)
             {
                 all_shadow_charges[resource_id] = checkedAdd(
@@ -756,18 +638,18 @@ namespace llaminar2
             for (const auto &participant : tier.request->participants)
             {
                 auto &resource =
-                    resources[resource_index.at(participant.resource_id)].output;
+                    resources[resource_index.at(participant.resource_id)];
                 for (std::size_t layer = 0; layer < layer_count; ++layer)
                 {
                     if (participant.shadow_slots_per_layer >
                         static_cast<std::size_t>(
                             std::numeric_limits<int>::max() -
-                            resource.shadow_copies_per_layer[layer]))
+                            resource.shadow_arrival_capacity_per_layer[layer]))
                     {
                         throw std::overflow_error(
                             "ExpertOverlay shadow copy count exceeds int");
                     }
-                    resource.shadow_copies_per_layer[layer] +=
+                    resource.shadow_arrival_capacity_per_layer[layer] +=
                         static_cast<int>(participant.shadow_slots_per_layer);
                 }
             }
@@ -1009,20 +891,35 @@ namespace llaminar2
                   [](const auto &lhs, const auto &rhs)
                   { return lhs.tier_index < rhs.tier_index; });
 
-        result.physical_resources.reserve(resources.size());
-        for (auto &resource : resources)
+        PhysicalMemoryPlanBuilder physical_plan_builder;
+        for (const auto &resource : resources)
         {
-            resource.output.used_bytes = resourceUsed(resource.output);
-            if (resource.output.used_bytes >
-                resource.output.usable_budget_bytes)
+            auto final_bom = resource.memory.build();
+            if (!final_bom.fits())
             {
                 throw std::logic_error(
                     "ExpertOverlay capacity resolver committed an over-budget resource");
             }
-            resource.output.remaining_bytes =
-                resource.output.usable_budget_bytes -
-                resource.output.used_bytes;
-            result.physical_resources.push_back(std::move(resource.output));
+            physical_plan_builder.add(final_bom);
+        }
+        result.physical_memory_admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(
+            physical_plan_builder.build());
+
+        result.physical_resources.reserve(resources.size());
+        for (auto &resource : resources)
+        {
+            const auto final_bom = resource.memory.build();
+            const PhysicalMemoryAllocatorIdentity identity{
+                .world_rank = final_bom.resource().world_rank,
+                .device = final_bom.resource().device,
+            };
+            result.physical_resources.emplace_back(
+                std::move(resource.resource_id),
+                result.physical_memory_admission,
+                identity,
+                std::move(resource.live_copies_per_layer),
+                std::move(resource.shadow_arrival_capacity_per_layer));
         }
         return result;
     }
@@ -1067,6 +964,13 @@ namespace llaminar2
             {
                 throw std::invalid_argument(
                     "ExpertOverlay resolved capacity tier identity does not match the placement plan");
+            }
+            if (!tier.resolved_live_experts_per_layer.empty() &&
+                tier.resolved_live_experts_per_layer !=
+                    resolved.live_experts_per_layer)
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay installed placement quotas differ from the retained physical-memory certificate");
             }
             tier.resolved_live_experts_per_layer =
                 resolved.live_experts_per_layer;

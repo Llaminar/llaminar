@@ -2,7 +2,7 @@
 """Validate fully device-owned GPU dynamic MTP generation evidence.
 
 CUDA composes one maximum-capacity graph family and selects an exact draft-depth
-branch inside a native SWITCH/WHILE. HIP does not expose conditional graph
+prefix inside a native selector-gated WHILE. HIP does not expose conditional graph
 nodes, so ROCm publishes one authenticated immutable scheduler ticket and the
 host submits the named already-captured transaction; all mutable generation
 state and outcome reduction remain device-owned. These validators correlate
@@ -14,6 +14,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
+
+from gpu_host_transfer_perf_policy import (
+    device_generation_dispatch_ticket_abi_is_canonical,
+)
 
 
 @dataclass(frozen=True)
@@ -133,7 +137,7 @@ def validate_cuda_dynamic_mtp_device_generation_policy(
                 tags.get("backend") != "CUDA"
                 or tags.get("depth_policy") != "dynamic"
                 or tags.get("execution")
-                != "native_device_controlled_switch_while"
+                != "native_device_controlled_selector_while"
                 or _integer(tags.get("minimum_draft_depth"))
                 != expected_minimum_depth
                 or _integer(tags.get("maximum_draft_depth"))
@@ -164,7 +168,7 @@ def validate_cuda_dynamic_mtp_device_generation_policy(
     for device in cuda_devices:
         if not any(
             (record.get("tags") or {}).get("execution")
-            == "single_async_native_switch_while_launch"
+            == "single_async_native_selector_while_launch"
             and _integer((record.get("tags") or {}).get("minimum_draft_depth"))
             == expected_minimum_depth
             and _integer((record.get("tags") or {}).get("maximum_draft_depth"))
@@ -172,7 +176,7 @@ def validate_cuda_dynamic_mtp_device_generation_policy(
             for record in launches.get(device, ())
         ):
             return MTPDeviceGenerationValidation(
-                error=f"CUDA dynamic MTP never launched its native SWITCH/WHILE on {device}",
+                error=f"CUDA dynamic MTP never launched its native selector/WHILE on {device}",
                 devices=cuda_devices,
             )
 
@@ -339,7 +343,8 @@ def validate_rocm_host_scheduled_mtp_device_generation_policy(
 ) -> MTPDeviceGenerationValidation:
     """Require authenticated ticket-selected captured graphs on every ROCm GPU.
 
-    The host-visible ticket is a 48-byte immutable graph-branch decision, not a
+    The host-visible ticket is an ABI-v2 52-byte immutable graph-branch
+    decision, not a
     generation-state payload. This proof couples each ticket to exactly one
     device-controller transaction and exactly one captured transaction or
     terminal submission. A pinned dynamic range is valid and useful for fixed
@@ -472,7 +477,9 @@ def validate_rocm_host_scheduled_mtp_device_generation_policy(
 
         device_ticket_submissions = ticket_submissions.get(device, ())
         if not device_ticket_submissions or any(
-            (record.get("tags") or {}).get("bytes") != "48"
+            not device_generation_dispatch_ticket_abi_is_canonical(
+                record.get("tags") or {}
+            )
             or (record.get("tags") or {}).get("authority")
             != "immutable_scheduler_snapshot"
             or (record.get("tags") or {}).get("state_payload") != "false"

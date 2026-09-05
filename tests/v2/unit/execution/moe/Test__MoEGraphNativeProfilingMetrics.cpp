@@ -33,9 +33,9 @@ protected:
 
     void TearDown() override
     {
+        mutableDebugEnv().profile.enabled = false;
         MoEExpertOverlayProfiler::reset();
         PerfStatsCollector::reset();
-        mutableDebugEnv().profile.enabled = false;
     }
 };
 
@@ -497,6 +497,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, SummaryIncludesGraphNativePhases)
 TEST_F(Test__MoEGraphNativeProfilingMetrics, WhenProfilingDisabled_NoRowsRecorded)
 {
     mutableDebugEnv().profile.enabled = false;
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
 
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
         0, 1, profileEdge(0, 1), 8, 16, 6, 1024, 4096, 0.0);

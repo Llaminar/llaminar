@@ -15,6 +15,7 @@
 #include "ExpertTierTransferMeasurement.h"
 #include "GPUExpertTransfer.h"
 #include "../../backends/DeviceId.h"
+#include "../../transfer/TransferEngine.h"
 
 #include <chrono>
 #include <cstddef>
@@ -69,6 +70,8 @@ namespace llaminar2
         {
             DeviceId source_device;
             DeviceId destination_device;
+            /** Exact destination participant/cycle background stream. */
+            PersistentTransferExecutionLane execution;
             std::string lane_name;
             std::string perf_device;
             /** Collect timing-event evidence for economy certification. */
@@ -91,7 +94,7 @@ namespace llaminar2
             const ExpertTierGpuPeerTransferLane &) = delete;
 
         /**
-         * @brief Create the named destination stream and reusable event.
+         * @brief Bind the pooled destination stream and create reusable events.
          * @param error Optional exact setup failure.
          * @return True when the complete persistent lane exists.
          */

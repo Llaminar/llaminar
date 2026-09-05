@@ -38,7 +38,7 @@ namespace llaminar2
         constexpr std::uint32_t kReadinessMagic = 0x45435244u; // "ECRD"
         /** Wire discriminator for one rank's service matrix. */
         constexpr std::uint32_t kServiceMagic = 0x45435356u; // "ECSV"
-        constexpr std::uint16_t kWireVersion = 2;
+        constexpr std::uint16_t kWireVersion = 3;
 
         /** @brief Fixed-layout optional projection observation. */
         struct ProjectionWire
@@ -124,7 +124,8 @@ namespace llaminar2
             std::uint32_t participant_count = 0;
             std::uint32_t num_layers = 0;
             std::uint32_t active_source_mask = 0;
-            std::uint32_t reserved_sources = 0;
+            std::uint32_t economy_source_mask = 0;
+            std::uint64_t production_topology_fingerprint = 0;
             std::uint64_t cell_count = 0;
             std::uint64_t packet_bytes = 0;
             std::uint64_t packet_hash = 0;
@@ -200,6 +201,24 @@ namespace llaminar2
                     result |= std::uint32_t{1} << phase;
             }
             return result;
+        }
+
+        /** @return Stable identity of every retained layer's two phase masks. */
+        std::uint64_t productionTopologyFingerprint(
+            const ExpertHistogramProductionTopology &topology) noexcept
+        {
+            std::uint64_t hash = kFNV1a64OffsetBasis;
+            for (std::size_t layer = 0; layer < topology.layerCount(); ++layer)
+            {
+                const std::array<std::uint32_t, 2> masks{
+                    encodeSourceMask(
+                        topology.sources(static_cast<int>(layer))),
+                    encodeSourceMask(
+                        topology.economySources(static_cast<int>(layer))),
+                };
+                hash = fnv1a64(masks.data(), sizeof(masks), hash);
+            }
+            return hash;
         }
 
         /** @brief Copy a public projection into its pointer-free wire form. */
@@ -350,6 +369,20 @@ namespace llaminar2
         std::chrono::steady_clock::time_point started_at{};
         MoEOverlayMPIEconomyEvidenceExchangeStats stats;
 
+        /** @return Retained routed-layer count from the topology authority. */
+        [[nodiscard]] int numLayers() const noexcept
+        {
+            return static_cast<int>(
+                config.production_topology.layerCount());
+        }
+
+        /** @return Union of graph-reachable phases for wire authentication. */
+        [[nodiscard]] ExpertHistogramProductionSourceMask reachableSources()
+            const noexcept
+        {
+            return config.production_topology.activeSources();
+        }
+
         /** @brief Emit one rare control-plane counter. */
         void record(const char *name, double value = 1.0) const
         {
@@ -493,10 +526,11 @@ namespace llaminar2
     {
         impl_->config = std::move(config);
         auto &owned = impl_->config;
-        if (!owned.mpi_context || owned.num_layers <= 0 ||
+        if (!owned.mpi_context ||
             owned.owner_map.participants().empty() ||
-            !validExpertHistogramProductionSourceMask(
-                owned.active_sources) ||
+            !owned.production_topology.valid() ||
+            owned.production_topology.layerCount() >
+                static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             owned.mpi_context->world_size() < 2 ||
             owned.mpi_context->rank() < 0 ||
             owned.mpi_context->rank() >= owned.mpi_context->world_size() ||
@@ -532,10 +566,12 @@ namespace llaminar2
 
         const std::size_t participants =
             owned.owner_map.participants().size();
+        const std::size_t num_layers =
+            owned.production_topology.layerCount();
         if (participants >
                 std::numeric_limits<std::size_t>::max() /
-                    static_cast<std::size_t>(owned.num_layers) ||
-            participants * static_cast<std::size_t>(owned.num_layers) >
+                    num_layers ||
+            participants * num_layers >
                 (std::numeric_limits<std::size_t>::max() -
                  sizeof(ServiceHeaderWire)) /
                     sizeof(ServiceCellWire))
@@ -544,7 +580,7 @@ namespace llaminar2
                 "ExpertOverlay MPI service packet geometry overflows host size");
         }
         const std::size_t cells =
-            participants * static_cast<std::size_t>(owned.num_layers);
+            participants * num_layers;
         const std::size_t semantic_packet_bytes =
             sizeof(ServiceHeaderWire) + cells * sizeof(ServiceCellWire);
         impl_->service_packet_words =
@@ -1156,12 +1192,17 @@ namespace llaminar2
             .participant_count = static_cast<std::uint32_t>(
                 impl_->config.owner_map.participants().size()),
             .num_layers = static_cast<std::uint32_t>(
-                impl_->config.num_layers),
+                impl_->numLayers()),
             .active_source_mask =
-                encodeSourceMask(impl_->config.active_sources),
+                encodeSourceMask(impl_->reachableSources()),
+            .economy_source_mask = encodeSourceMask(
+                impl_->config.production_topology.economyActiveSources()),
+            .production_topology_fingerprint =
+                productionTopologyFingerprint(
+                    impl_->config.production_topology),
             .cell_count = static_cast<std::uint64_t>(
                 impl_->config.owner_map.participants().size()) *
-                static_cast<std::uint64_t>(impl_->config.num_layers),
+                static_cast<std::uint64_t>(impl_->numLayers()),
             .packet_bytes = impl_->service_packet_bytes,
         };
         auto *cells = reinterpret_cast<ServiceCellWire *>(
@@ -1182,12 +1223,12 @@ namespace llaminar2
              ++participant)
         {
             for (int layer = 0;
-                 layer < impl_->config.num_layers;
+                 layer < impl_->numLayers();
                  ++layer)
             {
                 auto &cell = cells[
                     participant *
-                        static_cast<std::size_t>(impl_->config.num_layers) +
+                        static_cast<std::size_t>(impl_->numLayers()) +
                     static_cast<std::size_t>(layer)];
                 cell.participant_id = participant_ids[participant];
                 cell.layer = layer;
@@ -1195,40 +1236,77 @@ namespace llaminar2
         }
         for (const auto &row : local)
         {
-            bool invalid_phase_evidence = false;
-            for (std::size_t phase = 0;
-                 phase < kExpertHistogramProductionSourceCount;
-                 ++phase)
-            {
-                invalid_phase_evidence = invalid_phase_evidence ||
-                    (!impl_->config.active_sources[phase] &&
-                     row.sample_count[phase] != 0);
-            }
             const auto participant = std::lower_bound(
                 participant_ids.begin(), participant_ids.end(),
                 row.participant_id);
             const auto *owner =
                 impl_->config.owner_map.participantForId(row.participant_id);
-            if (!row.valid() ||
-                participant == participant_ids.end() ||
-                *participant != row.participant_id || !owner ||
-                !owner->world_rank_known ||
-                owner->world_rank != worldRank() || row.layer < 0 ||
-                row.layer >= impl_->config.num_layers ||
-                invalid_phase_evidence)
+            if (!row.valid())
             {
                 ++impl_->stats.rejected_packets;
                 assignError(
                     error,
-                    "ExpertOverlay MPI service exchange received malformed, phase-inconsistent, or wrongly owned local rows");
+                    "ExpertOverlay MPI service exchange received a malformed local row");
                 return false;
+            }
+            if (participant == participant_ids.end() ||
+                *participant != row.participant_id || !owner)
+            {
+                ++impl_->stats.rejected_packets;
+                assignError(
+                    error,
+                    "ExpertOverlay MPI service exchange received an unknown local participant");
+                return false;
+            }
+            if (!owner->world_rank_known ||
+                owner->world_rank != worldRank())
+            {
+                ++impl_->stats.rejected_packets;
+                std::ostringstream diagnostic;
+                diagnostic
+                    << "ExpertOverlay MPI service exchange received participant "
+                    << row.participant_id << " on world rank " << worldRank()
+                    << " but its authoritative owner rank is "
+                    << (owner->world_rank_known ? owner->world_rank : -1);
+                assignError(error, diagnostic.str());
+                return false;
+            }
+            if (row.layer < 0 || row.layer >= impl_->numLayers())
+            {
+                ++impl_->stats.rejected_packets;
+                std::ostringstream diagnostic;
+                diagnostic
+                    << "ExpertOverlay MPI service exchange received out-of-range layer "
+                    << row.layer << " for " << impl_->numLayers()
+                    << " retained layers";
+                assignError(error, diagnostic.str());
+                return false;
+            }
+            for (std::size_t phase = 0;
+                 phase < kExpertHistogramProductionSourceCount;
+                 ++phase)
+            {
+                if (!impl_->config.production_topology.reachable(
+                        row.layer, phase) &&
+                    row.sample_count[phase] != 0)
+                {
+                    ++impl_->stats.rejected_packets;
+                    std::ostringstream diagnostic;
+                    diagnostic
+                        << "ExpertOverlay MPI service exchange received "
+                        << row.sample_count[phase]
+                        << " samples for unreachable layer " << row.layer
+                        << " phase " << phase;
+                    assignError(error, diagnostic.str());
+                    return false;
+                }
             }
             const std::size_t participant_offset =
                 static_cast<std::size_t>(
                     participant - participant_ids.begin());
             auto &cell = cells[
                 participant_offset *
-                    static_cast<std::size_t>(impl_->config.num_layers) +
+                    static_cast<std::size_t>(impl_->numLayers()) +
                 static_cast<std::size_t>(row.layer)];
             if (cell.present != 0)
             {
@@ -1291,7 +1369,7 @@ namespace llaminar2
                 static_cast<std::size_t>(worldSize()));
             const std::size_t expected_cells =
                 impl_->config.owner_map.participants().size() *
-                static_cast<std::size_t>(impl_->config.num_layers);
+                static_cast<std::size_t>(impl_->numLayers());
             for (int rank = 0; rank < worldSize(); ++rank)
             {
                 const auto *begin = reinterpret_cast<const std::uint8_t *>(
@@ -1308,10 +1386,15 @@ namespace llaminar2
                         impl_->config.owner_map.participants().size() ||
                     header->num_layers !=
                         static_cast<std::uint32_t>(
-                            impl_->config.num_layers) ||
+                            impl_->numLayers()) ||
                     header->active_source_mask !=
-                        encodeSourceMask(impl_->config.active_sources) ||
-                    header->reserved_sources != 0 ||
+                        encodeSourceMask(impl_->reachableSources()) ||
+                    header->economy_source_mask != encodeSourceMask(
+                        impl_->config.production_topology
+                            .economyActiveSources()) ||
+                    header->production_topology_fingerprint !=
+                        productionTopologyFingerprint(
+                            impl_->config.production_topology) ||
                     header->cell_count != expected_cells ||
                     header->packet_bytes != impl_->service_packet_bytes ||
                     header->packet_hash == 0 ||
@@ -1362,8 +1445,7 @@ namespace llaminar2
             *result = MoEOverlayEconomyEvidenceMerger::mergeService(
                 rank_rows,
                 impl_->config.owner_map,
-                impl_->config.num_layers,
-                impl_->config.active_sources);
+                impl_->config.production_topology);
         }
         catch (const std::exception &exception)
         {

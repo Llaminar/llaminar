@@ -236,7 +236,8 @@ extern "C" bool rocmGemm_native_vnni_fp32_with_policy(
         device_id,
         stream);
 
-    if (launched && llaminar2::PerfStatsCollector::isEnabled())
+    if (launched &&
+        llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
     {
         llaminar2::PerfStatsCollector::addCounter(
             "kernel",

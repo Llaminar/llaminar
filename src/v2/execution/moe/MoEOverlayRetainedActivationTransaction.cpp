@@ -963,4 +963,95 @@ namespace llaminar2
         buildFollower(
             destination, canonical_lane, manifest_layers, stages);
     }
+
+    void MoEOverlayRetainedActivationTransaction::
+        buildStageOwnedTransactionFromCapturedUnits(
+            IGPUGraphCapture &destination,
+            const ComputeGraph &graph,
+            std::span<const MoEOverlayRetainedCaptureUnit> units)
+    {
+        if (!requiresHeterogeneousTicketSegmentation(
+                graph.nativeCaptureEnvelope()))
+        {
+            throw std::invalid_argument(
+                "Stage-owned retained composition requires a typed heterogeneous ticket envelope");
+        }
+
+        std::vector<std::string> expected_stages;
+        expected_stages.reserve(graph.getExecutionOrder().size());
+        for (const std::string &stage_name : graph.getExecutionOrder())
+        {
+            const ComputeNode *const node = graph.getNode(stage_name);
+            if (!node || !node->stage)
+            {
+                throw std::invalid_argument(
+                    "Stage-owned retained composition found an unresolved graph stage: " +
+                    stage_name);
+            }
+            if (node->stage->isManualGraphBoundary() ||
+                node->stage->isPassiveGraphCaptureNoOp())
+            {
+                continue;
+            }
+            expected_stages.push_back(stage_name);
+        }
+
+        std::vector<std::string> captured_stages;
+        captured_stages.reserve(expected_stages.size());
+        DeviceId device = DeviceId::invalid();
+        for (const auto &unit : units)
+        {
+            for (const std::string &stage_name : unit.stage_names)
+            {
+                const ComputeNode *const node = graph.getNode(stage_name);
+                if (!node || !node->stage ||
+                    node->stage->isManualGraphBoundary() ||
+                    node->stage->isPassiveGraphCaptureNoOp() ||
+                    !node->device.is_gpu() ||
+                    node->stage->device() != node->device)
+                {
+                    throw std::invalid_argument(
+                        "Stage-owned retained composition contains an invalid captured stage: " +
+                        stage_name);
+                }
+                if (!device.is_valid())
+                    device = node->device;
+                else if (node->device != device)
+                {
+                    throw std::invalid_argument(
+                        "Stage-owned retained composition cannot combine multiple GPU endpoints");
+                }
+                captured_stages.push_back(stage_name);
+            }
+        }
+        if (!device.is_gpu() || captured_stages != expected_stages)
+        {
+            throw std::invalid_argument(
+                "Stage-owned retained composition does not exactly cover the ordered GPU graph");
+        }
+
+        std::deque<std::string> names;
+        std::vector<MappedTimelineTransactionStep> steps;
+        steps.reserve(units.size());
+        for (std::size_t index = 0u; index < units.size(); ++index)
+        {
+            std::string name =
+                "stage_owned_capture_unit_" + std::to_string(index);
+            if (!units[index].stage_names.empty())
+            {
+                name += ":" + units[index].stage_names.front();
+                if (units[index].stage_names.size() > 1u)
+                {
+                    name += ".." + units[index].stage_names.back();
+                }
+            }
+            names.push_back(std::move(name));
+            steps.emplace_back(MappedTimelineCapturedFragment{
+                .name = names.back().c_str(),
+                .capture = units[index].capture,
+            });
+        }
+        TransferEngine::instance().buildMappedTimelineTransaction(
+            destination, steps, device);
+    }
 } // namespace llaminar2

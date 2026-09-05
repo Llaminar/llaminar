@@ -112,6 +112,12 @@ namespace
             .device = device,
             .slot_capacity = 2u,
             .execution_lane_capacity = 2u,
+            .execution_streams =
+                TransferEngine::instance()
+                    .allocatePersistentTransferExecutionLanes(
+                        2u,
+                        device,
+                        "mapped_progress_repeated_generations"),
             .maximum_bytes = kTransferBytes,
             .name = "integration_repeated_generations_" + device.toString(),
             .perf_device = device.toString(),
@@ -343,6 +349,12 @@ namespace
             .device = device,
             .slot_capacity = 2u,
             .execution_lane_capacity = 2u,
+            .execution_streams =
+                TransferEngine::instance()
+                    .allocatePersistentTransferExecutionLanes(
+                        2u,
+                        device,
+                        "mapped_progress_inference_no_join"),
             .maximum_bytes = kLargeBytes,
             .name = "integration_inference_no_join_" + device.toString(),
             .perf_device = device.toString(),
@@ -475,6 +487,12 @@ namespace
             .device = device,
             .slot_capacity = kTopologyCommandSlots,
             .execution_lane_capacity = kMigrationCycleSlots,
+            .execution_streams =
+                TransferEngine::instance()
+                    .allocatePersistentTransferExecutionLanes(
+                        4u,
+                        device,
+                        "mapped_progress_topology_sized_directory"),
             .maximum_bytes = 4096u,
             .name = "integration_topology_sized_directory_" +
                     device.toString(),
@@ -483,6 +501,7 @@ namespace
         ASSERT_NE(epoch, nullptr);
         EXPECT_EQ(epoch->slotCapacity(), kTopologyCommandSlots);
         EXPECT_EQ(epoch->executionLaneCapacity(), kMigrationCycleSlots);
+        EXPECT_EQ(epoch->executionStreamCapacity(), 4u);
         EXPECT_NE(epoch->executionStream(), nullptr);
         EXPECT_GT(epoch->slotCapacity(), epoch->executionLaneCapacity());
         EXPECT_EQ(epoch->stats().slots_reserved, 0u);
@@ -539,6 +558,12 @@ namespace
             .device = device,
             .slot_capacity = kCommandCount,
             .execution_lane_capacity = 1u,
+            .execution_streams =
+                TransferEngine::instance()
+                    .allocatePersistentTransferExecutionLanes(
+                        1u,
+                        device,
+                        "mapped_progress_bounded_lane_queue"),
             .maximum_bytes = kBytes,
             .name = "integration_bounded_lane_queue_" + device.toString(),
             .perf_device = device.toString(),

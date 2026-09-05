@@ -448,6 +448,178 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief CUDA/ROCm-tagged production loading honors uneven TP=2..8 plans.
+     *
+     * MockModelLoader keeps this a fast, device-free unit test while the
+     * DeviceId forces WeightManager through the same non-CPU materialization
+     * branch used by CUDA and ROCm.  Qwen3.5-122B geometry has 32 GDN heads
+     * and only two attention KV heads: TP=3 therefore owns 12/10/10 query/GDN
+     * heads and replicates K/V.  Every source row is checked byte-for-byte so
+     * an equal-row fallback cannot masquerade as a valid shard.
+     */
+    TEST(WeightManagerUnevenFusedQKVTest,
+         CUDAAndROCmTP2ThroughTP8ConsumeTypedAssignments)
+    {
+        constexpr int attention_heads = 32;
+        constexpr int attention_kv_heads = 2;
+        constexpr int attention_head_dim = 4;
+        constexpr int gdn_heads = 32;
+        constexpr int gdn_state = 4;
+        constexpr int hidden = 16;
+        constexpr int d_ff = 256;
+        constexpr int vocab = 128;
+        constexpr size_t attention_q_rows =
+            attention_heads * attention_head_dim;
+        constexpr size_t attention_kv_rows =
+            attention_kv_heads * attention_head_dim;
+        constexpr size_t attention_fused_rows =
+            attention_q_rows + 2 * attention_kv_rows;
+        constexpr size_t gdn_block_rows = gdn_heads * gdn_state;
+        constexpr size_t gdn_fused_rows = 3 * gdn_block_rows;
+
+        auto loader = std::make_shared<MockModelLoader>();
+        loader->setLoaded(true);
+        loader->setArchitecture("qwen3.5");
+        auto attention_source = makeTaggedMatrix(
+            attention_fused_rows, hidden, 11000);
+        auto gdn_source = makeTaggedMatrix(
+            gdn_fused_rows, hidden, 21000);
+        loader->addTensor("blk.1.attn_qkv.weight", attention_source);
+        loader->addTensor("blk.0.attn_qkv.weight", gdn_source);
+
+        Qwen35SchemaFactory schema_factory;
+        const WeightShardingConfig sharding =
+            schema_factory.getWeightShardingConfig();
+
+        for (const bool rocm_backend : {false, true})
+        {
+            for (int degree = 2; degree <= 8; ++degree)
+            {
+                std::vector<DeviceId> devices;
+                devices.reserve(static_cast<size_t>(degree));
+                for (int rank = 0; rank < degree; ++rank)
+                {
+                    devices.push_back(
+                        rocm_backend ? DeviceId::rocm(rank)
+                                     : DeviceId::cuda(rank));
+                }
+                auto config = std::make_shared<TensorParallelConfig>(
+                    TensorParallelConfig::equalSplit(
+                        degree,
+                        attention_heads,
+                        attention_kv_heads,
+                        d_ff,
+                        vocab,
+                        devices));
+
+                for (int rank = 0; rank < degree; ++rank)
+                {
+                    WeightManager manager(
+                        *loader,
+                        MPIContextFactory::create_mock(rank, degree),
+                        nullptr,
+                        WeightDistributionStrategy::SHARDED,
+                        WeightPrecision::NATIVE);
+                    manager.setWeightShardingConfig(sharding);
+                    manager.setModelDimensions(
+                        attention_heads,
+                        attention_kv_heads,
+                        attention_head_dim);
+                    manager.setGDNDimensions(
+                        gdn_heads, gdn_heads, gdn_state);
+                    manager.setTensorParallelConfig(config);
+
+                    const auto &assignment = config->forRank(rank);
+                    auto gdn = manager.getShardedWeightForAssignment(
+                        "blk.0.attn_qkv.weight",
+                        devices[static_cast<size_t>(rank)],
+                        assignment,
+                        0);
+                    auto attention = manager.getShardedWeightForAssignment(
+                        "blk.1.attn_qkv.weight",
+                        devices[static_cast<size_t>(rank)],
+                        assignment,
+                        0);
+                    ASSERT_NE(gdn, nullptr)
+                        << "backend=" << (rocm_backend ? "ROCm" : "CUDA")
+                        << " TP=" << degree << " rank=" << rank;
+                    ASSERT_NE(attention, nullptr)
+                        << "backend=" << (rocm_backend ? "ROCm" : "CUDA")
+                        << " TP=" << degree << " rank=" << rank;
+
+                    std::vector<size_t> expected_gdn_rows;
+                    std::vector<size_t> expected_attention_rows;
+                    const auto append = [](
+                                            std::vector<size_t> &rows,
+                                            size_t base,
+                                            size_t start,
+                                            size_t count)
+                    {
+                        for (size_t row = 0; row < count; ++row)
+                            rows.push_back(base + start + row);
+                    };
+                    const size_t local_q_start =
+                        static_cast<size_t>(assignment.head_start) *
+                        gdn_state;
+                    const size_t local_q_count =
+                        static_cast<size_t>(assignment.head_count) *
+                        gdn_state;
+                    append(
+                        expected_gdn_rows,
+                        0u,
+                        local_q_start,
+                        local_q_count);
+                    append(
+                        expected_gdn_rows,
+                        gdn_block_rows,
+                        local_q_start,
+                        local_q_count);
+                    append(
+                        expected_gdn_rows,
+                        2 * gdn_block_rows,
+                        local_q_start,
+                        local_q_count);
+
+                    const size_t attention_q_start =
+                        static_cast<size_t>(assignment.head_start) *
+                        attention_head_dim;
+                    const size_t attention_q_count =
+                        static_cast<size_t>(assignment.head_count) *
+                        attention_head_dim;
+                    const size_t attention_kv_start =
+                        static_cast<size_t>(assignment.kv_head_start) *
+                        attention_head_dim;
+                    const size_t attention_kv_count =
+                        static_cast<size_t>(assignment.kv_head_count) *
+                        attention_head_dim;
+                    append(
+                        expected_attention_rows,
+                        0u,
+                        attention_q_start,
+                        attention_q_count);
+                    append(
+                        expected_attention_rows,
+                        attention_q_rows,
+                        attention_kv_start,
+                        attention_kv_count);
+                    append(
+                        expected_attention_rows,
+                        attention_q_rows + attention_kv_rows,
+                        attention_kv_start,
+                        attention_kv_count);
+
+                    expectFP32Rows(
+                        *gdn, *gdn_source, expected_gdn_rows);
+                    expectFP32Rows(
+                        *attention,
+                        *attention_source,
+                        expected_attention_rows);
+                }
+            }
+        }
+    }
+
+    /**
      * @brief Every V-associated row, scalar, and column uses one packed order.
      */
     TEST_F(WeightManagerLinkedGDNTest, ValueWeightsShareOneByteExactOrderForTP2TP4TP8)

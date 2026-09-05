@@ -226,9 +226,10 @@ namespace llaminar2
      * production code must never infer a device class or preference from it.
      * Smaller `priority` values are preferred, priorities are unique within a
      * plan, and neither declaration order nor tier index participates in that
-     * ordering. `fallback` is only a complete-coverage responsibility. When
-     * present it must belong to the greatest numeric priority and does not
-     * imply CPU placement, unbounded capacity, or any thermal tier category.
+     * ordering. `fallback` is derived at the configuration boundary for the
+     * greatest numeric priority and records final-coverage responsibility for
+     * resolved runtime plans. It is not user-authored and does not imply CPU
+     * placement, unbounded capacity, or any thermal tier category.
      */
     struct RoutedExpertTier
     {

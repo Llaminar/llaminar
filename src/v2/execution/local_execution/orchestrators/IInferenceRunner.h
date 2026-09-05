@@ -139,6 +139,23 @@ namespace llaminar2
                        [](int rows)
                        { return rows > 0; });
         }
+
+        /**
+         * @brief Compare every address/geometry value embedded by native capture.
+         *
+         * Diagnostic and lean variants may be materialized from the same serving
+         * plan. They are distinct only by snapshot topology; a changed bucket,
+         * padding scalar, decode kind, or pipeline activation owner is a different
+         * serving family and may not reuse the sealed workspace contract.
+         */
+        bool sameCaptureIdentity(
+            const ServingGraphFamilyMaterializationPlan &other) const noexcept
+        {
+            return prefill_bucket_rows == other.prefill_bucket_rows &&
+                   prefill_pad_token_id == other.prefill_pad_token_id &&
+                   main_decode_graph == other.main_decode_graph &&
+                   pipeline_hidden_input == other.pipeline_hidden_input;
+        }
     };
 
     /**
@@ -416,6 +433,9 @@ namespace llaminar2
     {
         int request_count = 0; ///< Number of independent device controller rows.
         int max_new_tokens = 0; ///< New response-token capacity for each row.
+        /** Exact request-owned policy installed in every device controller. */
+        sampling_math::DeviceGenerationDepthPolicy depth_policy =
+            sampling_math::DeviceGenerationDepthPolicy::fixed(0);
         sampling_math::DeviceGenerationLeadingRowDisposition
             initial_leading_row_disposition =
                 sampling_math::DeviceGenerationLeadingRowDisposition::
@@ -425,6 +445,7 @@ namespace llaminar2
         [[nodiscard]] bool valid() const noexcept
         {
             return request_count > 0 && max_new_tokens > 0 &&
+                   depth_policy.valid() &&
                    sampling_math::
                        valid_device_generation_leading_row_disposition(
                            initial_leading_row_disposition);
@@ -536,7 +557,7 @@ namespace llaminar2
      * generation additionally needs a device-selected branch for every legal
      * draft depth. Keeping this distinction typed prevents callers from
      * assuming that support for a fixed conditional body also proves support
-     * for a SWITCH-in-WHILE graph.
+     * for a selector-gated WHILE graph.
      */
     enum class DeviceGenerationLoopTopology : uint8_t
     {
@@ -1337,21 +1358,22 @@ namespace llaminar2
         virtual bool forward(const int *tokens, int seq_len) = 0;
 
         /**
-         * @brief Wait for the most recently submitted forward pass at a benchmark boundary.
+         * @brief Wait for the latest inference transaction at a benchmark boundary.
          *
          * Production GPU inference deliberately returns after publishing its exact
          * terminal event so downstream device work can remain asynchronous. A host
-         * wall-clock benchmark, however, must not stop its timer at graph submission.
-         * GPU runners override this method and wait only for the durable event
-         * that terminates the complete forward transaction. For MTP prefill,
-         * that boundary includes shifted sidecar KV population rather than only
-         * the earlier main-graph output. Implementations must not synchronize the
-         * whole device or copy logits to host. CPU execution is already complete
-         * when forward() returns.
+         * wall-clock benchmark, however, must not stop its timer at graph submission
+         * or asynchronous prefix restoration. GPU runners override this method and
+         * select the durable event owned by the transaction that established the
+         * current output: either a captured forward graph or a full prefix-terminal
+         * restore. For MTP prefill, the selected boundary also includes shifted
+         * sidecar KV population. Implementations must not synchronize the whole
+         * device or copy logits to host. CPU execution is already complete when the
+         * inference call returns.
          *
-         * @return true when the last forward pass is complete and may be timed.
+         * @return true when the latest inference transaction is complete and may be timed.
          */
-        virtual bool waitForLastForwardCompletionForBenchmark()
+        virtual bool waitForLastInferenceCompletionForBenchmark()
         {
             return !primaryDeviceId().is_gpu();
         }

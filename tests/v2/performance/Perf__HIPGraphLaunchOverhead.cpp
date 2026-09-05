@@ -33,11 +33,13 @@
 #endif
 
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -148,6 +150,172 @@ struct RetainedDeviceGraph
     hipEvent_t completion = nullptr; ///< Exact event published after replay.
     hipError_t worker_error = hipSuccess; ///< First asynchronous worker error.
 };
+
+/**
+ * @brief One captured graph definition used to measure executable publication.
+ *
+ * Production heterogeneous ExpertOverlay retains many independently launchable
+ * graph segments per physical bucket.  The captured definition and explicit
+ * stream remain stable while the benchmark creates a family of executable
+ * instances, reproducing the driver-side registry pressure without loading a
+ * model or conflating graph launch latency with graph publication latency.
+ */
+struct CapturedInstantiationTemplate
+{
+    int device = -1;             ///< HIP ordinal that owns every native handle.
+    hipStream_t stream = nullptr; ///< Exact non-default capture stream.
+    hipGraph_t graph = nullptr;  ///< Reusable captured graph definition.
+};
+
+/**
+ * @brief Destroy one graph template on its immutable owner device.
+ * @param graph Template whose native resources are released.
+ */
+void destroyCapturedInstantiationTemplate(
+    CapturedInstantiationTemplate &graph) noexcept
+{
+    if (graph.device >= 0)
+        (void)hipSetDevice(graph.device);
+    if (graph.graph)
+        (void)hipGraphDestroy(graph.graph);
+    if (graph.stream)
+        (void)hipStreamDestroy(graph.stream);
+    graph = {};
+}
+
+/**
+ * @brief Record a fixed-width kernel graph without instantiating it.
+ * @param graph Destination template populated on success.
+ * @param device HIP ordinal that owns the graph.
+ * @param node_count Number of ordered kernel nodes to record.
+ * @return First failing HIP status, or `hipSuccess`.
+ */
+hipError_t captureInstantiationTemplate(
+    CapturedInstantiationTemplate &graph,
+    int device,
+    int node_count)
+{
+    graph.device = device;
+    hipError_t status = hipSetDevice(device);
+    if (status != hipSuccess)
+        return status;
+    status = hipStreamCreateWithFlags(&graph.stream, hipStreamNonBlocking);
+    if (status != hipSuccess)
+        return status;
+    status = hipStreamBeginCapture(
+        graph.stream,
+        hipStreamCaptureModeRelaxed);
+    if (status != hipSuccess)
+        return status;
+    for (int node = 0; node < node_count; ++node)
+        nop_kernel<<<1, 1, 0, graph.stream>>>();
+    return hipStreamEndCapture(graph.stream, &graph.graph);
+}
+
+/**
+ * @brief Result of one process-wide graph-executable publication wave.
+ */
+struct InstantiationWaveResult
+{
+    hipError_t status = hipSuccess; ///< First driver error across all devices.
+    double elapsed_ms = 0.0;        ///< Complete retained-family wall time.
+};
+
+/**
+ * @brief Instantiate and retain the same executable cardinality per device.
+ *
+ * The concurrent form starts one worker per device at the same barrier.  The
+ * serial form performs identical driver calls and retains the same handles,
+ * but publishes them in deterministic device-major order.  All handles remain
+ * alive until the timed wave has finished so the measurement includes the
+ * native registry pressure present in a serving graph family.
+ *
+ * @param templates One captured definition per participating device.
+ * @param executable_count Number of retained executables per device.
+ * @param concurrent Whether devices publish in parallel or serial order.
+ * @return Driver status and elapsed wall time; all executables are destroyed
+ *         before the function returns.
+ */
+InstantiationWaveResult instantiateRetainedFamily(
+    std::span<const CapturedInstantiationTemplate> templates,
+    int executable_count,
+    bool concurrent)
+{
+    InstantiationWaveResult result;
+    std::vector<std::vector<hipGraphExec_t>> executables(
+        templates.size(),
+        std::vector<hipGraphExec_t>(
+            static_cast<std::size_t>(executable_count), nullptr));
+    std::vector<hipError_t> worker_status(
+        templates.size(), hipSuccess);
+
+    const auto instantiate_device = [&](std::size_t index)
+    {
+        const auto &graph = templates[index];
+        hipError_t status = hipSetDevice(graph.device);
+        for (int executable = 0;
+             status == hipSuccess && executable < executable_count;
+             ++executable)
+        {
+            status = hipGraphInstantiate(
+                &executables[index][static_cast<std::size_t>(executable)],
+                graph.graph,
+                nullptr,
+                nullptr,
+                0);
+        }
+        worker_status[index] = status;
+    };
+
+    const auto begin = std::chrono::steady_clock::now();
+    if (concurrent)
+    {
+        std::atomic<std::size_t> ready{0u};
+        std::atomic<bool> start{false};
+        std::vector<std::thread> workers;
+        workers.reserve(templates.size());
+        for (std::size_t index = 0u; index < templates.size(); ++index)
+        {
+            workers.emplace_back(
+                [&, index]()
+                {
+                    ready.fetch_add(1u, std::memory_order_release);
+                    while (!start.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                    instantiate_device(index);
+                });
+        }
+        while (ready.load(std::memory_order_acquire) != templates.size())
+            std::this_thread::yield();
+        start.store(true, std::memory_order_release);
+        for (auto &worker : workers)
+            worker.join();
+    }
+    else
+    {
+        for (std::size_t index = 0u; index < templates.size(); ++index)
+            instantiate_device(index);
+    }
+    result.elapsed_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count();
+
+    for (std::size_t index = 0u; index < templates.size(); ++index)
+    {
+        if (result.status == hipSuccess &&
+            worker_status[index] != hipSuccess)
+        {
+            result.status = worker_status[index];
+        }
+        (void)hipSetDevice(templates[index].device);
+        for (hipGraphExec_t executable : executables[index])
+        {
+            if (executable)
+                (void)hipGraphExecDestroy(executable);
+        }
+    }
+    return result;
+}
 
 /**
  * @brief Destroy a retained endpoint on the device that owns its resources.
@@ -1118,6 +1286,84 @@ TEST(Perf__HIPGraphLaunchWave, FourDeviceSerialVsPersistentFanout)
     EXPECT_GT(serial_service.median_us, 0.0);
     EXPECT_GT(fanout_service.median_us, 0.0);
     destroyEndpoints();
+}
+
+// ============================================================================
+// TEST 7: Four-device retained-family graph instantiation contention
+// ============================================================================
+
+TEST(Perf__HIPGraphInstantiationWave, FourDeviceConcurrentVsSerialPublication)
+{
+    constexpr int kRequiredDevices = 4;
+    constexpr int kGraphNodes = 80;
+    constexpr int kExecutablesPerDevice = 32;
+
+    int available_devices = 0;
+    ASSERT_EQ(hipGetDeviceCount(&available_devices), hipSuccess);
+    if (available_devices < kRequiredDevices)
+    {
+        GTEST_SKIP()
+            << "Four-device graph-instantiation proof requires four visible "
+               "ROCm devices; found "
+            << available_devices;
+    }
+
+    std::vector<CapturedInstantiationTemplate> templates(
+        kRequiredDevices);
+    const auto destroyTemplates = [&]()
+    {
+        for (auto &graph : templates)
+            destroyCapturedInstantiationTemplate(graph);
+    };
+    for (int device = 0; device < kRequiredDevices; ++device)
+    {
+        const hipError_t status = captureInstantiationTemplate(
+            templates[static_cast<std::size_t>(device)],
+            device,
+            kGraphNodes);
+        if (status != hipSuccess)
+        {
+            destroyTemplates();
+            FAIL() << "Could not capture graph-instantiation template on "
+                      "ROCm device "
+                   << device << ": " << hipGetErrorString(status);
+            return;
+        }
+    }
+
+    /* Run the contended form first.  Destroying every executable before the
+     * serial wave keeps retained-family cardinality identical; the serial
+     * result then shows whether publication order, rather than graph topology,
+     * owns the scaling cliff. */
+    const InstantiationWaveResult concurrent = instantiateRetainedFamily(
+        templates,
+        kExecutablesPerDevice,
+        /*concurrent=*/true);
+    const InstantiationWaveResult serial = instantiateRetainedFamily(
+        templates,
+        kExecutablesPerDevice,
+        /*concurrent=*/false);
+    destroyTemplates();
+
+    ASSERT_EQ(concurrent.status, hipSuccess)
+        << "Concurrent retained-family publication failed: "
+        << hipGetErrorString(concurrent.status);
+    ASSERT_EQ(serial.status, hipSuccess)
+        << "Serial retained-family publication failed: "
+        << hipGetErrorString(serial.status);
+
+    std::printf(
+        "\nHIP retained-family instantiation: devices=%d nodes=%d "
+        "executables/device=%d concurrent=%.3f ms serial=%.3f ms "
+        "concurrent/serial=%.3fx\n",
+        kRequiredDevices,
+        kGraphNodes,
+        kExecutablesPerDevice,
+        concurrent.elapsed_ms,
+        serial.elapsed_ms,
+        serial.elapsed_ms > 0.0
+            ? concurrent.elapsed_ms / serial.elapsed_ms
+            : 0.0);
 }
 
 } // anonymous namespace

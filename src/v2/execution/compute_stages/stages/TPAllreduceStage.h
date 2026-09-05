@@ -39,6 +39,24 @@ namespace llaminar2
     struct WorkspaceRequirements;
 
     /**
+     * @brief Arithmetic authority used to publish one tensor-parallel sum.
+     *
+     * NativeCollective delegates both transport and floating-point reduction
+     * to the configured collective backend. CanonicalRankOrder uses the native
+     * backend only to allgather immutable participant banks, then folds those
+     * banks on device from rank zero upward. The latter is required whenever a
+     * grouped MTP row must be byte-identical to an independently decoded row.
+     */
+    enum class TPAllreduceArithmeticPolicy
+    {
+        NativeCollective,
+        CanonicalRankOrder
+    };
+
+    /** @return Stable diagnostic name for @p policy. */
+    const char *toString(TPAllreduceArithmeticPolicy policy) noexcept;
+
+    /**
      * @brief Native rooted LocalTP collective selected declaratively by a graph.
      */
     enum class TPLocalRootedCollectiveOperation
@@ -102,6 +120,8 @@ namespace llaminar2
         size_t count = 0;                         ///< Elements to reduce (0 = use tensor->numel())
         std::string stage_name;                   ///< Stage identifier for registered tensor lookup (optional)
         std::string precision;                    ///< Allreduce precision override ("fp32", "fp16", "bf16", "" = use global default)
+        TPAllreduceArithmeticPolicy arithmetic_policy =
+            TPAllreduceArithmeticPolicy::NativeCollective; ///< Floating-point reduction authority.
         std::optional<BufferId> tensor_buffer_id; ///< Arena BufferId for the in-place tensor (enables contract-based coherence)
         int sideband_device_index = -1;           ///< LocalTP participant index for optional sidebands.
         std::vector<LocalTPCollectiveSidebandBuffer> sidebands; ///< Optional same-stream control sidebands.
@@ -245,6 +265,13 @@ namespace llaminar2
             return params_.precision;
         }
 
+        /** @return Graph-bound floating-point reduction authority. */
+        [[nodiscard]] TPAllreduceArithmeticPolicy getArithmeticPolicy() const
+            noexcept
+        {
+            return params_.arithmetic_policy;
+        }
+
         /**
          * @brief Return the arena identity of the in-place tensor.
          * @return Optional BufferId used by declarative coherence handling.
@@ -278,6 +305,21 @@ namespace llaminar2
         void setParams(const Params &params);
 
     private:
+        /**
+         * @brief Execute the native-allgather plus fixed-rank device fold.
+         *
+         * @param local_tp Homogeneous LocalTP authority owning the collective.
+         * @param effective_count FP32 values contributed by each participant.
+         * @param stage_stream Exact graph stream for transport and reduction.
+         * @param sidebands Optional control collectives ordered after allgather.
+         * @return true after all operations were enqueued successfully.
+         */
+        bool executeCanonicalRankOrder(
+            ILocalTPContext *local_tp,
+            size_t effective_count,
+            void *stage_stream,
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands);
+
         Params params_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
     };

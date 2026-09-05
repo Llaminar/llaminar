@@ -1,4 +1,5 @@
 #include "PreparedWeightStore.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "../tensors/TensorClasses.h"
 #include "../tensors/TensorKernels.h"
 
@@ -21,6 +22,14 @@ namespace llaminar2
 {
     namespace
     {
+        /** @return Whether an owner is legal for persistent prepared weights. */
+        bool isPersistentWeightOwner(PhysicalMemoryOwner owner) noexcept
+        {
+            return owner == PhysicalMemoryOwner::PrimaryModelWeights ||
+                   owner == PhysicalMemoryOwner::AdditionalModelWeights ||
+                   owner == PhysicalMemoryOwner::RoutedExpertWeights;
+        }
+
         void validateBindingForStore(const WeightBinding &binding, ModelContextId model_id, PreparedWeightKind kind)
         {
             if (binding.binding_id == 0)
@@ -181,6 +190,31 @@ namespace llaminar2
         return model_id_ == model_id;
     }
 
+    void PreparedWeightStore::installPhysicalMemoryAuthority(
+        std::shared_ptr<PhysicalMemoryAuthority> authority)
+    {
+        if (!authority)
+        {
+            throw std::invalid_argument(
+                "PreparedWeightStore requires a non-null physical-memory authority");
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (physical_memory_authority_ &&
+            physical_memory_authority_.get() != authority.get())
+        {
+            throw std::logic_error(
+                "PreparedWeightStore cannot replace a live physical-memory authority");
+        }
+        physical_memory_authority_ = std::move(authority);
+    }
+
+    std::shared_ptr<PhysicalMemoryAuthority>
+    PreparedWeightStore::physicalMemoryAuthority() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return physical_memory_authority_;
+    }
+
     PreparedWeightKind PreparedWeightStore::inferPreparedKind(DeviceId device) const
     {
         if (device.is_cuda())
@@ -200,8 +234,23 @@ namespace llaminar2
         return ref;
     }
 
-    PreparedWeightRef PreparedWeightStore::prepareGemm(const WeightBinding &binding)
+    PreparedWeightRef PreparedWeightStore::prepareGemm(
+        const WeightBinding &binding)
     {
+        return prepareGemm(
+            binding,
+            PhysicalMemoryOwner::PrimaryModelWeights);
+    }
+
+    PreparedWeightRef PreparedWeightStore::prepareGemm(
+        const WeightBinding &binding,
+        PhysicalMemoryOwner memory_owner)
+    {
+        if (!isPersistentWeightOwner(memory_owner))
+        {
+            throw std::invalid_argument(
+                "PreparedWeightStore::prepareGemm requires a persistent-weight memory owner");
+        }
         if (!binding.tensor)
             throw std::runtime_error("PreparedWeightStore::prepareGemm requires a tensor binding: " + binding.identity.canonical_name);
 
@@ -579,10 +628,54 @@ namespace llaminar2
         size_t vocab_offset,
         size_t total_vocab)
     {
+        return prepareEmbedding(
+            binding,
+            d_model,
+            vocab_offset,
+            total_vocab,
+            PhysicalMemoryOwner::PrimaryModelWeights);
+    }
+
+    PreparedWeightRef PreparedWeightStore::prepareEmbedding(
+        const WeightBinding &binding,
+        int d_model,
+        size_t vocab_offset,
+        size_t total_vocab,
+        PhysicalMemoryOwner memory_owner)
+    {
+        if (!isPersistentWeightOwner(memory_owner))
+        {
+            throw std::invalid_argument(
+                "PreparedWeightStore::prepareEmbedding requires a persistent-weight memory owner");
+        }
         if (!binding.tensor)
             throw std::runtime_error("PreparedWeightStore::prepareEmbedding requires a tensor binding: " + binding.identity.canonical_name);
 
         const DeviceId device = binding.residency.resident_device.value_or(binding.residency.home_device);
+
+        /*
+         * Acquire the exact claim before entering the backend allocator. The
+         * handle takes ownership only after allocation succeeds; every throw
+         * before that point rolls the claim back through local RAII.
+         */
+        std::optional<PhysicalMemoryAllocationLease> allocation_lease;
+        if (const auto authority = physicalMemoryAuthority())
+        {
+            const size_t allocation_bytes =
+                PreparedEmbeddingWeights::allocationBytes(
+                    binding.tensor->rows(),
+                    d_model);
+            allocation_lease.emplace(
+                authority->claimNewAllocation(
+                    device,
+                    memory_owner,
+                    allocation_bytes));
+        }
+        else if (device.is_gpu())
+        {
+            throw std::logic_error(
+                "PreparedWeightStore GPU embedding preparation requires the admitted physical-memory authority");
+        }
 
         auto owned = llaminar::v2::kernels::KernelFactory::prepareEmbeddingHandleLocal(
             binding.tensor, d_model, device, vocab_offset, total_vocab);
@@ -591,6 +684,11 @@ namespace llaminar2
 
         validateBindingForStore(binding, model_id_, PreparedWeightKind::PreparedEmbedding);
         validatePreparedEmbeddingHandle(binding, device, owned.get());
+        if (allocation_lease)
+        {
+            owned->weights->bindPhysicalMemoryLease(
+                std::move(*allocation_lease));
+        }
 
         auto ref = makeRef(binding.binding_id, PreparedWeightKind::PreparedEmbedding, device);
         WeightBinding stored = binding;

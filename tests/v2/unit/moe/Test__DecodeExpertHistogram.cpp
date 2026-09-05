@@ -57,6 +57,91 @@ static DecodeExpertHistogramConfig makeConfig(
 
 // ── Tests ─────────────────────────────────────────────
 
+TEST(Test__DecodeExpertHistogram,
+     RetainedMTPTopologyKeepsMainDecodeCatchupReachable)
+{
+    const auto topology =
+        ExpertHistogramProductionTopology::forRetainedExecution(
+            /*retained_layer_count=*/49,
+            /*main_inference_layer_count=*/48,
+            ExpertHistogramServingRegime::PositiveDepthMTP);
+
+    EXPECT_EQ(topology.layerCount(), 49u);
+    EXPECT_TRUE(topology.reachable(0, 0));
+    EXPECT_TRUE(topology.reachable(0, 1));
+    EXPECT_TRUE(topology.reachable(0, 2));
+    EXPECT_TRUE(topology.reachable(47, 0));
+    EXPECT_FALSE(topology.requiresServiceEvidence(0, 0));
+    EXPECT_TRUE(topology.requiresServiceEvidence(0, 1));
+    EXPECT_TRUE(topology.requiresServiceEvidence(0, 2));
+    EXPECT_FALSE(topology.reachable(48, 0));
+    EXPECT_FALSE(topology.reachable(48, 1));
+    EXPECT_TRUE(topology.reachable(48, 2));
+    EXPECT_EQ(
+        topology.activeSources(),
+        (ExpertHistogramProductionSourceMask{true, true, true}));
+    EXPECT_EQ(
+        topology.economyActiveSources(),
+        (ExpertHistogramProductionSourceMask{false, true, true}));
+}
+
+TEST(Test__DecodeExpertHistogram,
+     DisabledMTPLeavesRetainedPredictorCapacityPhaseEmpty)
+{
+    const auto topology =
+        ExpertHistogramProductionTopology::forRetainedExecution(
+            /*retained_layer_count=*/49,
+            /*main_inference_layer_count=*/48,
+            ExpertHistogramServingRegime::Serial);
+
+    EXPECT_TRUE(topology.reachable(0, 0));
+    EXPECT_TRUE(topology.reachable(0, 1));
+    EXPECT_FALSE(topology.reachable(0, 2));
+    EXPECT_FALSE(topology.reachable(48, 0));
+    EXPECT_FALSE(topology.reachable(48, 1));
+    EXPECT_FALSE(topology.reachable(48, 2));
+    EXPECT_TRUE(topology.requiresServiceEvidence(0, 0));
+    EXPECT_TRUE(topology.requiresServiceEvidence(0, 1));
+    EXPECT_EQ(
+        topology.activeSources(),
+        (ExpertHistogramProductionSourceMask{true, true, false}));
+}
+
+TEST(Test__DecodeExpertHistogram,
+     AdaptiveDepthZeroMakesSerialDecodeEconomyRequired)
+{
+    const auto topology =
+        ExpertHistogramProductionTopology::forRetainedExecution(
+            /*retained_layer_count=*/49,
+            /*main_inference_layer_count=*/48,
+            ExpertHistogramServingRegime::AdaptiveSerialOrMTP);
+
+    EXPECT_TRUE(topology.reachable(0, 0));
+    EXPECT_TRUE(topology.requiresServiceEvidence(0, 0));
+    EXPECT_EQ(
+        topology.economyActiveSources(),
+        (ExpertHistogramProductionSourceMask{true, true, true}));
+    EXPECT_FALSE(topology.requiresServiceEvidence(48, 0));
+    EXPECT_TRUE(topology.requiresServiceEvidence(48, 2));
+}
+
+TEST(Test__DecodeExpertHistogram,
+     RetainedExecutionTopologyRejectsInvalidLayerBoundaries)
+{
+    EXPECT_THROW(
+        (void)ExpertHistogramProductionTopology::forRetainedExecution(
+            0, 0, ExpertHistogramServingRegime::PositiveDepthMTP),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)ExpertHistogramProductionTopology::forRetainedExecution(
+            48, 0, ExpertHistogramServingRegime::PositiveDepthMTP),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)ExpertHistogramProductionTopology::forRetainedExecution(
+            48, 49, ExpertHistogramServingRegime::PositiveDepthMTP),
+        std::invalid_argument);
+}
+
 TEST(Test__DecodeExpertHistogram, Construction)
 {
     auto cfg = makeConfig(4, 64, 8, 256);
@@ -876,8 +961,11 @@ TEST(Test__DecodeExpertHistogram, PrefillChunkRouteMergeCountsOnlyRealRows)
     chunk0.real_token_count = 3;
     chunk0.bucket_token_count = 4;
     chunk0.top_k = 2;
+    std::vector<std::uint64_t> count_scratch(
+        static_cast<std::size_t>(cfg.num_experts));
 
-    auto result = hist.mergeRoutedExpertRows(chunk0_routes.data(), chunk0);
+    auto result = hist.mergeRoutedExpertRows(
+        chunk0_routes.data(), chunk0, count_scratch);
 
     ASSERT_TRUE(result) << result.error;
     EXPECT_EQ(result.tokens_counted, 3u);
@@ -903,7 +991,8 @@ TEST(Test__DecodeExpertHistogram, PrefillChunkRouteMergeCountsOnlyRealRows)
     RoutedExpertHistogramMerge chunk1 = chunk0;
     chunk1.real_token_count = 2;
 
-    result = hist.mergeRoutedExpertRows(chunk1_routes.data(), chunk1);
+    result = hist.mergeRoutedExpertRows(
+        chunk1_routes.data(), chunk1, count_scratch);
 
     ASSERT_TRUE(result) << result.error;
     EXPECT_EQ(result.tokens_counted, 2u);
@@ -928,6 +1017,8 @@ TEST(Test__DecodeExpertHistogram, FrozenWindowRetainsExactProductionPhaseEvidenc
         1, 2,
         1, 3,
     };
+    std::vector<std::uint64_t> count_scratch(
+        static_cast<std::size_t>(cfg.num_experts));
     const auto prefill_result = hist.mergeRoutedExpertRows(
         prefill_routes.data(),
         RoutedExpertHistogramMerge{
@@ -938,7 +1029,8 @@ TEST(Test__DecodeExpertHistogram, FrozenWindowRetainsExactProductionPhaseEvidenc
             .top_k = 2,
             .route_stride = 2,
             .count_window_tokens = true,
-        });
+        },
+        count_scratch);
     ASSERT_TRUE(prefill_result) << prefill_result.error;
 
     const std::uint64_t verifier_counts[4] = {0, 0, 3, 1};
@@ -982,8 +1074,11 @@ TEST(Test__DecodeExpertHistogram, FrozenWindowRetainsExactProductionPhaseEvidenc
 TEST(Test__DecodeExpertHistogram,
      ValidatedFrozenViewAuthenticatesOnceAndProvidesTypedConstantTimeReads)
 {
-    DecodeExpertHistogram hist(makeConfig(2, 4, 2, 8));
+    auto cfg = makeConfig(2, 4, 2, 8);
+    DecodeExpertHistogram hist(cfg);
     const std::array<int, 2> decode_routes{1, 3};
+    std::vector<std::uint64_t> count_scratch(
+        static_cast<std::size_t>(cfg.num_experts));
     const auto merge = hist.mergeRoutedExpertRows(
         decode_routes.data(),
         RoutedExpertHistogramMerge{
@@ -994,7 +1089,8 @@ TEST(Test__DecodeExpertHistogram,
             .top_k = 2,
             .route_stride = 2,
             .count_window_tokens = true,
-        });
+        },
+        count_scratch);
     ASSERT_TRUE(merge) << merge.error;
 
     const auto frozen = hist.freezeAndRotateWindow();
@@ -1035,11 +1131,42 @@ TEST(Test__DecodeExpertHistogram, PrefillChunkRouteMergeRejectsInvalidRealRowsBe
     merge.real_token_count = 2;
     merge.bucket_token_count = 3;
     merge.top_k = 2;
+    std::vector<std::uint64_t> count_scratch(
+        static_cast<std::size_t>(cfg.num_experts));
 
-    auto result = hist.mergeRoutedExpertRows(routes.data(), merge);
+    auto result = hist.mergeRoutedExpertRows(
+        routes.data(), merge, count_scratch);
 
     EXPECT_FALSE(result);
     EXPECT_NE(result.error.find("expert id"), std::string::npos);
+    EXPECT_EQ(hist.windowTokenCount(), 0u);
+    for (int expert = 0; expert < cfg.num_experts; ++expert)
+        EXPECT_EQ(hist.activationCount(0, expert), 0u);
+}
+
+TEST(Test__DecodeExpertHistogram,
+     RoutedRowMergeRejectsUndersizedCallerScratchBeforeMutation)
+{
+    auto cfg = makeConfig(1, 4, 2, 8);
+    DecodeExpertHistogram hist(cfg);
+    const std::array<int, 2> routes{0, 1};
+    std::array<std::uint64_t, 3> undersized_scratch{};
+
+    const auto result = hist.mergeRoutedExpertRows(
+        routes.data(),
+        RoutedExpertHistogramMerge{
+            .source = ExpertHistogramSource::DecodeToken,
+            .layer_idx = 0,
+            .real_token_count = 1,
+            .bucket_token_count = 1,
+            .top_k = 2,
+            .route_stride = 2,
+            .count_window_tokens = true,
+        },
+        undersized_scratch);
+
+    EXPECT_FALSE(result);
+    EXPECT_NE(result.error.find("expert_count_scratch"), std::string::npos);
     EXPECT_EQ(hist.windowTokenCount(), 0u);
     for (int expert = 0; expert < cfg.num_experts; ++expert)
         EXPECT_EQ(hist.activationCount(0, expert), 0u);

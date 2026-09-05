@@ -2,8 +2,9 @@
  * @file Perf__CPUMoEExpertVerifierRows.cpp
  * @brief Production-shaped CPU MoE verifier-FFN correctness and economy gate.
  *
- * Qwen3.6-35B-A3B routes a verifier transaction through expert matrices with
- * `d_model=2048` and `intermediate=512`. On one apportioned dual-socket rank,
+ * By default Qwen3.6-35B-A3B routes a verifier transaction through expert
+ * matrices with `d_model=2048` and `intermediate=512`. On one apportioned
+ * dual-socket rank,
  * a depth-three verifier commonly owns about sixteen route rows distributed
  * across fourteen experts: most experts receive one row and a small minority
  * receive two. This harness reproduces that sparse expert-major geometry
@@ -16,18 +17,26 @@
  * Every grouped intermediate is compared byte-for-byte with independent M=1
  * serial decode before timing begins. The diagnostic serial route is never a
  * production implementation; it is solely the arithmetic oracle required to
- * tune grouped execution safely. IQ2_S is the default because production
+ * tune grouped execution safely. The benchmark measures both the GPU-aligned
+ * production expert contract and the otherwise-identical backend-native CPU
+ * contract so parity-preserving arithmetic changes carry a visible economy
+ * cost. IQ2_S is the default because production
  * PerfStats identify codebook 13 for the routed experts in the active
  * Qwen3.6-35B UD-IQ3_S artifact; the file-level quantization label does not
  * imply that every tensor has the same codebook. Set
  * `LLAMINAR_CPU_MOE_EXPERT_FORMATS=all` to run the canonical all-format
- * registry, or provide a comma-separated subset.
+ * registry, or provide a comma-separated subset. Timed samples execute a
+ * configurable transaction batch (`LLAMINAR_CPU_MOE_EXPERT_BATCH_ITERATIONS`)
+ * so sub-millisecond OpenMP wake-up jitter cannot masquerade as a kernel
+ * regression. Profiler launches isolate one policy selected by
+ * `LLAMINAR_CPU_MOE_EXPERT_PROFILE_POLICY=native|aligned`.
  */
 
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
+#include "utils/CPUFeatures.h"
 #include "utils/QuantizedVerifierFormats.h"
 
 #include <algorithm>
@@ -35,6 +44,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -49,14 +59,15 @@
 
 using namespace llaminar2;
 using llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel;
+using llaminar2::cpu::native_vnni::VerifierRowsPolicy;
 using llaminar2::cpu::native_vnni::gemv_native_vnni_preq;
 using llaminar2::cpu::native_vnni::quantize_activations_to_q8_1;
 using llaminar2::cpu::native_vnni::swiglu_quantize_activations_to_q8_1;
 
 namespace
 {
-    constexpr int kDModel = 2048;
-    constexpr int kIntermediate = 512;
+    constexpr int kDefaultDModel = 2048;
+    constexpr int kDefaultIntermediate = 512;
     constexpr int kDefaultActiveExperts = 14;
     constexpr int kDefaultLocalRouteRows = 16;
 
@@ -82,6 +93,13 @@ namespace
         double complete_us = 0.0;
         double persistent_complete_us = 0.0;
         double serial_us = 0.0;
+    };
+
+    /** @brief Numerical policy isolated by an external profiler launch. */
+    enum class ProfilePolicy : uint8_t
+    {
+        Native,
+        Aligned,
     };
 
     /** @brief Parse a positive integer environment setting. */
@@ -116,6 +134,50 @@ namespace
                 std::string(name) + " must be a non-negative integer");
         }
         return static_cast<int>(parsed);
+    }
+
+    /** @brief Parse a forceable grouped-row policy for exact perf comparison. */
+    VerifierRowsPolicy selectedVerifierPolicy()
+    {
+        const char *raw =
+            std::getenv("LLAMINAR_CPU_MOE_EXPERT_VERIFIER_POLICY");
+        const std::string policy = raw && *raw ? raw : "Auto";
+        if (policy == "Auto")
+            return VerifierRowsPolicy::Auto;
+        if (policy == "Pairwise")
+            return VerifierRowsPolicy::Pairwise;
+        if (policy == "WideRows")
+            return VerifierRowsPolicy::WideRows;
+        if (policy == "FullKRowChunkGrid")
+            return VerifierRowsPolicy::FullKRowChunkGrid;
+        if (policy == "FullKTwoRowNbc1")
+            return VerifierRowsPolicy::FullKTwoRowNbc1;
+        if (policy == "FullKTwoRowNbc2")
+            return VerifierRowsPolicy::FullKTwoRowNbc2;
+        if (policy == "FullKTwoRowPairGridNbc1")
+            return VerifierRowsPolicy::FullKTwoRowPairGridNbc1;
+        if (policy == "FullKTwoRowPairGridNbc2")
+            return VerifierRowsPolicy::FullKTwoRowPairGridNbc2;
+        if (policy == "FullKTwoRowPairGridNbc4")
+            return VerifierRowsPolicy::FullKTwoRowPairGridNbc4;
+        if (policy == "FullKTwoRowPairGridNbc8")
+            return VerifierRowsPolicy::FullKTwoRowPairGridNbc8;
+        throw std::invalid_argument(
+            "LLAMINAR_CPU_MOE_EXPERT_VERIFIER_POLICY names an unknown policy");
+    }
+
+    /** @brief Parse the one policy that a profiler launch may exercise. */
+    ProfilePolicy selectedProfilePolicy()
+    {
+        const char *raw =
+            std::getenv("LLAMINAR_CPU_MOE_EXPERT_PROFILE_POLICY");
+        const std::string policy = raw && *raw ? raw : "aligned";
+        if (policy == "native")
+            return ProfilePolicy::Native;
+        if (policy == "aligned")
+            return ProfilePolicy::Aligned;
+        throw std::invalid_argument(
+            "LLAMINAR_CPU_MOE_EXPERT_PROFILE_POLICY must be native or aligned");
     }
 
     /** @brief Parse the optional comma-separated format selection. */
@@ -166,10 +228,10 @@ namespace
     }
 
     /** @brief Produce deterministic, non-trivial router-published hidden rows. */
-    std::vector<float> makeHiddenRows(int rows)
+    std::vector<float> makeHiddenRows(int rows, int d_model)
     {
         std::vector<float> hidden(
-            static_cast<size_t>(rows) * static_cast<size_t>(kDModel));
+            static_cast<size_t>(rows) * static_cast<size_t>(d_model));
         for (size_t index = 0; index < hidden.size(); ++index)
         {
             const int centered =
@@ -207,22 +269,38 @@ namespace
             << " expected=" << static_cast<unsigned>(expected_bytes[first]);
     }
 
-    /** @brief Return median latency after untimed warmup. */
+    /**
+     * @brief Return median per-transaction latency from batched samples.
+     *
+     * One production transaction is shorter than an OpenMP scheduling quantum
+     * on this geometry. Repeating it inside one clock interval makes timing
+     * proportional to kernel work while retaining the same prepared weights,
+     * worker team, and rotating expert working set.
+     */
     template <typename Function>
-    double medianMicros(Function &&function, int warmup, int samples)
+    double medianMicros(
+        Function &&function,
+        int warmup,
+        int samples,
+        int batch_iterations)
     {
         for (int iteration = 0; iteration < warmup; ++iteration)
-            function();
+        {
+            for (int batch = 0; batch < batch_iterations; ++batch)
+                function();
+        }
 
         std::vector<double> measurements;
         measurements.reserve(static_cast<size_t>(samples));
         for (int sample = 0; sample < samples; ++sample)
         {
             const auto begin = std::chrono::steady_clock::now();
-            function();
+            for (int batch = 0; batch < batch_iterations; ++batch)
+                function();
             const auto end = std::chrono::steady_clock::now();
             measurements.push_back(
-                std::chrono::duration<double, std::micro>(end - begin).count());
+                std::chrono::duration<double, std::micro>(end - begin).count() /
+                static_cast<double>(batch_iterations));
         }
         std::sort(measurements.begin(), measurements.end());
         return measurements[measurements.size() / 2u];
@@ -233,7 +311,10 @@ namespace
      */
     std::vector<PreparedExpert> prepareExperts(
         const test::QuantizedVerifierFormatCase &format,
-        const std::vector<int> &rows_per_expert)
+        const std::vector<int> &rows_per_expert,
+        int d_model,
+        int intermediate,
+        CPUProjectionNumericalPolicy numerical_policy)
     {
         std::vector<PreparedExpert> experts;
         experts.reserve(rows_per_expert.size());
@@ -250,16 +331,16 @@ namespace
             const uint32_t seed = static_cast<uint32_t>(
                 41000u + expert_index * 101u + format.source_codebook_id);
             expert.gate_weights = format.create(
-                {static_cast<size_t>(kIntermediate),
-                 static_cast<size_t>(kDModel)},
+                {static_cast<size_t>(intermediate),
+                 static_cast<size_t>(d_model)},
                 seed + 1u);
             expert.up_weights = format.create(
-                {static_cast<size_t>(kIntermediate),
-                 static_cast<size_t>(kDModel)},
+                {static_cast<size_t>(intermediate),
+                 static_cast<size_t>(d_model)},
                 seed + 2u);
             expert.down_weights = format.create(
-                {static_cast<size_t>(kDModel),
-                 static_cast<size_t>(kIntermediate)},
+                {static_cast<size_t>(d_model),
+                 static_cast<size_t>(intermediate)},
                 seed + 3u);
             if (!expert.gate_weights || !expert.up_weights ||
                 !expert.down_weights)
@@ -270,11 +351,11 @@ namespace
             }
 
             expert.gate = std::make_unique<CPUNativeVNNIGemmKernel>(
-                expert.gate_weights.get());
+                expert.gate_weights.get(), 0, -1, numerical_policy);
             expert.up = std::make_unique<CPUNativeVNNIGemmKernel>(
-                expert.up_weights.get());
+                expert.up_weights.get(), 0, -1, numerical_policy);
             expert.down = std::make_unique<CPUNativeVNNIGemmKernel>(
-                expert.down_weights.get());
+                expert.down_weights.get(), 0, -1, numerical_policy);
             if (!expert.gate->isValid() || !expert.up->isValid() ||
                 !expert.down->isValid())
             {
@@ -294,37 +375,49 @@ namespace
         const test::QuantizedVerifierFormatCase &format,
         int active_experts,
         int local_route_rows,
+        int d_model,
+        int intermediate,
+        CPUProjectionNumericalPolicy numerical_policy,
+        VerifierRowsPolicy verifier_schedule,
         int warmup,
         int samples,
+        int batch_iterations,
         int profile_iterations,
         const std::string &profile_phase)
     {
         const std::vector<int> rows_per_expert =
             routeRowsPerExpert(active_experts, local_route_rows);
         std::vector<PreparedExpert> experts =
-            prepareExperts(format, rows_per_expert);
+            prepareExperts(
+                format,
+                rows_per_expert,
+                d_model,
+                intermediate,
+                numerical_policy);
 
         const int hidden_blocks =
-            kDModel / static_cast<int>(Q8_1Block::BLOCK_SIZE);
+            d_model / static_cast<int>(Q8_1Block::BLOCK_SIZE);
         const int activation_blocks =
-            kIntermediate / static_cast<int>(Q8_1Block::BLOCK_SIZE);
-        const std::vector<float> hidden = makeHiddenRows(local_route_rows);
+            intermediate / static_cast<int>(Q8_1Block::BLOCK_SIZE);
+        const std::vector<float> hidden =
+            makeHiddenRows(local_route_rows, d_model);
         std::vector<Q8_1Block> router_q8(
             static_cast<size_t>(local_route_rows) * hidden_blocks);
         quantize_activations_to_q8_1(
             hidden.data(),
             router_q8.data(),
             local_route_rows,
-            kDModel,
-            hidden_blocks);
+            d_model,
+            hidden_blocks,
+            numerical_policy);
 
         std::vector<float> grouped_gate(
-            static_cast<size_t>(local_route_rows) * kIntermediate);
+            static_cast<size_t>(local_route_rows) * intermediate);
         std::vector<float> grouped_up(grouped_gate.size());
         std::vector<Q8_1Block> grouped_activation(
             static_cast<size_t>(local_route_rows) * activation_blocks);
         std::vector<float> grouped_down(
-            static_cast<size_t>(local_route_rows) * kDModel);
+            static_cast<size_t>(local_route_rows) * d_model);
 
         std::vector<float> serial_gate(grouped_gate.size());
         std::vector<float> serial_up(grouped_up.size());
@@ -346,30 +439,33 @@ namespace
             gate_up_descriptors.push_back({
                 .kernel = expert.gate.get(),
                 .input_q8 = expert_input,
-                .output = grouped_gate.data() + row * kIntermediate,
+                .output = grouped_gate.data() + row * intermediate,
                 .bias = nullptr,
                 .rows = expert.rows,
-                .n = kIntermediate,
-                .ldc = kIntermediate,
+                .n = intermediate,
+                .ldc = intermediate,
+                .verifier_schedule = verifier_schedule,
             });
             gate_up_descriptors.push_back({
                 .kernel = expert.up.get(),
                 .input_q8 = expert_input,
-                .output = grouped_up.data() + row * kIntermediate,
+                .output = grouped_up.data() + row * intermediate,
                 .bias = nullptr,
                 .rows = expert.rows,
-                .n = kIntermediate,
-                .ldc = kIntermediate,
+                .n = intermediate,
+                .ldc = intermediate,
+                .verifier_schedule = verifier_schedule,
             });
             down_descriptors.push_back({
                 .kernel = expert.down.get(),
                 .input_q8 = grouped_activation.data() +
                     row * activation_blocks,
-                .output = grouped_down.data() + row * kDModel,
+                .output = grouped_down.data() + row * d_model,
                 .bias = nullptr,
                 .rows = expert.rows,
-                .n = kDModel,
-                .ldc = kDModel,
+                .n = d_model,
+                .ldc = d_model,
+                .verifier_schedule = verifier_schedule,
             });
         }
 
@@ -379,7 +475,7 @@ namespace
                     multiply_batched_preq_decode_equivalent(
                         gate_up_descriptors.data(),
                         static_cast<int>(gate_up_descriptors.size()),
-                        kDModel))
+                        d_model))
             {
                 throw std::runtime_error("Grouped CPU MoE gate/up failed");
             }
@@ -391,8 +487,9 @@ namespace
                 grouped_up.data(),
                 grouped_activation.data(),
                 local_route_rows,
-                kIntermediate,
-                activation_blocks);
+                intermediate,
+                activation_blocks,
+                numerical_policy);
         };
         auto grouped_down_projection = [&]()
         {
@@ -400,7 +497,7 @@ namespace
                     multiply_batched_preq_decode_equivalent(
                         down_descriptors.data(),
                         static_cast<int>(down_descriptors.size()),
-                        kIntermediate))
+                        intermediate))
             {
                 throw std::runtime_error("Grouped CPU MoE down failed");
             }
@@ -417,12 +514,12 @@ namespace
                     execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
                         gate_up_descriptors.data(),
                         static_cast<int>(gate_up_descriptors.size()),
-                        kDModel,
+                        d_model,
                         grouped_gate.data(),
                         grouped_up.data(),
                         grouped_activation.data(),
                         local_route_rows,
-                        kIntermediate,
+                        intermediate,
                         activation_blocks,
                         down_descriptors.data(),
                         static_cast<int>(down_descriptors.size())))
@@ -443,31 +540,44 @@ namespace
                         router_q8.data() +
                         static_cast<size_t>(row) * hidden_blocks;
                     float *gate_row = serial_gate.data() +
-                        static_cast<size_t>(row) * kIntermediate;
+                        static_cast<size_t>(row) * intermediate;
                     float *up_row = serial_up.data() +
-                        static_cast<size_t>(row) * kIntermediate;
+                        static_cast<size_t>(row) * intermediate;
                     float *activated_row = serial_activated.data() +
-                        static_cast<size_t>(row) * kIntermediate;
+                        static_cast<size_t>(row) * intermediate;
                     Q8_1Block *activation_row = serial_activation.data() +
                         static_cast<size_t>(row) * activation_blocks;
                     float *down_row = serial_down.data() +
-                        static_cast<size_t>(row) * kDModel;
+                        static_cast<size_t>(row) * d_model;
 
                     gemv_native_vnni_preq(
                         expert.gate->packedWeights(), hidden_row, gate_row);
                     gemv_native_vnni_preq(
                         expert.up->packedWeights(), hidden_row, up_row);
-                    primitives::compute_swiglu_serial(
-                        gate_row,
-                        up_row,
-                        activated_row,
-                        kIntermediate);
+                    if (numerical_policy ==
+                        CPUProjectionNumericalPolicy::GPUAlignedExpert)
+                    {
+                        primitives::compute_swiglu_gpu_aligned_expert_serial(
+                            gate_row,
+                            up_row,
+                            activated_row,
+                            intermediate);
+                    }
+                    else
+                    {
+                        primitives::compute_swiglu_serial(
+                            gate_row,
+                            up_row,
+                            activated_row,
+                            intermediate);
+                    }
                     quantize_activations_to_q8_1(
                         activated_row,
                         activation_row,
                         1,
-                        kIntermediate,
-                        activation_blocks);
+                        intermediate,
+                        activation_blocks,
+                        numerical_policy);
                     gemv_native_vnni_preq(
                         expert.down->packedWeights(),
                         activation_row,
@@ -557,17 +667,20 @@ namespace
 
         PipelineTiming timing;
         timing.gate_up_us =
-            medianMicros(grouped_gate_up, warmup, samples);
+            medianMicros(grouped_gate_up, warmup, samples, batch_iterations);
         timing.swiglu_q8_us =
-            medianMicros(grouped_swiglu_q8, warmup, samples);
+            medianMicros(grouped_swiglu_q8, warmup, samples, batch_iterations);
         timing.down_us =
-            medianMicros(grouped_down_projection, warmup, samples);
+            medianMicros(
+                grouped_down_projection, warmup, samples, batch_iterations);
         timing.complete_us =
-            medianMicros(grouped_complete, warmup, samples);
+            medianMicros(grouped_complete, warmup, samples, batch_iterations);
         timing.persistent_complete_us =
-            medianMicros(grouped_complete_persistent, warmup, samples);
+            medianMicros(
+                grouped_complete_persistent, warmup, samples, batch_iterations);
         timing.serial_us =
-            medianMicros(serial_complete, /*warmup=*/1, samples);
+            medianMicros(
+                serial_complete, /*warmup=*/1, samples, batch_iterations);
         return timing;
     }
 } // namespace
@@ -577,6 +690,12 @@ namespace
  */
 TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
 {
+    const int d_model = envPositiveInt(
+        "LLAMINAR_CPU_MOE_EXPERT_D_MODEL",
+        kDefaultDModel);
+    const int intermediate = envPositiveInt(
+        "LLAMINAR_CPU_MOE_EXPERT_INTERMEDIATE",
+        kDefaultIntermediate);
     const int active_experts = envPositiveInt(
         "LLAMINAR_CPU_MOE_EXPERT_ACTIVE_EXPERTS",
         kDefaultActiveExperts);
@@ -589,6 +708,9 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
     const int samples = envPositiveInt(
         "LLAMINAR_CPU_MOE_EXPERT_SAMPLES",
         9);
+    const int batch_iterations = envPositiveInt(
+        "LLAMINAR_CPU_MOE_EXPERT_BATCH_ITERATIONS",
+        32);
     const int profile_iterations = envNonNegativeInt(
         "LLAMINAR_CPU_MOE_EXPERT_PROFILE_ITERATIONS",
         0);
@@ -598,52 +720,134 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
         profile_phase_raw && *profile_phase_raw
             ? profile_phase_raw
             : "complete";
+    const ProfilePolicy profile_policy = selectedProfilePolicy();
+    const VerifierRowsPolicy verifier_schedule = selectedVerifierPolicy();
     ASSERT_LE(active_experts, 256);
     ASSERT_GE(local_route_rows, active_experts);
+    ASSERT_EQ(d_model % static_cast<int>(Q8_1Block::BLOCK_SIZE), 0)
+        << "d_model must contain complete Q8_1 blocks";
+    ASSERT_EQ(intermediate % static_cast<int>(Q8_1Block::BLOCK_SIZE), 0)
+        << "intermediate must contain complete Q8_1 blocks";
 
     const std::set<std::string> requested = selectedFormats();
     const bool all_formats = requested.count("all") != 0u;
+    std::ofstream csv;
+    if (const char *path =
+            std::getenv("LLAMINAR_CPU_MOE_EXPERT_POLICY_CSV");
+        path && *path)
+    {
+        csv.open(path, std::ios::trunc);
+        ASSERT_TRUE(csv.is_open()) << "Could not open CSV output " << path;
+        csv << "format,isa,d_model,intermediate,active_experts,route_rows,"
+               "threads,native_gate_up_us,native_swiglu_q8_us,native_down_us,"
+               "native_complete_us,native_persistent_us,"
+               "aligned_gate_up_us,aligned_swiglu_q8_us,aligned_down_us,"
+               "aligned_complete_us,aligned_persistent_us,"
+               "aligned_over_native_persistent\n";
+    }
     int executed = 0;
     std::cout
-        << "\nCPU MoE verifier expert speedometer"
+        << "\nCPU MoE expert numerical-policy speedometer"
         << " (threads=" << omp_get_max_threads()
+        << ", d_model=" << d_model
+        << ", intermediate=" << intermediate
         << ", active_experts=" << active_experts
-        << ", local_route_rows=" << local_route_rows << ")\n"
-        << "format gate_up_us swiglu_q8_us down_us complete_us "
-           "persistent_us serial_us speedup persistent_speedup\n";
+        << ", local_route_rows=" << local_route_rows
+        << ", verifier_policy="
+        << cpu::native_vnni::verifierRowsPolicyName(verifier_schedule)
+        << ")\n"
+        << "format native_persistent_us aligned_persistent_us "
+           "aligned/native native_speedup aligned_speedup\n";
 
     for (const auto &format : test::quantizedMoEVerifierFormats())
     {
         if (!all_formats && requested.count(format.label) == 0u)
             continue;
 
-        const PipelineTiming timing = runFormat(
-            format,
-            active_experts,
-            local_route_rows,
-            warmup,
-            samples,
-            profile_iterations,
-            profile_phase);
-        const double speedup = timing.complete_us > 0.0
-            ? timing.serial_us / timing.complete_us
+        PipelineTiming native;
+        PipelineTiming aligned;
+        auto measure_native = [&]
+        {
+            native = runFormat(
+                format,
+                active_experts,
+                local_route_rows,
+                d_model,
+                intermediate,
+                CPUProjectionNumericalPolicy::BackendNative,
+                verifier_schedule,
+                warmup,
+                samples,
+                batch_iterations,
+                profile_policy == ProfilePolicy::Native
+                    ? profile_iterations
+                    : 0,
+                profile_phase);
+        };
+        auto measure_aligned = [&]
+        {
+            aligned = runFormat(
+                format,
+                active_experts,
+                local_route_rows,
+                d_model,
+                intermediate,
+                CPUProjectionNumericalPolicy::GPUAlignedExpert,
+                verifier_schedule,
+                warmup,
+                samples,
+                batch_iterations,
+                profile_policy == ProfilePolicy::Aligned
+                    ? profile_iterations
+                    : 0,
+                profile_phase);
+        };
+        /* Alternate first policy to avoid systematic cache-temperature bias. */
+        if ((executed & 1) != 0)
+        {
+            measure_aligned();
+            measure_native();
+        }
+        else
+        {
+            measure_native();
+            measure_aligned();
+        }
+        const double native_speedup = native.persistent_complete_us > 0.0
+            ? native.serial_us / native.persistent_complete_us
             : 0.0;
-        const double persistent_speedup = timing.persistent_complete_us > 0.0
-            ? timing.serial_us / timing.persistent_complete_us
+        const double aligned_speedup = aligned.persistent_complete_us > 0.0
+            ? aligned.serial_us / aligned.persistent_complete_us
             : 0.0;
+        const double slowdown = aligned.persistent_complete_us /
+            native.persistent_complete_us;
         std::cout
             << format.label << ' '
-            << timing.gate_up_us << ' '
-            << timing.swiglu_q8_us << ' '
-            << timing.down_us << ' '
-            << timing.complete_us << ' '
-            << timing.persistent_complete_us << ' '
-            << timing.serial_us << ' '
-            << speedup << ' '
-            << persistent_speedup << '\n';
-        EXPECT_GT(speedup, 1.0)
+            << native.persistent_complete_us << ' '
+            << aligned.persistent_complete_us << ' '
+            << slowdown << ' '
+            << native_speedup << ' '
+            << aligned_speedup << '\n';
+        if (csv)
+        {
+            csv << format.label << ','
+                << isaLevelName(activeISALevel()) << ','
+                << d_model << ',' << intermediate << ','
+                << active_experts << ',' << local_route_rows << ','
+                << omp_get_max_threads() << ','
+                << native.gate_up_us << ',' << native.swiglu_q8_us << ','
+                << native.down_us << ',' << native.complete_us << ','
+                << native.persistent_complete_us << ','
+                << aligned.gate_up_us << ',' << aligned.swiglu_q8_us << ','
+                << aligned.down_us << ',' << aligned.complete_us << ','
+                << aligned.persistent_complete_us << ',' << slowdown << '\n';
+        }
+        EXPECT_GT(native_speedup, 1.0)
             << format.label
-            << " grouped verifier expert execution must beat serial row replay";
+            << " backend-native grouped execution must beat serial row replay";
+        EXPECT_GT(aligned_speedup, 1.0)
+            << format.label
+            << " GPU-aligned grouped execution must beat serial row replay";
         ++executed;
     }
     ASSERT_GT(executed, 0)

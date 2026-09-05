@@ -1011,7 +1011,6 @@ namespace llaminar2
         std::vector<std::string> gpu_graph_collective_segmented_capture_allow; ///< Optional stage-name allowlist inside an already admitted heterogeneous collective segmented plan (env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW)
         bool gpu_graph_stream_only = false;                                    ///< Execute segmented path on stream-only mode (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY)
         bool gpu_graph_stream_only_default = false;                            ///< Stream-only mode uses default stream (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT)
-        bool gpu_graph_trace_replay = false;                                   ///< Trace per-segment progress during graph replay (env: LLAMINAR_GPU_GRAPH_TRACE_REPLAY)
         bool force_mpi_collective_context = false;                             ///< Force MPI-backed CollectiveContext in GLOBAL TP (env: LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT)
 
         // =================================================================
@@ -1116,7 +1115,6 @@ namespace llaminar2
             gpu_graph_defer_captured_collective_final_sync = false;
             gpu_graph_stream_only = false;
             gpu_graph_stream_only_default = false;
-            gpu_graph_trace_replay = false;
 
             const char *use_exec_env = std::getenv("LLAMINAR_USE_LAYER_EXECUTOR");
             if (use_exec_env)
@@ -1239,11 +1237,6 @@ namespace llaminar2
                 gpu_graph_stream_only_default = (std::atoi(gpu_graph_stream_only_default_env) != 0);
             }
 
-            const char *gpu_graph_trace_replay_env = std::getenv("LLAMINAR_GPU_GRAPH_TRACE_REPLAY");
-            if (gpu_graph_trace_replay_env)
-            {
-                gpu_graph_trace_replay = (std::atoi(gpu_graph_trace_replay_env) != 0);
-            }
 
             const char *force_mpi_collective_ctx_env = std::getenv("LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT");
             if (force_mpi_collective_ctx_env)
@@ -1418,9 +1411,6 @@ namespace llaminar2
      *   LLAMINAR_SNAPSHOT_DUMP_LAYERS=21 \
      *   LLAMINAR_SNAPSHOT_DUMP_STAGES=FFN_INPUT_RESIDUAL,FFN_DOWN,FFN_RESIDUAL \
      *   ./run_llaminar.sh -m model.gguf -p "test"
-     *
-     *   # Enable zero-copy mapped memory for snapshots
-     *   LLAMINAR_SNAPSHOT_USE_MAPPED=1 ./run_llaminar.sh -m model.gguf -p "test"
      */
     struct SnapshotConfig
     {
@@ -1431,7 +1421,6 @@ namespace llaminar2
         int dump_rank = 0;                                   ///< MPI rank to dump (-1=all)
         bool dump_all_layers = true;                         ///< Whether to dump all layers
         bool dump_all_stages = true;                         ///< Whether to dump all stages
-        bool use_mapped_memory = false;                      ///< Use mapped memory for zero-copy snapshots
 
         SnapshotConfig()
         {
@@ -1444,16 +1433,6 @@ namespace llaminar2
             if (enabled_env)
             {
                 tensor_dump_enabled = (std::atoi(enabled_env) != 0);
-            }
-
-            // LLAMINAR_SNAPSHOT_USE_MAPPED - Enable mapped memory for zero-copy snapshots
-            // When enabled, FP32 activation buffers are allocated using mapped memory
-            // (hipHostMallocMapped/cudaHostAllocMapped) which enables zero-copy access
-            // from both host and device without memcpy.
-            const char *mapped_env = std::getenv("LLAMINAR_SNAPSHOT_USE_MAPPED");
-            if (mapped_env)
-            {
-                use_mapped_memory = (std::atoi(mapped_env) != 0);
             }
 
             const char *dir_env = std::getenv("LLAMINAR_SNAPSHOT_DUMP_DIR");
@@ -2569,6 +2548,85 @@ namespace llaminar2
     };
 
     /**
+     * @brief Process-wide accelerator startup and discovery policy.
+     *
+     * These switches are operational topology inputs rather than diagnostic
+     * hints. Every path that can enumerate a GPU backend, create one of its
+     * runtime contexts, or construct one of its collective backends must use
+     * this one parsed snapshot. Keeping the decision here prevents a rank that
+     * participates only in another backend from accidentally materializing a
+     * foreign primary context and consuming that backend's memory.
+     */
+    struct BackendStartupConfig
+    {
+        /// Skip every accelerator backend when the integer environment toggle is non-zero.
+        bool force_cpu_only = false;
+        /// Skip CUDA discovery and context-factory registration when non-zero.
+        bool skip_cuda = false;
+        /// Skip ROCm discovery and context-factory registration when non-zero.
+        bool skip_rocm = false;
+
+        /**
+         * @brief Capture the process environment when the configuration is constructed.
+         */
+        BackendStartupConfig()
+        {
+            reload();
+        }
+
+        /**
+         * @brief Reload all backend-startup switches from the process environment.
+         *
+         * The parser deliberately preserves the historical non-zero integer
+         * semantics of these operational variables. Production launchers set
+         * them before process creation; tests that mutate them must explicitly
+         * reload the global DebugEnv snapshot.
+         */
+        void reload()
+        {
+            force_cpu_only = readNonZeroInteger("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
+            skip_cuda = readNonZeroInteger("LLAMINAR_SKIP_CUDA_STARTUP");
+            skip_rocm = readNonZeroInteger("LLAMINAR_SKIP_ROCM_STARTUP");
+        }
+
+        /**
+         * @brief Whether this process may initialize any accelerator backend.
+         */
+        [[nodiscard]] bool acceleratorsEnabled() const noexcept
+        {
+            return !force_cpu_only;
+        }
+
+        /**
+         * @brief Whether CUDA discovery and runtime-context creation are allowed.
+         */
+        [[nodiscard]] bool cudaEnabled() const noexcept
+        {
+            return acceleratorsEnabled() && !skip_cuda;
+        }
+
+        /**
+         * @brief Whether ROCm discovery and runtime-context creation are allowed.
+         */
+        [[nodiscard]] bool rocmEnabled() const noexcept
+        {
+            return acceleratorsEnabled() && !skip_rocm;
+        }
+
+    private:
+        /**
+         * @brief Parse one legacy integer switch without broadening its accepted syntax.
+         * @param name Environment-variable name.
+         * @return True exactly when the variable exists and `std::atoi` is non-zero.
+         */
+        static bool readNonZeroInteger(const char *name)
+        {
+            const char *value = std::getenv(name);
+            return value != nullptr && std::atoi(value) != 0;
+        }
+    };
+
+    /**
      * @brief MPI bootstrap environment snapshot
      */
     struct MPIBootstrapEnvConfig
@@ -3402,6 +3460,7 @@ namespace llaminar2
         TransferTracingConfig transfer_tracing;    ///< Memory transfer tracing for H2D/D2H debugging
         LoggerConfig logger;                       ///< Logger environment configuration
         TopologyEnvConfig topology;                ///< Topology-related environment configuration
+        BackendStartupConfig backend_startup;      ///< Authoritative accelerator discovery/context policy.
         MPIBootstrapEnvConfig mpi_bootstrap;       ///< MPI bootstrap environment snapshot
 
         /// MoE expert rebalancing configuration
@@ -4106,6 +4165,7 @@ namespace llaminar2
             transfer_tracing.reload();
             logger.reload();
             topology.reload();
+            backend_startup.reload();
             mpi_bootstrap.reload();
         }
     };

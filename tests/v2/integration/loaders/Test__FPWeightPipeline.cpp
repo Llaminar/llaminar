@@ -133,7 +133,7 @@ TEST(Test__FPWeightPipeline, PlanRawWeight_MixedWithQuantized)
 
 TEST(Test__FPWeightPipeline, Orchestrator_PlanRawWeight)
 {
-    LoadOrchestrator orch(nullptr);
+    LoadOrchestrator orch(nullptr, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
 
     orch.planRawWeight(0, "fp32_attn_q", 1024, 2048, 1024 * 2048 * 4);
@@ -145,7 +145,7 @@ TEST(Test__FPWeightPipeline, Orchestrator_PlanRawWeight)
 
 TEST(Test__FPWeightPipeline, Orchestrator_PlanRawWeight_UnknownDeviceThrows)
 {
-    LoadOrchestrator orch(nullptr);
+    LoadOrchestrator orch(nullptr, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
 
     EXPECT_THROW(
@@ -155,7 +155,7 @@ TEST(Test__FPWeightPipeline, Orchestrator_PlanRawWeight_UnknownDeviceThrows)
 
 TEST(Test__FPWeightPipeline, Orchestrator_MixedPlanQuantizedAndRaw)
 {
-    LoadOrchestrator orch(nullptr);
+    LoadOrchestrator orch(nullptr, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
 
     orch.planWeight(0, "q4_w", 512, 1024, 16, false, false, 262144);
@@ -472,7 +472,7 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_MultipleWeights_StreamReuse)
 TEST_F(Test__FPDeviceLoadPipeline, LoadOrchestrator_EndToEnd_RawFP)
 {
     // Test the full LoadOrchestrator path with RAW_FP weights
-    LoadOrchestrator orch(backend_);
+    LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
 
     const int N = 64;
@@ -545,7 +545,7 @@ TEST_F(Test__FPDeviceLoadPipeline, LoadOrchestrator_EndToEnd_RawFP)
 
 TEST_F(Test__FPDeviceLoadPipeline, LoadOrchestrator_ChunkedRawFPParity)
 {
-    LoadOrchestrator orch(backend_);
+    LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
 
     const int N = 64;

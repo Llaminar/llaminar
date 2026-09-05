@@ -735,6 +735,48 @@ namespace llaminar2
         return false;
     }
 
+    GPUStreamExecutionState NvidiaDeviceContext::queryStreamExecutionState(
+        void *stream,
+        std::string_view boundary)
+    {
+        if (!stream)
+        {
+            throw std::invalid_argument(
+                "NvidiaDeviceContext::queryStreamExecutionState requires the exact non-null stream");
+        }
+        if (boundary.empty())
+        {
+            throw std::invalid_argument(
+                "NvidiaDeviceContext::queryStreamExecutionState requires a lifecycle boundary");
+        }
+
+        const cudaError_t set_error = cudaSetDevice(device_ordinal_);
+        if (set_error != cudaSuccess)
+        {
+            std::ostringstream message;
+            message << "CUDA device selection failed while observing GPU stream"
+                    << " device=CUDA:" << device_ordinal_
+                    << " boundary=" << boundary
+                    << " error=" << cudaGetErrorString(set_error);
+            throw std::runtime_error(message.str());
+        }
+
+        const cudaError_t status =
+            cudaStreamQuery(static_cast<cudaStream_t>(stream));
+        if (status == cudaSuccess)
+            return GPUStreamExecutionState::Complete;
+        if (status == cudaErrorNotReady)
+            return GPUStreamExecutionState::Pending;
+
+        std::ostringstream message;
+        message << "Asynchronous CUDA execution failed"
+                << " device=CUDA:" << device_ordinal_
+                << " boundary=" << boundary
+                << " error=" << cudaGetErrorString(status)
+                << " code=" << static_cast<int>(status);
+        throw std::runtime_error(message.str());
+    }
+
     void NvidiaDeviceContext::synchronizeEvent(void *event)
     {
         (void)synchronizeEventChecked(event);

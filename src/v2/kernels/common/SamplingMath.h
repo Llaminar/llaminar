@@ -718,7 +718,10 @@ namespace llaminar2::sampling_math
     struct DeviceGenerationDispatchTicket
     {
         static constexpr uint32_t kMagic = 0x4D545044u; // "MTPD"
-        static constexpr uint32_t kABIVersion = 1u;
+        static constexpr uint32_t kABIVersion = 2u;
+        static constexpr uint32_t kWordCount = 13u;
+        static constexpr size_t kWireBytes =
+            static_cast<size_t>(kWordCount) * sizeof(uint32_t);
 
         uint32_t magic = 0;
         uint32_t abi_version = 0;
@@ -732,6 +735,15 @@ namespace llaminar2::sampling_math
         int32_t next_draft_depth = 0;
         int32_t error_code = 0;
         int32_t maintenance_due = 0;
+        /**
+         * Cumulative logical response tokens committed by the device owner.
+         *
+         * This is cadence evidence only.  A hosted HIP scheduler may publish
+         * the positive delta to background ExpertOverlay maintenance after it
+         * retires the matching sparse graph sequence.  It must never use this
+         * value to reconstruct response contents or mutate generation state.
+         */
+        int32_t committed_output_tokens = 0;
 
         /** @brief Reconstruct the request epoch without relying on host layout. */
         LLAMINAR_SAMPLING_HD uint64_t sessionEpoch() const
@@ -771,7 +783,8 @@ namespace llaminar2::sampling_math
                    (healthy == 0 || healthy == 1) &&
                    (complete == 0 || complete == 1) &&
                    transaction_count >= 0 && next_draft_depth >= 0 &&
-                   maintenance_due >= 0 && maintenance_due <= 1;
+                   maintenance_due >= 0 && maintenance_due <= 1 &&
+                   committed_output_tokens >= 0;
         }
 
         /** @brief Compare only fields that must agree across mirrored ranks. */
@@ -782,11 +795,15 @@ namespace llaminar2::sampling_math
                    transaction_count == other.transaction_count &&
                    next_draft_depth == other.next_draft_depth &&
                    error_code == other.error_code &&
-                   maintenance_due == other.maintenance_due;
+                   maintenance_due == other.maintenance_due &&
+                   committed_output_tokens ==
+                       other.committed_output_tokens;
         }
     };
 
-    static_assert(sizeof(DeviceGenerationDispatchTicket) == 12u * sizeof(uint32_t));
+    static_assert(
+        sizeof(DeviceGenerationDispatchTicket) ==
+        DeviceGenerationDispatchTicket::kWireBytes);
 
     /**
      * @brief Initialize the stable identity of a host-scheduling ticket.
@@ -818,6 +835,7 @@ namespace llaminar2::sampling_math
         ticket->error_code =
             static_cast<int32_t>(DeviceGenerationError::InvalidInitialization);
         ticket->maintenance_due = 0;
+        ticket->committed_output_tokens = 0;
         return true;
     }
 
@@ -969,6 +987,8 @@ namespace llaminar2::sampling_math
             control[kDeviceGenerationControlCurrentDraftDepth];
         ticket->error_code = control[kDeviceGenerationControlErrorCode];
         ticket->maintenance_due = due <= 1u ? static_cast<int32_t>(due) : 0;
+        ticket->committed_output_tokens =
+            control[kDeviceGenerationControlResponseTokenCount];
         return true;
     }
 

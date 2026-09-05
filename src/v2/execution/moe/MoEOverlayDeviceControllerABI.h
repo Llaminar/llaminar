@@ -21,7 +21,7 @@ namespace llaminar2
         0x43454f4du;
 
     /** Version of every fixed-width controller record in this header. */
-    inline constexpr std::uint32_t kMoEOverlayDeviceControllerVersion = 6u;
+    inline constexpr std::uint32_t kMoEOverlayDeviceControllerVersion = 7u;
 
     /** Maximum participants represented by one node-local inference epoch barrier. */
     inline constexpr std::uint32_t
@@ -86,6 +86,8 @@ namespace llaminar2
         StaticCheck = 1u,       ///< Prove immobility without changing placement.
         DynamicPlacement = 2u,  ///< Publish one durable `E -> E+1` placement.
         CurrentBatchLLEP = 3u,  ///< Publish and later restore transient assignment.
+        /** Restore the loader-prepared owner table before context reuse. */
+        PreparedContextRestore = 4u,
     };
 
     /** Phase-pure routed evidence selected by the sole transaction authority. */
@@ -252,7 +254,7 @@ namespace llaminar2
          * prevents a bounded cycle budget from permanently starving higher
          * model layers without imposing any topology-specific layer count.
          */
-        std::uint32_t dynamic_layer_cursor = 0u;
+        std::uint32_t placement_layer_cursor = 0u;
     };
 
     /**

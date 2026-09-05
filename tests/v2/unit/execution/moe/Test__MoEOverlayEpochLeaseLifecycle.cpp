@@ -227,55 +227,38 @@ namespace llaminar2::test
     }
 
     /**
-     * @brief Forward ownership follows topology, never maintenance timing.
+     * @brief Forward ownership follows transaction shape, never topology.
      *
-     * A heterogeneous host-authority main graph must acquire and release on its
-     * exact submission stream.  Classifying it as unbound or as a captured-main
-     * transaction recreates the stale ambient-reader race exposed by the
-     * CUDA/CPU real-weight campaign.
+     * An ordinary main graph is a complete captured transaction under both
+     * host- and device-authoritative placement. Auxiliary graphs are members of
+     * a larger sequence and therefore retain the explicit external envelope.
+     * This distinction removes a backend scheduling edge without changing the
+     * authority that selects or publishes placement.
      */
     TEST(MoEOverlayEpochLeaseLifecycle,
-         ForwardSubmissionPolicyIsTotalAndTopologyOwned)
+         ForwardSubmissionPolicyIsTotalAndTransactionOwned)
     {
         using Policy = MoEOverlayForwardEpochSubmissionPolicy;
 
-        for (const bool topology_wide : {false, true})
+        for (const bool main_inference : {false, true})
         {
-            for (const bool main_inference : {false, true})
-            {
-                EXPECT_EQ(
-                    moeOverlayForwardEpochSubmissionPolicy(
-                        /*has_epoch_binding=*/false,
-                        topology_wide,
-                        main_inference),
-                    Policy::Unbound);
-            }
+            EXPECT_EQ(
+                moeOverlayForwardEpochSubmissionPolicy(
+                    /*has_epoch_binding=*/false,
+                    main_inference),
+                Policy::Unbound);
         }
 
         EXPECT_EQ(
             moeOverlayForwardEpochSubmissionPolicy(
                 /*has_epoch_binding=*/true,
-                /*topology_wide_device_authority=*/false,
-                /*main_inference=*/true),
-            Policy::RetainedPerForwardTransaction);
-        EXPECT_EQ(
-            moeOverlayForwardEpochSubmissionPolicy(
-                /*has_epoch_binding=*/true,
-                /*topology_wide_device_authority=*/false,
-                /*main_inference=*/false),
-            Policy::RetainedPerForwardTransaction);
-        EXPECT_EQ(
-            moeOverlayForwardEpochSubmissionPolicy(
-                /*has_epoch_binding=*/true,
-                /*topology_wide_device_authority=*/true,
-                /*main_inference=*/false),
-            Policy::RetainedPerForwardTransaction);
-        EXPECT_EQ(
-            moeOverlayForwardEpochSubmissionPolicy(
-                /*has_epoch_binding=*/true,
-                /*topology_wide_device_authority=*/true,
                 /*main_inference=*/true),
             Policy::CapturedMainTransaction);
+        EXPECT_EQ(
+            moeOverlayForwardEpochSubmissionPolicy(
+                /*has_epoch_binding=*/true,
+                /*main_inference=*/false),
+            Policy::RetainedPerForwardTransaction);
     }
 
     /**

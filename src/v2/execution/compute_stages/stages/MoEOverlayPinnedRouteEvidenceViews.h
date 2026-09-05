@@ -15,6 +15,7 @@
 #include "../IComputeStage.h"
 #include "../../../execution/moe/MoEOverlayActivationPacketABI.h"
 #include "../../../execution/moe/MoEOverlayNodeLocalRouteExchangeABI.h"
+#include "../../../execution/moe/MoERuntimeTable.h"
 
 #include <cstdint>
 #include <memory>
@@ -39,8 +40,8 @@ namespace llaminar2
         {
             DeviceId device = DeviceId::invalid();
             MoEDomainRouteAssignmentLedger domain_route_assignment{};
-            /** Final post-readiness-filter weight for every original route slot. */
-            const float *runtime_route_weights = nullptr;
+            /** Workload-typed final weight publication consumed by execution. */
+            MoERuntimeRouteWeightBinding runtime_route_weights{};
             MoEOverlayRoutePlacementDeviceBinding overlay_route_placement{};
             std::uint32_t physical_rows = 0u;
             std::uint32_t top_k = 0u;

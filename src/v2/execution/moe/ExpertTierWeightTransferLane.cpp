@@ -56,9 +56,14 @@ namespace llaminar2
         if (!config_.device.is_gpu())
             throw std::invalid_argument(
                 "Expert tier transfer lane requires one exact GPU endpoint");
-        if (config_.staging_capacity_bytes == 0)
+        if (!config_.staging.valid() ||
+            config_.staging.device() != config_.device)
             throw std::invalid_argument(
-                "Expert tier transfer lane requires non-zero staging capacity");
+                "Expert tier transfer lane requires one matching persistent staging slice");
+        if (!config_.execution.valid() ||
+            config_.execution.device() != config_.device)
+            throw std::invalid_argument(
+                "Expert tier transfer lane requires one matching persistent execution lane");
         if (config_.lane_name.empty())
             throw std::invalid_argument(
                 "Expert tier transfer lane requires a stable non-empty name");
@@ -114,10 +119,9 @@ namespace llaminar2
             device_ordinal_ = config_.device.gpu_ordinal();
             gpu_context_ =
                 &GPUDeviceContextPool::instance().getContext(config_.device);
-            transfer_stream_ = gpu_context_->getOrCreateAuxiliaryStream(
-                "expert_tier_weight_transfer:" + config_.lane_name);
+            transfer_stream_ = config_.execution.stream();
             if (!transfer_stream_)
-                throw std::runtime_error("Could not create the auxiliary transfer stream");
+                throw std::runtime_error("Could not bind the pooled auxiliary transfer stream");
 
             /* All allocations happen before any inference ticket can use this lane. */
             chunk_ready_event_ = backend_->createEvent(device_ordinal_);
@@ -128,11 +132,16 @@ namespace llaminar2
                 chunk_timing_stop_event_ =
                     backend_->createTimingEvent(device_ordinal_);
             }
+            /*
+             * TransferEngine already allocated and bounds-certified this
+             * lane's exclusive slice as part of one pool-wide slab.  Setup
+             * binds only stable addresses here; it never registers a small
+             * pinned allocation per lane.
+             */
             device_chunk_ = static_cast<std::uint8_t *>(
-                backend_->allocate(config_.staging_capacity_bytes, device_ordinal_));
+                config_.staging.mutableDeviceData());
             pinned_chunk_ = static_cast<std::uint8_t *>(
-                backend_->allocatePinned(
-                    config_.staging_capacity_bytes, device_ordinal_));
+                config_.staging.mutablePinnedData());
             if (!chunk_ready_event_ || !device_chunk_ || !pinned_chunk_ ||
                 (config_.collect_timing_measurements &&
                  (!chunk_timing_start_event_ || !chunk_timing_stop_event_)))
@@ -181,7 +190,7 @@ namespace llaminar2
         const std::size_t total_bytes = layout.chunkBytes(layout.unit_count);
         if (final_cpu_bytes.size() != total_bytes ||
             layout.chunkBytes(layout.maximum_units_per_chunk) >
-                config_.staging_capacity_bytes)
+                config_.staging.sizeBytes())
         {
             assignError(error, "GPU-to-CPU tier transfer storage does not match its manifest");
             return false;
@@ -253,7 +262,7 @@ namespace llaminar2
         const std::size_t total_bytes = layout.chunkBytes(layout.unit_count);
         if (cpu_bytes.size() != total_bytes ||
             layout.chunkBytes(layout.maximum_units_per_chunk) >
-                config_.staging_capacity_bytes)
+                config_.staging.sizeBytes())
         {
             assignError(error, "CPU-to-GPU tier transfer storage does not match its manifest");
             return false;
@@ -454,7 +463,7 @@ namespace llaminar2
 #ifdef HAVE_CUDA
             return launchGpuToCpuExpertTierChunkCUDA(
                 gpu_source_, layout_, first_unit, unit_count, device_chunk_,
-                config_.staging_capacity_bytes, transfer_stream_);
+                config_.staging.sizeBytes(), transfer_stream_);
 #else
             return false;
 #endif
@@ -464,7 +473,7 @@ namespace llaminar2
 #ifdef HAVE_ROCM
             return launchGpuToCpuExpertTierChunkROCm(
                 gpu_source_, layout_, first_unit, unit_count, device_chunk_,
-                config_.staging_capacity_bytes, transfer_stream_);
+                config_.staging.sizeBytes(), transfer_stream_);
 #else
             return false;
 #endif
@@ -520,7 +529,7 @@ namespace llaminar2
             }
             byte_offset = contiguous_completed_bytes_;
             bytes = std::min(
-                config_.staging_capacity_bytes,
+                config_.staging.sizeBytes(),
                 contiguous_total_bytes_ - contiguous_completed_bytes_);
         }
         else
@@ -532,7 +541,7 @@ namespace llaminar2
             bytes = layout_.chunkBytes(unit_count);
             byte_offset = layout_.chunkBytes(completed_units_);
         }
-        if (bytes == 0 || bytes > config_.staging_capacity_bytes ||
+        if (bytes == 0 || bytes > config_.staging.sizeBytes() ||
             (!isContiguousDirection() && unit_count == 0))
         {
             fail("Tier transfer computed an invalid next chunk", error);
@@ -856,10 +865,6 @@ namespace llaminar2
             if (chunk_timing_stop_event_)
                 backend_->destroyEvent(
                     chunk_timing_stop_event_, device_ordinal_);
-            if (device_chunk_)
-                backend_->free(device_chunk_, device_ordinal_);
-            if (pinned_chunk_)
-                backend_->freePinned(pinned_chunk_, device_ordinal_);
         }
         chunk_ready_event_ = nullptr;
         chunk_timing_start_event_ = nullptr;

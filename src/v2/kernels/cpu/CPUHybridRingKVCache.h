@@ -18,7 +18,6 @@
 #include "CPURingKVCache.h"
 #include "../HybridKVCacheConfig.h"
 #include "../IHybridKVCache.h"
-#include "../../config/GDNHeadAssignment.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../utils/OpenMPUtils.h"
 
@@ -754,60 +753,22 @@ namespace llaminar2
             if (n_gdn <= 0)
                 return;
 
-            // Compute GDN dimensions (same logic as Qwen35Graph::ensureGDNStates)
-            const int n_k_heads_full = config.gdn_group_count > 0
-                                           ? config.gdn_group_count
-                                           : config.n_heads;
-            const int n_v_heads_full = config.gdn_time_step_rank > 0
-                                           ? config.gdn_time_step_rank
-                                           : n_k_heads_full;
-
-            int n_k_heads = n_k_heads_full;
-            int n_v_heads = n_v_heads_full;
-
-            if (config.local_n_heads > 0 && config.n_heads > 0 &&
-                config.local_n_heads < config.n_heads)
-            {
-                const GDNHeadAssignment assignment =
-                    GDNHeadAssignment::fromPartition(
-                        n_k_heads_full,
-                        n_v_heads_full,
-                        config.local_head_start,
-                        config.local_n_heads,
-                        config.n_heads);
-                n_k_heads = assignment.localKeyHeads();
-                n_v_heads = assignment.localValueHeads();
-            }
-
-            const int d_v = config.gdn_state_size;
-            const int d_k = d_v;
-            const int full_key_dim = n_k_heads_full * d_k;
-            const int full_value_dim = config.gdn_inner_size > 0
-                                           ? config.gdn_inner_size
-                                           : n_v_heads_full * d_v;
-            const int full_qkv_dim = 2 * full_key_dim + full_value_dim;
-            const int full_recurrence_state_size = n_v_heads_full * d_k * d_v;
-            const int full_conv_state_size =
-                config.gdn_conv_kernel_size > 1
-                    ? full_qkv_dim * (config.gdn_conv_kernel_size - 1)
-                    : 0;
-            const int key_dim = n_k_heads * d_k;
-            const int value_dim = config.gdn_inner_size > 0
-                                      ? (config.gdn_inner_size * n_v_heads / n_v_heads_full)
-                                      : n_v_heads * d_v;
-            const int qkv_dim = 2 * key_dim + value_dim;
+            const HybridGDNStateGeometry geometry =
+                config.gdnStateGeometry();
 
             gdn_states_.resize(n_gdn);
             for (auto &state : gdn_states_)
             {
-                state.n_v_heads = n_v_heads;
-                state.n_k_heads = n_k_heads;
-                state.d_k = d_k;
-                state.d_v = d_v;
+                state.n_v_heads = geometry.local_value_heads;
+                state.n_k_heads = geometry.local_key_heads;
+                state.d_k = geometry.d_k;
+                state.d_v = geometry.d_v;
                 state.conv_kernel_size = config.gdn_conv_kernel_size;
-                state.full_recurrence_state_size = full_recurrence_state_size;
-                state.full_conv_state_size = full_conv_state_size;
-                state.initializeCPUState(qkv_dim);
+                state.full_recurrence_state_size =
+                    geometry.full_recurrence_state_floats;
+                state.full_conv_state_size =
+                    geometry.full_conv_state_floats;
+                state.initializeCPUState(geometry.local_qkv_dim);
             }
 
             LOG_DEBUG("[CPUHybridRingKVCache] Created: " << total_layers_ << " total layers, "

@@ -14,6 +14,7 @@
 #include "execution/moe/GpuExpertTransferStagingPool.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/PreparedWeightStore.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
 #include "kernels/KernelFactory.h"
@@ -191,6 +192,31 @@ namespace
         if (hasCUDABackend())
             return DeviceId(DeviceType::CUDA, 0);
         return DeviceId::cpu();
+    }
+
+    /**
+     * @brief Build a rank-bound authority for a cache-only GPU lifecycle test.
+     *
+     * These cases prove that no new allocation is needed: the resource is
+     * present in the aggregate certificate but every owner line is zero. Any
+     * accidental repack therefore fails its ledger claim rather than escaping
+     * the test's memory contract.
+     */
+    std::shared_ptr<PhysicalMemoryAuthority> noAllocationAuthority(
+        DeviceId device)
+    {
+        PhysicalMemoryBOMBuilder resource({
+            .world_rank = 0,
+            .device = device,
+            .total_bytes = 1ULL << 30,
+            .admission_available_bytes = 1ULL << 30,
+        });
+        PhysicalMemoryPlanBuilder plan;
+        plan.add(resource.build());
+        auto admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(plan.build());
+        return std::make_shared<PhysicalMemoryAuthority>(
+            std::move(admission), 0);
     }
 
     ITensorGemm *fakeGemm(int id)
@@ -914,6 +940,7 @@ TEST(Test__MoEExpertWeightService, ReleaseDepartedExperts_DoesNotCallThroughRawS
     owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
     owner.prepared_up_gemm.assign(kNumExperts, nullptr);
     owner.prepared_down_gemm.assign(kNumExperts, nullptr);
+
     owner.prepared_gate_gemm[1] = fakeGemm(1);
     owner.prepared_up_gemm[1] = fakeGemm(101);
     owner.prepared_down_gemm[1] = fakeGemm(201);
@@ -1197,7 +1224,7 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_ReusesReleasedPhysicalSlot)
         specs.push_back(std::move(spec));
     }
 
-    auto pool = GpuExpertSlotPool::create(
+    auto pool = GpuExpertSlotPool::createForTest(
         nullptr,
         DeviceId::cuda(0),
         /*device_ordinal=*/0,
@@ -1248,7 +1275,7 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_RetainsSameExpertAcrossRcuE
         });
     }
 
-    auto pool = GpuExpertSlotPool::create(
+    auto pool = GpuExpertSlotPool::createForTest(
         nullptr,
         DeviceId::cuda(0),
         /*device_ordinal=*/0,
@@ -1300,7 +1327,7 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_TransferSlotsAreSurplusAndR
         specs.push_back(std::move(spec));
     }
 
-    auto pool = GpuExpertSlotPool::create(
+    auto pool = GpuExpertSlotPool::createForTest(
         nullptr,
         DeviceId::cuda(0),
         /*device_ordinal=*/0,
@@ -1397,7 +1424,7 @@ TEST(Test__MoEExpertWeightService, GpuDirectTransferStagingPool_RecommendedCapac
         specs.push_back(std::move(spec));
     }
 
-    auto pool = GpuExpertTransferStagingPool::create(
+    auto pool = GpuExpertTransferStagingPool::createForTest(
         nullptr,
         DeviceId::cuda(0),
         /*device_ordinal=*/0,
@@ -2058,6 +2085,11 @@ TEST(Test__MoEExpertWeightService, GPURebalanceRequiresPayloadWhenCacheMissing)
     owner.prepared_up_gemm.assign(kNumExperts, nullptr);
     owner.prepared_down_gemm.assign(kNumExperts, nullptr);
 
+    PreparedWeightStore store(ModelContextId{11});
+    store.installPhysicalMemoryAuthority(
+        noAllocationAuthority(owner.device_id));
+    owner.prepared_store = &store;
+
     {
         auto ctx = owner.buildContext();
         ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
@@ -2088,6 +2120,8 @@ TEST(Test__MoEExpertWeightService, GPURebalanceResolvesStoreSlabsWhenCachedRefsM
     owner.prepared_down_gemm.assign(kNumExperts, nullptr);
 
     PreparedWeightStore store(ModelContextId{10});
+    store.installPhysicalMemoryAuthority(
+        noAllocationAuthority(owner.device_id));
     owner.prepared_store = &store;
 
     auto gate_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertGate));

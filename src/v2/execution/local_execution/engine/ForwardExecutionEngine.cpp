@@ -971,6 +971,25 @@ namespace llaminar2
             return signature.all_position_logits ? "main_verifier" : "main_decode";
         }
 
+        /**
+         * @brief Install one signature-derived snapshot reuse proof on both caches.
+         *
+         * Full-graph and explicitly admitted segmented capture are alternative
+         * lowering forms of the same forward signature. They must therefore
+         * name the same diagnostic arena namespace before either form begins
+         * descriptor discovery or native capture.
+         */
+        void bindGraphSnapshotArenaReusePolicy(
+            ForwardGraphCache &cache,
+            const ForwardGraphSignature &signature)
+        {
+            const auto policy =
+                graphSnapshotArenaReusePolicyForSignature(signature);
+            cache.snapshot_manifest.bindStorageReusePolicy(policy);
+            cache.segment_cache.snapshot_manifest.bindStorageReusePolicy(
+                policy);
+        }
+
         PerfStatsCollector::Tags forwardCacheLookupTags(
             const ForwardGraphSignature &signature,
             const char *result)
@@ -1742,21 +1761,17 @@ namespace llaminar2
          * whose capture identity includes the finalized generation may cross
          * this boundary.
          */
-        const bool shifted_main_prefill =
-            input.execution_role == ForwardExecutionRole::MainInference &&
-            input.execution_phase == ForwardExecutionPhase::Prefill &&
-            input.state_transaction == ForwardStateTransaction::Ordinary;
-        const bool shifted_restored_prefix_decode =
-            input.execution_role == ForwardExecutionRole::MTPCondition &&
-            input.execution_phase == ForwardExecutionPhase::Decode &&
-            input.state_transaction ==
-                ForwardStateTransaction::RestoredPrefixMTPDecodeBridge &&
-            input.batch_size == 1 && input.seq_len == 1;
+        const bool graph_integrated_shifted_mtp =
+            isGraphIntegratedShiftedMTPTransaction(
+                input.execution_role,
+                input.execution_phase,
+                input.state_transaction,
+                input.batch_size,
+                input.seq_len);
         if (input.shifted_mtp_prefill &&
             (!input.shifted_mtp_prefill->executableForRequestCount(
                  input.batch_size) ||
-             (!shifted_main_prefill &&
-              !shifted_restored_prefix_decode)))
+             !graph_integrated_shifted_mtp))
         {
             LOG_ERROR(
                 "[ForwardExecutionEngine] Refusing a declaration-only or "
@@ -2060,12 +2075,17 @@ namespace llaminar2
                     bucketed_prefill ? bucketed_prefill_seq_len : 0,
                 .rehydrate_prefix_runtime_on_device =
                     effective_input.rehydrate_prefix_runtime_on_device,
-                .moe_placement_epoch = host.moePlacementEpoch()};
+                .moe_placement_epoch = host.moePlacementEpoch(),
+                .snapshot_configuration_identity =
+                    executor_.snapshotConfigurationEpoch()};
 
             auto cache_it = cache_.find(forward_signature);
             if (cache_it != cache_.end())
             {
                 active_forward_cache = &cache_it->second;
+                bindGraphSnapshotArenaReusePolicy(
+                    *active_forward_cache,
+                    forward_signature);
                 active_forward_cache->segment_cache.replay_workload =
                     replayWorkloadGeometryForSignature(forward_signature);
             }
@@ -2113,8 +2133,72 @@ namespace llaminar2
                 << " prefix_rehydrate="
                 << boolTag(
                        forward_signature.rehydrate_prefix_runtime_on_device)
-                << " placement_epoch="
-                << forward_signature.moe_placement_epoch);
+                      << " placement_epoch="
+                      << forward_signature.moe_placement_epoch
+                      << " snapshot_identity="
+                      << forward_signature.snapshot_configuration_identity);
+
+            /*
+             * A production GPU runner seals its admitted serving family before
+             * request admission. A runtime miss is therefore rare diagnostic
+             * evidence that setup and live graph identity disagree. Keep hits
+             * and setup materialization at TRACE, but surface this one bounded
+             * event so cold-capture latency cannot hide inside inference.
+             */
+            if (!use_cached_forward && !setup_materialization &&
+                forward_signature.device.is_gpu())
+            {
+                LOG_INFO(
+                    "[ForwardGraphCacheIdentity] runtime_materialization"
+                    << " signature_hash="
+                    << ForwardGraphSignatureHash{}(forward_signature)
+                    << " context="
+                    << forwardGraphPerfContext(forward_signature)
+                    << " seq_len=" << forward_signature.seq_len
+                    << " batch=" << forward_signature.batch_size
+                    << " device=" << forward_signature.device.toString()
+                    << " role="
+                    << static_cast<int>(forward_signature.execution_role)
+                    << " state_transaction="
+                    << static_cast<int>(forward_signature.state_transaction)
+                    << " history="
+                    << boolTag(forward_signature.decode_has_history)
+                    << " all_logits="
+                    << boolTag(forward_signature.all_position_logits)
+                    << " all_logit_rows="
+                    << forward_signature.all_position_logit_rows
+                    << " live_mtp_condition="
+                    << boolTag(
+                           forward_signature
+                               .live_mtp_request_batch_condition)
+                    << " device_tokens="
+                    << boolTag(forward_signature.uses_device_token_ids)
+                    << " device_positions="
+                    << boolTag(forward_signature.uses_device_position_ids)
+                    << " position_policy="
+                    << static_cast<int>(forward_signature.position_policy)
+                    << " device_lengths="
+                    << boolTag(
+                           forward_signature
+                               .uses_device_sequence_lengths)
+                    << " chunk_identity="
+                    << forward_signature
+                           .device_prefill_chunk_capture_identity
+                    << " shifted_mtp_identity="
+                    << forward_signature
+                           .shifted_mtp_prefill_capture_identity
+                    << " terminal_hidden_identity="
+                    << forward_signature
+                           .mtp_main_terminal_hidden_capture_identity
+                    << " bucket_rows="
+                    << forward_signature.bucket_seq_len
+                    << " prefix_rehydrate="
+                    << boolTag(
+                           forward_signature
+                               .rehydrate_prefix_runtime_on_device)
+                    << " placement_epoch="
+                    << forward_signature.moe_placement_epoch);
+            }
         }
 
         if (live_mtp_request_batch_condition &&
@@ -2139,13 +2223,18 @@ namespace llaminar2
 
         if (use_cached_forward)
         {
+            auto lookup_tags =
+                forwardCacheLookupTags(forward_signature, "hit");
+            lookup_tags.emplace(
+                "submission",
+                setup_materialization ? "setup_materialize" : "runtime");
             PerfStatsCollector::addCounter(
                 "forward_graph",
                 "forward_cache_lookup",
                 1.0,
                 forward_signature.decode ? "decode" : "prefill",
                 forward_signature.device.toString(),
-                forwardCacheLookupTags(forward_signature, "hit"));
+                std::move(lookup_tags));
             touchPrefillForwardCache(forward_signature, *active_forward_cache);
             const bool success = executeCacheHit(effective_input, output, *active_forward_cache, host,
                                                  is_decode, start);
@@ -2183,15 +2272,23 @@ namespace llaminar2
         bool should_cache_after_build = false;
         if (forward_cache_eligible)
         {
+            auto lookup_tags =
+                forwardCacheLookupTags(forward_signature, "miss");
+            lookup_tags.emplace(
+                "submission",
+                setup_materialization ? "setup_materialize" : "runtime");
             PerfStatsCollector::addCounter(
                 "forward_graph",
                 "forward_cache_lookup",
                 1.0,
                 forward_signature.decode ? "decode" : "prefill",
                 forward_signature.device.toString(),
-                forwardCacheLookupTags(forward_signature, "miss"));
+                std::move(lookup_tags));
             auto [it, _inserted] = cache_.try_emplace(forward_signature);
             build_cache = &it->second;
+            bindGraphSnapshotArenaReusePolicy(
+                *build_cache,
+                forward_signature);
             build_cache->segment_cache.replay_workload =
                 replayWorkloadGeometryForSignature(forward_signature);
             should_cache_after_build = !build_cache->valid;
@@ -2409,9 +2506,8 @@ namespace llaminar2
             cache.segment_cache.retained_composed_parent_replay;
         if (parent_plan.valid())
         {
-            if (cache.segment_cache.graph_replay_plan_policy !=
-                    DeviceGraphExecutor::GraphReplayPlanPolicy::
-                        RequireRetainedParentComposition ||
+            if (!DeviceGraphExecutor::isRetainedParentPlanPolicy(
+                    cache.segment_cache.graph_replay_plan_policy) ||
                 !cache.segment_cache.retained_parent_capture ||
                 !cache.segment_cache.retained_parent_capture->hasExecutable())
             {
@@ -2531,22 +2627,22 @@ namespace llaminar2
         DeviceGraphExecutor::RetainedParentCompositionHook parent_composer;
         if (retained->composed_parent)
         {
-            if (plan_policy !=
-                DeviceGraphExecutor::GraphReplayPlanPolicy::
-                    RequireRetainedParentComposition)
+            if (!DeviceGraphExecutor::isRetainedParentPlanPolicy(plan_policy))
             {
                 return fail(
                     "retained parent view disagrees with cache replay policy");
             }
             try
             {
-                auto composer = makeMoEOverlayRetainedParentComposer(*cache.graph);
-                if (!composer)
+                auto parent_plan =
+                    makeMoEOverlayRetainedParentPlan(*cache.graph);
+                if (!parent_plan ||
+                    parent_plan->replay_policy != plan_policy)
                 {
                     return fail(
-                        "retained parent graph no longer declares typed packet frontiers");
+                        "retained parent graph no longer declares the sealed typed packet lifecycle");
                 }
-                parent_composer = std::move(*composer);
+                parent_composer = std::move(parent_plan->composer);
             }
             catch (const std::exception &ex)
             {
@@ -2905,18 +3001,15 @@ namespace llaminar2
                     << envelope_error);
                 return false;
             }
-            if (auto sparse_parent_composer =
-                    makeMoEOverlayRetainedParentComposer(
+            if (auto sparse_parent_plan =
+                    makeMoEOverlayRetainedParentPlan(
                         *forward_cache.graph);
-                native_capture_envelope ==
-                        GraphNativeCaptureEnvelope::Ordinary &&
-                    sparse_parent_composer)
+                sparse_parent_plan)
             {
                 capture_policy.graph_replay_plan_policy =
-                    DeviceGraphExecutor::GraphReplayPlanPolicy::
-                        RequireRetainedParentComposition;
+                    sparse_parent_plan->replay_policy;
                 capture_policy.retained_parent_composer =
-                    std::move(*sparse_parent_composer);
+                    std::move(sparse_parent_plan->composer);
                 capture_policy.defer_final_sync = true;
             }
         }
@@ -3566,12 +3659,10 @@ namespace llaminar2
                         << envelope_error);
                     return false;
                 }
-                if (auto sparse_parent_composer =
-                        makeMoEOverlayRetainedParentComposer(
+                if (auto sparse_parent_plan =
+                        makeMoEOverlayRetainedParentPlan(
                             *forward_cache.graph);
-                    native_capture_envelope ==
-                            GraphNativeCaptureEnvelope::Ordinary &&
-                        sparse_parent_composer)
+                    sparse_parent_plan)
                 {
                     if (!decode_capture_allowed ||
                         !capture_policy.allow_cached_graph_replay)
@@ -3581,10 +3672,9 @@ namespace llaminar2
                         return false;
                     }
                     capture_policy.graph_replay_plan_policy =
-                        DeviceGraphExecutor::GraphReplayPlanPolicy::
-                            RequireRetainedParentComposition;
+                        sparse_parent_plan->replay_policy;
                     capture_policy.retained_parent_composer =
-                        std::move(*sparse_parent_composer);
+                        std::move(sparse_parent_plan->composer);
                     uses_retained_sparse_parent = true;
                 }
             }
@@ -3744,7 +3834,11 @@ namespace llaminar2
                                  DeviceGraphExecutor::GraphReplayPlanPolicy::
                                      RequireRetainedParentComposition
                              ? "require_retained_parent_composition"
-                             : "allow_heterogeneous_boundary_segmentation")}});
+                             : (capture_policy.graph_replay_plan_policy ==
+                                        DeviceGraphExecutor::GraphReplayPlanPolicy::
+                                            RequireRetainedParentWithConcurrentTicketService
+                                    ? "require_retained_parent_with_concurrent_ticket_service"
+                                    : "allow_heterogeneous_boundary_segmentation"))}});
 
             if (capture_policy.allow_cached_graph_replay && !forward_cache.gpu_stream)
             {
@@ -4287,12 +4381,10 @@ namespace llaminar2
                     << envelope_error);
                 return false;
             }
-            if (auto sparse_parent_composer =
-                    makeMoEOverlayRetainedParentComposer(
+            if (auto sparse_parent_plan =
+                    makeMoEOverlayRetainedParentPlan(
                         *forward_cache.graph);
-                native_capture_envelope ==
-                        GraphNativeCaptureEnvelope::Ordinary &&
-                    sparse_parent_composer)
+                sparse_parent_plan)
             {
                 if (!prefill_capture_policy.allow_cached_graph_replay)
                 {
@@ -4301,10 +4393,9 @@ namespace llaminar2
                     return false;
                 }
                 prefill_capture_policy.graph_replay_plan_policy =
-                    DeviceGraphExecutor::GraphReplayPlanPolicy::
-                        RequireRetainedParentComposition;
+                    sparse_parent_plan->replay_policy;
                 prefill_capture_policy.retained_parent_composer =
-                    std::move(*sparse_parent_composer);
+                    std::move(sparse_parent_plan->composer);
                 /*
                  * The retained parent is a single asynchronous device
                  * transaction. Terminal-state and snapshot publication are
@@ -4384,7 +4475,7 @@ namespace llaminar2
                 ForwardPassProfiler::addReplayLaunchNs(ns);
             }
 
-            if (PerfStatsCollector::isEnabled())
+            if (PerfStatsCollector::isDomainEnabled("forward_graph"))
             {
                 auto observation = makePrefillGraphObservation(
                     input,

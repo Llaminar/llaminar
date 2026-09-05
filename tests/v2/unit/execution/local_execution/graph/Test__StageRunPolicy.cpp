@@ -100,6 +100,9 @@ TEST(Test__StageRunPolicy, FullPolicy_AllFeaturesEnabled)
     EXPECT_TRUE(p.snapshot_callback);
     EXPECT_TRUE(p.timeline);            // On by default in full (prefill profiling)
     EXPECT_FALSE(p.pointer_validation); // Off by default in full
+    EXPECT_EQ(
+        p.snapshot_recording_authority,
+        StageRunPolicy::SnapshotRecordingAuthority::StageExecutor);
 }
 
 TEST(Test__StageRunPolicy, FastDecodePolicy_MinimalOverhead)
@@ -116,6 +119,9 @@ TEST(Test__StageRunPolicy, FastDecodePolicy_MinimalOverhead)
     EXPECT_FALSE(p.stage_dump);
     EXPECT_FALSE(p.snapshot_callback);
     EXPECT_FALSE(p.pointer_validation);
+    EXPECT_EQ(
+        p.snapshot_recording_authority,
+        StageRunPolicy::SnapshotRecordingAuthority::StageExecutor);
 
     // collective_intercept and timeline should be ON for fast decode
     EXPECT_TRUE(p.collective_intercept);

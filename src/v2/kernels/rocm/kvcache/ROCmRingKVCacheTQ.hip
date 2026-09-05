@@ -8,6 +8,7 @@
 
 #include "ROCmRingKVCacheTQ.h"
 #include "ROCmTurboQuantKernels.h"
+#include "../../kvcache/KVCacheWorkspaceContract.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
@@ -423,23 +424,15 @@ namespace llaminar2
         int m, int n, int k) const
     {
         (void)k;
-        const bool has_token_hint = n > 0;
-        const int hinted_batch =
-            has_token_hint ? n : ((m > 0) ? m : batch_size_);
-        const int scratch_tokens =
-            has_token_hint ? std::max(m, max_seq_len_) : max_seq_len_;
-        const size_t rows =
-            static_cast<size_t>(std::max(hinted_batch, batch_size_)) *
-            static_cast<size_t>(std::max(1, scratch_tokens));
-        const size_t bytes =
-            rows * static_cast<size_t>(kv_dim_) * sizeof(_Float16);
-
-        WorkspaceRequirements requirements;
-        requirements.buffers.emplace_back(
-            KVCacheWorkspaceBuffers::CONV_SCRATCH_K, bytes, 256, true);
-        requirements.buffers.emplace_back(
-            KVCacheWorkspaceBuffers::CONV_SCRATCH_V, bytes, 256, true);
-        return requirements;
+        return kv_cache_workspace::conversionRequirements({
+            .configured_batch_size = batch_size_,
+            .configured_context_rows = max_seq_len_,
+            .requested_graph_rows = m,
+            .requested_batch_size = n,
+            .conversion_row_bytes =
+                static_cast<size_t>(kv_dim_) * sizeof(_Float16),
+            .native_row_bytes = 0u,
+        });
     }
 
     void ROCmRingKVCacheTQ::bindWorkspace(

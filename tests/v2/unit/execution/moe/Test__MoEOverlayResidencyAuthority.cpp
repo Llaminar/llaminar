@@ -17,11 +17,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -355,10 +359,14 @@ namespace llaminar2::test
             return plan;
         }
 
-        /** @brief Geometry used to force two independently bounded swaps. */
-        MoERoutedExpertModelMetadata eightExpertMetadata()
+        /**
+         * @brief Geometry used to force independently bounded swaps.
+         * @param layer_count Number of identical routed layers in the fixture.
+         */
+        MoERoutedExpertModelMetadata eightExpertMetadata(int layer_count = 1)
         {
             auto metadata = modelMetadata();
+            metadata.num_layers = layer_count;
             metadata.num_experts = 8;
             return metadata;
         }
@@ -451,11 +459,15 @@ namespace llaminar2::test
             return histogram;
         }
 
-        /** @brief Histogram ownership matching the four-participant test plan. */
-        std::unique_ptr<DecodeExpertHistogram> fourParticipantHistogram()
+        /**
+         * @brief Histogram ownership matching the four-participant test plan.
+         * @param layer_count Number of identical layered ownership rows.
+         */
+        std::unique_ptr<DecodeExpertHistogram>
+        fourParticipantHistogram(int layer_count = 1)
         {
             DecodeExpertHistogramConfig config;
-            config.num_layers = 1;
+            config.num_layers = layer_count;
             config.num_experts = 8;
             config.top_k = 2;
             config.window_size = 4;
@@ -466,18 +478,24 @@ namespace llaminar2::test
                 DeviceId::cpu(),
             };
             config.ownership = MoELayeredExpertOwnership::uniform(
-                1,
+                layer_count,
                 4,
                 {0, 0, 1, 1, 2, 2, 3, 3});
             return std::make_unique<DecodeExpertHistogram>(config);
         }
 
-        /** @brief Six accelerator and two three-expert CPU owner buckets. */
+        /**
+         * @brief Six accelerator and two three-expert CPU owner buckets.
+         * @param layer_count Number of identical layered ownership rows.
+         */
         std::unique_ptr<DecodeExpertHistogram>
-        threeParticipantTwelveExpertHistogram()
+        threeParticipantTwelveExpertHistogram(int layer_count = 1)
         {
+            if (layer_count <= 0)
+                throw std::invalid_argument(
+                    "Test histogram requires a positive layer count");
             DecodeExpertHistogramConfig config;
-            config.num_layers = 1;
+            config.num_layers = layer_count;
             config.num_experts = 12;
             config.top_k = 2;
             config.window_size = 4;
@@ -487,7 +505,7 @@ namespace llaminar2::test
                 DeviceId::cpu(),
             };
             config.ownership = MoELayeredExpertOwnership::uniform(
-                1,
+                layer_count,
                 3,
                 {0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2});
             return std::make_unique<DecodeExpertHistogram>(config);
@@ -572,6 +590,9 @@ namespace llaminar2::test
             auto profile =
                 std::make_shared<MoERoutedTierServiceProfile>();
             profile->identity = "three-tier-service-v1";
+            profile->production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    1, kAllExpertHistogramProductionSources);
             profile->costs = {
                 {.tier_index = 0,
                  .layer = 0,
@@ -597,39 +618,59 @@ namespace llaminar2::test
             return profile;
         }
 
-        /** @brief Monotonic service costs for two integer-priority tiers. */
+        /**
+         * @brief Monotonic service costs for two integer-priority tiers.
+         * @param participant_count Number of physical participant rows.
+         * @param layer_count Number of routed layers priced identically.
+         */
         std::shared_ptr<const MoERoutedTierServiceProfile>
-        twoTierServiceProfile(int participant_count = 3)
+        twoTierServiceProfile(
+            int participant_count = 3,
+            int layer_count = 1)
         {
+            if (participant_count <= 0 || layer_count <= 0)
+                throw std::invalid_argument(
+                    "Test service profile requires positive geometry");
             auto profile =
                 std::make_shared<MoERoutedTierServiceProfile>();
             profile->identity = "two-priority-tier-service-v1";
-            profile->costs = {
-                {.tier_index = 0,
-                 .layer = 0,
-                 .nanoseconds_per_activation = {10, 20, 30}},
-                {.tier_index = 1,
-                 .layer = 0,
-                 .nanoseconds_per_activation = {100, 200, 300}},
-            };
-            for (int participant = 0;
-                 participant < participant_count;
-                 ++participant)
+            profile->production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    layer_count, kAllExpertHistogramProductionSources);
+            for (int layer = 0; layer < layer_count; ++layer)
             {
-                const std::array<uint64_t,
-                                 kExpertHistogramProductionSourceCount>
-                    cost = participant == 0
-                               ? std::array<uint64_t,
-                                            kExpertHistogramProductionSourceCount>{
-                                     10, 20, 30}
-                               : std::array<uint64_t,
-                                            kExpertHistogramProductionSourceCount>{
-                                     100, 200, 300};
-                profile->participant_costs.push_back({
-                    .participant_id = participant,
-                    .layer = 0,
-                    .nanoseconds_per_activation = cost,
-                });
+                profile->costs.insert(
+                    profile->costs.end(),
+                    {
+                        {.tier_index = 0,
+                         .layer = layer,
+                         .nanoseconds_per_activation = {10, 20, 30}},
+                        {.tier_index = 1,
+                         .layer = layer,
+                         .nanoseconds_per_activation = {100, 200, 300}},
+                    });
+                for (int participant = 0;
+                     participant < participant_count;
+                     ++participant)
+                {
+                    const std::array<
+                        uint64_t,
+                        kExpertHistogramProductionSourceCount> cost =
+                        participant == 0
+                            ? std::array<
+                                  uint64_t,
+                                  kExpertHistogramProductionSourceCount>{
+                                  10, 20, 30}
+                            : std::array<
+                                  uint64_t,
+                                  kExpertHistogramProductionSourceCount>{
+                                  100, 200, 300};
+                    profile->participant_costs.push_back({
+                        .participant_id = participant,
+                        .layer = layer,
+                        .nanoseconds_per_activation = cost,
+                    });
+                }
             }
             return profile;
         }
@@ -641,6 +682,9 @@ namespace llaminar2::test
             auto profile =
                 std::make_shared<MoERoutedTierServiceProfile>();
             profile->identity = "one-tier-service-v1";
+            profile->production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    1, kAllExpertHistogramProductionSources);
             profile->costs = {
                 {.tier_index = 0,
                  .layer = 0,
@@ -664,6 +708,9 @@ namespace llaminar2::test
             auto profile =
                 std::make_shared<MoERoutedTierServiceProfile>();
             profile->identity = "one-tier-asymmetric-service-v1";
+            profile->production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    1, kAllExpertHistogramProductionSources);
             profile->costs = {
                 {.tier_index = 0,
                  .layer = 0,
@@ -680,57 +727,80 @@ namespace llaminar2::test
             return profile;
         }
 
-        /** @brief Complete directed physical movement profile for three endpoints. */
+        /**
+         * @brief Complete directed physical movement profile for three endpoints.
+         * @param transfer_and_repack_ns Measured directed transfer cost.
+         * @param inference_interference_ns Measured overlapping interference.
+         * @param layer_count Number of routed layers priced identically.
+         */
         std::shared_ptr<const MoEOverlayMigrationCostProfile>
         threeParticipantMigrationProfile(
             uint64_t transfer_and_repack_ns,
-            uint64_t inference_interference_ns)
+            uint64_t inference_interference_ns,
+            int layer_count = 1)
         {
+            if (layer_count <= 0)
+                throw std::invalid_argument(
+                    "Test migration profile requires a positive layer count");
             auto profile =
                 std::make_shared<MoEOverlayMigrationCostProfile>();
             profile->identity = "three-participant-migration-v1";
-            for (int source = 0; source < 3; ++source)
+            for (int layer = 0; layer < layer_count; ++layer)
             {
-                for (int destination = 0; destination < 3; ++destination)
+                for (int source = 0; source < 3; ++source)
                 {
-                    if (source == destination)
-                        continue;
-                    profile->costs.push_back({
-                        .source_participant = source,
-                        .destination_participant = destination,
-                        .layer = 0,
-                        .transfer_and_repack_ns = transfer_and_repack_ns,
-                        .inference_interference_ns =
-                            inference_interference_ns,
-                    });
+                    for (int destination = 0; destination < 3; ++destination)
+                    {
+                        if (source == destination)
+                            continue;
+                        profile->costs.push_back({
+                            .source_participant = source,
+                            .destination_participant = destination,
+                            .layer = layer,
+                            .transfer_and_repack_ns = transfer_and_repack_ns,
+                            .inference_interference_ns =
+                                inference_interference_ns,
+                        });
+                    }
                 }
             }
             return profile;
         }
 
-        /** @brief Complete directed movement costs for four test endpoints. */
+        /**
+         * @brief Complete directed movement costs for four test endpoints.
+         * @param transfer_and_repack_ns Measured directed transfer cost.
+         * @param inference_interference_ns Measured overlapping interference.
+         * @param layer_count Number of routed layers priced identically.
+         */
         std::shared_ptr<const MoEOverlayMigrationCostProfile>
         fourParticipantMigrationProfile(
             uint64_t transfer_and_repack_ns,
-            uint64_t inference_interference_ns)
+            uint64_t inference_interference_ns,
+            int layer_count = 1)
         {
             auto profile =
                 std::make_shared<MoEOverlayMigrationCostProfile>();
             profile->identity = "four-participant-migration-v1";
-            for (int source = 0; source < 4; ++source)
+            for (int layer = 0; layer < layer_count; ++layer)
             {
-                for (int destination = 0; destination < 4; ++destination)
+                for (int source = 0; source < 4; ++source)
                 {
-                    if (source == destination)
-                        continue;
-                    profile->costs.push_back({
-                        .source_participant = source,
-                        .destination_participant = destination,
-                        .layer = 0,
-                        .transfer_and_repack_ns = transfer_and_repack_ns,
-                        .inference_interference_ns =
-                            inference_interference_ns,
-                    });
+                    for (int destination = 0; destination < 4;
+                         ++destination)
+                    {
+                        if (source == destination)
+                            continue;
+                        profile->costs.push_back({
+                            .source_participant = source,
+                            .destination_participant = destination,
+                            .layer = layer,
+                            .transfer_and_repack_ns =
+                                transfer_and_repack_ns,
+                            .inference_interference_ns =
+                                inference_interference_ns,
+                        });
+                    }
                 }
             }
             return profile;
@@ -1669,10 +1739,79 @@ namespace llaminar2::test
                 frozenWindow(1, {100, 90, 80, 1, 1, 1}));
         ASSERT_TRUE(transaction.valid());
         EXPECT_TRUE(transaction.empty())
-            << "raw activation balance must not move a hot expert onto a "
+            << "candidate selection must not move a hot expert onto a "
                "participant whose measured service makes the critical path worse";
-        EXPECT_GT(transaction.economy.payoff_rejected_cycles, 0u);
+        EXPECT_EQ(transaction.economy.payoff_rejected_cycles, 0u)
+            << "certified service evidence should reject the bad candidate "
+               "before transaction admission";
         EXPECT_EQ(transaction.economy.projected_service_gain_ns, 0u);
+    }
+
+    /**
+     * @brief Measured service skew must be actionable when raw totals tie.
+     *
+     * Both participants initially own thirty routed activations, so a raw-count
+     * controller sees no imbalance. Participant one is nevertheless one hundred
+     * times slower and owns a fifteen-count expert that can be exchanged for a
+     * five-count expert on participant zero. The capacity-preserving exchange
+     * lowers every phase's measured critical path without changing either
+     * participant's resident expert count. This is the reduced contract for a
+     * heterogeneous authority: candidate selection and final economic admission
+     * must optimize the same certified service objective.
+     */
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        ParticipantSpecificCostFindsServiceGainWhenRawLoadsAreBalanced)
+    {
+        auto histogram = oneTierHistogram();
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = oneTierTwoParticipantPlan(
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced),
+            .model_metadata = modelMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .phase_service_profile = asymmetricOneTierServiceProfile(),
+            .migration_cost_profile = twoParticipantMigrationProfile(),
+            .migration_economy_policy =
+                MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 2048,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+            .participant_rebalance_policy = {
+                .enabled = true,
+                .imbalance_threshold_per_mille = 1300,
+                .minimum_improvement_per_mille = 50,
+                .maximum_swaps_per_layer = 1,
+                .maximum_plan_entries_per_wave = 2,
+                .minimum_window_activations = 1,
+            },
+            .shadow_slots_per_endpoint_layer = 1,
+            .max_concurrent_cycles = 1,
+            .perf_device = "one-tier-service-aware-candidate",
+        });
+
+        const auto transaction =
+            authority.proposeFromFrozenHistogramWindow(
+                frozenWindow(1, {20, 5, 5, 15, 10, 5}));
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_EQ(transaction.migrations.size(), 2u)
+            << "equal raw loads must not hide a measured critical-path gain";
+        EXPECT_GT(transaction.economy.projected_service_gain_ns, 0u);
+        EXPECT_GT(transaction.economy.projected_net_benefit_ns, 0u);
+        EXPECT_EQ(transaction.economy.payoff_rejected_cycles, 0u);
+        EXPECT_TRUE(std::all_of(
+            transaction.migrations.begin(),
+            transaction.migrations.end(),
+            [](const auto &migration)
+            {
+                return migration.axis ==
+                           MoEOptimizationMovementAxis::ParticipantPlacement &&
+                       migration.direction ==
+                           MoEOverlayTierMigrationDirection::SamePriority;
+            }));
     }
 
     TEST(
@@ -2025,11 +2164,140 @@ namespace llaminar2::test
                 0,
                 4),
             9u);
-        EXPECT_EQ(histogram->windowSize(), 16);
+        EXPECT_EQ(histogram->windowSize(), 4)
+            << "rotation alone is not evidence that placement converged";
         EXPECT_EQ(
             authority.optimizationDemandWindow().capacity_routed_rows,
-            16u);
+            4u);
         EXPECT_FALSE(authority.maintenanceWindowReady());
+
+        const auto transaction =
+            authority.proposeFromFrozenHistogramWindow(ready.window);
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_FALSE(transaction.empty());
+        EXPECT_EQ(histogram->windowSize(), 4)
+            << "a movement wave must retain the short convergence cadence";
+    }
+
+    /**
+     * @brief Prove adaptive cooldown follows policy convergence, not rotation.
+     *
+     * The first window already ranks the resident priority order correctly, so
+     * its observed no-op may grow the cadence. The second window changes demand
+     * enough to select a tier movement and must restore the initial cadence for
+     * the next independent objective.
+     */
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        AdaptiveHistogramCadenceGrowsOnlyAfterNoMovementAndResetsOnMovement)
+    {
+        ScopedPerfStats perf;
+        auto histogram = histogramWithCounts({0, 0, 0, 0, 0, 0});
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = threeTierPlan(
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced,
+                RoutedExpertOwnerOrder::Ordinal),
+            .model_metadata = modelMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .histogram_max_window_tokens = 16u,
+            .histogram_window_growth_factor = 2.0,
+            .perf_device = "adaptive-host-cadence",
+        });
+
+        const auto converged = authority.proposeFromFrozenHistogramWindow(
+            frozenWindow(1, {100, 90, 80, 70, 60, 50}));
+        ASSERT_TRUE(converged.valid());
+        ASSERT_TRUE(converged.empty());
+        EXPECT_EQ(histogram->windowSize(), 8);
+
+        const auto moving = authority.proposeFromFrozenHistogramWindow(
+            frozenWindow(2, {1, 1, 1, 1, 100, 90}));
+        ASSERT_TRUE(moving.valid());
+        ASSERT_FALSE(moving.empty());
+        EXPECT_EQ(histogram->windowSize(), 4);
+
+        const auto records = PerfStatsCollector::snapshot(
+            {"moe_overlay_residency"});
+        ASSERT_NE(findRecord(records, "histogram_window_growth"), nullptr);
+        ASSERT_NE(
+            findRecord(
+                records,
+                "histogram_window_reset_after_movement"),
+            nullptr);
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        RuntimeEvidenceProbeAccumulatesWithoutRotatingAnUnderfullHostWindow)
+    {
+        auto histogram = histogramWithCounts({0, 0, 0, 0, 0, 0});
+        int drain_polls = 0;
+        histogram->registerRuntimeHistogramDrain(
+            [&]()
+            {
+                ++drain_polls;
+                if ((drain_polls & 1) != 0)
+                    return RuntimeExpertHistogramDrainResult::pending();
+
+                const uint64_t device_counts[6] = {2, 0, 0, 0, 2, 0};
+                histogram->mergeLayerCounts(
+                    0,
+                    device_counts,
+                    6,
+                    /*count_window_tokens=*/true,
+                    ExpertHistogramSource::GroupedVerifier);
+                return RuntimeExpertHistogramDrainResult::ready();
+            });
+
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = threeTierPlan(
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced,
+                RoutedExpertOwnerOrder::Ordinal),
+            .model_metadata = modelMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .perf_device = "CUDA:0",
+        });
+
+        EXPECT_EQ(
+            authority.progressHistogramWindow().progress,
+            MoEOverlayHistogramWindowProgress::Waiting);
+        EXPECT_EQ(drain_polls, 0)
+            << "A partial host view must not poll device banks continuously";
+
+        EXPECT_EQ(
+            authority
+                .progressHistogramWindow(
+                    MoEOverlayHistogramEvidenceScope::RuntimeSources)
+                .progress,
+            MoEOverlayHistogramWindowProgress::Pending);
+        const auto partial = authority.progressHistogramWindow(
+            MoEOverlayHistogramEvidenceScope::RuntimeSources);
+        EXPECT_EQ(
+            partial.progress,
+            MoEOverlayHistogramWindowProgress::Reconciled);
+        EXPECT_FALSE(partial.window);
+        EXPECT_EQ(histogram->windowGeneration(), 0u);
+        EXPECT_EQ(histogram->windowTokenCount(), 2u);
+        EXPECT_FALSE(authority.maintenanceWindowReady());
+
+        EXPECT_EQ(
+            authority
+                .progressHistogramWindow(
+                    MoEOverlayHistogramEvidenceScope::RuntimeSources)
+                .progress,
+            MoEOverlayHistogramWindowProgress::Pending);
+        const auto complete = authority.progressHistogramWindow(
+            MoEOverlayHistogramEvidenceScope::RuntimeSources);
+        ASSERT_EQ(
+            complete.progress,
+            MoEOverlayHistogramWindowProgress::Ready);
+        ASSERT_TRUE(complete.window);
+        EXPECT_EQ(complete.window->token_count, 4u);
+        EXPECT_EQ(histogram->windowGeneration(), 1u);
+        EXPECT_EQ(histogram->windowTokenCount(), 0u);
+        EXPECT_EQ(drain_polls, 4);
     }
 
     INSTANTIATE_TEST_SUITE_P(
@@ -3095,6 +3363,411 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief Axis fairness must reserve one lane without overriding economy.
+     *
+     * The adversarial owner map exposes two profitable tier exchanges and more
+     * than one profitable same-tier correction.  Three physical slots therefore
+     * require one lane for each independent Dynamic objective, while the third
+     * lane must return to descending marginal net benefit.  Giving every
+     * participant candidate priority over the second tier exchange turns an
+     * anti-starvation rule into participant-axis domination on larger models.
+     */
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        BoundedDynamicWaveReservesOneParticipantLaneThenUsesEconomyOrder)
+    {
+        ScopedPerfStats perf;
+        constexpr int layer_count = 2;
+        auto histogram = fourParticipantHistogram(layer_count);
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = twoTierThreeCpuParticipantPlan(),
+            .model_metadata = eightExpertMetadata(layer_count),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .phase_service_profile =
+                twoTierServiceProfile(4, layer_count),
+            .migration_cost_profile =
+                fourParticipantMigrationProfile(
+                    /*transfer_and_repack_ns=*/1,
+                    /*inference_interference_ns=*/1,
+                    layer_count),
+            .migration_economy_policy =
+                MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 370,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+            .participant_rebalance_policy = {
+                .enabled = true,
+                .imbalance_threshold_per_mille = 1001,
+                .minimum_improvement_per_mille = 1,
+                .maximum_swaps_per_layer = 4,
+                .maximum_plan_entries_per_wave = 16,
+                .minimum_window_activations = 1,
+            },
+            .shadow_slots_per_endpoint_layer = 2,
+            .max_concurrent_cycles = 3,
+            .perf_device = "bounded-one-lane-axis-reservation",
+        });
+
+        const std::vector<std::uint64_t> layer_counts{
+            10, 9, 100, 90, 80, 70, 1, 1};
+        auto window = std::make_shared<DecodeExpertHistogramWindow>();
+        window->generation = 1;
+        window->num_layers = layer_count;
+        window->num_experts = 8;
+        for (int layer = 0; layer < layer_count; ++layer)
+        {
+            window->expert_counts.insert(
+                window->expert_counts.end(),
+                layer_counts.begin(),
+                layer_counts.end());
+        }
+        window->source_expert_counts.assign(
+            window->expert_counts.size() *
+                kExpertHistogramProductionSourceCount,
+            0u);
+        std::copy(
+            window->expert_counts.begin(),
+            window->expert_counts.end(),
+            window->source_expert_counts.begin());
+        window->token_count = std::accumulate(
+            window->expert_counts.begin(),
+            window->expert_counts.end(),
+            std::uint64_t{0});
+        window->source_token_counts[0] = window->token_count;
+        ASSERT_TRUE(window->valid());
+
+        const auto transaction =
+            authority.proposeFromFrozenHistogramWindow(window);
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_TRUE(transaction.host_admission.has_value());
+        const auto &admission = *transaction.host_admission;
+        ASSERT_TRUE(admission.valid());
+        EXPECT_GE(admission.policy_eligible_axes.tier_residency, 2u);
+        EXPECT_GE(admission.policy_eligible_axes.participant_placement, 2u);
+        EXPECT_EQ(admission.admitted_candidate_cycles, 3u);
+        EXPECT_EQ(
+            admission.admitted_candidate_axes.participant_placement,
+            1u)
+            << "axis fairness reserves one participant lane, not every lane";
+        EXPECT_EQ(
+            admission.admitted_candidate_axes.tier_residency,
+            2u)
+            << "the unreserved lane must return to higher marginal tier economy";
+
+        const auto records = PerfStatsCollector::snapshot(
+            {"moe_overlay_residency"});
+        const auto *axis_admission = findRecord(
+            records, "cycle_axis_admission");
+        ASSERT_NE(axis_admission, nullptr);
+        const auto reserved = axis_admission->tags.find(
+            "independent_axis_reserved_participant_candidates");
+        ASSERT_NE(reserved, axis_admission->tags.end());
+        EXPECT_EQ(reserved->second, "1")
+            << "fairness may preempt economy for exactly one participant lane";
+    }
+
+    /**
+     * @brief A one-slot Dynamic wave must compare both independent axes.
+     *
+     * Tier promotion and same-tier skew repair are policy alternatives when
+     * only one closed transfer cycle can be staged. The physical BOM must not
+     * make tier residency an implicit permanent priority: both alternatives
+     * reach measured-economy admission and the selected transaction carries
+     * the winning alternative's exact score and typed axis.
+     */
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        OneSlotDynamicWaveArbitratesTierAndParticipantAxesByEconomy)
+    {
+        ScopedPerfStats perf;
+        auto histogram = fourParticipantHistogram();
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = twoTierThreeCpuParticipantPlan(),
+            .model_metadata = eightExpertMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .phase_service_profile = twoTierServiceProfile(4),
+            .migration_cost_profile =
+                fourParticipantMigrationProfile(
+                    /*transfer_and_repack_ns=*/1,
+                    /*inference_interference_ns=*/1),
+            .migration_economy_policy =
+                MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 370,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+            .participant_rebalance_policy = {
+                .enabled = true,
+                .imbalance_threshold_per_mille = 1001,
+                .minimum_improvement_per_mille = 1,
+                .maximum_swaps_per_layer = 4,
+                .maximum_plan_entries_per_wave = 16,
+                .minimum_window_activations = 1,
+            },
+            .shadow_slots_per_endpoint_layer = 1,
+            .max_concurrent_cycles = 1,
+            .perf_device = "one-slot-two-axis-dynamic",
+        });
+
+        const auto transaction =
+            authority.proposeFromFrozenHistogramWindow(
+                frozenWindow(
+                    1,
+                    {10, 9, 100, 90, 80, 70, 1, 1}));
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_EQ(transaction.migration_cycles.size(), 1u);
+        ASSERT_TRUE(transaction.host_admission.has_value());
+        const auto &admission = *transaction.host_admission;
+        ASSERT_TRUE(admission.valid());
+        EXPECT_EQ(admission.maximum_concurrent_cycles, 1u);
+        EXPECT_GT(
+            admission.policy_eligible_axes.tier_residency +
+                admission.policy_eligible_axes.combined,
+            0u);
+        EXPECT_GT(
+            admission.policy_eligible_axes.participant_placement +
+                admission.policy_eligible_axes.combined,
+            0u)
+            << "a one-slot BOM must not suppress participant planning while "
+               "tier promotion remains available";
+        EXPECT_EQ(admission.admitted_candidate_cycles, 1u);
+        EXPECT_GT(admission.capacity_rejected_cycles, 0u);
+
+        const auto records = PerfStatsCollector::snapshot(
+            {"moe_overlay_residency"});
+        const auto *arbitration = findRecord(
+            records, "single_cycle_axis_arbitration");
+        ASSERT_NE(arbitration, nullptr);
+        EXPECT_NE(arbitration->tags.at("eligible_tier_candidates"), "0");
+        EXPECT_NE(
+            arbitration->tags.at("eligible_participant_candidates"), "0");
+        EXPECT_EQ(
+            std::stoull(arbitration->tags.at(
+                "selected_projected_net_benefit_ns")),
+            transaction.economy.projected_net_benefit_ns);
+        EXPECT_EQ(
+            arbitration->tags.at("selection_policy"),
+            "measured_economy");
+    }
+
+    /**
+     * @brief Jointly economical axes must survive zero standalone payoff.
+     *
+     * CPU participants one and two begin co-critical while participant three
+     * is idle. Promoting one expert from participant one cannot reduce the
+     * layer makespan until a same-tier exchange also halves participant two's
+     * work. Conversely, that participant exchange cannot reduce makespan while
+     * participant one remains untouched. The two closed cycles are therefore
+     * a single economic dependency cohort: rejecting either from its
+     * standalone score makes a profitable Dynamic epoch unrepresentable.
+     */
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        BoundedDynamicWaveAdmitsJointlyProfitableDependencyCohort)
+    {
+        ScopedPerfStats perf;
+        auto histogram = fourParticipantHistogram();
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = twoTierThreeCpuParticipantPlan(),
+            .model_metadata = eightExpertMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .phase_service_profile = twoTierServiceProfile(4),
+            .migration_cost_profile =
+                fourParticipantMigrationProfile(
+                    /*transfer_and_repack_ns=*/1,
+                    /*inference_interference_ns=*/1),
+            .migration_economy_policy =
+                MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 1'000,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+            .participant_rebalance_policy = {
+                .enabled = true,
+                .imbalance_threshold_per_mille = 1001,
+                .minimum_improvement_per_mille = 1,
+                .maximum_swaps_per_layer = 4,
+                .maximum_plan_entries_per_wave = 16,
+                .minimum_window_activations = 1,
+            },
+            .shadow_slots_per_endpoint_layer = 2,
+            .max_concurrent_cycles = 2,
+            .perf_device = "joint-two-axis-dependency",
+        });
+
+        /*
+         * Initial ownership is GPU={0,1}, CPU1={2,3}, CPU2={4,5},
+         * CPU3={6,7}. CPU1 and CPU2 each carry 100 units of work. The tier
+         * cycle halves CPU1 while the participant cycle halves CPU2; only the
+         * atomic pair lowers the 100-unit critical path to 50.
+         */
+        const auto transaction =
+            authority.proposeFromFrozenHistogramWindow(
+                frozenWindow(
+                    1,
+                    {0, 0, 50, 50, 50, 50, 0, 0}));
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_EQ(transaction.migration_cycles.size(), 2u);
+        ASSERT_TRUE(transaction.host_admission.has_value());
+        EXPECT_NE(
+            transaction.host_admission->admitted_physical_axes
+                    .tier_residency +
+                transaction.host_admission->admitted_physical_axes.combined,
+            0u);
+        EXPECT_NE(
+            transaction.host_admission->admitted_physical_axes
+                    .participant_placement +
+                transaction.host_admission->admitted_physical_axes.combined,
+            0u);
+        EXPECT_GT(transaction.economy.projected_net_benefit_ns, 0u);
+    }
+
+    /**
+     * @brief An uneconomical layer must not hide a profitable later layer.
+     *
+     * Layer zero's accelerator transfers are deliberately uneconomical while
+     * layer one has a single hot CPU expert whose promotion pays immediately.
+     * Candidate filtering must retain the independent later-layer movement.
+     */
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        UneconomicalLayerDoesNotHideIndependentProfitableLayer)
+    {
+        ScopedPerfStats perf;
+        constexpr int layer_count = 2;
+        auto migration_profile =
+            std::make_shared<MoEOverlayMigrationCostProfile>();
+        migration_profile->identity =
+            "rejected-dependent-cohort-migration-v1";
+        for (int layer = 0; layer < layer_count; ++layer)
+        {
+            for (int source = 0; source < 4; ++source)
+            {
+                for (int destination = 0; destination < 4; ++destination)
+                {
+                    if (source == destination)
+                        continue;
+                    const bool expensive_layer_zero_tier_edge =
+                        layer == 0 &&
+                        (source == 0 || destination == 0);
+                    migration_profile->costs.push_back({
+                        .source_participant = source,
+                        .destination_participant = destination,
+                        .layer = layer,
+                        .transfer_and_repack_ns =
+                            expensive_layer_zero_tier_edge ? 100'000u : 1u,
+                        .inference_interference_ns =
+                            expensive_layer_zero_tier_edge ? 100'000u : 1u,
+                    });
+                }
+            }
+        }
+        auto metadata = eightExpertMetadata();
+        metadata.num_layers = layer_count;
+        DecodeExpertHistogramConfig histogram_config;
+        histogram_config.num_layers = layer_count;
+        histogram_config.num_experts = metadata.num_experts;
+        histogram_config.top_k = 2;
+        histogram_config.window_size = 4;
+        histogram_config.sockets = {
+            DeviceId::cuda(0),
+            DeviceId::cpu(),
+            DeviceId::cpu(),
+            DeviceId::cpu(),
+        };
+        histogram_config.ownership =
+            MoELayeredExpertOwnership::uniform(
+                layer_count,
+                4,
+                {0, 0, 1, 1, 2, 2, 3, 3});
+        auto histogram =
+            std::make_unique<DecodeExpertHistogram>(histogram_config);
+
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = twoTierThreeCpuParticipantPlan(),
+            .model_metadata = metadata,
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .phase_service_profile =
+                twoTierServiceProfile(4, layer_count),
+            .migration_cost_profile = std::move(migration_profile),
+            .migration_economy_policy =
+                MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 1'000,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+            .participant_rebalance_policy = {
+                .enabled = true,
+                .imbalance_threshold_per_mille = 1001,
+                .minimum_improvement_per_mille = 1,
+                .maximum_swaps_per_layer = 4,
+                .maximum_plan_entries_per_wave = 16,
+                .minimum_window_activations = 1,
+            },
+            .shadow_slots_per_endpoint_layer = 2,
+            .max_concurrent_cycles = 2,
+            .perf_device = "rejected-cohort-cycle-proof",
+        });
+
+        const std::array<std::vector<std::uint64_t>, layer_count>
+            layer_counts{{
+                {0, 0, 50, 50, 50, 50, 0, 0},
+                {0, 0, 0, 0, 0, 0, 10'000, 0},
+            }};
+        auto window = std::make_shared<DecodeExpertHistogramWindow>();
+        window->generation = 1;
+        window->num_layers = layer_count;
+        window->num_experts = metadata.num_experts;
+        for (const auto &counts : layer_counts)
+        {
+            window->expert_counts.insert(
+                window->expert_counts.end(),
+                counts.begin(),
+                counts.end());
+        }
+        window->source_expert_counts.assign(
+            window->expert_counts.size() *
+                kExpertHistogramProductionSourceCount,
+            0u);
+        std::copy(
+            window->expert_counts.begin(),
+            window->expert_counts.end(),
+            window->source_expert_counts.begin());
+        window->token_count = std::accumulate(
+            window->expert_counts.begin(),
+            window->expert_counts.end(),
+            std::uint64_t{0});
+        window->source_token_counts[0] = window->token_count;
+        ASSERT_TRUE(window->valid());
+
+        MoEOverlayResidencyTransaction transaction;
+        ASSERT_NO_THROW(
+            transaction = authority.proposeFromFrozenHistogramWindow(window));
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_FALSE(transaction.empty());
+        ASSERT_TRUE(transaction.host_admission.has_value());
+        EXPECT_TRUE(transaction.host_admission->valid());
+        EXPECT_TRUE(std::any_of(
+            transaction.migrations.begin(),
+            transaction.migrations.end(),
+            [](const auto &migration)
+            { return migration.layer_idx == 1; }));
+    }
+
+    /**
      * @brief A phase-regressive first layer must not hide later alternatives.
      *
      * Multi-tier waves reserve one two-edge participant slot. The raw-count
@@ -3136,6 +3809,10 @@ namespace llaminar2::test
             std::make_shared<MoERoutedTierServiceProfile>();
         service_profile->identity =
             "two-layer-alternative-participant-service-v1";
+        service_profile->production_topology =
+            ExpertHistogramProductionTopology::uniform(
+                metadata.num_layers,
+                kAllExpertHistogramProductionSources);
         for (int layer = 0; layer < metadata.num_layers; ++layer)
         {
             service_profile->costs.push_back({
@@ -3204,7 +3881,10 @@ namespace llaminar2::test
                 .imbalance_threshold_per_mille = 1'000,
                 .minimum_improvement_per_mille = 0,
                 .maximum_swaps_per_layer = 2,
-                .maximum_plan_entries_per_wave = 16,
+                /* Final publication may admit only one two-edge participant
+                 * swap. Candidate discovery must nevertheless inspect both
+                 * layers before choosing which swap earns that slot. */
+                .maximum_plan_entries_per_wave = 2,
                 .minimum_window_activations = 1,
             },
             .shadow_slots_per_endpoint_layer = 2,
@@ -3482,6 +4162,298 @@ namespace llaminar2::test
                 "admitted_participant_placement_cycles"),
             "0")
             << "combined cycles are one exclusive typed telemetry bucket";
+    }
+
+    /**
+     * @brief A combined cycle must not consume the next physical cycle's policy budget.
+     *
+     * Layer zero folds its participant objective into a profitable tier
+     * exchange. Layer one has an independent profitable swap between the two
+     * rank-resolved CPU participants. The configured transaction has three
+     * physical cycle slots and sixteen participant-plan entries, so both
+     * profitable cycles must publish. This is the reduced regression for a
+     * real 122B wave where a hidden two-entry cap left the second transfer
+     * slot idle and starved all cross-rank CPU movement.
+     */
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        CombinedCycleDoesNotStarveConfiguredCrossRankParticipantSlot)
+    {
+        ScopedPerfStats perf;
+        constexpr int layer_count = 2;
+        auto metadata = twelveExpertMetadata();
+        metadata.num_layers = layer_count;
+        auto histogram =
+            threeParticipantTwelveExpertHistogram(layer_count);
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = twoTierNodeLocalPlan(
+                RoutedExpertOwnerOrder::Ordinal,
+                /*accelerator_capacity=*/6),
+            .model_metadata = metadata,
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .phase_service_profile = twoTierServiceProfile(
+                /*participant_count=*/3,
+                layer_count),
+            .migration_cost_profile =
+                threeParticipantMigrationProfile(
+                    /*transfer_and_repack_ns=*/1,
+                    /*inference_interference_ns=*/1,
+                    layer_count),
+            .migration_economy_policy =
+                MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 1'000,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+            .participant_rebalance_policy = {
+                .enabled = true,
+                .imbalance_threshold_per_mille = 1001,
+                .minimum_improvement_per_mille = 1,
+                .maximum_swaps_per_layer = 4,
+                .maximum_plan_entries_per_wave = 16,
+                .minimum_window_activations = 1,
+            },
+            .shadow_slots_per_endpoint_layer = 2,
+            .max_concurrent_cycles = 3,
+            .perf_device = "combined-plus-cross-rank-participant",
+        });
+
+        const std::array<std::vector<std::uint64_t>, layer_count>
+            layer_counts{{
+                {100, 10, 800, 800, 800, 800,
+                 1'000, 50, 50, 900, 0, 0},
+                {101, 101, 101, 101, 101, 101,
+                 100, 90, 80, 1, 1, 1},
+            }};
+        auto window = std::make_shared<DecodeExpertHistogramWindow>();
+        window->generation = 1;
+        window->num_layers = layer_count;
+        window->num_experts = metadata.num_experts;
+        for (const auto &layer : layer_counts)
+        {
+            window->expert_counts.insert(
+                window->expert_counts.end(),
+                layer.begin(),
+                layer.end());
+        }
+        window->source_expert_counts.assign(
+            window->expert_counts.size() *
+                kExpertHistogramProductionSourceCount,
+            0u);
+        std::copy(
+            window->expert_counts.begin(),
+            window->expert_counts.end(),
+            window->source_expert_counts.begin());
+        window->token_count = std::accumulate(
+            window->expert_counts.begin(),
+            window->expert_counts.end(),
+            std::uint64_t{0});
+        window->source_token_counts[0] = window->token_count;
+        ASSERT_TRUE(window->valid());
+
+        const auto transaction =
+            authority.proposeFromFrozenHistogramWindow(window);
+        ASSERT_TRUE(transaction.valid());
+        std::ostringstream movement_summary;
+        for (const auto &migration : transaction.migrations)
+        {
+            movement_summary
+                << " [layer=" << migration.layer_idx
+                << " expert=" << migration.expert_id
+                << " source=" << migration.source.owner_participant
+                << " destination="
+                << migration.destination.owner_participant
+                << " tier=" << migration.source.tier_idx << "->"
+                << migration.destination.tier_idx
+                << " axis=" << static_cast<int>(migration.axis) << "]";
+        }
+        if (transaction.host_admission)
+        {
+            const auto &admission = *transaction.host_admission;
+            movement_summary
+                << " admission{candidate=" << admission.candidate_cycles
+                << " eligible=" << admission.policy_eligible_cycles
+                << " eligible_participant="
+                << admission.policy_eligible_axes.participant_placement
+                << " eligible_combined="
+                << admission.policy_eligible_axes.combined
+                << " admitted=" << admission.admitted_physical_cycles
+                << " budget_rejected="
+                << admission.participant_axis_budget_rejected_cycles
+                << " payoff_rejected="
+                << admission.dependent_payoff_rejected_cycles
+                << " capacity_rejected="
+                << admission.capacity_rejected_cycles << "}";
+        }
+        ASSERT_EQ(transaction.migration_cycles.size(), 2u)
+            << "configured physical cycle slots must remain usable:"
+            << movement_summary.str();
+        ASSERT_TRUE(transaction.host_admission.has_value());
+        EXPECT_EQ(
+            transaction.host_admission->maximum_concurrent_cycles,
+            3u);
+        EXPECT_EQ(
+            transaction.host_admission
+                ->participant_axis_budget_rejected_cycles,
+            0u)
+            << "the configured participant entry budget is not a hidden one-swap cap";
+
+        const bool combined_layer_zero = std::any_of(
+            transaction.migrations.begin(),
+            transaction.migrations.end(),
+            [](const auto &migration)
+            {
+                return migration.layer_idx == 0 &&
+                       migration.axis ==
+                           MoEOptimizationMovementAxis::Combined;
+            });
+        const bool cross_rank_layer_one = std::any_of(
+            transaction.migrations.begin(),
+            transaction.migrations.end(),
+            [](const auto &migration)
+            {
+                return migration.layer_idx == 1 &&
+                       !migration.crossesTier() &&
+                       migration.crossesWorldRank() &&
+                       migration.axis ==
+                           MoEOptimizationMovementAxis::ParticipantPlacement;
+            });
+        EXPECT_TRUE(combined_layer_zero)
+            << "the first cycle must exercise participant intent absorbed into tier movement";
+        EXPECT_TRUE(cross_rank_layer_one)
+            << "the remaining slot must rebalance the distributed CPU tier";
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        PreparedPublicationWaitsForCompleteGraphSequenceBoundary)
+    {
+        auto histogram = histogramWithCounts({90, 20, 80, 10, 100, 70});
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = threeTierPlan(
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced,
+                RoutedExpertOwnerOrder::Ordinal),
+            .model_metadata = modelMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .perf_device = "graph-sequence-publication-boundary",
+        });
+        RecordingTransport transport(&authority);
+        const auto transaction = authority.proposeFromHistogram();
+        auto sequence = authority.tryAcquireGraphSequenceSnapshot();
+        ASSERT_TRUE(sequence.has_value());
+        ASSERT_EQ(sequence->epoch(), 1u);
+
+        ASSERT_EQ(
+            authority.beginApply(transaction, transport).status,
+            MoEOverlayResidencyApplyStatus::Started);
+        ASSERT_EQ(
+            authority.advanceBackground().status,
+            MoEOverlayResidencyApplyStatus::Preparing);
+
+        const auto waiting = authority.advanceBackground();
+        EXPECT_EQ(
+            waiting.status,
+            MoEOverlayResidencyApplyStatus::
+                AwaitingGraphSequenceBoundary);
+        EXPECT_EQ(authority.snapshot()->epoch, 1u);
+        EXPECT_EQ(
+            transport.calls,
+            (std::vector<std::string>{"stage", "prepare"}))
+            << "selector publication must not bisect a graph sequence";
+        EXPECT_EQ(authority.stats().publication_boundary_reservations, 1u);
+        EXPECT_EQ(authority.stats().publication_boundary_drains, 1u);
+
+        /* Dropping the complete-sequence lease is the only edge which makes
+         * the already-prepared selector transaction publishable. */
+        sequence.reset();
+        ASSERT_EQ(
+            authority.advanceBackground().status,
+            MoEOverlayResidencyApplyStatus::Publishing);
+        EXPECT_TRUE(transport.candidate_was_exact_addressable);
+        ASSERT_EQ(
+            authority.advanceBackground().status,
+            MoEOverlayResidencyApplyStatus::Published);
+
+        auto successor_sequence = authority.tryAcquireGraphSequenceSnapshot();
+        ASSERT_TRUE(successor_sequence.has_value());
+        EXPECT_EQ(successor_sequence->epoch(), 2u);
+    }
+
+    /**
+     * @brief A graph admission racing selector commit sees one whole epoch.
+     *
+     * Repeat the irreversible edge twenty times because the production defect
+     * was timing-sensitive. The waiter must remain asleep while selectors are
+     * in flight and then acquire only the fully published successor.
+     */
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        GraphSequenceAdmissionPublicationRaceIsEpochAtomic)
+    {
+        for (int iteration = 0; iteration < 20; ++iteration)
+        {
+            auto histogram =
+                histogramWithCounts({90, 20, 80, 10, 100, 70});
+            MoEOverlayResidencyAuthority authority({
+                .initial_plan = threeTierPlan(
+                    RoutedExpertResidencyPolicy::RoutedTierRebalanced,
+                    RoutedExpertOwnerOrder::Ordinal),
+                .model_metadata = modelMetadata(),
+                .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+                .histogram = histogram.get(),
+                .perf_device = "graph-sequence-publication-race",
+            });
+            RecordingTransport transport(&authority);
+            transport.publication_pending_polls = 1;
+            const auto transaction = authority.proposeFromHistogram();
+            ASSERT_EQ(
+                authority.beginApply(transaction, transport).status,
+                MoEOverlayResidencyApplyStatus::Started);
+            ASSERT_EQ(
+                authority.advanceBackground().status,
+                MoEOverlayResidencyApplyStatus::Preparing);
+            ASSERT_EQ(
+                authority.advanceBackground().status,
+                MoEOverlayResidencyApplyStatus::Publishing);
+
+            std::atomic<bool> returned{false};
+            std::atomic<std::uint64_t> acquired_epoch{0};
+            std::thread waiter([&]
+            {
+                auto lease = authority.tryAcquireGraphSequenceSnapshot();
+                acquired_epoch.store(
+                    lease ? lease->epoch() : 0u,
+                    std::memory_order_release);
+                lease.reset();
+                returned.store(true, std::memory_order_release);
+            });
+
+            const auto wait_deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(5);
+            while (authority.stats().graph_sequence_boundary_waits == 0u &&
+                   std::chrono::steady_clock::now() < wait_deadline)
+            {
+                std::this_thread::yield();
+            }
+            EXPECT_EQ(authority.stats().graph_sequence_boundary_waits, 1u);
+            EXPECT_FALSE(returned.load(std::memory_order_acquire))
+                << "a graph sequence escaped while selector publication was incomplete";
+
+            EXPECT_EQ(
+                authority.advanceBackground().status,
+                MoEOverlayResidencyApplyStatus::Publishing);
+            EXPECT_EQ(
+                authority.advanceBackground().status,
+                MoEOverlayResidencyApplyStatus::Published);
+            waiter.join();
+            EXPECT_TRUE(returned.load(std::memory_order_acquire));
+            EXPECT_EQ(acquired_epoch.load(std::memory_order_acquire), 2u);
+        }
     }
 
     TEST(

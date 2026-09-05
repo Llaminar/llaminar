@@ -666,6 +666,27 @@ TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataUsesOnlyTheExactProduce
 }
 
 TEST(Test__HiddenStateRowSelectStage,
+     ExternalCheckpointOutputRetainsArenaInputAuthority)
+{
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = 3;
+    params.d_model = 32;
+    params.input_buffer_id = BufferId::NORMALIZED;
+    params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow;
+    HiddenStateRowSelectStage stage(params);
+
+    const StageBufferContract contract = stage.bufferContract();
+    ASSERT_EQ(contract.inputs.size(), 1u);
+    EXPECT_EQ(contract.inputs.front().id, BufferId::NORMALIZED);
+    EXPECT_TRUE(contract.outputs.empty())
+        << "An external diagnostic tensor must not masquerade as an arena output";
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::FULL)
+        << "The executor must bind and cohere the graph-produced arena input";
+}
+
+TEST(Test__HiddenStateRowSelectStage,
      ShiftedPrefillTransactionDeclaresCompletePersistentArenaContract)
 {
     HiddenStateRowsSelectStage::Params params;

@@ -6,6 +6,7 @@
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "execution/moe/ExpertTierGpuBlobTransferLane.h"
 #include "execution/moe/CpuExpertSlotPool.h"
+#include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "execution/moe/MoEOverlayPreparedWeightSource.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 
@@ -15,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <string>
 #include <tuple>
@@ -490,6 +492,31 @@ namespace llaminar2
             };
         }
 
+        /**
+         * @brief Sum canonical physical allocation extents for one CPU slot.
+         * @param specs Complete gate/up/down projection specification.
+         * @return Exact bytes that CpuExpertSlotPool must materialize.
+         */
+        std::size_t plannedCpuSlotAllocationBytes(
+            std::span<const CpuExpertSlotPool::ProjectionSpec> specs)
+        {
+            std::size_t total = 0u;
+            for (const auto &spec : specs)
+            {
+                const std::size_t bytes =
+                    resolveExpertPreparedProjectionMemoryGeometry(
+                        spec.N, spec.K, spec.format)
+                        .cpu_bytes;
+                if (bytes > std::numeric_limits<std::size_t>::max() - total)
+                {
+                    throw std::overflow_error(
+                        "CPU expert slot test geometry overflowed");
+                }
+                total += bytes;
+            }
+            return total;
+        }
+
         TEST(
             CpuExpertSlotPool,
             SameExpertMayRetainOldAndCandidateEpochUntilEveryEngineAliasDies)
@@ -499,7 +526,7 @@ namespace llaminar2
                 .is_superblock = native_vnni_formats::Q4_0.is_superblock,
                 .present = true,
             };
-            auto pool = CpuExpertSlotPool::create({
+            auto pool = CpuExpertSlotPool::createForTest({
                 .participant_id = 2,
                 .layer_idx = 7,
                 .capacity = 2,
@@ -568,15 +595,21 @@ namespace llaminar2
                     .is_superblock = entry.metadata->is_superblock,
                     .present = true,
                 };
-                auto pool = CpuExpertSlotPool::create({
+                const auto projections =
+                    cpuSlotProjectionSpecs(source_identity);
+                const std::size_t planned_bytes =
+                    plannedCpuSlotAllocationBytes(projections);
+                auto pool = CpuExpertSlotPool::createForTest({
                     .participant_id = participant_id++,
                     .layer_idx = 0,
                     .capacity = 1,
-                    .projections = cpuSlotProjectionSpecs(source_identity),
+                    .projections = projections,
                     .memory_placement =
                         CpuExpertSlotPool::MemoryPlacement::aggregateDomain(),
                     .perf_device = "cpu-catalog-test",
                 });
+                EXPECT_EQ(pool->allocationBytes(), planned_bytes)
+                    << "format=" << entry.quant_type;
                 auto lease = pool->acquire(3, 9);
                 ASSERT_TRUE(lease.has_value());
                 ASSERT_EQ(lease->projections.size(), 3u);
@@ -608,15 +641,20 @@ namespace llaminar2
             {
                 SCOPED_TRACE(static_cast<int>(type));
                 const auto format = ExpertWeightFormat::floating(type);
-                auto pool = CpuExpertSlotPool::create({
+                const auto projections =
+                    cpuFloatingSlotProjectionSpecs(type);
+                const std::size_t planned_bytes =
+                    plannedCpuSlotAllocationBytes(projections);
+                auto pool = CpuExpertSlotPool::createForTest({
                     .participant_id = participant_id++,
                     .layer_idx = 3,
                     .capacity = 1,
-                    .projections = cpuFloatingSlotProjectionSpecs(type),
+                    .projections = projections,
                     .memory_placement =
                         CpuExpertSlotPool::MemoryPlacement::aggregateDomain(),
                     .perf_device = "cpu-floating-source-test",
                 });
+                EXPECT_EQ(pool->allocationBytes(), planned_bytes);
                 auto lease = pool->acquire(7, 14);
                 ASSERT_TRUE(lease.has_value());
                 ASSERT_EQ(lease->projections.size(), 3u);
@@ -685,7 +723,7 @@ namespace llaminar2
             auto specs = cpuSlotProjectionSpecs(source_identity);
             specs[2].projection = ExpertTierWeightProjection::Gate;
             EXPECT_THROW(
-                (void)CpuExpertSlotPool::create({
+                (void)CpuExpertSlotPool::createForTest({
                     .participant_id = 1,
                     .layer_idx = 0,
                     .capacity = 1,
@@ -706,7 +744,7 @@ namespace llaminar2
                 .is_superblock = native_vnni_formats::Q4_K.is_superblock,
                 .present = true,
             };
-            auto pool = CpuExpertSlotPool::create({
+            auto pool = CpuExpertSlotPool::createForTest({
                 .participant_id = 4,
                 .layer_idx = 2,
                 .capacity = 1,

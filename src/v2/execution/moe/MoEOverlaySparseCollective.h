@@ -27,6 +27,7 @@ namespace llaminar2
     class IDeviceContext;
     class IMPIContext;
     class MappedHostTransferRegion;
+    class MappedHostTransferArena;
     struct MoEOverlayCanonicalRouteTicketControl;
 
     /**
@@ -90,18 +91,35 @@ namespace llaminar2
     /**
      * @brief Model-lifetime owner for one immutable-address dispatch ticket.
      *
-     * GPU sources require backend-pinned payload storage because native graph
-     * replay records fixed asynchronous D2H destinations. They additionally
-     * own one isolated mapped timeline word: the producer release-publishes it
-     * immediately after the payload copies, and the CPU consumer acquires that
-     * exact edge without waiting for unrelated work at the graph terminal.
-     * CPU sources use ordinary aligned storage as their first-class
-     * implementation. Capacity is bound exactly once; rebinding a live ticket
-     * is a fatal topology error.
+     * GPU sources own mapped payload pages and one isolated mapped timeline
+     * word. Captured producer kernels write the payload through the exact
+     * device alias, then system-release publish the timeline; retained graphs
+     * therefore contain no D2H memcpy nodes or host synchronization. The CPU
+     * endpoint acquires the same host pages without waiting for unrelated work
+     * at the graph terminal. CPU sources use ordinary aligned storage as their
+     * first-class implementation. Capacity is bound exactly once; rebinding a
+     * live ticket is a fatal topology error.
      */
     class MoEOverlayDispatchTicketStorage final
     {
     public:
+        /**
+         * @brief Stable device sources copied into one mapped dispatch ticket.
+         *
+         * The logical-row scalar is optional for exact-width decode graphs.
+         * Every other pointer and byte count is mandatory and must describe
+         * immutable graph-capture storage on the ticket's source device.
+         */
+        struct CapturedDevicePayload
+        {
+            const int32_t *logical_row_count = nullptr;
+            const void *routing_indices = nullptr;
+            const void *routing_weights = nullptr;
+            size_t route_bytes = 0u;
+            const void *hidden_rows = nullptr;
+            size_t hidden_bytes = 0u;
+        };
+
         MoEOverlayDispatchTicketStorage() = default;
         ~MoEOverlayDispatchTicketStorage();
 
@@ -118,7 +136,7 @@ namespace llaminar2
          * @brief Bind the ticket's complete fixed-capacity capture identity.
          * @throws std::invalid_argument for invalid geometry.
          * @throws std::logic_error when an existing ticket is rebound.
-         * @throws std::runtime_error when pinned allocation fails.
+         * @throws std::runtime_error when mapped arena allocation fails.
          */
         void bindFixedCapacity(
             int layer_idx,
@@ -126,7 +144,8 @@ namespace llaminar2
             int top_k,
             int d_model,
             DeviceId source_device,
-            uint64_t workspace_generation);
+            uint64_t workspace_generation,
+            std::shared_ptr<MappedHostTransferArena> mapped_arena = nullptr);
 
         bool isBound() const noexcept { return allocation_ != nullptr; }
         const DeviceId &sourceDevice() const noexcept { return source_device_; }
@@ -149,10 +168,29 @@ namespace llaminar2
         bool armCapturedPublication(std::string *error = nullptr) noexcept;
 
         /**
+         * @brief Enqueue all device-owned ticket bytes through mapped aliases.
+         *
+         * TransferEngine validates each destination offset and launches bounded
+         * backend kernels on @p stream. The method never allocates, waits,
+         * synchronizes, or records a host-facing memcpy node. Call
+         * @ref enqueueCapturedPublication afterward on the same stream to
+         * release-publish the complete payload.
+         *
+         * @param payload Exact device pointers and immutable byte geometry.
+         * @param stream Exact non-null captured producer stream.
+         * @param error Optional exact contract or launch diagnostic.
+         * @return True only after every mapped copy kernel was enqueued.
+         */
+        bool enqueueCapturedPayload(
+            const CapturedDevicePayload &payload,
+            void *stream,
+            std::string *error = nullptr) noexcept;
+
+        /**
          * @brief Enqueue the ticket's system-release publication on @p stream.
          *
-         * Publication follows every preceding D2H payload copy on the same
-         * exact stream and is graph-capturable on CUDA and ROCm.
+         * Publication follows every preceding mapped payload kernel on the
+         * same exact stream and is graph-capturable on CUDA and ROCm.
          *
          * @param stream Exact non-null producer stream.
          * @param error Optional exact enqueue diagnostic.
@@ -182,8 +220,8 @@ namespace llaminar2
 
         void *allocation_ = nullptr;
         size_t allocation_bytes_ = 0;
-        IBackend *backend_ = nullptr;
-        bool backend_pinned_ = false;
+        /** GPU ticket payload pages; null for a host-owned CPU ticket. */
+        std::shared_ptr<MappedHostTransferRegion> payload_region_;
         /** Isolated mapped cache line used only for GPU-to-host readiness. */
         std::shared_ptr<MappedHostTransferRegion> publication_region_;
         /** Stable host alias at byte zero of @ref publication_region_. */
@@ -203,7 +241,7 @@ namespace llaminar2
      *
      * The route-slot arrays and completion record live in a small mapped region.
      * Preweighted rows remain in the participant's serial CPU expert arena and
-     * are registered exactly once through TransferEngine, so every layer graph
+     * are allocated as one native mapped region through TransferEngine, so every layer graph
      * can reuse the maximum route workspace without allocating a top-k-sized
      * return matrix per layer. One ticket has one producer and one continuation
      * GPU; capacity and every mapped alias are immutable after binding.
@@ -295,6 +333,9 @@ namespace llaminar2
          * @param workspace_generation Positive setup-owned graph identity.
          * @param contribution_region Mapped CPU canonical-route arena, with at
          *        least `route_capacity * d_model * sizeof(float)` bytes.
+         * @param metadata_arena Model-owned mapped arena for this ticket's
+         *        captured control/route metadata. It must name the exact
+         *        continuation GPU; per-ticket native registration is forbidden.
          * @throws std::invalid_argument for incomplete geometry or mapping.
          * @throws std::logic_error when a live ticket is rebound.
          */
@@ -304,7 +345,8 @@ namespace llaminar2
             int d_model,
             DeviceId continuation_device,
             uint64_t workspace_generation,
-            std::shared_ptr<MappedHostTransferRegion> contribution_region);
+            std::shared_ptr<MappedHostTransferRegion> contribution_region,
+            std::shared_ptr<MappedHostTransferArena> metadata_arena);
 
         /**
          * @brief Arm one CPU publication before it writes route rows.
@@ -315,6 +357,19 @@ namespace llaminar2
          */
         [[nodiscard]] Publication arm(uint64_t residency_epoch) noexcept;
 
+        /**
+         * @brief Release a captured consumer after CPU ticket service fails.
+         *
+         * The method publishes one monotonic @c Aborted sequence when no
+         * success payload is pending. A pending current publication is already
+         * sufficient to release the consumer and is accepted idempotently.
+         * It never overwrites an armed producer lease or an unconsumed payload.
+         *
+         * @return True when the GPU consumer is guaranteed to observe either a
+         *         success or abort publication; false for an unsafe lifecycle.
+         */
+        [[nodiscard]] bool publishAbort() noexcept;
+
         /** @return Whether a complete current publication is host-visible. */
         [[nodiscard]] bool payloadReady() const noexcept;
         /**
@@ -322,6 +377,22 @@ namespace llaminar2
          * @param residency_epoch Epoch named by the sparse dispatch packet.
          */
         [[nodiscard]] bool payloadReadyFor(
+            uint64_t residency_epoch) const noexcept;
+        /**
+         * @brief Test whether one exact epoch was successfully published.
+         *
+         * Unlike @ref payloadReadyFor, this certificate remains true after the
+         * GPU has acknowledged the publication. It is intended for a CPU
+         * protocol terminal that follows the producer while a retained GPU
+         * parent consumes the same ticket concurrently. It does not grant the
+         * caller permission to overwrite payload storage; only @ref arm owns
+         * that producer transition.
+         *
+         * @param residency_epoch Epoch named by the sparse dispatch packet.
+         * @return True for a successful pending or already-acknowledged
+         *         publication of exactly @p residency_epoch.
+         */
+        [[nodiscard]] bool publicationSucceededFor(
             uint64_t residency_epoch) const noexcept;
         /** @return Whether all immutable mapped identities remain valid. */
         [[nodiscard]] bool hasValidBoundIdentity() const noexcept;

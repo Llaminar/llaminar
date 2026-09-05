@@ -54,6 +54,22 @@ namespace llaminar2::test::parity
 
     TEST(
         Test__ParityNumericalAggregation,
+        ExplicitRecursiveMTPFloorDoesNotWeakenModelThreshold)
+    {
+        EXPECT_FALSE(productionRecursiveMTPAggregatePasses(
+            0.979999, 0.98, 0.98));
+        EXPECT_TRUE(productionRecursiveMTPAggregatePasses(
+            0.981706, 0.98, 0.98));
+        EXPECT_FALSE(productionRecursiveMTPAggregatePasses(
+            0.989, 0.995, 0.98))
+            << "A case-local recursive floor cannot weaken its model threshold";
+        EXPECT_DOUBLE_EQ(
+            productionRecursiveMTPAggregateRequiredCosine(0.995, 0.98),
+            0.995);
+    }
+
+    TEST(
+        Test__ParityNumericalAggregation,
         PromotedExpertComparisonIgnoresUnrelatedRouteSetDrift)
     {
         const std::array production_routes{3.0f, 4.0f, 3.0f, 5.0f};

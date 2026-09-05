@@ -1,8 +1,17 @@
 /**
  * @file WeightSlicer.cpp
- * @brief Stateless weight slicing computations - implementation
+ * @brief Authoritative, I/O-free tensor-parallel weight-slice geometry.
  *
- * Extracted from WeightManager.cpp. Pure computation — no I/O, no caching.
+ * This translation unit owns the arithmetic that maps a typed
+ * DeviceShardingAssignment onto source tensor intervals.  WeightManager uses
+ * these results to materialize native-format slices; graph construction uses
+ * the same assignment to size participant-local buffers.  Keeping the
+ * geometry here prevents loaders from quietly reverting to equal byte splits
+ * when a valid TP plan contains uneven head counts (for example TP=3).
+ *
+ * No method performs allocation, transfer, caching, or backend work.  A slice
+ * that cannot preserve a model semantic boundary fails before any weight is
+ * loaded.
  *
  * @author David Sanftenberg
  */
@@ -341,28 +350,141 @@ namespace llaminar2
             return result;
         }
 
-        const size_t sub_block_sizes[3] = {q_rows, k_rows, v_rows};
-
-        // Validate divisibility
-        static constexpr const char *sub_names[3] = {"Q", "K", "V"};
-        for (size_t s = 0; s < 3; s++)
-        {
-            if (sub_block_sizes[s] % static_cast<size_t>(world_size) != 0)
-            {
-                std::ostringstream err;
-                err << "[WeightSlicer] Cannot shard FusedQKV weight '" << name
-                    << "': sub-block " << sub_names[s]
-                    << " has " << sub_block_sizes[s]
-                    << " rows, not divisible by TP degree " << world_size;
-                throw std::invalid_argument(err.str());
-            }
-        }
-
         FusedQKVSliceResult result;
         result.q_total = q_rows;
         result.k_total = k_rows;
         result.v_total = v_rows;
         result.modulo_linked_gdn = false;
+
+        const auto checked_head_slice = [&name](
+                                            int head_start,
+                                            int head_count,
+                                            int global_heads,
+                                            int elements_per_head,
+                                            size_t block_rows,
+                                            const char *sub_block)
+        {
+            if (global_heads <= 0 || elements_per_head <= 0 ||
+                head_start < 0 || head_count <= 0 ||
+                head_start > global_heads - head_count ||
+                block_rows !=
+                    static_cast<size_t>(global_heads) *
+                        static_cast<size_t>(elements_per_head))
+            {
+                std::ostringstream err;
+                err << "[WeightSlicer] FusedQKV " << sub_block
+                    << " assignment is incompatible with weight '" << name
+                    << "': heads=[" << head_start << ","
+                    << (head_start + head_count) << ")/" << global_heads
+                    << " elements_per_head=" << elements_per_head
+                    << " block_rows=" << block_rows;
+                throw std::invalid_argument(err.str());
+            }
+            return SliceSpec{
+                .start = static_cast<size_t>(head_start) *
+                         static_cast<size_t>(elements_per_head),
+                .count = static_cast<size_t>(head_count) *
+                         static_cast<size_t>(elements_per_head),
+            };
+        };
+
+        const size_t expected_attention_q =
+            dimensions_.isValid()
+                ? static_cast<size_t>(dimensions_.n_heads) *
+                      static_cast<size_t>(dimensions_.head_dim)
+                : 0u;
+        const size_t expected_attention_kv =
+            dimensions_.isValid() && dimensions_.n_kv_heads > 0
+                ? static_cast<size_t>(dimensions_.n_kv_heads) *
+                      static_cast<size_t>(dimensions_.head_dim)
+                : 0u;
+        const bool exact_attention_layout =
+            expected_attention_q > 0u && expected_attention_kv > 0u &&
+            q_rows == expected_attention_q &&
+            k_rows == expected_attention_kv &&
+            v_rows == expected_attention_kv;
+        const bool full_head_equal_layout =
+            expected_attention_q > 0u && q_rows == expected_attention_q &&
+            k_rows == expected_attention_q &&
+            v_rows == expected_attention_q;
+
+        if (exact_attention_layout)
+        {
+            /* Q follows the query-head assignment.  K/V follow the typed KV
+             * assignment, which naturally represents both sharded KV and the
+             * n_kv_heads < TP-degree replicated-KV production policy. */
+            result.q = checked_head_slice(
+                assignment.head_start,
+                assignment.head_count,
+                dimensions_.n_heads,
+                dimensions_.head_dim,
+                q_rows,
+                "Q");
+            result.k = checked_head_slice(
+                assignment.kv_head_start,
+                assignment.kv_head_count,
+                dimensions_.n_kv_heads,
+                dimensions_.head_dim,
+                k_rows,
+                "K");
+            result.v.push_back(checked_head_slice(
+                assignment.kv_head_start,
+                assignment.kv_head_count,
+                dimensions_.n_kv_heads,
+                dimensions_.head_dim,
+                v_rows,
+                "V"));
+            return result;
+        }
+
+        if (full_head_equal_layout)
+        {
+            /* Some attention exporters store full-width K/V blocks.  They
+             * share the query-head ownership rather than the GQA KV range. */
+            result.q = checked_head_slice(
+                assignment.head_start,
+                assignment.head_count,
+                dimensions_.n_heads,
+                dimensions_.head_dim,
+                q_rows,
+                "Q");
+            result.k = checked_head_slice(
+                assignment.head_start,
+                assignment.head_count,
+                dimensions_.n_heads,
+                dimensions_.head_dim,
+                k_rows,
+                "K");
+            result.v.push_back(checked_head_slice(
+                assignment.head_start,
+                assignment.head_count,
+                dimensions_.n_heads,
+                dimensions_.head_dim,
+                v_rows,
+                "V"));
+            return result;
+        }
+
+        /* Without authenticated head geometry there is no safe place to put a
+         * remainder: it might split a head.  Retain the strict equal-row rule
+         * for this legacy/unknown layout while assignment-aware model layouts
+         * above admit uneven participant widths explicitly. */
+        const size_t sub_block_sizes[3] = {q_rows, k_rows, v_rows};
+        static constexpr const char *sub_names[3] = {"Q", "K", "V"};
+        for (size_t sub_block = 0; sub_block < 3; ++sub_block)
+        {
+            if (sub_block_sizes[sub_block] %
+                    static_cast<size_t>(world_size) !=
+                0u)
+            {
+                std::ostringstream err;
+                err << "[WeightSlicer] Cannot shard unknown-layout FusedQKV weight '"
+                    << name << "': sub-block " << sub_names[sub_block]
+                    << " has " << sub_block_sizes[sub_block]
+                    << " rows, not divisible by TP degree " << world_size;
+                throw std::invalid_argument(err.str());
+            }
+        }
 
         result.q = computeSubBlockSlice(q_rows, rank, world_size);
         result.k = computeSubBlockSlice(k_rows, rank, world_size);

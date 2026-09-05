@@ -13,7 +13,6 @@
 #include "execution/compute_stages/stages/MoERankBatchSparseStages.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
-#include "execution/compute_stages/stages/GDNLiveStateLocalizeStage.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
@@ -22,6 +21,7 @@
 #include "execution/compute_stages/stages/LMHeadStage.h"
 #include "execution/compute_stages/stages/RoPEStage.h"
 #include "execution/compute_stages/stages/ShortConv1dStage.h"
+#include "execution/compute_stages/stages/TPAllreduceStage.h"
 #include "execution/compute_stages/stages/TPKVCacheStateAllGatherStage.h"
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
@@ -38,6 +38,7 @@
 #include "utils/TestTensorFactory.h"
 
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <memory>
 #include <numeric>
@@ -611,6 +612,39 @@ namespace
                 kv_cache, position_ids, device);
         }
 
+        /**
+         * @brief Build one attention graph under an explicit execution phase.
+         *
+         * This exposes the same typed phase scope installed by production graph
+         * family construction, allowing policy tests to distinguish compact
+         * decode/verifier reductions from equally small prefill buckets.
+         */
+        ComputeGraph buildAttentionGraphForPhase(
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            IKVCache *kv_cache,
+            const int *position_ids,
+            DeviceId device,
+            ForwardExecutionPhase phase)
+        {
+            ForwardExecutionPhaseScope phase_scope(*this, phase);
+            DecodeReplicatedDenseScope decode_dense_scope(
+                *this,
+                seq_len * batch_size);
+            return buildAttentionGraph(
+                layer,
+                buffers,
+                layer_idx,
+                seq_len,
+                batch_size,
+                kv_cache,
+                position_ids,
+                device);
+        }
+
         LayerWeights selectedLayerWeightsForTokenCount(int layer_idx, int total_tokens)
         {
             DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
@@ -625,9 +659,10 @@ namespace
         void registerRuntimeTableHistogramSyncForTesting(
             const std::string &key,
             IMoERuntimeTable *table,
-            bool enabled = true)
+            MoERuntimeHistogramProducerRole role =
+                MoERuntimeHistogramProducerRole::ProductionDecode)
         {
-            registerRuntimeTableHistogramSyncIfNeeded(key, table, enabled);
+            registerRuntimeTableHistogramSyncIfNeeded(key, table, role);
         }
     };
 
@@ -651,6 +686,11 @@ namespace
         void prepareDecodeHistogramProducerStream(void *stream) override
         {
             prepared_producer_stream = stream;
+        }
+        void transitionDecodeHistogramProducerCapture(
+            void *,
+            RuntimeHistogramProducerCaptureTransition) override
+        {
         }
         void recordDecodeHistogramProducerStream(void *stream) override
         {
@@ -2788,7 +2828,7 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedSkipsGDNLiveStateAllGatherWhenPr
     EXPECT_TRUE(hasDependency(prefill_graph, "layer0_gated_norm", "layer0_gdn_recurrence"));
 }
 
-TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherForModularRepeat)
+TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesLinkedGDNLiveStateAllGatherForValueRepeats)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
     tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
@@ -2802,7 +2842,7 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherForModu
 
     TensorArena arena;
     LayerWeights base_layer = makeGDNTPModularLayerWeights(
-        arena, config, /*key_heads=*/2, /*value_heads=*/2, /*row_parallel_out=*/true);
+        arena, config, /*key_heads=*/1, /*value_heads=*/2, /*row_parallel_out=*/true);
     LayerWeights decode_layer = makeGDNTPModularLayerWeights(
         arena, config, /*key_heads=*/2, /*value_heads=*/4, /*row_parallel_out=*/false);
 
@@ -2878,7 +2918,7 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherForModu
         DeviceId::cpu());
 
     ActivationBuffers prefill_buffers = makeGDNTPModularActivationBuffers(
-        arena, /*tokens=*/2, config, /*key_heads=*/2, /*value_heads=*/2);
+        arena, /*tokens=*/2, config, /*key_heads=*/1, /*value_heads=*/2);
     int position_ids[2] = {0, 1};
     ComputeGraph prefill_graph = graph_builder.buildAttentionGraphForTokenCount(
         base_layer,
@@ -2896,15 +2936,27 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherForModu
         dynamic_cast<const GDNLiveStateAllGatherStage *>(handoff_node->stage.get());
     ASSERT_NE(handoff, nullptr);
     const auto &params = handoff->getParams();
-    EXPECT_TRUE(params.modular_conv_state);
-    EXPECT_EQ(params.local_conv_state_floats, 36);
-    EXPECT_EQ(params.full_conv_state_floats, 48);
-    EXPECT_EQ(params.conv_history_len, 3);
-    EXPECT_EQ(params.conv_qk_channels, 8);
-    EXPECT_EQ(params.conv_local_v_channels, 4);
-    EXPECT_EQ(params.conv_full_v_channels, 8);
-    EXPECT_EQ(params.local_recurrence_state_floats, 8);
-    EXPECT_EQ(params.full_recurrence_state_floats, 16);
+    EXPECT_EQ(params.geometry.global_key_heads, 2);
+    EXPECT_EQ(params.geometry.global_value_heads, 4);
+    EXPECT_EQ(params.geometry.key_width, 2);
+    EXPECT_EQ(params.geometry.value_width, 2);
+    EXPECT_EQ(params.geometry.conv_history_length, 3);
+
+    const auto conv_shape = params.geometry.resolve(
+        GDNLinkedLiveStateKind::ConvHistory,
+        /*degree=*/2);
+    ASSERT_TRUE(conv_shape.has_value());
+    EXPECT_EQ(conv_shape->repeat_factor, 2);
+    EXPECT_EQ(conv_shape->local_state_floats, 24);
+    EXPECT_EQ(conv_shape->full_state_floats, 48);
+
+    const auto recurrence_shape = params.geometry.resolve(
+        GDNLinkedLiveStateKind::Recurrence,
+        /*degree=*/2);
+    ASSERT_TRUE(recurrence_shape.has_value());
+    EXPECT_EQ(recurrence_shape->repeat_factor, 2);
+    EXPECT_EQ(recurrence_shape->local_state_floats, 8);
+    EXPECT_EQ(recurrence_shape->full_state_floats, 16);
 
     ActivationBuffers decode_buffers = makeGDNTPModularActivationBuffers(
         arena, /*tokens=*/1, config, /*key_heads=*/2, /*value_heads=*/4);
@@ -2971,6 +3023,149 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedPrefillKeepsAttentionTPAllreduce
         /*batch_size=*/1, DeviceId::cpu());
     EXPECT_NE(ffn_graph.getNode("layer0_down_allreduce"), nullptr)
         << "Replicated attention state must not disable dense FFN prefill partial reductions";
+}
+
+TEST(Test__Qwen35MoEGraph,
+     DecodeTP4AllreducesHaveOneCanonicalAuthorityIndependentOfMTPEnablement)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices({
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1),
+        GlobalDeviceAddress::cuda(2),
+        GlobalDeviceAddress::cuda(3)});
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+
+    GraphConfig config = makeMoEConfig(tp_ctx.get());
+    config.default_device = DeviceId::cuda(0);
+    config.dense_tp_enabled = true;
+    config.qkv_column_parallel = true;
+    config.local_n_heads = 1;
+    config.local_n_kv_heads = 1;
+
+    /*
+     * MTP-off serial decode is the external behavioral oracle for speculative
+     * execution.  It must therefore resolve the same arithmetic authority as
+     * every retained MTP graph, not silently delegate its sum order to NCCL.
+     */
+    TensorArena arena;
+    LayerWeights layer = makeFALayerWeights(arena, config);
+    layer.wo = arena.rowParallelFP32(
+        {static_cast<size_t>(config.d_model),
+         static_cast<size_t>(config.d_model)},
+        /*rank=*/0,
+        /*world_size=*/4);
+
+    TestableQwen35MoEGraph mtp_off_builder(config, nullptr);
+    auto mtp_off_buffers =
+        makeFAActivationBuffers(arena, /*tokens=*/1, config);
+    int mtp_off_position = 0;
+    ComputeGraph mtp_off_graph = mtp_off_builder.buildAttentionGraphForPhase(
+        layer,
+        mtp_off_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/1,
+        /*batch_size=*/1,
+        /*kv_cache=*/nullptr,
+        &mtp_off_position,
+        DeviceId::cuda(0),
+        ForwardExecutionPhase::Decode);
+    const auto *mtp_off_node =
+        mtp_off_graph.getNode("layer0_wo_allreduce");
+    ASSERT_NE(mtp_off_node, nullptr);
+    const auto *mtp_off_stage = dynamic_cast<const TPAllreduceStage *>(
+        mtp_off_node->stage.get());
+    ASSERT_NE(mtp_off_stage, nullptr);
+    EXPECT_EQ(
+        mtp_off_stage->getArithmeticPolicy(),
+        TPAllreduceArithmeticPolicy::CanonicalRankOrder);
+    EXPECT_EQ(mtp_off_stage->getPrecision(), "fp32");
+
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 15;
+    config.mtp.graph_capacity_draft_tokens = 15;
+
+    TestableQwen35MoEGraph serial_builder(config, nullptr);
+    auto serial_buffers = makeFAActivationBuffers(arena, /*tokens=*/1, config);
+    int serial_position = 0;
+    ComputeGraph serial_graph = serial_builder.buildAttentionGraphForPhase(
+        layer,
+        serial_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/1,
+        /*batch_size=*/1,
+        /*kv_cache=*/nullptr,
+        &serial_position,
+        DeviceId::cuda(0),
+        ForwardExecutionPhase::Decode);
+    const auto *serial_node = serial_graph.getNode("layer0_wo_allreduce");
+    ASSERT_NE(serial_node, nullptr);
+    const auto *serial_stage = dynamic_cast<const TPAllreduceStage *>(
+        serial_node->stage.get());
+    ASSERT_NE(serial_stage, nullptr);
+    EXPECT_EQ(
+        serial_stage->getArithmeticPolicy(),
+        TPAllreduceArithmeticPolicy::CanonicalRankOrder);
+    EXPECT_EQ(serial_stage->getPrecision(), "fp32");
+    const auto serial_workspace =
+        serial_stage->getWorkspaceRequirements(1, config.d_model, config.d_model);
+    ASSERT_EQ(serial_workspace.buffers.size(), 1u);
+    EXPECT_EQ(
+        serial_workspace.buffers.front().size_bytes,
+        static_cast<size_t>(config.d_model) * 4u * sizeof(float));
+    EXPECT_EQ(
+        serial_workspace.buffers.front().regime,
+        WorkspaceExecutionRegime::CompactDecodeOnly);
+
+    GraphConfig grouped_config = config;
+    grouped_config.grouped_mtp_verifier = true;
+    grouped_config.compute_all_position_logits = true;
+    TestableQwen35MoEGraph grouped_builder(grouped_config, nullptr);
+    auto grouped_buffers =
+        makeFAActivationBuffers(arena, /*tokens=*/16, grouped_config);
+    std::array<int, 16> grouped_positions{};
+    std::iota(grouped_positions.begin(), grouped_positions.end(), 0);
+    ComputeGraph grouped_graph = grouped_builder.buildAttentionGraphForPhase(
+        layer,
+        grouped_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/16,
+        /*batch_size=*/1,
+        /*kv_cache=*/nullptr,
+        grouped_positions.data(),
+        DeviceId::cuda(0),
+        ForwardExecutionPhase::Decode);
+    const auto *grouped_node = grouped_graph.getNode("layer0_wo_allreduce");
+    ASSERT_NE(grouped_node, nullptr);
+    const auto *grouped_stage = dynamic_cast<const TPAllreduceStage *>(
+        grouped_node->stage.get());
+    ASSERT_NE(grouped_stage, nullptr);
+    EXPECT_EQ(
+        grouped_stage->getArithmeticPolicy(),
+        TPAllreduceArithmeticPolicy::CanonicalRankOrder);
+    EXPECT_EQ(grouped_stage->getPrecision(), "fp32");
+
+    TestableQwen35MoEGraph prefill_builder(config, nullptr);
+    auto prefill_buffers = makeFAActivationBuffers(arena, /*tokens=*/2, config);
+    int prefill_positions[2] = {0, 1};
+    ComputeGraph prefill_graph = prefill_builder.buildAttentionGraphForPhase(
+        layer,
+        prefill_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/2,
+        /*batch_size=*/1,
+        /*kv_cache=*/nullptr,
+        prefill_positions,
+        DeviceId::cuda(0),
+        ForwardExecutionPhase::Prefill);
+    const auto *prefill_node = prefill_graph.getNode("layer0_wo_allreduce");
+    ASSERT_NE(prefill_node, nullptr);
+    const auto *prefill_stage = dynamic_cast<const TPAllreduceStage *>(
+        prefill_node->stage.get());
+    ASSERT_NE(prefill_stage, nullptr);
+    EXPECT_EQ(
+        prefill_stage->getArithmeticPolicy(),
+        TPAllreduceArithmeticPolicy::NativeCollective);
 }
 
 TEST(Test__Qwen35MoEGraph, FullForwardGraphActivatesDenseDecodeReplicatedScope)
@@ -3603,6 +3798,7 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithPost
     config.local_n_kv_heads = 1;
     config.n_heads = 2;
     config.n_kv_heads = 2;
+    config.head_start = 1;
     config.head_dim = 2;
     config.rope_on_read = true;
 
@@ -3716,6 +3912,9 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithPost
     EXPECT_EQ(attention->getParams().V, buffers.V);
     EXPECT_EQ(attention->getParams().n_heads, config.local_n_heads);
     EXPECT_EQ(attention->getParams().n_kv_heads, config.n_kv_heads);
+    EXPECT_EQ(attention->getParams().head_start, config.head_start)
+        << "TP-local prefill Q heads must retain their global GQA offset even "
+           "when the phase-split cache stores complete KV rows";
     EXPECT_EQ(attention->getParams().gqa_n_rep,
               config.n_heads / config.n_kv_heads);
     EXPECT_TRUE(attention->getParams().read_kv_from_cache);
@@ -3744,6 +3943,7 @@ TEST(Test__Qwen35MoEGraph, DirectAttentionDecodeGraphUsesPhaseSplitReplicatedPos
     config.local_n_kv_heads = 1;
     config.n_heads = 2;
     config.n_kv_heads = 2;
+    config.head_start = 1;
     config.head_dim = 2;
     config.rope_on_read = true;
 
@@ -3790,7 +3990,9 @@ TEST(Test__Qwen35MoEGraph, DirectAttentionDecodeGraphUsesPhaseSplitReplicatedPos
     ASSERT_NE(attention, nullptr);
     EXPECT_EQ(attention->getParams().n_heads, config.n_heads);
     EXPECT_EQ(attention->getParams().n_kv_heads, config.n_kv_heads);
-    EXPECT_EQ(attention->getParams().head_start, config.head_start);
+    EXPECT_EQ(attention->getParams().head_start, 0)
+        << "a replicated full-Q graph owns global head zero on every "
+           "participant, irrespective of that participant's primary TP shard";
     EXPECT_TRUE(attention->getParams().read_kv_from_cache);
     EXPECT_FALSE(
         attention->getParams().execution_policy.key_cache.transformsOnRead());
@@ -3932,7 +4134,9 @@ TEST(Test__Qwen35MoEGraph, PrefillRuntimeTableDoesNotRegisterDecodeHistogramSync
     FakeRuntimeTable prefill_only_table;
     prefill_only_table.counts = {7, 0, 0, 0};
     graph_builder.registerRuntimeTableHistogramSyncForTesting(
-        "cuda:0#prefill", &prefill_only_table, /*enabled=*/false);
+        "cuda:0#prefill",
+        &prefill_only_table,
+        MoERuntimeHistogramProducerRole::NotProducer);
 
     histogram.recordTokenBoundary(0);
     ASSERT_TRUE(histogram.windowFull());
@@ -3943,15 +4147,41 @@ TEST(Test__Qwen35MoEGraph, PrefillRuntimeTableDoesNotRegisterDecodeHistogramSync
 
     FakeRuntimeTable decode_table_without_stream;
     graph_builder.registerRuntimeTableHistogramSyncForTesting(
-        "cuda:0#decode", &decode_table_without_stream, /*enabled=*/true);
+        "cuda:0#decode",
+        &decode_table_without_stream,
+        MoERuntimeHistogramProducerRole::ProductionDecode);
     EXPECT_THROW(
         (void)histogram.syncRuntimeHistograms(),
         std::runtime_error)
         << "Decode runtime-table sync should fail fast when no producer stream was recorded";
 }
 
-TEST(Test__Qwen35MoEGraph, RuntimeHistogramRegistrationIsDecodeOnly)
+TEST(Test__Qwen35MoEGraph, RuntimeHistogramProducerPolicyIsSemanticNotPhysicalM)
 {
+    EXPECT_EQ(
+        selectMoERuntimeHistogramProducerRole(
+            MoERuntimeHistogramWorkload::SerialDecode,
+            /*host_maintenance_collects=*/true),
+        MoERuntimeHistogramProducerRole::ProductionDecode);
+    EXPECT_EQ(
+        selectMoERuntimeHistogramProducerRole(
+            MoERuntimeHistogramWorkload::GroupedMainVerifier,
+            /*host_maintenance_collects=*/true),
+        MoERuntimeHistogramProducerRole::ProductionDecode)
+        << "Accepted grouped-verifier rows are decode demand even when M > 1";
+    EXPECT_EQ(
+        selectMoERuntimeHistogramProducerRole(
+            MoERuntimeHistogramWorkload::NonDecode,
+            /*host_maintenance_collects=*/true),
+        MoERuntimeHistogramProducerRole::NotProducer)
+        << "Ordinary prefill and MTP sidecars must not feed decode demand";
+    EXPECT_EQ(
+        selectMoERuntimeHistogramProducerRole(
+            MoERuntimeHistogramWorkload::GroupedMainVerifier,
+            /*host_maintenance_collects=*/false),
+        MoERuntimeHistogramProducerRole::NotProducer)
+        << "Device-resident maintenance must not acquire a host drain";
+
     std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
     ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
     const std::string source(
@@ -3970,9 +4200,8 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramRegistrationIsDecodeOnly)
     ASSERT_NE(decode_call_end, std::string::npos);
     const std::string decode_call_text =
         source.substr(decode_call, decode_call_end - decode_call);
-    EXPECT_NE(decode_call_text.find("register_runtime_histogram_for_decode"), std::string::npos)
-        << "Decode runtime tables should register host histogram sync only when host maintenance owns rebalance";
-    EXPECT_EQ(decode_call_text.find("register_decode_histogram=*/false"), std::string::npos);
+    EXPECT_NE(decode_call_text.find("runtime_histogram_producer_role"), std::string::npos)
+        << "Serial decode must consume the typed histogram producer policy";
     EXPECT_NE(source.find("device_side_graph_rebalance_candidate"), std::string::npos)
         << "Device-side graph rebalance must not register host histogram sync callbacks";
     EXPECT_NE(source.find("!device_side_graph_rebalance_candidate"), std::string::npos);
@@ -3985,8 +4214,8 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramRegistrationIsDecodeOnly)
     ASSERT_NE(prefill_call_end, std::string::npos);
     const std::string prefill_call_text =
         source.substr(prefill_call, prefill_call_end - prefill_call);
-    EXPECT_NE(prefill_call_text.find("/*register_decode_histogram=*/false"), std::string::npos)
-        << "Prefill runtime tables must not register stale decode histogram sync callbacks";
+    EXPECT_NE(prefill_call_text.find("runtime_histogram_producer_role"), std::string::npos)
+        << "M > 1 must use semantic workload policy so grouped verification registers while ordinary prefill does not";
 }
 
 /**
@@ -4216,9 +4445,11 @@ TEST(Test__Qwen35MoEGraph, MTPSidecarUsesReplicatedDecodeBindingsForSharedExpert
     ASSERT_NE(mtp_missing_checks, std::string::npos);
     const std::string mtp_preamble =
         qwen35_source.substr(mtp_builder, mtp_missing_checks - mtp_builder);
-    EXPECT_NE(mtp_preamble.find("DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);"),
-              std::string::npos)
-        << "MTP sidecar graph construction must resolve prepared refs from the same replicated decode view as its tensors.";
+    EXPECT_NE(
+        mtp_preamble.find(
+            "config_.mtpUsesReplicatedDenseSidecarBinding()"),
+        std::string::npos)
+        << "MTP sidecar graph construction must select its typed replicated-predictor binding view explicitly.";
 
     std::string qwen_base_path = LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
     const size_t base_suffix_pos = qwen_base_path.find(moe_suffix);
@@ -4566,8 +4797,15 @@ TEST(Test__Qwen35MoEGraph,
         authority_body.find("runtime_layer.route_participant_ids"),
         std::string::npos);
     EXPECT_NE(
-        authority_body.find("runtime_layer.route_weights"),
-        std::string::npos);
+        authority_body.find("bindMoERuntimeRouteWeights"),
+        std::string::npos)
+        << "Route evidence must use the typed workload projection instead of "
+           "assuming grouped-route storage for serial decode";
+    EXPECT_NE(
+        authority_body.find(
+            "captured_overlay_route_weight_projection"),
+        std::string::npos)
+        << "The captured workload must select the exact device weight producer";
     EXPECT_EQ(
         authority_body.find("if (use_mapped_activation_parent)"),
         std::string::npos)

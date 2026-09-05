@@ -191,10 +191,25 @@ namespace llaminar2
      * CPU has armed the next transaction. The record is isolated on its own
      * cache line so polling never contends with route-slot payload bytes.
      */
+    /**
+     * @brief CPU publication outcome consumed by one retained GPU ingress.
+     *
+     * An abort is a progress record, not valid model output. It exists so a
+     * parent already submitted to the GPU can drain every mapped wait after a
+     * CPU service failure; the host still returns the original execution error
+     * after fencing that failed parent.
+     */
+    enum class MoEOverlayCanonicalRouteTicketStatus : std::int32_t
+    {
+        Empty = 0,
+        Success = 1,
+        Aborted = 2,
+    };
+
     struct alignas(64) MoEOverlayCanonicalRouteTicketControl
     {
         static constexpr std::uint32_t kMagic = 0x43544f4du; // "MOTC"
-        static constexpr std::uint32_t kABIVersion = 2u;
+        static constexpr std::uint32_t kABIVersion = 3u;
 
         std::uint32_t magic = kMagic; ///< Immutable ABI identity.
         std::uint32_t abi_version = kABIVersion; ///< Immutable ABI version.
@@ -208,7 +223,10 @@ namespace llaminar2
         std::int32_t layer_idx = -1; ///< Model layer embedded in the ticket.
         std::int32_t route_capacity = 0; ///< Maximum compact/original slot count.
         std::int32_t d_model = 0; ///< Width of one canonical contribution row.
-        std::int32_t reserved = 0;
+        /** Success payload or host-authenticated failure-drain publication. */
+        std::int32_t publication_status =
+            static_cast<std::int32_t>(
+                MoEOverlayCanonicalRouteTicketStatus::Empty);
 
         /** @return Whether immutable identity and geometry are representable. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid() const noexcept

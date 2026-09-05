@@ -275,10 +275,24 @@ namespace llaminar2
             header.payload_bytes_per_layer_offset +
                     header.num_layers * sizeof(std::uint64_t) >
                 leader_owned_end ||
-            header.demand_history_offset < leader_owned_begin ||
-            header.demand_history_offset <
+            header.initial_owner_participants_offset <
                 header.payload_bytes_per_layer_offset +
                     header.num_layers * sizeof(std::uint64_t) ||
+            header.initial_owner_participants_offset %
+                    alignof(std::uint32_t) !=
+                0u ||
+            header.initial_owner_participants_words !=
+                static_cast<std::uint64_t>(header.num_layers) *
+                    header.num_experts ||
+            header.initial_owner_participants_offset +
+                    header.initial_owner_participants_words *
+                        sizeof(std::uint32_t) >
+                leader_owned_end ||
+            header.demand_history_offset < leader_owned_begin ||
+            header.demand_history_offset <
+                header.initial_owner_participants_offset +
+                    header.initial_owner_participants_words *
+                        sizeof(std::uint32_t) ||
             header.demand_history_offset % alignof(std::uint64_t) != 0u ||
             header.demand_history_words !=
                 static_cast<std::uint64_t>(
@@ -411,7 +425,8 @@ namespace llaminar2
                mapped_base_device && mapped_bytes != 0u && layout &&
                participants && groups && controller &&
                inference_epoch_record && command &&
-               command_entries && payload_bytes_per_layer && demand_history &&
+               command_entries && payload_bytes_per_layer &&
+               initial_owner_participants && demand_history &&
                economy && economy_service_costs &&
                economy_migration_costs && economy_last_moved &&
                local_group &&
@@ -442,6 +457,7 @@ namespace llaminar2
             .command = command,
             .command_entries = command_entries,
             .payload_bytes_per_layer = payload_bytes_per_layer,
+            .initial_owner_participants = initial_owner_participants,
             .demand_history = demand_history,
             .economy = economy,
             .economy_service_costs = economy_service_costs,
@@ -562,6 +578,19 @@ namespace llaminar2
                 sizeof(std::uint64_t),
                 "payload byte geometry bytes"),
             "payload byte geometry");
+        cursor = checkedAlignUp(cursor, 64u, "initial prepared owner table");
+        const std::size_t initial_owner_participants_offset = cursor;
+        const std::size_t initial_owner_participants_words = checkedMultiply(
+            num_layers,
+            num_experts,
+            "initial prepared owner words");
+        cursor = checkedAdd(
+            cursor,
+            checkedMultiply(
+                initial_owner_participants_words,
+                sizeof(std::uint32_t),
+                "initial prepared owner bytes"),
+            "initial prepared owner table");
         cursor = checkedAlignUp(cursor, 64u, "phase demand history");
         const std::size_t demand_history_offset = cursor;
         const std::size_t demand_history_words = checkedMultiply(
@@ -746,6 +775,10 @@ namespace llaminar2
             .command_entries_offset = command_entries_offset,
             .payload_bytes_per_layer_offset =
                 payload_bytes_per_layer_offset,
+            .initial_owner_participants_offset =
+                initial_owner_participants_offset,
+            .initial_owner_participants_words =
+                initial_owner_participants_words,
             .demand_history_offset = demand_history_offset,
             .demand_history_words = demand_history_words,
             .economy_header_offset = economy_header_offset,
@@ -783,6 +816,11 @@ namespace llaminar2
         MoEOverlayNodeLocalDeviceControllerFabric(Config config)
         : config_(std::move(config))
     {
+        const std::size_t initial_owner_words =
+            static_cast<std::size_t>(config_.num_layers) *
+            static_cast<std::size_t>(config_.num_experts);
+        const bool dynamic_geometry =
+            !config_.payload_bytes_per_layer.empty();
         if (!config_.mpi_ctx || !config_.topology ||
             !config_.topology->valid() || config_.num_layers == 0u ||
             config_.num_experts == 0u || config_.command_capacity == 0u ||
@@ -791,11 +829,27 @@ namespace llaminar2
             config_.initial_durable_epoch == 0u ||
             (!config_.payload_bytes_per_layer.empty() &&
              config_.payload_bytes_per_layer.size() != config_.num_layers) ||
+            (dynamic_geometry &&
+             config_.initial_owner_participants.size() !=
+                 initial_owner_words) ||
+            (!config_.initial_owner_participants.empty() &&
+             config_.initial_owner_participants.size() !=
+                 initial_owner_words) ||
             config_.minimum_window_activations == 0u ||
             config_.maximum_cycles_per_wave == 0u)
         {
             throw std::invalid_argument(
                 "node-local device controller fabric requires complete topology and geometry");
+        }
+        if (std::any_of(
+                config_.initial_owner_participants.begin(),
+                config_.initial_owner_participants.end(),
+                [participant_count = config_.topology->participants.size()](
+                    std::uint32_t participant)
+                { return participant >= participant_count; }))
+        {
+            throw std::invalid_argument(
+                "node-local device controller fabric initial owner table names an invalid participant");
         }
         const auto *const mpi_topology = config_.mpi_ctx->topology();
         if (!mpi_topology || mpi_topology->node_shared_memory_namespace() == 0u)
@@ -1336,6 +1390,25 @@ namespace llaminar2
                         ? 0u
                         : config_.payload_bytes_per_layer[layer];
             }
+            auto *const initial_owners = at<std::uint32_t>(
+                base,
+                static_cast<std::size_t>(
+                    layout_.header.initial_owner_participants_offset));
+            if (config_.initial_owner_participants.empty())
+            {
+                std::fill_n(
+                    initial_owners,
+                    static_cast<std::size_t>(
+                        layout_.header.initial_owner_participants_words),
+                    std::numeric_limits<std::uint32_t>::max());
+            }
+            else
+            {
+                std::copy(
+                    config_.initial_owner_participants.begin(),
+                    config_.initial_owner_participants.end(),
+                    initial_owners);
+            }
             auto *const demand_history = at<std::uint64_t>(
                 base,
                 static_cast<std::size_t>(
@@ -1426,6 +1499,16 @@ namespace llaminar2
             base,
             static_cast<std::size_t>(
                 layout_.header.inference_epoch_record_offset));
+        const auto *const published_initial_owners = at<std::uint32_t>(
+            base,
+            static_cast<std::size_t>(
+                layout_.header.initial_owner_participants_offset));
+        const bool initial_owners_match =
+            config_.initial_owner_participants.empty() ||
+            std::equal(
+                config_.initial_owner_participants.begin(),
+                config_.initial_owner_participants.end(),
+                published_initial_owners);
         std::uint32_t expected_inference_mask = 0u;
         for (const int participant_id :
              config_.topology->groups.at(
@@ -1444,6 +1527,11 @@ namespace llaminar2
                 layout_.header.inference_epoch_record_offset ||
             published_layout->payload_bytes_per_layer_offset !=
                 layout_.header.payload_bytes_per_layer_offset ||
+            published_layout->initial_owner_participants_offset !=
+                layout_.header.initial_owner_participants_offset ||
+            published_layout->initial_owner_participants_words !=
+                layout_.header.initial_owner_participants_words ||
+            !initial_owners_match ||
             published_layout->minimum_window_activations !=
                 layout_.header.minimum_window_activations ||
             published_layout->maximum_cycles_per_wave !=
@@ -1731,6 +1819,10 @@ namespace llaminar2
                 base,
                 static_cast<std::size_t>(
                     layout_.header.payload_bytes_per_layer_offset)),
+            .initial_owner_participants = at<std::uint32_t>(
+                base,
+                static_cast<std::size_t>(
+                    layout_.header.initial_owner_participants_offset)),
             .demand_history = at<std::uint64_t>(
                 base,
                 static_cast<std::size_t>(
@@ -1998,18 +2090,23 @@ namespace llaminar2
             false);
         if (profiles.service->costs.size() !=
             static_cast<std::size_t>(layout_.header.tier_count) *
+                layout_.header.num_layers ||
+            !profiles.service->production_topology.valid() ||
+            profiles.service->production_topology.layerCount() !=
                 layout_.header.num_layers)
         {
             throw std::invalid_argument(
-                "certified device economy service profile has incomplete tier/layer geometry");
+                "certified device economy service profile has incomplete tier/layer topology");
         }
+        const auto active_sources =
+            profiles.service->production_topology.economyActiveSources();
         std::uint32_t active_source_bits = 0u;
         for (std::uint32_t phase = 0u;
              phase <
                  kMoEOverlayDeviceControllerEconomyServicePhaseCount;
              ++phase)
         {
-            if (profiles.service->active_sources[phase])
+            if (active_sources[phase])
                 active_source_bits |= 1u << phase;
         }
         if (active_source_bits == 0u)
@@ -2039,7 +2136,9 @@ namespace llaminar2
                      static_cast<std::size_t>(row.layer)) *
                         kMoEOverlayDeviceControllerEconomyServicePhaseCount +
                     phase;
-                const bool active = (active_source_bits & (1u << phase)) != 0u;
+                const bool active =
+                    profiles.service->production_topology
+                        .requiresServiceEvidence(row.layer, phase);
                 const std::uint64_t cost =
                     row.nanoseconds_per_activation[phase];
                 if (service_seen[offset] ||

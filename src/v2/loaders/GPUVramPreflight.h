@@ -13,6 +13,7 @@
 #pragma once
 
 #include "GPUHostLoadPreflight.h"
+#include "planning/PhysicalMemoryBOM.h"
 #include "utils/DebugEnv.h"
 
 #include <algorithm>
@@ -24,6 +25,9 @@
 
 namespace llaminar2
 {
+    /** Device-allocation alignment shared with @ref WeightVRAMPool. */
+    inline constexpr std::size_t kGPUWeightLoadAllocationAlignment = 256u;
+
     /** @brief Immutable policy inputs for one GPU's initial weight upload. */
     struct GPUWeightLoadMemoryPolicy
     {
@@ -33,46 +37,38 @@ namespace llaminar2
         size_t staging_budget_bytes = 0;
     };
 
-    /**
-     * @brief Complete initial-load memory bill for one GPU.
-     *
-     * `required_bytes` includes every byte allocated by this lifecycle:
-     * persistent prepared weights and all upload slots. Keeping the components
-     * alongside the total makes diagnostics auditable without allowing callers
-     * to perform a second fit equation.
-     */
-    struct GPUWeightLoadMemoryBOM
+    /** @brief Exact bounded upload-ring geometry before physical admission. */
+    struct GPUWeightLoadMemoryGeometry
     {
-        size_t planned_weight_bytes = 0;
         size_t maximum_source_bytes = 0;
+        /** Logical payload capacity used by row-chunk scheduling. */
         size_t staging_slot_bytes = 0;
+        /** Physical distance between slots after allocator alignment. */
+        size_t staging_slot_stride_bytes = 0;
+        /** Complete device allocation for every simultaneously resident slot. */
         size_t staging_bytes = 0;
-        /** Persistent weights plus every independently resident staging slot. */
-        size_t load_bytes = 0;
-        /** Complete concrete allocation requirement. */
-        size_t required_bytes = 0;
-        size_t free_vram_bytes = 0;
+        /** Exact pinned-host allocation before any allocator page rounding. */
+        size_t host_staging_bytes = 0;
         int staging_stream_count = 0;
-
-        /** @return Whether the backend supplied a meaningful free-memory reading. */
-        [[nodiscard]] bool hasMemoryObservation() const noexcept
-        {
-            return free_vram_bytes > 0;
-        }
-
-        /**
-         * @return Whether the complete bill fits, or true when memory is unknown.
-         *
-         * Load infrastructure historically permits backends that cannot report
-         * free VRAM. Capacity admission itself supplies a positive hardware
-         * inventory and therefore never relies on the unknown-memory branch.
-         */
-        [[nodiscard]] bool fits() const noexcept
-        {
-            return !hasMemoryObservation() || required_bytes <= free_vram_bytes;
-        }
-
     };
+
+    /**
+     * @brief Round an allocation without permitting address-space overflow.
+     * @param bytes Unaligned byte count.
+     * @return Byte count aligned to the GPU weight-pool contract.
+     */
+    [[nodiscard]] inline size_t alignGPUWeightLoadAllocation(size_t bytes)
+    {
+        if (bytes == 0)
+            return 0;
+        constexpr size_t alignment = kGPUWeightLoadAllocationAlignment;
+        if (bytes > std::numeric_limits<size_t>::max() - (alignment - 1u))
+        {
+            throw std::overflow_error(
+                "GPU weight-load allocation alignment overflows size_t");
+        }
+        return (bytes + alignment - 1u) & ~(alignment - 1u);
+    }
 
     /**
      * @brief Resolve the process-wide initial-load settings into a typed policy.
@@ -97,32 +93,19 @@ namespace llaminar2
     }
 
     /**
-     * @brief Compute the authoritative persistent/staging memory bill.
-     * @param planned_weight_bytes Persistent prepared-weight pool bytes.
+     * @brief Resolve the exact logical and physical upload-ring geometry.
      * @param maximum_source_bytes Largest raw source transaction loaded through
      *        any ring slot. A bounded policy caps each slot independently.
-     * @param free_vram_bytes Current or admission-time available VRAM.
      * @param policy Typed upload-slot policy.
-     * @return Auditable bill whose `fits()` method owns the admission equation.
+     * @return Geometry consumed unchanged by planning and WeightVRAMPool.
      * @throws std::invalid_argument for an impossible stream policy.
      * @throws std::overflow_error when any byte calculation exceeds `size_t`.
      */
-    [[nodiscard]] inline GPUWeightLoadMemoryBOM gpuWeightLoadMemoryBOM(
-        size_t planned_weight_bytes,
+    [[nodiscard]] inline GPUWeightLoadMemoryGeometry
+    resolveGPUWeightLoadMemoryGeometry(
         size_t maximum_source_bytes,
-        size_t free_vram_bytes,
         const GPUWeightLoadMemoryPolicy &policy)
     {
-        const auto checkedAdd = [](size_t left, size_t right, const char *what)
-        {
-            if (right > std::numeric_limits<size_t>::max() - left)
-            {
-                throw std::overflow_error(
-                    std::string("GPU weight-load ") + what +
-                    " overflows size_t");
-            }
-            return left + right;
-        };
         const auto checkedMultiply = [](
             size_t left, size_t right, const char *what)
         {
@@ -147,30 +130,70 @@ namespace llaminar2
         size_t staging_slot_bytes = 0;
         if (maximum_source_bytes > 0)
         {
-            staging_slot_bytes = policy.staging_budget_bytes > 0
-                                     ? std::min(
-                                           maximum_source_bytes,
-                                           std::max<size_t>(
-                                               1,
-                                               policy.staging_budget_bytes /
-                                                   stream_count))
-                                     : maximum_source_bytes;
+            if (policy.staging_budget_bytes > 0)
+            {
+                const size_t unaligned_per_stream =
+                    policy.staging_budget_bytes / stream_count;
+                const size_t physical_per_stream =
+                    unaligned_per_stream &
+                    ~(kGPUWeightLoadAllocationAlignment - 1u);
+                if (physical_per_stream == 0)
+                {
+                    throw std::invalid_argument(
+                        "GPU weight-load staging budget cannot hold one aligned slot per stream");
+                }
+                staging_slot_bytes = std::min(
+                    maximum_source_bytes, physical_per_stream);
+            }
+            else
+            {
+                staging_slot_bytes = maximum_source_bytes;
+            }
         }
+        const size_t staging_slot_stride_bytes =
+            alignGPUWeightLoadAllocation(staging_slot_bytes);
         const size_t staging_bytes = checkedMultiply(
-            staging_slot_bytes, stream_count, "staging ring");
-
-        const size_t load_bytes = checkedAdd(
-            planned_weight_bytes, staging_bytes, "weight plus staging bill");
+            staging_slot_stride_bytes, stream_count, "staging ring");
+        const size_t host_staging_bytes = checkedMultiply(
+            staging_slot_bytes, stream_count, "pinned host ring");
         return {
-            .planned_weight_bytes = planned_weight_bytes,
             .maximum_source_bytes = maximum_source_bytes,
             .staging_slot_bytes = staging_slot_bytes,
+            .staging_slot_stride_bytes = staging_slot_stride_bytes,
             .staging_bytes = staging_bytes,
-            .load_bytes = load_bytes,
-            .required_bytes = load_bytes,
-            .free_vram_bytes = free_vram_bytes,
+            .host_staging_bytes = host_staging_bytes,
             .staging_stream_count = policy.staging_stream_count,
         };
+    }
+
+    /**
+     * @brief Build the canonical physical GPU bill for initial weight loading.
+     * @param resource Exact rank/device allocator observation.
+     * @param planned_weight_bytes Unaligned terminal offset of the persistent
+     *        weight pool.
+     * @param geometry Upload geometry returned by
+     *        @ref resolveGPUWeightLoadMemoryGeometry.
+     * @return Universal typed BOM used directly for fit and certification.
+     */
+    [[nodiscard]] inline PhysicalMemoryBOM gpuWeightLoadMemoryBOM(
+        PhysicalMemoryResource resource,
+        size_t planned_weight_bytes,
+        const GPUWeightLoadMemoryGeometry &geometry)
+    {
+        if (!resource.valid() || !resource.device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "GPU weight-load BOM requires a valid CUDA or ROCm physical resource");
+        }
+        PhysicalMemoryBOMBuilder builder(std::move(resource));
+        builder
+            .add(
+                PhysicalMemoryOwner::PrimaryModelWeights,
+                alignGPUWeightLoadAllocation(planned_weight_bytes))
+            .add(
+                PhysicalMemoryOwner::WeightLoadStaging,
+                geometry.staging_bytes);
+        return builder.build();
     }
 
     inline std::string gpuPipelineVramPreflightMitigations(

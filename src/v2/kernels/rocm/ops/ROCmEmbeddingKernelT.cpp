@@ -11,6 +11,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../common/EmbeddingWorkspaceContract.h"
 #include "../../common/PreparedEmbeddingWeights.h"
 #include "../ROCmKernelBase.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
@@ -937,20 +938,7 @@ namespace llaminar2
     {
         (void)n; // Unused for embedding
         (void)k; // Persistent embedding weights are not graph workspace
-
-        WorkspaceRequirements reqs;
-
-        // Buffer 1: Token IDs [max_seq_len × sizeof(int)]
-        // m is the maximum sequence length
-        size_t token_ids_bytes = static_cast<size_t>(m) * sizeof(int);
-        reqs.buffers.push_back({
-            EmbeddingWorkspaceBuffers::TOKEN_IDS,
-            token_ids_bytes,
-            256, // Alignment for HIP
-            true // Required
-        });
-
-        return reqs;
+        return embedding_workspace::requirements({.graph_rows = m});
     }
 
     void ROCmEmbeddingKernelT::bindWorkspace(DeviceWorkspaceManager *workspace)

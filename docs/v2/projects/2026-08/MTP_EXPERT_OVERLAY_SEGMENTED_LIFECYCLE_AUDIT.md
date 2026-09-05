@@ -331,14 +331,24 @@ flowchart LR
     G --> M[Certify + initial timing + move + converged timing]
 ```
 
-`ModelParityDynamicEvidence` now makes the two proof obligations explicit.
-Every Dynamic cell owns `EconomicMovement`: it runs the real production
-service certification, publishes physical expert bytes, settles at a typed
-between-wave boundary, proves its exact graph/MTP/prefix path, and emits the
-normal CSV evidence.  The central matrix expander assigns exactly one
-`EconomicMovementAndObservedSpeedup` witness per topology, activation/KV
-precision pair, and owner order.  The witness is the MTP-off cell on the first
-declared prefill schedule; no fixture infers this role from a test name.
+`ModelParityDynamicEvidence` makes the two proof obligations explicit. Every
+Dynamic cell owns `EconomicMovement`: it runs the real production service
+certification, publishes physical expert bytes, settles at a typed between-wave
+boundary, proves its exact graph/MTP/prefix path, and emits the normal CSV
+evidence. The first expander version incorrectly multiplied
+`EconomicMovementAndObservedSpeedup` over every CPU-bearing topology,
+activation/KV precision pair, and owner order. That was redundant economy work,
+not additional mathematical coverage.
+
+`ModelParityFeatureMatrix::dynamic_speedup_witness` is now the typed selection
+authority. A definition selects ordinal, random, both owner orders, or disabled;
+the expander assigns the matched timing cohort only to the first activation/KV
+pair, MTP-off policy, and first declared prefill schedule. The representative
+set covers CUDA/CPU, ROCm/CPU, and CUDA/ROCm/CPU transport economies through the
+122B CUDA2+CPU2 random cell, 122B ROCm4+CPU2 random cell, and 35B
+CUDA1+ROCm1+CPU2 random cell respectively. Every other Dynamic cell still moves
+and proves real expert payload bytes. No fixture infers this role from a test
+name.
 
 ```mermaid
 stateDiagram-v2
@@ -1246,3 +1256,634 @@ integration regressions deliberately retire the DAG, destroy the external
 producer stream, and only then destroy the runtime table. Both registrations
 are part of `ProductionParityPreflight`, and a unit source-policy assertion
 locks the retirement call ahead of graph/context destruction.
+
+## Follow-up: snapshot manifest construction observed device-owned KV state
+
+Removing the redundant device-wide teardown drains exposed one remaining
+phase-skew defect in the process-resident ROCm campaign.  While one LocalTP
+participant was beginning native graph capture, another participant assembled
+the immutable diagnostic manifest for the same transaction.  The attention
+manifest builder called the scalar KV-cache accessor, which synchronously
+downloaded the GPU-owned cache head/count.  HIP correctly rejected the
+resulting legacy-stream dependency on a peer's capturing blocking stream.
+
+The failing lifecycle mixed descriptor construction with execution-state
+observation:
+
+```mermaid
+sequenceDiagram
+    participant A as LocalTP participant A
+    participant B as LocalTP participant B
+    participant K as GPU KV-cache authority
+    A->>A: Begin native graph capture
+    B->>B: Build immutable snapshot manifest
+    B->>K: Read scalar cached-token count on host
+    K->>K: Device-wide observation and synchronous D2H
+    K--xA: Legacy stream depends on capturing stream
+    A--xA: Capture invalidated
+```
+
+Snapshot manifest construction now consumes only graph-stable tensors already
+published by the attention execution stage.  GPU sequence state remains
+device-owned throughout preparation and capture; the CPU branch retains its
+ordinary host-owned cache inspection.  The manifest describes addresses and
+maximum logical geometry, while captured D2D copy nodes and their exact
+completion event publish the requested diagnostic contents.
+
+```mermaid
+flowchart TD
+    E[Attention execution resolves exact cache-owned K/V views] --> P[Publish graph-stable diagnostic tensor views]
+    P --> M[Every participant builds immutable snapshot manifest]
+    M --> C[Every participant captures D2D snapshot nodes]
+    C --> L[Launch retained production graph]
+    L --> V[Record exact snapshot completion event]
+    V --> H[Diagnostic host reader waits on that event]
+    CPU[CPU cache is host-owned] --> CH[CPU-only scalar descriptor branch]
+    CH --> M
+```
+
+The simplified invariant is structural: a GPU snapshot descriptor may never
+call `get_cached_tokens()` or `get_kv()`; only the execute-published tensor
+view is authoritative.  A source-policy regression locks that boundary.  The
+exact two-ROCm Qwen3.6 campaign then passed all 24 process-resident cells—both
+owner orders, Static and Dynamic placement, and MTP off, depths 1/2/3/15, and
+dynamic depth—with 212 CSV artifacts validated.  Those 24 ordered transitions
+also provide the required greater-than-20 stress proof for the original race.
+
+## Follow-up: GDN linked-state handoff had two contradictory layouts
+
+The Qwen3.5 TP=3 production proof exposed an older GDN assumption: fused Q/K/V
+weights were sliced as though Q and K were replicated while V alone followed
+the participant. The actual recurrence dependency is modular—each value head
+consumes one key head—so a participant must own one contiguous Q/K interval and
+every value-head interval linked to it. Once the weight layout was corrected,
+the equal-count TP=2/4/8 live-state allgather still concatenated those local
+banks rank-major, while mirrored decode consumes semantic groups globally.
+
+```mermaid
+flowchart LR
+    W[Global Q, K, and repeated V groups] --> S[Dependency-closed TP slicer]
+    S --> R0[Rank 0: Q0, K0, V0 repeat 0..N]
+    S --> R1[Rank 1: Q1, K1, V1 repeat 0..N]
+    R0 --> G[Raw equal-count allgather]
+    R1 --> G
+    G --> X[Rank-major bytes: rank 0 groups, rank 1 groups]
+    X --> P[Captured device-side permutation]
+    P --> F[Full semantic order: all Q, all K, each complete V repeat]
+    F --> D[Mirrored dense decode]
+```
+
+`GDNLinkedLiveStateGeometry` is now the sole accounting and layout authority.
+It derives convolution-history and recurrence sizes from global key/value head
+counts, per-head widths, history length, and TP degree. CUDA and ROCm launch one
+explicit-stream permutation into a distinct persistent destination, so raw
+collective input cannot be overwritten while it is still being read. TP=3 is
+valid for dependency-closed projection slicing but cannot use an equal-count
+state collective when 16 key heads divide unevenly; it stays on the TP-local
+state path instead of pretending that incompatible counts form a full bank.
+
+The verifier lifecycle had retained a second, unreachable mechanism from the
+old layout. A `GDNLiveStateLocalizeStage` was supposed to convert mirrored
+state back to local state for verification, after which the generic MTP
+publisher could invoke a non-capturing post-restore allgather. Its construction
+predicate simultaneously required the allgather to be available and
+unavailable. Production verifier graphs already use full mirrored GDN kernels,
+whose short-convolution and recurrence stages capture and restore their own
+full state directly.
+
+The lifecycle is therefore one-way and has one accepted-state authority:
+
+```mermaid
+stateDiagram-v2
+    [*] --> LocalPrefillState: dependency-closed local kernels
+    LocalPrefillState --> FullDecodeState: captured raw allgather plus device permutation
+    FullDecodeState --> SpeculativeFullState: grouped verifier uses isolated full-state scratch
+    SpeculativeFullState --> FullDecodeState: accepted row restored by each exact state owner
+    SpeculativeFullState --> FullDecodeState: rejected transaction leaves live bank unchanged
+    FullDecodeState --> FullDecodeState: ordinary captured decode
+```
+
+`GDNLiveStateLocalizeStage`, its stage type/factory path, and the generic
+`requiresPostVerifierStatePublication()` / `publishPostVerifierStateRestore()`
+hooks have been removed. MTP publication now has only two graph-node outcomes:
+a verifier-capturing state owner restores its selected row and detaches scratch,
+or a non-state stage is skipped. CPU-only protocol tests prove the layout and
+accounting through TP=8; captured CUDA and ROCm integration tests prove both
+state kinds byte-exact through TP=8 and run in `ProductionParityPreflight`.
+
+## Follow-up: device-owned restoration crossed split teardown authorities
+
+The exact 122B `CUDA2 + ROCm4`, Dynamic, ordinal, FP16 activation/KV,
+MTP-off cell eventually passed every Hugging Face checkpoint, movement proof,
+and prefix-restore comparison but failed while retiring its reusable model
+context. This was not a collection of unrelated numerical defects. It was the
+first test to traverse the complete process-resident Dynamic lifecycle, and
+each earlier failure prevented the next terminal edge from executing.
+
+The masked sequence was:
+
+1. An empty post-calibration transaction advanced the recurring device cadence
+   despite observing zero routed rows.
+2. Movement-proof traffic populated the production prefix cache with the parity
+   prompt, so the subsequent parity request restored all rows and produced no
+   fresh graph snapshots.
+3. Device RCU restored the runtime owner table, but terminal physical sealing
+   tried to acquire the deliberately stale host participant-bank epoch.
+4. Once physical sealing used the device slot ledger, registry rebinding still
+   re-read the stale host residency snapshot and compared its setup epoch with
+   the later restored durable epoch. The physical seal succeeded, but the model
+   lifecycle remained in `Sealing` and exact final-owner retirement rejected it.
+
+That explains the serial discovery pattern: every defect was deterministic,
+but a failed predecessor made its successor unreachable. Unit tests covered
+the individual cadence, prefix, RCU, fabric, and retirement components; the
+real-weight process campaign was the missing composition proof.
+
+The audited production lifecycle now has one explicit forward path:
+
+```mermaid
+flowchart TD
+    A[Initial prepared placement and owner map] --> B[Bounded transport profile]
+    B --> C{Observed routed rows?}
+    C -->|No| D[Keep recurring cadence unchanged]
+    C -->|Yes| E[Advance evidence-derived cadence]
+    D --> F[Certify live service economy]
+    E --> F
+    F --> G[Dynamic movement proof]
+    G --> H[MovementBoundarySettled]
+    H --> I[Coordinated production prefix purge]
+    I --> J[NumericalParityReady]
+    J --> K[Captured prefill and decode parity]
+    K --> L[Fresh, complete, and partial prefix restore]
+    L --> M[TerminalContextSeal]
+    M --> N[Close admission and drain device service]
+    N --> O[Device authors PreparedContextRestore]
+    O --> P[Publish and retire exact durable restore epoch]
+    P --> Q[Snapshot quiescent physical slot ledger]
+    Q --> R[Self-contained physical seal: canonical owner map plus local banks]
+    R --> S[Atomically replace model ExpertGemmRegistry bindings]
+    S --> T[Seal exact retained allocation BOM]
+    T --> U[Sealing to Reusable]
+    U --> V{Another campaign cell?}
+    V -->|Yes| W[Reusable to RunnerExclusive]
+    V -->|No| X[Exact final-owner device retirement]
+    W --> F
+```
+
+The ownership split is deliberate and non-overlapping:
+
+| Live value | Sole authority |
+|---|---|
+| Dynamic logical placement and inference selector | device controller/runtime table |
+| Process-local prepared-engine lifetimes | device physical slot ledger |
+| Terminal restored placement and canonical engine banks | `MoEOverlayReusableContextSeal` |
+| Model-visible routed GEMM bindings after sealing | `ExpertGemmRegistry` |
+| Runner admission/reuse state and retained allocation BOM | `ModelContextReuseAuthority` |
+
+The physical seal now carries the exact prepared `MoEExpertOwnerMap` represented
+by its immutable local banks. Its validity check proves epoch, participant,
+device, layer/expert geometry, owner masks, and triplet completeness together.
+Consequently, registry rebind cannot consult a host residency snapshot or infer
+that two different epoch numbers should match. Host-owned RCU and device-owned
+RCU still use different inventory sources, selected by the typed
+`MoEOverlayPhysicalInventoryAuthority`, but both converge to the same terminal
+seal type and the same atomic registry replacement.
+
+Focused proof includes the quiescent device physical-inventory state machine,
+all 20 quantized codebooks plus FP16/BF16/FP32 terminal sealing, and the real
+CUDA/ROCm prepared-context restoration integration. The exact 122B cell then
+passed both MPI ranks through clean suite teardown in 296.5 seconds, emitted
+all numerical and prefix CSVs, certified one restoration wave to durable epoch
+3, rebound 2,058 CUDA and 10,486 ROCm resident experts, and retired all six
+device runtime generations.
+
+## Follow-up: logical transfer edges multiplied physical HIP resources
+
+The `ROCm1 + CPU2` 122B Dynamic cell exposed a different composition defect
+before inference began. The physical residency fabric had correctly retained
+one logical lane for every directed edge, projection, remote role, and admitted
+cycle. It had incorrectly made every logical lane allocate its own 4 MiB pinned
+buffer, device buffer, and HIP stream. A 49-cycle policy therefore expanded
+into hundreds of host registrations and stream creations even though the GPU
+could execute only the bounded cycle cohort concurrently. On this host, HIP
+registration and queue setup made model admission exceed the cell watchdog.
+
+Logical command identity, storage concurrency, and execution concurrency are
+now three explicit quantities:
+
+```mermaid
+flowchart TD
+    A[Typed topology and integer-priority tier plan] --> B[Resolve maximum concurrent physical cycles]
+    B --> C[Build complete logical command directory]
+    B --> D[Allocate one pinned slab and one device slab per compatible lane pool]
+    D --> E[Issue disjoint typed staging slices]
+    B --> F[Materialize one background stream per local GPU participant and cycle]
+    F --> G[Issue typed execution-lane handles]
+    C --> H[Construct projection, edge, and remote-role state machines]
+    E --> H
+    G --> H
+    H --> I[InferenceReady]
+    I --> J[Authority admits a bounded movement wave]
+    J --> K[Compatible logical operations share their participant/cycle stream]
+    K --> L[Independent completion events publish each operation]
+    L --> M[Atomic placement publication at the wave boundary]
+```
+
+The important separation is that logical lanes still own disjoint staging
+regions and completion events. Only compatible operations share an execution
+queue. Different admitted cycles retain different queues, so movement can
+progress in parallel up to the typed physical-cycle budget without creating a
+queue for every graph edge. `TransferEngine` is the sole allocation and stream-
+pool authority; weight, peer, and cross-rank endpoint lanes reject a missing or
+wrong-device handle and never create a stream themselves.
+
+Shared slabs have one RAII owner. Lane cleanup destroys only its own events and
+clears borrowed slice views; it cannot free an interior pinned/device address.
+The stream pool is setup-owned by the worker GPU context and uses the
+`BackgroundMaintenance` scheduling class. Live movement performs no allocation,
+registration, stream construction, or blocking synchronization.
+
+```mermaid
+stateDiagram-v2
+    [*] --> GeometryValidated
+    GeometryValidated --> SlabsBound: allocate shared host/device slabs
+    SlabsBound --> StreamsBound: materialize bounded background pool
+    StreamsBound --> LanesMaterialized: bind slices, typed streams, and private events
+    LanesMaterialized --> Pending: authority submits disjoint operation
+    Pending --> Pending: event query completes one chunk and enqueues the next
+    Pending --> Ready: exact lane completion event observed
+    Ready --> LanesMaterialized: release logical reservation
+    LanesMaterialized --> Retired: all lanes quiescent before context retirement
+    GeometryValidated --> Fatal: zero/overflowing geometry or wrong device
+    StreamsBound --> Fatal: null/missing/mismatched execution handle
+    Pending --> Fatal: event or transfer failure
+```
+
+The regression surface is deliberately layered. Device-free tests prove one
+allocation per slab and invalid typed geometry. CUDA and ROCm integration tests
+prove exact bounded stream identity and idempotent reuse. A second adversarial
+test races two multi-chunk FP16/BF16 transfers on one physical stream while
+retaining independent events and byte-exact output; it passed 20 consecutive
+runs on each backend. The production parity fixture additionally requires the
+real Dynamic model to publish `transfer` path evidence whose lane count is a
+positive multiple of its configured migration-cycle capacity. That PerfStats
+record is observability only: completed movement remains authoritative solely
+through the typed optimization movement ledger.
+
+## Follow-up: partial prefix restore crossed a valid movement epoch
+
+The CPU NodeTP Dynamic/Random production cell eventually passed every
+Hugging Face checkpoint, KV comparison, terminal-payload comparison, and
+movement assertion, but rejected the layer-4 GDN recurrence hash. The serial
+oracle ran at movement epoch 8 and the independent partial-restore request ran
+at epoch 9. Dynamic maintenance had validly published between those requests;
+it did not mutate either admitted request in place.
+
+The cached prefix was still byte exact. Only the one-token suffix was
+recomputed through a different expert placement, so its CPU participant and
+reduction order introduced a small bounded floating-point change that then
+propagated into the recurrent state. Main KV and terminal payloads already had
+a placement-aware comparison contract. GDN retained two booleans that always
+selected byte hashes, making it the lone state family that interpreted a
+legitimate request-boundary publication as corruption.
+
+```mermaid
+sequenceDiagram
+    participant O as Serial oracle request
+    participant A as ExpertOverlay authority
+    participant C as Prefix cache
+    participant R as Partial-restore request
+    O->>A: Admit and pin placement epoch 8
+    O->>C: Seed exact prefix and retain full diagnostic state
+    O-->>A: Complete and release epoch lease
+    A->>A: Prepare, certify, and atomically publish epoch 9
+    R->>A: Admit and pin placement epoch 9
+    C-->>R: Restore byte-exact cached prefix
+    R->>R: Recompute one-token suffix under epoch 9
+    R->>R: Compare authenticated epoch-8 and epoch-9 states
+```
+
+The comparison lifecycle now has one typed policy rather than independent
+hash/value flags:
+
+```mermaid
+stateDiagram-v2
+    [*] --> MetadataValidated
+    MetadataValidated --> ExactComparison: ExactBytes
+    MetadataValidated --> NumericalComparison: NumericalValues
+    MetadataValidated --> ExactComparison: ExactUnlessMoEPlacementChanged and epochs equal
+    MetadataValidated --> NumericalComparison: ExactUnlessMoEPlacementChanged and epochs differ
+    ExactComparison --> Passed: every authoritative byte hash matches
+    ExactComparison --> Failed: any byte hash differs
+    NumericalComparison --> Failed: authority is asymmetric or a full bank is missing
+    NumericalComparison --> Failed: NaN, Inf, cosine, or scale-aware relative-L2 gate fails
+    NumericalComparison --> Passed: every recurrence and short-conv value is certified
+    Passed --> [*]
+    Failed --> [*]
+```
+
+CPU probes copy the complete host-owned GDN bank. GPU probes reuse the exact
+stream export used for hashing and select the full replicated decode bank from
+the serialized local/full layout; they never compare a stale host mirror or a
+range spanning two banks. The CSV contract records policy, payload and element
+counts, minimum cosine, maximum relative L2, maximum absolute difference, and
+the aggregate decision. Thus an epoch change cannot weaken or skip evidence:
+it changes exact bytes into a complete numerical proof.
+
+A separate ambiguity appeared only during the CPU-only cell's teardown. An
+empty device-retirement BOM meant “host-only context,” but the caller passed it
+to the strict GPU retirement API, which correctly rejected an empty batch.
+`PendingExclusiveModelRetirement` now represents `HostOnly` and `DeviceBatch`
+as disjoint kinds. The host-only transition consumes its plan exactly once and
+never fabricates a GPU transaction.
+
+The focused production cell passed 20 fresh two-rank MPI processes. Two runs
+exercised genuinely non-byte-identical GDN banks and passed complete numerical
+comparisons; the remaining schedules happened to stay byte exact. The
+canonical four-cell CPU NodeTP campaign then passed Static/Dynamic and
+Ordinal/Random placement, validated all 32 CSV artifacts, and completed in
+168.3 seconds including its model-free preflight. A dedicated model-free
+CPU-hybrid integration regression now runs in `ProductionParityPreflight` so
+the cross-epoch contract is checked before any model campaign starts.
+
+## Follow-up: rank-local fail-fast crossed parity-cell identity
+
+The canonical `ROCm1 + CPU2`, Dynamic/Ordinal, Depth-15 cell produced its full
+graph-path and numerical CSV set in about 90 seconds, yet the campaign watchdog
+expired at 600 seconds. A faithful two-cell process reproduction showed the
+cause: the comparison-owning rank rejected one recursive LM-head KL value while
+its peer passed. GoogleTest fail-fast is process-local, so the failing rank
+stopped after teardown and the passing rank entered the next generated cell.
+Its next-cell collectives could never match the peer's suite-retirement work.
+
+The old test lifecycle had two indistinguishable barriers and no result
+authority spanning ranks:
+
+```mermaid
+sequenceDiagram
+    participant R0 as Rank 0
+    participant B0 as Rank 0 GoogleTest
+    participant R1 as Rank 1
+    participant B1 as Rank 1 GoogleTest
+    R0->>R1: Cell teardown entry barrier
+    R0->>B0: Local numerical failure
+    R1->>B1: Local pass
+    R0->>R1: Cell teardown exit barrier
+    B0-->>R0: Fail-fast ends suite
+    B1-->>R1: Advance to next generated cell
+    R1->>R0: Next-cell MPI collective waits forever
+```
+
+`ParityCellLifecycle` now makes that invalid interleaving unrepresentable. The
+teardown communicator has one typed transaction, and a rank-wide reduction
+creates an immutable outcome receipt before either process may inspect
+fail-fast or retire the communicator:
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotEntered
+    NotEntered --> Active: enter and duplicate control/teardown lanes
+    Active --> TeardownEntered: beginTeardown entry rendezvous
+    TeardownEntered --> OutcomeConverged: convergeOutcome all-reduce
+    OutcomeConverged --> Retired: cleanup complete + finishTeardown rendezvous
+    Retired --> [*]
+```
+
+```mermaid
+sequenceDiagram
+    participant R0 as Comparing rank
+    participant T as Isolated teardown channel
+    participant R1 as Peer rank
+    R0->>T: Failed
+    R1->>T: Passed
+    T-->>R0: AtLeastOneRankFailed, failed ranks = 1
+    T-->>R1: AtLeastOneRankFailed, failed ranks = 1
+    R1->>R1: Publish aggregate failure into local GoogleTest state
+    R0->>T: Finish teardown
+    R1->>T: Finish teardown
+    T-->>R0: Both ranks retire the same cell
+    T-->>R1: Both ranks retire the same cell
+```
+
+The model-free MPI preflight supplies a synthetic one-rank failure as data and
+proves that every participant receives the same aggregate result. It also
+adversarially rejects every skipped or repeated transition. This does not make
+test evidence a production authority: it only prevents the campaign harness
+from losing MPI cell identity when a valid production comparison is red.
+
+The numerical rejection itself was independent and deterministic. Repeated
+artifacts measured a maximum KL of 0.06695 at the fourteenth recursive FP16
+round trip, while cosine and mutual top-3 evidence remained within their strict
+contracts. Per the explicit campaign decision to budget this fixed-depth
+quantized drift rather than switch activations to FP32, only Depth-15 receives
+a 0.07 KL threshold; ordinary MTP and dynamic-depth remain at 0.05.
+
+## Follow-up: heterogeneous main inference had a split epoch transaction
+
+The `ROCm4 + CPU2` Static/Ordinal cell completed prefill but its first decode
+timed out before layer-zero sparse dispatch. Native graph inspection proved the
+retained parent had one root and one fully chained DAG, and the production-
+shaped TP4/RCCL analogue completed under the same graph and VRAM pressure. The
+remaining difference was the residency envelope: heterogeneous main inference
+submitted a separate one-node acquire graph, made the parent stream wait on its
+event, and then immediately submitted the much larger retained parent. All four
+input edges were complete, but HIP scheduled the tiny producer on only one
+participant while the other three output events remained pending. The parent
+could not begin because it consumed those events.
+
+The old topology-dependent lifecycle was:
+
+```mermaid
+flowchart LR
+    P[Prior release receipt] --> S[Submission stream]
+    S --> A[Separate captured Acquire graph]
+    A --> E[Acquire completion event]
+    E --> M[Retained main parent waits]
+    M --> F[Captured model and sparse collectives]
+    F --> R[Separate captured Release graph]
+    R --> N[Next release receipt]
+```
+
+This represented one logical forward as three native graph launches and two
+cross-stream event handoffs. Placement authority did not require that split;
+it only chooses which published bank the acquire kernel observes. The ordinary
+main graph was already a complete captured transaction under either host- or
+device-authoritative placement.
+
+Main inference now has one transaction shape for every GPU topology:
+
+```mermaid
+flowchart LR
+    P[Prior immutable release receipt] --> W[Exact parent stream event wait]
+    subgraph MAIN[One retained captured main epoch transaction]
+        A[Acquire root] --> F[Model, collectives, and heterogeneous tickets]
+        F --> R[Release terminal]
+    end
+    W --> A
+    R --> N[Record immutable release receipt]
+```
+
+The typed policy depends only on two facts: whether the participant has an
+epoch binding and whether the graph is ordinary main inference. Controller
+location, tier count, backend mix, and maintenance timing are not lifecycle
+proxies. Auxiliary MTP graphs remain deliberately different because several
+captured children share one external sequence or hosted-parent reader:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unbound: no epoch binding
+    [*] --> CapturedMain: main inference
+    [*] --> ExternalSequence: auxiliary or MTP child
+    CapturedMain --> ReleasePublished: Acquire + forward + Release in one graph
+    ExternalSequence --> ExternalSequence: child borrows enclosing reader
+    ExternalSequence --> ReleasePublished: sequence terminal releases once
+    ReleasePublished --> CapturedMain: next parent waits on receipt
+```
+
+The focused preflight reproduces the four-participant, 49-fragment retained
+RCCL parent, mapped CPU ticket service, approximately 3,800 nodes, and model-
+like VRAM pressure. It embeds the real epoch acquire as the first node and the
+real release as the terminal, replays two retained families, and proves every
+reader count and request ticket is retired. This locks down the simplified
+production transaction before any real-weight campaign begins.
+
+## Follow-up: promoted MTP evidence was consumed before its producer
+
+The `CUDA2 + ROCm4`, Dynamic/Random, Depth-1 cell completed graph-captured
+prefill, prefix restore, decode, and its movement epoch. That epoch promoted
+two experts from model layer 48, the Qwen3.5 MTP sidecar. The fixture then
+rejected an empty promoted-expert witness set even though it already owned an
+exact primary-MTP checkpoint observer capable of producing those witnesses.
+
+The failure was an ordering bug in the proof lifecycle, not a numerical or
+physical-movement failure:
+
+```mermaid
+flowchart LR
+    A[Movement epoch publishes layer-48 promotions] --> B[Main prefill parity]
+    B --> C[Main decode and prefix-restore parity]
+    C --> D[Old promotion epilogue consumes witnesses]
+    D --> E[Failure: MTP witness set is still empty]
+    E -. unreachable evidence producer .-> F[Primary Hugging Face MTP checkpoint]
+```
+
+Main and MTP checkpoints are independent evidence producers with disjoint
+snapshot namespaces. A main-model promotion may be witnessed by prefill or
+decode, while an MTP-layer promotion can only be witnessed after the primary
+sidecar checkpoint. The fixture now encodes that distinction in the existing
+Dynamic proof state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> NumericalParityReady: movement settled and proof prefix purged
+    NumericalParityReady --> NumericalEvidenceComplete: main parity, MTP disabled
+    NumericalParityReady --> AwaitingMTPParity: main parity, MTP enabled
+    AwaitingMTPParity --> NumericalEvidenceComplete: primary MTP checkpoint compared
+    NumericalEvidenceComplete --> PromotionEvidenceEpilogue: join movement, placement, and numerical witnesses
+    PromotionEvidenceEpilogue --> [*]
+```
+
+There is no retry, synthetic route, forced token, or extra inference phase.
+The same production checkpoints already required by the canonical cell now run
+before their single evidence consumer. A model-free preflight regression
+adversarially rejects MTP-before-main, repeated-main, and MTP-when-disabled
+transitions, and proves both the MTP and non-MTP terminal paths.
+
+## Follow-up: topology-valid movement was not necessarily numerically witnessable
+
+After fixing the MTP evidence ordering, the same Dynamic/Random/Depth-1 cell
+still reached a valid movement boundary without producing a promoted-expert
+numerical witness. The first two production promotions were layer 0 expert 226
+and layer 1 expert 69. Neither expert appeared in any authenticated Hugging Face
+prefill or decode route for this fixed corpus. Later production waves promoted
+layer 6 expert 120 and layer 9 expert 235, which appeared five and four times,
+respectively, in the authenticated prefill routes.
+
+This exposed two distinct convergence predicates that had been collapsed into
+one:
+
+1. A service-economical movement is topology-valid and may improve residency
+   for production traffic.
+2. A parity-proof movement is also selected by the immutable authenticated
+   workload, so the captured checkpoint can execute its destination and compare
+   its contribution with the Hugging Face reference.
+
+The proof lifecycle now keeps those predicates explicit:
+
+```mermaid
+flowchart TD
+    S[Ordinary service-economy traffic] --> L[Typed production movement ledger]
+    A[Authenticated Hugging Face prefill traffic] --> L
+    L --> T{Required topology publications and movement axes satisfied?}
+    T -->|No| D[Continue ordinary production traffic]
+    T -->|Yes| W{Ledger suffix contains an authenticated-workload promotion?}
+    W -->|No| D
+    W -->|Yes| B[Settle at a between-wave boundary]
+    B --> C[Cache only numerically witnessable promotion identities]
+    C --> P[Captured prefill, decode, prefix-restore, and MTP comparisons]
+    P --> J[Join movement, selected destination, and per-route numerical evidence]
+```
+
+The authenticated route counts are a test-side convergence requirement only.
+They never enter the ExpertOverlay controller, alter its histogram, force a
+route, or choose a placement. The production controller continues making its
+normal device-authoritative decisions, and every committed movement remains in
+`expert_movement.csv`; the numerical witness set merely selects the ledger
+suffix entries that the fixed reference corpus can independently exercise.
+
+The corresponding model-free preflight proves that a topology-valid promotion
+absent from the authenticated workload remains pending, that a later routed
+promotion satisfies the proof, and that malformed ledger geometry fails
+fatally. This makes the evidence dependency explicit without using PerfStats as
+an authority or weakening the production movement path.
+
+## Follow-up: finite traffic horizon was not a demand-bank lifecycle
+
+The 35B heterogeneous Dynamic/Ordinal cell completed an 82-migration physical
+transaction and published generation two, then waited for movement with that
+successor bank empty. The test driver had spent its global request allowance
+while generation one was frozen for asynchronous transfer. Those requests
+correctly kept inference live, but they could not populate a bank that did not
+yet exist. Treating submitted request count as bank occupancy therefore created
+a passive state with no remaining producer.
+
+The broken control flow was:
+
+```mermaid
+flowchart LR
+    O[Spend global request horizon] --> C[Close generation 1]
+    C --> M[Move and publish asynchronously]
+    M --> E[Generation 2 is empty and quiescent]
+    E --> W[Classify as AwaitMovement]
+    W --> W
+```
+
+Settlement now follows the authority's generation and occupancy rather than
+trying to infer either from request count:
+
+```mermaid
+stateDiagram-v2
+    [*] --> AdmitOrdinaryTraffic
+    AdmitOrdinaryTraffic --> AwaitMovement: bank full or movement in flight
+    AdmitOrdinaryTraffic --> Settle: finite ordinary horizon exhausted
+    AwaitMovement --> Settle: publication and retirement complete
+    Settle --> SeedEmptyBank: target incomplete and occupancy = 0
+    SeedEmptyBank --> AwaitDemandPublication: authenticated prefill + boundary submitted
+    AwaitDemandPublication --> AwaitDemandPublication: generation and occupancy unchanged
+    AwaitDemandPublication --> ClosePartialBank: occupancy increased
+    ClosePartialBank --> AwaitDemandPublication: exact remaining rows submitted
+    AwaitDemandPublication --> AwaitMovement: bank completed
+    Settle --> CloseProtectedBoundary: target complete but cohort lacks headroom
+    CloseProtectedBoundary --> AwaitDemandPublication
+    Settle --> Ready: target complete and boundary quiescent
+    Ready --> [*]
+```
+
+One typed admission receipt carries the generation and pre-submit occupancy for
+both seeding and exact closure. The next admission is impossible until the sole
+optimization authority either increases occupancy or rotates to a newer
+generation; regression is fatal. Movement work is bounded by the number of
+authority generations needed for the publication target plus its authenticated
+promotion witness, while post-target cohort closure remains a separate state.
+This removes the former optional-boolean/pending-closure control flow and keeps
+the 30-second watchdog attached to one unchanged authoritative frontier.

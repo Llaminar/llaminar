@@ -116,17 +116,10 @@ namespace llaminar2
 
     void MoEOverlayDispatchTicketStorage::release() noexcept
     {
-        if (backend_pinned_ && allocation_ && backend_ &&
-            source_device_.is_gpu())
-        {
-            backend_->freePinned(
-                allocation_, source_device_.gpu_ordinal());
-        }
         cpu_storage_.clear();
         allocation_ = nullptr;
         allocation_bytes_ = 0;
-        backend_ = nullptr;
-        backend_pinned_ = false;
+        payload_region_.reset();
         publication_timeline_ = nullptr;
         publication_region_.reset();
         source_device_ = DeviceId::cpu();
@@ -144,7 +137,8 @@ namespace llaminar2
         int top_k,
         int d_model,
         DeviceId source_device,
-        uint64_t workspace_generation)
+        uint64_t workspace_generation,
+        std::shared_ptr<MappedHostTransferArena> mapped_arena)
     {
         if (layer_idx < 0 || bucket_rows <= 0 || top_k <= 0 ||
             d_model <= 0 || !source_device.is_valid() ||
@@ -201,34 +195,27 @@ namespace llaminar2
 
         if (source_device.is_gpu())
         {
-            backend_ = getBackendFor(source_device);
-            if (!backend_)
+            if (!mapped_arena ||
+                mapped_arena->devices().size() != 1u ||
+                mapped_arena->devices().front() != source_device)
             {
-                throw std::runtime_error(
-                    "MoE overlay dispatch ticket has no backend for " +
-                    source_device.toString());
+                throw std::invalid_argument(
+                    "GPU MoE overlay dispatch tickets require one model-owned mapped arena for the exact source device");
             }
-            allocation_ = backend_->allocatePinned(
-                allocation_bytes_, source_device.gpu_ordinal());
-            if (!allocation_)
-            {
-                throw std::runtime_error(
-                    "MoE overlay dispatch ticket pinned allocation failed for " +
-                    source_device.toString());
-            }
-            backend_pinned_ = true;
-
             /*
-             * Keep readiness on its own mapped page. Payload DMA retains the
-             * established pinned allocation while a system-scope stream write
-             * gives the host an exact mid-graph observation edge.
-             * TransferEngine is the sole mapping and alias authority.
+             * Both logical regions are cache-line-isolated slices of a
+             * geometrically growing model-owned arena. They retain independent
+             * bounds for TransferEngine validation without multiplying native
+             * host registrations by layers, buckets, or MTP depth. Device
+             * kernels publish through the payload alias; no retained graph
+             * records D2H DMA.
              */
-            const std::array<DeviceId, 1> publication_devices{
-                source_device};
-            publication_region_ =
-                TransferEngine::instance().allocateMappedHostRegion(
-                    sizeof(std::uint64_t), publication_devices);
+            constexpr size_t kPublicationCacheLineBytes = 64u;
+            payload_region_ = mapped_arena->allocate(
+                allocation_bytes_, kPublicationCacheLineBytes);
+            allocation_ = payload_region_->mutableHostData();
+            publication_region_ = mapped_arena->allocate(
+                sizeof(std::uint64_t), kPublicationCacheLineBytes);
             publication_timeline_ = static_cast<std::uint64_t *>(
                 publication_region_->mutableHostData());
             std::atomic_ref<std::uint64_t>(*publication_timeline_).store(
@@ -300,11 +287,109 @@ namespace llaminar2
         const noexcept
     {
         return source_device_.is_gpu() && publication_region_ &&
+               payload_region_ && payload_region_->isBound() &&
+               payload_region_->hasDevice(source_device_) &&
+               payload_region_->contains(0u, allocation_bytes_) &&
                publication_region_->isBound() && publication_timeline_ &&
                publication_region_->hasDevice(source_device_) &&
-               publication_region_->contains(0u, sizeof(std::uint64_t)) &&
+               publication_region_->contains(
+                   0u, sizeof(std::uint64_t)) &&
                (reinterpret_cast<std::uintptr_t>(publication_timeline_) &
                 (alignof(std::uint64_t) - 1u)) == 0u;
+    }
+
+    bool MoEOverlayDispatchTicketStorage::enqueueCapturedPayload(
+        const CapturedDevicePayload &payload,
+        void *stream,
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+        if (!source_device_.is_gpu())
+            return true;
+        if (!stream || !hasCapturedPublicationContract() ||
+            !payload.routing_indices || !payload.routing_weights ||
+            !payload.hidden_rows || payload.route_bytes == 0u ||
+            payload.hidden_bytes == 0u)
+        {
+            if (error)
+            {
+                *error =
+                    "captured ticket payload requires mapped storage, exact stream, and complete positive device geometry";
+            }
+            return false;
+        }
+
+        const auto destination_offset = [&](const void *destination,
+                                            size_t bytes) -> size_t
+        {
+            const std::uintptr_t base =
+                reinterpret_cast<std::uintptr_t>(allocation_);
+            const std::uintptr_t target =
+                reinterpret_cast<std::uintptr_t>(destination);
+            if (target < base || target - base > allocation_bytes_ ||
+                bytes > allocation_bytes_ -
+                            static_cast<size_t>(target - base))
+            {
+                throw std::out_of_range(
+                    "captured ticket payload destination exceeds its immutable mapped region");
+            }
+            return static_cast<size_t>(target - base);
+        };
+
+        try
+        {
+            auto &transfer = TransferEngine::instance();
+            const auto enqueue = [&](const void *source,
+                                     const void *destination,
+                                     size_t bytes)
+            {
+                transfer.enqueuePersistentDeviceRegionToMappedHostByKernel(
+                    source,
+                    bytes,
+                    /*source_offset=*/0u,
+                    *payload_region_,
+                    destination_offset(destination, bytes),
+                    bytes,
+                    source_device_,
+                    stream);
+            };
+            if (payload.logical_row_count)
+            {
+                enqueue(
+                    payload.logical_row_count,
+                    &ticket_.header->logical_row_count,
+                    sizeof(ticket_.header->logical_row_count));
+            }
+            enqueue(
+                payload.routing_indices,
+                ticket_.routing_indices_fp32,
+                payload.route_bytes);
+            enqueue(
+                payload.routing_weights,
+                ticket_.routing_weights_fp32,
+                payload.route_bytes);
+            enqueue(
+                payload.hidden_rows,
+                ticket_.hidden_rows_fp32,
+                payload.hidden_bytes);
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+            return false;
+        }
+        catch (...)
+        {
+            if (error)
+            {
+                *error =
+                    "captured ticket payload publication threw a non-standard exception";
+            }
+            return false;
+        }
     }
 
     bool MoEOverlayDispatchTicketStorage::armCapturedPublication(
@@ -424,14 +509,20 @@ namespace llaminar2
                 if (error)
                 {
                     *error =
-                        "captured ticket publication exceeded the canonical 30-second protocol deadline";
+                        "captured ticket publication exceeded the canonical 30-second protocol deadline; storage=" +
+                        std::to_string(
+                            reinterpret_cast<std::uintptr_t>(this)) +
+                        ",publication=" +
+                        std::to_string(reinterpret_cast<std::uintptr_t>(
+                            publication_timeline_));
                 }
                 return false;
             }
+            ++polls;
 
             /* Keep sub-millisecond handoff latency without monopolizing the
              * controller core if a peer or device stalls pathologically. */
-            if ((++polls & 1023u) == 0u)
+            if ((polls & 1023u) == 0u)
                 std::this_thread::yield();
         }
     }
@@ -442,7 +533,8 @@ namespace llaminar2
         int d_model,
         DeviceId continuation_device,
         uint64_t workspace_generation,
-        std::shared_ptr<MappedHostTransferRegion> contribution_region)
+        std::shared_ptr<MappedHostTransferRegion> contribution_region,
+        std::shared_ptr<MappedHostTransferArena> metadata_arena)
     {
         if (metadata_region_ || contribution_region_)
         {
@@ -454,10 +546,12 @@ namespace llaminar2
             route_capacity >
                 static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
             !contribution_region || !contribution_region->isBound() ||
-            !contribution_region->hasDevice(continuation_device))
+            !contribution_region->hasDevice(continuation_device) ||
+            !metadata_arena || metadata_arena->devices().size() != 1u ||
+            metadata_arena->devices().front() != continuation_device)
         {
             throw std::invalid_argument(
-                "canonical route return ticket requires complete layer, route, mapped contribution, and GPU identity");
+                "canonical route return ticket requires complete layer, route, mapped contribution, exact GPU, and model-owned metadata arena identity");
         }
 
         const size_t contribution_elements = checkedTicketProduct(
@@ -490,9 +584,9 @@ namespace llaminar2
                 route_capacity, sizeof(int32_t), "compact route slots"),
             "compact route slots");
 
-        const std::array<DeviceId, 1> devices{continuation_device};
-        metadata_region_ =
-            TransferEngine::instance().allocateMappedHostRegion(offset, devices);
+        constexpr size_t kControlCacheLineBytes = 64u;
+        metadata_region_ = metadata_arena->allocate(
+            offset, kControlCacheLineBytes);
         contribution_region_ = std::move(contribution_region);
         control_host_ = static_cast<MoEOverlayCanonicalRouteTicketControl *>(
             metadata_region_->mutableHostData());
@@ -512,7 +606,8 @@ namespace llaminar2
             .layer_idx = layer_idx,
             .route_capacity = static_cast<int32_t>(route_capacity),
             .d_model = d_model,
-            .reserved = 0,
+            .publication_status = static_cast<std::int32_t>(
+                MoEOverlayCanonicalRouteTicketStatus::Empty),
         };
         continuation_device_ = continuation_device;
         layer_idx_ = layer_idx;
@@ -594,6 +689,8 @@ namespace llaminar2
 
         control_host_->live_entry_count = 0u;
         control_host_->residency_epoch = residency_epoch;
+        control_host_->publication_status = static_cast<std::int32_t>(
+            MoEOverlayCanonicalRouteTicketStatus::Empty);
         armed_sequence_ = published + 1u;
         producer_lifecycle_ = ProducerLifecycle::Armed;
         return Publication(this, armed_sequence_);
@@ -620,6 +717,8 @@ namespace llaminar2
             return false;
 
         control_host_->live_entry_count = live_entry_count;
+        control_host_->publication_status = static_cast<std::int32_t>(
+            MoEOverlayCanonicalRouteTicketStatus::Success);
         std::atomic_ref<std::uint64_t>(control_host_->published_sequence)
             .store(armed_sequence_, std::memory_order_release);
         armed_sequence_ = 0u;
@@ -640,8 +739,45 @@ namespace llaminar2
          * unchanged and the next arm receives the same unused sequence. */
         control_host_->live_entry_count = 0u;
         control_host_->residency_epoch = 0u;
+        control_host_->publication_status = static_cast<std::int32_t>(
+            MoEOverlayCanonicalRouteTicketStatus::Empty);
         armed_sequence_ = 0u;
         producer_lifecycle_ = ProducerLifecycle::Quiescent;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::publishAbort() noexcept
+    {
+        if (!hasValidBoundIdentity() ||
+            producer_lifecycle_ != ProducerLifecycle::Quiescent)
+        {
+            return false;
+        }
+
+        const std::uint64_t published =
+            std::atomic_ref<std::uint64_t>(control_host_->published_sequence)
+                .load(std::memory_order_acquire);
+        const std::uint64_t consumed =
+            std::atomic_ref<std::uint64_t>(control_host_->consumed_sequence)
+                .load(std::memory_order_acquire);
+        if (published < consumed || published - consumed > 1u)
+            return false;
+        if (published > consumed)
+        {
+            /* A successfully published payload (or an earlier abort in this
+             * drain pass) already gives the captured consumer a progress edge.
+             * Never mutate its bytes while the GPU owns them. */
+            return true;
+        }
+        if (published == std::numeric_limits<std::uint64_t>::max())
+            return false;
+
+        control_host_->live_entry_count = 0u;
+        control_host_->residency_epoch = 0u;
+        control_host_->publication_status = static_cast<std::int32_t>(
+            MoEOverlayCanonicalRouteTicketStatus::Aborted);
+        std::atomic_ref<std::uint64_t>(control_host_->published_sequence)
+            .store(published + 1u, std::memory_order_release);
+        return true;
     }
 
     bool MoEOverlayCanonicalRouteReturnTicketStorage::payloadReady()
@@ -659,6 +795,9 @@ namespace llaminar2
             std::atomic_ref<std::uint64_t>(control_host_->consumed_sequence)
                 .load(std::memory_order_acquire);
         return published > consumed && published - consumed == 1u &&
+               control_host_->publication_status ==
+                   static_cast<std::int32_t>(
+                       MoEOverlayCanonicalRouteTicketStatus::Success) &&
                control_host_->residency_epoch != 0u &&
                control_host_->live_entry_count <= route_capacity_;
     }
@@ -668,6 +807,36 @@ namespace llaminar2
     {
         return residency_epoch != 0u && payloadReady() &&
                control_host_->residency_epoch == residency_epoch;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::
+        publicationSucceededFor(uint64_t residency_epoch) const noexcept
+    {
+        if (residency_epoch == 0u || !hasValidBoundIdentity() ||
+            producer_lifecycle_ != ProducerLifecycle::Quiescent)
+        {
+            return false;
+        }
+
+        const std::uint64_t published =
+            std::atomic_ref<std::uint64_t>(control_host_->published_sequence)
+                .load(std::memory_order_acquire);
+        const std::uint64_t consumed =
+            std::atomic_ref<std::uint64_t>(control_host_->consumed_sequence)
+                .load(std::memory_order_acquire);
+        /*
+         * The GPU may advance consumed_sequence immediately after the CPU's
+         * release publication. Both the one-pending state and the exact
+         * acknowledged state certify producer success; an initial, malformed,
+         * armed, or aborted record does not.
+         */
+        return published != 0u && published >= consumed &&
+               published - consumed <= 1u &&
+               control_host_->publication_status ==
+                   static_cast<std::int32_t>(
+                       MoEOverlayCanonicalRouteTicketStatus::Success) &&
+               control_host_->residency_epoch == residency_epoch &&
+               control_host_->live_entry_count <= route_capacity_;
     }
 
     bool MoEOverlayCanonicalRouteReturnTicketStorage::hasValidBoundIdentity()

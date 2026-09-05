@@ -25,6 +25,7 @@
 #include "../ROCmKernelBase.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../kernels/rope/RoPEDeviceParams.h"
+#include "../../../kernels/rope/RoPEWorkspaceContract.h"
 #include <hip/hip_runtime.h>
 #include <bit>
 #include <cmath>
@@ -573,32 +574,7 @@ namespace llaminar2
         {
             (void)n;
             (void)k;
-
-            // Position IDs buffer - m is max sequence length
-            size_t pos_ids_bytes = static_cast<size_t>(m) * sizeof(int);
-
-            WorkspaceRequirements reqs;
-            reqs.buffers.push_back({
-                RoPEWorkspaceBuffers::POSITION_IDS,
-                pos_ids_bytes,
-                256, // HIP alignment
-                true // Required
-            });
-            // Inverse frequency table - allocated for worst-case head_dim
-            reqs.buffers.push_back({
-                RoPEWorkspaceBuffers::INV_FREQ,
-                rope::kInvariantPublicationSlots *
-                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
-                256, // HIP alignment
-                true, // Required
-                WorkspaceExecutionRegime::Any,
-                WorkspaceContentLifetime::SerialGraphFamily
-            });
-            // Device params buffer for graph capture
-            reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
-                                    sizeof(rope::RoPEDeviceParams), 256, true});
-
-            return reqs;
+            return rope_workspace::requirements({.graph_rows = m});
         }
 
         void ROCmRoPEKernelT<ActivationPrecision::FP32>::bindWorkspace(DeviceWorkspaceManager *ws)
@@ -973,27 +949,7 @@ namespace llaminar2
         {
             (void)n;
             (void)k;
-
-            size_t pos_ids_bytes = static_cast<size_t>(m) * sizeof(int);
-
-            WorkspaceRequirements reqs;
-            reqs.buffers.push_back({RoPEWorkspaceBuffers::POSITION_IDS,
-                                    pos_ids_bytes,
-                                    256,
-                                    true});
-            // Inverse frequency table - allocated for worst-case head_dim
-            reqs.buffers.push_back({RoPEWorkspaceBuffers::INV_FREQ,
-                                    rope::kInvariantPublicationSlots *
-                                        static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
-                                    256,
-                                    true,
-                                    WorkspaceExecutionRegime::Any,
-                                    WorkspaceContentLifetime::SerialGraphFamily});
-            // Device params buffer for graph capture
-            reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
-                                    sizeof(rope::RoPEDeviceParams), 256, true});
-
-            return reqs;
+            return rope_workspace::requirements({.graph_rows = m});
         }
 
         void ROCmRoPEKernelT<ActivationPrecision::BF16>::bindWorkspace(DeviceWorkspaceManager *ws)
@@ -1361,27 +1317,7 @@ namespace llaminar2
         {
             (void)n;
             (void)k;
-
-            size_t pos_ids_bytes = static_cast<size_t>(m) * sizeof(int);
-
-            WorkspaceRequirements reqs;
-            reqs.buffers.push_back({RoPEWorkspaceBuffers::POSITION_IDS,
-                                    pos_ids_bytes,
-                                    256,
-                                    true});
-            // Inverse frequency table - allocated for worst-case head_dim
-            reqs.buffers.push_back({RoPEWorkspaceBuffers::INV_FREQ,
-                                    rope::kInvariantPublicationSlots *
-                                        static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
-                                    256,
-                                    true,
-                                    WorkspaceExecutionRegime::Any,
-                                    WorkspaceContentLifetime::SerialGraphFamily});
-            // Device params buffer for graph capture
-            reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
-                                    sizeof(rope::RoPEDeviceParams), 256, true});
-
-            return reqs;
+            return rope_workspace::requirements({.graph_rows = m});
         }
 
         void ROCmRoPEKernelT<ActivationPrecision::FP16>::bindWorkspace(DeviceWorkspaceManager *ws)

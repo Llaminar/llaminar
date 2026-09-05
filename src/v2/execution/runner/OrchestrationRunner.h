@@ -29,6 +29,7 @@
 #include "../prefix_cache/PrefixCacheStats.h"
 #include "../mtp/MTPDepthController.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
+#include "../moe/MoEOverlayDeviceControllerGraphService.h"
 #include "../../planning/MemoryPlanner.h"
 #include "../../collective/ILocalTPContext.h"
 #include "../../collective/ILocalPPContext.h"
@@ -64,16 +65,19 @@ namespace llaminar2
     class MoEOverlayDistributedResidencyTransport;
     class MoEOverlayMPIResidencyProposalPublisher;
     class MoEOverlayResidencyMaintenanceService;
+    enum class MoEOverlayInferenceProgressPhase : std::uint8_t;
+    class MoEOverlayEconomyCalibrationController;
     class MoEOverlayInferenceInterferenceProbe;
     class MoEOverlayRankBatchTransportRegistry;
     class MoEOverlayNodeLocalDeviceControllerFabric;
-    class MoEOverlayDeviceControllerGraphService;
     struct MoEOverlayDeviceControllerTopology;
     class MoEOverlayInferenceTransactionCoordinator;
     class MoEOverlayInferenceTransactionFollower;
     class IModelContext;
     struct MoEExpertOverlayExecutionPlan;
     struct MoEOverlayResidencySnapshot;
+    struct MoEOverlaySealedMigrationMeasurements;
+    struct MoEOverlayResolvedCapacityPlan;
     struct InferenceMeasurementReadiness;
 
     /**
@@ -254,6 +258,9 @@ namespace llaminar2
 
         const RankExecutionPlan &executionPlan() const override;
         const OrchestrationConfig &config() const override;
+        bool configureMTPRequestPolicy(
+            const MTPRequestPolicy &policy) override;
+        [[nodiscard]] MTPRequestPolicy mtpRequestPolicy() const override;
 
         // =====================================================================
         // IOrchestrationRunner: Status
@@ -298,6 +305,11 @@ namespace llaminar2
 
         void enableSnapshotCapture(const std::string &output_dir = "") override;
         void setSnapshotCaptureFilter(const std::vector<std::string> &keys) override;
+        bool setSnapshotMemoryCapacity(
+            GraphSnapshotMemoryCapacity capacity) override;
+        bool prepareInactiveSnapshotCapture(
+            const std::string &output_dir = "") override;
+        bool activatePreparedSnapshotCapture() override;
         void disableSnapshotCapture() override;
         void clearSnapshots() override;
         const float *getSnapshot(const std::string &key, size_t &out_size) const override;
@@ -316,7 +328,7 @@ namespace llaminar2
 
         int sampleGreedyOnDevice() override;
         int sampleOnDevice(const SamplingParams &params) override;
-        bool waitForLastForwardCompletionForBenchmark() override;
+        bool waitForLastInferenceCompletionForBenchmark() override;
         InferenceReadiness inferenceReadiness() const override;
         bool prepareForInference() override;
         void setSkipLogitsGatherDecode(bool skip) override;
@@ -335,9 +347,10 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief MPI command tags for rank coordination in server mode.
+         * @brief MPI command tags for coordinated application inference.
          *
-         * Rank 0 broadcasts these tags to tell non-root ranks what to do.
+         * The inventory-resolved continuation root broadcasts these tags to
+         * tell follower ranks what to do.
          */
         enum class MPICommand : int32_t
         {
@@ -349,24 +362,34 @@ namespace llaminar2
             PURGE_PREFIX_CACHE = 6,  ///< Retire reusable prefix records on every rank
             FORCE_DECODE_TOKEN = 7,  ///< Commit a forced token (followed by token id)
             SET_STOP_TOKENS = 8,     ///< Install request stop policy (followed by count + token IDs)
+            SET_MTP_REQUEST_POLICY = 9, ///< Select an admitted retained MTP lane
+            YIELD_RETAINED_RUNNER = 10, ///< Return from the loop without retiring model state
             SHUTDOWN = 99            ///< Exit the worker loop
         };
 
-        /** Terminal lifecycle of the coordinated worker-command channel. */
+        /** Typed lifecycle of the coordinated worker-command channel. */
         enum class MPIWorkerCommandLifecycle : std::uint8_t
         {
             AcceptingCommands, ///< Worker ranks are blocked in command receive.
+            YieldedRetainedRunner, ///< Request state is idle and the worker loop returned.
             ShutdownPublished, ///< Every worker has observed terminal admission.
         };
 
         /**
-         * @brief Run as MPI worker (non-root rank) in server mode.
+         * @brief Run as an MPI command follower.
          *
-         * Blocks in a loop waiting for commands from rank 0. Participates
-         * in inference collectives (allreduce) as directed by rank 0.
-         * Returns when rank 0 sends SHUTDOWN command.
+         * Blocks in a loop waiting for commands from the inventory-resolved
+         * continuation root. Participates in the admitted inference
+         * collectives and returns after observing SHUTDOWN.
          */
         void runMPIWorkerLoop() override;
+
+        /**
+         * @brief Publish a nonterminal retained-runner boundary to every rank.
+         * @return True after all request state was proven idle and YIELD was
+         *         published (or recorded locally for a single-rank runner).
+         */
+        bool yieldMPIWorkersForRetainedRunner() override;
 
         /**
          * @brief Close command admission and drain topology maintenance.
@@ -397,12 +420,8 @@ namespace llaminar2
          */
         void setMPICoordinatedMode(bool enabled) override
         {
-            /**
-             * A worker loop can only be started once for an orchestration
-             * runner.  Re-enabling coordinated mode after rank zero has sent
-             * SHUTDOWN would make a later command wait for workers that have
-             * already deliberately left the communicator protocol.
-             */
+            /* Terminal shutdown is irreversible. A retained yield is instead
+             * the one legal request-idle edge back into command admission. */
             if (enabled &&
                 mpi_worker_command_lifecycle_ ==
                     MPIWorkerCommandLifecycle::ShutdownPublished)
@@ -410,6 +429,18 @@ namespace llaminar2
                 LLAMINAR_UNREACHABLE(
                     "Cannot re-enable MPI coordinated mode after worker shutdown; "
                     "construct a new OrchestrationRunner for the next serving session");
+            }
+            if (enabled &&
+                mpi_worker_command_lifecycle_ ==
+                    MPIWorkerCommandLifecycle::YieldedRetainedRunner)
+            {
+                if (!mtpRequestPolicyTransitionIsIdle())
+                {
+                    LLAMINAR_UNREACHABLE(
+                        "Cannot reopen a retained MPI worker session with live request state");
+                }
+                mpi_worker_command_lifecycle_ =
+                    MPIWorkerCommandLifecycle::AcceptingCommands;
             }
             mpi_coordinated_mode_ = enabled;
         }
@@ -570,6 +601,26 @@ namespace llaminar2
         bool applyConfiguredSnapshotCaptureSetup();
 
         /**
+         * @brief Materialize the current snapshot variant of the frozen family.
+         *
+         * ExpertOverlay and ordinary runners derive their plan from the same
+         * orchestration-owned accounting used at initial setup. Transfer epochs
+         * are already bound; this method only asks the runner to certify the
+         * currently selected diagnostic topology.
+         */
+        bool materializeCurrentServingGraphFamilyVariantWithoutLaunch();
+
+        /**
+         * @brief Finish a prepared-inactive policy with the lean variant active.
+         *
+         * Called once before maintenance and request-ticket authority start. The
+         * diagnostic family was materialized by the preceding normal setup pass;
+         * this transition disables its callback, materializes the lean family,
+         * and records that later activation must be replay-only.
+         */
+        bool deactivatePreparedSnapshotCaptureAndMaterializeLeanServingFamily();
+
+        /**
          * @brief Bind physical transfer epochs and seal every serving graph.
          *
          * The physical fabric's exact GPU inventory is installed into the
@@ -647,8 +698,10 @@ namespace llaminar2
          *
          * This runs only after graph, controller, transport, and local-context
          * teardown. It queries model-owned allocation registries rather than an
-         * admission projection or driver free-memory delta, then supplies the
-         * value for the atomic `Sealing -> Reusable` publication.
+         * admission projection or driver free-memory delta. An exported model
+         * publishes the value through `Sealing -> Reusable`; an ordinary final
+         * owner binds it to exclusive TransferEngine retirement tickets before
+         * releasing its model and workspace allocations.
          */
         bool sealModelContextDeviceMemoryRetention(
             std::vector<ModelDeviceMemoryRetention> *retention,
@@ -713,6 +766,19 @@ namespace llaminar2
         bool refreshRankLocalGPUCapacityObservations(
             const std::vector<DeviceId> &devices,
             std::string_view purpose);
+
+        /**
+         * @brief Bind the admitted topology plan to this rank's allocators.
+         *
+         * This is the sole admission-to-materialization transition. It creates
+         * one rank-bound authority and publishes that same object to the model
+         * WeightManager/prepared store before any graph, expert shadow bank, or
+         * transfer directory may allocate. Re-entry is legal only when both
+         * admission and authority object identity are unchanged.
+         *
+         * @return True when the existing admission is consistently published.
+         */
+        bool publishPhysicalMemoryAuthority();
 
         /**
          * @brief Validate that the model fits in device memory
@@ -836,6 +902,21 @@ namespace llaminar2
         bool ensureMTPDepthController(const MTPRuntimeConfig &mtp);
         int effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const;
         int currentMTPDraftDepth(const MTPRuntimeConfig &mtp);
+
+        /**
+         * @brief Resolve immutable setup-time MTP capacity for this rank.
+         * @return The plan-owned config when present, otherwise startup config.
+         */
+        [[nodiscard]] const MTPRuntimeConfig &retainedMTPConfig() const noexcept;
+
+        /**
+         * @brief Compose the live request policy over immutable capacity.
+         * @return Ephemeral execution view; never a second capacity authority.
+         */
+        [[nodiscard]] MTPRuntimeConfig activeMTPRequestConfig() const;
+
+        /** @return Whether policy can change without crossing live request state. */
+        [[nodiscard]] bool mtpRequestPolicyTransitionIsIdle() const noexcept;
         /**
          * @brief Initialize the scheduler-owned MTP position after prefill.
          *
@@ -1064,6 +1145,19 @@ namespace llaminar2
             bool prefix_cache_enabled) const;
 
         /**
+         * @brief Publish completed host-authority inference as drain cadence.
+         * @param phase Mathematical prefill or decode phase that completed.
+         * @param completed_logical_tokens Positive logical-token count.
+         *
+         * This helper is a no-op for static, observe-only, and device-resident
+         * authorities. It never publishes routing data: exact route histograms
+         * remain owned by their CPU/GPU producers until maintenance drains them.
+         */
+        void notifyHostMoEOverlayInferenceProgress(
+            MoEOverlayInferenceProgressPhase phase,
+            std::uint64_t completed_logical_tokens) noexcept;
+
+        /**
          * @brief Forward one indivisible prefill transaction through the runner.
          *
          * This method owns the existing activation-graph bucket scheduling
@@ -1176,6 +1270,11 @@ namespace llaminar2
 
         // Configuration
         OrchestrationConfig config_;
+        /**
+         * Request-selectable execution state over @ref retainedMTPConfig().
+         * Physical graph and weight identity never enters this value.
+         */
+        std::optional<MTPRequestPolicy> mtp_request_policy_;
         /** Requested routed-weight identity captured before model-aware freezing. */
         std::string requested_routed_weight_authority_identity_;
         RankExecutionPlan plan_;
@@ -1277,6 +1376,9 @@ namespace llaminar2
         /** Retained group-root graphs on dedicated controller streams. */
         std::unique_ptr<MoEOverlayDeviceControllerGraphService>
             moe_overlay_device_controller_graph_service_;
+        /** Typed terminal receipt retained after device graph destruction. */
+        std::optional<MoEOverlayDeviceControllerDrainResult>
+            terminal_moe_device_controller_drain_result_;
         /**
          * Successful terminal optimization state retained after maintenance
          * resources are released. Reset-composition teardown clears it.
@@ -1327,8 +1429,36 @@ namespace llaminar2
         /** Model-frozen physical routed plan retained by the reuse contract. */
         std::shared_ptr<const MoERoutedExpertPlacementPlan>
             retained_prepared_routed_weight_plan_;
+        /** Physical-memory proof imported with the retained routed plan. */
+        std::shared_ptr<const MoEOverlayResolvedCapacityPlan>
+            retained_expert_overlay_memory_admission_;
+        /** Sole physical-memory proof selected for this runner's overlay. */
+        std::shared_ptr<const MoEOverlayResolvedCapacityPlan>
+            moe_expert_overlay_memory_admission_;
+        /**
+         * Sole topology-wide CPU/GPU admission proof for this runner.
+         *
+         * ExpertOverlay aliases the certificate embedded in its resolved
+         * capacity plan; ordinary dense/TP execution installs the same type
+         * from MemoryPlanner. No allocator may reconstruct a local budget.
+         */
+        std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>
+            physical_memory_admission_;
+        /** Rank-bound admission and live-allocation authority. */
+        std::shared_ptr<PhysicalMemoryAuthority>
+            physical_memory_authority_;
         /** Exact requested ExpertOverlay identity carried by the reuse contract. */
         std::string retained_routed_weight_authority_identity_;
+        /** Immutable physical transfer evidence imported with prepared weights. */
+        std::shared_ptr<const MoEOverlaySealedMigrationMeasurements>
+            retained_expert_overlay_migration_profile_;
+        /** Exact admission identity for the retained physical evidence. */
+        std::string retained_expert_overlay_migration_profile_identity_;
+        /** Current runner's profile owner, retained for immutable export. */
+        std::shared_ptr<MoEOverlayEconomyCalibrationController>
+            moe_expert_overlay_economy_calibration_;
+        /** Exact identity under which the current profile was admitted. */
+        std::string moe_expert_overlay_migration_profile_identity_;
         /** True only after the current plan passed the retained-plan comparison. */
         bool retained_prepared_weight_plan_validated_{false};
         /** Model-owned prepared records counted when an imported plan was admitted. */
@@ -1369,35 +1499,43 @@ namespace llaminar2
             {
                 Disabled, ///< No diagnostic D2D copies belong to graph identity.
                 Enabled,  ///< The retained filter belongs to graph identity.
+                PreparedInactive, ///< Diagnostic and lean variants are prepared; lean starts active.
             };
 
             Mode mode = Mode::Disabled;
             std::string output_directory;
             std::vector<std::string> filter;
+            /** Complete device-storage bound supplied by policy owner. */
+            GraphSnapshotMemoryCapacity memory_capacity;
 
             /** @return Whether graph-resident snapshot nodes are requested. */
             [[nodiscard]] bool enabled() const noexcept
             {
-                return mode == Mode::Enabled;
+                return mode != Mode::Disabled;
+            }
+
+            /**
+             * @brief Count serving graph topologies resident at the same time.
+             *
+             * Enabled and disabled modes each retain one selected topology.
+             * Prepared-inactive parity owns diagnostic and lean variants
+             * concurrently so later activation is an allocation-free cache
+             * selection rather than request-time recapture.
+             */
+            [[nodiscard]] std::size_t
+            retainedModelGraphTopologyVariantCount() const noexcept
+            {
+                return mode == Mode::PreparedInactive ? 2u : 1u;
             }
         } snapshot_capture_setup_;
+        /** True only after both prepared-inactive executable variants are resident. */
+        bool prepared_inactive_snapshot_capture_ready_ = false;
         /** Rank-wide source authority; null on remote and non-overlay ranks. */
         std::shared_ptr<MoEOverlayInferenceTransactionCoordinator>
             moe_overlay_inference_transaction_coordinator_;
         /** Remote retained-graph scheduler; null on the continuation rank. */
         std::unique_ptr<MoEOverlayInferenceTransactionFollower>
             moe_overlay_inference_transaction_follower_;
-        /**
-         * @brief Whether shutdown may resolve a physical backend for runner_.
-         *
-         * Production constructors keep this true. Constructors that accept an
-         * injected IInferenceRunner are unit-test seams: their CUDA/ROCm-shaped
-         * DeviceIds exercise policy only and must never initialize a physical
-         * backend during teardown. Injected RankOrchestrator instances still
-         * receive synchronizeDevices(); that object independently knows whether
-         * its children own physical devices.
-         */
-        bool physical_runner_backend_access_enabled_ = true;
         /**
          * @brief Owns TP-combined snapshot views returned through the orchestration API.
          *
@@ -1746,6 +1884,20 @@ namespace llaminar2
          * crossed every committed transaction boundary.
          */
         bool device_generation_embedded_moe_maintenance_pending_ack_{false};
+        /**
+         * @brief Device-authenticated decode progress already sent to hosted maintenance.
+         *
+         * HIP's retained transaction scheduler publishes cumulative committed
+         * output in its immutable ticket. The transaction coordinator converts
+         * that frontier into exactly-once deltas and increments this host-only
+         * lifecycle receipt after waking the background maintenance service.
+         * The ordinary outer decode boundary consumes the receipt and must
+         * match it exactly, preventing the same logical tokens from advancing
+         * the movement cadence twice. This is acknowledgement metadata only;
+         * it neither mirrors nor controls device-owned generation state.
+         */
+        std::atomic<std::uint64_t>
+            hosted_device_generation_decode_progress_notified_{0u};
         /**
          * @brief Per-request state initialized by prefillBatch().
          *

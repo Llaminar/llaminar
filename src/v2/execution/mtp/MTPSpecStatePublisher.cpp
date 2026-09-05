@@ -101,41 +101,6 @@ namespace llaminar2
                 result.accepted_count += step.accepted_count;
         }
 
-        std::string publishPostRestoreStage(
-            IComputeStage *stage,
-            size_t stage_index,
-            DeviceId device,
-            void *stream,
-            const char *publication_kind,
-            MTPSpecStatePublicationResult &result)
-        {
-            if (!stage->requiresPostVerifierStatePublication())
-                return {};
-
-            if (device.is_gpu() && stream == nullptr)
-            {
-                std::ostringstream msg;
-                msg << publication_kind
-                    << " post-restore publication for GPU stage "
-                    << stage->name()
-                    << " at index " << stage_index
-                    << " requires an explicit non-null stream";
-                return msg.str();
-            }
-
-            if (!stage->publishPostVerifierStateRestore(stream))
-            {
-                std::ostringstream msg;
-                msg << publication_kind
-                    << " failed post-restore publication for stage "
-                    << stage->name()
-                    << " at index " << stage_index;
-                return msg.str();
-            }
-
-            ++result.post_restore_stage_count;
-            return {};
-        }
     } // namespace
 
     MTPSpecStatePublicationResult publishAcceptedMTPSpecState(
@@ -233,17 +198,7 @@ namespace llaminar2
                         << " but no capture was bound";
                     return publicationFailure(plan, msg.str());
                 }
-                const std::string post_error = publishPostRestoreStage(
-                    stage,
-                    i,
-                    device,
-                    stream,
-                    "MTP spec-state publication",
-                    result);
-                if (!post_error.empty())
-                    return publicationFailure(plan, post_error);
-                if (!stage->requiresPostVerifierStatePublication())
-                    ++result.skipped_stage_count;
+                ++result.skipped_stage_count;
                 continue;
             }
             if (!stage->restoreVerifierStateCaptureRow(restore_row, stream))
@@ -255,15 +210,6 @@ namespace llaminar2
                 return publicationFailure(plan, msg.str());
             }
             ++result.restored_stage_count;
-            const std::string post_error = publishPostRestoreStage(
-                stage,
-                i,
-                device,
-                stream,
-                "MTP spec-state publication",
-                result);
-            if (!post_error.empty())
-                return publicationFailure(plan, post_error);
             stage->clearVerifierStateCaptureBindingAfterPublication();
         }
 
@@ -512,30 +458,10 @@ namespace llaminar2
                     if (stage->hasVerifierStateCapture())
                     {
                         ++result.restored_stage_count;
-                        const std::string post_error = publishPostRestoreStage(
-                            stage,
-                            i,
-                            device,
-                            stream,
-                            "single-request CPU MTP publication",
-                            result);
-                        if (!post_error.empty())
-                            return batchPublicationFailure(plans, post_error);
                         stage->clearVerifierStateCaptureBindingAfterPublication();
                         continue;
                     }
-
-                    const std::string post_error = publishPostRestoreStage(
-                        stage,
-                        i,
-                        device,
-                        stream,
-                        "single-request CPU MTP publication",
-                        result);
-                    if (!post_error.empty())
-                        return batchPublicationFailure(plans, post_error);
-                    if (!stage->requiresPostVerifierStatePublication())
-                        ++result.skipped_stage_count;
+                    ++result.skipped_stage_count;
                 }
             }
 
@@ -579,17 +505,7 @@ namespace llaminar2
                         << stage->name() << " at index " << i;
                     return batchPublicationFailure(plans, msg.str());
                 }
-                const std::string post_error = publishPostRestoreStage(
-                    stage,
-                    i,
-                    device,
-                    stream,
-                    "host-indexed batched MTP spec-state publication",
-                    result);
-                if (!post_error.empty())
-                    return batchPublicationFailure(plans, post_error);
-                if (!stage->requiresPostVerifierStatePublication())
-                    ++result.skipped_stage_count;
+                ++result.skipped_stage_count;
                 continue;
             }
             if (!stage->restoreVerifierStateCaptureRows(
@@ -603,15 +519,6 @@ namespace llaminar2
                 return batchPublicationFailure(plans, msg.str());
             }
             ++result.restored_stage_count;
-            const std::string post_error = publishPostRestoreStage(
-                stage,
-                i,
-                device,
-                stream,
-                "host-indexed batched MTP spec-state publication",
-                result);
-            if (!post_error.empty())
-                return batchPublicationFailure(plans, post_error);
             stage->clearVerifierStateCaptureBindingAfterPublication();
         }
 
@@ -732,17 +639,7 @@ namespace llaminar2
                         << " but no capture was bound";
                     return devicePublicationFailure(shape, msg.str());
                 }
-                const std::string post_error = publishPostRestoreStage(
-                    stage,
-                    i,
-                    device,
-                    stream,
-                    "device-indexed MTP spec-state publication",
-                    result);
-                if (!post_error.empty())
-                    return devicePublicationFailure(shape, post_error);
-                if (!stage->requiresPostVerifierStatePublication())
-                    ++result.skipped_stage_count;
+                ++result.skipped_stage_count;
                 continue;
             }
             if (!stage->restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -756,15 +653,6 @@ namespace llaminar2
                 return devicePublicationFailure(shape, msg.str());
             }
             ++result.restored_stage_count;
-            const std::string post_error = publishPostRestoreStage(
-                stage,
-                i,
-                device,
-                stream,
-                "device-indexed MTP spec-state publication",
-                result);
-            if (!post_error.empty())
-                return devicePublicationFailure(shape, post_error);
             stage->clearVerifierStateCaptureBindingAfterPublication();
         }
 
@@ -891,17 +779,7 @@ namespace llaminar2
                         << " but no capture was bound";
                     return devicePublicationFailure(shape, msg.str());
                 }
-                const std::string post_error = publishPostRestoreStage(
-                    stage,
-                    i,
-                    device,
-                    stream,
-                    "batched device-indexed MTP spec-state publication",
-                    result);
-                if (!post_error.empty())
-                    return devicePublicationFailure(shape, post_error);
-                if (!stage->requiresPostVerifierStatePublication())
-                    ++result.skipped_stage_count;
+                ++result.skipped_stage_count;
                 continue;
             }
             if (!stage->restoreVerifierStateCaptureRowsFromDeviceIndices(
@@ -917,15 +795,6 @@ namespace llaminar2
                 return devicePublicationFailure(shape, msg.str());
             }
             ++result.restored_stage_count;
-            const std::string post_error = publishPostRestoreStage(
-                stage,
-                i,
-                device,
-                stream,
-                "batched device-indexed MTP spec-state publication",
-                result);
-            if (!post_error.empty())
-                return devicePublicationFailure(shape, post_error);
             stage->clearVerifierStateCaptureBindingAfterPublication();
         }
 

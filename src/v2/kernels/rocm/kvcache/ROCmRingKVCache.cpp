@@ -14,6 +14,7 @@
  */
 
 #include "ROCmRingKVCache.h"
+#include "../../kvcache/KVCacheWorkspaceContract.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -2646,40 +2647,26 @@ namespace llaminar2
          * and reserve at least the cache's configured batch capacity.
          */
         (void)k;
-        const bool has_token_hint = n > 0;
-        const int actual_batch_size = has_token_hint ? n : ((m > 0) ? m : batch_size_);
-        const int scratch_tokens = has_token_hint
-                                       ? std::max(m, max_seq_len_)
-                                       : max_seq_len_;
-        const int bounded_batch_size =
-            std::max(std::max(1, actual_batch_size), batch_size_);
-        const int bounded_scratch_tokens = std::max(1, scratch_tokens);
-        const size_t batched_scratch_tokens =
-            static_cast<size_t>(bounded_scratch_tokens) *
-            static_cast<size_t>(bounded_batch_size);
-        const size_t fp32_scratch_bytes =
-            batched_scratch_tokens * static_cast<size_t>(kv_dim_) * sizeof(float);
-        const size_t fp16_scratch_bytes =
-            batched_scratch_tokens * static_cast<size_t>(kv_dim_) * sizeof(uint16_t);
-        const size_t native_scratch_bytes =
-            batched_scratch_tokens * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        const auto geometry = kv_cache_workspace::ConversionGeometry{
+            .configured_batch_size = batch_size_,
+            .configured_context_rows = max_seq_len_,
+            .requested_graph_rows = m,
+            .requested_batch_size = n,
+            .conversion_row_bytes =
+                static_cast<size_t>(kv_dim_) * sizeof(float),
+            .native_row_bytes =
+                static_cast<size_t>(kv_storage_dim_) * sizeof(DataT),
+        };
+        WorkspaceRequirements reqs =
+            kv_cache_workspace::conversionRequirements(geometry);
         const size_t conversion_scratch_bytes =
-            std::max(fp32_scratch_bytes, std::max(fp16_scratch_bytes, native_scratch_bytes));
+            kv_cache_workspace::conversionBufferBytes(geometry);
 
-        WorkspaceRequirements reqs;
-
-        reqs.buffers.push_back({KVCacheWorkspaceBuffers::CONV_SCRATCH_K,
-                                conversion_scratch_bytes,
-                                256,
-                                true});
-        reqs.buffers.push_back({KVCacheWorkspaceBuffers::CONV_SCRATCH_V,
-                                conversion_scratch_bytes,
-                                256,
-                                true});
-
-        LOG_TRACE("[ROCmRingKVCache] Workspace requirements: batch_size="
-                  << bounded_batch_size
-                  << " scratch_tokens=" << bounded_scratch_tokens
+        LOG_TRACE("[ROCmRingKVCache] Workspace requirements: configured_batch="
+                  << batch_size_
+                  << " configured_context=" << max_seq_len_
+                  << " requested_graph_rows=" << m
+                  << " requested_batch=" << n
                   << " CONV_SCRATCH(each)=" << conversion_scratch_bytes);
 
         return reqs;

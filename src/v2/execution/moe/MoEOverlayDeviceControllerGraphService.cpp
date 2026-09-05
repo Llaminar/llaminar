@@ -263,13 +263,15 @@ namespace llaminar2
         return {};
     }
 
-    std::uint64_t MoEOverlayMaintenanceBoundaryGate::growRequiredTokens(
+    std::uint64_t MoEOverlayMaintenanceBoundaryGate::advanceAfterReceipt(
         std::uint64_t maximum_tokens,
-        double growth_factor) noexcept
+        double growth_factor,
+        MoEOverlayMaintenanceCadenceReceipt receipt) noexcept
     {
         const std::uint64_t current =
             required_tokens_.load(std::memory_order_acquire);
-        if (maximum_tokens == 0u || maximum_tokens <= current ||
+        if (!receipt.permitsCooldown() || maximum_tokens == 0u ||
+            maximum_tokens <= current ||
             !std::isfinite(growth_factor) || growth_factor <= 1.0)
         {
             return current;
@@ -318,16 +320,38 @@ namespace llaminar2
         /** Sole-leader finite transaction-open nodes, specialized by phase. */
         std::unique_ptr<IGPUGraphCapture> dynamic_begin_prefill_graph;
         std::unique_ptr<IGPUGraphCapture> dynamic_begin_decode_graph;
+        /** Sole-leader terminal restoration transaction-open graph. */
+        std::unique_ptr<IGPUGraphCapture>
+            prepared_context_restore_begin_graph;
         /** Participant-local demand publication with no peer dependency. */
         std::unique_ptr<IGPUGraphCapture> dynamic_snapshot_prefill_graph;
         std::unique_ptr<IGPUGraphCapture> dynamic_snapshot_decode_graph;
+        /** Participant snapshot of live ownership for terminal restoration. */
+        std::unique_ptr<IGPUGraphCapture>
+            prepared_context_restore_snapshot_graph;
         /** Group-root reduction admitted after every participant receipt. */
         std::unique_ptr<IGPUGraphCapture> dynamic_group_snapshot_graph;
         /** Sole-leader policy nodes launched only after every group receipt. */
         std::unique_ptr<IGPUGraphCapture> dynamic_author_prefill_graph;
         std::unique_ptr<IGPUGraphCapture> dynamic_author_decode_graph;
-        /** Physical-ready E -> E+1 publication and retirement admission. */
-        std::unique_ptr<IGPUGraphCapture> dynamic_publish_graph;
+        /** Sole-leader comparison against the immutable prepared owner table. */
+        std::unique_ptr<IGPUGraphCapture>
+            prepared_context_restore_author_graph;
+        /** Build the complete inactive E+1 bank on every participant. */
+        std::unique_ptr<IGPUGraphCapture> dynamic_prepare_candidate_graph;
+        /** Group-root receipt after every local E+1 bank is complete. */
+        std::unique_ptr<IGPUGraphCapture> dynamic_acknowledge_prepared_graph;
+        /** Sole-leader commit after every group preparation receipt. */
+        std::unique_ptr<IGPUGraphCapture> dynamic_begin_commit_graph;
+        /** Participant-local RCU selector publication after commit. */
+        std::unique_ptr<IGPUGraphCapture> dynamic_publish_candidate_graph;
+        /** Group-root receipt after every local selector publication. */
+        std::unique_ptr<IGPUGraphCapture> dynamic_acknowledge_published_graph;
+        /** Sole-leader E+1 admission and E retirement opening. */
+        std::unique_ptr<IGPUGraphCapture> dynamic_publish_admission_graph;
+        /** Bounded participant-local old-bank reader-drain probe. */
+        std::unique_ptr<IGPUGraphCapture>
+            dynamic_retirement_readiness_graph;
         /** Reader-ticket-selected participant-local bank reclamation. */
         std::unique_ptr<IGPUGraphCapture> dynamic_retire_graph;
         /** Physical-retirement-selected topology terminal publication. */
@@ -345,6 +369,43 @@ namespace llaminar2
     /** Process-local follower for one device-owned physical transaction. */
     struct MoEOverlayDeviceControllerGraphService::DynamicWorker
     {
+        /** One complete retained transaction objective. */
+        enum class TransactionObjective : std::uint8_t
+        {
+            DynamicPrefill,
+            DynamicDecode,
+            PreparedContextRestore,
+        };
+
+        /** Device-authored terminal identity returned by @ref runOne. */
+        struct TransactionResult
+        {
+            MoEOverlayDeviceControllerTransactionKind kind =
+                MoEOverlayDeviceControllerTransactionKind::Invalid;
+            std::uint64_t transaction = 0u;
+            std::uint64_t durable_epoch = 0u;
+            std::uint32_t command_count = 0u;
+            /** Device-authored demand consumed by this exact transaction. */
+            std::uint64_t snapshot_observations = 0u;
+
+            /** @return Whether this transaction moved durable expert bytes. */
+            [[nodiscard]] bool movedWeights() const noexcept
+            {
+                return command_count != 0u;
+            }
+
+            /**
+             * @return Typed cadence projection of this device-authored result.
+             */
+            [[nodiscard]] MoEOverlayMaintenanceCadenceReceipt cadenceReceipt()
+                const noexcept
+            {
+                return MoEOverlayMaintenanceCadenceReceipt::
+                    fromDynamicTransaction(
+                        snapshot_observations, command_count);
+            }
+        };
+
         /** Bind the worker to its sole service and immutable token cadence. */
         DynamicWorker(
             MoEOverlayDeviceControllerGraphService *service,
@@ -375,6 +436,15 @@ namespace llaminar2
             MoEOptimizationActivityState::LearningEconomy};
         /** Monotonic owner/worker proof that shutdown has no admitted work. */
         MoEOverlayWorkerDrainProtocol drain;
+        /** Owner-selected terminal objective, published before @ref drain. */
+        std::atomic<MoEOverlayDeviceControllerDrainIntent> drain_intent{
+            MoEOverlayDeviceControllerDrainIntent::ReleaseResources};
+        /** Exact device-certified terminal durable epoch. */
+        std::atomic<std::uint64_t> restored_durable_epoch{0u};
+        /** Number of physical restoration waves, excluding the final proof. */
+        std::atomic<std::uint64_t> restoration_movement_waves{0u};
+        /** Release-published only after a zero-command restoration receipt. */
+        std::atomic<bool> prepared_context_certified{false};
         mutable std::mutex failure_mutex;
         std::string failure;
         std::uint64_t last_transaction = 0u;
@@ -460,7 +530,12 @@ namespace llaminar2
 
         /** Execute one complete device-authored transaction. */
         [[nodiscard]] bool runOne(
-            MoEOverlayInferencePhase phase,
+            TransactionObjective objective,
+            TransactionResult *result,
+            std::string *error) noexcept;
+
+        /** Run bounded restoration waves through a final zero-command proof. */
+        [[nodiscard]] bool restorePreparedContext(
             std::string *error) noexcept;
 
         /**
@@ -477,7 +552,8 @@ namespace llaminar2
          */
         [[nodiscard]] bool observeAuthorityTransaction(
             std::uint64_t *transaction,
-            MoEOverlayInferencePhase *phase,
+            MoEOverlayDeviceControllerTransactionKind *kind,
+            MoEOverlayDeviceDemandPhase *phase,
             std::string *error) const noexcept;
 
         /** Advance host-owned measurements and publish immutable device costs. */
@@ -787,24 +863,154 @@ namespace llaminar2
                 throw std::logic_error(
                     "Dynamic device controller rank owns participants but no group-root transport lane");
             }
-            dynamic_worker_->thread = std::jthread(
-                [worker = dynamic_worker_.get()](std::stop_token token)
-                {
-                    worker->run(token);
-                });
+            /*
+             * Do not start the submitter here. The runner still has one lean
+             * serving topology to capture after this controller family is
+             * materialized. Any CUDA/HIP work submitted from this thread in
+             * that interval can invalidate an unrelated stream capture.
+             * start() is the sole, typed activation edge after all graph
+             * families have crossed rank-wide setup consensus.
+             */
         }
+    }
+
+    void MoEOverlayDeviceControllerGraphService::start()
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+        if (activation_state_.load(std::memory_order_acquire) !=
+            MoEOverlayDeviceControllerActivationState::Prepared)
+        {
+            throw std::logic_error(
+                "Device controller service may start exactly once from Prepared");
+        }
+        if (config_.execution_mode == ExecutionMode::Static &&
+            !static_certified_)
+        {
+            throw std::logic_error(
+                "Static device controller service cannot start before its no-movement certification");
+        }
+
+        activation_state_.store(
+            MoEOverlayDeviceControllerActivationState::Starting,
+            std::memory_order_release);
+        try
+        {
+            if (dynamic_worker_)
+            {
+                dynamic_worker_->thread = std::jthread(
+                    [worker = dynamic_worker_.get()](std::stop_token token)
+                    {
+                        worker->run(token);
+                    });
+
+                /*
+                 * The worker can report a fatal setup/protocol error as soon
+                 * as it enters run(). Do not overwrite that terminal state
+                 * with Running merely because thread construction returned.
+                 */
+                auto expected =
+                    MoEOverlayDeviceControllerActivationState::Starting;
+                if (!activation_state_.compare_exchange_strong(
+                        expected,
+                        MoEOverlayDeviceControllerActivationState::Running,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire))
+                {
+                    dynamic_worker_->thread.request_stop();
+                    dynamic_worker_->wake_cv.notify_all();
+                    if (dynamic_worker_->thread.joinable())
+                        dynamic_worker_->thread.join();
+                    throw std::runtime_error(
+                        "Device controller worker failed during activation: " +
+                        failureMessage());
+                }
+            }
+            else
+            {
+                /* Static and participant-empty ranks own no worker thread. */
+                activation_state_.store(
+                    MoEOverlayDeviceControllerActivationState::Running,
+                    std::memory_order_release);
+            }
+        }
+        catch (...)
+        {
+            activation_state_.store(
+                MoEOverlayDeviceControllerActivationState::Failed,
+                std::memory_order_release);
+            throw;
+        }
+    }
+
+    MoEOverlayDeviceControllerActivationState
+    MoEOverlayDeviceControllerGraphService::state() const noexcept
+    {
+        return activation_state_.load(std::memory_order_acquire);
     }
 
     MoEOverlayDeviceControllerGraphService::
         ~MoEOverlayDeviceControllerGraphService()
     {
-        stopAndDrain();
+        (void)stopAndDrain();
     }
 
-    void MoEOverlayDeviceControllerGraphService::stopAndDrain() noexcept
+    MoEOverlayDeviceControllerDrainResult
+    MoEOverlayDeviceControllerGraphService::stopAndDrain(
+        MoEOverlayDeviceControllerDrainIntent intent) noexcept
     {
-        if (stopped_)
-            return;
+        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+        const auto activation_state =
+            activation_state_.load(std::memory_order_acquire);
+        if (activation_state ==
+            MoEOverlayDeviceControllerActivationState::Stopped)
+            return terminal_drain_result_;
+
+        terminal_drain_result_ = {
+            .intent = intent,
+            .succeeded = false,
+        };
+
+        /*
+         * Setup rollback must never enter the distributed terminal protocol.
+         * A Prepared service has submitted no background work, so releasing
+         * its retained graphs is purely process-local. Prepared-context
+         * restoration is intentionally not manufactured here: terminal model
+         * reuse is admitted only after a successfully Running authority.
+         */
+        if (activation_state ==
+                MoEOverlayDeviceControllerActivationState::Prepared ||
+            (activation_state ==
+                 MoEOverlayDeviceControllerActivationState::Failed &&
+             dynamic_worker_ && !dynamic_worker_->thread.joinable()))
+        {
+            terminal_drain_result_.succeeded =
+                intent == MoEOverlayDeviceControllerDrainIntent::
+                              ReleaseResources;
+            dynamic_worker_.reset();
+            for (auto &endpoint : endpoints_)
+            {
+                if (endpoint)
+                    releaseEndpoint(*endpoint);
+            }
+            endpoints_.clear();
+            activation_state_.store(
+                MoEOverlayDeviceControllerActivationState::Stopped,
+                std::memory_order_release);
+            return terminal_drain_result_;
+        }
+
+        if (activation_state !=
+                MoEOverlayDeviceControllerActivationState::Running &&
+            activation_state !=
+                MoEOverlayDeviceControllerActivationState::Failed)
+        {
+            LOG_ERROR(
+                "[MoEOverlayDeviceController] terminal drain reached an invalid activation state");
+            std::terminate();
+        }
+        activation_state_.store(
+            MoEOverlayDeviceControllerActivationState::Draining,
+            std::memory_order_release);
 
         if (dynamic_worker_)
         {
@@ -814,6 +1020,8 @@ namespace llaminar2
              * join a transaction that a faster peer already admitted. A
              * local jthread cancellation is not a distributed protocol edge.
              */
+            dynamic_worker_->drain_intent.store(
+                intent, std::memory_order_release);
             config_.mpi_ctx->barrier();
             const auto drain_request = dynamic_worker_->drain.request();
             dynamic_worker_->wake_cv.notify_all();
@@ -876,11 +1084,43 @@ namespace llaminar2
                 dynamic_worker_->completedMovement();
             terminal_movement_ledger_ =
                 dynamic_worker_->completedMovementLedger();
+            const std::uint64_t restoration_waves =
+                dynamic_worker_->restoration_movement_waves.load(
+                    std::memory_order_acquire);
+            const std::uint64_t all_durable_waves = config_.fabric
+                ? config_.fabric->completedDurableMovementEpochs()
+                : 0u;
             terminal_published_movement_waves_ =
-                config_.fabric
-                    ? config_.fabric->completedDurableMovementEpochs()
+                all_durable_waves >= restoration_waves
+                    ? all_durable_waves - restoration_waves
                     : 0u;
+            terminal_drain_result_ = {
+                .intent = intent,
+                .succeeded = dynamic_worker_->healthy.load(
+                    std::memory_order_acquire),
+                .prepared_context_certified =
+                    dynamic_worker_->prepared_context_certified.load(
+                        std::memory_order_acquire),
+                .durable_epoch =
+                    dynamic_worker_->restored_durable_epoch.load(
+                        std::memory_order_acquire),
+                .restoration_movement_waves = restoration_waves,
+            };
+            if (intent == MoEOverlayDeviceControllerDrainIntent::
+                              RestorePreparedContext &&
+                !terminal_drain_result_.valid())
+            {
+                LOG_ERROR(
+                    "[MoEOverlayDeviceController] terminal drain omitted its device-authored prepared-context certification");
+                std::terminate();
+            }
             dynamic_worker_.reset();
+        }
+        else
+        {
+            terminal_drain_result_.succeeded =
+                intent == MoEOverlayDeviceControllerDrainIntent::
+                              ReleaseResources;
         }
         for (auto &endpoint : endpoints_)
         {
@@ -888,7 +1128,10 @@ namespace llaminar2
                 releaseEndpoint(*endpoint);
         }
         endpoints_.clear();
-        stopped_ = true;
+        activation_state_.store(
+            MoEOverlayDeviceControllerActivationState::Stopped,
+            std::memory_order_release);
+        return terminal_drain_result_;
     }
 
     void MoEOverlayDeviceControllerGraphService::materializeEndpoint(
@@ -998,6 +1241,8 @@ namespace llaminar2
                                       AuthorStaticPolicy ||
                         action == MoEOverlayDeviceControllerAction::
                                       AuthorDynamicPolicy ||
+                        action == MoEOverlayDeviceControllerAction::
+                                      AuthorPreparedContextRestore ||
                         action == MoEOverlayDeviceControllerAction::
                                       PublishCommand;
                     const bool publication_action =
@@ -1283,6 +1528,56 @@ namespace llaminar2
                     decode_source_mask,
                     decode_baseline,
                     "Dynamic bounded decode decision phase");
+                if (endpoint.binding.authority_leader)
+                {
+                    capture(
+                        endpoint.prepared_context_restore_begin_graph,
+                        [&]
+                        {
+                            return enqueue(
+                                MoEOverlayDeviceControllerAction::
+                                    BeginTransaction,
+                                MoEOverlayDeviceControllerTransactionKind::
+                                    PreparedContextRestore,
+                                MoEOverlayDeviceDemandPhase::Invalid);
+                        },
+                        "prepared-context restoration transaction-open phase");
+                    capture(
+                        endpoint.prepared_context_restore_author_graph,
+                        [&]
+                        {
+                            return enqueue(
+                                       MoEOverlayDeviceControllerAction::
+                                           AuthorPreparedContextRestore,
+                                       MoEOverlayDeviceControllerTransactionKind::
+                                           Invalid,
+                                       MoEOverlayDeviceDemandPhase::Invalid) &&
+                                   enqueue(
+                                       MoEOverlayDeviceControllerAction::
+                                           PublishCommand) &&
+                                   enqueue(
+                                       MoEOverlayDeviceControllerAction::
+                                           CompleteEmptyDynamicDecision);
+                        },
+                        "prepared-context restoration policy-author phase");
+                }
+                capture(
+                    endpoint.prepared_context_restore_snapshot_graph,
+                    [&]
+                    {
+                        /* Restoration consumes ownership only. Cumulative
+                         * demand is packed solely because the shared snapshot
+                         * wire format carries both values; no phase baseline
+                         * is advanced and the restore author ignores counts. */
+                        return pack_snapshot(
+                                   moe_runtime_abi::
+                                       kAllHistogramSourcesMask,
+                                   /*baseline=*/nullptr) &&
+                               enqueue(
+                                   MoEOverlayDeviceControllerAction::
+                                       PublishParticipantSnapshot);
+                    },
+                    "prepared-context restoration participant-snapshot phase");
                 if (endpoint.binding.group_root)
                 {
                     /* This reduction graph is intentionally phase-agnostic.
@@ -1299,57 +1594,97 @@ namespace llaminar2
                         "Dynamic bounded group-snapshot publication phase");
                 }
 
+                /*
+                 * Publication uses the same finite receipt-selected shape as
+                 * snapshot reduction.  The former monolithic graph let a fast
+                 * ROCm participant enter AcknowledgePrepared while a sibling's
+                 * graph was still queued behind grouped inference.  That
+                 * device-resident peer wait could in turn prevent the grouped
+                 * transaction from retiring.  Each graph below now consumes
+                 * only prerequisites which runOne() has already observed as
+                 * immutable mapped facts.
+                 */
                 capture(
-                    endpoint.dynamic_publish_graph,
+                    endpoint.dynamic_prepare_candidate_graph,
                     [&]
                     {
-                        bool captured = enqueue(
+                        return enqueue(
                             MoEOverlayDeviceControllerAction::
                                 ApplyRuntimeCandidate);
-                        if (endpoint.binding.group_root)
+                    },
+                    "Dynamic runtime-candidate preparation phase");
+                if (endpoint.binding.group_root)
+                {
+                    capture(
+                        endpoint.dynamic_acknowledge_prepared_graph,
+                        [&]
                         {
-                            captured = captured && enqueue(
+                            return enqueue(
                                 MoEOverlayDeviceControllerAction::
                                     AcknowledgePrepared);
-                        }
-                        if (endpoint.binding.authority_leader)
+                        },
+                        "Dynamic group preparation-receipt phase");
+                }
+                if (endpoint.binding.authority_leader)
+                {
+                    capture(
+                        endpoint.dynamic_begin_commit_graph,
+                        [&]
                         {
-                            captured = captured && enqueue(
+                            return enqueue(
                                 MoEOverlayDeviceControllerAction::BeginCommit);
-                        }
-                        captured = captured && enqueue(
+                        },
+                        "Dynamic topology commit phase");
+                }
+                capture(
+                    endpoint.dynamic_publish_candidate_graph,
+                    [&]
+                    {
+                        return enqueue(
                             MoEOverlayDeviceControllerAction::
                                 PublishRuntimeCandidate);
-                        if (endpoint.binding.group_root)
+                    },
+                    "Dynamic runtime-candidate publication phase");
+                if (endpoint.binding.group_root)
+                {
+                    capture(
+                        endpoint.dynamic_acknowledge_published_graph,
+                        [&]
                         {
-                            captured = captured && enqueue(
+                            return enqueue(
                                 MoEOverlayDeviceControllerAction::
                                     AcknowledgePublished);
-                        }
-                        if (endpoint.binding.authority_leader)
+                        },
+                        "Dynamic group publication-receipt phase");
+                }
+                if (endpoint.binding.authority_leader)
+                {
+                    capture(
+                        endpoint.dynamic_publish_admission_graph,
+                        [&]
                         {
-                            captured = captured &&
-                                enqueue(
-                                    MoEOverlayDeviceControllerAction::
-                                        PublishAdmission) &&
-                                enqueue(
-                                    MoEOverlayDeviceControllerAction::
-                                        BeginDynamicRetirement);
-                        }
-                        /* Unlike the inference-release epilogue, this probe is
-                         * part of the already-prearmed Publish epoch. Join the
-                         * leader's retirement-open edge before probing so a
-                         * fast follower cannot no-op before Retiring and then
-                         * wait forever for inference that may never recur. */
-                        return captured &&
-                            enqueue(
-                                MoEOverlayDeviceControllerAction::
-                                    AwaitRuntimeRetirement) &&
-                            enqueue(
-                                MoEOverlayDeviceControllerAction::
-                                    PublishRuntimeRetirementReadiness);
+                            return enqueue(
+                                       MoEOverlayDeviceControllerAction::
+                                           PublishAdmission) &&
+                                   enqueue(
+                                       MoEOverlayDeviceControllerAction::
+                                           BeginDynamicRetirement);
+                        },
+                        "Dynamic topology admission phase");
+                }
+                capture(
+                    endpoint.dynamic_retirement_readiness_graph,
+                    [&]
+                    {
+                        /* Retirement is already open before this graph is
+                         * selected. The probe is bounded: an outstanding old-
+                         * bank reader publishes the same receipt from its
+                         * captured inference-release epilogue instead. */
+                        return enqueue(
+                            MoEOverlayDeviceControllerAction::
+                                PublishRuntimeRetirementReadiness);
                     },
-                    "Dynamic bounded publication epoch");
+                    "Dynamic runtime-retirement readiness phase");
 
                 capture(
                     endpoint.dynamic_retire_graph,
@@ -1725,6 +2060,13 @@ namespace llaminar2
         }
         if (static_certified_)
             return true;
+        if (state() !=
+            MoEOverlayDeviceControllerActivationState::Prepared)
+        {
+            return fail(
+                error,
+                "Static device controller certification is setup-only and requires Prepared state");
+        }
 
         // Capture may finish at different times on CUDA and ROCm. Do not start
         // a system-scope wait kernel until every rank has retained its graph.
@@ -1791,6 +2133,8 @@ namespace llaminar2
         std::uint64_t completed_tokens) noexcept
     {
         if (config_.execution_mode != ExecutionMode::Dynamic ||
+            state() !=
+                MoEOverlayDeviceControllerActivationState::Running ||
             completed_tokens == 0u ||
             (phase != InferencePhase::Prefill &&
              phase != InferencePhase::Decode))
@@ -1833,8 +2177,13 @@ namespace llaminar2
 
     bool MoEOverlayDeviceControllerGraphService::healthy() const noexcept
     {
+        if (state() ==
+            MoEOverlayDeviceControllerActivationState::Failed)
+        {
+            return false;
+        }
         return !dynamic_worker_ ||
-            dynamic_worker_->healthy.load(std::memory_order_acquire);
+               dynamic_worker_->healthy.load(std::memory_order_acquire);
     }
 
     std::string MoEOverlayDeviceControllerGraphService::failureMessage() const
@@ -1862,6 +2211,17 @@ namespace llaminar2
         }
         if (config_.execution_mode == ExecutionMode::Static)
             return {};
+        if (state() ==
+                MoEOverlayDeviceControllerActivationState::Prepared ||
+            state() ==
+                MoEOverlayDeviceControllerActivationState::Starting)
+        {
+            return {
+                .state = InferenceMeasurementReadinessState::Calibrating,
+                .owner = "expert_overlay_device_controller",
+                .phase = "prepared_not_started",
+            };
+        }
         if (config_.fabric && config_.fabric->economyProfilesPublished())
         {
             InferenceMeasurementReadiness ready{
@@ -1916,7 +2276,9 @@ namespace llaminar2
     MoEOptimizationStatus
     MoEOverlayDeviceControllerGraphService::optimizationStatus() const
     {
-        if (stopped_)
+        const auto activation_state = state();
+        if (activation_state ==
+            MoEOverlayDeviceControllerActivationState::Stopped)
         {
             return {
                 .authority = MoEOptimizationAuthority::Device,
@@ -1938,6 +2300,15 @@ namespace llaminar2
         };
         if (dynamic_worker_)
             status.completed_movement = dynamic_worker_->completedMovement();
+        if (activation_state ==
+                MoEOverlayDeviceControllerActivationState::Prepared ||
+            activation_state ==
+                MoEOverlayDeviceControllerActivationState::Starting)
+        {
+            if (config_.execution_mode == ExecutionMode::Dynamic)
+                status.state = MoEOptimizationLifecycleState::LearningEconomy;
+            return status;
+        }
         if (!healthy())
         {
             status.state = MoEOptimizationLifecycleState::Failed;
@@ -2030,18 +2401,36 @@ namespace llaminar2
                 return "begin-prefill-decision";
             case DynamicGraphEpoch::BeginDecodeDecision:
                 return "begin-decode-decision";
+            case DynamicGraphEpoch::BeginPreparedContextRestore:
+                return "begin-prepared-context-restore";
             case DynamicGraphEpoch::SnapshotPrefillDemand:
                 return "snapshot-prefill-demand";
             case DynamicGraphEpoch::SnapshotDecodeDemand:
                 return "snapshot-decode-demand";
+            case DynamicGraphEpoch::SnapshotPreparedContextRestore:
+                return "snapshot-prepared-context-restore";
             case DynamicGraphEpoch::PublishGroupSnapshot:
                 return "publish-group-snapshot";
             case DynamicGraphEpoch::AuthorPrefillDecision:
                 return "author-prefill-decision";
             case DynamicGraphEpoch::AuthorDecodeDecision:
                 return "author-decode-decision";
-            case DynamicGraphEpoch::Publish:
-                return "publish";
+            case DynamicGraphEpoch::AuthorPreparedContextRestore:
+                return "author-prepared-context-restore";
+            case DynamicGraphEpoch::PrepareRuntimeCandidate:
+                return "prepare-runtime-candidate";
+            case DynamicGraphEpoch::AcknowledgePrepared:
+                return "acknowledge-prepared";
+            case DynamicGraphEpoch::BeginCommit:
+                return "begin-commit";
+            case DynamicGraphEpoch::PublishRuntimeCandidate:
+                return "publish-runtime-candidate";
+            case DynamicGraphEpoch::AcknowledgePublished:
+                return "acknowledge-published";
+            case DynamicGraphEpoch::PublishAdmission:
+                return "publish-admission";
+            case DynamicGraphEpoch::PublishRetirementReadiness:
+                return "publish-retirement-readiness";
             case DynamicGraphEpoch::Retire:
                 return "retire";
             case DynamicGraphEpoch::Complete:
@@ -2077,11 +2466,17 @@ namespace llaminar2
             case DynamicGraphEpoch::BeginDecodeDecision:
                 graph = endpoint.dynamic_begin_decode_graph.get();
                 break;
+            case DynamicGraphEpoch::BeginPreparedContextRestore:
+                graph = endpoint.prepared_context_restore_begin_graph.get();
+                break;
             case DynamicGraphEpoch::SnapshotPrefillDemand:
                 graph = endpoint.dynamic_snapshot_prefill_graph.get();
                 break;
             case DynamicGraphEpoch::SnapshotDecodeDemand:
                 graph = endpoint.dynamic_snapshot_decode_graph.get();
+                break;
+            case DynamicGraphEpoch::SnapshotPreparedContextRestore:
+                graph = endpoint.prepared_context_restore_snapshot_graph.get();
                 break;
             case DynamicGraphEpoch::PublishGroupSnapshot:
                 graph = endpoint.dynamic_group_snapshot_graph.get();
@@ -2092,8 +2487,29 @@ namespace llaminar2
             case DynamicGraphEpoch::AuthorDecodeDecision:
                 graph = endpoint.dynamic_author_decode_graph.get();
                 break;
-            case DynamicGraphEpoch::Publish:
-                graph = endpoint.dynamic_publish_graph.get();
+            case DynamicGraphEpoch::AuthorPreparedContextRestore:
+                graph = endpoint.prepared_context_restore_author_graph.get();
+                break;
+            case DynamicGraphEpoch::PrepareRuntimeCandidate:
+                graph = endpoint.dynamic_prepare_candidate_graph.get();
+                break;
+            case DynamicGraphEpoch::AcknowledgePrepared:
+                graph = endpoint.dynamic_acknowledge_prepared_graph.get();
+                break;
+            case DynamicGraphEpoch::BeginCommit:
+                graph = endpoint.dynamic_begin_commit_graph.get();
+                break;
+            case DynamicGraphEpoch::PublishRuntimeCandidate:
+                graph = endpoint.dynamic_publish_candidate_graph.get();
+                break;
+            case DynamicGraphEpoch::AcknowledgePublished:
+                graph = endpoint.dynamic_acknowledge_published_graph.get();
+                break;
+            case DynamicGraphEpoch::PublishAdmission:
+                graph = endpoint.dynamic_publish_admission_graph.get();
+                break;
+            case DynamicGraphEpoch::PublishRetirementReadiness:
+                graph = endpoint.dynamic_retirement_readiness_graph.get();
                 break;
             case DynamicGraphEpoch::Retire:
                 graph = endpoint.dynamic_retire_graph.get();
@@ -2105,9 +2521,15 @@ namespace llaminar2
             const bool role_specific_epoch =
                 epoch == DynamicGraphEpoch::BeginPrefillDecision ||
                 epoch == DynamicGraphEpoch::BeginDecodeDecision ||
+                epoch == DynamicGraphEpoch::BeginPreparedContextRestore ||
                 epoch == DynamicGraphEpoch::PublishGroupSnapshot ||
                 epoch == DynamicGraphEpoch::AuthorPrefillDecision ||
-                epoch == DynamicGraphEpoch::AuthorDecodeDecision;
+                epoch == DynamicGraphEpoch::AuthorDecodeDecision ||
+                epoch == DynamicGraphEpoch::AuthorPreparedContextRestore ||
+                epoch == DynamicGraphEpoch::AcknowledgePrepared ||
+                epoch == DynamicGraphEpoch::BeginCommit ||
+                epoch == DynamicGraphEpoch::AcknowledgePublished ||
+                epoch == DynamicGraphEpoch::PublishAdmission;
             if (!graph && role_specific_epoch)
                 continue;
             if (!graph)
@@ -2130,7 +2552,8 @@ namespace llaminar2
                 epoch == DynamicGraphEpoch::ServiceTelemetrySnapshot ||
                 epoch == DynamicGraphEpoch::RebaseHistograms ||
                 epoch == DynamicGraphEpoch::SnapshotPrefillDemand ||
-                epoch == DynamicGraphEpoch::SnapshotDecodeDemand;
+                epoch == DynamicGraphEpoch::SnapshotDecodeDemand ||
+                epoch == DynamicGraphEpoch::SnapshotPreparedContextRestore;
             if (inference_snapshot_epoch)
             {
                 /*
@@ -2343,9 +2766,14 @@ namespace llaminar2
             dynamic_worker_->activity.store(
                 MoEOptimizationActivityState::Failed,
                 std::memory_order_release);
-            std::lock_guard<std::mutex> lock(
-                dynamic_worker_->failure_mutex);
-            dynamic_worker_->failure = std::move(message);
+            {
+                std::lock_guard<std::mutex> lock(
+                    dynamic_worker_->failure_mutex);
+                dynamic_worker_->failure = std::move(message);
+            }
+            activation_state_.store(
+                MoEOverlayDeviceControllerActivationState::Failed,
+                std::memory_order_release);
         }
         /* A shutdown waiter must observe failure without spending its timeout. */
         dynamic_worker_->wake_cv.notify_all();
@@ -2384,6 +2812,37 @@ namespace llaminar2
                 !healthy.load(std::memory_order_acquire))
             {
                 break;
+            }
+
+            /* Terminal intent is sampled only after any prior runOne() has
+             * completed, so there is never a second lifecycle stacked over an
+             * admitted transaction. Every rank publishes the intent before
+             * requesting drain; followers can therefore remain active while
+             * the sole leader authors restoration waves. */
+            if (drain.acknowledgementPending())
+            {
+                activity.store(
+                    MoEOptimizationActivityState::Draining,
+                    std::memory_order_release);
+                const auto intent = drain_intent.load(
+                    std::memory_order_acquire);
+                stopEconomy();
+                if (intent == MoEOverlayDeviceControllerDrainIntent::
+                                  RestorePreparedContext)
+                {
+                    std::string restore_error;
+                    if (!restorePreparedContext(&restore_error))
+                    {
+                        owner->failDynamic(
+                            restore_error.empty()
+                                ? "device-owned prepared-context restoration failed"
+                                : std::move(restore_error));
+                        break;
+                    }
+                }
+                drain.acknowledge(drain.currentRequest());
+                wake_cv.notify_all();
+                continue;
             }
 
             activity.store(
@@ -2477,8 +2936,7 @@ namespace llaminar2
                  */
                 if (drain.shutdownRequested())
                 {
-                    drain.acknowledge(drain.currentRequest());
-                    wake_cv.notify_all();
+                    continue;
                 }
                 continue;
             }
@@ -2511,11 +2969,16 @@ namespace llaminar2
             else
             {
                 std::uint64_t transaction = 0u;
-                MoEOverlayInferencePhase authority_phase =
-                    MoEOverlayInferencePhase::Prefill;
+                MoEOverlayDeviceControllerTransactionKind authority_kind =
+                    MoEOverlayDeviceControllerTransactionKind::Invalid;
+                MoEOverlayDeviceDemandPhase authority_demand_phase =
+                    MoEOverlayDeviceDemandPhase::Invalid;
                 std::string ticket_error;
                 if (!observeAuthorityTransaction(
-                        &transaction, &authority_phase, &ticket_error))
+                        &transaction,
+                        &authority_kind,
+                        &authority_demand_phase,
+                        &ticket_error))
                 {
                     owner->failDynamic(
                         ticket_error.empty()
@@ -2525,6 +2988,23 @@ namespace llaminar2
                 }
                 if (transaction != 0u)
                 {
+                    if (authority_kind !=
+                            MoEOverlayDeviceControllerTransactionKind::
+                                DynamicPlacement ||
+                        (authority_demand_phase !=
+                             MoEOverlayDeviceDemandPhase::Prefill &&
+                         authority_demand_phase !=
+                             MoEOverlayDeviceDemandPhase::Decode))
+                    {
+                        owner->failDynamic(
+                            "ordinary maintenance observed a non-Dynamic authority ticket");
+                        break;
+                    }
+                    const auto authority_phase =
+                        authority_demand_phase ==
+                                MoEOverlayDeviceDemandPhase::Prefill
+                            ? MoEOverlayInferencePhase::Prefill
+                            : MoEOverlayInferencePhase::Decode;
                     /* The command sideband and mapped device ticket travel on
                      * independent ordered channels. Either can arrive first;
                      * wait only on this background scheduler until the exact
@@ -2582,8 +3062,7 @@ namespace llaminar2
                         LOG_INFO(diagnostic.str());
                         drain_idle_diagnostic_published = true;
                     }
-                    drain.acknowledge(drain.currentRequest());
-                    wake_cv.notify_all();
+                    continue;
                 }
                 continue;
             }
@@ -2591,7 +3070,12 @@ namespace llaminar2
             activity.store(
                 MoEOptimizationActivityState::ReconcilingDemand,
                 std::memory_order_release);
-            if (!runOne(window.phase, &error))
+            TransactionResult transaction_result;
+            const auto objective =
+                window.phase == MoEOverlayInferencePhase::Prefill
+                    ? TransactionObjective::DynamicPrefill
+                    : TransactionObjective::DynamicDecode;
+            if (!runOne(objective, &transaction_result, &error))
             {
                 if (error.empty())
                     error = "device controller background transaction failed";
@@ -2630,8 +3114,10 @@ namespace llaminar2
                  {"blocking_inference", "false"}});
 
             const std::uint64_t next_window_tokens =
-                boundary_gate.growRequiredTokens(
-                    maximum_window_tokens, window_growth_factor);
+                boundary_gate.advanceAfterReceipt(
+                    maximum_window_tokens,
+                    window_growth_factor,
+                    transaction_result.cadenceReceipt());
             if (next_window_tokens != admitted_window_tokens)
             {
                 PerfStatsCollector::addCounter(
@@ -2657,8 +3143,7 @@ namespace llaminar2
                 /* Pending cadence is not admitted work. Once runOne() closes,
                  * no ready-but-unconsumed window may delay shutdown or cause
                  * a new controller transaction. */
-                drain.acknowledge(drain.currentRequest());
-                wake_cv.notify_all();
+                continue;
             }
         }
         activity.store(
@@ -3074,14 +3559,17 @@ namespace llaminar2
     bool MoEOverlayDeviceControllerGraphService::DynamicWorker::
         observeAuthorityTransaction(
             std::uint64_t *transaction,
-            MoEOverlayInferencePhase *phase,
+            MoEOverlayDeviceControllerTransactionKind *kind,
+            MoEOverlayDeviceDemandPhase *phase,
             std::string *error) const noexcept
     {
         if (transaction)
             *transaction = 0u;
+        if (kind)
+            *kind = MoEOverlayDeviceControllerTransactionKind::Invalid;
         if (phase)
-            *phase = MoEOverlayInferencePhase::Prefill;
-        if (!transaction || !phase || protocols.empty())
+            *phase = MoEOverlayDeviceDemandPhase::Invalid;
+        if (!transaction || !kind || !phase || protocols.empty())
         {
             return fail(
                 error,
@@ -3089,16 +3577,21 @@ namespace llaminar2
         }
 
         std::uint64_t observed_transaction = 0u;
+        MoEOverlayDeviceControllerTransactionKind observed_kind =
+            MoEOverlayDeviceControllerTransactionKind::Invalid;
         MoEOverlayDeviceDemandPhase observed_phase =
             MoEOverlayDeviceDemandPhase::Invalid;
         for (const auto &protocol : protocols)
         {
             std::uint64_t candidate_transaction = 0u;
+            MoEOverlayDeviceControllerTransactionKind candidate_kind =
+                MoEOverlayDeviceControllerTransactionKind::Invalid;
             MoEOverlayDeviceDemandPhase candidate_phase =
                 MoEOverlayDeviceDemandPhase::Invalid;
             if (!protocol->snapshotTransactionAfter(
                     last_transaction,
                     &candidate_transaction,
+                    &candidate_kind,
                     &candidate_phase))
             {
                 return true;
@@ -3106,9 +3599,11 @@ namespace llaminar2
             if (observed_transaction == 0u)
             {
                 observed_transaction = candidate_transaction;
+                observed_kind = candidate_kind;
                 observed_phase = candidate_phase;
             }
             else if (candidate_transaction != observed_transaction ||
+                     candidate_kind != observed_kind ||
                      candidate_phase != observed_phase)
             {
                 return fail(
@@ -3118,18 +3613,37 @@ namespace llaminar2
         }
 
         *transaction = observed_transaction;
-        *phase = observed_phase == MoEOverlayDeviceDemandPhase::Prefill
-            ? MoEOverlayInferencePhase::Prefill
-            : MoEOverlayInferencePhase::Decode;
+        *kind = observed_kind;
+        *phase = observed_phase;
         return true;
     }
 
     bool MoEOverlayDeviceControllerGraphService::DynamicWorker::runOne(
-        MoEOverlayInferencePhase phase,
+        TransactionObjective objective,
+        TransactionResult *result,
         std::string *error) noexcept
     {
+        if (result)
+            *result = TransactionResult{};
+        const bool prepared_context_restore =
+            objective == TransactionObjective::PreparedContextRestore;
+        const MoEOverlayInferencePhase phase =
+            objective == TransactionObjective::DynamicDecode
+                ? MoEOverlayInferencePhase::Decode
+                : MoEOverlayInferencePhase::Prefill;
+        const auto expected_kind = prepared_context_restore
+            ? MoEOverlayDeviceControllerTransactionKind::
+                  PreparedContextRestore
+            : MoEOverlayDeviceControllerTransactionKind::DynamicPlacement;
+        const auto expected_demand_phase = prepared_context_restore
+            ? MoEOverlayDeviceDemandPhase::Invalid
+            : phase == MoEOverlayInferencePhase::Prefill
+            ? MoEOverlayDeviceDemandPhase::Prefill
+            : MoEOverlayDeviceDemandPhase::Decode;
         const char *const inference_phase =
-            phase == MoEOverlayInferencePhase::Prefill
+            prepared_context_restore
+                ? "terminal_restore"
+                : phase == MoEOverlayInferencePhase::Prefill
                 ? "prefill"
                 : phase == MoEOverlayInferencePhase::Decode
                 ? "decode"
@@ -3145,9 +3659,7 @@ namespace llaminar2
              {"policy_owner", "device"}});
         if (error)
             error->clear();
-        if (!owner || protocols.empty() ||
-            (phase != MoEOverlayInferencePhase::Prefill &&
-             phase != MoEOverlayInferencePhase::Decode) ||
+        if (!owner || !result || protocols.empty() ||
             !owner->config_.physical_fabric)
         {
             return false;
@@ -3233,13 +3745,16 @@ namespace llaminar2
          * occupy the resources needed by that ROCm transaction, and the host
          * still observes lifecycle identities only—not histograms or policy.
          */
-        const auto begin_epoch =
-            phase == MoEOverlayInferencePhase::Prefill
+        const auto begin_epoch = prepared_context_restore
+            ? DynamicGraphEpoch::BeginPreparedContextRestore
+            : phase == MoEOverlayInferencePhase::Prefill
                 ? DynamicGraphEpoch::BeginPrefillDecision
                 : DynamicGraphEpoch::BeginDecodeDecision;
         if (!owner->launchDynamicEpoch(begin_epoch, error) ||
             !wait_terminals(
-                phase == MoEOverlayInferencePhase::Prefill
+                prepared_context_restore
+                    ? "prepared-context restoration transaction-open epoch"
+                    : phase == MoEOverlayInferencePhase::Prefill
                     ? "Dynamic bounded prefill transaction-open epoch"
                     : "Dynamic bounded decode transaction-open epoch"))
         {
@@ -3247,14 +3762,18 @@ namespace llaminar2
         }
 
         std::uint64_t decision_transaction = 0u;
-        MoEOverlayInferencePhase authority_phase = phase;
+        MoEOverlayDeviceControllerTransactionKind authority_kind =
+            MoEOverlayDeviceControllerTransactionKind::Invalid;
+        MoEOverlayDeviceDemandPhase authority_phase =
+            MoEOverlayDeviceDemandPhase::Invalid;
         bool observation_failed = false;
         if (!wait_protocol(
                 [&]
                 {
                     std::string observation_error;
-                    if (!observeAuthorityTransaction(
+                        if (!observeAuthorityTransaction(
                             &decision_transaction,
+                            &authority_kind,
                             &authority_phase,
                             &observation_error))
                     {
@@ -3266,22 +3785,26 @@ namespace llaminar2
                     return decision_transaction > last_transaction;
                 },
                 "Dynamic decision did not publish its transaction-open ticket") ||
-            observation_failed || authority_phase != phase)
+            observation_failed || authority_kind != expected_kind ||
+            authority_phase != expected_demand_phase)
         {
             return observation_failed || (error && !error->empty())
                 ? false
                 : fail(
                       error,
-                      "Dynamic transaction-open ticket selected the wrong inference phase");
+                      "device controller transaction-open ticket selected the wrong typed objective");
         }
 
-        const auto snapshot_epoch =
-            phase == MoEOverlayInferencePhase::Prefill
+        const auto snapshot_epoch = prepared_context_restore
+            ? DynamicGraphEpoch::SnapshotPreparedContextRestore
+            : phase == MoEOverlayInferencePhase::Prefill
                 ? DynamicGraphEpoch::SnapshotPrefillDemand
                 : DynamicGraphEpoch::SnapshotDecodeDemand;
         if (!owner->launchDynamicEpoch(snapshot_epoch, error) ||
             !wait_terminals(
-                phase == MoEOverlayInferencePhase::Prefill
+                prepared_context_restore
+                    ? "prepared-context restoration participant-snapshot epoch"
+                    : phase == MoEOverlayInferencePhase::Prefill
                     ? "Dynamic bounded prefill participant-snapshot epoch"
                     : "Dynamic bounded decode participant-snapshot epoch"))
         {
@@ -3312,7 +3835,9 @@ namespace llaminar2
                 DynamicGraphEpoch::PublishGroupSnapshot,
                 error) ||
             !wait_terminals(
-                phase == MoEOverlayInferencePhase::Prefill
+                prepared_context_restore
+                    ? "prepared-context restoration group-snapshot publication epoch"
+                    : phase == MoEOverlayInferencePhase::Prefill
                     ? "Dynamic bounded prefill group-snapshot publication epoch"
                     : "Dynamic bounded decode group-snapshot publication epoch") ||
             !wait_protocol(
@@ -3332,13 +3857,16 @@ namespace llaminar2
             return false;
         }
 
-        const auto author_epoch =
-            phase == MoEOverlayInferencePhase::Prefill
+        const auto author_epoch = prepared_context_restore
+            ? DynamicGraphEpoch::AuthorPreparedContextRestore
+            : phase == MoEOverlayInferencePhase::Prefill
                 ? DynamicGraphEpoch::AuthorPrefillDecision
                 : DynamicGraphEpoch::AuthorDecodeDecision;
         if (!owner->launchDynamicEpoch(author_epoch, error) ||
             !wait_terminals(
-                phase == MoEOverlayInferencePhase::Prefill
+                prepared_context_restore
+                    ? "prepared-context restoration policy-author epoch"
+                    : phase == MoEOverlayInferencePhase::Prefill
                     ? "Dynamic bounded prefill policy-author epoch"
                     : "Dynamic bounded decode policy-author epoch"))
         {
@@ -3393,6 +3921,13 @@ namespace llaminar2
         }
 
         const auto &command = *acquired.front();
+        if (static_cast<MoEOverlayDeviceControllerTransactionKind>(
+                command.header.kind) != expected_kind)
+        {
+            return fail(
+                error,
+                "device physical follower acquired a command for the wrong typed objective");
+        }
         for (std::size_t index = 1u; index < acquired.size(); ++index)
         {
             if (!sameCommand(command, *acquired[index]))
@@ -3478,57 +4013,83 @@ namespace llaminar2
                 return false;
             }
             last_transaction = command.header.transaction_id;
-            PerfStatsCollector::addCounter(
-                "moe_overlay_controller",
-                "dynamic_zero_movement_transactions",
-                1.0,
-                "maintenance",
-                owner->config_.perf_device,
-                {{"transaction", std::to_string(last_transaction)},
-                 {"movement_commands", "0"},
-                 {"physical_bytes", "0"},
-                 {"snapshot_observations",
-                  std::to_string(command.header.snapshot_observations)},
-                 {"priority_cost_before",
-                  std::to_string(command.header.priority_cost_before)},
-                 {"priority_cost_after",
-                  std::to_string(command.header.priority_cost_after)},
-                 {"same_priority_makespan_before",
-                  std::to_string(
-                      command.header.same_priority_makespan_before)},
-                 {"same_priority_makespan_after",
-                  std::to_string(
-                      command.header.same_priority_makespan_after)},
-                 {"accepted_cycles",
-                  std::to_string(command.header.accepted_cycles)},
-                 {"rejected_cycles",
-                  std::to_string(command.header.rejected_cycles)},
-                 {"payoff_rejected_cycles",
-                  std::to_string(
-                      command.header.payoff_rejected_cycles)},
-                 {"residency_rejected_cycles",
-                  std::to_string(
-                      command.header.residency_rejected_cycles)},
-                 {"projected_service_gain_ns",
-                  std::to_string(
-                      command.header.projected_service_gain_ns)},
-                 {"projected_transfer_and_repack_ns",
-                  std::to_string(
-                      command.header.projected_transfer_and_repack_ns)},
-                 {"projected_inference_interference_ns",
-                  std::to_string(
-                      command.header.projected_inference_interference_ns)},
-                 {"projected_net_benefit_ns",
-                  std::to_string(
-                      command.header.projected_net_benefit_ns)},
-                 {"layer_scan_start",
-                  std::to_string(command.header.layer_scan_start)},
-                 {"layer_scan_next",
-                  std::to_string(command.header.layer_scan_next)},
-                 {"bounded_device_phases", "true"},
-                 {"resident_external_waits", "0"},
-                 {"prearmed_cross_device_fanin", "true"},
-                 {"policy_owner", "device"}});
+            *result = {
+                .kind = expected_kind,
+                .transaction = last_transaction,
+                .durable_epoch = command.header.candidate_epoch,
+                .command_count = 0u,
+                .snapshot_observations =
+                    command.header.snapshot_observations,
+            };
+            if (prepared_context_restore)
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_controller",
+                    "prepared_context_restore_certifications",
+                    1.0,
+                    "model_teardown",
+                    owner->config_.perf_device,
+                    {{"transaction", std::to_string(last_transaction)},
+                     {"durable_epoch",
+                      std::to_string(command.header.candidate_epoch)},
+                     {"movement_commands", "0"},
+                     {"policy_owner", "device"},
+                     {"exact_initial_owner_table", "true"}});
+            }
+            else
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_controller",
+                    "dynamic_zero_movement_transactions",
+                    1.0,
+                    "maintenance",
+                    owner->config_.perf_device,
+                    {{"transaction", std::to_string(last_transaction)},
+                     {"movement_commands", "0"},
+                     {"physical_bytes", "0"},
+                     {"snapshot_observations",
+                      std::to_string(command.header.snapshot_observations)},
+                     {"priority_cost_before",
+                      std::to_string(command.header.priority_cost_before)},
+                     {"priority_cost_after",
+                      std::to_string(command.header.priority_cost_after)},
+                     {"same_priority_makespan_before",
+                      std::to_string(
+                          command.header.same_priority_makespan_before)},
+                     {"same_priority_makespan_after",
+                      std::to_string(
+                          command.header.same_priority_makespan_after)},
+                     {"accepted_cycles",
+                      std::to_string(command.header.accepted_cycles)},
+                     {"rejected_cycles",
+                      std::to_string(command.header.rejected_cycles)},
+                     {"payoff_rejected_cycles",
+                      std::to_string(
+                          command.header.payoff_rejected_cycles)},
+                     {"residency_rejected_cycles",
+                      std::to_string(
+                          command.header.residency_rejected_cycles)},
+                     {"projected_service_gain_ns",
+                      std::to_string(
+                          command.header.projected_service_gain_ns)},
+                     {"projected_transfer_and_repack_ns",
+                      std::to_string(
+                          command.header.projected_transfer_and_repack_ns)},
+                     {"projected_inference_interference_ns",
+                      std::to_string(
+                          command.header.projected_inference_interference_ns)},
+                     {"projected_net_benefit_ns",
+                      std::to_string(
+                          command.header.projected_net_benefit_ns)},
+                     {"layer_scan_start",
+                      std::to_string(command.header.layer_scan_start)},
+                     {"layer_scan_next",
+                      std::to_string(command.header.layer_scan_next)},
+                     {"bounded_device_phases", "true"},
+                     {"resident_external_waits", "0"},
+                     {"prearmed_cross_device_fanin", "true"},
+                     {"policy_owner", "device"}});
+            }
             return true;
         }
 
@@ -3904,14 +4465,148 @@ namespace llaminar2
         activity.store(
             MoEOptimizationActivityState::PublishingResidency,
             std::memory_order_release);
+
+        /*
+         * Every publication transition below is a separate finite graph.  The
+         * host scheduler observes only monotonic, device-authored receipts and
+         * uses them to select the next retained graph; it never authors policy
+         * or placement.  Splitting at those receipts prevents a fast device's
+         * peer-wait kernel from remaining resident while a sibling's next
+         * controller graph is queued behind live sparse inference.
+         */
         if (!run_epoch(
-                DynamicGraphEpoch::Publish,
-                "Dynamic bounded publication epoch"))
+                DynamicGraphEpoch::PrepareRuntimeCandidate,
+                "Dynamic bounded runtime-candidate preparation epoch"))
         {
             return unwind(
                 error && !error->empty()
                     ? *error
-                    : "device publication epoch did not terminate");
+                    : "device runtime-candidate preparation epoch did not terminate");
+        }
+        if (!wait_protocol(
+                [&]
+                {
+                    return std::all_of(
+                        protocols.begin(), protocols.end(),
+                        [&](const auto &protocol)
+                        {
+                            return protocol->preparationReady(command);
+                        });
+                },
+                "device controller timed out awaiting participant preparation receipts"))
+        {
+            return unwind(error && !error->empty()
+                              ? *error
+                              : "participant preparation receipts were not published");
+        }
+        if (!run_epoch(
+                DynamicGraphEpoch::AcknowledgePrepared,
+                "Dynamic bounded group preparation-receipt epoch"))
+        {
+            return unwind(
+                error && !error->empty()
+                    ? *error
+                    : "device group preparation-receipt epoch did not terminate");
+        }
+        if (!wait_protocol(
+                [&]
+                {
+                    return std::all_of(
+                        protocols.begin(), protocols.end(),
+                        [&](const auto &protocol)
+                        {
+                            return protocol->allGroupsPrepared(command);
+                        });
+                },
+                "device controller timed out awaiting topology preparation receipts"))
+        {
+            return unwind(error && !error->empty()
+                              ? *error
+                              : "topology preparation receipts were not published");
+        }
+        if (!run_epoch(
+                DynamicGraphEpoch::BeginCommit,
+                "Dynamic bounded topology commit epoch"))
+        {
+            return unwind(
+                error && !error->empty()
+                    ? *error
+                    : "device topology commit epoch did not terminate");
+        }
+        if (!wait_protocol(
+                [&]
+                {
+                    return std::all_of(
+                        protocols.begin(), protocols.end(),
+                        [&](const auto &protocol)
+                        {
+                            return protocol->commitRequested(command);
+                        });
+                },
+                "device controller timed out awaiting topology commit"))
+        {
+            return unwind(error && !error->empty()
+                              ? *error
+                              : "topology commit was not published");
+        }
+        if (!run_epoch(
+                DynamicGraphEpoch::PublishRuntimeCandidate,
+                "Dynamic bounded runtime-candidate publication epoch"))
+        {
+            return unwind(
+                error && !error->empty()
+                    ? *error
+                    : "device runtime-candidate publication epoch did not terminate");
+        }
+        if (!wait_protocol(
+                [&]
+                {
+                    return std::all_of(
+                        protocols.begin(), protocols.end(),
+                        [&](const auto &protocol)
+                        {
+                            return protocol->publicationReady(command);
+                        });
+                },
+                "device controller timed out awaiting participant publication receipts"))
+        {
+            return unwind(error && !error->empty()
+                              ? *error
+                              : "participant publication receipts were not published");
+        }
+        if (!run_epoch(
+                DynamicGraphEpoch::AcknowledgePublished,
+                "Dynamic bounded group publication-receipt epoch"))
+        {
+            return unwind(
+                error && !error->empty()
+                    ? *error
+                    : "device group publication-receipt epoch did not terminate");
+        }
+        if (!wait_protocol(
+                [&]
+                {
+                    return std::all_of(
+                        protocols.begin(), protocols.end(),
+                        [&](const auto &protocol)
+                        {
+                            return protocol->allGroupsPublished(command);
+                        });
+                },
+                "device controller timed out awaiting topology publication receipts"))
+        {
+            return unwind(error && !error->empty()
+                              ? *error
+                              : "topology publication receipts were not published");
+        }
+        if (!run_epoch(
+                DynamicGraphEpoch::PublishAdmission,
+                "Dynamic bounded topology admission epoch"))
+        {
+            return unwind(
+                error && !error->empty()
+                    ? *error
+                    : "device topology admission epoch did not terminate");
         }
         if (!wait_protocol(
                 [&]
@@ -3932,6 +4627,16 @@ namespace llaminar2
         activity.store(
             MoEOptimizationActivityState::MovingWeights,
             std::memory_order_release);
+
+        if (!run_epoch(
+                DynamicGraphEpoch::PublishRetirementReadiness,
+                "Dynamic bounded runtime-retirement readiness epoch"))
+        {
+            return unwind(
+                error && !error->empty()
+                    ? *error
+                    : "device runtime-retirement readiness epoch did not terminate");
+        }
 
         if (!wait_protocol(
                 [&]
@@ -4029,6 +4734,39 @@ namespace llaminar2
             return false;
         }
         last_transaction = command.header.transaction_id;
+        *result = {
+            .kind = expected_kind,
+            .transaction = last_transaction,
+            .durable_epoch = batch.candidate_epoch,
+            .command_count = batch.command_count,
+            .snapshot_observations = command.header.snapshot_observations,
+        };
+
+        /* Terminal restoration is physical lifecycle work, not an optimization
+         * decision. It deliberately bypasses Dynamic movement/economy ledgers
+         * so production assertions cannot mistake cleanup for useful inferred
+         * hotness movement. The next restoration transaction will snapshot the
+         * newly published epoch and either continue or certify exact equality. */
+        if (prepared_context_restore)
+        {
+            PerfStatsCollector::addCounter(
+                "moe_overlay_controller",
+                "prepared_context_restore_movement_waves",
+                1.0,
+                "model_teardown",
+                owner->config_.perf_device,
+                {{"transaction", std::to_string(last_transaction)},
+                 {"base_epoch", std::to_string(batch.base_epoch)},
+                 {"candidate_epoch",
+                  std::to_string(batch.candidate_epoch)},
+                 {"movement_commands",
+                  std::to_string(batch.command_count)},
+                 {"physical_bytes",
+                  std::to_string(batch.packed_weight_bytes)},
+                 {"policy_owner", "device"},
+                 {"excluded_from_optimization_ledger", "true"}});
+            return true;
+        }
 
         std::vector<std::size_t> cycle_index_by_migration(
             batch.migrations.size(),
@@ -4399,6 +5137,70 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEOverlayDeviceControllerGraphService::DynamicWorker::
+        restorePreparedContext(std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+        if (!owner || !owner->config_.fabric || protocols.empty())
+        {
+            return fail(
+                error,
+                "prepared-context restoration lost its controller fabric or transport protocols");
+        }
+
+        /* Every non-terminal transaction changes at least one expert owner.
+         * A flat owner table therefore bounds the number of movement waves
+         * independently of topology, command capacity, and cycles-per-wave.
+         * The additional transaction is the mandatory zero-command proof. */
+        const std::uint64_t owner_words =
+            owner->config_.fabric->layout().header
+                .initial_owner_participants_words;
+        if (owner_words == 0u)
+        {
+            return fail(
+                error,
+                "prepared-context restoration has no immutable initial owner table");
+        }
+        std::uint64_t movement_waves = 0u;
+        for (std::uint64_t attempt = 0u; attempt <= owner_words; ++attempt)
+        {
+            TransactionResult transaction;
+            if (!runOne(
+                    TransactionObjective::PreparedContextRestore,
+                    &transaction,
+                    error))
+            {
+                return false;
+            }
+            if (transaction.kind !=
+                    MoEOverlayDeviceControllerTransactionKind::
+                        PreparedContextRestore ||
+                transaction.transaction == 0u ||
+                transaction.durable_epoch == 0u)
+            {
+                return fail(
+                    error,
+                    "prepared-context restoration returned an invalid typed transaction receipt");
+            }
+            if (!transaction.movedWeights())
+            {
+                restoration_movement_waves.store(
+                    movement_waves, std::memory_order_release);
+                restored_durable_epoch.store(
+                    transaction.durable_epoch,
+                    std::memory_order_release);
+                prepared_context_certified.store(
+                    true, std::memory_order_release);
+                return true;
+            }
+            ++movement_waves;
+        }
+        return fail(
+            error,
+            "prepared-context restoration exceeded its owner-table progress bound without a zero-command proof");
+    }
+
     std::size_t MoEOverlayDeviceControllerGraphService::localGraphCount()
         const noexcept
     {
@@ -4438,12 +5240,21 @@ namespace llaminar2
                     endpoint.dynamic_histogram_rebase_graph.reset();
                     endpoint.dynamic_begin_prefill_graph.reset();
                     endpoint.dynamic_begin_decode_graph.reset();
+                    endpoint.prepared_context_restore_begin_graph.reset();
                     endpoint.dynamic_snapshot_prefill_graph.reset();
                     endpoint.dynamic_snapshot_decode_graph.reset();
+                    endpoint.prepared_context_restore_snapshot_graph.reset();
                     endpoint.dynamic_group_snapshot_graph.reset();
                     endpoint.dynamic_author_prefill_graph.reset();
                     endpoint.dynamic_author_decode_graph.reset();
-                    endpoint.dynamic_publish_graph.reset();
+                    endpoint.prepared_context_restore_author_graph.reset();
+                    endpoint.dynamic_prepare_candidate_graph.reset();
+                    endpoint.dynamic_acknowledge_prepared_graph.reset();
+                    endpoint.dynamic_begin_commit_graph.reset();
+                    endpoint.dynamic_publish_candidate_graph.reset();
+                    endpoint.dynamic_acknowledge_published_graph.reset();
+                    endpoint.dynamic_publish_admission_graph.reset();
+                    endpoint.dynamic_retirement_readiness_graph.reset();
                     endpoint.dynamic_retire_graph.reset();
                     endpoint.dynamic_complete_graph.reset();
                     endpoint.arrival_inbox.reset();

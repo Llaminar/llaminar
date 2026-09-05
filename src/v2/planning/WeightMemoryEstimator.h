@@ -1,6 +1,8 @@
 #pragma once
 #include "backends/DeviceId.h"
+#include "config/TensorParallelConfig.h"
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -92,21 +94,30 @@ namespace llaminar2
         size_t tied_lm_head_bytes = 0;
     };
 
-    /** @brief Tensor dimension divided by tensor parallel placement. */
-    enum class TensorParallelWeightShardAxis
-    {
-        /** Tensor is replicated on every tensor-parallel participant. */
-        Replicated,
-        /** Output rows/N are divided across participants. */
-        OutputColumns,
-        /** Reduction width/K is divided while output rows remain complete. */
-        ReductionDimension,
-    };
-
     class WeightMemoryEstimator
     {
     public:
-        /// Estimate weight memory for a device, accounting for TP sharding and PP layer range.
+        /**
+         * @brief Estimate prepared weight memory for one physical participant.
+         *
+         * Tensor-parallel policy is resolved from the model's registered
+         * `WeightShardingConfig`; this estimator deliberately owns no tensor-
+         * name classifier. Rank-local TP callers pass the exact assignment
+         * used by weight loading so GQA replication and uneven ranges are
+         * priced from the same typed authority. Uniform cross-rank TP may omit
+         * it after topology validation has proved an equal split.
+         *
+         * @param profile Parsed model geometry and complete tensor inventory.
+         * @param device Physical participant receiving the prepared weights.
+         * @param shard_index Zero-based participant index in the TP group.
+         * @param total_shards Number of participants in the TP group.
+         * @param first_layer First included pipeline layer.
+         * @param last_layer Last included pipeline layer, or -1 for all.
+         * @param residency Exact full/continuation/expert-only residency view.
+         * @param tensor_parallel_assignment Exact rank-local TP assignment when
+         *        the production topology has one.
+         * @return Native-source and prepared-device byte inventory.
+         */
         static WeightEstimate estimate(
             const ModelMemoryProfile &profile,
             DeviceId device,
@@ -114,7 +125,9 @@ namespace llaminar2
             int total_shards = 1,
             int first_layer = 0,
             int last_layer = -1, // -1 = all layers
-            const DeviceWeightResidency &residency = {}
+            const DeviceWeightResidency &residency = {},
+            const std::optional<DeviceShardingAssignment>
+                &tensor_parallel_assignment = std::nullopt
         );
 
         /// Bytes per weight element for native (GGUF on-disk) format.
@@ -129,23 +142,6 @@ namespace llaminar2
         /// Bytes per weight element after CPU VNNI packing.
         static float getCPUPackedBytesPerWeight(const std::string &quant_type);
 
-        /**
-         * @brief Return the production tensor-parallel slicing axis for a weight.
-         *
-         * Workspace planning needs this distinction because an output-column
-         * shard reduces GEMM N while a reduction shard leaves N unchanged.
-         * Keeping the classification beside weight admission prevents the two
-         * preflight calculations from drifting.
-         *
-         * @param tensor_name Canonical GGUF tensor name.
-         * @return Tensor-parallel slice axis.
-         */
-        static TensorParallelWeightShardAxis tensorParallelShardAxis(
-            const std::string &tensor_name);
-
-    private:
-        /// Is this tensor replicated across all TP ranks (norms, embeddings)?
-        static bool isReplicatedTensor(const std::string &tensor_name);
     };
 
 } // namespace llaminar2

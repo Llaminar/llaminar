@@ -47,6 +47,7 @@ namespace llaminar2
         Deferred,   ///< Frozen transaction awaits destination shadow capacity.
         Staging,    ///< Preparation and transfer events remain in flight.
         Preparing, ///< Inactive participant banks are being completed.
+        AwaitingGraphSequenceBoundary, ///< Prepared banks await a complete graph edge.
         Publishing, ///< Ready device selectors are being published globally.
         Draining,   ///< Shutdown rejected new work and is reaping resources.
         Failed,     ///< Fatal protocol or transport error stopped proposals.
@@ -66,6 +67,35 @@ namespace llaminar2
     {
         ProcessLocalComposition, ///< Prepared/local-only setup ownership.
         DistributedTopology,     ///< Terminal all-rank serving shutdown.
+    };
+
+    /** @brief Mathematical inference phase completing routed model work. */
+    enum class MoEOverlayInferenceProgressPhase : std::uint8_t
+    {
+        Prefill, ///< Ordinary or restored-prefix prefill rows completed.
+        Decode,  ///< Serial or speculative decode output tokens completed.
+    };
+
+    /**
+     * @brief Allocation-free cadence signal from inference to maintenance.
+     *
+     * This value is never placement evidence. GPU route histograms remain
+     * device-owned until their exact event-polled drain completes; the logical
+     * token count merely prevents the host coordinator from polling those
+     * banks continuously while still guaranteeing that an otherwise invisible
+     * full device window is eventually reconciled.
+     */
+    struct MoEOverlayInferenceProgress
+    {
+        MoEOverlayInferenceProgressPhase phase =
+            MoEOverlayInferenceProgressPhase::Decode;
+        std::uint64_t completed_logical_tokens = 0u;
+
+        /** @return Whether the signal represents real completed inference. */
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return completed_logical_tokens > 0u;
+        }
     };
 
     /**
@@ -99,6 +129,7 @@ namespace llaminar2
         case MoEOverlayMaintenanceState::Staging:
         case MoEOverlayMaintenanceState::Preparing:
             return MoEOptimizationActivityState::MovingWeights;
+        case MoEOverlayMaintenanceState::AwaitingGraphSequenceBoundary:
         case MoEOverlayMaintenanceState::Publishing:
             return MoEOptimizationActivityState::PublishingResidency;
         case MoEOverlayMaintenanceState::Draining:
@@ -175,6 +206,9 @@ namespace llaminar2
         uint64_t worker_starts = 0;       ///< Background worker entries.
         uint64_t poll_iterations = 0;     ///< Non-blocking authority polls.
         uint64_t notifications = 0;       ///< Explicit early-wake notifications.
+        uint64_t inference_progress_tokens = 0; ///< Cadence tokens published.
+        uint64_t histogram_runtime_probes = 0; ///< Device-bank probes begun.
+        uint64_t histogram_runtime_reconciliations = 0; ///< Underfull probes completed.
         uint64_t economy_certification_polls = 0; ///< Setup evidence progress.
         uint64_t economy_certifications = 0; ///< Immutable installs observed.
         uint64_t device_service_snapshots_imported = 0; ///< GPU cumulative views accepted.
@@ -303,6 +337,17 @@ namespace llaminar2
         void notifyMaintenanceProgress() noexcept;
 
         /**
+         * @brief Publish completed inference solely as a runtime-drain cadence.
+         * @param progress Typed phase and positive logical-token count.
+         *
+         * The method saturates its monotonic counter, requests one worker wake,
+         * and returns immediately. It never reads a histogram, records a GPU
+         * event, or treats the host count as routing evidence.
+         */
+        void notifyInferenceProgress(
+            MoEOverlayInferenceProgress progress) noexcept;
+
+        /**
          * @brief Stop accepting unpublished proposals and drain owned work.
          * @param scope Exact process-local or topology-terminal boundary.
          *
@@ -371,6 +416,17 @@ namespace llaminar2
         void publishReconciledWaitingState(
             std::uint64_t observed_progress_generation) noexcept;
 
+        /**
+         * @brief Reconcile the coordinator's next complete histogram window.
+         *
+         * The worker uses completed logical inference only to rate-limit an
+         * exact runtime-source probe. The returned window, when any, is still
+         * derived exclusively from the host histogram after every registered
+         * source event completes.
+         */
+        [[nodiscard]] MoEOverlayHistogramWindowResult
+        progressAuthoritativeHistogramWindow();
+
         /** @brief Start or retry the exact retained transaction. */
         void tryBeginRetainedTransaction();
 
@@ -427,11 +483,23 @@ namespace llaminar2
         std::atomic<uint64_t> poll_iterations_{0};
         /** Published by inference/event producers before each wake. */
         std::atomic<uint64_t> notifications_{0};
+        /** Monotonic logical-token cadence published by inference threads. */
+        std::atomic<uint64_t> inference_progress_tokens_{0};
+        /** Last token cadence included in a completed runtime-source probe. */
+        uint64_t reconciled_inference_progress_tokens_ = 0u;
+        /** Worker-owned token watermark for an in-flight runtime drain. */
+        uint64_t active_histogram_probe_tokens_ = 0u;
+        /** Notification watermark paired with the in-flight device bank. */
+        uint64_t active_histogram_probe_notification_ = 0u;
+        /** True only between runtime-source drain admission and completion. */
+        bool histogram_runtime_probe_active_ = false;
         /** Latest notification generation proved empty by the policy worker. */
         std::atomic<uint64_t> reconciled_progress_generation_{0};
         std::atomic<uint64_t> economy_certification_polls_{0};
         std::atomic<uint64_t> economy_certifications_{0};
         std::atomic<uint64_t> device_service_snapshots_imported_{0};
+        std::atomic<uint64_t> histogram_runtime_probes_{0};
+        std::atomic<uint64_t> histogram_runtime_reconciliations_{0};
         std::atomic<uint64_t> proposals_{0};
         std::atomic<uint64_t> deferred_attempts_{0};
         std::atomic<uint64_t> waves_started_{0};

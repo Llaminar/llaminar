@@ -28,6 +28,7 @@
 #include <limits>
 #include <memory>
 #include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -180,6 +181,66 @@ TEST(Test__TransferEngine_Plan, DescribeTransferPlan_HostResident)
 
 namespace
 {
+    /** @brief Device-free allocation spy for persistent staging-slab ownership. */
+    class TransferStagingBackendSpy final : public MockBackend
+    {
+    public:
+        TransferStagingBackendSpy() : MockBackend(DeviceType::CUDA) {}
+
+        /** @brief Model one canonical device-slab allocation. */
+        void *allocate(size_t bytes, int device_id) override
+        {
+            ++device_allocations;
+            last_device_bytes = bytes;
+            last_device_ordinal = device_id;
+            return MockBackend::allocate(bytes, device_id);
+        }
+
+        /** @brief Observe the final shared-owner device release. */
+        void free(void *ptr, int device_id) override
+        {
+            if (ptr)
+                ++device_frees;
+            MockBackend::free(ptr, device_id);
+        }
+
+        /** @brief Model one backend-pinned host slab with ordinary test RAM. */
+        void *allocatePinned(size_t bytes, int device_id) override
+        {
+            ++pinned_allocations;
+            last_pinned_bytes = bytes;
+            last_pinned_ordinal = device_id;
+            return std::malloc(bytes);
+        }
+
+        /** @brief Observe the final shared-owner pinned release. */
+        void freePinned(void *ptr, int) override
+        {
+            if (ptr)
+            {
+                ++pinned_frees;
+                std::free(ptr);
+            }
+        }
+
+        size_t pinned_allocations = 0u;
+        size_t pinned_frees = 0u;
+        size_t device_allocations = 0u;
+        size_t device_frees = 0u;
+        size_t last_pinned_bytes = 0u;
+        size_t last_device_bytes = 0u;
+        int last_pinned_ordinal = -1;
+        int last_device_ordinal = -1;
+    };
+
+    TransferStagingBackendSpy *transfer_staging_backend_spy = nullptr;
+
+    /** @return Active device-free staging backend for TransferEngine injection. */
+    IBackend *resolveTransferStagingBackend(DeviceId)
+    {
+        return transfer_staging_backend_spy;
+    }
+
     /** @brief Device-free backend spy for reclamation receipt semantics. */
     class ReclamationBackendSpy final : public MockBackend
     {
@@ -211,17 +272,50 @@ namespace
         {
             ++runtime_reset_calls;
             last_runtime_reset_device_id = request.deviceOrdinal();
+            runtime_reset_device_ids.push_back(request.deviceOrdinal());
+
+            /* A batch reset is correct only if every participant worker was
+             * already destroyed and its acquisition marker remains installed.
+             * Probe through the public pool API at the exact backend reset
+             * boundary; only its typed logic_error proves exclusion. */
+            if (!required_excluded_cuda_ordinals.empty())
+            {
+                bool all_participants_excluded = true;
+                for (const int ordinal :
+                     required_excluded_cuda_ordinals)
+                {
+                    try
+                    {
+                        (void)GPUDeviceContextPool::instance().getContext(
+                            DeviceId::cuda(ordinal));
+                        all_participants_excluded = false;
+                    }
+                    catch (const std::logic_error &)
+                    {
+                        // This is the one valid acquisition result in reset.
+                    }
+                    catch (const std::exception &)
+                    {
+                        all_participants_excluded = false;
+                    }
+                }
+                batch_exclusion_observations.push_back(
+                    all_participants_excluded);
+            }
+
             DeviceRuntimeGenerationRetirementResult receipt;
             receipt.supported = true;
             receipt.success = runtime_reset_succeeds;
             receipt.reset_invoked = runtime_reset_succeeds;
             receipt.retired_generation = runtime_generation;
-            receipt.active_generation = runtime_reset_succeeds
-                                            ? runtime_generation + 1u
-                                            : 0u;
+            receipt.successor_generation = runtime_reset_succeeds
+                                                ? runtime_generation + 1u
+                                                : 0u;
+            receipt.post_reset_state =
+                runtime_reset_succeeds
+                    ? DeviceRuntimePostResetState::Quiescent
+                    : DeviceRuntimePostResetState::Unverified;
             receipt.driver_free_bytes_before = driver_free_bytes;
-            receipt.driver_free_bytes_after =
-                runtime_driver_free_bytes_after;
             receipt.diagnostic = runtime_reset_succeeds
                                      ? "injected runtime reset"
                                      : "injected runtime reset failure";
@@ -245,13 +339,18 @@ namespace
             .active_bytes = 384u,
         }; ///< Exact pre-release canonical ownership.
         size_t driver_free_bytes = 1000u; ///< Injected ticket baseline.
-        size_t runtime_driver_free_bytes_after = 1384u; ///< Reset diagnostic.
         int calls = 0; ///< Number of public-authority invocations.
         int last_device_id = -1; ///< Exact ordinal forwarded by TransferEngine.
         bool runtime_reset_succeeds = true; ///< Injected reset outcome.
         std::uint64_t runtime_generation = 1u; ///< Current fake runtime identity.
         int runtime_reset_calls = 0; ///< Exclusive runtime-reset invocations.
         int last_runtime_reset_device_id = -1; ///< Exact reset ordinal.
+        /** Exact reset order observed by the backend authority. */
+        std::vector<int> runtime_reset_device_ids;
+        /** CUDA ordinals that must all be excluded at every batch reset. */
+        std::vector<int> required_excluded_cuda_ordinals;
+        /** One all-participant exclusion observation per runtime reset. */
+        std::vector<bool> batch_exclusion_observations;
         mutable int free_memory_calls = 0; ///< Ticket baseline observations.
         mutable int last_free_memory_device_id = -1; ///< Observed GPU ordinal.
         mutable int allocation_accounting_calls = 0; ///< Ledger observations.
@@ -295,6 +394,115 @@ namespace
         return result;
     }
 } // namespace
+
+TEST(Test__TransferEngine_StagingSlab,
+     OneAllocationOwnsEveryDisjointConcurrentLaneSlice)
+{
+    TransferStagingBackendSpy backend;
+    transfer_staging_backend_spy = &backend;
+    TransferEngine engine(&resolveTransferStagingBackend);
+
+    constexpr size_t kSliceBytes = 4096u;
+    constexpr size_t kSliceCount = 49u;
+    {
+        const auto slices =
+            engine.allocatePersistentTransferStagingSlices(
+                kSliceBytes,
+                kSliceCount,
+                DeviceId::cuda(3));
+
+        ASSERT_EQ(slices.size(), kSliceCount);
+        EXPECT_EQ(backend.pinned_allocations, 1u);
+        EXPECT_EQ(backend.device_allocations, 1u);
+        EXPECT_EQ(backend.last_pinned_bytes, kSliceBytes * kSliceCount);
+        EXPECT_EQ(backend.last_device_bytes, kSliceBytes * kSliceCount);
+        EXPECT_EQ(backend.last_pinned_ordinal, 3);
+        EXPECT_EQ(backend.last_device_ordinal, 3);
+
+        const auto *const pinned_base = static_cast<const std::uint8_t *>(
+            slices.front().mutablePinnedData());
+        const auto *const device_base = static_cast<const std::uint8_t *>(
+            slices.front().mutableDeviceData());
+        for (size_t index = 0u; index < slices.size(); ++index)
+        {
+            EXPECT_TRUE(slices[index].valid());
+            EXPECT_EQ(slices[index].device(), DeviceId::cuda(3));
+            EXPECT_EQ(slices[index].sizeBytes(), kSliceBytes);
+            EXPECT_EQ(
+                static_cast<const std::uint8_t *>(
+                    slices[index].mutablePinnedData()),
+                pinned_base + index * kSliceBytes);
+            EXPECT_EQ(
+                static_cast<const std::uint8_t *>(
+                    slices[index].mutableDeviceData()),
+                device_base + index * kSliceBytes);
+        }
+        EXPECT_EQ(backend.pinned_frees, 0u);
+        EXPECT_EQ(backend.device_frees, 0u);
+    }
+
+    EXPECT_EQ(backend.pinned_frees, 1u);
+    EXPECT_EQ(backend.device_frees, 1u);
+    transfer_staging_backend_spy = nullptr;
+}
+
+TEST(Test__TransferEngine_StagingSlab, RejectsInvalidOrOverflowingGeometry)
+{
+    TransferStagingBackendSpy backend;
+    transfer_staging_backend_spy = &backend;
+    TransferEngine engine(&resolveTransferStagingBackend);
+
+    EXPECT_THROW(
+        (void)engine.allocatePersistentTransferStagingSlices(
+            0u, 1u, DeviceId::cuda(0)),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)engine.allocatePersistentTransferStagingSlices(
+            1u, 0u, DeviceId::cuda(0)),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)engine.allocatePersistentTransferStagingSlices(
+            1u, 1u, DeviceId::cpu()),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)engine.allocatePersistentTransferStagingSlices(
+            std::numeric_limits<size_t>::max(),
+            2u,
+            DeviceId::cuda(0)),
+        std::overflow_error);
+    EXPECT_EQ(backend.pinned_allocations, 0u);
+    EXPECT_EQ(backend.device_allocations, 0u);
+    transfer_staging_backend_spy = nullptr;
+}
+
+TEST(Test__TransferEngine_ExecutionStreamPool,
+     InvalidGeometryFailsBeforeAnyDeviceContextIsRequired)
+{
+    TransferEngine engine;
+    const PersistentTransferExecutionLane invalid_lane;
+
+    EXPECT_FALSE(invalid_lane.valid());
+    EXPECT_EQ(invalid_lane.device(), DeviceId::invalid());
+    EXPECT_THROW((void)invalid_lane.stream(), std::logic_error);
+    EXPECT_THROW(
+        (void)engine.allocatePersistentTransferExecutionLanes(
+            0u,
+            DeviceId::cuda(0),
+            "unit_invalid_zero_width"),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)engine.allocatePersistentTransferExecutionLanes(
+            1u,
+            DeviceId::cpu(),
+            "unit_invalid_cpu_endpoint"),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)engine.allocatePersistentTransferExecutionLanes(
+            1u,
+            DeviceId::cuda(0),
+            ""),
+        std::invalid_argument);
+}
 
 TEST(Test__TransferEngine_Reclamation, RequestFactoriesRejectInvalidOwnership)
 {
@@ -420,7 +628,6 @@ TEST(Test__TransferEngine_Reclamation,
     backend.result = successfulRawReclamationResult();
     backend.result.before.driver_free_bytes = 1300u;
     backend.result.after.driver_free_bytes = 1384u;
-    backend.runtime_driver_free_bytes_after = 1040u;
     reclamation_backend_spy = &backend;
     TransferEngine engine(&resolveReclamationBackend);
 
@@ -437,8 +644,8 @@ TEST(Test__TransferEngine_Reclamation,
 
     const auto receipt = engine.completeExclusiveModelRetirement(
         std::move(ticket));
-    EXPECT_EQ(receipt.reclaimedDriverBytes(), 40u);
-    EXPECT_EQ(receipt.driverBytesVisibleSinceOwnerRelease(), 40u);
+    EXPECT_EQ(receipt.reclaimedDriverBytes(), 0u);
+    EXPECT_EQ(receipt.driverBytesVisibleSinceOwnerRelease(), 0u);
     EXPECT_EQ(receipt.releasedCanonicalBytes(), 384u);
     EXPECT_EQ(receipt.expected_retired_bytes, 384u);
     EXPECT_EQ(receipt.canonical_allocations_before_owner_release, 1u);
@@ -446,7 +653,10 @@ TEST(Test__TransferEngine_Reclamation,
     EXPECT_EQ(receipt.driver_free_bytes_before_owner_release, 1000u);
     EXPECT_TRUE(receipt.runtime_reset_invoked);
     EXPECT_EQ(receipt.retired_runtime_generation, 1u);
-    EXPECT_EQ(receipt.active_runtime_generation, 2u);
+    EXPECT_EQ(receipt.successor_runtime_generation, 2u);
+    EXPECT_EQ(
+        receipt.runtime_post_reset_state,
+        DeviceRuntimePostResetState::Quiescent);
     EXPECT_EQ(backend.last_runtime_reset_device_id, 4);
     EXPECT_EQ(backend.calls, 0);
     EXPECT_FALSE(ticket.valid());
@@ -454,6 +664,95 @@ TEST(Test__TransferEngine_Reclamation,
         (void)engine.completeExclusiveModelRetirement(
             std::move(ticket)),
         std::logic_error);
+    reclamation_backend_spy = nullptr;
+}
+
+TEST(Test__TransferEngine_Reclamation,
+     MultiDeviceBatchExcludesEveryWorkerBeforeFirstRuntimeReset)
+{
+    llaminar2::testing::installHardwareFreeGPUContextFactories();
+    auto &pool = GPUDeviceContextPool::instance();
+    constexpr int kFirstOrdinal = 61;
+    constexpr int kSecondOrdinal = 62;
+    ASSERT_TRUE(
+        pool.getContext(DeviceId::cuda(kFirstOrdinal)).isInitialized());
+    ASSERT_TRUE(
+        pool.getContext(DeviceId::cuda(kSecondOrdinal)).isInitialized());
+
+    ReclamationBackendSpy backend;
+    backend.required_excluded_cuda_ordinals = {
+        kFirstOrdinal,
+        kSecondOrdinal,
+    };
+    reclamation_backend_spy = &backend;
+    TransferEngine engine(&resolveReclamationBackend);
+
+    std::vector<ExclusiveModelRetirementTicket> tickets;
+    tickets.reserve(2u);
+    tickets.push_back(engine.beginExclusiveModelRetirement(
+        ModelDeviceMemoryRetention{
+            .device = DeviceId::cuda(kFirstOrdinal),
+            .prepared_weight_bytes = 300u,
+            .reusable_workspace_bytes = 84u,
+        }));
+    tickets.push_back(engine.beginExclusiveModelRetirement(
+        ModelDeviceMemoryRetention{
+            .device = DeviceId::cuda(kSecondOrdinal),
+            .prepared_weight_bytes = 300u,
+            .reusable_workspace_bytes = 84u,
+        }));
+
+    const auto receipts = engine.completeExclusiveModelRetirements(
+        std::move(tickets));
+    ASSERT_EQ(receipts.size(), 2u);
+    EXPECT_EQ(receipts[0].device, DeviceId::cuda(kFirstOrdinal));
+    EXPECT_EQ(receipts[1].device, DeviceId::cuda(kSecondOrdinal));
+    EXPECT_EQ(
+        backend.runtime_reset_device_ids,
+        (std::vector<int>{kFirstOrdinal, kSecondOrdinal}));
+    ASSERT_EQ(backend.batch_exclusion_observations.size(), 2u);
+    EXPECT_TRUE(backend.batch_exclusion_observations[0]);
+    EXPECT_TRUE(backend.batch_exclusion_observations[1]);
+
+    /* The scopes release together after every reset and receipt is complete;
+     * the next model generation must be able to acquire both endpoints. */
+    EXPECT_TRUE(
+        pool.getContext(DeviceId::cuda(kFirstOrdinal)).isInitialized());
+    EXPECT_TRUE(
+        pool.getContext(DeviceId::cuda(kSecondOrdinal)).isInitialized());
+    (void)pool.retireExclusiveGeneration(DeviceId::cuda(kFirstOrdinal));
+    (void)pool.retireExclusiveGeneration(DeviceId::cuda(kSecondOrdinal));
+    reclamation_backend_spy = nullptr;
+}
+
+TEST(Test__TransferEngine_Reclamation,
+     MultiDeviceBatchRejectsEmptyAndDuplicateParticipantSets)
+{
+    ReclamationBackendSpy backend;
+    reclamation_backend_spy = &backend;
+    TransferEngine engine(&resolveReclamationBackend);
+
+    std::vector<ExclusiveModelRetirementTicket> empty;
+    EXPECT_THROW(
+        (void)engine.completeExclusiveModelRetirements(std::move(empty)),
+        std::invalid_argument);
+
+    std::vector<ExclusiveModelRetirementTicket> duplicates;
+    duplicates.reserve(2u);
+    for (int index = 0; index < 2; ++index)
+    {
+        duplicates.push_back(engine.beginExclusiveModelRetirement(
+            ModelDeviceMemoryRetention{
+                .device = DeviceId::cuda(11),
+                .prepared_weight_bytes = 300u,
+                .reusable_workspace_bytes = 84u,
+            }));
+    }
+    EXPECT_THROW(
+        (void)engine.completeExclusiveModelRetirements(
+            std::move(duplicates)),
+        std::invalid_argument);
+    EXPECT_EQ(backend.runtime_reset_calls, 0);
     reclamation_backend_spy = nullptr;
 }
 

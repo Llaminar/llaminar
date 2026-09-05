@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
+#include <utility>
 
 namespace llaminar2
 {
@@ -19,6 +21,60 @@ namespace llaminar2
         : producer_device_(producer_device),
           budget_bytes_(budget_bytes)
     {
+    }
+
+    std::shared_ptr<RamPrefixStorageBackend>
+    RamPrefixStorageBackend::create(
+        DeviceId producer_device,
+        size_t budget_bytes,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+        std::string *error)
+    {
+        const auto fail = [&](const std::string &message)
+            -> std::shared_ptr<RamPrefixStorageBackend>
+        {
+            if (error)
+                *error = message;
+            return nullptr;
+        };
+        if (!producer_device.is_valid() || budget_bytes == 0u)
+            return fail("RAM prefix tier requires a device and positive capacity");
+        if (!memory_authority ||
+            !memory_authority->contains(DeviceId::cpu()))
+        {
+            return fail(
+                "RAM prefix tier requires the admitted rank-local CPU memory authority");
+        }
+
+        auto result = std::shared_ptr<RamPrefixStorageBackend>(
+            new RamPrefixStorageBackend(producer_device, budget_bytes));
+        try
+        {
+            // Reserve the entire bounded tier before any pageable or pinned
+            // allocation exists. Concurrent participant caches on this rank
+            // therefore cannot each spend the same admitted host bytes.
+            result->reservation_ =
+                memory_authority->reserveNewAllocations(
+                    DeviceId::cpu(),
+                    PhysicalMemoryOwner::PrefixHostTier,
+                    budget_bytes);
+        }
+        catch (const std::exception &exception)
+        {
+            return fail(exception.what());
+        }
+        return result;
+    }
+
+    std::shared_ptr<void> RamPrefixStorageBackend::claimHostAllocation(
+        size_t bytes) const
+    {
+        if (bytes == 0u || !reservation_.valid())
+            return {};
+        auto lease = reservation_.claimAllocation(bytes);
+        return std::static_pointer_cast<void>(
+            std::make_shared<PhysicalMemorySuballocationLease>(
+                std::move(lease)));
     }
 
     bool RamPrefixStorageBackend::allocateSection(
@@ -91,6 +147,21 @@ namespace llaminar2
         {
             return {};
         }
+        if (allocations_.find(key) != allocations_.end())
+            return {};
+
+        try
+        {
+            // Capacity was committed at construction; this child makes the
+            // physically materialized subset observable and follows every
+            // copied RAM handle until its backing sections are truly freed.
+            handle.ram_payload_memory_lease =
+                claimHostAllocation(handle.total_bytes);
+        }
+        catch (const std::exception &)
+        {
+            return {};
+        }
 
         if (producer_device_.is_gpu())
             handle.payload_readiness = std::make_shared<PrefixPayloadReadiness>();
@@ -133,6 +204,49 @@ namespace llaminar2
         allocations_[key] = handle.total_bytes;
         used_bytes_ += handle.total_bytes;
         return handle;
+    }
+
+    bool RamPrefixStorageBackend::attachModelRuntimeState(
+        PrefixBlockHandle *handle,
+        std::shared_ptr<std::vector<uint8_t>> storage)
+    {
+        if (!handle || !handle->valid() ||
+            handle->tier != PrefixStorageTier::Ram || !storage ||
+            storage->empty() || handle->model_runtime_state_storage ||
+            handle->ram_runtime_state_memory_lease)
+        {
+            return false;
+        }
+        auto allocation = allocations_.find(handle->key);
+        if (allocation == allocations_.end() ||
+            allocation->second != handle->total_bytes)
+        {
+            return false;
+        }
+        const size_t bytes = storage->size();
+        if (!canStore(bytes))
+            return false;
+
+        std::shared_ptr<void> memory_lease;
+        try
+        {
+            memory_lease = claimHostAllocation(bytes);
+        }
+        catch (const std::exception &)
+        {
+            return false;
+        }
+
+        // Every operation after the claim is non-throwing. Publish storage
+        // before accounting metadata so reverse member destruction remains
+        // allocation-then-lease even if the caller immediately drops it.
+        handle->model_runtime_state_storage = std::move(storage);
+        handle->ram_runtime_state_memory_lease = std::move(memory_lease);
+        handle->has_model_runtime_state = true;
+        handle->total_bytes += bytes;
+        allocation->second += bytes;
+        used_bytes_ += bytes;
+        return true;
     }
 
     bool RamPrefixStorageBackend::release(const PrefixBlockHandle &handle)

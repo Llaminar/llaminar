@@ -3,11 +3,11 @@
  * @brief Device-free contract tests for shared mapped activation channels.
  *
  * These tests exercise the public TransferEngine authority with independent
- * CUDA- and ROCm-shaped backend spies. They prove that one shared allocation
- * is registered once per backend family, resolves one alias per exact device,
- * carries 64-bit waits/publications on the caller's exact streams, never
- * synchronizes as a side effect, and rolls partial setup back before releasing
- * the external mapping lifetime.
+ * CUDA- and ROCm-shaped backend spies. They prove that exact-one-GPU regions
+ * use backend-owned mapped allocation, genuinely shared pages register once
+ * per backend family, every exact device receives its own alias, timeline work
+ * uses the caller's stream without synchronization, and partial setup rolls
+ * back before releasing the external mapping lifetime.
  */
 
 #include "backends/IBackend.h"
@@ -77,13 +77,41 @@ namespace
         bool registerExternalMappedHostMemory(
             void *ptr,
             size_t bytes,
-            int registration_device_id) override
+            int registration_device_id,
+            MappedHostRegistrationScope scope) override
         {
             ++register_count;
             registered_host = ptr;
             registered_bytes = bytes;
             registration_ordinal = registration_device_id;
+            registration_scope = scope;
             return registration_succeeds;
+        }
+
+        /** @brief Record an exact-device native mapped allocation. */
+        void *allocateMapped(
+            size_t bytes,
+            int device_id,
+            void **device_ptr) override
+        {
+            ++mapped_allocate_count;
+            mapped_allocation_bytes = bytes;
+            mapped_allocation_ordinal = device_id;
+            void *const allocation =
+                MockBackend::allocateMapped(bytes, device_id, device_ptr);
+            mapped_allocation_host = allocation;
+            mapped_allocation_alias =
+                device_ptr ? *device_ptr : nullptr;
+            return allocation;
+        }
+
+        /** @brief Record native mapped retirement before delegating to the mock. */
+        void freeMapped(void *host_ptr, int device_id) override
+        {
+            ++mapped_free_count;
+            mapped_free_host = host_ptr;
+            mapped_free_ordinal = device_id;
+            MockBackend::freeMapped(host_ptr, device_id);
         }
 
         /** @brief Return the deterministic alias belonging to one exact ordinal. */
@@ -187,12 +215,22 @@ namespace
         size_t register_count = 0u;
         size_t alias_count = 0u;
         size_t unregister_count = 0u;
+        size_t mapped_allocate_count = 0u;
+        size_t mapped_free_count = 0u;
         void *registered_host = nullptr;
         size_t registered_bytes = 0u;
         int registration_ordinal = -1;
+        MappedHostRegistrationScope registration_scope =
+            MappedHostRegistrationScope::DeviceLocal;
         void *unregister_host = nullptr;
         int unregister_ordinal = -1;
         bool unregister_saw_live_lifetime = false;
+        void *mapped_allocation_host = nullptr;
+        void *mapped_allocation_alias = nullptr;
+        size_t mapped_allocation_bytes = 0u;
+        int mapped_allocation_ordinal = -1;
+        void *mapped_free_host = nullptr;
+        int mapped_free_ordinal = -1;
         std::vector<TimelineCall> timeline_calls;
         std::vector<MappedProgressCall> progress_calls;
 
@@ -260,6 +298,84 @@ namespace
 
 TEST_F(
     Test__MappedHostTransferRegion,
+    ExactOneGPUUsesBackendOwnedMappedAllocationWithoutExternalRegistration)
+{
+    const std::array devices{DeviceId::rocm(1)};
+    auto region = engine_.allocateMappedHostRegion(1025u, devices);
+
+    ASSERT_NE(region, nullptr);
+    ASSERT_TRUE(region->isBound());
+    EXPECT_GE(region->sizeBytes(), 1025u);
+    EXPECT_EQ(rocm_->mapped_allocate_count, 1u);
+    EXPECT_EQ(rocm_->mapped_allocation_ordinal, 1);
+    EXPECT_EQ(rocm_->register_count, 0u);
+    EXPECT_EQ(rocm_->alias_count, 0u);
+    EXPECT_EQ(region->mutableHostData(), rocm_->mapped_allocation_host);
+    EXPECT_EQ(
+        region->deviceAlias(DeviceId::rocm(1)),
+        rocm_->mapped_allocation_alias);
+    EXPECT_EQ(
+        *static_cast<const std::byte *>(region->mutableHostData()),
+        std::byte{0});
+    EXPECT_EQ(rocm_->getSyncCount(), 0u);
+    EXPECT_EQ(rocm_->getStreamSyncCount(), 0u);
+
+    void *const allocation = region->mutableHostData();
+    region.reset();
+    EXPECT_EQ(rocm_->mapped_free_count, 1u);
+    EXPECT_EQ(rocm_->mapped_free_host, allocation);
+    EXPECT_EQ(rocm_->mapped_free_ordinal, 1);
+    EXPECT_EQ(rocm_->unregister_count, 0u);
+}
+
+TEST_F(
+    Test__MappedHostTransferRegion,
+    PooledMappedTransferSlicesUseOneNativeAllocationAndRetainItExactlyOnce)
+{
+    constexpr size_t kSliceBytes = 4097u;
+    constexpr size_t kSliceCount = 7u;
+    auto slices = engine_.allocateMappedHostTransferSlices(
+        kSliceBytes, kSliceCount, DeviceId::rocm(1));
+
+    ASSERT_EQ(slices.size(), kSliceCount);
+    EXPECT_EQ(rocm_->mapped_allocate_count, 1u);
+    EXPECT_EQ(rocm_->mapped_allocation_ordinal, 1);
+    EXPECT_EQ(rocm_->register_count, 0u);
+    std::vector<void *> host_addresses;
+    host_addresses.reserve(kSliceCount);
+    for (const auto &slice : slices)
+    {
+        ASSERT_NE(slice, nullptr);
+        ASSERT_TRUE(slice->isBound());
+        EXPECT_EQ(slice->sizeBytes(), kSliceBytes);
+        ASSERT_EQ(slice->devices().size(), 1u);
+        EXPECT_EQ(slice->devices().front(), DeviceId::rocm(1));
+        EXPECT_TRUE(slice->hasDevice(DeviceId::rocm(1)));
+        EXPECT_FALSE(slice->hasDevice(DeviceId::rocm(0)));
+        host_addresses.push_back(slice->mutableHostData());
+    }
+    for (size_t lhs = 0u; lhs < host_addresses.size(); ++lhs)
+    {
+        for (size_t rhs = lhs + 1u; rhs < host_addresses.size(); ++rhs)
+            EXPECT_NE(host_addresses[lhs], host_addresses[rhs]);
+    }
+    EXPECT_GE(rocm_->mapped_allocation_bytes, kSliceBytes * kSliceCount);
+    EXPECT_EQ(rocm_->getSyncCount(), 0u);
+    EXPECT_EQ(rocm_->getStreamSyncCount(), 0u);
+
+    /* Every child owns the same hidden slab lifetime. Clearing all but one
+     * child must not free it; the final child releases exactly one native
+     * allocation and never enters the external-registration lifecycle. */
+    auto final_owner = slices.back();
+    slices.clear();
+    EXPECT_EQ(rocm_->mapped_free_count, 0u);
+    final_owner.reset();
+    EXPECT_EQ(rocm_->mapped_free_count, 1u);
+    EXPECT_EQ(rocm_->unregister_count, 0u);
+}
+
+TEST_F(
+    Test__MappedHostTransferRegion,
     RegistersOncePerFamilyAndReleasesMappingOnlyAfterBothUnregister)
 {
     auto lifetime = std::make_shared<LifetimeProbe>(&lifetime_released_);
@@ -278,6 +394,12 @@ TEST_F(
     EXPECT_EQ(region->sizeBytes(), pages_.size());
     EXPECT_EQ(cuda_->register_count, 1u);
     EXPECT_EQ(rocm_->register_count, 1u);
+    EXPECT_EQ(
+        cuda_->registration_scope,
+        MappedHostRegistrationScope::BackendPortable);
+    EXPECT_EQ(
+        rocm_->registration_scope,
+        MappedHostRegistrationScope::BackendPortable);
     EXPECT_EQ(cuda_->alias_count, 2u);
     EXPECT_EQ(rocm_->alias_count, 2u);
     EXPECT_EQ(region->deviceAlias(DeviceId::cpu()), pages_.data());
@@ -312,6 +434,15 @@ TEST_F(
     const std::array devices{DeviceId::cuda(0), DeviceId::rocm(0)};
     auto region = engine_.registerExternalMappedHostRegion(
         pages_.data(), pages_.size(), devices, lifetime);
+
+    ASSERT_EQ(cuda_->register_count, 1u);
+    ASSERT_EQ(rocm_->register_count, 1u);
+    EXPECT_EQ(
+        cuda_->registration_scope,
+        MappedHostRegistrationScope::DeviceLocal);
+    EXPECT_EQ(
+        rocm_->registration_scope,
+        MappedHostRegistrationScope::DeviceLocal);
 
     constexpr size_t signal_offset = 128u;
     void *const cuda_stream = reinterpret_cast<void *>(0xCAFE0001u);
@@ -563,4 +694,77 @@ TEST_F(
     EXPECT_FALSE(lifetime_released_);
     lifetime.reset();
     EXPECT_TRUE(lifetime_released_);
+}
+
+TEST_F(
+    Test__MappedHostTransferRegion,
+    ArenaRetainsStableSlicesWhileNativeRegistrationsGrowLogarithmically)
+{
+    constexpr size_t kLogicalSliceCount = 640u;
+    constexpr size_t kSliceBytes = 2u * sizeof(std::uint64_t);
+    constexpr size_t kSliceAlignment = 64u;
+    const std::array devices{DeviceId::cuda(0), DeviceId::rocm(0)};
+
+    auto arena = engine_.createMappedHostArena(devices);
+    ASSERT_NE(arena, nullptr);
+    std::vector<std::shared_ptr<MappedHostTransferRegion>> slices;
+    slices.reserve(kLogicalSliceCount);
+    for (size_t index = 0u; index < kLogicalSliceCount; ++index)
+    {
+        auto slice = arena->allocate(kSliceBytes, kSliceAlignment);
+        ASSERT_NE(slice, nullptr);
+        ASSERT_TRUE(slice->isBound());
+        EXPECT_EQ(slice->sizeBytes(), kSliceBytes);
+        EXPECT_EQ(
+            reinterpret_cast<std::uintptr_t>(slice->mutableHostData()) %
+                kSliceAlignment,
+            0u);
+        EXPECT_EQ(
+            reinterpret_cast<std::uintptr_t>(
+                slice->deviceAlias(DeviceId::cuda(0))) %
+                kSliceAlignment,
+            0u);
+        EXPECT_EQ(
+            reinterpret_cast<std::uintptr_t>(
+                slice->deviceAlias(DeviceId::rocm(0))) %
+                kSliceAlignment,
+            0u);
+        *static_cast<std::uint64_t *>(slice->mutableHostData()) =
+            static_cast<std::uint64_t>(index + 1u);
+        slices.push_back(std::move(slice));
+    }
+
+    const auto snapshot = arena->snapshot();
+    size_t logarithmic_registration_bound = 1u;
+    for (size_t remaining = kLogicalSliceCount;
+         remaining > 1u;
+         remaining = (remaining + 1u) / 2u)
+    {
+        ++logarithmic_registration_bound;
+    }
+    EXPECT_EQ(snapshot.slice_count, kLogicalSliceCount);
+    EXPECT_EQ(snapshot.allocated_bytes, kLogicalSliceCount * kSliceBytes);
+    EXPECT_EQ(snapshot.backing_region_count, cuda_->register_count);
+    EXPECT_EQ(snapshot.backing_region_count, rocm_->register_count);
+    EXPECT_LE(snapshot.backing_region_count, logarithmic_registration_bound);
+    EXPECT_EQ(
+        *static_cast<const std::uint64_t *>(slices.front()->mutableHostData()),
+        1u);
+    EXPECT_EQ(
+        *static_cast<const std::uint64_t *>(slices.back()->mutableHostData()),
+        kLogicalSliceCount);
+    EXPECT_EQ(cuda_->getSyncCount(), 0u);
+    EXPECT_EQ(cuda_->getStreamSyncCount(), 0u);
+    EXPECT_EQ(rocm_->getSyncCount(), 0u);
+    EXPECT_EQ(rocm_->getStreamSyncCount(), 0u);
+
+    /* Returned slices retain their parent registrations even after the bump
+     * allocator owner is gone. Unregistration occurs exactly once per backing
+     * region only after the final captured-address owner is released. */
+    arena.reset();
+    EXPECT_EQ(cuda_->unregister_count, 0u);
+    EXPECT_EQ(rocm_->unregister_count, 0u);
+    slices.clear();
+    EXPECT_EQ(cuda_->unregister_count, snapshot.backing_region_count);
+    EXPECT_EQ(rocm_->unregister_count, snapshot.backing_region_count);
 }

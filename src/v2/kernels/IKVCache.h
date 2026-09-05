@@ -235,6 +235,40 @@ namespace llaminar2
         }
 
         /**
+         * @brief Attach the canonical claim for this cache's physical payload.
+         *
+         * KernelFactory acquires the claim before invoking a concrete cache
+         * constructor, then transfers it here after construction succeeds. The
+         * IKVCache base outlives every concrete CPU/GPU allocation-owning base,
+         * so destruction releases backing storage before returning the bytes to
+         * the topology ledger. Direct low-level fixtures may remain unbound.
+         *
+         * @param lease Non-null type-erased PhysicalMemoryAllocationLease.
+         * @throws std::invalid_argument for a null lease.
+         * @throws std::logic_error if this cache was already bound.
+         */
+        void bindPhysicalMemoryLease(std::shared_ptr<void> lease)
+        {
+            if (!lease)
+            {
+                throw std::invalid_argument(
+                    "IKVCache physical-memory lease cannot be null");
+            }
+            if (physical_memory_lease_)
+            {
+                throw std::logic_error(
+                    "IKVCache physical-memory lease cannot be rebound");
+            }
+            physical_memory_lease_ = std::move(lease);
+        }
+
+        /** @return Whether this cache is attached to admitted physical bytes. */
+        [[nodiscard]] bool hasPhysicalMemoryLease() const noexcept
+        {
+            return physical_memory_lease_ != nullptr;
+        }
+
+        /**
          * @brief Descriptor for copying a logical KV block in oldest-to-newest order.
          *
          * The token range is logical within the sequence, not a physical ring row
@@ -1381,6 +1415,7 @@ namespace llaminar2
     private:
         StateOwnership state_ownership_{};
         bool state_ownership_bound_ = false;
+        std::shared_ptr<void> physical_memory_lease_;
     };
 
 } // namespace llaminar2

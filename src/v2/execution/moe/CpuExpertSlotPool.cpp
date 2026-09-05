@@ -5,6 +5,7 @@
 
 #include "CpuExpertSlotPool.h"
 
+#include "ExpertPreparedMemoryGeometry.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "memory/NUMAAllocator.h"
@@ -29,6 +30,7 @@ namespace llaminar2
         ProjectionSpec spec;
         std::uint8_t *destination = nullptr;
         std::size_t destination_bytes = 0;
+        std::size_t allocation_bytes = 0;
         std::shared_ptr<TensorBase> floating_tensor;
         std::shared_ptr<ITensorGemm> engine;
     };
@@ -37,6 +39,7 @@ namespace llaminar2
     struct CpuExpertSlotPool::Slot
     {
         std::vector<PreparedProjection> projections;
+        int layer_idx = -1;
         int expert_id = -1;
         std::uint64_t residency_epoch = 0;
     };
@@ -51,9 +54,46 @@ namespace llaminar2
         {
             std::shared_ptr<CpuExpertSlotPool> pool;
             int slot_index = -1;
+            int layer_idx = -1;
             int expert_id = -1;
             std::uint64_t residency_epoch = 0;
         };
+
+        /** Floating tensor together with its allocator-owned physical extent. */
+        struct FloatingTensorAllocation
+        {
+            std::shared_ptr<TensorBase> tensor;
+            std::size_t allocation_bytes = 0u;
+        };
+
+        /** @brief Sum exact CPU slot bytes without allowing integer wraparound. */
+        std::size_t checkedByteAdd(
+            std::size_t left,
+            std::size_t right,
+            const char *description)
+        {
+            if (right > std::numeric_limits<std::size_t>::max() - left)
+            {
+                throw std::overflow_error(
+                    std::string(description) + " byte sum overflows size_t");
+            }
+            return left + right;
+        }
+
+        /** @brief Multiply exact CPU slot bytes without allowing integer wraparound. */
+        std::size_t checkedByteMultiply(
+            std::size_t left,
+            std::size_t right,
+            const char *description)
+        {
+            if (left != 0u &&
+                right > std::numeric_limits<std::size_t>::max() / left)
+            {
+                throw std::overflow_error(
+                    std::string(description) + " byte product overflows size_t");
+            }
+            return left * right;
+        }
 
         /** @brief Validate one projection and return its catalogued source. */
         const NativeVnniFormatInfo *validateProjectionSpec(
@@ -84,7 +124,8 @@ namespace llaminar2
         /** @brief Canonicalize and allocate one projection's final metadata. */
         CpuPacked makePackedMetadata(
             const CpuExpertSlotPool::ProjectionSpec &spec,
-            std::size_t allocation_alignment)
+            std::size_t allocation_alignment,
+            bool requires_dedicated_mapping)
         {
             const NativeVnniFormatInfo *source =
                 validateProjectionSpec(spec);
@@ -134,11 +175,21 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "CPU expert slot projection byte capacity overflows size_t");
             }
-            packed.native_interleaved.resize_uninitialized_aligned(
+            const std::size_t destination_bytes =
                 static_cast<std::size_t>(unit_count) *
-                    static_cast<std::size_t>(
-                        packed.interleaved_block_stride),
-                allocation_alignment);
+                static_cast<std::size_t>(
+                    packed.interleaved_block_stride);
+            if (requires_dedicated_mapping)
+            {
+                packed.native_interleaved =
+                    AlignedVector<std::uint8_t>::pageMappedUninitialized(
+                        destination_bytes);
+            }
+            else
+            {
+                packed.native_interleaved.resize_uninitialized_aligned(
+                    destination_bytes, allocation_alignment);
+            }
             return packed;
         }
 
@@ -188,24 +239,85 @@ namespace llaminar2
         }
 
         /** @brief Allocate one final row-major floating tensor for a slot. */
-        std::shared_ptr<TensorBase> makeFloatingTensor(
-            const CpuExpertSlotPool::ProjectionSpec &spec)
+        FloatingTensorAllocation makeFloatingTensor(
+            const CpuExpertSlotPool::ProjectionSpec &spec,
+            bool requires_dedicated_mapping)
         {
             const std::vector<std::size_t> shape{
                 static_cast<std::size_t>(spec.N),
                 static_cast<std::size_t>(spec.K)};
+            const std::size_t elements = checkedByteMultiply(
+                static_cast<std::size_t>(spec.N),
+                static_cast<std::size_t>(spec.K),
+                "CPU floating expert elements");
             const auto type = spec.format.floatingTensorType();
             if (!type)
                 throw std::invalid_argument(
                     "CPU floating expert slot lacks a floating tensor type");
+            constexpr std::size_t allocation_alignment =
+                NUMAAllocator::externalRangeAlignment();
             switch (*type)
             {
             case TensorType::FP16:
-                return std::make_shared<FP16Tensor>(shape);
+            {
+                AlignedVector<std::uint16_t> storage;
+                if (requires_dedicated_mapping)
+                {
+                    storage = AlignedVector<std::uint16_t>::
+                        pageMappedUninitialized(elements);
+                }
+                else
+                {
+                    storage.resize_uninitialized_aligned(
+                        elements, allocation_alignment);
+                }
+                const std::size_t bytes = storage.allocationBytes();
+                return {
+                    .tensor = std::make_shared<FP16Tensor>(
+                        shape, std::move(storage)),
+                    .allocation_bytes = bytes,
+                };
+            }
             case TensorType::BF16:
-                return std::make_shared<BF16Tensor>(shape);
+            {
+                AlignedVector<std::uint16_t> storage;
+                if (requires_dedicated_mapping)
+                {
+                    storage = AlignedVector<std::uint16_t>::
+                        pageMappedUninitialized(elements);
+                }
+                else
+                {
+                    storage.resize_uninitialized_aligned(
+                        elements, allocation_alignment);
+                }
+                const std::size_t bytes = storage.allocationBytes();
+                return {
+                    .tensor = std::make_shared<BF16Tensor>(
+                        shape, std::move(storage)),
+                    .allocation_bytes = bytes,
+                };
+            }
             case TensorType::FP32:
-                return std::make_shared<FP32Tensor>(shape, DeviceId::cpu());
+            {
+                AlignedVector<float> storage;
+                if (requires_dedicated_mapping)
+                {
+                    storage = AlignedVector<float>::pageMappedUninitialized(
+                        elements);
+                }
+                else
+                {
+                    storage.resize_uninitialized_aligned(
+                        elements, allocation_alignment);
+                }
+                const std::size_t bytes = storage.allocationBytes();
+                return {
+                    .tensor = std::make_shared<FP32Tensor>(
+                        shape, std::move(storage), DeviceId::cpu()),
+                    .allocation_bytes = bytes,
+                };
+            }
             default:
                 throw std::invalid_argument(
                     "CPU floating expert slot received an unsupported precision");
@@ -225,7 +337,32 @@ namespace llaminar2
     }
 
     std::shared_ptr<CpuExpertSlotPool> CpuExpertSlotPool::create(
-        Config config)
+        Config config,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+        PhysicalMemoryOwner owner)
+    {
+        return createImpl(
+            std::move(config),
+            std::move(memory_authority),
+            owner,
+            /*admitted=*/true);
+    }
+
+    std::shared_ptr<CpuExpertSlotPool>
+    CpuExpertSlotPool::createForTest(Config config)
+    {
+        return createImpl(
+            std::move(config),
+            nullptr,
+            PhysicalMemoryOwner::Count,
+            /*admitted=*/false);
+    }
+
+    std::shared_ptr<CpuExpertSlotPool> CpuExpertSlotPool::createImpl(
+        Config config,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+        PhysicalMemoryOwner owner,
+        bool admitted)
     {
         if (config.participant_id < 0 || config.layer_idx < 0 ||
             config.capacity <= 0)
@@ -237,25 +374,56 @@ namespace llaminar2
         if (config.perf_device.empty())
             config.perf_device = "CPU";
 
+        std::size_t bytes_per_slot = 0u;
+        for (const ProjectionSpec &spec : config.projections)
+        {
+            bytes_per_slot = checkedByteAdd(
+                bytes_per_slot,
+                resolveExpertPreparedProjectionMemoryGeometry(
+                    spec.N, spec.K, spec.format)
+                    .cpu_bytes,
+                "CPU expert slot");
+        }
+        const std::size_t planned_allocation_bytes = checkedByteMultiply(
+            bytes_per_slot,
+            static_cast<std::size_t>(config.capacity),
+            "CPU expert slot pool");
+        std::optional<PhysicalMemoryAllocationLease> memory_lease;
+        if (admitted)
+        {
+            if (!memory_authority ||
+                (owner != PhysicalMemoryOwner::ExpertShadowSlots &&
+                 owner != PhysicalMemoryOwner::RoutedExpertWeights) ||
+                !memory_authority->contains(DeviceId::cpu()))
+            {
+                throw std::invalid_argument(
+                    "CPU expert slot pool requires a rank-local CPU memory authority and a live/shadow expert owner");
+            }
+            memory_lease.emplace(memory_authority->claimNewAllocation(
+                DeviceId::cpu(), owner, planned_allocation_bytes));
+        }
+
         std::vector<Slot> slots;
         slots.reserve(static_cast<std::size_t>(config.capacity));
+        std::size_t materialized_allocation_bytes = 0u;
         for (int slot_index = 0; slot_index < config.capacity; ++slot_index)
         {
             Slot slot;
             slot.projections.reserve(config.projections.size());
             for (const ProjectionSpec &spec : config.projections)
             {
+                const bool requires_dedicated_mapping =
+                    config.memory_placement.requiresNodeBinding();
                 const std::size_t allocation_alignment =
-                    config.memory_placement.requiresNodeBinding()
-                        ? NUMAAllocator::externalRangeAlignment()
-                        : AlignedVector<std::uint8_t>::ALIGNMENT;
+                    NUMAAllocator::externalRangeAlignment();
                 if (spec.format.isFloating())
                 {
-                    auto tensor = makeFloatingTensor(spec);
+                    auto allocation = makeFloatingTensor(
+                        spec, requires_dedicated_mapping);
                     auto *destination = static_cast<std::uint8_t *>(
-                        tensor->raw_mutable_data());
+                        allocation.tensor->raw_mutable_data());
                     const std::size_t destination_bytes =
-                        tensor->size_bytes();
+                        allocation.tensor->size_bytes();
                     if (!destination || destination_bytes == 0)
                     {
                         throw std::runtime_error(
@@ -277,9 +445,9 @@ namespace llaminar2
                     }
                     auto engine = std::make_shared<
                         gemm::FloatingPointGemmKernel>(
-                            tensor.get(),
+                            allocation.tensor.get(),
                             gemm::FloatingPointGemmKernel::NumericalPolicy::
-                                MovableExpert);
+                                GPUAlignedExpert);
                     ContiguousFloatingPointWeightDescriptor descriptor;
                     if (!engine->exportContiguousFloatingPointWeights(
                             descriptor) ||
@@ -293,13 +461,20 @@ namespace llaminar2
                         .spec = spec,
                         .destination = destination,
                         .destination_bytes = destination_bytes,
-                        .floating_tensor = std::move(tensor),
+                        .allocation_bytes = allocation.allocation_bytes,
+                        .floating_tensor = std::move(allocation.tensor),
                         .engine = std::move(engine),
                     });
+                    materialized_allocation_bytes = checkedByteAdd(
+                        materialized_allocation_bytes,
+                        allocation.allocation_bytes,
+                        "CPU floating expert pool");
                     continue;
                 }
                 CpuPacked packed = makePackedMetadata(
-                    spec, allocation_alignment);
+                    spec,
+                    allocation_alignment,
+                    requires_dedicated_mapping);
                 if (config.memory_placement.requiresNodeBinding() &&
                     !NUMAAllocator::instance().prepareExternalReceiveRangeOnNode(
                         packed.native_interleaved.data(),
@@ -317,7 +492,11 @@ namespace llaminar2
                 std::uint8_t *destination = packed.native_interleaved.data();
                 const std::size_t destination_bytes =
                     packed.native_interleaved.size();
-                auto engine = std::make_shared<CpuKernel>(std::move(packed));
+                const std::size_t allocation_bytes =
+                    packed.native_interleaved.allocationBytes();
+                auto engine = std::make_shared<CpuKernel>(
+                    std::move(packed),
+                    CPUProjectionNumericalPolicy::GPUAlignedExpert);
                 if (!engine->isValid() ||
                     engine->packedWeights().native_interleaved.data() !=
                         destination)
@@ -329,15 +508,30 @@ namespace llaminar2
                     .spec = spec,
                     .destination = destination,
                     .destination_bytes = destination_bytes,
+                    .allocation_bytes = allocation_bytes,
                     .floating_tensor = nullptr,
                     .engine = std::move(engine),
                 });
+                materialized_allocation_bytes = checkedByteAdd(
+                    materialized_allocation_bytes,
+                    allocation_bytes,
+                    "CPU NativeVNNI expert pool");
             }
             slots.push_back(std::move(slot));
         }
 
+        if (materialized_allocation_bytes != planned_allocation_bytes)
+        {
+            throw std::logic_error(
+                "CPU expert slot pool materialized bytes differ from canonical projection geometry");
+        }
+
         auto pool = std::shared_ptr<CpuExpertSlotPool>(
-            new CpuExpertSlotPool(std::move(config), std::move(slots)));
+            new CpuExpertSlotPool(
+                std::move(config),
+                std::move(slots),
+                std::move(memory_lease),
+                materialized_allocation_bytes));
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
             "cpu_inactive_slots_materialized",
@@ -352,8 +546,13 @@ namespace llaminar2
 
     CpuExpertSlotPool::CpuExpertSlotPool(
         Config config,
-        std::vector<Slot> slots)
-        : config_(std::move(config)), slots_(std::move(slots))
+        std::vector<Slot> slots,
+        std::optional<PhysicalMemoryAllocationLease> memory_lease,
+        std::size_t allocation_bytes)
+        : config_(std::move(config)),
+          memory_lease_(std::move(memory_lease)),
+          slots_(std::move(slots)),
+          allocation_bytes_(allocation_bytes)
     {
     }
 
@@ -361,7 +560,17 @@ namespace llaminar2
         int expert_id,
         std::uint64_t residency_epoch)
     {
-        if (expert_id < 0 || residency_epoch == 0)
+        return acquireForLayer(
+            config_.layer_idx, expert_id, residency_epoch);
+    }
+
+    std::optional<CpuExpertSlotPool::Lease>
+    CpuExpertSlotPool::acquireForLayer(
+        int layer_idx,
+        int expert_id,
+        std::uint64_t residency_epoch)
+    {
+        if (layer_idx < 0 || expert_id < 0 || residency_epoch == 0)
             return std::nullopt;
 
         int selected = -1;
@@ -370,7 +579,8 @@ namespace llaminar2
             for (std::size_t index = 0; index < slots_.size(); ++index)
             {
                 const Slot &slot = slots_[index];
-                if (slot.expert_id == expert_id &&
+                if (slot.layer_idx == layer_idx &&
+                    slot.expert_id == expert_id &&
                     slot.residency_epoch == residency_epoch)
                 {
                     return std::nullopt;
@@ -381,6 +591,7 @@ namespace llaminar2
             if (selected < 0)
                 return std::nullopt;
             Slot &slot = slots_[static_cast<std::size_t>(selected)];
+            slot.layer_idx = layer_idx;
             slot.expert_id = expert_id;
             slot.residency_epoch = residency_epoch;
         }
@@ -389,6 +600,7 @@ namespace llaminar2
             new CpuSlotLeaseToken{
                 .pool = shared_from_this(),
                 .slot_index = selected,
+                .layer_idx = layer_idx,
                 .expert_id = expert_id,
                 .residency_epoch = residency_epoch,
             },
@@ -398,6 +610,7 @@ namespace llaminar2
                 {
                     lease->pool->release(
                         lease->slot_index,
+                        lease->layer_idx,
                         lease->expert_id,
                         lease->residency_epoch);
                 }
@@ -406,6 +619,7 @@ namespace llaminar2
 
         Lease lease;
         lease.slot_index = selected;
+        lease.layer_idx = layer_idx;
         lease.expert_id = expert_id;
         lease.residency_epoch = residency_epoch;
         lease.lifetime = token;
@@ -437,7 +651,7 @@ namespace llaminar2
             "maintenance",
             config_.perf_device,
             {{"participant", std::to_string(config_.participant_id)},
-             {"layer", std::to_string(config_.layer_idx)},
+             {"layer", std::to_string(layer_idx)},
              {"slot", std::to_string(selected)},
              {"epoch", std::to_string(residency_epoch)}});
         return lease;
@@ -470,7 +684,8 @@ namespace llaminar2
         for (std::size_t index = 0; index < slots_.size(); ++index)
         {
             const Slot &slot = slots_[index];
-            if (slot.expert_id == expert_id &&
+            if (slot.layer_idx == config_.layer_idx &&
+                slot.expert_id == expert_id &&
                 slot.residency_epoch == residency_epoch)
             {
                 return static_cast<int>(index);
@@ -481,6 +696,7 @@ namespace llaminar2
 
     void CpuExpertSlotPool::release(
         int slot_index,
+        int layer_idx,
         int expert_id,
         std::uint64_t residency_epoch) noexcept
     {
@@ -493,11 +709,13 @@ namespace llaminar2
                 return;
             }
             Slot &slot = slots_[static_cast<std::size_t>(slot_index)];
-            if (slot.expert_id != expert_id ||
+            if (slot.layer_idx != layer_idx ||
+                slot.expert_id != expert_id ||
                 slot.residency_epoch != residency_epoch)
             {
                 return;
             }
+            slot.layer_idx = -1;
             slot.expert_id = -1;
             slot.residency_epoch = 0;
             released = true;
@@ -512,7 +730,7 @@ namespace llaminar2
             "maintenance",
             config_.perf_device,
             {{"participant", std::to_string(config_.participant_id)},
-             {"layer", std::to_string(config_.layer_idx)},
+             {"layer", std::to_string(layer_idx)},
              {"slot", std::to_string(slot_index)},
              {"epoch", std::to_string(residency_epoch)}});
     }

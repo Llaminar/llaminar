@@ -72,6 +72,7 @@
  */
 
 #include "ROCmQuantisedGemmKernel.h"
+#include "ROCmQuantisedGemmWorkspaceContract.h"
 #include "transfer/TransferEngine.h"
 #include "../ROCmKernelBase.h"
 #include "ROCmWeightPacker.h"     // packWeightsToROCm, packNativeVNNI
@@ -121,8 +122,11 @@ namespace llaminar2
         namespace
         {
             std::atomic<uint32_t> g_rocm_gemm_workspace_slice_counter{1};
-            constexpr int ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS = 4;
-            constexpr int ROCM_NATIVE_SMALL_M_GRAPH_SAFE_KB_CAP = 64;
+            constexpr int ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS =
+                static_cast<int>(
+                    quantized_gemm_workspace::kFusedProjectionStreamCapacity);
+            constexpr int ROCM_NATIVE_SMALL_M_GRAPH_SAFE_KB_CAP =
+                quantized_gemm_workspace::kScatterKBlockCapacity;
             thread_local bool g_rocm_native_vnni_decode_equivalent_scope = false;
 
             int computeNativeVNNISmallMBatchedKBForValidation(
@@ -1456,8 +1460,7 @@ namespace llaminar2
             if (actual_output_columns <= 0 ||
                 serial_partition_columns <= 0 ||
                 actual_output_columns != static_cast<int>(N_) ||
-                serial_partition_columns > actual_output_columns ||
-                (actual_output_columns % serial_partition_columns) != 0)
+                serial_partition_columns > actual_output_columns)
             {
                 throw std::invalid_argument(
                     "[ROCmQuantisedGemmKernel] Invalid replicated-output serial partition contract");
@@ -2722,7 +2725,7 @@ namespace llaminar2
                         }
                     }
 
-                    if (PerfStatsCollector::isEnabled())
+                    if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
@@ -2738,7 +2741,7 @@ namespace llaminar2
 
                     }
 
-                    if (PerfStatsCollector::isEnabled())
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
@@ -3554,7 +3557,8 @@ namespace llaminar2
 
                 fused_uses_blockwise_shared_quant = all_projections_have_vnni_weights;
 
-                if (m >= 2 && projections.size() >= 2 && PerfStatsCollector::isEnabled())
+        if (m >= 2 && projections.size() >= 2 &&
+            PerfStatsCollector::isDomainEnabled("kernel"))
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -3869,7 +3873,7 @@ namespace llaminar2
                     }
 
                     /* Prove the persistent side-stream prefill branch ran. */
-                    if (PerfStatsCollector::isEnabled())
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
@@ -4177,7 +4181,7 @@ namespace llaminar2
                     }
 
                     /* Prove the persistent side-stream decode branch ran. */
-                    if (PerfStatsCollector::isEnabled())
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
@@ -4622,7 +4626,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
@@ -4676,7 +4680,8 @@ namespace llaminar2
                     return true;
                 }
 
-                if (PerfStatsCollector::isEnabled() && !batched_bypass_reason.empty())
+            if (PerfStatsCollector::isDomainEnabled("kernel") &&
+                !batched_bypass_reason.empty())
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -5067,7 +5072,7 @@ namespace llaminar2
                         }
                     }
 
-                    if (PerfStatsCollector::isEnabled())
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
@@ -5287,82 +5292,24 @@ namespace llaminar2
         WorkspaceRequirements ROCmQuantisedGemmKernel::getWorkspaceRequirements(
             int m, int n, int k) const
         {
-            WorkspaceRequirements reqs;
-
             // Use internal dimensions if not specified
             if (n == 0)
                 n = static_cast<int>(N_);
             if (k == 0)
                 k = static_cast<int>(K_);
-
-            // INT8 path needs quantization + accumulator buffers
-            size_t quant_a_bytes = static_cast<size_t>(m) * k * sizeof(int8_t);
-            size_t scales_a_bytes = static_cast<size_t>(m) * sizeof(float);
-            size_t acc_int32_bytes = static_cast<size_t>(m) * n * sizeof(int32_t);
-
-            // Blockwise activation scales: [M × ceil(K/32)] for blockwise quantization mode
-            const int blocks_per_row = (k + 31) / 32;
-            size_t scales_a_blockwise_bytes = static_cast<size_t>(m) * blocks_per_row * sizeof(float);
-            size_t sums_a_blockwise_bytes = static_cast<size_t>(m) * blocks_per_row * sizeof(int32_t);
-
-            // Also need FP32 temp buffers for host→device transfer
-            size_t temp_a_fp32_bytes = static_cast<size_t>(m) * k * sizeof(float);
-            size_t temp_c_fp32_bytes = static_cast<size_t>(m) * n * sizeof(float);
-
-            reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::SUMS_A_BLOCKWISE, sums_a_blockwise_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
-            // Shared buffer names (matching CUDA). Native-VNNI concurrent
-            // prefill needs no accumulator scratch; Q8 prefill uses the
-            // canonical serial grouped launch and this planned accumulator.
-            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_A_FP32, temp_a_fp32_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
-
-            // NOTE: CK (ComposableKernel) workspace buffers (ROCM_CK_INT32,
-            // ROCM_A_PADDED, ROCM_SCALE_A_PADDED, ROCM_E_PADDED, ROCM_B_REPACK)
-            // are intentionally NOT requested. The CK dispatch path is being
-            // retired — all quantized prefill now routes through native-VNNI
-            // (≤6-bit) or INT8-VNNI (8-bit) kernels, neither of which needs
-            // the CK scratch. The legacy CK dispatch code still exists in this
-            // file but is no longer reachable in normal execution. This saves
-            // up to N×K bytes (≈1.27 GB for a Q4_K LM head).
-
-            // Scatter+reduce partial buffer: KB_MAX x rows x N x sizeof(float).
-            // Runtime verifier kernels support any M that fits the declared
-            // graph capacity.  The default declaration certifies sixteen rows
-            // without making a large prompt-prefill bucket allocate prompt-M
-            // GEMV partials that it will never use.
-            // KB_MAX=64 is the maximum k-blocks the scatter dispatch can produce.
-            // The workspace manager takes max across all kernel instances, so
-            // the largest N (LM Head: 152064) determines the actual allocation.
-            // The same arena is reused across layers and verifier replays.
-            constexpr int SCATTER_KB_MAX = 64;
-            const int scatter_rows = std::clamp(
-                m,
-                1,
-                kDefaultNativeVNNIVerifierRowCapacity);
-            size_t scatter_partial_bytes = static_cast<size_t>(SCATTER_KB_MAX) *
-                                           static_cast<size_t>(scatter_rows) *
-                                           static_cast<size_t>(n) * sizeof(float);
-            reqs.buffers.push_back({scatterPartialBufferName(), scatter_partial_bytes, 256, true});
-
-            constexpr int SCATTER_TILE_N = 128;
-            const size_t selfreduce_counter_bytes =
-                static_cast<size_t>((n + SCATTER_TILE_N - 1) / SCATTER_TILE_N) * sizeof(int);
-            reqs.buffers.push_back({
-                GemmWorkspaceBuffers::ROCM_SELFREDUCE_COUNTERS,
-                selfreduce_counter_bytes,
-                256,
-                true});
+            WorkspaceRequirements reqs =
+                quantized_gemm_workspace::projectionRequirements(m, n, k);
 
             LOG_TRACE("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
-                      << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
-                      << "scales_a=" << (scales_a_bytes) << "B, "
-                      << "scales_a_blockwise=" << (scales_a_blockwise_bytes) << "B"
-                      << " (blocks_per_row=" << blocks_per_row << "), "
-                      << "acc=" << (acc_int32_bytes / 1024) << "KB");
+                      << "quant_a="
+                      << (reqs.find(GemmWorkspaceBuffers::QUANT_A)->size_bytes / 1024)
+                      << "KB, scales_a="
+                      << reqs.find(GemmWorkspaceBuffers::SCALES_A)->size_bytes
+                      << "B, scales_a_blockwise="
+                      << reqs.find(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)->size_bytes
+                      << "B, acc="
+                      << (reqs.find(GemmWorkspaceBuffers::ACC_INT32)->size_bytes / 1024)
+                      << "KB");
 
             return reqs;
         }
@@ -5374,53 +5321,8 @@ namespace llaminar2
             int k) const
         {
             (void)k;
-            if (projection_columns.empty())
-                return;
-            if (m <= 0)
-            {
-                throw std::invalid_argument(
-                    "ROCm fused projection workspace requires a positive row capacity");
-            }
-
-            /*
-             * At most four side streams execute concurrently.  A larger MoE
-             * decode bundle reuses a stream only after its preceding projection
-             * has completed, so each stream needs the widest projection mapped
-             * to that stream rather than one slice for every logical member.
-             * Small-M verifier bundles contain at most four projections and are
-             * therefore the same layout without stream reuse.
-             */
-            const size_t stream_count = std::min<size_t>(
-                projection_columns.size(),
-                ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS);
-            std::array<size_t, ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS>
-                stream_widths{};
-            for (size_t projection = 0;
-                 projection < projection_columns.size();
-                 ++projection)
-            {
-                const int width = projection_columns[projection];
-                if (width <= 0)
-                {
-                    throw std::invalid_argument(
-                        "ROCm fused projection workspace requires positive output widths");
-                }
-                const size_t stream = projection % stream_count;
-                stream_widths[stream] = std::max(
-                    stream_widths[stream], static_cast<size_t>(width));
-            }
-
-            const int rows = std::clamp(
-                m, 1, kDefaultNativeVNNIVerifierRowCapacity);
-            size_t simultaneous_columns = 0;
-            for (size_t stream = 0; stream < stream_count; ++stream)
-                simultaneous_columns += stream_widths[stream];
-
-            const size_t bytes =
-                static_cast<size_t>(ROCM_NATIVE_SMALL_M_GRAPH_SAFE_KB_CAP) *
-                static_cast<size_t>(rows) * simultaneous_columns * sizeof(float);
-            requirements.buffers.push_back({
-                scatterPartialBatchedBufferName(), bytes, 256, true});
+            quantized_gemm_workspace::appendFusedProjectionRequirements(
+                requirements, m, projection_columns);
         }
 
         void ROCmQuantisedGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
@@ -6389,7 +6291,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (PerfStatsCollector::isEnabled())
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",

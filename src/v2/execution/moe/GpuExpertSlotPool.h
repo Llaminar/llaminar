@@ -2,12 +2,13 @@
  * @file GpuExpertSlotPool.h
  * @brief Persistent GPU slots with epoch-safe ExpertOverlay ownership.
  *
- * Rebalanced GPU arrivals share fixed per-layer shapes. This pool preallocates
+ * Rebalanced GPU arrivals share fixed projection shapes. This pool preallocates
  * bounded compute-facing slots plus optional transient transfer slots. Active
- * leases are keyed by `(expert, residency epoch)`, so an old RCU bank and its
- * candidate successor may retain the same logical expert concurrently without
- * overwriting either version. Legacy Dynamic/LLEP callers use epoch zero; the
- * arbitrary-tier ExpertOverlay path must always supply its positive epoch.
+ * ExpertOverlay leases are keyed by `(layer, expert, residency epoch)`, so
+ * exact-geometry layers may share physical capacity while an old RCU bank and
+ * its candidate successor retain distinct assignments. Legacy Dynamic/LLEP
+ * callers use the pool's setup layer and epoch zero; arbitrary-tier
+ * ExpertOverlay must always supply its positive epoch.
  */
 
 #pragma once
@@ -30,6 +31,8 @@ namespace llaminar2
 {
     class IBackend;
     class LoadOrchestrator;
+    class PhysicalMemoryAuthority;
+    enum class PhysicalMemoryOwner : std::uint8_t;
 
     /**
      * @brief Model-lifetime GPU allocation pool with lease-driven slot reuse.
@@ -68,6 +71,7 @@ namespace llaminar2
         struct AcquiredSlot
         {
             int slot_index = -1;
+            int layer_idx = -1;
             int expert_id = -1;
             uint64_t residency_epoch = 0;
             std::shared_ptr<void> lifetime;
@@ -96,6 +100,24 @@ namespace llaminar2
             int layer_idx,
             int active_capacity,
             std::vector<ProjectionSpec> specs,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+            PhysicalMemoryOwner active_owner,
+            int transfer_capacity = 0);
+
+        /**
+         * @brief Allocate a logical/device fixture without production admission.
+         *
+         * This named entry point is restricted to tests. Production callers
+         * must use @ref create so a missing authority cannot become a late
+         * backend allocation failure.
+         */
+        static std::shared_ptr<GpuExpertSlotPool> createForTest(
+            IBackend *backend,
+            DeviceId device,
+            int device_ordinal,
+            int layer_idx,
+            int active_capacity,
+            std::vector<ProjectionSpec> specs,
             int transfer_capacity = 0);
 
         /** @return Active capacity covering cache churn and one arrival batch. */
@@ -118,6 +140,24 @@ namespace llaminar2
          * @return Lease, or no value on invalid/duplicate identity or pressure.
          */
         std::optional<AcquiredSlot> acquire(
+            int expert_id,
+            uint64_t residency_epoch);
+
+        /**
+         * @brief Acquire a slot for one layer in a shared exact-geometry arena.
+         *
+         * The allocation geometry is fixed when the pool is created, but the
+         * physical bytes may be recycled between transformer layers with that
+         * exact geometry. Layer identity therefore participates in the lease
+         * key even though it does not change the allocation layout.
+         *
+         * @param layer_idx Logical transformer layer receiving the expert.
+         * @param expert_id Logical expert identity within that layer.
+         * @param residency_epoch Positive candidate RCU epoch.
+         * @return Lease, or no value on invalid/duplicate identity or pressure.
+         */
+        std::optional<AcquiredSlot> acquireForLayer(
+            int layer_idx,
             int expert_id,
             uint64_t residency_epoch);
 
@@ -164,6 +204,7 @@ namespace llaminar2
         /** @brief Exact logical assignment of one physical slot. */
         struct SlotIdentity
         {
+            int layer_idx = -1;
             int expert_id = -1;
             uint64_t residency_epoch = 0;
 
@@ -185,6 +226,19 @@ namespace llaminar2
                           int transfer_capacity,
                           std::vector<ProjectionSpec> specs,
                           std::shared_ptr<LoadOrchestrator> orchestrator);
+
+        /** @brief Shared implementation behind admitted and named test setup. */
+        static std::shared_ptr<GpuExpertSlotPool> createImpl(
+            IBackend *backend,
+            DeviceId device,
+            int device_ordinal,
+            int layer_idx,
+            int active_capacity,
+            std::vector<ProjectionSpec> specs,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+            PhysicalMemoryOwner active_owner,
+            int transfer_capacity,
+            bool explicit_test_allocation);
 
         /** @return Unique model-lifetime allocation name for an active slot. */
         static std::string activeSlotName(int slot_index, const std::string &label);
@@ -210,6 +264,7 @@ namespace llaminar2
 
         mutable std::mutex mutex_;
         std::vector<int> expert_by_slot_;
+        std::vector<int> layer_by_slot_;
         std::vector<uint64_t> epoch_by_slot_;
         std::unordered_map<SlotIdentity, int, SlotIdentityHash>
             slot_by_identity_;

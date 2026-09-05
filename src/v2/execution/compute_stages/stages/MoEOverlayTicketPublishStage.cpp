@@ -5,12 +5,11 @@
 
 #include "MoEOverlayTicketPublishStage.h"
 
-#include "../../../backends/BackendManager.h"
-#include "../../../backends/IBackend.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace llaminar2
@@ -90,13 +89,6 @@ namespace llaminar2
 
         auto &ticket = params_.ticket_storage->ticket();
         ticket.header->return_logical_row_count = 0;
-        IBackend *const backend = getBackendFor(params_.device_id);
-        if (!backend)
-        {
-            LOG_ERROR("[MoEOverlayTicketPublishStage] Source backend is unavailable");
-            return false;
-        }
-        const int device_ordinal = params_.device_id.gpu_ordinal();
         const size_t route_bytes =
             static_cast<size_t>(params_.bucket_rows) *
             static_cast<size_t>(params_.top_k) * sizeof(float);
@@ -104,45 +96,24 @@ namespace llaminar2
             static_cast<size_t>(params_.bucket_rows) *
             static_cast<size_t>(params_.d_model) * sizeof(float);
 
-        if (params_.active_row_count_device)
-        {
-            if (!backend->deviceToHostOnStream(
-                    &ticket.header->logical_row_count,
-                    params_.active_row_count_device,
-                    sizeof(ticket.header->logical_row_count),
-                    device_ordinal,
-                    stream))
-            {
-                LOG_ERROR("[MoEOverlayTicketPublishStage] Failed to enqueue logical-row ticket publication");
-                return false;
-            }
-        }
-        else
-        {
-            // Exact-width graphs retain the immutable bucket count on every replay.
-            ticket.header->logical_row_count = params_.bucket_rows;
-        }
-
-        if (!backend->deviceToHostOnStream(
-                ticket.routing_indices_fp32,
+        MoEOverlayDispatchTicketStorage::CapturedDevicePayload payload{
+            .logical_row_count = params_.active_row_count_device,
+            .routing_indices =
                 params_.routing_indices->gpu_data_ptr(),
-                route_bytes,
-                device_ordinal,
-                stream) ||
-            !backend->deviceToHostOnStream(
-                ticket.routing_weights_fp32,
+            .routing_weights =
                 params_.routing_weights->gpu_data_ptr(),
-                route_bytes,
-                device_ordinal,
-                stream) ||
-            !backend->deviceToHostOnStream(
-                ticket.hidden_rows_fp32,
-                params_.hidden->gpu_data_ptr(),
-                hidden_bytes,
-                device_ordinal,
-                stream))
+            .route_bytes = route_bytes,
+            .hidden_rows = params_.hidden->gpu_data_ptr(),
+            .hidden_bytes = hidden_bytes,
+        };
+        std::string payload_error;
+        if (!params_.ticket_storage->enqueueCapturedPayload(
+                payload, stream, &payload_error))
         {
-            LOG_ERROR("[MoEOverlayTicketPublishStage] Failed to enqueue fixed-capacity ticket payload publication");
+            LOG_ERROR(
+                "[MoEOverlayTicketPublishStage] Failed to enqueue mapped "
+                "fixed-capacity ticket payload: "
+                << payload_error);
             return false;
         }
         std::string publication_error;

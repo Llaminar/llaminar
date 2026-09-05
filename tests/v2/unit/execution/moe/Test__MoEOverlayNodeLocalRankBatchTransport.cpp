@@ -114,6 +114,14 @@ namespace
                     .model_layer_indices = {4},
                 },
             },
+            .activation_layout =
+                planMoEOverlayNodeLocalActivationLayout({
+                    .participant_count = kParticipants.size(),
+                    .max_rows_per_participant = kRowsPerParticipant,
+                    .max_entries_per_participant = kEntriesPerParticipant,
+                    .d_model = kDModel,
+                    .activation_graph_family_count = 2u,
+                }),
             .local_lanes = {
                 {.participant_id = kParticipants[0],
                  .device = DeviceId::cpu()},

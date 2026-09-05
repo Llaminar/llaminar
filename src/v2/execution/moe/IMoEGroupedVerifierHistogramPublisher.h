@@ -17,6 +17,8 @@
 
 namespace llaminar2
 {
+    enum class RuntimeHistogramProducerCaptureTransition : std::uint8_t;
+
     /**
      * @brief Explicit lifecycle role at a grouped-verifier history boundary.
      *
@@ -110,6 +112,23 @@ namespace llaminar2
          */
         virtual bool prepareGroupedVerifierHistogramProducer(
             void *producer_stream) = 0;
+
+        /**
+         * @brief Publish the native-capture activity of the admitted stream.
+         *
+         * The accepted-state graph calls Entering immediately before backend
+         * capture and exactly one Completed or Aborted edge afterward. This is
+         * host-only lifecycle bookkeeping which prevents asynchronous
+         * histogram maintenance from recording an external event into an
+         * active CUDA/HIP capture interval.
+         *
+         * @param producer_stream Exact pre-admitted publication stream.
+         * @param transition Typed producer-capture lifecycle edge.
+         * @return true when the runtime-table authority accepted the edge.
+         */
+        virtual bool transitionGroupedVerifierHistogramProducerCapture(
+            void *producer_stream,
+            RuntimeHistogramProducerCaptureTransition transition) = 0;
 
         /**
          * @brief Enqueue accepted-row histogram publication on the exact stream.

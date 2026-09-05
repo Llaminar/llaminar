@@ -16,7 +16,7 @@ from python.reference.snapshot_metadata import (
 )
 
 
-def test_reference_identity_binds_exact_model_prompt_tokens_and_depth(tmp_path):
+def test_reference_identity_binds_model_descriptor_prompt_tokens_and_depth(tmp_path):
     model = tmp_path / "model.gguf"
     model.write_bytes(b"real model weights\x00\xff")
     prompt = "first line\nsecond line"
@@ -30,7 +30,8 @@ def test_reference_identity_binds_exact_model_prompt_tokens_and_depth(tmp_path):
         "reference_engine": REFERENCE_ENGINE,
         "reference_device": REFERENCE_DEVICE,
         "reference_dtype": REFERENCE_DTYPE,
-        "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+        "model_filename": model.name,
+        "model_size_bytes": str(model.stat().st_size),
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "token_ids_sha256": hashlib.sha256(b"7,11,13").hexdigest(),
         "decode_steps": "5",

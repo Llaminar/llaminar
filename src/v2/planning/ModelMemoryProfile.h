@@ -27,7 +27,15 @@ namespace llaminar2
         size_t native_bytes = 0;
         std::string quant_type; // "F32", "Q8_0", "Q4_0", "IQ4_NL", etc.
         size_t elements = 0;
-        size_t K = 0;         // Inner dimension (last dim) for packed size estimation
+        /**
+         * @brief Inner dimension of one logical matrix.
+         *
+         * This is the normalized second axis for ordinary 2-D weights and the
+         * first GGUF axis for a 3-D routed-expert parent `[K, N, experts]`.
+         * It is deliberately not just `dimensions.back()`: that axis is the
+         * expert count for routed parents.
+         */
+        size_t K = 0;
         int layer_index = -1; // -1 for non-layer tensors (embedding, lm_head, norms)
     };
 

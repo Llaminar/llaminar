@@ -10,6 +10,7 @@
 
 #pragma once
 #include "backends/DeviceId.h"
+#include "execution/config/RuntimeConfig.h"
 #include "planning/ModelMemoryProfile.h"
 #include <cstddef>
 
@@ -27,13 +28,25 @@ namespace llaminar2
 struct WorkspaceMemoryGeometry
 {
     DeviceId device = DeviceId::invalid(); ///< Participant being admitted.
-    int device_compute_units = 0; ///< CUDA SMs or ROCm CUs visible to it.
+    /**
+     * CUDA SMs, ROCm CUs, or configured physical-core CPU workers.
+     * This is execution parallelism, not the host's SMT thread count.
+     */
+    int device_compute_units = 0;
     int batch_size = 1; ///< Maximum simultaneously admitted requests.
     int resident_graph_rows = 1; ///< Largest token-row capture bucket.
     int max_context_rows = 1; ///< Stable KV-cache capacity in token rows.
+    bool owns_embedding = false; ///< Participant publishes token-ID state.
+    int shard_index = 0; ///< Zero-based participant index in the TP group.
+    bool has_exact_tensor_parallel_assignment = false; ///< Local ranges below are authoritative.
     int local_d_ff = 0; ///< Dense FFN output width owned locally.
+    int local_d_ff_start = 0; ///< First global dense-FFN column owned locally.
     int local_query_head_start = 0; ///< First global query head owned locally.
     int local_query_heads = 0; ///< Exact participant-local query heads.
+    int local_kv_head_start = 0; ///< First global KV head owned locally.
+    int local_kv_heads = 0; ///< Exact participant-local KV heads.
+    int local_vocab_start = 0; ///< First global vocabulary row owned locally.
+    int local_vocab = 0; ///< Exact participant-local vocabulary rows.
     int first_layer = 0; ///< First model layer owned by this participant.
     int last_layer = -1; ///< Last model layer owned by this participant.
     int total_shards = 1; ///< Tensor-parallel degree for local dimensions.
@@ -43,6 +56,9 @@ struct WorkspaceMemoryGeometry
      * Zero means no MTP graph family is materialized on this participant.
      */
     int mtp_target_query_rows = 0;
+    /** Terminal projection ownership retained by the MTP graph family. */
+    MTPTerminalLogitsLayout mtp_terminal_logits_layout =
+        MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
 };
 
 class WorkspaceMemoryEstimator
@@ -52,8 +68,9 @@ public:
      * @brief Estimate dense kernel workspace from explicit dimensions.
      *
      * GPU devices reserve graph-stable GEMM, terminal projection, and
-     * quantization scratch. CPU kernels do not use DeviceWorkspaceManager and
-     * therefore return zero.
+     * quantization scratch. This legacy dimensional overload lacks CPU
+     * attention/head/worker geometry and therefore returns zero for CPU; use
+     * the model-aware overload for production CPU admission.
      *
      * @param batch_size Maximum simultaneously admitted request count.
      * @param max_seq_len Maximum rows resident in one captured graph.

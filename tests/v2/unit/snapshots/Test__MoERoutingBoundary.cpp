@@ -237,4 +237,94 @@ namespace llaminar2::test::parity
         EXPECT_TRUE(invalid_scores.evaluated);
         EXPECT_FALSE(invalid_scores.equivalent);
     }
+
+    TEST(Test__MoERoutingBoundary,
+         RoutedContributionPrefersDirectSparseWeightEvidence)
+    {
+        const MoERoutedContributionResult result =
+            adjudicateMoERoutedContribution({
+                .routing_boundary = {
+                    .evaluated = true,
+                    .equivalent = true,
+                    .maximum_boundary_gap = 0.0,
+                    .maximum_error_limit = 0.0,
+                },
+                .sparse_routing_weights_equivalent = true,
+                .routed_expert_output_equivalent = false,
+                .router_symmetric_kl = 0.001,
+                .maximum_router_symmetric_kl = 0.01,
+            });
+
+        EXPECT_TRUE(result.evaluated);
+        EXPECT_TRUE(result.equivalent);
+        EXPECT_EQ(
+            result.authority,
+            MoERoutedContributionAuthority::SparseRoutingWeights);
+    }
+
+    TEST(Test__MoERoutingBoundary,
+         BoundaryEquivalentContributionRequiresRouterKLAndRoutedOutput)
+    {
+        const MoERoutedContributionEvidence complete{
+            .routing_boundary = {
+                .evaluated = true,
+                .equivalent = true,
+                .maximum_boundary_gap = 1.0e-5,
+                .maximum_error_limit = 2.0e-5,
+            },
+            .sparse_routing_weights_equivalent = false,
+            .routed_expert_output_equivalent = true,
+            .router_symmetric_kl = 0.002,
+            .maximum_router_symmetric_kl = 0.01,
+        };
+        const MoERoutedContributionResult accepted =
+            adjudicateMoERoutedContribution(complete);
+
+        EXPECT_TRUE(accepted.evaluated);
+        EXPECT_TRUE(accepted.equivalent);
+        EXPECT_EQ(
+            accepted.authority,
+            MoERoutedContributionAuthority::
+                BoundaryEquivalentRoutedOutput);
+
+        auto excessive_kl = complete;
+        excessive_kl.router_symmetric_kl = 0.02;
+        EXPECT_FALSE(
+            adjudicateMoERoutedContribution(excessive_kl).equivalent);
+
+        auto bad_output = complete;
+        bad_output.routed_expert_output_equivalent = false;
+        EXPECT_FALSE(
+            adjudicateMoERoutedContribution(bad_output).equivalent);
+
+        auto unresolved_selection = complete;
+        unresolved_selection.routing_boundary.equivalent = false;
+        EXPECT_FALSE(
+            adjudicateMoERoutedContribution(unresolved_selection).equivalent);
+    }
+
+    TEST(Test__MoERoutingBoundary,
+         RoutedContributionRejectsIncompleteOrMalformedEvidence)
+    {
+        MoERoutedContributionEvidence evidence{
+            .routing_boundary = {
+                .evaluated = false,
+                .equivalent = true,
+            },
+            .sparse_routing_weights_equivalent = true,
+            .routed_expert_output_equivalent = true,
+            .router_symmetric_kl = 0.0,
+            .maximum_router_symmetric_kl = 0.01,
+        };
+        EXPECT_FALSE(adjudicateMoERoutedContribution(evidence).evaluated);
+
+        evidence.routing_boundary.evaluated = true;
+        evidence.router_symmetric_kl =
+            std::numeric_limits<double>::infinity();
+        EXPECT_FALSE(adjudicateMoERoutedContribution(evidence).evaluated);
+
+        evidence.router_symmetric_kl = 0.0;
+        evidence.maximum_router_symmetric_kl = -1.0;
+        EXPECT_FALSE(adjudicateMoERoutedContribution(evidence).evaluated);
+    }
 } // namespace llaminar2::test::parity

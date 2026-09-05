@@ -103,24 +103,6 @@ namespace llaminar2
             uint64_t return_live_rows = 0;
         };
 
-        /** @brief Byte offsets of one participant's two shared row families. */
-        struct ParticipantLayout
-        {
-            size_t dispatch_begin = 0;
-            size_t row_ids = 0;
-            size_t entry_offsets = 0;
-            size_t expert_ids = 0;
-            size_t route_weights = 0;
-            size_t original_route_slots = 0;
-            size_t compact_route_slots = 0;
-            size_t hidden_rows = 0;
-            size_t dispatch_end = 0;
-            size_t return_begin = 0;
-            size_t return_row_ids = 0;
-            size_t output_rows = 0;
-            size_t return_end = 0;
-        };
-
         size_t alignUp(size_t value, size_t alignment)
         {
             if (alignment == 0 || value >
@@ -338,6 +320,242 @@ namespace llaminar2
         }
 
     } // namespace
+
+    std::size_t
+    MoEOverlayNodeLocalActivationLayout::sourceOwnedBytes() const noexcept
+    {
+        std::size_t result = metadata_pages.bytes +
+                             shared_return_pages.bytes;
+        for (const auto &participant : participants)
+            result += participant.return_pages.bytes;
+        return result;
+    }
+
+    std::size_t
+    MoEOverlayNodeLocalActivationLayout::targetOwnedBytes() const noexcept
+    {
+        std::size_t result = shared_dispatch_pages.bytes;
+        for (const auto &participant : participants)
+            result += participant.dispatch_pages.bytes;
+        return result;
+    }
+
+    bool MoEOverlayNodeLocalActivationLayout::valid() const noexcept
+    {
+        if (!geometry.valid() || page_size == 0u ||
+            (page_size & (page_size - 1u)) != 0u ||
+            mapping_bytes == 0u || mapping_bytes % page_size != 0u ||
+            participants.size() != geometry.participant_count ||
+            !metadata_pages.validFor(mapping_bytes) ||
+            metadata_pages.offset != 0u ||
+            !shared_dispatch_pages.validFor(mapping_bytes) ||
+            !shared_return_pages.validFor(mapping_bytes))
+        {
+            return false;
+        }
+        const auto pageAligned = [this](const auto &range)
+        {
+            return range.offset % page_size == 0u &&
+                   range.bytes % page_size == 0u;
+        };
+        const auto offsetInside = [](std::size_t offset, const auto &range)
+        {
+            return offset >= range.offset && offset < range.end();
+        };
+        if (!pageAligned(metadata_pages) ||
+            !pageAligned(shared_dispatch_pages) ||
+            !pageAligned(shared_return_pages) ||
+            metadata_pages.end() != shared_dispatch_pages.offset ||
+            !offsetInside(dispatch_publication, metadata_pages) ||
+            !offsetInside(return_publication, metadata_pages) ||
+            !offsetInside(participant_controls, metadata_pages) ||
+            !offsetInside(activation_controls, metadata_pages) ||
+            !offsetInside(
+                shared_dispatch_hidden_rows, shared_dispatch_pages) ||
+            !offsetInside(
+                shared_return_route_rows, shared_return_pages))
+        {
+            return false;
+        }
+
+        std::size_t cursor = shared_dispatch_pages.end();
+        for (const auto &participant : participants)
+        {
+            if (!participant.dispatch_pages.validFor(mapping_bytes) ||
+                !participant.return_pages.validFor(mapping_bytes) ||
+                !pageAligned(participant.dispatch_pages) ||
+                !pageAligned(participant.return_pages) ||
+                participant.dispatch_pages.offset != cursor ||
+                participant.dispatch_pages.end() !=
+                    participant.return_pages.offset ||
+                !offsetInside(participant.row_ids,
+                              participant.dispatch_pages) ||
+                !offsetInside(participant.entry_offsets,
+                              participant.dispatch_pages) ||
+                !offsetInside(participant.expert_ids,
+                              participant.dispatch_pages) ||
+                !offsetInside(participant.route_weights,
+                              participant.dispatch_pages) ||
+                !offsetInside(participant.original_route_slots,
+                              participant.dispatch_pages) ||
+                !offsetInside(participant.compact_route_slots,
+                              participant.dispatch_pages) ||
+                !offsetInside(participant.hidden_rows,
+                              participant.dispatch_pages) ||
+                !offsetInside(participant.return_row_ids,
+                              participant.return_pages) ||
+                !offsetInside(participant.output_rows,
+                              participant.return_pages))
+            {
+                return false;
+            }
+            cursor = participant.return_pages.end();
+        }
+        return cursor == shared_return_pages.offset &&
+               shared_return_pages.end() == mapping_bytes &&
+               sourceOwnedBytes() + targetOwnedBytes() == mapping_bytes;
+    }
+
+    MoEOverlayNodeLocalActivationLayout
+    planMoEOverlayNodeLocalActivationLayout(
+        const MoEOverlayNodeLocalActivationLayoutGeometry &geometry)
+    {
+        if (!geometry.valid())
+        {
+            throw std::invalid_argument(
+                "MoE shared activation layout requires complete positive geometry");
+        }
+        const long raw_page_size = ::sysconf(_SC_PAGESIZE);
+        if (raw_page_size <= 0 ||
+            (static_cast<size_t>(raw_page_size) &
+             (static_cast<size_t>(raw_page_size) - 1u)) != 0u)
+        {
+            throw std::invalid_argument(
+                "MoE shared activation layout requires a power-of-two system page size");
+        }
+
+        MoEOverlayNodeLocalActivationLayout result;
+        result.geometry = geometry;
+        result.page_size = static_cast<size_t>(raw_page_size);
+        size_t cursor = sizeof(SharedChannelHeader);
+        const auto appendRegion = [&](size_t bytes,
+                                      size_t alignment = kCacheLine)
+        {
+            const size_t offset = alignUp(cursor, alignment);
+            cursor = checkedAdd(offset, bytes, "payload region");
+            return offset;
+        };
+
+        result.dispatch_publication = appendRegion(sizeof(SharedPublication));
+        result.return_publication = appendRegion(sizeof(SharedPublication));
+        result.participant_controls = appendRegion(
+            checkedMultiply(
+                geometry.participant_count,
+                sizeof(SharedParticipantControl),
+                "participant controls"));
+        result.activation_controls = appendRegion(
+            checkedMultiply(
+                checkedMultiply(
+                    geometry.participant_count,
+                    geometry.activation_graph_family_count,
+                    "activation lane count"),
+                sizeof(MoEOverlayActivationEpochControl),
+                "activation epoch controls"));
+
+        const size_t row_id_bytes = checkedMultiply(
+            geometry.max_rows_per_participant,
+            sizeof(int32_t),
+            "row ids");
+        const size_t entry_offset_bytes = checkedMultiply(
+            checkedAdd(
+                geometry.max_rows_per_participant,
+                1u,
+                "entry offset count"),
+            sizeof(int32_t),
+            "entry offsets");
+        const size_t expert_bytes = checkedMultiply(
+            geometry.max_entries_per_participant,
+            sizeof(int32_t),
+            "expert ids");
+        const size_t weight_bytes = checkedMultiply(
+            geometry.max_entries_per_participant,
+            sizeof(float),
+            "route weights");
+        const size_t route_slot_bytes = checkedMultiply(
+            geometry.max_entries_per_participant,
+            sizeof(int32_t),
+            "route slot identities");
+        const size_t activation_bytes = checkedMultiply(
+            checkedMultiply(
+                geometry.max_rows_per_participant,
+                static_cast<size_t>(geometry.d_model),
+                "activation elements"),
+            sizeof(float),
+            "activation bytes");
+
+        cursor = alignUp(cursor, result.page_size);
+        result.metadata_pages = {0u, cursor};
+        const size_t shared_dispatch_begin = cursor;
+        result.shared_dispatch_hidden_rows =
+            appendRegion(activation_bytes);
+        cursor = alignUp(cursor, result.page_size);
+        result.shared_dispatch_pages = {
+            shared_dispatch_begin,
+            cursor - shared_dispatch_begin,
+        };
+
+        result.participants.resize(geometry.participant_count);
+        for (auto &participant : result.participants)
+        {
+            cursor = alignUp(cursor, result.page_size);
+            const size_t dispatch_begin = cursor;
+            participant.row_ids = appendRegion(row_id_bytes);
+            participant.entry_offsets = appendRegion(entry_offset_bytes);
+            participant.expert_ids = appendRegion(expert_bytes);
+            participant.route_weights = appendRegion(weight_bytes);
+            participant.original_route_slots = appendRegion(route_slot_bytes);
+            participant.compact_route_slots = appendRegion(route_slot_bytes);
+            participant.hidden_rows = appendRegion(activation_bytes);
+            cursor = alignUp(cursor, result.page_size);
+            participant.dispatch_pages = {
+                dispatch_begin,
+                cursor - dispatch_begin,
+            };
+
+            const size_t return_begin = cursor;
+            participant.return_row_ids = appendRegion(row_id_bytes);
+            participant.output_rows = appendRegion(activation_bytes);
+            cursor = alignUp(cursor, result.page_size);
+            participant.return_pages = {
+                return_begin,
+                cursor - return_begin,
+            };
+        }
+
+        cursor = alignUp(cursor, result.page_size);
+        const size_t shared_return_begin = cursor;
+        const size_t canonical_return_bytes = checkedMultiply(
+            checkedMultiply(
+                geometry.max_entries_per_participant,
+                static_cast<size_t>(geometry.d_model),
+                "canonical return elements"),
+            sizeof(float),
+            "canonical return bytes");
+        result.shared_return_route_rows =
+            appendRegion(canonical_return_bytes);
+        cursor = alignUp(cursor, result.page_size);
+        result.shared_return_pages = {
+            shared_return_begin,
+            cursor - shared_return_begin,
+        };
+        result.mapping_bytes = cursor;
+        if (!result.valid())
+        {
+            throw std::logic_error(
+                "MoE shared activation layout planner produced an invalid page partition");
+        }
+        return result;
+    }
 
     MoEOverlayPersistentGraphStorage::MoEOverlayPersistentGraphStorage(
         Config config)
@@ -705,7 +923,22 @@ namespace llaminar2
                 topology->node_shared_memory_namespace(), config);
             shm_name_ = sharedMemoryName(
                 topology->node_shared_memory_namespace(), channel_hash_);
-            computeLayout();
+            const auto expected_layout =
+                planMoEOverlayNodeLocalActivationLayout({
+                    .participant_count = participants_.size(),
+                    .max_rows_per_participant = max_rows_,
+                    .max_entries_per_participant = max_entries_,
+                    .d_model = d_model_,
+                    .activation_graph_family_count =
+                        activation_family_count_,
+                });
+            if (!config.activation_layout.valid() ||
+                config.activation_layout != expected_layout)
+            {
+                throw std::invalid_argument(
+                    "Node-local MoE channel runtime geometry disagrees with its admitted mapping layout");
+            }
+            layout_ = config.activation_layout;
             mapOrCreate(config);
         }
 
@@ -713,7 +946,7 @@ namespace llaminar2
         {
             if (base_)
             {
-                ::munmap(base_, mapping_bytes_);
+                ::munmap(base_, layout_.mapping_bytes);
                 base_ = nullptr;
             }
             if (fd_ >= 0)
@@ -726,7 +959,7 @@ namespace llaminar2
         Mapping(const Mapping &) = delete;
         Mapping &operator=(const Mapping &) = delete;
 
-        size_t bytes() const noexcept { return mapping_bytes_; }
+        size_t bytes() const noexcept { return layout_.mapping_bytes; }
         void *baseAddress() const noexcept { return base_; }
         const std::string &name() const noexcept { return shm_name_; }
         SharedPublication &dispatchPublication() const noexcept
@@ -794,7 +1027,7 @@ namespace llaminar2
         MoEOverlaySparseRows dispatchRows(int participant_id) const
         {
             const size_t index = participantIndex(participant_id);
-            const ParticipantLayout &layout = layouts_[index];
+            const auto &layout = layout_.participants[index];
             MoEOverlaySparseRows rows;
             rows.target_participant = participant_id;
             rows.d_model = d_model_;
@@ -819,7 +1052,7 @@ namespace llaminar2
         MoEOverlayReturnRows returnRows(int participant_id) const
         {
             const size_t index = participantIndex(participant_id);
-            const ParticipantLayout &layout = layouts_[index];
+            const auto &layout = layout_.participants[index];
             MoEOverlayReturnRows rows;
             rows.source_participant = participant_id;
             rows.d_model = d_model_;
@@ -832,14 +1065,14 @@ namespace llaminar2
         /** @return Shared activation-only physical-row matrix. */
         float *sharedActivationHiddenRows() const noexcept
         {
-            return at<float>(shared_dispatch_hidden_rows_offset_);
+            return at<float>(layout_.shared_dispatch_hidden_rows);
         }
 
         /** @return Original route-slot identities for one participant lane. */
         std::int32_t *originalRouteSlots(int participant_id) const
         {
             return at<std::int32_t>(
-                layouts_[participantIndex(participant_id)]
+                layout_.participants[participantIndex(participant_id)]
                     .original_route_slots);
         }
 
@@ -847,14 +1080,14 @@ namespace llaminar2
         std::int32_t *compactRouteSlots(int participant_id) const
         {
             return at<std::int32_t>(
-                layouts_[participantIndex(participant_id)]
+                layout_.participants[participantIndex(participant_id)]
                     .compact_route_slots);
         }
 
         /** @return Shared original-route contribution matrix for this rank pair. */
         float *sharedCanonicalReturnRoutes() const noexcept
         {
-            return at<float>(shared_return_route_rows_offset_);
+            return at<float>(layout_.shared_return_route_rows);
         }
 
         SharedParticipantControl &control(size_t index) const
@@ -897,7 +1130,8 @@ namespace llaminar2
                     "MoE shared activation alias precedes the mapped region");
             }
             const size_t offset = static_cast<size_t>(value - base);
-            if (offset > mapping_bytes_ || bytes > mapping_bytes_ - offset)
+            if (offset > layout_.mapping_bytes ||
+                bytes > layout_.mapping_bytes - offset)
             {
                 throw std::out_of_range(
                     "MoE shared activation alias range exceeds the mapped region");
@@ -968,120 +1202,6 @@ namespace llaminar2
                 static_cast<std::byte *>(base_) + offset);
         }
 
-        size_t appendRegion(size_t bytes, size_t alignment = kCacheLine)
-        {
-            size_t offset = alignUp(mapping_bytes_, alignment);
-            mapping_bytes_ = checkedAdd(offset, bytes, "payload region");
-            return offset;
-        }
-
-        void computeLayout()
-        {
-            const long raw_page_size = ::sysconf(_SC_PAGESIZE);
-            if (raw_page_size <= 0 ||
-                (static_cast<size_t>(raw_page_size) &
-                 (static_cast<size_t>(raw_page_size) - 1u)) != 0u)
-            {
-                throw std::runtime_error(
-                    "MoE shared activation channel requires a power-of-two system page size");
-            }
-            page_size_ = static_cast<size_t>(raw_page_size);
-            const size_t participant_count = participants_.size();
-            mapping_bytes_ = sizeof(SharedChannelHeader);
-            dispatch_publication_offset_ = appendRegion(
-                sizeof(SharedPublication));
-            return_publication_offset_ = appendRegion(
-                sizeof(SharedPublication));
-            controls_offset_ = appendRegion(
-                checkedMultiply(
-                    participant_count,
-                    sizeof(SharedParticipantControl),
-                    "participant controls"));
-            activation_controls_offset_ = appendRegion(
-                checkedMultiply(
-                    checkedMultiply(
-                        participant_count,
-                        activation_family_count_,
-                        "activation lane count"),
-                    sizeof(MoEOverlayActivationEpochControl),
-                    "activation epoch controls"));
-
-            const size_t row_id_bytes = checkedMultiply(
-                max_rows_, sizeof(int32_t), "row ids");
-            const size_t entry_offset_bytes = checkedMultiply(
-                checkedAdd(max_rows_, 1u, "entry offset count"),
-                sizeof(int32_t),
-                "entry offsets");
-            const size_t expert_bytes = checkedMultiply(
-                max_entries_, sizeof(int32_t), "expert ids");
-            const size_t weight_bytes = checkedMultiply(
-                max_entries_, sizeof(float), "route weights");
-            const size_t route_slot_bytes = checkedMultiply(
-                max_entries_, sizeof(int32_t), "route slot identities");
-            const size_t activation_bytes = checkedMultiply(
-                checkedMultiply(max_rows_, static_cast<size_t>(d_model_),
-                                "activation elements"),
-                sizeof(float),
-                "activation bytes");
-
-            /* The physical continuation activation is identical for every
-             * participant behind this rank-pair channel. Isolate one matrix on
-             * target-owned pages so a captured bulk path publishes it once and
-             * lane-local CSR metadata merely selects rows from it. */
-            mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
-            shared_dispatch_begin_ = mapping_bytes_;
-            shared_dispatch_hidden_rows_offset_ =
-                appendRegion(activation_bytes);
-            mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
-            shared_dispatch_end_ = mapping_bytes_;
-
-            layouts_.resize(participant_count);
-            for (ParticipantLayout &layout : layouts_)
-            {
-                /* Dispatch and return occupy disjoint page families so the
-                 * endpoint that synchronously reads each direction can own its
-                 * NUMA placement. GPU writes are posted; GPU reads otherwise
-                 * pay the full remote-socket UPI latency on every cache line. */
-                mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
-                layout.dispatch_begin = mapping_bytes_;
-                layout.row_ids = appendRegion(row_id_bytes);
-                layout.entry_offsets = appendRegion(entry_offset_bytes);
-                layout.expert_ids = appendRegion(expert_bytes);
-                layout.route_weights = appendRegion(weight_bytes);
-                layout.original_route_slots = appendRegion(route_slot_bytes);
-                layout.compact_route_slots = appendRegion(route_slot_bytes);
-                layout.hidden_rows = appendRegion(activation_bytes);
-                mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
-                layout.dispatch_end = mapping_bytes_;
-                layout.return_begin = mapping_bytes_;
-                layout.return_row_ids = appendRegion(row_id_bytes);
-                layout.output_rows = appendRegion(activation_bytes);
-                mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
-                layout.return_end = mapping_bytes_;
-            }
-
-            /* All remote GPUs publish disjoint original router slots into one
-             * rank-pair matrix.  A single shared allocation avoids reserving a
-             * worst-case top-k matrix for every participant while preserving
-             * arbitrary dynamic placement: any one lane may still own every
-             * live route.  The continuation rank is the synchronous consumer,
-             * so first-touch places these pages with the return direction. */
-            const size_t canonical_return_bytes = checkedMultiply(
-                checkedMultiply(
-                    max_entries_,
-                    static_cast<size_t>(d_model_),
-                    "canonical return elements"),
-                sizeof(float),
-                "canonical return bytes");
-            mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
-            shared_return_begin_ = mapping_bytes_;
-            shared_return_route_rows_offset_ =
-                appendRegion(canonical_return_bytes);
-            mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
-            shared_return_end_ = mapping_bytes_;
-            mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
-        }
-
         /**
          * @brief First-touch one direction on its synchronous consumer socket.
          *
@@ -1111,66 +1231,57 @@ namespace llaminar2
                     "MoE shared activation payload placement requires exactly one local endpoint role");
             }
 
-            size_t touched_bytes = 0u;
+            /* The designated source creator already first-touched the metadata
+             * page family before publishing the initialized header. Include it
+             * in this ownership total without writing live control words again. */
+            size_t touched_bytes =
+                source ? layout_.metadata_pages.bytes : 0u;
             if (target)
             {
-                if (shared_dispatch_begin_ % page_size_ != 0u ||
-                    shared_dispatch_end_ % page_size_ != 0u ||
-                    shared_dispatch_begin_ >= shared_dispatch_end_ ||
-                    shared_dispatch_end_ > mapping_bytes_)
-                {
-                    throw std::logic_error(
-                        "MoE shared activation physical payload range is not page isolated");
-                }
                 std::memset(
                     static_cast<std::byte *>(base_) +
-                        shared_dispatch_begin_,
+                        layout_.shared_dispatch_pages.offset,
                     0,
-                    shared_dispatch_end_ - shared_dispatch_begin_);
+                    layout_.shared_dispatch_pages.bytes);
                 touched_bytes = checkedAdd(
                     touched_bytes,
-                    shared_dispatch_end_ - shared_dispatch_begin_,
+                    layout_.shared_dispatch_pages.bytes,
                     "shared dispatch first-touch bytes");
             }
-            for (const ParticipantLayout &layout : layouts_)
+            for (const auto &participant : layout_.participants)
             {
-                const size_t begin =
-                    source ? layout.return_begin : layout.dispatch_begin;
-                const size_t end =
-                    source ? layout.return_end : layout.dispatch_end;
-                if (begin % page_size_ != 0u || end % page_size_ != 0u ||
-                    begin >= end || end > mapping_bytes_)
-                {
-                    throw std::logic_error(
-                        "MoE shared activation directional payload range is not page isolated");
-                }
+                const auto &range = source
+                                        ? participant.return_pages
+                                        : participant.dispatch_pages;
                 std::memset(
-                    static_cast<std::byte *>(base_) + begin,
+                    static_cast<std::byte *>(base_) + range.offset,
                     0,
-                    end - begin);
+                    range.bytes);
                 touched_bytes = checkedAdd(
                     touched_bytes,
-                    end - begin,
+                    range.bytes,
                     "directional first-touch bytes");
             }
             if (source)
             {
-                if (shared_return_begin_ % page_size_ != 0u ||
-                    shared_return_end_ % page_size_ != 0u ||
-                    shared_return_begin_ >= shared_return_end_ ||
-                    shared_return_end_ > mapping_bytes_)
-                {
-                    throw std::logic_error(
-                        "MoE shared canonical return range is not page isolated");
-                }
                 std::memset(
-                    static_cast<std::byte *>(base_) + shared_return_begin_,
+                    static_cast<std::byte *>(base_) +
+                        layout_.shared_return_pages.offset,
                     0,
-                    shared_return_end_ - shared_return_begin_);
+                    layout_.shared_return_pages.bytes);
                 touched_bytes = checkedAdd(
                     touched_bytes,
-                    shared_return_end_ - shared_return_begin_,
+                    layout_.shared_return_pages.bytes,
                     "canonical return first-touch bytes");
+            }
+
+            const size_t expected_touched = source
+                                                ? layout_.sourceOwnedBytes()
+                                                : layout_.targetOwnedBytes();
+            if (touched_bytes != expected_touched)
+            {
+                throw std::logic_error(
+                    "MoE shared activation first-touch work diverged from the admitted page ownership plan");
             }
 
             auto &local_ready =
@@ -1270,12 +1381,26 @@ namespace llaminar2
         void mapOrCreate(const MoEOverlayRankBatchTransportConfig &config)
         {
             bool creator = false;
-            fd_ = ::shm_open(
-                shm_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
-            if (fd_ >= 0)
+            const bool designated_creator =
+                config.mpi_ctx->rank() == config.source_world_rank;
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(
+                    collective_timeout_policy::kDefaultCollectiveTimeoutMs);
+            if (designated_creator)
             {
+                fd_ = ::shm_open(
+                    shm_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+                if (fd_ < 0)
+                {
+                    throw std::runtime_error(
+                        "MoE shared activation source could not create its run-scoped mapping: " +
+                        std::string(std::strerror(errno)));
+                }
                 creator = true;
-                if (::ftruncate(fd_, static_cast<off_t>(mapping_bytes_)) != 0)
+                if (::ftruncate(
+                        fd_,
+                        static_cast<off_t>(layout_.mapping_bytes)) != 0)
                 {
                     const std::string detail = std::strerror(errno);
                     ::close(fd_);
@@ -1286,9 +1411,26 @@ namespace llaminar2
                         detail);
                 }
             }
-            else if (errno == EEXIST)
+            else
             {
-                fd_ = ::shm_open(shm_name_.c_str(), O_RDWR, 0);
+                do
+                {
+                    fd_ = ::shm_open(shm_name_.c_str(), O_RDWR, 0);
+                    if (fd_ >= 0)
+                        break;
+                    if (errno != ENOENT)
+                    {
+                        throw std::runtime_error(
+                            "MoE shared activation target could not open the source-owned mapping: " +
+                            std::string(std::strerror(errno)));
+                    }
+                    if (std::chrono::steady_clock::now() >= deadline)
+                    {
+                        throw std::runtime_error(
+                            "MoE shared activation channel timed out waiting for its source-owned mapping");
+                    }
+                    cpuRelax();
+                } while (true);
             }
             if (fd_ < 0)
             {
@@ -1298,12 +1440,9 @@ namespace llaminar2
             }
 
             struct stat status{};
-            const auto deadline =
-                std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(
-                    collective_timeout_policy::kDefaultCollectiveTimeoutMs);
             while (::fstat(fd_, &status) == 0 &&
-                   static_cast<size_t>(status.st_size) < mapping_bytes_)
+                   static_cast<size_t>(status.st_size) <
+                       layout_.mapping_bytes)
             {
                 if (std::chrono::steady_clock::now() >= deadline)
                     throw std::runtime_error(
@@ -1311,7 +1450,8 @@ namespace llaminar2
                 cpuRelax();
             }
             if (status.st_size < 0 ||
-                static_cast<size_t>(status.st_size) != mapping_bytes_)
+                static_cast<size_t>(status.st_size) !=
+                    layout_.mapping_bytes)
             {
                 throw std::runtime_error(
                     "MoE shared activation channel mapping size disagrees across ranks");
@@ -1319,7 +1459,7 @@ namespace llaminar2
 
             base_ = ::mmap(
                 nullptr,
-                mapping_bytes_,
+                layout_.mapping_bytes,
                 PROT_READ | PROT_WRITE,
                 MAP_SHARED,
                 fd_,
@@ -1333,14 +1473,14 @@ namespace llaminar2
             }
             header_ = static_cast<SharedChannelHeader *>(base_);
             dispatch_publication_ =
-                at<SharedPublication>(dispatch_publication_offset_);
+                at<SharedPublication>(layout_.dispatch_publication);
             return_publication_ =
-                at<SharedPublication>(return_publication_offset_);
+                at<SharedPublication>(layout_.return_publication);
             controls_ =
-                at<SharedParticipantControl>(controls_offset_);
+                at<SharedParticipantControl>(layout_.participant_controls);
             activation_controls_ =
                 at<MoEOverlayActivationEpochControl>(
-                    activation_controls_offset_);
+                    layout_.activation_controls);
 
             if (creator)
             {
@@ -1349,19 +1489,14 @@ namespace llaminar2
                  * first-touched by their actual producer socket during setup
                  * or first use, avoiding one-sided NUMA placement.
                  */
-                std::memset(
-                    base_,
-                    0,
-                    activation_controls_offset_ +
-                        participants_.size() * activation_family_count_ *
-                            sizeof(MoEOverlayActivationEpochControl));
+                std::memset(base_, 0, layout_.metadata_pages.bytes);
                 header_->magic = kSharedChannelMagic;
                 header_->version = kSharedChannelVersion;
                 header_->participant_count =
                     static_cast<uint32_t>(participants_.size());
                 header_->activation_family_count = static_cast<uint32_t>(
                     activation_family_count_);
-                header_->mapping_bytes = mapping_bytes_;
+                header_->mapping_bytes = layout_.mapping_bytes;
                 header_->channel_hash = channel_hash_;
                 header_->max_rows_per_participant = max_rows_;
                 header_->max_entries_per_participant = max_entries_;
@@ -1401,7 +1536,7 @@ namespace llaminar2
                 header_->participant_count != participants_.size() ||
                 header_->activation_family_count !=
                     activation_family_count_ ||
-                header_->mapping_bytes != mapping_bytes_ ||
+                header_->mapping_bytes != layout_.mapping_bytes ||
                 header_->channel_hash != channel_hash_ ||
                 header_->max_rows_per_participant != max_rows_ ||
                 header_->max_entries_per_participant != max_entries_ ||
@@ -1442,7 +1577,7 @@ namespace llaminar2
             PerfStatsCollector::addCounter(
                 "memory",
                 "moe_overlay_node_local_shared_channel_bytes",
-                static_cast<double>(mapping_bytes_),
+                static_cast<double>(layout_.mapping_bytes),
                 "model_setup",
                 "cpu",
                 {{"channel_hash", std::to_string(channel_hash_)},
@@ -1458,29 +1593,12 @@ namespace llaminar2
         int d_model_ = 0;
         int top_k_ = 0;
         size_t activation_family_count_ = 0;
-        size_t page_size_ = 0;
+        /** Planner-owned mapping offsets and NUMA page partition. */
+        MoEOverlayNodeLocalActivationLayout layout_;
         uint64_t channel_hash_ = 0;
         std::string shm_name_;
         int fd_ = -1;
         void *base_ = nullptr;
-        size_t mapping_bytes_ = 0;
-        size_t dispatch_publication_offset_ = 0;
-        size_t return_publication_offset_ = 0;
-        size_t controls_offset_ = 0;
-        size_t activation_controls_offset_ = 0;
-        /** Target-owned page range for the one physical activation payload. */
-        size_t shared_dispatch_begin_ = 0;
-        /** Byte offset of the shared physical activation matrix. */
-        size_t shared_dispatch_hidden_rows_offset_ = 0;
-        /** Exclusive end of the shared physical activation page range. */
-        size_t shared_dispatch_end_ = 0;
-        /** Source-owned page range for canonical follower contributions. */
-        size_t shared_return_begin_ = 0;
-        /** Byte offset of `[max_entries, d_model]` canonical route rows. */
-        size_t shared_return_route_rows_offset_ = 0;
-        /** Exclusive end of the canonical return page range. */
-        size_t shared_return_end_ = 0;
-        std::vector<ParticipantLayout> layouts_;
         SharedChannelHeader *header_ = nullptr;
         SharedPublication *dispatch_publication_ = nullptr;
         SharedPublication *return_publication_ = nullptr;
@@ -1519,6 +1637,7 @@ namespace llaminar2
             config_.activation_graph_families.size() >
                 static_cast<size_t>(
                     std::numeric_limits<std::uint32_t>::max()) ||
+            !config_.activation_layout.valid() ||
             config_.local_lanes.empty())
         {
             throw std::invalid_argument(

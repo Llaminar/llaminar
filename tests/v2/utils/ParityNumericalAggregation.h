@@ -26,7 +26,10 @@ namespace llaminar2::test::parity
      * the next depth. A merely marginal aggregate at the final retained depth
      * is therefore an early warning for state or expert-execution drift even
      * when the sampled token remains unchanged. Model-specific thresholds may
-     * be stricter, but production coverage must never admit less than 0.99.
+     * be stricter. A typed model/MTP-policy definition may explicitly supply
+     * a different recursive aggregate floor when a measured quantized
+     * recurrence needs it; callers that do not carry such a contract retain
+     * this strict default.
      */
     inline constexpr double
         kMinimumProductionRecursiveMTPAggregateCosine = 0.99;
@@ -44,18 +47,35 @@ namespace llaminar2::test::parity
     inline constexpr double kParityCosineNormProductResolution = 1.0e-10;
 
     /**
-     * @brief Apply the strict production recursive-MTP aggregate gate.
+     * @brief Resolve the recursive-MTP aggregate threshold for one typed case.
+     * @param model_threshold Model/backend-specific decode threshold.
+     * @param production_floor Typed case floor, or the strict default.
+     * @return Stronger of the model threshold and recursive aggregate floor.
+     */
+    constexpr double productionRecursiveMTPAggregateRequiredCosine(
+        double model_threshold,
+        double production_floor =
+            kMinimumProductionRecursiveMTPAggregateCosine) noexcept
+    {
+        return std::max(model_threshold, production_floor);
+    }
+
+    /**
+     * @brief Apply the production recursive-MTP aggregate gate.
      * @param aggregate_cosine Mean cosine of comparable numerical checkpoints.
      * @param model_threshold Model/backend-specific decode threshold.
-     * @return True only when the aggregate satisfies both lower bounds.
+     * @param production_floor Typed case floor, or the strict default.
+     * @return True only when the aggregate satisfies the resolved lower bound.
      */
     constexpr bool productionRecursiveMTPAggregatePasses(
         double aggregate_cosine,
-        double model_threshold) noexcept
+        double model_threshold,
+        double production_floor =
+            kMinimumProductionRecursiveMTPAggregateCosine) noexcept
     {
-        return aggregate_cosine >= std::max(
-                   model_threshold,
-                   kMinimumProductionRecursiveMTPAggregateCosine);
+        return aggregate_cosine >=
+               productionRecursiveMTPAggregateRequiredCosine(
+                   model_threshold, production_floor);
     }
 
     /**

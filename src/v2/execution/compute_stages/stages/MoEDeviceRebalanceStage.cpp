@@ -347,7 +347,7 @@ namespace llaminar2
 
     size_t MoEDeviceRebalanceStage::localHistogramEntries() const
     {
-        return histogramLayerCount() *
+        return workspaceCapacity().histogramLayerCount() *
                static_cast<size_t>(params_.config.num_experts);
     }
 
@@ -372,32 +372,17 @@ namespace llaminar2
 
     size_t MoEDeviceRebalanceStage::histogramLayerCount() const
     {
-        const uint32_t window_count =
-            params_.config.layer_window_count == 0u
-                ? params_.config.num_layers
-                : std::min(params_.config.layer_window_count,
-                           params_.config.num_layers);
-        const uint32_t wave_count =
-            params_.config.layer_wave_count == 0u
-                ? window_count
-                : std::min(params_.config.layer_wave_count, window_count);
-        return static_cast<size_t>(std::max<uint32_t>(1u, wave_count));
+        return workspaceCapacity().histogramLayerCount();
     }
 
     size_t MoEDeviceRebalanceStage::llepPlannerScratchCount() const
     {
-        const uint32_t window_count =
-            params_.config.layer_window_count == 0u
-                ? params_.config.num_layers
-                : std::min(params_.config.layer_window_count,
-                           params_.config.num_layers);
-        return static_cast<size_t>(std::max<uint32_t>(1u, window_count));
+        return workspaceCapacity().llepPlannerScratchCount();
     }
 
     size_t MoEDeviceRebalanceStage::transferPlanEntries() const
     {
-        return static_cast<size_t>(
-            deviceMoERebalanceCommandPlanCapacity(params_.config, params_.transfer_mode));
+        return workspaceCapacity().transferPlanCapacity();
     }
 
     size_t MoEDeviceRebalanceStage::transferPlanCapacity() const
@@ -407,30 +392,17 @@ namespace llaminar2
 
     size_t MoEDeviceRebalanceStage::payloadSlotCapacity() const
     {
-        if (!usesCollectivePayloadLane())
-            return 0;
-        const size_t captured_slot_capacity =
-            params_.collective_payload_slot_capacity == 0
-                ? static_cast<size_t>(params_.local_transfer_slot_count)
-                : std::min<size_t>(
-                      static_cast<size_t>(params_.collective_payload_slot_capacity),
-                      static_cast<size_t>(params_.local_transfer_slot_count));
-        return std::min<size_t>(
-            transferPlanCapacity(),
-            captured_slot_capacity);
+        return workspaceCapacity().payloadSlotCapacity();
     }
 
     size_t MoEDeviceRebalanceStage::commandBufferCount() const
     {
-        return usesTransferSlotApply() ? 2u : 1u;
+        return workspaceCapacity().commandBufferCount();
     }
 
     size_t MoEDeviceRebalanceStage::collectivePayloadSlotCount() const
     {
-        const size_t slot_capacity = payloadSlotCapacity();
-        if (usesCompactTransferSlots())
-            return slot_capacity;
-        return slot_capacity * static_cast<size_t>(params_.config.participant_count);
+        return workspaceCapacity().collectivePayloadSlotCount();
     }
 
     size_t MoEDeviceRebalanceStage::collectivePayloadLocalBytes() const
@@ -447,35 +419,33 @@ namespace llaminar2
 
     bool MoEDeviceRebalanceStage::usesTransferSlotApply() const
     {
-        return deviceMoERebalanceModeUsesTransferSlots(params_.transfer_mode) &&
-               params_.local_transfer_slots != nullptr &&
-               params_.local_transfer_slot_count > 0;
+        /*
+         * Storage identity is policy-owned and must not change merely because
+         * a live pointer has not yet been materialized. validateCommon()
+         * rejects a missing pointer before execution; admission and workspace
+         * sizing remain identical on both sides of that lifecycle boundary.
+         */
+        return workspaceCapacity().usesTransferSlots();
     }
 
     bool MoEDeviceRebalanceStage::usesCompactTransferSlots() const
     {
-        return usesTransferSlotApply() &&
-               params_.transfer_mode == DeviceMoERebalanceTransferMode::CompactTransferSlots;
+        return workspaceCapacity().usesCompactTransferSlots();
     }
 
     bool MoEDeviceRebalanceStage::usesFixedPayloadTransfer() const
     {
-        return usesTransferSlotApply() &&
-               deviceMoERebalanceModeMovesFixedPayloadCapacity(params_.transfer_mode);
+        return workspaceCapacity().usesFixedPayloadTransfer();
     }
 
     bool MoEDeviceRebalanceStage::usesCollectivePayloadLane() const
     {
-        return usesTransferSlotApply() &&
-               deviceMoERebalanceModeUsesCollectivePayloadLane(params_.transfer_mode);
+        return workspaceCapacity().usesCollectivePayloadLane();
     }
 
     bool MoEDeviceRebalanceStage::usesReadyWaveApply() const
     {
-        return usesTransferSlotApply() ||
-               hasDeviceMoERebalanceFlag(
-                   params_.config.flags,
-                   DeviceMoERebalanceFlags::DeferRuntimeApply);
+        return workspaceCapacity().usesReadyWaveApply();
     }
 
     bool MoEDeviceRebalanceStage::collectsState() const
@@ -500,9 +470,7 @@ namespace llaminar2
 
     bool MoEDeviceRebalanceStage::usesParallelLLEPPlanning() const
     {
-        return runsController() &&
-               params_.config.routed_assignment_policy ==
-                   kDeviceMoERebalanceAssignmentLeastLoadedResident;
+        return workspaceCapacity().usesParallelLLEPPlanning();
     }
 
     bool MoEDeviceRebalanceStage::ownsRequestTransactionState() const noexcept
@@ -660,6 +628,28 @@ namespace llaminar2
                              : params_.workspace_name);
     }
 
+    DeviceMoERebalanceWorkspaceCapacity
+    MoEDeviceRebalanceStage::workspaceCapacity() const noexcept
+    {
+        return DeviceMoERebalanceWorkspaceCapacity::fromRuntime(
+            params_.config,
+            params_.local_transfer_slot_count,
+            params_.collective_payload_slot_capacity,
+            params_.phase,
+            params_.transfer_mode);
+    }
+
+    DeviceMoERebalanceWorkspaceBinding
+    MoEDeviceRebalanceStage::workspaceBinding() const
+    {
+        return {
+            .capacity = workspaceCapacity(),
+            .collective_payload_slot_bytes =
+                params_.collective_payload_slot_bytes,
+            .workspace_suffix = workspaceSuffix(),
+        };
+    }
+
     DeviceMoERebalanceTransferState *MoEDeviceRebalanceStage::transferState() const
     {
         return params_.transfer_state.get();
@@ -790,6 +780,13 @@ namespace llaminar2
                 LOG_ERROR("[" << label << "] Durable overlay maintenance must own the canonical main table and its exact epoch arena");
                 return false;
             }
+        }
+        if (usesTransferSlotApply() &&
+            (!params_.local_transfer_slots ||
+             params_.local_transfer_slot_count == 0u))
+        {
+            LOG_ERROR("[" << label << "] Transfer-backed rebalance requires a materialized non-empty transfer directory");
+            return false;
         }
         if (usesCollectivePayloadLane() && params_.collective_payload_slot_bytes == 0)
         {
@@ -1045,7 +1042,7 @@ namespace llaminar2
             return false;
         }
 
-        if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("moe_rebalance"))
         {
             PerfStatsCollector::addCounter(
                 "moe_rebalance",
@@ -1135,7 +1132,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("moe_rebalance"))
             {
                 PerfStatsCollector::addCounter(
                     "moe_rebalance",
@@ -1181,7 +1178,7 @@ namespace llaminar2
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to project gathered root commands into local apply ABI");
                 return false;
             }
-            if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("moe_rebalance"))
             {
                 PerfStatsCollector::addCounter(
                     "moe_rebalance",
@@ -1310,7 +1307,8 @@ namespace llaminar2
                 return false;
             }
 
-            if (params_.overlay_epoch_arena && PerfStatsCollector::isEnabled())
+        if (params_.overlay_epoch_arena &&
+            PerfStatsCollector::isDomainEnabled("moe_rebalance"))
             {
                 PerfStatsCollector::addCounter(
                     "moe_rebalance",
@@ -1834,57 +1832,8 @@ namespace llaminar2
 
     size_t MoEDeviceRebalanceStage::estimatedMemoryBytes() const
     {
-        if (params_.phase == DeviceMoERebalanceStagePhase::JoinTransfer)
-            return 0;
-        size_t bytes =
-            (localHistogramEntries() + gatheredHistogramEntries()) * sizeof(uint64_t) +
-            commandBufferCount() * transferPlanCapacity() * sizeof(DeviceMoERebalancePlanEntry) +
-            commandBufferCount() * sizeof(uint32_t) +
-            commandBufferCount() * sizeof(DeviceMoERebalanceCommandBufferHeader) +
-            sizeof(DeviceMoERebalanceGraphControllerState) +
-            sizeof(DeviceMoEPlacementBank) +
-            commandBufferCount() * sizeof(DeviceMoERebalanceWaveState) +
-            sizeof(DeviceMoERebalanceStatus);
-        if (usesReadyWaveApply())
-        {
-            bytes += sizeof(DeviceMoERebalanceApplyStatus);
-        }
-        if (usesTransferSlotApply())
-        {
-            bytes += sizeof(DeviceMoERebalanceApplyStatus);
-            bytes += static_cast<size_t>(params_.config.participant_count) *
-                     sizeof(DeviceMoERebalanceApplyStatus);
-            bytes += deviceMoETransferSlotClaimIndexBytes(
-                params_.local_transfer_slot_count);
-            bytes += transferPlanCapacity() *
-                         static_cast<size_t>(params_.config.participant_count) *
-                         commandBufferCount() *
-                         sizeof(DeviceMoERebalancePlanEntry) +
-                     static_cast<size_t>(params_.config.participant_count) *
-                         commandBufferCount() *
-                         sizeof(DeviceMoERebalanceCommandBufferHeader) +
-                     static_cast<size_t>(params_.config.participant_count) *
-                         commandBufferCount() *
-                         sizeof(DeviceMoERebalanceWaveState);
-            if (usesCompactTransferSlots())
-            {
-                bytes +=
-                    localSourceDescriptorEntries() *
-                    sizeof(DeviceMoEExpertDirectoryEntry);
-            }
-            if (usesCollectivePayloadLane())
-            {
-                bytes +=
-                    collectivePayloadLocalBytes() +
-                    collectivePayloadGatheredBytes();
-            }
-            if (usesFixedPayloadTransfer())
-            {
-                bytes +=
-                    localDirectoryEntries() * sizeof(DeviceMoEExpertDirectoryEntry);
-            }
-        }
-        return bytes;
+        return DeviceMoERebalanceWorkspaceContract::logicalBytes(
+            workspaceBinding());
     }
 
     bool MoEDeviceRebalanceStage::supportsBackend(ComputeBackendType backend) const
@@ -2038,136 +1987,10 @@ namespace llaminar2
         (void)m;
         (void)n;
         (void)k;
-        WorkspaceRequirements reqs;
         if (!validateDeviceMoERebalanceConfig(params_.config))
-            return reqs;
-        if (params_.phase == DeviceMoERebalanceStagePhase::JoinTransfer)
-            return reqs;
-
-        reqs.buffers.push_back({localHistogramBufferName(),
-                                localHistogramEntries() * sizeof(uint64_t),
-                                256,
-                                true});
-        reqs.buffers.push_back({gatheredHistogramBufferName(),
-                                gatheredHistogramEntries() * sizeof(uint64_t),
-                                256,
-                                true});
-        reqs.buffers.push_back({transferPlanBufferName(),
-                                commandBufferCount() * transferPlanCapacity() *
-                                    sizeof(DeviceMoERebalancePlanEntry),
-                                256,
-                                true});
-        reqs.buffers.push_back({transferPlanCountBufferName(),
-                                commandBufferCount() * sizeof(uint32_t),
-                                256,
-                                true});
-        reqs.buffers.push_back({commandHeaderBufferName(),
-                                commandBufferCount() *
-                                    sizeof(DeviceMoERebalanceCommandBufferHeader),
-                                256,
-                                true});
-        reqs.buffers.push_back({controllerStateBufferName(),
-                                sizeof(DeviceMoERebalanceGraphControllerState),
-                                256,
-                                true});
-        /*
-         * Deferred planning is speculative and may overlap readers that still
-         * pin either durable RCU bank. One graph-lifetime bank is sufficient:
-         * the controller visits its bounded layer wave serially and emits all
-         * durable effects into immutable command records before reuse.
-         */
-        reqs.buffers.push_back({placementPlanScratchBufferName(),
-                                sizeof(DeviceMoEPlacementBank),
-                                256,
-                                true});
-        if (usesParallelLLEPPlanning())
-        {
-            reqs.buffers.push_back({
-                llepLayerPlansBufferName(),
-                llepPlannerScratchCount() *
-                    sizeof(DeviceMoELLEPLayerPlanScratch),
-                256,
-                true});
-        }
-        reqs.buffers.push_back({waveStateBufferName(),
-                                commandBufferCount() * sizeof(DeviceMoERebalanceWaveState),
-                                256,
-                                true});
-        reqs.buffers.push_back({statusBufferName(),
-                                sizeof(DeviceMoERebalanceStatus),
-                                256,
-                                true});
-        if (usesReadyWaveApply())
-        {
-            reqs.buffers.push_back({applyStatusBufferName(),
-                                    sizeof(DeviceMoERebalanceApplyStatus),
-                                    256,
-                                    true});
-        }
-        if (usesTransferSlotApply())
-        {
-            reqs.buffers.push_back({copyStatusBufferName(),
-                                    sizeof(DeviceMoERebalanceApplyStatus),
-                                    256,
-                                    true});
-            reqs.buffers.push_back({gatheredCopyStatusBufferName(),
-                                    static_cast<size_t>(params_.config.participant_count) *
-                                        sizeof(DeviceMoERebalanceApplyStatus),
-                                    256,
-                                    true});
-            reqs.buffers.push_back({gatheredTransferPlanBufferName(),
-                                    transferPlanCapacity() *
-                                        commandBufferCount() *
-                                        static_cast<size_t>(params_.config.participant_count) *
-                                        sizeof(DeviceMoERebalancePlanEntry),
-                                    256,
-                                    true});
-            reqs.buffers.push_back({gatheredCommandHeaderBufferName(),
-                                    static_cast<size_t>(params_.config.participant_count) *
-                                        commandBufferCount() *
-                                        sizeof(DeviceMoERebalanceCommandBufferHeader),
-                                    256,
-                                    true});
-            reqs.buffers.push_back({gatheredWaveStateBufferName(),
-                                    static_cast<size_t>(params_.config.participant_count) *
-                                        commandBufferCount() *
-                                        sizeof(DeviceMoERebalanceWaveState),
-                                    256,
-                                    true});
-            reqs.buffers.push_back({
-                transferSlotClaimIndexBufferName(),
-                deviceMoETransferSlotClaimIndexBytes(
-                    params_.local_transfer_slot_count),
-                256,
-                true});
-            if (usesCompactTransferSlots())
-            {
-                reqs.buffers.push_back({localSourceDescriptorsBufferName(),
-                                        localSourceDescriptorEntries() *
-                                            sizeof(DeviceMoEExpertDirectoryEntry),
-                                        256,
-                                        true});
-            }
-            if (usesCollectivePayloadLane())
-            {
-                reqs.buffers.push_back({localTransferPayloadBufferName(),
-                                        collectivePayloadLocalBytes(),
-                                        256,
-                                        true});
-                reqs.buffers.push_back({gatheredTransferPayloadBufferName(),
-                                        collectivePayloadGatheredBytes(),
-                                        256,
-                                        true});
-            }
-            if (usesFixedPayloadTransfer())
-            {
-                reqs.buffers.push_back({localDirectoryBufferName(),
-                                        localDirectoryEntries() * sizeof(DeviceMoEExpertDirectoryEntry),
-                                        256,
-                                        true});
-            }
-        }
-        return reqs;
+            return {};
+        return DeviceMoERebalanceWorkspaceContract::requirements(
+            workspaceBinding());
     }
 
     void MoEDeviceRebalanceStage::bindWorkspace(DeviceWorkspaceManager *workspace)

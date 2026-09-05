@@ -5,6 +5,7 @@
 #include "utils/Logger.h"
 #include "utils/WeightLoadingProfiler.h"
 #include "utils/ProductionParityEvidence.h"
+#include "kernels/common/SamplingMath.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -43,6 +44,7 @@ namespace
             else
                 unsetenv(name);
             mutableDebugEnv().reload();
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
         }
 
         ~ScopedEnv()
@@ -52,6 +54,7 @@ namespace
             else
                 unsetenv(name_.c_str());
             mutableDebugEnv().reload();
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
         }
 
     private:
@@ -141,7 +144,18 @@ namespace
             .name = "device_generation_dispatch_ticket_d2h_submissions",
             .device = device,
             .tags = {
-                {"bytes", "48"},
+                {"bytes",
+                 std::to_string(
+                     sampling_math::DeviceGenerationDispatchTicket::
+                         kWireBytes)},
+                {"abi_version",
+                 std::to_string(
+                     sampling_math::DeviceGenerationDispatchTicket::
+                         kABIVersion)},
+                {"word_count",
+                 std::to_string(
+                     sampling_math::DeviceGenerationDispatchTicket::
+                         kWordCount)},
                 {"authority", "immutable_scheduler_snapshot"},
                 {"state_payload", "false"}},
             .value = 3.0,
@@ -409,14 +423,14 @@ TEST(Test__ProductionParityEvidence, RecognizesNativeConditionalGenerationParent
             .kind = PerfStatRecord::Kind::Counter,
             .domain = "mtp",
             .name = "device_generation_loop_graph_materializations",
-            .tags = {{"execution", "native_device_controlled_switch_while"}},
+            .tags = {{"execution", "native_device_controlled_selector_while"}},
             .value = 1.0,
         },
         PerfStatRecord{
             .kind = PerfStatRecord::Kind::Counter,
             .domain = "mtp",
             .name = "device_generation_loop_graph_launches",
-            .tags = {{"execution", "single_async_native_switch_while_launch"}},
+            .tags = {{"execution", "single_async_native_selector_while_launch"}},
             .value = 1.0,
         },
         PerfStatRecord{
@@ -570,6 +584,33 @@ TEST(Test__ProductionParityEvidence,
             MissingHeterogeneousSegmentPlan)
         << "Only the inventory-resolved authority may satisfy the campaign's "
            "mandatory segmented-boundary proof";
+}
+
+TEST(Test__ProductionParityEvidence,
+     RetainedParentDecodeReplayAcceptsEveryProductionCounterSpelling)
+{
+    const auto record = [](std::string name,
+                           std::string phase = "decode",
+                           double value = 1.0)
+    {
+        return PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "forward_graph",
+            .name = std::move(name),
+            .phase = std::move(phase),
+            .device = "ROCm:0",
+            .value = value,
+        };
+    };
+
+    EXPECT_TRUE(productionParityHasRetainedParentDecodeReplay(
+        {record("retained_parent_replays")}));
+    EXPECT_TRUE(productionParityHasRetainedParentDecodeReplay(
+        {record("retained_parent_transaction_replays")}));
+    EXPECT_FALSE(productionParityHasRetainedParentDecodeReplay(
+        {record("retained_parent_replays", "prefill")}));
+    EXPECT_FALSE(productionParityHasRetainedParentDecodeReplay(
+        {record("retained_parent_replays", "decode", 0.0)}));
 }
 
 TEST(Test__ProductionParityEvidence,
@@ -1021,6 +1062,45 @@ TEST(Test__PerfStatsCollector, ExportFilterIsACollectionDomainGate)
     ASSERT_EQ(records.size(), 1u);
     EXPECT_EQ(records.front().domain, "mtp");
     EXPECT_EQ(records.front().name, "kept");
+}
+
+/**
+ * @brief Environment parsing is a setup transition, never dormant hot work.
+ *
+ * The raw mutation between the two observations deliberately omits a reload.
+ * If `isDomainEnabled()` starts consulting `getenv()` again, the middle
+ * assertion fails and protects the disabled inference fast path that the 122B
+ * Dynamic benchmark exposed.
+ */
+TEST(Test__PerfStatsCollector, EnvironmentIsParsedOnlyAtExplicitPolicyBoundaries)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv stage_detail("LLAMINAR_GPU_STAGE_TIMING_DETAIL", nullptr);
+    ScopedEnv perf_gpu_timing(
+        "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv perf_cpu_timing(
+        "LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", nullptr);
+    ScopedEnv table("LLAMINAR_PERF_STATS_TABLE", nullptr);
+    ScopedEnv summary("LLAMINAR_PERF_STATS_SUMMARY", nullptr);
+    ScopedEnv csv("LLAMINAR_PERF_STATS_CSV", nullptr);
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", nullptr);
+    PerfStatsCollector::reset();
+
+    ASSERT_FALSE(PerfStatsCollector::isEnabled());
+    ASSERT_FALSE(PerfStatsCollector::isDomainEnabled("moe_overlay_residency"));
+
+    ASSERT_EQ(::setenv("LLAMINAR_PERF_STATS_JSON", "1", 1), 0);
+    EXPECT_FALSE(PerfStatsCollector::isEnabled());
+    EXPECT_FALSE(PerfStatsCollector::isDomainEnabled("moe_overlay_residency"));
+
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    EXPECT_TRUE(PerfStatsCollector::isEnabled());
+    EXPECT_TRUE(PerfStatsCollector::isDomainEnabled("moe_overlay_residency"));
+
+    ASSERT_EQ(::unsetenv("LLAMINAR_PERF_STATS_JSON"), 0);
+    PerfStatsCollector::reloadConfigurationFromEnvironment();
+    EXPECT_FALSE(PerfStatsCollector::isEnabled());
 }
 
 TEST(Test__PerfStatsCollector, QualifiedFilterEnablesItsOwningDomain)

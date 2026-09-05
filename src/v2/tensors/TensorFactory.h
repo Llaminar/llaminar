@@ -285,29 +285,9 @@ namespace llaminar2
          */
         static bool isNumaAvailable();
 
-        /**
-         * @brief Enable mapped memory allocation for GPU tensors
-         *
-         * When enabled, FP32 tensors targeting GPU devices will be allocated using
-         * zero-copy mapped memory (cudaHostAllocMapped / hipHostMallocMapped).
-         * This enables direct host access without memcpy, ideal for:
-         * - Snapshot/debugging modes where host needs to read GPU output
-         * - Logits tensors that must be read by host for sampling
-         *
-         * @param enable true to use mapped memory for GPU FP32 tensors
-         */
-        void setUseMappedMemoryForGPU(bool enable) { use_mapped_memory_for_gpu_ = enable; }
-
-        /**
-         * @brief Check if mapped memory is enabled for GPU tensors
-         * @return true if mapped memory allocation is enabled
-         */
-        bool useMappedMemoryForGPU() const { return use_mapped_memory_for_gpu_; }
-
     private:
         int mpi_rank_;
-        int numa_node_;                          // NUMA node for this rank
-        bool use_mapped_memory_for_gpu_ = false; // When true, FP32 GPU tensors use zero-copy mapped memory
+        int numa_node_; // NUMA node for this rank
 
         /**
          * @brief Bind current thread to NUMA node

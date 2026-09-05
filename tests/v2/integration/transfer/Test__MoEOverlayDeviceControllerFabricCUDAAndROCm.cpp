@@ -192,7 +192,10 @@ namespace llaminar2::test
             }
             auto service = std::make_shared<MoERoutedTierServiceProfile>();
             service->identity = "device-controller-test-service-v1";
-            service->active_sources = {true, true, true};
+            service->production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    static_cast<int>(layer_count),
+                    kAllExpertHistogramProductionSources);
             for (std::uint32_t tier = 0u; tier < tier_count; ++tier)
             {
                 for (std::uint32_t layer = 0u;
@@ -584,6 +587,194 @@ namespace llaminar2::test
             economy.payoff_horizon_tokens = 65'536u;
             input.economy = std::move(economy);
             return input;
+        }
+
+        /**
+         * @brief Build the exact two-slot policy shape that once starved skew.
+         *
+         * Layer zero has two high-value tier exchanges and no participant
+         * correction. Layer one is tier-optimal and has one lower-value closed
+         * cycle that independently reduces the priority-23 makespan. A
+         * two-cycle wave therefore proves the device selector searches the
+         * complete layer cursor before spending a reserved slot on fallback.
+         */
+        MoEOverlayDevicePlacementPolicyInput boundedTwoAxisPolicyInput()
+        {
+            auto input = adversarialPolicyInput();
+            input.num_layers = 2u;
+            input.num_experts = 12u;
+            input.collected_state.assign(
+                6u * input.num_layers * input.num_experts, 0u);
+            const std::array<std::uint32_t, 12> layer_zero_owners = {
+                2u, 3u, 1u, 0u, 0u, 1u,
+                4u, 5u, 5u, 4u, 3u, 2u,
+            };
+            const std::array<std::uint32_t, 12> layer_one_owners = {
+                0u, 1u, 1u, 0u, 2u, 3u,
+                5u, 4u, 5u, 4u, 3u, 2u,
+            };
+            const std::array<std::uint64_t, 12> counts = {
+                1200u, 1100u, 1000u, 900u,
+                850u, 825u, 800u, 700u,
+                600u, 500u, 100u, 50u,
+            };
+            for (std::uint32_t layer = 0u;
+                 layer < input.num_layers;
+                 ++layer)
+            {
+                const auto &owners = layer == 0u
+                                         ? layer_zero_owners
+                                         : layer_one_owners;
+                for (std::uint32_t expert = 0u;
+                     expert < input.num_experts;
+                     ++expert)
+                {
+                    input.collected_state[
+                        (static_cast<std::size_t>(owners[expert]) *
+                             input.num_layers +
+                         layer) *
+                            input.num_experts +
+                        expert] = moe_rebalance_policy::packCollectedState(
+                        counts[expert],
+                        /*active_transfer_slots=*/0u,
+                        /*physically_resident=*/true,
+                        /*transfer_backed=*/false,
+                        /*authoritative_owner=*/true);
+                }
+            }
+            input.payload_bytes_per_layer = {4096u, 4096u};
+            input.maximum_cycles_per_wave = 2u;
+            input.dynamic_maximum_cycles_per_layer = 2u;
+            input.dynamic_imbalance_threshold_per_mille = 1000u;
+            input.dynamic_minimum_improvement_per_mille = 0u;
+            input.command_capacity = input.num_experts;
+
+            auto &economy = input.economy.value();
+            const std::size_t plane_words =
+                static_cast<std::size_t>(input.num_layers) *
+                input.num_experts;
+            economy.phase_expert_demand.assign(
+                kMoEOverlayDeviceControllerDemandPhaseCount * plane_words,
+                0u);
+            for (std::uint32_t layer = 0u;
+                 layer < input.num_layers;
+                 ++layer)
+            {
+                for (std::uint32_t expert = 0u;
+                     expert < input.num_experts;
+                     ++expert)
+                {
+                    economy.phase_expert_demand[
+                        static_cast<std::size_t>(
+                            kMoEOverlayDeviceControllerEconomyPrefillPhase) *
+                            plane_words +
+                        static_cast<std::size_t>(layer) * input.num_experts +
+                        expert] = counts[expert];
+                }
+            }
+            economy.service_costs.assign(
+                static_cast<std::size_t>(economy.tier_count) *
+                    input.num_layers *
+                    kMoEOverlayDeviceControllerEconomyServicePhaseCount,
+                0u);
+            for (std::uint32_t tier = 0u; tier < economy.tier_count; ++tier)
+            {
+                for (std::uint32_t layer = 0u;
+                     layer < input.num_layers;
+                     ++layer)
+                {
+                    for (std::uint32_t phase = 0u;
+                         phase <
+                             kMoEOverlayDeviceControllerEconomyServicePhaseCount;
+                         ++phase)
+                    {
+                        economy.service_costs[
+                            (static_cast<std::size_t>(tier) *
+                                 input.num_layers +
+                             layer) *
+                                kMoEOverlayDeviceControllerEconomyServicePhaseCount +
+                            phase] = 10u + tier * 90u;
+                    }
+                }
+            }
+            economy.migration_costs.assign(
+                input.participants.size() * input.participants.size() *
+                    input.num_layers,
+                {});
+            for (std::uint32_t source = 0u;
+                 source < input.participants.size();
+                 ++source)
+            {
+                for (std::uint32_t destination = 0u;
+                     destination < input.participants.size();
+                     ++destination)
+                {
+                    if (source == destination)
+                        continue;
+                    for (std::uint32_t layer = 0u;
+                         layer < input.num_layers;
+                         ++layer)
+                    {
+                        economy.migration_costs[
+                            (static_cast<std::size_t>(source) *
+                                 input.participants.size() +
+                             destination) *
+                                input.num_layers +
+                            layer] = {
+                            .transfer_and_repack_ns = 1u,
+                            .inference_interference_ns = 0u,
+                        };
+                    }
+                }
+            }
+            economy.last_moved_generation.assign(
+                plane_words,
+                kMoEOverlayDeviceControllerNeverMovedGeneration);
+            return input;
+        }
+
+        /** Extract the exact layer-major initial owner table from a snapshot. */
+        std::vector<std::uint32_t> initialOwners(
+            const MoEOverlayDevicePlacementPolicyInput &input)
+        {
+            std::vector<std::uint32_t> owners(
+                static_cast<std::size_t>(input.num_layers) *
+                    input.num_experts,
+                std::numeric_limits<std::uint32_t>::max());
+            for (std::uint32_t layer = 0u; layer < input.num_layers; ++layer)
+            {
+                for (std::uint32_t expert = 0u;
+                     expert < input.num_experts;
+                     ++expert)
+                {
+                    std::uint32_t owner_count = 0u;
+                    for (std::uint32_t participant = 0u;
+                         participant < input.participants.size();
+                         ++participant)
+                    {
+                        const auto word = input.collected_state[
+                            (static_cast<std::size_t>(participant) *
+                                 input.num_layers +
+                             layer) *
+                                input.num_experts +
+                            expert];
+                        if (moe_rebalance_policy::
+                                collectedStateAuthoritativeOwner(word))
+                        {
+                            owners[static_cast<std::size_t>(layer) *
+                                       input.num_experts +
+                                   expert] = participant;
+                            ++owner_count;
+                        }
+                    }
+                    if (owner_count != 1u)
+                    {
+                        throw std::logic_error(
+                            "test snapshot does not have exactly one initial owner");
+                    }
+                }
+            }
+            return owners;
         }
 
         /** Publish one group's complete setup-only differential snapshot. */
@@ -1555,6 +1746,13 @@ namespace llaminar2::test
             OmitFirstDestinationArrival,
         };
 
+        /** Durable device-authority objective exercised by the publication rig. */
+        enum class RuntimeCandidateApplyObjective
+        {
+            DynamicPlacement,
+            PreparedContextRestore,
+        };
+
         /** Typed execution policy for the runtime-publication integration rig. */
         struct RuntimeCandidateApplyOptions
         {
@@ -1565,6 +1763,9 @@ namespace llaminar2::test
             bool exercise_reader_grace_period = false;
             RuntimeCandidateApplyFault fault =
                 RuntimeCandidateApplyFault::None;
+            /** Select ordinary optimization or terminal prepared-owner repair. */
+            RuntimeCandidateApplyObjective objective =
+                RuntimeCandidateApplyObjective::DynamicPlacement;
         };
 
         /**
@@ -1601,11 +1802,31 @@ namespace llaminar2::test
                 return false;
             }
             *evidence = {};
+            const bool prepared_context_restore =
+                options.objective ==
+                RuntimeCandidateApplyObjective::PreparedContextRestore;
+            const auto transaction_kind = prepared_context_restore
+                ? MoEOverlayDeviceControllerTransactionKind::
+                      PreparedContextRestore
+                : MoEOverlayDeviceControllerTransactionKind::
+                      DynamicPlacement;
+            const auto demand_phase = prepared_context_restore
+                ? MoEOverlayDeviceDemandPhase::Invalid
+                : MoEOverlayDeviceDemandPhase::Prefill;
+            const auto author_action = prepared_context_restore
+                ? MoEOverlayDeviceControllerAction::
+                      AuthorPreparedContextRestore
+                : MoEOverlayDeviceControllerAction::AuthorDynamicPolicy;
             const std::uint64_t initial_epoch =
                 transport_bindings.empty()
                     ? 0u
                     : transport_bindings.front()
                           .controller->current_durable_epoch;
+            const std::uint64_t prior_transaction =
+                transport_bindings.empty()
+                    ? 0u
+                    : transport_bindings.front()
+                          .controller->command_transaction;
             if (initial_epoch == 0u)
             {
                 if (error)
@@ -1786,13 +2007,18 @@ namespace llaminar2::test
                 return false;
             }
 
-            const auto enqueue_action = [policy_device](
+            const auto enqueue_action = [policy_device,
+                                         transaction_kind,
+                                         demand_phase,
+                                         author_action](
                                             Endpoint &endpoint,
                                             MoEOverlayDeviceControllerAction action)
             {
                 const bool policy_action =
                     action ==
                         MoEOverlayDeviceControllerAction::AuthorDynamicPolicy ||
+                    action == MoEOverlayDeviceControllerAction::
+                                  AuthorPreparedContextRestore ||
                     action ==
                         MoEOverlayDeviceControllerAction::PublishCommand;
                 return endpoint.kernel->runMoEOverlayDeviceControllerAction(
@@ -1804,18 +2030,15 @@ namespace llaminar2::test
                             action ==
                                     MoEOverlayDeviceControllerAction::
                                         BeginTransaction
-                                ? MoEOverlayDeviceControllerTransactionKind::
-                                      DynamicPlacement
+                                ? transaction_kind
                                 : MoEOverlayDeviceControllerTransactionKind::
                                       Invalid,
                         .demand_phase =
                             action ==
                                     MoEOverlayDeviceControllerAction::
                                         BeginTransaction ||
-                                    action ==
-                                        MoEOverlayDeviceControllerAction::
-                                            AuthorDynamicPolicy
-                                ? MoEOverlayDeviceDemandPhase::Prefill
+                                    action == author_action
+                                ? demand_phase
                                 : MoEOverlayDeviceDemandPhase::Invalid,
                         .policy_result = policy_action
                                              ? static_cast<
@@ -1956,10 +2179,14 @@ namespace llaminar2::test
             }
             submitted = submitted && enqueue_action(
                 *leader,
-                MoEOverlayDeviceControllerAction::AuthorDynamicPolicy);
+                author_action);
             submitted = submitted && enqueue_action(
                 *leader,
                 MoEOverlayDeviceControllerAction::PublishCommand);
+            submitted = submitted && enqueue_action(
+                *leader,
+                MoEOverlayDeviceControllerAction::
+                    CompleteEmptyDynamicDecision);
 
             struct TransportResult
             {
@@ -1985,6 +2212,7 @@ namespace llaminar2::test
                          &topology,
                          &fixture_for,
                          options,
+                         prior_transaction,
                          &result = transport_results[index]]
                         {
                             MoEOverlayDeviceTransportProtocol protocol(binding);
@@ -1994,7 +2222,8 @@ namespace llaminar2::test
                             MoEOverlayDeviceTransportAcquireResult acquired;
                             while (std::chrono::steady_clock::now() < deadline)
                             {
-                                acquired = protocol.tryAcquire(0u);
+                                acquired = protocol.tryAcquire(
+                                    prior_transaction);
                                 if (acquired.status !=
                                     MoEOverlayDeviceTransportAcquireStatus::
                                         Waiting)
@@ -2307,7 +2536,7 @@ namespace llaminar2::test
                 }
             }
 
-            if (options.complete_epoch && submitted)
+            if (options.complete_epoch && submitted && !observed_no_movement)
             {
                 // Fan in complete inactive-bank construction at each group
                 // root, then let the sole authority open topology-wide commit.
@@ -2581,6 +2810,66 @@ namespace llaminar2::test
                     submitted = submitted && all_retired;
                 }
 
+                if (!options.exercise_reader_grace_period && submitted &&
+                    !observed_no_movement)
+                {
+                    /* Match the retained production Publish -> Retire edge.
+                     * The mapped readiness words are scheduler receipts only;
+                     * they carry no placement state. Once every participant
+                     * has proved the old bank reader-free, submit all local
+                     * retirement graphs as one independent wavefront. */
+                    const auto readiness_deadline =
+                        std::chrono::steady_clock::now() +
+                        std::chrono::seconds(5);
+                    bool topology_ready = false;
+                    while (std::chrono::steady_clock::now() <
+                           readiness_deadline)
+                    {
+                        topology_ready = std::all_of(
+                            endpoints.begin(),
+                            endpoints.end(),
+                            [initial_epoch](const Endpoint &endpoint)
+                            {
+                                return endpoint.binding
+                                           .local_participant_record
+                                           ->retirement_ready_epoch ==
+                                    initial_epoch;
+                            });
+                        if (topology_ready)
+                            break;
+                        const auto controller_state =
+                            std::atomic_ref<const std::uint32_t>(
+                                transport_bindings.front()
+                                    .controller->state)
+                                .load(std::memory_order_acquire);
+                        if (controller_state ==
+                            static_cast<std::uint32_t>(
+                                MoEOverlayDeviceControllerState::Error))
+                        {
+                            break;
+                        }
+                        std::this_thread::yield();
+                    }
+                    const bool authority_rejected =
+                        std::atomic_ref<const std::uint32_t>(
+                            transport_bindings.front().controller->state)
+                            .load(std::memory_order_acquire) ==
+                        static_cast<std::uint32_t>(
+                            MoEOverlayDeviceControllerState::Error);
+                    submitted = submitted &&
+                        (topology_ready || authority_rejected);
+                    if (topology_ready)
+                    {
+                        for (auto &endpoint : endpoints)
+                        {
+                            note_submission(enqueue_action(
+                                endpoint,
+                                MoEOverlayDeviceControllerAction::
+                                    PublishRuntimeRetirement));
+                        }
+                    }
+                }
+
                 // Only a successful device-owned retirement lets the physical
                 // workers publish their completion words and release these
                 // group/leader fan-in actions.
@@ -2598,6 +2887,21 @@ namespace llaminar2::test
                     *leader,
                     MoEOverlayDeviceControllerAction::
                         CompleteDynamicRetirement));
+                for (auto &endpoint : endpoints)
+                {
+                    note_submission(enqueue_action(
+                        endpoint,
+                        MoEOverlayDeviceControllerAction::
+                            AwaitTransactionComplete));
+                }
+            }
+
+            if (options.complete_epoch && submitted && observed_no_movement)
+            {
+                /* The retained production author graph closes an empty
+                 * durable decision immediately. Every non-authority graph
+                 * consumes that exact terminal word; no synthetic
+                 * prepare/commit/retire lifecycle is manufactured. */
                 for (auto &endpoint : endpoints)
                 {
                     note_submission(enqueue_action(
@@ -3020,6 +3324,7 @@ namespace llaminar2::test
                     .initial_durable_epoch = policy_input.base_epoch,
                     .payload_bytes_per_layer =
                         policy_input.payload_bytes_per_layer,
+                    .initial_owner_participants = initialOwners(policy_input),
                     .minimum_window_activations =
                         policy_input.minimum_window_activations,
                     .maximum_cycles_per_wave =
@@ -3426,6 +3731,8 @@ namespace llaminar2::test
         };
         command.header.kind = static_cast<std::uint32_t>(
             MoEOverlayDeviceControllerTransactionKind::DynamicPlacement);
+        command.header.demand_phase = static_cast<std::uint32_t>(
+            MoEOverlayDeviceDemandPhase::Decode);
         command.header.command_count = static_cast<std::uint32_t>(
             command.entries.size());
         command.header.topology_fingerprint =
@@ -3482,6 +3789,110 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         DeviceAuthoredTwoCycleWaveAdvancesBothIndependentPlacementAxes)
+    {
+        IBackend *const cuda = getCUDABackend();
+        IBackend *const rocm = getROCmBackend();
+        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
+            rocm->deviceCount() < 4)
+        {
+            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
+        }
+
+        const auto resolved_topology = topology();
+        const auto policy_input = boundedTwoAxisPolicyInput();
+        const auto expected =
+            MoEOverlayDevicePlacementPolicyReference::planDynamic(
+                policy_input);
+        ASSERT_EQ(expected.evidence.accepted_cycles, 2u);
+        ASSERT_GT(expected.evidence.promotions, 0u);
+        ASSERT_GT(expected.evidence.demotions, 0u);
+        ASSERT_GT(expected.evidence.same_priority_moves, 0u);
+
+        auto fabrics = makeControllerFabricPair(
+            resolved_topology, policy_input);
+        publishSyntheticEconomy(
+            *fabrics.cuda_rank,
+            *fabrics.rocm_rank,
+            *resolved_topology,
+            policy_input.num_layers);
+        const auto participant_bindings = allParticipantBindings(
+            *fabrics.cuda_rank, *fabrics.rocm_rank);
+        const auto transport_bindings = allTransportBindings(
+            *fabrics.cuda_rank, *fabrics.rocm_rank);
+
+        std::vector<std::unique_ptr<
+            MoEOverlayDeviceRuntimePublicationFixture>> fixtures;
+        fixtures.reserve(resolved_topology->participants.size());
+        for (const auto &participant : resolved_topology->participants)
+        {
+            IBackend *const backend =
+                participant.device.type == DeviceType::CUDA ? cuda : rocm;
+            const auto binding = std::find_if(
+                participant_bindings.begin(),
+                participant_bindings.end(),
+                [&participant](const auto &candidate)
+                {
+                    return candidate.participant_id ==
+                           participant.participant_id;
+                });
+            ASSERT_NE(binding, participant_bindings.end());
+            fixtures.push_back(std::make_unique<
+                MoEOverlayDeviceRuntimePublicationFixture>(
+                backend,
+                participant,
+                *resolved_topology,
+                policy_input,
+                &binding->controller->admission_epoch,
+                binding->lifetime));
+        }
+
+        RuntimeCandidateApplyEvidence observed;
+        std::string error;
+        ASSERT_TRUE(runRuntimeCandidateApply(
+            cuda,
+            rocm,
+            *resolved_topology,
+            participant_bindings,
+            transport_bindings,
+            fixtures,
+            &observed,
+            &error,
+            RuntimeCandidateApplyOptions{.complete_epoch = true})) << error;
+        ASSERT_EQ(observed.policy.accepted_cycles, 2u);
+        ASSERT_EQ(observed.commands.size(), expected.commands.size());
+        EXPECT_EQ(
+            observed.policy.command_digest,
+            commandDigest(
+                expected.commands.data(),
+                static_cast<std::uint32_t>(expected.commands.size())));
+
+        bool advances_tier = false;
+        bool advances_participant = false;
+        for (std::size_t index = 0u;
+             index < observed.commands.size();
+             ++index)
+        {
+            EXPECT_EQ(
+                std::memcmp(
+                    &observed.commands[index],
+                    &expected.commands[index],
+                    sizeof(MoEOverlayDeviceMovementCommand)),
+                0) << "device/CPU command ABI mismatch at ordinal " << index;
+            const auto axis = static_cast<MoEOverlayDeviceMovementAxis>(
+                observed.commands[index].flags);
+            advances_tier = advances_tier ||
+                axis == MoEOverlayDeviceMovementAxis::TierResidency ||
+                axis == MoEOverlayDeviceMovementAxis::Combined;
+            advances_participant = advances_participant ||
+                axis == MoEOverlayDeviceMovementAxis::ParticipantPlacement ||
+                axis == MoEOverlayDeviceMovementAxis::Combined;
+        }
+        EXPECT_TRUE(advances_tier);
+        EXPECT_TRUE(advances_participant);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
          DeviceAuthoredDynamicRetirementDoesNotBlockNewCudaOrRocmReaders)
     {
         IBackend *const cuda = getCUDABackend();
@@ -3517,6 +3928,7 @@ namespace llaminar2::test
                 .initial_durable_epoch = policy_input.base_epoch,
                 .payload_bytes_per_layer =
                     policy_input.payload_bytes_per_layer,
+                .initial_owner_participants = initialOwners(policy_input),
                 .minimum_window_activations =
                     policy_input.minimum_window_activations,
                 .maximum_cycles_per_wave =
@@ -3656,7 +4068,7 @@ namespace llaminar2::test
             observed.controller.candidate_epoch,
             policy_input.base_epoch + 1u);
         EXPECT_EQ(
-            observed.controller.dynamic_layer_cursor,
+            observed.controller.placement_layer_cursor,
             expected.evidence.layer_scan_next);
         EXPECT_EQ(observed.policy.command_count, expected.commands.size());
         EXPECT_EQ(
@@ -3897,6 +4309,251 @@ namespace llaminar2::test
         }
     }
 
+    /**
+     * @brief Restore a moved CUDA/ROCm runtime to its immutable prepared owners.
+     *
+     * The test executes the exact retained durable transaction family three
+     * times: one economical Dynamic movement, one inverse restoration wave,
+     * and one zero-command restoration certification. The terminal proof
+     * checks every active runtime descriptor against the loader-era owner
+     * table and also proves restoration did not rewrite optimization
+     * hysteresis or its placement scan cursor.
+     */
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         DeviceAuthoredPreparedContextRestoreReturnsEveryRuntimeOwnerExactly)
+    {
+        IBackend *const cuda = getCUDABackend();
+        IBackend *const rocm = getROCmBackend();
+        if (!cuda || !rocm || cuda->deviceCount() < 2 ||
+            rocm->deviceCount() < 4)
+        {
+            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
+        }
+
+        const auto resolved_topology = topology();
+        const auto policy_input = adversarialPolicyInput();
+        const auto prepared_owners = initialOwners(policy_input);
+        const auto expected_dynamic =
+            MoEOverlayDevicePlacementPolicyReference::planDynamic(
+                policy_input);
+        ASSERT_TRUE(expected_dynamic.hasMovement());
+
+        auto fabrics = makeControllerFabricPair(
+            resolved_topology, policy_input);
+        publishSyntheticEconomy(
+            *fabrics.cuda_rank,
+            *fabrics.rocm_rank,
+            *resolved_topology,
+            policy_input.num_layers);
+        const auto participant_bindings = allParticipantBindings(
+            *fabrics.cuda_rank, *fabrics.rocm_rank);
+        const auto transport_bindings = allTransportBindings(
+            *fabrics.cuda_rank, *fabrics.rocm_rank);
+
+        std::vector<std::unique_ptr<
+            MoEOverlayDeviceRuntimePublicationFixture>> fixtures;
+        fixtures.reserve(resolved_topology->participants.size());
+        for (const auto &participant : resolved_topology->participants)
+        {
+            IBackend *const backend =
+                participant.device.type == DeviceType::CUDA ? cuda : rocm;
+            const auto binding = std::find_if(
+                participant_bindings.begin(),
+                participant_bindings.end(),
+                [&participant](const auto &candidate)
+                {
+                    return candidate.participant_id ==
+                        participant.participant_id;
+                });
+            ASSERT_NE(binding, participant_bindings.end());
+            fixtures.push_back(std::make_unique<
+                MoEOverlayDeviceRuntimePublicationFixture>(
+                backend,
+                participant,
+                *resolved_topology,
+                policy_input,
+                &binding->controller->admission_epoch,
+                binding->lifetime));
+        }
+
+        RuntimeCandidateApplyEvidence dynamic;
+        RuntimeCandidateApplyEvidence restored;
+        RuntimeCandidateApplyEvidence certified;
+        std::string error;
+        ASSERT_TRUE(runRuntimeCandidateApply(
+            cuda,
+            rocm,
+            *resolved_topology,
+            participant_bindings,
+            transport_bindings,
+            fixtures,
+            &dynamic,
+            &error,
+            RuntimeCandidateApplyOptions{
+                .complete_epoch = true,
+            })) << error;
+        ASSERT_FALSE(dynamic.commands.empty());
+        ASSERT_EQ(
+            dynamic.command.kind,
+            static_cast<std::uint32_t>(
+                MoEOverlayDeviceControllerTransactionKind::
+                    DynamicPlacement));
+
+        ASSERT_TRUE(runRuntimeCandidateApply(
+            cuda,
+            rocm,
+            *resolved_topology,
+            participant_bindings,
+            transport_bindings,
+            fixtures,
+            &restored,
+            &error,
+            RuntimeCandidateApplyOptions{
+                .complete_epoch = true,
+                .objective = RuntimeCandidateApplyObjective::
+                    PreparedContextRestore,
+            })) << error;
+        ASSERT_FALSE(restored.commands.empty());
+        EXPECT_EQ(
+            restored.command.kind,
+            static_cast<std::uint32_t>(
+                MoEOverlayDeviceControllerTransactionKind::
+                    PreparedContextRestore));
+        EXPECT_EQ(
+            restored.command.demand_phase,
+            static_cast<std::uint32_t>(
+                MoEOverlayDeviceDemandPhase::Invalid));
+        EXPECT_EQ(
+            restored.controller.current_durable_epoch,
+            policy_input.base_epoch + 2u);
+        EXPECT_EQ(
+            restored.controller.admission_epoch,
+            policy_input.base_epoch + 2u);
+        EXPECT_EQ(restored.command.projected_service_gain_ns, 0u);
+        EXPECT_EQ(restored.command.projected_transfer_and_repack_ns, 0u);
+        EXPECT_EQ(restored.command.projected_inference_interference_ns, 0u);
+        EXPECT_EQ(restored.command.projected_net_benefit_ns, 0);
+        EXPECT_EQ(
+            restored.economy_last_moved,
+            dynamic.economy_last_moved)
+            << "Prepared-context repair cannot become Dynamic hysteresis";
+        EXPECT_EQ(
+            restored.controller.placement_layer_cursor,
+            dynamic.controller.placement_layer_cursor)
+            << "Prepared-context repair cannot advance the policy scan";
+
+        ASSERT_EQ(restored.commands.size(), dynamic.commands.size());
+        for (const auto &moved : dynamic.commands)
+        {
+            const auto inverse = std::find_if(
+                restored.commands.begin(),
+                restored.commands.end(),
+                [&moved](const auto &candidate)
+                {
+                    return candidate.layer == moved.layer &&
+                        candidate.expert == moved.expert &&
+                        candidate.source_participant ==
+                            moved.destination_participant &&
+                        candidate.destination_participant ==
+                            moved.source_participant;
+                });
+            EXPECT_NE(inverse, restored.commands.end())
+                << "Missing inverse restoration for layer " << moved.layer
+                << " expert " << moved.expert;
+        }
+
+        ASSERT_TRUE(runRuntimeCandidateApply(
+            cuda,
+            rocm,
+            *resolved_topology,
+            participant_bindings,
+            transport_bindings,
+            fixtures,
+            &certified,
+            &error,
+            RuntimeCandidateApplyOptions{
+                .complete_epoch = true,
+                .expect_no_movement = true,
+                .objective = RuntimeCandidateApplyObjective::
+                    PreparedContextRestore,
+            })) << error;
+        EXPECT_TRUE(certified.commands.empty());
+        EXPECT_EQ(
+            certified.command.kind,
+            static_cast<std::uint32_t>(
+                MoEOverlayDeviceControllerTransactionKind::
+                    PreparedContextRestore));
+        EXPECT_EQ(
+            certified.command.base_epoch,
+            restored.controller.current_durable_epoch);
+        EXPECT_EQ(
+            certified.command.candidate_epoch,
+            restored.controller.current_durable_epoch);
+        EXPECT_EQ(
+            certified.controller.current_durable_epoch,
+            restored.controller.current_durable_epoch);
+        EXPECT_EQ(
+            certified.controller.completed_transaction,
+            certified.controller.transaction_id);
+        EXPECT_EQ(
+            certified.economy_last_moved,
+            dynamic.economy_last_moved);
+        EXPECT_EQ(
+            certified.controller.placement_layer_cursor,
+            dynamic.controller.placement_layer_cursor);
+        EXPECT_EQ(certified.transport_groups_prepared, 0u);
+        EXPECT_EQ(certified.transport_groups_published, 0u);
+        EXPECT_EQ(certified.transport_groups_retired, 0u);
+
+        ASSERT_EQ(certified.runtime_layers.size(), fixtures.size());
+        for (std::uint32_t layer = 0u;
+             layer < policy_input.num_layers;
+             ++layer)
+        {
+            for (std::uint32_t expert = 0u;
+                 expert < policy_input.num_experts;
+                 ++expert)
+            {
+                const std::uint32_t expected_owner = prepared_owners[
+                    static_cast<std::size_t>(layer) *
+                        policy_input.num_experts +
+                    expert];
+                std::uint32_t active_owner_count = 0u;
+                for (std::size_t fixture_index = 0u;
+                     fixture_index < fixtures.size();
+                     ++fixture_index)
+                {
+                    const auto &runtime =
+                        certified.runtime_layers[fixture_index].at(layer);
+                    ASSERT_LT(
+                        runtime.active_bank,
+                        kDeviceMoEOverlayEpochBankCount);
+                    EXPECT_EQ(
+                        runtime.active_epoch,
+                        restored.controller.current_durable_epoch);
+                    const auto &descriptor =
+                        runtime.banks[runtime.active_bank].experts[expert];
+                    const bool owns = hasMoEExpertFlag(
+                        descriptor.flags,
+                        DeviceMoEExpertFlags::LocalCompute);
+                    if (!owns)
+                        continue;
+                    ++active_owner_count;
+                    EXPECT_EQ(
+                        fixtures[fixture_index]->participantId(),
+                        static_cast<int>(expected_owner));
+                    EXPECT_EQ(
+                        descriptor.logical_expert_id,
+                        static_cast<std::int32_t>(expert));
+                    EXPECT_TRUE(descriptor.weightsReady());
+                }
+                EXPECT_EQ(active_owner_count, 1u)
+                    << "Prepared owner multiplicity mismatch at layer "
+                    << layer << " expert " << expert;
+            }
+        }
+    }
+
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
          DeviceAuthoredDynamicNoMovementCompletesWithoutDescriptorOrEpochMutation)
     {
@@ -3932,6 +4589,7 @@ namespace llaminar2::test
                 .initial_durable_epoch = policy_input.base_epoch,
                 .payload_bytes_per_layer =
                     policy_input.payload_bytes_per_layer,
+                .initial_owner_participants = initialOwners(policy_input),
                 .minimum_window_activations =
                     policy_input.minimum_window_activations,
                 .maximum_cycles_per_wave =
@@ -4117,6 +4775,7 @@ namespace llaminar2::test
                 .initial_durable_epoch = policy_input.base_epoch,
                 .payload_bytes_per_layer =
                     policy_input.payload_bytes_per_layer,
+                .initial_owner_participants = initialOwners(policy_input),
                 .minimum_window_activations =
                     policy_input.minimum_window_activations,
                 .maximum_cycles_per_wave =
@@ -4343,6 +5002,7 @@ namespace llaminar2::test
                 .initial_durable_epoch = policy_input.base_epoch,
                 .payload_bytes_per_layer =
                     policy_input.payload_bytes_per_layer,
+                .initial_owner_participants = initialOwners(policy_input),
                 .minimum_window_activations =
                     policy_input.minimum_window_activations,
                 .maximum_cycles_per_wave =
@@ -4462,7 +5122,7 @@ namespace llaminar2::test
             observed.controller.candidate_epoch,
             policy_input.base_epoch + 1u);
         EXPECT_EQ(
-            observed.controller.dynamic_layer_cursor,
+            observed.controller.placement_layer_cursor,
             expected.evidence.layer_scan_next);
         EXPECT_EQ(observed.transport_groups_prepared, transport_bindings.size());
 
@@ -5211,6 +5871,12 @@ namespace llaminar2::test
         ASSERT_EQ(rocm_service->localGraphCount(), 4u);
         ASSERT_TRUE(cuda_service->ownsLeaderGraph());
         ASSERT_FALSE(rocm_service->ownsLeaderGraph());
+        EXPECT_EQ(
+            cuda_service->state(),
+            MoEOverlayDeviceControllerActivationState::Prepared);
+        EXPECT_EQ(
+            rocm_service->state(),
+            MoEOverlayDeviceControllerActivationState::Prepared);
 
         bool cuda_ok = false;
         bool rocm_ok = false;
@@ -5232,6 +5898,22 @@ namespace llaminar2::test
         rocm_certifier.join();
         EXPECT_TRUE(cuda_ok) << cuda_message;
         EXPECT_TRUE(rocm_ok) << rocm_message;
+
+        /*
+         * Static certification is setup work, not implicit service
+         * activation. Mirror the production post-capture edge explicitly and
+         * prove both backend owners reject a second transition.
+         */
+        cuda_service->start();
+        rocm_service->start();
+        EXPECT_EQ(
+            cuda_service->state(),
+            MoEOverlayDeviceControllerActivationState::Running);
+        EXPECT_EQ(
+            rocm_service->state(),
+            MoEOverlayDeviceControllerActivationState::Running);
+        EXPECT_THROW(cuda_service->start(), std::logic_error);
+        EXPECT_THROW(rocm_service->start(), std::logic_error);
     }
 
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,

@@ -3810,6 +3810,9 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             source,
         )
         self.assertIn("reduceNativeVNNIKTilePartialsExact", source)
+        # Every materialized K-partial path must terminate in the one exact
+        # reduction primitive: standalone serial/grouped execution and the
+        # layer-batched local/fused variants account for these six call sites.
         self.assertEqual(
             len(
                 re.findall(
@@ -3818,7 +3821,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
                     flags=re.MULTILINE,
                 )
             ),
-            4,
+            6,
         )
         self.assertEqual(source.count("_mm512_loadu_ps(base)"), 1)
         self.assertIn("grouped_k_parallel_row_tiles", source)

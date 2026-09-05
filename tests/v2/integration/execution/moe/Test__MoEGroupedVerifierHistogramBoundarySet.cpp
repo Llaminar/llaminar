@@ -12,10 +12,14 @@
 
 #include <gtest/gtest.h>
 
+#include "execution/moe/MoEOverlayEconomyProfileComposer.h"
 #include "execution/moe/MoEGroupedVerifierHistogramBoundarySet.h"
 
+#include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace llaminar2::test
 {
@@ -70,6 +74,14 @@ namespace llaminar2::test
             bool prepareGroupedVerifierHistogramProducer(void *) override
             {
                 ++prepare_calls;
+                return true;
+            }
+
+            /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+            bool transitionGroupedVerifierHistogramProducerCapture(
+                void *,
+                RuntimeHistogramProducerCaptureTransition) override
+            {
                 return true;
             }
 
@@ -228,5 +240,63 @@ namespace llaminar2::test
         EXPECT_EQ(
             missing_boundary_set.state(),
             MoEGroupedVerifierHistogramBoundarySet::State::Faulted);
+    }
+
+    /**
+     * @brief Fixed-depth MTP retains main-model serial catch-up service.
+     *
+     * Production can execute a one-row main-model decode transaction before a
+     * grouped verifier transaction, notably for short tails and terminal
+     * catch-up. Feed that observation through the economy normalizer: it must
+     * remain legal graph evidence without becoming a recurring service cost or
+     * blocking fixed-depth MTP certification. Predictor-only retained layers
+     * remain grouped-verifier-only and are checked independently below.
+     */
+    TEST(MoEGroupedVerifierHistogramBoundarySet,
+         RetainedMTPTopologyAcceptsMainDecodeCatchupEvidence)
+    {
+        const auto topology =
+            ExpertHistogramProductionTopology::forRetainedExecution(
+                /*retained_layer_count=*/2,
+                /*main_inference_layer_count=*/1,
+                ExpertHistogramServingRegime::PositiveDepthMTP);
+
+        std::vector<MoEOverlayParticipantLayerServiceTotals> totals{
+            {
+                .participant_id = 4,
+                .layer = 0,
+                .total_nanoseconds = {100, 200, 300},
+                .activation_count = {1, 2, 3},
+                .sample_count = {1, 1, 1},
+            },
+            {
+                .participant_id = 4,
+                .layer = 1,
+                .total_nanoseconds = {0, 0, 400},
+                .activation_count = {0, 0, 4},
+                .sample_count = {0, 0, 1},
+            },
+        };
+
+        const auto normalized =
+            MoEOverlayEconomyProfileComposer::normalizeServiceTotals(
+                totals, topology);
+        ASSERT_EQ(normalized.size(), 2u);
+        EXPECT_EQ(
+            normalized[0].nanoseconds_per_activation,
+            (std::array<std::uint64_t, 3>{0, 100, 100}));
+        EXPECT_EQ(
+            normalized[1].nanoseconds_per_activation,
+            (std::array<std::uint64_t, 3>{0, 0, 100}));
+
+        // An auxiliary predictor layer still cannot masquerade as serial
+        // decode; only the main-model catch-up coordinate is reachable.
+        totals[1].total_nanoseconds[0] = 1;
+        totals[1].activation_count[0] = 1;
+        totals[1].sample_count[0] = 1;
+        EXPECT_THROW(
+            (void)MoEOverlayEconomyProfileComposer::normalizeServiceTotals(
+                totals, topology),
+            std::invalid_argument);
     }
 }

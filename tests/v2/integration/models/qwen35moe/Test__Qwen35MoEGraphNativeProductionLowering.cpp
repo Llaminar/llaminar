@@ -411,7 +411,7 @@ namespace llaminar2::test
          * transaction rather than serialized sparse collectives.
          */
         std::shared_ptr<MoERoutedExpertPlacementPlan>
-        makeDistributedLocalTPContinuationPlan()
+        makeDistributedLocalTPContinuationPlan(int layer_count = 1)
         {
             auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             plan->enabled = true;
@@ -448,13 +448,16 @@ namespace llaminar2::test
                 tier("priority_0", "continuation_domain", 0),
                 tier("priority_1", "remote_domain", 1, true),
             };
-            plan->placements.push_back(RoutedExpertLayerPlacement{
-                .layer = 0,
-                .routed_expert_tier = {0, 0, 1, 1, 1, 1},
-            });
+            for (int layer = 0; layer < layer_count; ++layer)
+            {
+                plan->placements.push_back(RoutedExpertLayerPlacement{
+                    .layer = layer,
+                    .routed_expert_tier = {0, 0, 1, 1, 1, 1},
+                });
+            }
             validateMoERoutedExpertPlacementPlanOrThrow(
                 *plan,
-                {.layer_count = 1,
+                {.layer_count = layer_count,
                  .routed_expert_count = kNumExperts});
             return plan;
         }
@@ -791,6 +794,86 @@ namespace llaminar2::test
             buffers.extensions[BufferId::MOE_GATE_SCRATCH] = arena.fp32({rows, kIntermediate});
             buffers.extensions[BufferId::MOE_UP_SCRATCH] = arena.fp32({rows, kIntermediate});
             return buffers;
+        }
+
+        /**
+         * @brief Build one complete MoE predictor block for GPU graph lowering.
+         *
+         * The sidecar borrows the routed/shared expert tensors from @p moe_layer
+         * and adds the attention and predictor-only weights required by the
+         * public `buildMTPGraph()` entrypoint. Tensor values are irrelevant to
+         * declarative lowering, but every pointer and shape is production-valid.
+         */
+        MTPDepthWeights makeMTPSidecarWeights(
+            TensorArena &arena,
+            const LayerWeights &moe_layer,
+            int source_layer_index)
+        {
+            const size_t d_model = static_cast<size_t>(kDModel);
+            const size_t q_dim = 8u;
+            const size_t kv_dim = 8u;
+
+            MTPDepthWeights weights;
+            weights.depth_index = 0;
+            weights.source_layer_index = source_layer_index;
+            weights.nextn_block_layout = true;
+            weights.fc = arena.fp32({d_model, 2u * d_model});
+            weights.pre_fc_norm_hidden = arena.fp32({d_model});
+            weights.pre_fc_norm_embedding = arena.fp32({d_model});
+            weights.final_norm = arena.fp32({d_model});
+            weights.fa_block = moe_layer;
+            weights.fa_block.attn_norm = arena.fp32({d_model});
+            weights.fa_block.wq = arena.fp32({2u * q_dim, d_model});
+            weights.fa_block.wk = arena.fp32({kv_dim, d_model});
+            weights.fa_block.wv = arena.fp32({kv_dim, d_model});
+            weights.fa_block.wo = arena.fp32({d_model, q_dim});
+            weights.fa_block.q_norm = arena.fp32({4u});
+            weights.fa_block.k_norm = arena.fp32({4u});
+            return weights;
+        }
+
+        /**
+         * @brief Allocate every stable output bound by a one-row MoE sidecar.
+         * @param arena Owner whose lifetime encloses the constructed graph.
+         * @return Complete non-owning MTP output bundle.
+         */
+        MTPForwardOutput makeMTPSidecarOutput(TensorArena &arena)
+        {
+            constexpr size_t rows = 1u;
+            constexpr size_t q_dim = 8u;
+            constexpr size_t kv_dim = 8u;
+            MTPForwardOutput output;
+            output.logits = arena.fp32({rows, 32u});
+            output.hidden = arena.fp32({rows, kDModel});
+            output.embedding = arena.fp32({rows, kDModel});
+            output.norm_hidden = arena.fp32({rows, kDModel});
+            output.norm_embedding = arena.fp32({rows, kDModel});
+            output.concat = arena.fp32({rows, 2u * kDModel});
+            output.projected = arena.fp32({rows, kDModel});
+            output.q = arena.fp32({rows, q_dim});
+            output.k = arena.fp32({rows, kv_dim});
+            output.v = arena.fp32({rows, kv_dim});
+            output.q_raw = arena.fp32({rows, 2u * q_dim});
+            output.q_gate = arena.fp32({rows, q_dim});
+            output.attn_output = arena.fp32({rows, q_dim});
+            output.attn_proj = arena.fp32({rows, kDModel});
+            output.gate = arena.fp32({rows, 16u});
+            output.up = arena.fp32({rows, 16u});
+            output.ffn_output = arena.fp32({rows, kDModel});
+            output.moe_expert_indices = arena.fp32({rows, kTopK});
+            output.moe_expert_weights = arena.fp32({rows, kTopK});
+            output.moe_combined_output = arena.fp32({rows, kDModel});
+            output.moe_canonical_route_contributions = arena.fp32(
+                {rows,
+                 static_cast<size_t>(kTopK + 2) *
+                     static_cast<size_t>(kDModel)});
+            output.moe_shared_expert_output =
+                arena.fp32({rows, kDModel});
+            output.moe_gate_scratch =
+                arena.fp32({rows, kIntermediate});
+            output.moe_up_scratch =
+                arena.fp32({rows, kIntermediate});
+            return output;
         }
 
         size_t countStagesOfType(const ComputeGraph &graph, ComputeStageType type)
@@ -1285,6 +1368,17 @@ namespace llaminar2::test
         auto controller_topology = std::make_shared<
             const MoEOverlayDeviceControllerTopology>(
             std::move(controller_topology_value));
+        const auto initial_layered_ownership = owner_map.layeredOwnership(
+            /*num_layers=*/1,
+            /*num_experts=*/kNumExperts);
+        std::vector<std::uint32_t> initial_owner_participants;
+        initial_owner_participants.reserve(kNumExperts);
+        for (int expert = 0; expert < kNumExperts; ++expert)
+        {
+            initial_owner_participants.push_back(
+                static_cast<std::uint32_t>(
+                    initial_layered_ownership.owner(0, expert)));
+        }
         const auto controller_config =
             [&](const std::shared_ptr<MockMPIContext> &mpi)
         {
@@ -1296,6 +1390,8 @@ namespace llaminar2::test
                 .command_capacity = 4u,
                 .initial_durable_epoch = 1u,
                 .payload_bytes_per_layer = {4096u},
+                .initial_owner_participants =
+                    initial_owner_participants,
                 .minimum_window_activations = 1u,
                 .maximum_cycles_per_wave = 1u,
             };
@@ -1846,7 +1942,7 @@ namespace llaminar2::test
                 graph->nativeCaptureEnvelope(),
                 GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
             EXPECT_FALSE(
-                makeMoEOverlayRetainedParentComposer(*graph).has_value())
+                makeMoEOverlayRetainedParentPlan(*graph).has_value())
                 << "Conditional attention and mapped packet edges must live "
                    "in one directly captured endpoint graph, never in CUDA "
                    "child graphs";
@@ -1869,7 +1965,9 @@ namespace llaminar2::test
     void assertDistributedLocalTPContinuationCapture(
         MoEOverlayNodeLocalRouteTransport route_transport)
     {
-        auto plan = makeDistributedLocalTPContinuationPlan();
+        constexpr int kMTPSourceLayer = 1;
+        auto plan = makeDistributedLocalTPContinuationPlan(
+            /*layer_count=*/kMTPSourceLayer + 1);
         auto overlay_mpi =
             std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/2);
         overlay_mpi->set_topology(
@@ -1930,10 +2028,21 @@ namespace llaminar2::test
         ASSERT_NE(model_ctx->concreteWeightManager(), nullptr);
         auto &registry =
             model_ctx->concreteWeightManager()->expertGemmRegistry();
-        registerCompleteDomainExpertLayer(
-            registry, "continuation_domain", DeviceId::rocm(0), 0);
-        registerCompleteDomainExpertLayer(
-            registry, "continuation_domain", DeviceId::rocm(1), 0);
+        for (int layer_index = 0;
+             layer_index <= kMTPSourceLayer;
+             ++layer_index)
+        {
+            registerCompleteDomainExpertLayer(
+                registry,
+                "continuation_domain",
+                DeviceId::rocm(0),
+                layer_index);
+            registerCompleteDomainExpertLayer(
+                registry,
+                "continuation_domain",
+                DeviceId::rocm(1),
+                layer_index);
+        }
 
         TensorArena weight_arena;
         auto layer = makeLayerWeights(weight_arena);
@@ -1945,10 +2054,21 @@ namespace llaminar2::test
             weight_arena.fp32({kDModel, kIntermediate});
         layer.shared_expert_gate_inp =
             weight_arena.fp32({1, kDModel});
+        const MTPDepthWeights mtp_weights = makeMTPSidecarWeights(
+            weight_arena, layer, kMTPSourceLayer);
+        ModelWeights model_weights;
+        model_weights.embedding_table =
+            weight_arena.fp32({32u, static_cast<size_t>(kDModel)});
+        model_weights.lm_head =
+            weight_arena.fp32({32u, static_cast<size_t>(kDModel)});
         TensorArena activation_arena0;
         auto buffers0 = makeActivationBuffers(activation_arena0);
+        MTPForwardOutput mtp_output0 =
+            makeMTPSidecarOutput(activation_arena0);
         TensorArena activation_arena1;
         auto buffers1 = makeActivationBuffers(activation_arena1);
+        MTPForwardOutput mtp_output1 =
+            makeMTPSidecarOutput(activation_arena1);
         ScopedDevicePublicationStream stream0(DeviceId::rocm(0));
         ScopedDevicePublicationStream stream1(DeviceId::rocm(1));
 
@@ -1969,17 +2089,19 @@ namespace llaminar2::test
                 /*rank=*/1,
                 /*world_size=*/2,
                 /*ranks_per_node=*/2));
-        const auto graph_family =
-            resolveMoEOverlayInferenceGraphFamilyIdentity(
-                model_ctx->concreteLoader(),
-                model_ctx->architecture(),
-                model_ctx->totalBlockCount(),
-                MoEOverlayMTPGraphFamilyPolicy::MainOnly,
-                /*graph_family_generation=*/1,
-                /*max_graph_rows=*/kSeqLen,
-                /*max_decode_rows=*/1,
-                config0.max_request_count,
-                /*max_mtp_draft_depth=*/0);
+        /* The test loader has no GGUF metadata to discover. Install the exact
+         * validated family that production derives from the model manifest so
+         * both mapped endpoints retain main and MTP activation slots. */
+        const MoEOverlayInferenceGraphFamilyIdentity graph_family{
+            .graph_family_generation = 1,
+            .main_layer_count = 1,
+            .mtp_source_layers = {kMTPSourceLayer},
+            .max_graph_rows = kSeqLen,
+            .max_decode_rows = 1,
+            .max_request_count = config0.max_request_count,
+            .max_mtp_draft_depth = 1,
+        };
+        ASSERT_TRUE(graph_family.valid());
         const auto transaction_topology =
             makeMoEOverlayInferenceTopologyIdentity(
                 owner_map,
@@ -2117,6 +2239,8 @@ namespace llaminar2::test
 
         Qwen35MoEGraph builder0(model_ctx, overlay_mpi, config0);
         Qwen35MoEGraph builder1(model_ctx, overlay_mpi, config1);
+        builder0.setWeights(model_weights);
+        builder1.setWeights(model_weights);
 
         /*
          * Production constructs the one-token decode family before it needs
@@ -2200,6 +2324,82 @@ namespace llaminar2::test
                 GraphLaunchPreparationPolicy::CaptureOnly);
         }
 
+        /*
+         * A predictor source layer lives immediately beyond the main-model
+         * interval in Qwen3.5. Build that exact public sidecar shape after the
+         * ordinary decode table exists, then prove the root publishes both
+         * projections of its request-pinned route epoch. This is the fast
+         * regression for the real-weight parity assertion: an `MTP0_` numeric
+         * checkpoint without these views cannot certify which moved experts
+         * actually contributed.
+         */
+        int draft_token = 1;
+        int position_id = 0;
+        MTPForwardInput mtp_input0;
+        mtp_input0.draft_token_ids = &draft_token;
+        mtp_input0.terminal_hidden = mtp_output0.projected;
+        mtp_input0.position_ids = &position_id;
+        mtp_input0.batch_size = 1;
+        mtp_input0.seq_len = 1;
+        mtp_input0.device_state_publication_stream = stream0.get();
+        mtp_input0.device = DeviceId::rocm(0);
+        MTPForwardInput mtp_input1 = mtp_input0;
+        mtp_input1.terminal_hidden = mtp_output1.projected;
+        mtp_input1.device_state_publication_stream = stream1.get();
+        mtp_input1.device = DeviceId::rocm(1);
+
+        ComputeGraph mtp_graph0 = builder0.buildMTPGraph(
+            /*depth_idx=*/0, mtp_weights, mtp_input0, mtp_output0);
+        ComputeGraph mtp_graph1 = builder1.buildMTPGraph(
+            /*depth_idx=*/0, mtp_weights, mtp_input1, mtp_output1);
+        const std::string mtp_reduce_name =
+            "MTP0_moe_overlay_continuation_routes_ordered_reduce";
+        const auto *mtp_reduce0 = dynamic_cast<
+            const MoECanonicalRouteReduceStage *>(
+            mtp_graph0.getNode(mtp_reduce_name)
+                ? mtp_graph0.getNode(mtp_reduce_name)->stage.get()
+                : nullptr);
+        const auto *mtp_reduce1 = dynamic_cast<
+            const MoECanonicalRouteReduceStage *>(
+            mtp_graph1.getNode(mtp_reduce_name)
+                ? mtp_graph1.getNode(mtp_reduce_name)->stage.get()
+                : nullptr);
+        ASSERT_NE(mtp_reduce0, nullptr);
+        ASSERT_NE(mtp_reduce1, nullptr);
+        const StageDumpInfo mtp_root_dump =
+            mtp_reduce0->getDumpInfoSnapshot();
+        const StageDumpInfo mtp_nonroot_dump =
+            mtp_reduce1->getDumpInfoSnapshot();
+        const auto has_mtp_route_output = [](
+                                              const StageDumpInfo &dump,
+                                              std::string_view name)
+        {
+            return std::any_of(
+                dump.outputs.begin(),
+                dump.outputs.end(),
+                [name](const StageDumpInfo::OutputBuffer &output)
+                {
+                    return output.name &&
+                           std::string_view(output.name) == name;
+                });
+        };
+        for (const std::string_view output_name : {
+                 "domain_route_participant_ids",
+                 "runtime_route_weights",
+                 "overlay_route_participants_bank0",
+                 "overlay_route_bank0_epoch",
+                 "overlay_route_participants_bank1",
+                 "overlay_route_bank1_epoch",
+                 "overlay_route_selected_bank",
+             })
+        {
+            EXPECT_TRUE(has_mtp_route_output(mtp_root_dump, output_name))
+                << output_name;
+            EXPECT_FALSE(
+                has_mtp_route_output(mtp_nonroot_dump, output_name))
+                << output_name;
+        }
+
         DeviceGraphExecutor::GraphSegmentCache root_capture_plan;
         DeviceGraphExecutor::GraphSegmentCache nonroot_capture_plan;
         const auto root_collectives =
@@ -2245,11 +2445,11 @@ namespace llaminar2::test
             decode_graph1.nativeCaptureEnvelope(),
             GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
         EXPECT_FALSE(
-            makeMoEOverlayRetainedParentComposer(decode_graph0).has_value())
+            makeMoEOverlayRetainedParentPlan(decode_graph0).has_value())
             << "The continuation root must capture its mapped timeline edges "
                "inside the complete endpoint graph";
         EXPECT_FALSE(
-            makeMoEOverlayRetainedParentComposer(decode_graph1).has_value())
+            makeMoEOverlayRetainedParentPlan(decode_graph1).has_value())
             << "A continuation sibling likewise owns one complete endpoint graph";
 
         size_t root_dispatch_units = 0u;
@@ -2529,8 +2729,8 @@ namespace llaminar2::test
         EXPECT_EQ(
             graph1.nativeCaptureEnvelope(),
             GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
-        EXPECT_FALSE(makeMoEOverlayRetainedParentComposer(graph0).has_value());
-        EXPECT_FALSE(makeMoEOverlayRetainedParentComposer(graph1).has_value());
+        EXPECT_FALSE(makeMoEOverlayRetainedParentPlan(graph0).has_value());
+        EXPECT_FALSE(makeMoEOverlayRetainedParentPlan(graph1).has_value());
 
         const std::string ordered_name =
             "layer0_moe_overlay_continuation_routes_ordered_reduce";
@@ -2642,17 +2842,33 @@ namespace llaminar2::test
             EXPECT_EQ(params.d_model, kDModel);
             EXPECT_EQ(params.reduction_role, expected_role);
             EXPECT_EQ(params.route_participant_id, expected_participant);
-            if (route_transport ==
-                MoEOverlayNodeLocalRouteTransport::MappedSparse)
             {
-                EXPECT_EQ(
-                    params.node_local_route_exchange,
-                    config0.moe.node_local_route_exchange)
-                    << "Every graph and bucket must retain one sparse fabric owner";
+                const bool uses_mapped_sparse_transport =
+                    route_transport ==
+                    MoEOverlayNodeLocalRouteTransport::MappedSparse;
+                if (uses_mapped_sparse_transport)
+                {
+                    EXPECT_EQ(
+                        params.node_local_route_exchange,
+                        config0.moe.node_local_route_exchange)
+                        << "Every graph and bucket must retain one sparse fabric owner";
+                }
+                else
+                {
+                    EXPECT_EQ(params.node_local_route_exchange, nullptr)
+                        << "Native NCCL/RCCL owns row transport without a mapped fabric";
+                }
                 EXPECT_NE(
                     params.domain_route_assignment.participant_ids,
                     nullptr);
-                EXPECT_NE(params.runtime_route_weights, nullptr);
+                EXPECT_TRUE(params.runtime_route_weights.validFor(
+                    static_cast<std::uint32_t>(expected_rows),
+                    static_cast<std::uint32_t>(kTopK)));
+                EXPECT_EQ(
+                    params.runtime_route_weights.projection,
+                    expected_rows == 1
+                        ? MoERuntimeRouteWeightProjection::DecodeTopK
+                        : MoERuntimeRouteWeightProjection::GroupedRouteSlots);
                 EXPECT_GE(
                     params.domain_route_assignment.capacity,
                     static_cast<std::uint32_t>(expected_rows * kTopK));
@@ -2662,9 +2878,23 @@ namespace llaminar2::test
                 EXPECT_EQ(
                     params.overlay_route_placement.expert_count,
                     static_cast<std::uint32_t>(kNumExperts));
-                EXPECT_EQ(stage->coherencePolicy(), CoherencePolicy::FULL)
-                    << "A sparse publisher is active on every participant";
-                EXPECT_FALSE(stage->isPassiveGraphCaptureNoOp());
+                const bool root = expected_role ==
+                                  MoECanonicalRouteReductionRole::RootOwner;
+                if (uses_mapped_sparse_transport)
+                {
+                    EXPECT_EQ(
+                        stage->coherencePolicy(), CoherencePolicy::FULL)
+                        << "A mapped sparse publisher is active on every participant";
+                    EXPECT_FALSE(stage->isPassiveGraphCaptureNoOp());
+                }
+                else
+                {
+                    EXPECT_EQ(
+                        stage->coherencePolicy(),
+                        root ? CoherencePolicy::FULL
+                             : CoherencePolicy::NONE);
+                    EXPECT_EQ(stage->isPassiveGraphCaptureNoOp(), !root);
+                }
 
                 const StageDumpInfo dump = stage->getDumpInfoSnapshot();
                 const auto find_output =
@@ -2710,7 +2940,7 @@ namespace llaminar2::test
                     EXPECT_STREQ(assignment_dump->dtype, "INT32");
                     EXPECT_EQ(
                         runtime_weights_dump->tensor->gpu_data_ptr(),
-                        params.runtime_route_weights);
+                        params.runtime_route_weights.weights);
                     EXPECT_EQ(runtime_weights_dump->rows,
                               static_cast<std::size_t>(expected_rows));
                     EXPECT_EQ(runtime_weights_dump->cols,
@@ -2773,22 +3003,6 @@ namespace llaminar2::test
                     EXPECT_EQ(bank1_epoch_dump, dump.outputs.end());
                     EXPECT_EQ(selected_bank_dump, dump.outputs.end());
                 }
-            }
-            else
-            {
-                EXPECT_EQ(params.node_local_route_exchange, nullptr);
-                EXPECT_EQ(
-                    params.domain_route_assignment.participant_ids,
-                    nullptr);
-                EXPECT_EQ(params.domain_route_assignment.capacity, 0u);
-                EXPECT_EQ(params.runtime_route_weights, nullptr);
-                EXPECT_FALSE(params.overlay_route_placement.valid());
-                const bool root = expected_role ==
-                                  MoECanonicalRouteReductionRole::RootOwner;
-                EXPECT_EQ(
-                    stage->coherencePolicy(),
-                    root ? CoherencePolicy::FULL : CoherencePolicy::NONE);
-                EXPECT_EQ(stage->isPassiveGraphCaptureNoOp(), !root);
             }
             EXPECT_TRUE(
                 stage->supportsGraphCaptureAfterLaunchPreparation());

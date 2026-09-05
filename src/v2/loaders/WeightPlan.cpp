@@ -37,9 +37,28 @@ namespace llaminar2
         }
     }
 
-    WeightPlan::WeightPlan(InferenceStrategy strategy)
-        : strategy_(std::move(strategy))
+    namespace
     {
+        /** @return Whether an owner may back a persistent prepared-weight set. */
+        bool isPersistentWeightOwner(PhysicalMemoryOwner owner) noexcept
+        {
+            return owner == PhysicalMemoryOwner::PrimaryModelWeights ||
+                   owner == PhysicalMemoryOwner::AdditionalModelWeights ||
+                   owner == PhysicalMemoryOwner::RoutedExpertWeights;
+        }
+    } // namespace
+
+    WeightPlan::WeightPlan(
+        InferenceStrategy strategy,
+        PhysicalMemoryOwner physical_memory_owner)
+        : strategy_(std::move(strategy)),
+          physical_memory_owner_(physical_memory_owner)
+    {
+        if (!isPersistentWeightOwner(physical_memory_owner_))
+        {
+            throw std::invalid_argument(
+                "WeightPlan requires a persistent prepared-weight physical-memory owner");
+        }
     }
 
     void WeightPlan::add(WeightRequirement requirement)
@@ -101,9 +120,19 @@ namespace llaminar2
         return std::move(bindings_);
     }
 
-    FrozenModelWeightSet::FrozenModelWeightSet(InferenceStrategy strategy, std::vector<WeightBinding> bindings)
-        : strategy_(std::move(strategy)), bindings_(std::move(bindings))
+    FrozenModelWeightSet::FrozenModelWeightSet(
+        InferenceStrategy strategy,
+        std::vector<WeightBinding> bindings,
+        PhysicalMemoryOwner physical_memory_owner)
+        : strategy_(std::move(strategy)),
+          physical_memory_owner_(physical_memory_owner),
+          bindings_(std::move(bindings))
     {
+        if (!isPersistentWeightOwner(physical_memory_owner_))
+        {
+            throw std::invalid_argument(
+                "FrozenModelWeightSet requires a persistent prepared-weight physical-memory owner");
+        }
         for (size_t index = 0; index < bindings_.size(); ++index)
             indexBinding(index, bindings_[index]);
     }

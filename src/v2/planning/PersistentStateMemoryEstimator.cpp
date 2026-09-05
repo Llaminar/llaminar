@@ -6,11 +6,14 @@
 #include "planning/PersistentStateMemoryEstimator.h"
 
 #include "execution/mtp/MTPCheckpointPolicy.h"
+#include "kernels/HybridGDNStateGeometry.h"
 #include "planning/KVCacheMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <string_view>
 
 namespace llaminar2
@@ -23,17 +26,18 @@ namespace llaminar2
             GDN,
         };
 
-        struct RecurrentGeometry
+        [[nodiscard]] std::size_t checkedAdd(
+            std::size_t left,
+            std::size_t right,
+            const char *what)
         {
-            size_t local_conv_floats = 0;
-            size_t full_conv_floats = 0;
-            size_t local_recurrence_floats = 0;
-            size_t full_recurrence_floats = 0;
-        };
-
-        size_t alignUp(size_t bytes, size_t alignment)
-        {
-            return (bytes + alignment - 1) & ~(alignment - 1);
+            if (right > std::numeric_limits<std::size_t>::max() - left)
+            {
+                throw std::overflow_error(
+                    std::string("Persistent-state ") + what +
+                    " overflows size_t");
+            }
+            return left + right;
         }
 
         bool layerHasTensor(
@@ -72,147 +76,6 @@ namespace llaminar2
             return LayerStorageKind::FullAttention;
         }
 
-        RecurrentGeometry recurrentGeometry(
-            const ModelMemoryProfile &profile,
-            int local_query_heads,
-            int total_shards)
-        {
-            RecurrentGeometry geometry;
-            if (profile.gdn_state_size <= 0 ||
-                profile.gdn_conv_kernel_size <= 1 ||
-                profile.n_heads <= 0)
-            {
-                return geometry;
-            }
-
-            const int full_k_heads =
-                profile.gdn_group_count > 0
-                    ? profile.gdn_group_count
-                    : profile.n_heads;
-            const int full_v_heads =
-                profile.gdn_time_step_rank > 0
-                    ? profile.gdn_time_step_rank
-                    : full_k_heads;
-            if (full_k_heads <= 0 || full_v_heads <= 0)
-                return geometry;
-
-            const int shards = std::max(1, total_shards);
-            const int local_attention_heads =
-                local_query_heads > 0
-                    ? local_query_heads
-                    : std::max(1, profile.n_heads / shards);
-            int local_k_heads = full_k_heads;
-            int local_v_heads = full_v_heads;
-            const bool modular_repeat = full_v_heads > full_k_heads;
-            if (local_attention_heads < profile.n_heads)
-            {
-                local_v_heads = std::max(
-                    1,
-                    full_v_heads * local_attention_heads /
-                        profile.n_heads);
-                if (!modular_repeat)
-                {
-                    local_k_heads = std::max(
-                        1,
-                        full_k_heads * local_attention_heads /
-                            profile.n_heads);
-                }
-            }
-
-            const size_t state_dim =
-                static_cast<size_t>(profile.gdn_state_size);
-            const size_t full_value_dim =
-                profile.gdn_inner_size > 0
-                    ? static_cast<size_t>(profile.gdn_inner_size)
-                    : static_cast<size_t>(full_v_heads) * state_dim;
-            const size_t local_value_dim =
-                profile.gdn_inner_size > 0
-                    ? static_cast<size_t>(profile.gdn_inner_size) *
-                          static_cast<size_t>(local_v_heads) /
-                          static_cast<size_t>(full_v_heads)
-                    : static_cast<size_t>(local_v_heads) * state_dim;
-            const size_t history =
-                static_cast<size_t>(
-                    profile.gdn_conv_kernel_size - 1);
-
-            geometry.full_conv_floats =
-                (2 * static_cast<size_t>(full_k_heads) * state_dim +
-                 full_value_dim) *
-                history;
-            geometry.local_conv_floats =
-                (2 * static_cast<size_t>(local_k_heads) * state_dim +
-                 local_value_dim) *
-                history;
-            geometry.full_recurrence_floats =
-                static_cast<size_t>(full_v_heads) *
-                state_dim * state_dim;
-            geometry.local_recurrence_floats =
-                static_cast<size_t>(local_v_heads) *
-                state_dim * state_dim;
-            return geometry;
-        }
-
-        size_t gpuArenaBytesForOneKernel(
-            size_t local_floats,
-            size_t full_floats,
-            int request_capacity)
-        {
-            if (local_floats == 0)
-                return 0;
-
-            constexpr size_t kAlignment = 256;
-            constexpr size_t kFP32 = sizeof(float);
-            size_t bytes =
-                alignUp(local_floats * kFP32, kAlignment);
-            if (full_floats != local_floats)
-            {
-                bytes +=
-                    alignUp(full_floats * kFP32, kAlignment);
-            }
-            bytes += alignUp(
-                static_cast<size_t>(std::max(1, request_capacity)) *
-                    std::max(local_floats, full_floats) * kFP32,
-                kAlignment);
-            return bytes;
-        }
-
-        size_t localPayloadBytes(
-            const RecurrentGeometry &geometry,
-            int layer_count)
-        {
-            return static_cast<size_t>(std::max(0, layer_count)) *
-                   (geometry.local_conv_floats +
-                    geometry.local_recurrence_floats) *
-                   sizeof(float);
-        }
-
-        /**
-         * @brief Size the exact GPU-side hybrid payload serialized per prefix.
-         *
-         * GPU hybrid caches retain both local and full state banks only when
-         * their geometries differ. Prefix export writes those distinct banks
-         * without arena alignment, matching CUDA and ROCm byte-for-byte.
-         */
-        size_t prefixHybridDeviceStateBytes(
-            const RecurrentGeometry &geometry,
-            int layer_count)
-        {
-            size_t floats_per_layer =
-                geometry.local_conv_floats +
-                geometry.local_recurrence_floats;
-            if (geometry.full_conv_floats !=
-                geometry.local_conv_floats)
-            {
-                floats_per_layer += geometry.full_conv_floats;
-            }
-            if (geometry.full_recurrence_floats !=
-                geometry.local_recurrence_floats)
-            {
-                floats_per_layer += geometry.full_recurrence_floats;
-            }
-            return static_cast<size_t>(std::max(0, layer_count)) *
-                   floats_per_layer * sizeof(float);
-        }
     } // namespace
 
     PersistentStateEstimate PersistentStateMemoryEstimator::estimate(
@@ -220,9 +83,10 @@ namespace llaminar2
         DeviceId device,
         int batch_size,
         int max_seq_len,
-        int local_kv_heads,
+        int main_local_kv_heads,
+        int mtp_local_kv_heads,
+        int local_query_head_start,
         int local_query_heads,
-        int total_shards,
         int first_layer,
         int last_layer,
         const std::string &kv_precision,
@@ -271,62 +135,80 @@ namespace llaminar2
             }
         }
 
-        const int resident_fa_layers =
-            result.main_full_attention_layers +
-            result.mtp_full_attention_layers;
-        result.kv_cache_bytes = KVCacheMemoryEstimator::estimate(
-            resident_fa_layers,
+        /*
+         * Runtime owns committed and shifted KV as distinct cache objects.
+         * Price those objects independently: a replicated predictor can own
+         * every KV head beside a sharded main cache, and cache-local metadata
+         * must follow the geometry of its actual owner.
+         */
+        result.main_kv_cache_bytes = KVCacheMemoryEstimator::estimate(
+            result.main_full_attention_layers,
             batch_size,
             max_seq_len,
-            local_kv_heads,
+            main_local_kv_heads,
             profile.head_dim,
             kv_precision,
             device);
+        result.mtp_kv_cache_bytes = KVCacheMemoryEstimator::estimate(
+            result.mtp_full_attention_layers,
+            batch_size,
+            max_seq_len,
+            mtp_local_kv_heads,
+            profile.head_dim,
+            kv_precision,
+            device);
+        result.kv_cache_bytes = checkedAdd(
+            result.main_kv_cache_bytes,
+            result.mtp_kv_cache_bytes,
+            "main plus shifted KV-cache bytes");
 
-        const RecurrentGeometry geometry =
-            recurrentGeometry(profile, local_query_heads, total_shards);
-        if (device.is_gpu())
+        HybridGDNStateGeometry geometry;
+        const int resident_gdn_layers =
+            result.main_gdn_layers + result.mtp_gdn_layers;
+        if (resident_gdn_layers > 0)
         {
-            const size_t bytes_per_gdn_layer =
-                gpuArenaBytesForOneKernel(
-                    geometry.local_conv_floats,
-                    geometry.full_conv_floats,
-                    batch_size) +
-                gpuArenaBytesForOneKernel(
-                    geometry.local_recurrence_floats,
-                    geometry.full_recurrence_floats,
-                    batch_size);
-            result.live_recurrent_state_bytes =
-                static_cast<size_t>(
-                    result.main_gdn_layers +
-                    result.mtp_gdn_layers) *
-                bytes_per_gdn_layer;
-            result.prefix_hybrid_device_state_bytes =
-                prefixHybridDeviceStateBytes(
-                    geometry,
-                    result.main_gdn_layers);
-        }
-        else
-        {
-            result.live_recurrent_state_bytes =
-                localPayloadBytes(
-                    geometry,
-                    result.main_gdn_layers +
-                        result.mtp_gdn_layers);
+            geometry = HybridGDNStateGeometry::resolve(
+                profile.n_heads,
+                local_query_head_start,
+                local_query_heads,
+                profile.gdn_group_count,
+                profile.gdn_time_step_rank,
+                profile.gdn_state_size,
+                profile.gdn_inner_size,
+                profile.gdn_conv_kernel_size);
+            if (device.is_gpu())
+            {
+                result.live_recurrent_state_bytes =
+                    geometry.deviceArenaBytes(
+                        resident_gdn_layers,
+                        batch_size);
+                result.prefix_hybrid_device_state_bytes =
+                    geometry.deviceSerializedPayloadBytes(
+                        result.main_gdn_layers);
+            }
+            else
+            {
+                result.live_recurrent_state_bytes =
+                    geometry.localPayloadBytes(resident_gdn_layers);
+            }
         }
 
         if (mtp_enabled)
         {
+            const auto checkpointPayloadBytes =
+                [&](int gdn_layers)
+                {
+                    return device.is_gpu()
+                               ? geometry.deviceSerializedPayloadBytes(
+                                     gdn_layers)
+                               : geometry.localPayloadBytes(gdn_layers);
+                };
             const size_t main_payload_bytes =
-                localPayloadBytes(
-                    geometry,
-                    result.main_gdn_layers) +
+                checkpointPayloadBytes(result.main_gdn_layers) +
                 static_cast<size_t>(std::max(0, profile.d_model)) *
                     sizeof(float);
             const size_t shifted_payload_bytes =
-                localPayloadBytes(
-                    geometry,
-                    result.mtp_gdn_layers);
+                checkpointPayloadBytes(result.mtp_gdn_layers);
             result.checkpoint_state_bytes =
                 kMTPConcurrentLiveCheckpointSets *
                 (main_payload_bytes + shifted_payload_bytes);

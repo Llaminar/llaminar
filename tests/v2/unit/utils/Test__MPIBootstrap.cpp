@@ -1,4 +1,7 @@
 #include "utils/MPIBootstrap.h"
+#include "app/MPIBootstrapPhase.h"
+#include "backends/ComputeBackend.h"
+#include "config/ExecutionDomainDefinition.h"
 
 #include <gtest/gtest.h>
 
@@ -79,4 +82,32 @@ TEST(Test__MPIBootstrap, SingleRankAllCoreLaunchUsesSlotProcessingElements)
     EXPECT_TRUE(contains(cmd, "core"));
     EXPECT_TRUE(contains(cmd, "slot:PE=56"))
         << "a single all-core CPU rank cannot fit inside one socket mapping";
+}
+
+/**
+ * @brief CPU overlay selectors contribute every requested NUMA node pre-MPI.
+ *
+ * This is the focused regression for a heterogeneous overlay whose four ROCm
+ * participants were local to NUMA 1 while `cpu:0,cpu:1` was accidentally
+ * treated as unresolved CPU ordinals.  Bootstrap then pinned both ranks to
+ * NUMA 1 and made certified first-touch allocation on NUMA 0 impossible.
+ */
+TEST(Test__MPIBootstrap, OverlayCpuShortSelectorsDriveBootstrapNumaSet)
+{
+    llaminar2::OrchestrationConfig config =
+        llaminar2::OrchestrationConfig::defaults();
+    config.domain_definitions.push_back(
+        llaminar2::DomainDefinition::parse(
+            "cpu_tier=cpu:0,cpu:1;scope=auto;backend=upi"));
+
+    llaminar2::CPUTopology topology;
+    topology.numa_nodes = 2;
+
+    const auto nodes =
+        llaminar2::MPIBootstrapPhase::resolveInferenceNUMANodes(
+            config,
+            llaminar2::DeviceManager::instance(),
+            topology);
+
+    EXPECT_EQ(nodes, (std::set<int>{0, 1}));
 }

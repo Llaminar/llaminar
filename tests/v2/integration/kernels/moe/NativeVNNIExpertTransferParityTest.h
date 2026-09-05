@@ -45,6 +45,8 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/common/DeviceFP32NumericalContract.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -483,7 +485,514 @@ namespace llaminar2::test
                 ++mismatch;
             }
         }
+
+        /**
+         * @brief Own one CPU-promoted projection on a GPU endpoint.
+         *
+         * Optional metadata allocations follow the exact destination layout.
+         * The owners keep every descriptor address stable until grouped
+         * inference has consumed the promoted expert.
+         */
+        struct PromotedCPUProjection final
+        {
+            std::unique_ptr<DeviceAllocation> payload;
+            std::unique_ptr<DeviceAllocation> scales;
+            std::unique_ptr<DeviceAllocation> mins;
+            std::unique_ptr<DeviceAllocation> emins;
+            DeviceNativeVNNIMatrixDesc descriptor{};
+            ExpertTierWeightTransferLaneStats stats{};
+        };
+
+        /**
+         * @brief Stream final CPU execution bytes into their exact GPU form.
+         * @param backend Exact destination backend.
+         * @param device CUDA or ROCm endpoint that owns the inactive allocation.
+         * @param cpu_weights Real CPU prepared bytes retaining source provenance.
+         * @param projection Stable gate/up/down role used in the transfer manifest.
+         * @param identity Unique diagnostic identity for the transaction.
+         * @return Stable promoted descriptor and all of its allocation owners.
+         */
+        PromotedCPUProjection promoteCPUProjection(
+            IBackend *backend,
+            DeviceId device,
+            const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+            ExpertTierWeightProjection projection,
+            uint64_t identity);
     } // namespace native_vnni_transfer_parity_detail
+
+    /**
+     * @brief Prove one logical quantized expert is byte-stable across CPU/GPU.
+     *
+     * The transfer-only regressions above prove that every codebook survives
+     * repacking, but movement correctness also requires the destination to
+     * execute the same arithmetic program. For every canonical quantized
+     * source format this test prepares the same gate/up/down tensors twice:
+     * once as GPU-aligned CPU NativeVNNI engines and once through the production
+     * CUDA/ROCm loader. The GPU endpoint runs its real grouped sparse-MoE plan;
+     * the CPU endpoint runs the complete grouped FFN transaction. Hidden Q8,
+     * gate/up, SwiGLU Q8, down, and canonical route publication are therefore
+     * all inside the comparison rather than mocked by a format conversion.
+     *
+     * @param backend_label Stable diagnostic backend label.
+     * @param device CUDA or ROCm endpoint paired with the CPU tier.
+     * @param stream Explicit non-default GPU stream.
+     */
+    inline void runCPUToGPUAllFormatExpertArithmeticParity(
+        const char *backend_label,
+        DeviceId device,
+        void *stream)
+    {
+        using namespace native_vnni_transfer_parity_detail;
+        using CpuKernel =
+            cpu::native_vnni::CPUNativeVNNIGemmKernel;
+        using CpuDescriptor =
+            CpuKernel::BatchedPrequantizedProjectionDesc;
+
+        if (!backend_label || !device.is_gpu() || !stream)
+        {
+            throw std::invalid_argument(
+                "Cross-tier expert arithmetic parity requires a GPU and stream");
+        }
+        IBackend *backend = getBackendFor(device);
+        if (!backend)
+            throw std::runtime_error("Cross-tier parity backend is unavailable");
+
+        // Qwen3.5-122B production expert geometry. Both K widths exercise the
+        // complete GPU-aligned expert tree, while M=65 crosses from the
+        // verifier family into the scalable prefill family.
+        constexpr int kDModel = 3072;
+        constexpr int kIntermediate = 1024;
+        constexpr int kNumExperts = 1;
+        constexpr int kTopK = 1;
+        constexpr int kMaximumRows = 65;
+        constexpr std::array<int, 5> kRows = {1, 2, 3, 15, 65};
+
+        auto gpu_kernel =
+            llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
+        ASSERT_NE(gpu_kernel, nullptr);
+        gpu_kernel->setGPUStream(stream);
+        auto requirements = device.is_cuda()
+                                ? MoEWorkspaceBuffers::cudaMoE(
+                                      kMaximumRows,
+                                      kDModel,
+                                      kIntermediate,
+                                      kNumExperts,
+                                      kTopK)
+                                : MoEWorkspaceBuffers::rocmMoE(
+                                      kMaximumRows,
+                                      kDModel,
+                                      kIntermediate,
+                                      kNumExperts,
+                                      kTopK);
+        DeviceWorkspaceManager workspace(
+            device,
+            requirements.total_bytes_with_alignment() +
+                4u * 1024u * 1024u);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        auto *workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(gpu_kernel.get());
+        ASSERT_NE(workspace_consumer, nullptr);
+        workspace_consumer->bindWorkspace(&workspace);
+
+        const auto &formats = quantizedMoEVerifierFormats();
+        for (std::size_t format_index = 0;
+             format_index < formats.size();
+             ++format_index)
+        {
+            const auto &format = formats[format_index];
+            SCOPED_TRACE(
+                std::string(backend_label) + " cross-tier format=" +
+                format.label);
+
+            std::vector<std::unique_ptr<TensorBase>> weights;
+            std::vector<GpuPreparedGemm> prepared;
+            weights.reserve(3u);
+            prepared.reserve(3u);
+            const std::uint64_t model_base =
+                3900000u + static_cast<std::uint64_t>(format_index) * 16u +
+                (device.is_cuda() ? 0u : 100000u);
+            const std::string prefix =
+                std::string("test.") + backend_label +
+                ".cross_tier_arithmetic." + format.label;
+            const DeviceNativeVNNIMatrixDesc gate_descriptor =
+                prepareMatrixDescriptor(
+                    format,
+                    device,
+                    stream,
+                    kIntermediate,
+                    kDModel,
+                    930001u + static_cast<std::uint32_t>(format_index),
+                    prefix + ".gate",
+                    ModelContextId{model_base + 1u},
+                    weights,
+                    prepared);
+            const DeviceNativeVNNIMatrixDesc up_descriptor =
+                prepareMatrixDescriptor(
+                    format,
+                    device,
+                    stream,
+                    kIntermediate,
+                    kDModel,
+                    940001u + static_cast<std::uint32_t>(format_index),
+                    prefix + ".up",
+                    ModelContextId{model_base + 2u},
+                    weights,
+                    prepared);
+            const DeviceNativeVNNIMatrixDesc down_descriptor =
+                prepareMatrixDescriptor(
+                    format,
+                    device,
+                    stream,
+                    kDModel,
+                    kIntermediate,
+                    950001u + static_cast<std::uint32_t>(format_index),
+                    prefix + ".down",
+                    ModelContextId{model_base + 3u},
+                    weights,
+                    prepared);
+
+            std::array<std::unique_ptr<CpuKernel>, 3> cpu_kernels;
+            for (std::size_t projection = 0;
+                 projection < cpu_kernels.size();
+                 ++projection)
+            {
+                cpu_kernels[projection] = std::make_unique<CpuKernel>(
+                    weights[projection].get(),
+                    0,
+                    -1,
+                    CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                ASSERT_TRUE(cpu_kernels[projection]->isValid());
+            }
+
+            auto promoted_gate = promoteCPUProjection(
+                backend,
+                device,
+                cpu_kernels[0]->packedWeights(),
+                ExpertTierWeightProjection::Gate,
+                model_base + 11u);
+            auto promoted_up = promoteCPUProjection(
+                backend,
+                device,
+                cpu_kernels[1]->packedWeights(),
+                ExpertTierWeightProjection::Up,
+                model_base + 12u);
+            auto promoted_down = promoteCPUProjection(
+                backend,
+                device,
+                cpu_kernels[2]->packedWeights(),
+                ExpertTierWeightProjection::Down,
+                model_base + 13u);
+
+            DeviceMoEExpertDescriptor expert{};
+            expert.logical_expert_id = 0;
+            expert.owner_participant = 0;
+            expert.local_slot = 0;
+            expert.flags = toMoEExpertFlags(
+                DeviceMoEExpertFlags::Valid |
+                DeviceMoEExpertFlags::Resident |
+                DeviceMoEExpertFlags::LocalCompute);
+            expert.gate = promoted_gate.descriptor;
+            expert.up = promoted_up.descriptor;
+            expert.down = promoted_down.descriptor;
+            std::vector<DeviceMoEExpertDescriptor> experts = {expert};
+
+            const int gate_up_table =
+                gpu_kernel->uploadGroupedExpertGateUpDescriptorTables(
+                    &promoted_gate.descriptor,
+                    &promoted_up.descriptor,
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate);
+            const int down_table =
+                gpu_kernel->uploadGroupedExpertDownDescriptorTable(
+                    &promoted_down.descriptor,
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate);
+            ASSERT_GE(gate_up_table, 0);
+            ASSERT_GE(down_table, 0);
+
+            auto runtime = makeRuntimeTable(
+                device,
+                stream,
+                experts,
+                /*participant_id=*/0u,
+                std::vector<std::uint8_t>(kNumExperts, 1u),
+                std::vector<std::uint32_t>(kNumExperts, 0b01u),
+                /*num_layers=*/1,
+                kTopK,
+                kMaximumRows);
+
+            for (const int rows : kRows)
+            {
+                SCOPED_TRACE("rows=" + std::to_string(rows));
+                auto hidden = makeHidden(rows, kDModel, format_index);
+                const int hidden_blocks_per_row =
+                    kDModel / static_cast<int>(Q8_1Block::BLOCK_SIZE);
+                const int activation_blocks_per_row =
+                    kIntermediate /
+                    static_cast<int>(Q8_1Block::BLOCK_SIZE);
+                std::vector<Q8_1Block> hidden_q8(
+                    static_cast<std::size_t>(rows) *
+                    hidden_blocks_per_row);
+                std::vector<float> cpu_gate(
+                    static_cast<std::size_t>(rows) * kIntermediate);
+                std::vector<float> cpu_up(cpu_gate.size());
+                std::vector<Q8_1Block> cpu_activation_q8(
+                    static_cast<std::size_t>(rows) *
+                    activation_blocks_per_row);
+                std::vector<float> cpu_output(
+                    static_cast<std::size_t>(rows) * kDModel);
+                std::vector<float> cpu_serial_gate(cpu_gate.size());
+                std::vector<float> cpu_serial_up(cpu_up.size());
+                std::vector<float> cpu_serial_activation(cpu_up.size());
+                std::vector<Q8_1Block> cpu_serial_activation_q8(
+                    cpu_activation_q8.size());
+                std::vector<float> cpu_serial_output(cpu_output.size());
+
+                cpu::native_vnni::quantize_activations_to_q8_1(
+                    hidden->data(),
+                    hidden_q8.data(),
+                    rows,
+                    kDModel,
+                    hidden_blocks_per_row,
+                    CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                const std::array<CpuDescriptor, 2> gate_up{{
+                    {
+                        .kernel = cpu_kernels[0].get(),
+                        .input_q8 = hidden_q8.data(),
+                        .output = cpu_gate.data(),
+                        .rows = rows,
+                        .n = kIntermediate,
+                        .ldc = kIntermediate,
+                    },
+                    {
+                        .kernel = cpu_kernels[1].get(),
+                        .input_q8 = hidden_q8.data(),
+                        .output = cpu_up.data(),
+                        .rows = rows,
+                        .n = kIntermediate,
+                        .ldc = kIntermediate,
+                    },
+                }};
+                const std::array<CpuDescriptor, 1> down{{{
+                    .kernel = cpu_kernels[2].get(),
+                    .input_q8 = cpu_activation_q8.data(),
+                    .output = cpu_output.data(),
+                    .rows = rows,
+                    .n = kDModel,
+                    .ldc = kDModel,
+                }}};
+                ASSERT_TRUE(
+                    CpuKernel::
+                        execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
+                            gate_up.data(),
+                            static_cast<int>(gate_up.size()),
+                            kDModel,
+                            cpu_gate.data(),
+                            cpu_up.data(),
+                            cpu_activation_q8.data(),
+                            rows,
+                            kIntermediate,
+                            activation_blocks_per_row,
+                            down.data(),
+                            static_cast<int>(down.size())));
+
+                /*
+                 * Keep an independent M=1 oracle beside the layer-global CPU
+                 * transaction. This is diagnostic and test-only: it localizes
+                 * a broken grouped schedule before a downstream GPU mismatch
+                 * obscures which arithmetic boundary changed. Production never
+                 * replays expert rows.
+                 */
+                for (int row = 0; row < rows; ++row)
+                {
+                    const auto hidden_offset =
+                        static_cast<std::size_t>(row) * hidden_blocks_per_row;
+                    const auto intermediate_offset =
+                        static_cast<std::size_t>(row) * kIntermediate;
+                    const auto activation_offset =
+                        static_cast<std::size_t>(row) *
+                        activation_blocks_per_row;
+                    const auto output_offset =
+                        static_cast<std::size_t>(row) * kDModel;
+                    cpu::native_vnni::gemv_native_vnni_preq(
+                        cpu_kernels[0]->packedWeights(),
+                        hidden_q8.data() + hidden_offset,
+                        cpu_serial_gate.data() + intermediate_offset);
+                    cpu::native_vnni::gemv_native_vnni_preq(
+                        cpu_kernels[1]->packedWeights(),
+                        hidden_q8.data() + hidden_offset,
+                        cpu_serial_up.data() + intermediate_offset);
+                    primitives::compute_swiglu_gpu_aligned_expert_serial(
+                        cpu_serial_gate.data() + intermediate_offset,
+                        cpu_serial_up.data() + intermediate_offset,
+                        cpu_serial_activation.data() + intermediate_offset,
+                        kIntermediate);
+                    cpu::native_vnni::quantize_activations_to_q8_1(
+                        cpu_serial_activation.data() + intermediate_offset,
+                        cpu_serial_activation_q8.data() + activation_offset,
+                        /*M=*/1,
+                        kIntermediate,
+                        activation_blocks_per_row,
+                        CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                    cpu::native_vnni::gemv_native_vnni_preq(
+                        cpu_kernels[2]->packedWeights(),
+                        cpu_serial_activation_q8.data() + activation_offset,
+                        cpu_serial_output.data() + output_offset);
+                }
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " CPU grouped vs independent M1 gate M=" +
+                        std::to_string(rows),
+                    cpu_gate,
+                    cpu_serial_gate,
+                    kIntermediate);
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " CPU grouped vs independent M1 up M=" +
+                        std::to_string(rows),
+                    cpu_up,
+                    cpu_serial_up,
+                    kIntermediate);
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " CPU grouped vs independent M1 full expert M=" +
+                        std::to_string(rows),
+                    cpu_output,
+                    cpu_serial_output,
+                    kDModel);
+
+                if (rows == 1)
+                {
+                    /*
+                     * The tables now contain the CPU-promoted descriptors, so
+                     * these are genuine before/after-movement checkpoints.
+                     * They localize projection drift before SwiGLU and the
+                     * second activation quantization can obscure its origin.
+                     */
+                    auto gpu_gate = TestTensorFactory::createFP32(
+                        {1u, static_cast<std::size_t>(kIntermediate)});
+                    auto gpu_up = TestTensorFactory::createFP32(
+                        {1u, static_cast<std::size_t>(kIntermediate)});
+                    ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+                    ASSERT_TRUE(gpu_gate->ensureOnDevice(device, stream));
+                    ASSERT_TRUE(gpu_up->ensureOnDevice(device, stream));
+                    ITensor *gate_outputs[1] = {gpu_gate.get()};
+                    ITensor *up_outputs[1] = {gpu_up.get()};
+                    const int expert_id = 0;
+                    ASSERT_TRUE(gpu_kernel->groupedExpertGateUpDecodeFromTable(
+                        hidden.get(),
+                        &expert_id,
+                        gate_up_table,
+                        /*num_active=*/1,
+                        gate_outputs,
+                        up_outputs,
+                        kDModel,
+                        kIntermediate));
+                    ASSERT_TRUE(gpu_gate->ensureOnHost(stream));
+                    ASSERT_TRUE(gpu_up->ensureOnHost(stream));
+                    ASSERT_TRUE(backend->synchronizeStream(
+                        stream, device.ordinal));
+                    expectByteEqual(
+                        std::string(backend_label) + " " + format.label +
+                            " CPU vs promoted-GPU gate checkpoint",
+                        std::vector<float>(
+                            gpu_gate->data(),
+                            gpu_gate->data() + gpu_gate->numel()),
+                        cpu_serial_gate,
+                        kIntermediate);
+                    expectByteEqual(
+                        std::string(backend_label) + " " + format.label +
+                            " CPU vs promoted-GPU up checkpoint",
+                        std::vector<float>(
+                            gpu_up->data(),
+                            gpu_up->data() + gpu_up->numel()),
+                        cpu_serial_up,
+                        kIntermediate);
+                }
+
+                auto routing_indices = TestTensorFactory::createFP32(
+                    {static_cast<std::size_t>(rows), kTopK});
+                auto routing_weights = TestTensorFactory::createFP32(
+                    {static_cast<std::size_t>(rows), kTopK});
+                std::fill_n(
+                    routing_indices->mutable_data(), rows * kTopK, 0.0f);
+                std::vector<float> cpu_preweighted_output(
+                    cpu_serial_output.size());
+                for (int row = 0; row < rows; ++row)
+                {
+                    /*
+                     * A unit route weight cannot distinguish raw expert rows
+                     * from the preweighted publication contract used by the
+                     * heterogeneous return lane. Vary non-dyadic weights by
+                     * row so this proof covers the exact placement-sensitive
+                     * multiply that follows a CPU/GPU ownership change.
+                     */
+                    const float route_weight =
+                        0.137f + 0.019f * static_cast<float>(row % 11);
+                    routing_weights->mutable_data()[row] = route_weight;
+                    const size_t row_offset =
+                        static_cast<size_t>(row) * kDModel;
+                    for (int column = 0; column < kDModel; ++column)
+                    {
+                        cpu_preweighted_output[row_offset + column] =
+                            device_fp32_contract::multiply(
+                                route_weight,
+                                cpu_serial_output[row_offset + column]);
+                    }
+                }
+                ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+                ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
+                ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+                ASSERT_TRUE(gpu_kernel->publishCompleteGroupedPrefillPlanFromRouter(
+                    runtime->deviceLayerState(0),
+                    routing_indices.get(),
+                    routing_weights.get(),
+                    rows,
+                    rows,
+                    kNumExperts,
+                    kTopK,
+                    gate_up_table,
+                    down_table,
+                    /*filter_to_local_runtime_experts=*/true));
+                std::vector<float> gpu_canonical;
+                const auto gpu_output = executePublishedPlan(
+                    backend,
+                    *gpu_kernel,
+                    *runtime,
+                    device,
+                    stream,
+                    hidden.get(),
+                    gate_up_table,
+                    down_table,
+                    rows,
+                    kDModel,
+                    kIntermediate,
+                    kNumExperts,
+                    kTopK,
+                    /*layer_idx=*/0,
+                    &gpu_canonical);
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " CPU vs promoted-GPU canonical expert rows M=" +
+                        std::to_string(rows),
+                    gpu_canonical,
+                    cpu_preweighted_output,
+                    kDModel);
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " CPU vs promoted-GPU reduced expert output M=" +
+                        std::to_string(rows),
+                    gpu_output,
+                    cpu_preweighted_output,
+                    kDModel);
+            }
+        }
+
+        ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+        workspace_consumer->unbindWorkspace();
+    }
 
     /**
      * @brief Prove StaticOwner and transferred CurrentBatchLLEP grouped equality.
@@ -553,7 +1062,7 @@ namespace llaminar2::test
                 projectionSpecsForFormat(format, kDModel, kIntermediate));
         }
 
-        auto transfer_directory = DeviceMoETransferSlotDirectory::create(
+        auto transfer_directory = DeviceMoETransferSlotDirectory::createForTest(
             backend,
             device,
             device.ordinal,
@@ -1665,47 +2174,28 @@ namespace llaminar2::test
     namespace native_vnni_transfer_parity_detail
     {
         /**
-         * @brief Own one CPU-promoted asymmetric projection on a GPU endpoint.
-         *
-         * The three allocation owners keep the descriptor stable while grouped
-         * inference executes. `stats` is retained after the short-lived transfer
-         * lane is destroyed so the caller can prove promotion did not introduce
-         * an inference-stream wait or a blocking synchronization.
-         */
-        struct PromotedAsymmetricProjection final
-        {
-            std::unique_ptr<DeviceAllocation> payload;
-            std::unique_ptr<DeviceAllocation> scales;
-            std::unique_ptr<DeviceAllocation> mins;
-            DeviceNativeVNNIMatrixDesc descriptor{};
-            ExpertTierWeightTransferLaneStats stats{};
-        };
-
-        /**
-         * @brief Stream one CPU-native asymmetric matrix into executable GPU form.
+         * @brief Stream one CPU-native matrix into executable GPU form.
          *
          * @param backend Exact destination backend.
          * @param device CUDA or ROCm endpoint that owns the inactive allocation.
          * @param cpu_weights Real CPU prepared bytes retaining source provenance.
          * @param projection Stable gate/up/down role used in the transfer manifest.
          * @param identity Unique diagnostic identity for the transaction.
-         * @return Stable codebook-23 descriptor and its device allocation owners.
+         * @return Stable destination descriptor and its device allocation owners.
          * @throws std::runtime_error when materialization, streaming, or format
          *         publication fails.
          */
-        inline PromotedAsymmetricProjection promoteAsymmetricProjection(
+        inline PromotedCPUProjection promoteCPUProjection(
             IBackend *backend,
             DeviceId device,
             const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
             ExpertTierWeightProjection projection,
             uint64_t identity)
         {
-            if (!backend || !device.is_gpu() ||
-                !cpu_weights.usesExpandedInt8() ||
-                !cpu_weights.is_asymmetric)
+            if (!backend || !device.is_gpu())
             {
                 throw std::invalid_argument(
-                    "Grouped promotion parity requires asymmetric expanded CPU weights");
+                    "Grouped promotion parity requires a GPU destination");
             }
 
             const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
@@ -1716,18 +2206,16 @@ namespace llaminar2::test
                 projection,
                 /*maximum_units_per_chunk=*/1);
             const auto layout = manifest.deviceLayout();
-            if (!layout.valid() ||
-                layout.gpu_codebook_id !=
-                    kNativeVnniExpandedInt8MinCodebook)
+            if (!layout.valid())
             {
                 throw std::runtime_error(
-                    "Asymmetric promotion did not select execution codebook 23");
+                    "CPU promotion did not produce a valid device layout");
             }
 
             const size_t blocks =
                 static_cast<size_t>(layout.N) *
                 static_cast<size_t>(layout.blocks_per_row);
-            PromotedAsymmetricProjection result;
+            PromotedCPUProjection result;
             result.payload = std::make_unique<DeviceAllocation>(
                 backend,
                 device.ordinal,
@@ -1736,32 +2224,58 @@ namespace llaminar2::test
                 backend,
                 device.ordinal,
                 blocks * sizeof(uint16_t));
-            result.mins = std::make_unique<DeviceAllocation>(
-                backend,
-                device.ordinal,
-                blocks * sizeof(uint16_t));
+            if (layout.gpu_is_asymmetric != 0u)
+            {
+                result.mins = std::make_unique<DeviceAllocation>(
+                    backend,
+                    device.ordinal,
+                    blocks * sizeof(uint16_t));
+            }
+            if (layout.gpu_has_emins != 0u)
+            {
+                result.emins = std::make_unique<DeviceAllocation>(
+                    backend,
+                    device.ordinal,
+                    blocks * sizeof(uint32_t));
+            }
 
             ExpertTierGpuMutableProjectionView destination{
                 .payload = result.payload->as<uint8_t>(),
                 .scales = result.scales->as<uint16_t>(),
-                .mins = result.mins->as<uint16_t>(),
-                .emins = nullptr,
+                .mins = result.mins
+                            ? result.mins->as<uint16_t>()
+                            : nullptr,
+                .emins = result.emins
+                             ? result.emins->as<uint32_t>()
+                             : nullptr,
                 .payload_bytes = result.payload->bytes(),
                 .scales_bytes = result.scales->bytes(),
-                .mins_bytes = result.mins->bytes(),
-                .emins_bytes = 0u,
+                .mins_bytes = result.mins ? result.mins->bytes() : 0u,
+                .emins_bytes = result.emins ? result.emins->bytes() : 0u,
             };
             if (!destination.validFor(layout))
             {
                 throw std::runtime_error(
-                    "Asymmetric promotion allocation does not satisfy its layout");
+                    "CPU promotion allocation does not satisfy its layout");
             }
 
             std::string error;
             ExpertTierWeightTransferLane lane({
                 .device = device,
-                .staging_capacity_bytes = layout.chunkBytes(1),
-                .lane_name = "grouped_asymmetric_promotion_" +
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   layout.chunkBytes(1),
+                                   1u,
+                                   device)
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     device,
+                                     "grouped_cpu_promotion_" +
+                                         std::to_string(identity))
+                                 .front(),
+                .lane_name = "grouped_cpu_promotion_" +
                              std::to_string(identity),
                 .perf_device = device.to_string(),
                 .collect_timing_measurements = true,
@@ -1774,7 +2288,7 @@ namespace llaminar2::test
                     &error))
             {
                 throw std::runtime_error(
-                    "Failed to start grouped asymmetric promotion: " + error);
+                    "Failed to start grouped CPU promotion: " + error);
             }
 
             const auto deadline =
@@ -1789,7 +2303,7 @@ namespace llaminar2::test
             if (progress != ExpertTierWeightTransferProgress::Ready)
             {
                 throw std::runtime_error(
-                    "Grouped asymmetric promotion did not complete: " + error);
+                    "Grouped CPU promotion did not complete: " + error);
             }
             result.stats = lane.stats();
             if (result.stats.transfers_completed != 1u ||
@@ -1800,14 +2314,14 @@ namespace llaminar2::test
                 result.stats.inference_stream_waits != 0u)
             {
                 throw std::runtime_error(
-                    "Grouped asymmetric promotion violated the async lane contract");
+                    "Grouped CPU promotion violated the async lane contract");
             }
 
             result.descriptor = DeviceNativeVNNIMatrixDesc{
                 .payload = result.payload->as<uint8_t>(),
                 .scales = result.scales->get(),
-                .mins = result.mins->get(),
-                .emins = nullptr,
+                .mins = result.mins ? result.mins->get() : nullptr,
+                .emins = result.emins ? result.emins->get() : nullptr,
                 .n = layout.N,
                 .k = layout.K,
                 .blocks_per_row =
@@ -2143,19 +2657,19 @@ namespace llaminar2::test
             ASSERT_TRUE(cpu_weights[index].usesExpandedInt8());
             ASSERT_TRUE(cpu_weights[index].is_asymmetric);
         }
-        auto promoted_gate = promoteAsymmetricProjection(
+        auto promoted_gate = promoteCPUProjection(
             backend,
             device,
             cpu_weights[0],
             ExpertTierWeightProjection::Gate,
             model_base + 11u);
-        auto promoted_up = promoteAsymmetricProjection(
+        auto promoted_up = promoteCPUProjection(
             backend,
             device,
             cpu_weights[1],
             ExpertTierWeightProjection::Up,
             model_base + 12u);
-        auto promoted_down = promoteAsymmetricProjection(
+        auto promoted_down = promoteCPUProjection(
             backend,
             device,
             cpu_weights[2],
@@ -2533,6 +3047,26 @@ namespace llaminar2::test
                     &publication_error),
                 MoEOverlayResidencyWaveProgress::Ready)
                 << publication_error;
+
+            /*
+             * Preparation may install the immutable candidate bank, but it
+             * must not change the live runtime selector.  Inference holding an
+             * epoch-one ticket can overlap this observation and must continue
+             * to see bank one until the explicit publication transition.
+             */
+            DeviceMoELayerRuntime prepared_runtime{};
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                &prepared_runtime,
+                published_runtime->deviceLayerState(0),
+                sizeof(prepared_runtime),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+            EXPECT_EQ(prepared_runtime.active_bank, 1u);
+            EXPECT_EQ(prepared_runtime.active_epoch, 1u);
+            EXPECT_EQ(prepared_runtime.banks[0].epoch, 2u);
+            EXPECT_TRUE(prepared_runtime.banks[0].experts[1].weightsReady());
+
             ASSERT_TRUE(transaction->beginPublication(&publication_error))
                 << publication_error;
             ASSERT_EQ(

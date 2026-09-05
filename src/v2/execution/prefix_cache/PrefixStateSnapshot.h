@@ -43,6 +43,14 @@ namespace llaminar2
         int metadata_layer_count = 0;
         size_t bytes = 0;
         DeviceId device = DeviceId::invalid();
+
+        /**
+         * Canonical SequenceMetadata claim retained with the pooled storage.
+         *
+         * This member precedes the allocation owner deliberately: reverse
+         * destruction frees VRAM before releasing its admitted byte claim.
+         */
+        std::shared_ptr<void> physical_memory_lease;
         std::shared_ptr<void> storage;
         std::shared_ptr<void> ready_event;
 

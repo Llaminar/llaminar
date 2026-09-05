@@ -298,6 +298,50 @@ namespace llaminar2::test
             return input;
         }
 
+        /** Extract the exact immutable owner table represented by a snapshot. */
+        std::vector<std::uint32_t> initialOwners(
+            const MoEOverlayDevicePlacementPolicyInput &input)
+        {
+            std::vector<std::uint32_t> owners(
+                static_cast<std::size_t>(input.num_layers) *
+                    input.num_experts,
+                std::numeric_limits<std::uint32_t>::max());
+            for (std::uint32_t layer = 0u; layer < input.num_layers; ++layer)
+            {
+                for (std::uint32_t expert = 0u;
+                     expert < input.num_experts;
+                     ++expert)
+                {
+                    std::uint32_t owner_count = 0u;
+                    for (std::uint32_t participant = 0u;
+                         participant < input.participants.size();
+                         ++participant)
+                    {
+                        const auto word = input.collected_state[
+                            (static_cast<std::size_t>(participant) *
+                                 input.num_layers +
+                             layer) *
+                                input.num_experts +
+                            expert];
+                        if (moe_rebalance_policy::
+                                collectedStateAuthoritativeOwner(word))
+                        {
+                            owners[static_cast<std::size_t>(layer) *
+                                       input.num_experts +
+                                   expert] = participant;
+                            ++owner_count;
+                        }
+                    }
+                    if (owner_count != 1u)
+                    {
+                        throw std::logic_error(
+                            "pre-armed snapshot does not have exactly one initial owner");
+                    }
+                }
+            }
+            return owners;
+        }
+
         /** Build a capacity-preserving but deliberately adversarial hotness map. */
         MoEOverlayDevicePlacementPolicyInput makeAdversarialDemandInput(
             const MoEOverlayDeviceControllerTopology &topology)
@@ -381,7 +425,10 @@ namespace llaminar2::test
                 return;
             auto service = std::make_shared<MoERoutedTierServiceProfile>();
             service->identity = "prearmed-transaction-service-v1";
-            service->active_sources = {true, true, true};
+            service->production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    static_cast<int>(kLayers),
+                    kAllExpertHistogramProductionSources);
             for (std::uint32_t tier = 0u; tier < 2u; ++tier)
             {
                 for (std::uint32_t layer = 0u; layer < kLayers; ++layer)
@@ -911,6 +958,7 @@ namespace llaminar2::test
                 .initial_durable_epoch = kInitialEpoch,
                 .payload_bytes_per_layer =
                     policy_input.payload_bytes_per_layer,
+                .initial_owner_participants = initialOwners(policy_input),
                 .minimum_window_activations = 1u,
                 .maximum_cycles_per_wave = 2u,
             });
@@ -1085,6 +1133,7 @@ namespace llaminar2::test
                 .initial_durable_epoch = kInitialEpoch,
                 .payload_bytes_per_layer =
                     policy_input.payload_bytes_per_layer,
+                .initial_owner_participants = initialOwners(policy_input),
                 .minimum_window_activations = 1u,
                 .maximum_cycles_per_wave = 2u,
             });

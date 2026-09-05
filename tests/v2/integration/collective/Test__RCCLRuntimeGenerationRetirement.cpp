@@ -188,7 +188,12 @@ namespace llaminar2::test
                 std::move(retirement_ticket));
         EXPECT_TRUE(receipt.runtime_reset_invoked);
         EXPECT_EQ(receipt.retired_runtime_generation, generation_before);
-        EXPECT_EQ(receipt.active_runtime_generation, generation_before + 1u);
+        EXPECT_EQ(
+            receipt.successor_runtime_generation,
+            generation_before + 1u);
+        EXPECT_EQ(
+            receipt.runtime_post_reset_state,
+            DeviceRuntimePostResetState::Quiescent);
 
         RCCLBackend fresh_collective;
         ASSERT_TRUE(fresh_collective.initialize(group))

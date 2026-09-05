@@ -1216,14 +1216,14 @@ decisions beside it.
 In both loci, histogram windows, policy decisions, epoch publication, and all
 mutable MTP/decode state have exactly one owner. The graph API determines only
 how a device-selected branch is submitted: CUDA composes a native conditional
-parent; HIP publishes one immutable 48-byte scheduler ticket and the host
+parent; HIP publishes one immutable ABI-v2 52-byte scheduler ticket and the host
 submits the already-captured transaction named by that ticket.
 
 The backend implementations are intentionally asymmetric at the graph-control
 boundary. CUDA has a native conditional MTP parent. The installed HIP graph
 surface has no conditional nodes, so ROCm uses a first-class ticket-selected
 captured-transaction policy. Certification requires graph-family
-materialization, the exact 48-byte `immutable_scheduler_snapshot` with
+materialization, the exact ABI-v2 52-byte `immutable_scheduler_snapshot` with
 `state_payload=false`, authenticated decisions, per-device transaction and
 terminal submissions, controller/compact-reducer ledger equality, no
 intermediate host state materialization, and either a standalone device launch
@@ -1337,12 +1337,14 @@ order as a preference tie-break.
 Every tier instead has one unique signed integer `priority`. Smaller values are
 more preferred, values need not start at zero or be contiguous, and tier index
 is stable identity rather than rank. Equal priorities are rejected because
-otherwise some second field would silently become the ordering authority. The
-optional `fallback` flag is orthogonal coverage responsibility, not a thermal
-class: when present it must be on the greatest numeric priority, and it implies
-neither CPU placement nor unbounded storage. Terms such as "hot tier" in old
-test names or examples are shorthand for a particular configured priority,
-never schema values or recognized labels.
+otherwise some second field would silently become the ordering authority.
+Final coverage responsibility is derived automatically from the greatest
+numeric priority; it is not a second user-authored flag and implies neither CPU
+placement nor unbounded storage. Runtime plans retain a derived `fallback`
+diagnostic bit so dispatch and evidence can identify the coverage tier without
+recomputing it. Terms such as "hot tier" in old test names or examples are
+shorthand for a particular configured priority, never schema values or
+recognized labels.
 
 ### The intended answer
 
@@ -1777,8 +1779,45 @@ topology matrix is now certified; the remaining gaps are listed explicitly:
 | Histogram membership | The histogram rotates immutable decode, real-prefill, and accepted grouped-verifier source banks. `HistogramTieredCache` and `RoutedTierRebalanced` consume a total certified per-tier/layer/active-phase service profile and solve the exact fixed-quota assignment, minimizing measured service cost first, incumbent movement second, and expert id last. The residency authority smooths generations and applies measured transfer/interference payoff plus minimum-residency hysteresis before admitting a cycle. The production runner now calibrates representative exact-weight layers with real abort-only transport waves, expands only manifest-equivalent layers, gathers owner-authenticated rows over a private non-blocking MPI lane, and installs the composed certificate before proposal admission. | Installed and local/distributed protocol proven. The real-weight three-tier adversarial proof admits 22--23 economical cycles in each of three epochs and improves matched prefill/decode medians by 10.71%/17.36%. The remaining topology cells still require the same observed-economy gate. |
 | Within-tier participant skew | After constructing the fixed-quota tier candidate, `MoEOverlayResidencyAuthority` plans paired whole-expert swaps inside each apportioned tier, scores pure same-tier cycles by the reduction in maximum participant makespan, and publishes them through the same candidate epoch and transport as cross-tier cycles. | Installed with explicit proposal/load-spread/`same_priority_moves` evidence and one-tier unit/integration proof. The real-weight three-tier gate proves one participant-skew cycle and 21--22 tier-residency cycles share every wave and jointly reduce observed latency. |
 | Multi-tier LLEP | Existing CPU and GPU current-batch planners pin a durable epoch, balance one domain, materialize transient expert copies, and restore owner-only residency. | One-tier correctness and movement evidence are installed. A topology-wide lease and batch-local economy planner for resident, same-tier transient, and cross-tier transient destinations are missing; per-domain LLEP switches must not masquerade as this feature. |
-| Physical migration capacity | Production preallocates inactive RCU shadow slots per endpoint/layer and a 4 MiB chunk per physical lane, retains old/new residency banks, and adopts every loader-owned initial live slot into the recyclable physical arena. `migration_transfer_slots` is the positive setup-time physical concurrency authority (default `1`): a local directed edge receives `slots * min(source-device logical multiplicity, destination-device logical multiplicity)` lanes per projection; a remote GPU role receives `slots * local logical multiplicity`; MPI receives `global participants * slots * 3` lanes. `migration_cycles_per_wave` is an optional positive active-policy cap which defaults to all physical slots and may only reduce that width. Every Started-wave operation reserves a distinct lane before the first byte. | Slot recycling, both typed limits, exact lane/staging charging, and fail-closed parallel fan-out are installed. A retained model authority can therefore serve policies with different active wave widths without re-solving physical tier capacity. Focused real-device tests prove concurrent MPI and local paths. The real-weight three-tier campaign materializes 24 slots and admits every conflict-free positive-payoff cycle (22--23 per wave), while telemetry classifies the remaining candidates as policy-bounded rather than capacity-bounded. It records zero pool exhaustion, inference waits, blocking synchronization, or capacity rejection. |
+| Physical migration capacity | Production groups endpoint layers by exact prepared gate/up/down geometry and gives each participant/geometry group one shared inactive RCU shadow arena. The arena adopts every compatible loader-owned initial live slot into the same recycler; an adopted slot retired from one layer may serve a later epoch of another layer with identical geometry. Per-layer arrival capacity remains a logical collision bound, while `migration_transfer_slots` is the positive participant-wide physical concurrency authority (portable default `5`). Each physical lane retains a 4 MiB chunk, exact events, and command identity. `migration_cycles_per_wave` is an optional active-policy cap which defaults to all physical slots and may only reduce that width. Every Started-wave operation reserves a distinct lane before the first byte. | Shared exact-geometry recycling, both typed limits, canonical capacity charging, and fail-closed parallel fan-out are installed. Focused unit coverage proves that two layers reuse one arena only after RCU retirement and that non-identical geometry cannot alias. The Qwen-122B ROCm/CPU Release sweep measured slots `1/4/5/6/8`; five retained four useful cycles per wave. Two independent 8-by-1024-token MTP-depth-2 runs finished 2.25% and 1.91% above the matched Static decode endpoint; the repeat's converged last-four mean was 1.48% faster, with byte-identical token streams and no profiler timing enabled. Wider or narrower deployment overrides remain explicit topology policy. |
 | Production proof | Dynamic real-weight CUDA/CPU, ROCm/CPU, CUDA/ROCm, and CUDA/ROCm/CPU inference proves seeded-random/adversarial residency, histogram-driven promotions/demotions across domains, ranks, and backend types, repeated improving epochs, tunable transfer-slot waves, non-blocking background preparation, numerical parity, and the canonical CSV artifact set. Static CUDA/ROCm proves zero movement; segmented tri-tier prefill proves its declared heterogeneous capture boundary. | The exact CUDA/ROCm/NodeTP-CPU adversarial cell is green across repeated runs: three epochs commit 65 promotions, 65 demotions, and three paired CPU skew cycles, then improve matched prefill/decode medians by 10.71%/17.36%. Unsummed HF route evidence compares moved experts independently of unrelated top-k drift: all 294 comparable observations pass, with seven true route divergences retained as non-voting evidence. The remaining topology and MTP cells must pass the same mathematical and economy contracts before the campaign is complete. |
+
+### Qwen-122B MTP-depth-2 default-policy closure (2026-09-05)
+
+The final fixed-seed Release comparison used the Qwen3.5 122B MoE Q8_K_XL
+weights, four ROCm participants plus two NodeTP CPU participants, random initial
+ownership, FP16 activations and KV cache, prefix caching, and fixed MTP depth 2.
+No profiling or diagnostic timing was enabled. Static averaged 33.631 tok/s
+over three 1,024-token iterations. Dynamic with the production defaults
+converged to 33.988 tok/s over its final three iterations, a 1.06% settled
+improvement, while preserving byte-identical generated token IDs and the same
+0.6712 MTP acceptance rate.
+
+An intentionally durable candidate retained five physical slots but limited
+each layer to one swap and raised the payoff horizon from 2,048 to 16,384
+tokens. It issued 430 commands over 35 transactions (182 promotions, 182
+demotions, and 66 same-priority moves), so both placement axes were active, but
+it never reached a quiet epoch. Its final-three mean was 33.366 tok/s, 0.79%
+below Static, and its aggregate mean was 32.613 tok/s. This rejects the premise
+that a longer economic horizon is automatically better: recurring transfer
+traffic can consume the benefit of an improved layout.
+
+The packaged portable defaults therefore remain one canonical policy set:
+
+- five participant-wide physical transfer slots;
+- all five slots active when cycles-per-wave is unspecified;
+- four background execution streams;
+- four paired swaps considered per layer;
+- sixteen retained command entries per wave; and
+- a 2,048-token payoff horizon.
+
+Runtime configuration and CLI help derive these values from
+`DeviceMoERebalancePolicyShared.h`; parser regression coverage asserts the same
+constants. Deployment-specific overrides remain available, but they are not
+silently selected from topology names. The earlier five-percent economy target
+is not certified by this closure: the accepted result is the best stable
+configuration measured in this sprint, with the remaining performance gap
+explicitly deferred rather than hidden by the default.
 
 Therefore the answer to "does it work that way now?" is: **priority-ordered
 capacity budgeting, phase-aware cross-tier movement, and within-tier
@@ -1800,9 +1839,9 @@ The configuration model must represent these concepts independently with typed
 fields: strict tier priority, fixed-versus-automatic live capacity, per-physical
 participant memory limit, optional per-layer expert caps, cold-start
 membership policy, participant owner order, shadow concurrency, and migration
-payoff/hysteresis policy. `fallback=true` means final coverage responsibility;
-it must not imply unlimited memory. Before retaining the existing CLI spelling,
-the parser must stop treating `memory-mb=auto` as the same value as "no cap".
+payoff/hysteresis policy. The greatest numeric priority means final coverage
+responsibility and does not imply unlimited memory. The parser must keep
+`memory-mb=auto` distinct from "no cap".
 
 `--validate-only`, `--dry-run`, and `--explain-placement` must print, for every
 participant and layer, the budget source, fixed bytes, exact expert bytes,
@@ -1825,19 +1864,23 @@ weights use the CPU NativeVNNI interleaved packing. Migration reorders an
 already-quantized representation and copies its metadata; it never dequantizes,
 requantizes, or asks the model loader to recreate an evicted expert.
 
-Each `(domain, participant, layer)` endpoint owns persistent destination slots
-and conversion staging sized before captured execution. GPU engine pointers and
-runtime placement banks remain stable for the graph lifetime. CPU engines are
-host-owned and NUMA-placed according to the endpoint's typed policy.
+Each `(domain, participant, exact prepared geometry)` endpoint group owns one
+persistent destination arena and conversion staging sized before captured
+execution. A layer binding carries its own logical arrival limit but does not
+allocate another physical arena. GPU engine pointers and runtime placement
+banks remain stable for the graph lifetime. CPU engines are host-owned and
+NUMA-placed according to the endpoint's typed policy.
 
-The physical arena is the endpoint's resolved live allocations plus its
+The physical arena is the geometry group's resolved live allocations plus its
 separately charged RCU shadow allocations. Initial live allocations are
 prepared by the loader before the migration fabric exists, so the fabric
 adopts their exact storage as initially occupied slots instead of copying the
 weights into a second arena. The first migration normally arrives in a shadow
 slot. Only after the old epoch's final inference ticket and distributed retire
 fence have drained may the departed loader slot become a free destination for
-a later epoch.
+a later epoch. Its complete `(layer, expert, epoch)` identity is validated on
+release; reuse by another layer is permitted only because the arena key proves
+the prepared triplet geometry is byte compatible.
 
 Every assignment made after bootstrap carries an aliasing lease token through
 the candidate bank, published bank, transfer operations, and retirement work.

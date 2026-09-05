@@ -1126,7 +1126,7 @@ namespace llaminar2
         const double cpu_staging_gbs = (cpu_staging_ms > 0.0)
                                            ? (total_mb / 1024.0) / (cpu_staging_ms / 1000.0)
                                            : 0.0;
-        if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("weight_loading"))
         {
             const std::string device = "gpu:" + std::to_string(device_id_);
             PerfStatsCollector::addCounter("weight_loading", "gpu_pipeline_bytes",

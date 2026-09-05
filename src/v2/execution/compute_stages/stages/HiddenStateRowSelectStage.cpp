@@ -403,8 +403,13 @@ namespace llaminar2
          * Direct GPU integration fixtures must perform the same setup before
          * invoking the stage; executeGPU() never creates graph-visible storage.
          */
-        const bool graph_managed =
-            params_.input_buffer_id.has_value() &&
+        /*
+         * Input and output arena ownership are independent. A diagnostic
+         * checkpoint commonly reads an arena activation into an external,
+         * graph-owned observation tensor: the executor must bind the input,
+         * while this stage must still publish the external output itself.
+         */
+        const bool output_graph_managed =
             params_.output_buffer_id.has_value();
         const StageGPUExecution execution = gpuExecution();
         execution.requirePreparedInput(input_base);
@@ -509,7 +514,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!graph_managed)
+        if (!output_graph_managed)
         {
             /*
              * A direct-output row selector can also serve as a graph-captured
@@ -606,11 +611,12 @@ namespace llaminar2
 
     StageBufferContract HiddenStateRowSelectStage::bufferContract() const
     {
-        if (!params_.input_buffer_id || !params_.output_buffer_id)
-            return {};
-        return StageBufferContract::build()
-            .addInput(*params_.input_buffer_id, "FP32")
-            .addOutput(*params_.output_buffer_id, "FP32");
+        StageBufferContract contract = StageBufferContract::build();
+        if (params_.input_buffer_id)
+            contract.addInput(*params_.input_buffer_id, "FP32");
+        if (params_.output_buffer_id)
+            contract.addOutput(*params_.output_buffer_id, "FP32");
+        return contract;
     }
 
 } // namespace llaminar2

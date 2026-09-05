@@ -1,6 +1,19 @@
 /**
  * @file PerfStatsCollector.cpp
- * @brief Unified structured performance counter and timer collection.
+ * @brief Immutable-policy structured performance evidence collection.
+ *
+ * Collection policy and record storage have deliberately separate lifetimes.
+ * A policy reload parses the process environment once and release-publishes an
+ * immutable snapshot. Hot counter/timer sites acquire-load that pointer and
+ * return immediately when collection is disabled. Older snapshots are retained
+ * until process exit, which gives concurrent readers RCU-like safety without a
+ * reference-count increment, lock, environment lookup, or allocation in the
+ * inference path.
+ *
+ * Actual enabled records remain protected by the collector mutex. Callers that
+ * need expensive arguments or tags should still guard their construction with
+ * @ref PerfStatsCollector::isDomainEnabled; the policy cache makes that guard
+ * economical in both enabled and disabled configurations.
  */
 
 #include "PerfStatsCollector.h"
@@ -11,6 +24,7 @@
 #include "fort.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -18,6 +32,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -73,6 +88,79 @@ namespace llaminar2
         {
             static PerfStatsState instance;
             return instance;
+        }
+
+        /**
+         * @brief One immutable, fully parsed PerfStats collection policy.
+         *
+         * The special CPU/GPU timing booleans retain the existing rule that an
+         * explicit family switch overrides a narrower export filter. All other
+         * domains are selected by @ref filters, or collectively by
+         * @ref collect_all_domains.
+         */
+        struct PerfStatsCollectionPolicy
+        {
+            bool enabled = false;
+            bool collect_all_domains = false;
+            bool cpu_stage_timing = false;
+            bool gpu_stage_timing = false;
+            bool collect_cpu_stage_family = false;
+            bool collect_gpu_stage_family = false;
+            std::vector<std::string> filters;
+
+            /** @return Whether the immutable filter selects @p domain. */
+            [[nodiscard]] bool requestsDomain(
+                std::string_view domain) const noexcept
+            {
+                if (!enabled || domain.empty())
+                    return false;
+                if (collect_all_domains)
+                    return true;
+                if ((domain == "stage_cpu" ||
+                     domain == "stage_cpu_detail") &&
+                    collect_cpu_stage_family)
+                {
+                    return true;
+                }
+                if ((domain == "stage_gpu" ||
+                     domain == "mtp_stage_gpu") &&
+                    collect_gpu_stage_family)
+                {
+                    return true;
+                }
+                return std::any_of(
+                    filters.begin(),
+                    filters.end(),
+                    [domain](const std::string &filter)
+                    {
+                        return filter == "*" || filter == "all" ||
+                               filter == domain ||
+                               (filter.size() > domain.size() &&
+                                filter.starts_with(domain) &&
+                                filter[domain.size()] == '.');
+                    });
+            }
+        };
+
+        /**
+         * @brief RCU-style owner for every published policy generation.
+         *
+         * Reloads are rare setup/test transitions. Retaining old generations
+         * avoids a shared-pointer reference-count operation at every dormant
+         * counter while making a concurrent reload safe for an existing reader.
+         */
+        struct PerfStatsPolicyAuthority
+        {
+            std::mutex publication_mutex;
+            std::vector<std::unique_ptr<const PerfStatsCollectionPolicy>>
+                generations;
+            std::atomic<const PerfStatsCollectionPolicy *> published{nullptr};
+        };
+
+        PerfStatsPolicyAuthority &policyAuthority()
+        {
+            static PerfStatsPolicyAuthority authority;
+            return authority;
         }
 
         std::string trim(std::string value)
@@ -272,37 +360,106 @@ namespace llaminar2
                    filterRequestsStageCpuTiming();
         }
 
-        /**
-         * @brief Test whether an export filter can select records in a domain.
-         *
-         * A qualified filter such as `mtp.verifier_forward` necessarily
-         * enables its `mtp` producer even though the final name match happens
-         * when the report is rendered.
-         */
-        bool filterRequestsDomain(std::string_view domain)
-        {
-            const auto &filters = filterListFromEnv();
-            if (filters.empty())
-                return true;
-
-            return std::any_of(
-                filters.begin(),
-                filters.end(),
-                [domain](const std::string &filter)
-                {
-                    return filter == "*" || filter == "all" ||
-                           filter == domain ||
-                           (filter.size() > domain.size() &&
-                            filter.starts_with(domain) &&
-                            filter[domain.size()] == '.');
-                });
-        }
-
         bool perfStatsGpuStageTimingRequested()
         {
             return legacyUnifiedProfilingRequested() ||
                    isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING")) ||
                    filterRequestsStageGpuTiming();
+        }
+
+        /** @return Whether either live legacy GPU timing switch is enabled. */
+        bool gpuStageTimingEnvRequested();
+
+        /**
+         * @brief Parse every environment-owned PerfStats decision exactly once.
+         * @return Complete immutable policy ready for release publication.
+         */
+        PerfStatsCollectionPolicy buildCollectionPolicy()
+        {
+            const bool legacy_profile = legacyUnifiedProfilingRequested();
+            const bool cpu_stage_timing =
+                debugEnv().profile.enabled ||
+                perfStatsCpuStageTimingRequested();
+            const bool gpu_stage_timing =
+                debugEnv().gpu_stage_timing ||
+                debugEnv().profile.enabled ||
+                gpuStageTimingEnvRequested() ||
+                perfStatsGpuStageTimingRequested();
+            const bool summary_requested = isSummaryRequested();
+            const bool json_requested =
+                !exportPathFromEnv(
+                     "LLAMINAR_PERF_STATS_JSON",
+                     "/tmp/llaminar_perf_stats.json")
+                     .empty();
+            const bool csv_requested =
+                !exportPathFromEnv(
+                     "LLAMINAR_PERF_STATS_CSV",
+                     "/tmp/llaminar_perf_stats.csv")
+                     .empty();
+
+            PerfStatsCollectionPolicy policy;
+            policy.cpu_stage_timing = cpu_stage_timing;
+            policy.gpu_stage_timing = gpu_stage_timing;
+            /* A filter-derived timing request turns on the relevant clocks but
+             * must retain its exact domain/name selection. Only the explicit
+             * family switches override a narrower filter. */
+            policy.collect_cpu_stage_family =
+                isTruthyEnvValue(DebugEnv::envValue(
+                    "LLAMINAR_PERF_STATS_CPU_STAGE_TIMING"));
+            policy.collect_gpu_stage_family =
+                debugEnv().gpu_stage_timing ||
+                gpuStageTimingEnvRequested() ||
+                isTruthyEnvValue(DebugEnv::envValue(
+                    "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING"));
+            policy.filters = filterListFromEnv();
+            policy.enabled = debugEnv().profile.enabled || legacy_profile ||
+                             cpu_stage_timing || gpu_stage_timing ||
+                             summary_requested || json_requested ||
+                             csv_requested;
+            /* Legacy profiling explicitly means every historical family. An
+             * otherwise enabled unfiltered export retains the same contract. */
+            policy.collect_all_domains =
+                debugEnv().profile.enabled || legacy_profile ||
+                (policy.enabled && policy.filters.empty());
+            return policy;
+        }
+
+        /**
+         * @brief Publish one process-lifetime policy generation.
+         * @param force Replace an existing generation when true.
+         * @return The currently published immutable policy.
+         */
+        const PerfStatsCollectionPolicy &publishCollectionPolicy(bool force)
+        {
+            auto &authority = policyAuthority();
+            std::lock_guard<std::mutex> lock(authority.publication_mutex);
+            if (!force)
+            {
+                if (const auto *existing = authority.published.load(
+                        std::memory_order_acquire))
+                {
+                    return *existing;
+                }
+            }
+
+            auto policy = std::make_unique<const PerfStatsCollectionPolicy>(
+                buildCollectionPolicy());
+            const auto *const published = policy.get();
+            authority.generations.push_back(std::move(policy));
+            authority.published.store(published, std::memory_order_release);
+            return *published;
+        }
+
+        /** @return Current policy, lazily initialized before its first use. */
+        const PerfStatsCollectionPolicy &collectionPolicy()
+        {
+            auto &authority = policyAuthority();
+            if (const auto *published = authority.published.load(
+                    std::memory_order_acquire))
+            {
+                return *published;
+            }
+            return publishCollectionPolicy(/*force=*/false);
         }
 
         /**
@@ -507,72 +664,32 @@ namespace llaminar2
 
     bool PerfStatsCollector::isEnabled()
     {
-        return debugEnv().profile.enabled ||
-               debugEnv().gpu_stage_timing ||
-               perfStatsCpuStageTimingRequested() ||
-               gpuStageTimingEnvRequested() ||
-               perfStatsGpuStageTimingRequested() ||
-               isSummaryRequested() ||
-               exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json").size() > 0 ||
-               exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv").size() > 0;
+        return collectionPolicy().enabled;
     }
 
     bool PerfStatsCollector::isDomainEnabled(std::string_view domain)
     {
-        if (domain.empty())
-            return false;
-
-        // Explicit legacy profiling asks for the complete historical table.
-        if (debugEnv().profile.enabled || legacyUnifiedProfilingRequested())
-            return true;
-
-        // Family-specific environment switches remain authoritative even when
-        // an export filter is absent or narrower than the requested
-        // instrumentation. Filter-derived family activation is intentionally
-        // handled below, one exact domain at a time: asking for
-        // `stage_cpu_detail` must not also publish the coarse `stage_cpu`
-        // record around every graph node.
-        if ((domain == "stage_cpu" || domain == "stage_cpu_detail") &&
-            isTruthyEnvValue(
-                DebugEnv::envValue("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING")))
-        {
-            return true;
-        }
-        if ((domain == "stage_gpu" || domain == "mtp_stage_gpu") &&
-            (debugEnv().gpu_stage_timing || gpuStageTimingEnvRequested() ||
-             isTruthyEnvValue(
-                 DebugEnv::envValue("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING"))))
-        {
-            return true;
-        }
-
-        /*
-         * Reject an unrequested domain before consulting the broad export
-         * gate. This is the common hot-path case for a focused trace (for
-         * example, `mtp` while GEMM executes) and avoids repeated path parsing
-         * or clock reads in disabled kernel families.
-         */
-        if (!filterRequestsDomain(domain))
-            return false;
-        return isEnabled();
+        return collectionPolicy().requestsDomain(domain);
     }
 
     bool PerfStatsCollector::cpuStageTimingEnabled()
     {
-        return debugEnv().profile.enabled ||
-               perfStatsCpuStageTimingRequested();
+        return collectionPolicy().cpu_stage_timing;
     }
 
     bool PerfStatsCollector::gpuStageEventTimingEnabled()
     {
-        return debugEnv().gpu_stage_timing ||
-               debugEnv().profile.enabled ||
-               gpuStageTimingEnvRequested() ||
-               perfStatsGpuStageTimingRequested();
+        return collectionPolicy().gpu_stage_timing;
+    }
+
+    void PerfStatsCollector::reloadConfigurationFromEnvironment()
+    {
+        (void)publishCollectionPolicy(/*force=*/true);
     }
 
     void PerfStatsCollector::reset()
     {
+        reloadConfigurationFromEnvironment();
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         s.records.clear();
@@ -599,6 +716,7 @@ namespace llaminar2
             return;
         }
 
+        reloadConfigurationFromEnvironment();
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         for (auto it = s.records.begin(); it != s.records.end();)

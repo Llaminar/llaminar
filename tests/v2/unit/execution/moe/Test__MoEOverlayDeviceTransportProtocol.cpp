@@ -309,14 +309,19 @@ namespace llaminar2
         ASSERT_TRUE(transaction.has_value());
 
         std::uint64_t observed = 0u;
+        MoEOverlayDeviceControllerTransactionKind observed_kind =
+            MoEOverlayDeviceControllerTransactionKind::Invalid;
         MoEOverlayDeviceDemandPhase observed_phase =
             MoEOverlayDeviceDemandPhase::Invalid;
         EXPECT_TRUE(transport.snapshotTransactionAfter(
-            0u, &observed, &observed_phase));
+            0u, &observed, &observed_kind, &observed_phase));
         EXPECT_EQ(observed, *transaction);
+        EXPECT_EQ(
+            observed_kind,
+            MoEOverlayDeviceControllerTransactionKind::DynamicPlacement);
         EXPECT_EQ(observed_phase, MoEOverlayDeviceDemandPhase::Prefill);
         EXPECT_FALSE(transport.snapshotTransactionAfter(
-            *transaction, &observed, &observed_phase));
+            *transaction, &observed, &observed_kind, &observed_phase));
         EXPECT_FALSE(transport.localSnapshotsReady(*transaction));
 
         fixture.participant_records[0].snapshot_transaction = *transaction;
@@ -354,9 +359,59 @@ namespace llaminar2
             1u,
             0u));
         EXPECT_FALSE(transport.snapshotTransactionAfter(
-            0u, &observed, &observed_phase));
+            0u, &observed, &observed_kind, &observed_phase));
         EXPECT_FALSE(transport.localSnapshotsReady(*transaction));
         EXPECT_TRUE(transport.allGroupsSnapshotted(*transaction));
+    }
+
+    TEST(MoEOverlayDeviceTransportProtocol,
+         PreparedContextRestoreTicketAndZeroCommandFormAnExactTerminalProof)
+    {
+        Fixture fixture;
+        MoEOverlayDeviceTransportProtocol transport(fixture.binding);
+        const auto transaction = fixture.device.beginTransaction(
+            MoEOverlayDeviceControllerTransactionKind::
+                PreparedContextRestore,
+            MoEOverlayDeviceDemandPhase::Invalid);
+        ASSERT_TRUE(transaction.has_value());
+
+        std::uint64_t observed_transaction = 0u;
+        MoEOverlayDeviceControllerTransactionKind observed_kind =
+            MoEOverlayDeviceControllerTransactionKind::Invalid;
+        MoEOverlayDeviceDemandPhase observed_phase =
+            MoEOverlayDeviceDemandPhase::Decode;
+        ASSERT_TRUE(transport.snapshotTransactionAfter(
+            0u,
+            &observed_transaction,
+            &observed_kind,
+            &observed_phase));
+        EXPECT_EQ(observed_transaction, *transaction);
+        EXPECT_EQ(
+            observed_kind,
+            MoEOverlayDeviceControllerTransactionKind::
+                PreparedContextRestore);
+        EXPECT_EQ(observed_phase, MoEOverlayDeviceDemandPhase::Invalid);
+
+        ASSERT_TRUE(fixture.device.publishGroupSnapshot(
+            0u, *transaction, 0x9911u, 0u));
+        ASSERT_TRUE(fixture.device.publishCommand(
+            *transaction,
+            0u,
+            moeOverlayCommandDigestSeed(0u),
+            0u,
+            0u,
+            0u,
+            0u));
+        auto acquired = transport.tryAcquire(0u);
+        ASSERT_EQ(
+            acquired.status,
+            MoEOverlayDeviceTransportAcquireStatus::Ready)
+            << acquired.error;
+        EXPECT_TRUE(acquired.batch.valid());
+        EXPECT_FALSE(acquired.batch.movesWeights());
+        EXPECT_EQ(
+            acquired.batch.header.candidate_epoch,
+            acquired.batch.header.base_epoch);
     }
 
     TEST(MoEOverlayDeviceTransportProtocol,
@@ -563,7 +618,34 @@ namespace llaminar2
         // Tokens retired while that attempt ran are not discarded, but they
         // must satisfy the new cooldown before another wave is admitted.
         gate.notify(MoEOverlayInferencePhase::Decode, 70u);
-        EXPECT_EQ(gate.growRequiredTokens(128u, 1.5), 96u);
+        EXPECT_EQ(
+            gate.advanceAfterReceipt(
+                128u,
+                1.5,
+                MoEOverlayMaintenanceCadenceReceipt::
+                    fromDynamicTransaction(
+                        /*snapshot_observations=*/0u,
+                        /*command_count=*/0u)),
+            64u);
+        EXPECT_EQ(gate.requiredTokens(), 64u);
+        EXPECT_TRUE(gate.ready());
+
+        // The calibration rebase can leave a cadence-only notification that
+        // produces an empty first transaction. It must not consume the one
+        // adaptive-window transition reserved for real demand evidence.
+        const auto empty_post_rebase = gate.consumeReady();
+        ASSERT_TRUE(empty_post_rebase);
+        EXPECT_EQ(empty_post_rebase.completed_tokens, 70u);
+        gate.notify(MoEOverlayInferencePhase::Decode, 70u);
+        EXPECT_EQ(
+            gate.advanceAfterReceipt(
+                128u,
+                1.5,
+                MoEOverlayMaintenanceCadenceReceipt::
+                    fromDynamicTransaction(
+                        /*snapshot_observations=*/1u,
+                        /*command_count=*/0u)),
+            96u);
         EXPECT_EQ(gate.requiredTokens(), 96u);
         EXPECT_FALSE(gate.ready());
         gate.notify(MoEOverlayInferencePhase::Decode, 26u);
@@ -571,8 +653,20 @@ namespace llaminar2
         ASSERT_TRUE(grown_window);
         EXPECT_EQ(grown_window.phase, MoEOverlayInferencePhase::Decode);
         EXPECT_EQ(grown_window.completed_tokens, 96u);
-        EXPECT_EQ(gate.growRequiredTokens(128u, 1.5), 128u);
-        EXPECT_EQ(gate.growRequiredTokens(128u, 2.0), 128u);
+        EXPECT_EQ(
+            gate.advanceAfterReceipt(
+                128u,
+                1.5,
+                MoEOverlayMaintenanceCadenceReceipt::
+                    fromDynamicTransaction(1u, 0u)),
+            128u);
+        EXPECT_EQ(
+            gate.advanceAfterReceipt(
+                128u,
+                2.0,
+                MoEOverlayMaintenanceCadenceReceipt::
+                    fromDynamicTransaction(1u, 0u)),
+            128u);
 
         // A malformed zero-row progress report cannot create an epoch, and a
         // huge bounded prefill report saturates rather than wrapping the gate.
@@ -588,6 +682,55 @@ namespace llaminar2
         EXPECT_EQ(
             saturated.completed_tokens,
             std::numeric_limits<std::uint64_t>::max());
+    }
+
+    TEST(MoEOverlayMaintenanceBoundaryGate,
+         RetainsRapidCadenceUntilDevicePublishesObservedNoMovement)
+    {
+        MoEOverlayMaintenanceBoundaryGate gate(9u);
+
+        // A tier-residency cycle changes the placement seen by the next policy
+        // scan. Cooling down here used to strand participant-skew work behind
+        // a 4096-token window in finite production parity requests.
+        gate.notify(MoEOverlayInferencePhase::Prefill, 9u);
+        ASSERT_TRUE(gate.consumeReady());
+        EXPECT_EQ(
+            gate.advanceAfterReceipt(
+                4096u,
+                4096.0 / 9.0,
+                MoEOverlayMaintenanceCadenceReceipt::
+                    fromDynamicTransaction(
+                        /*snapshot_observations=*/72u,
+                        /*command_count=*/3u)),
+            9u);
+
+        // A second independently useful movement remains part of the same
+        // convergence burst, regardless of which axis the first wave covered.
+        gate.notify(MoEOverlayInferencePhase::Prefill, 9u);
+        ASSERT_TRUE(gate.consumeReady());
+        EXPECT_EQ(
+            gate.advanceAfterReceipt(
+                4096u,
+                4096.0 / 9.0,
+                MoEOverlayMaintenanceCadenceReceipt::
+                    fromDynamicTransaction(
+                        /*snapshot_observations=*/72u,
+                        /*command_count=*/2u)),
+            9u);
+
+        // Only an authenticated policy pass that consumed demand and emitted
+        // no command certifies that the burst can enter its long cooldown.
+        gate.notify(MoEOverlayInferencePhase::Prefill, 9u);
+        ASSERT_TRUE(gate.consumeReady());
+        EXPECT_EQ(
+            gate.advanceAfterReceipt(
+                4096u,
+                4096.0 / 9.0,
+                MoEOverlayMaintenanceCadenceReceipt::
+                    fromDynamicTransaction(
+                        /*snapshot_observations=*/72u,
+                        /*command_count=*/0u)),
+            4096u);
     }
 
     TEST(MoEOverlayMaintenanceBoundaryGate,

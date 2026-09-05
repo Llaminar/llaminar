@@ -34,8 +34,10 @@ namespace llaminar2
      */
     enum class DeviceControlledLoopFragmentExecution
     {
-        Always,                 ///< Execute on every admitted loop iteration.
-        IfDeviceWordNonZero,    ///< Execute only when the bound device word is non-zero.
+        Always,              ///< Execute on every admitted loop iteration.
+        IfDeviceWordNonZero, ///< Execute only when the bound device word is non-zero.
+        /** Execute when the validated transaction selector is at least the fragment threshold. */
+        IfDeviceSelectorAtLeast,
     };
 
     /// Result of an in-place graph executable update
@@ -132,16 +134,15 @@ namespace llaminar2
     };
 
     /**
-     * @brief Device-resident selector and fatal validation policy for a loop switch.
+     * @brief Device-resident selector and fatal validation policy for one loop transaction.
      *
-     * A single native SWITCH node controls one uniformly shaped request batch.
      * Every healthy, incomplete request must publish the same selector. Values
      * outside `[minimum_selector, maximum_selector]`, or disagreement between
-     * active rows, invalidate all active rows before any branch executes. The
-     * selected branch index is the selector value itself, keeping the control
-     * ABI visible and avoiding a second host-authored lookup table.
+     * active rows, invalidate all active rows before any transaction fragment
+     * executes. The validated value gates a monotonic linear prefix; it never
+     * selects among duplicated complete transaction bodies.
      */
-    struct DeviceControlledLoopSwitch
+    struct DeviceControlledLoopSelector
     {
         int *control_rows_device = nullptr; ///< Mutable first word of row zero.
         int control_stride = 0;             ///< Controller words between rows.
@@ -192,6 +193,14 @@ namespace llaminar2
          * It must remain stable for the complete executable lifetime.
          */
         const uint32_t *condition_word_device = nullptr;
+        /**
+         * Inclusive selector threshold used by @ref IfDeviceSelectorAtLeast.
+         *
+         * The enclosing selector contract owns the device address and legal
+         * interval. A negative value means that this fragment has no selector
+         * gate, making the three execution policies disjoint by construction.
+         */
+        int minimum_selector = -1;
 
         /** @brief Verify that the fragment carries complete diagnostic identity. */
         [[nodiscard]] bool valid() const noexcept
@@ -200,10 +209,17 @@ namespace llaminar2
             switch (execution)
             {
             case DeviceControlledLoopFragmentExecution::Always:
-                condition_binding_valid = condition_word_device == nullptr;
+                condition_binding_valid = condition_word_device == nullptr &&
+                                          minimum_selector < 0;
                 break;
             case DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero:
-                condition_binding_valid = condition_word_device != nullptr;
+                condition_binding_valid = condition_word_device != nullptr &&
+                                          minimum_selector < 0;
+                break;
+            case DeviceControlledLoopFragmentExecution::
+                IfDeviceSelectorAtLeast:
+                condition_binding_valid = condition_word_device == nullptr &&
+                                          minimum_selector >= 0;
                 break;
             }
             return name != nullptr && name[0] != '\0' && capture != nullptr &&
@@ -221,7 +237,8 @@ namespace llaminar2
             const DeviceControlledLoopFragment &other) const noexcept
         {
             return capture == other.capture && execution == other.execution &&
-                   condition_word_device == other.condition_word_device;
+                   condition_word_device == other.condition_word_device &&
+                   minimum_selector == other.minimum_selector;
         }
     };
 
@@ -240,23 +257,29 @@ namespace llaminar2
     {
         bool iteration_admitted = false;       ///< Whether the native loop body would run.
         bool conditional_word_nonzero = false; ///< Authenticated value for the conditional tail.
+        int selector = -1; ///< Authenticated selector for a depth-gated fragment.
 
         /**
          * @brief Decide whether one execution policy participates in this iteration.
-         * @param execution Typed policy stored in the retained branch.
+         * @tparam Fragment A fragment exposing execution and threshold fields.
+         * @param fragment Typed policy stored in the retained transaction.
          * @return true when the fragment must be submitted.
          */
+        template <typename Fragment>
         [[nodiscard]] constexpr bool selects(
-            DeviceControlledLoopFragmentExecution execution) const noexcept
+            const Fragment &fragment) const noexcept
         {
             if (!iteration_admitted)
                 return false;
-            switch (execution)
+            switch (fragment.execution)
             {
             case DeviceControlledLoopFragmentExecution::Always:
                 return true;
             case DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero:
                 return conditional_word_nonzero;
+            case DeviceControlledLoopFragmentExecution::
+                IfDeviceSelectorAtLeast:
+                return selector >= fragment.minimum_selector;
             }
             return false;
         }
@@ -274,7 +297,7 @@ namespace llaminar2
             size_t count = 0;
             for (const Fragment &fragment : ordered_fragments)
             {
-                if (selects(fragment.execution))
+                if (selects(fragment))
                     ++count;
             }
             return count;
@@ -295,7 +318,7 @@ namespace llaminar2
             size_t current_ordinal = 0;
             for (const Fragment &fragment : ordered_fragments)
             {
-                if (!selects(fragment.execution))
+                if (!selects(fragment))
                     continue;
                 if (current_ordinal == selected_ordinal)
                     return &fragment;
@@ -317,6 +340,58 @@ namespace llaminar2
         CapturedFragment, ///< Ordered retained graph captured on the same device.
         WaitValue64, ///< Unsigned-GEQ wait on an aligned GPU-visible word.
         PublishValue64, ///< Fenced 64-bit write after preceding graph work.
+    };
+
+    /**
+     * @brief Optional setup-time instrumentation for an ordered GPU timeline.
+     *
+     * The disabled policy preserves the production graph exactly. Per-step
+     * timing inserts backend-native event-record nodes around each already
+     * ordered step; it never adds a host callback, replay-time allocation, or
+     * synchronization. Consumers reclaim a completed prior replay through
+     * @ref IGPUGraphCapture::consumeOrderedTimelineTiming.
+     */
+    enum class GPUOrderedTimelineInstrumentation : std::uint8_t
+    {
+        Disabled, ///< Build the production graph without diagnostic nodes.
+        PerStepEvents, ///< Record one GPU event interval per ordered step.
+    };
+
+    /**
+     * @brief Lifecycle state of one instrumented ordered-timeline replay.
+     */
+    enum class GPUOrderedTimelineTimingState : std::uint8_t
+    {
+        Disabled, ///< This graph was built without timeline instrumentation.
+        AwaitingLaunch, ///< Instrumented graph has not completed a launch yet.
+        Pending, ///< The latest launch is still executing on the device.
+        Complete, ///< @ref GPUOrderedTimelineTimingSnapshot::samples are valid.
+        Failed, ///< A backend event query or elapsed-time read failed.
+    };
+
+    /**
+     * @brief One device-event measurement for an ordered timeline step.
+     */
+    struct GPUOrderedTimelineTimingSample
+    {
+        std::string name; ///< Stable semantic identity copied at composition.
+        GPUOrderedTimelineStepKind kind =
+            GPUOrderedTimelineStepKind::CapturedFragment;
+        double elapsed_ms = 0.0; ///< Device elapsed time, including device waits.
+    };
+
+    /**
+     * @brief Non-blocking snapshot of the latest ordered-timeline replay.
+     *
+     * Samples are populated only for @ref GPUOrderedTimelineTimingState::Complete.
+     * `error` is populated only for @ref GPUOrderedTimelineTimingState::Failed.
+     */
+    struct GPUOrderedTimelineTimingSnapshot
+    {
+        GPUOrderedTimelineTimingState state =
+            GPUOrderedTimelineTimingState::Disabled;
+        std::vector<GPUOrderedTimelineTimingSample> samples;
+        std::string error;
     };
 
     /**
@@ -354,18 +429,6 @@ namespace llaminar2
             }
             return false;
         }
-    };
-
-    /**
-     * @brief One complete transaction body selected by a device control value.
-     *
-     * Fragments are cloned in producer-to-consumer order. A branch inside the
-     * declared selector interval must be non-empty: accepting a selector and
-     * executing no transaction would leave the outer WHILE spinning forever.
-     */
-    struct DeviceControlledLoopBranch
-    {
-        std::span<const DeviceControlledLoopFragment> ordered_fragments;
     };
 
     /// Abstract interface for GPU graph capture and replay.
@@ -452,13 +515,15 @@ namespace llaminar2
         }
 
         /**
-         * @brief Report support for a device-selected transaction inside WHILE.
+         * @brief Report support for a selector-gated linear transaction in WHILE.
          *
          * This is stronger than @ref supportsDeviceControlledWhileLoop: the
-         * backend must support a nested native SWITCH whose selector is updated
-         * by a device kernel on every loop iteration.
+         * backend must validate a device selector before entering the
+         * transaction and lower monotonic selector thresholds without cloning
+         * one complete body per legal selector.
          */
-        [[nodiscard]] virtual bool supportsDeviceControlledSwitchWhileLoop() const noexcept
+        [[nodiscard]] virtual bool
+        supportsDeviceControlledSelectorWhileLoop() const noexcept
         {
             return false;
         }
@@ -516,10 +581,27 @@ namespace llaminar2
          * @return true when this capture owns the complete parent graph.
          */
         virtual bool buildOrderedTimelineTransaction(
-            std::span<const GPUOrderedTimelineStep> ordered_steps)
+            std::span<const GPUOrderedTimelineStep> ordered_steps,
+            GPUOrderedTimelineInstrumentation instrumentation =
+                GPUOrderedTimelineInstrumentation::Disabled)
         {
             (void)ordered_steps;
+            (void)instrumentation;
             return false;
+        }
+
+        /**
+         * @brief Consume completed per-step timings without waiting on the GPU.
+         *
+         * Backends return `Pending` while the terminal event is incomplete.
+         * A `Complete` snapshot consumes exactly one replay sample and returns
+         * the graph to `AwaitingLaunch`. Uninstrumented implementations retain
+         * this default `Disabled` result.
+         */
+        [[nodiscard]] virtual GPUOrderedTimelineTimingSnapshot
+        consumeOrderedTimelineTiming()
+        {
+            return {};
         }
 
         /**
@@ -578,34 +660,35 @@ namespace llaminar2
         }
 
         /**
-         * @brief Replace this graph with a device-controlled WHILE of SWITCH bodies.
+         * @brief Replace this graph with a selector-gated linear transaction in WHILE.
          *
          * The implementation first evaluates @p predicate to decide whether the
-         * loop may begin. Each iteration validates @p switch_policy on device,
-         * executes exactly one complete branch, then reevaluates @p predicate.
-         * Invalid or divergent selectors execute no branch and make the request
-         * terminally unhealthy. No partial common tail is permitted outside the
-         * branches because it could mutate state after selector validation failed.
-         * Each branch lowers the same typed unconditional and device-word
-         * conditional fragment policies as @ref buildDeviceControlledWhileLoop.
+         * loop may begin. Each iteration validates @p selector_policy on device,
+         * executes one producer-ordered transaction, then reevaluates @p predicate.
+         * Invalid or divergent selectors execute no fragment and make the request
+         * terminally unhealthy. Selector-gated fragments must form one monotonic
+         * region: their thresholds increase with transaction width, after which
+         * the shared verifier/publication tail appears exactly once. Ordinary
+         * device-word conditional fragments remain available in that common tail.
          *
-         * Branch array index is the device selector value. Entries outside the
-         * declared selector interval may be empty; every entry inside it must own
-         * at least one valid captured fragment.
+         * Fragments required at the minimum selector are unconditional. Every
+         * selector-gated threshold must be greater than the configured minimum
+         * and no greater than the configured maximum. This canonical shape keeps
+         * executable storage O(maximum selector) instead of O(sum of selectors).
          *
-         * @param branches Complete transaction bodies indexed by selector value.
+         * @param ordered_body_fragments One complete maximum-width transaction.
          * @param predicate Device-owned loop continuation policy.
-         * @param switch_policy Device-owned selector and fatal validation policy.
+         * @param selector_policy Device-owned selector and fatal validation policy.
          * @return true when this object owns a built, uninstantiated parent graph.
          */
-        virtual bool buildDeviceControlledSwitchWhileLoop(
-            std::span<const DeviceControlledLoopBranch> branches,
+        virtual bool buildDeviceControlledSelectorWhileLoop(
+            std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
             const DeviceControlledLoopPredicate &predicate,
-            const DeviceControlledLoopSwitch &switch_policy)
+            const DeviceControlledLoopSelector &selector_policy)
         {
-            (void)branches;
+            (void)ordered_body_fragments;
             (void)predicate;
-            (void)switch_policy;
+            (void)selector_policy;
             return false;
         }
 
@@ -650,6 +733,17 @@ namespace llaminar2
 
         /// @return true if an instantiated executable exists and is ready for launch()
         virtual bool hasExecutable() const = 0;
+
+        /**
+         * @brief Return setup-observed device bytes owned by this executable.
+         *
+         * The graph owner records this value directly around native
+         * instantiation. PerfStats and log output are diagnostics, never the
+         * accounting authority. A graph without an executable reports zero;
+         * a live executable may also report zero when an existing driver pool
+         * satisfies the allocation.
+         */
+        [[nodiscard]] virtual std::size_t residentMemoryBytes() const noexcept = 0;
 
         /// @return Number of nodes in the last captured graph (0 if no capture done)
         virtual size_t nodeCount() const = 0;

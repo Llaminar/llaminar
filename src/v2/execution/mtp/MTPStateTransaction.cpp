@@ -325,6 +325,8 @@ namespace llaminar2
             terminal_logits_numerical;
         MTPStateValidationResult::MainKVNumericalEvidence
             main_kv_numerical;
+        MTPStateValidationResult::GDNStateNumericalEvidence
+            gdn_numerical;
         auto mismatch = [&](std::string reason)
         {
             MTPStateValidationResult result =
@@ -332,6 +334,7 @@ namespace llaminar2
             result.terminal_hidden_numerical = terminal_hidden_numerical;
             result.terminal_logits_numerical = terminal_logits_numerical;
             result.main_kv_numerical = main_kv_numerical;
+            result.gdn_numerical = gdn_numerical;
             return result;
         };
 
@@ -1115,57 +1118,112 @@ namespace llaminar2
             }
         }
 
+        const bool placement_changed =
+            oracle.moe_runtime_movement_epoch !=
+            candidate.moe_runtime_movement_epoch;
+        const bool placement_aware_gdn =
+            options.gdn_state_policy ==
+            MTPGDNStateComparisonPolicy::
+                ExactUnlessMoEPlacementChanged;
+        const bool always_numerical_gdn =
+            options.gdn_state_policy ==
+            MTPGDNStateComparisonPolicy::NumericalValues;
+
         auto compare_gdn_values =
             [&](const std::vector<float> &lhs,
                 const std::vector<float> &rhs,
+                size_t expected_values,
                 int layer,
                 const char *state_name) -> MTPStateValidationResult
         {
-            if (lhs.empty() || rhs.empty())
-                return MTPStateValidationResult::success();
-            if (lhs.size() != rhs.size())
+            if (lhs.size() != expected_values ||
+                rhs.size() != expected_values)
             {
                 std::ostringstream msg;
-                msg << "GDN " << state_name << " value sample count mismatch at layer "
-                    << layer << ": " << lhs.size() << "/" << rhs.size();
+                msg << "GDN " << state_name
+                    << " numerical comparison requires complete retained values at layer "
+                    << layer << ": expected=" << expected_values
+                    << " actual=" << lhs.size() << "/" << rhs.size();
                 return mismatch(msg.str());
             }
 
             double sq_diff = 0.0;
-            double sq_rhs = 0.0;
+            double sq_oracle = 0.0;
             double dot = 0.0;
-            double sq_lhs = 0.0;
+            double sq_candidate = 0.0;
             double max_abs = 0.0;
-            for (size_t i = 0; i < lhs.size(); ++i)
+            bool finite = true;
+            for (size_t i = 0; i < expected_values; ++i)
             {
                 const double a = static_cast<double>(lhs[i]);
                 const double b = static_cast<double>(rhs[i]);
+                finite = finite && std::isfinite(a) && std::isfinite(b);
                 const double diff = a - b;
                 sq_diff += diff * diff;
-                sq_lhs += a * a;
-                sq_rhs += b * b;
+                sq_oracle += a * a;
+                sq_candidate += b * b;
                 dot += a * b;
                 max_abs = std::max(max_abs, std::abs(diff));
             }
 
             const double rel_l2 =
-                std::sqrt(sq_diff) / std::max(1e-30, std::sqrt(sq_rhs));
+                std::sqrt(sq_diff) /
+                std::max(1e-30, std::sqrt(sq_oracle));
+            const double norm_product =
+                std::sqrt(sq_oracle) * std::sqrt(sq_candidate);
+            const bool both_zero =
+                sq_oracle <= 1e-30 && sq_candidate <= 1e-30;
             const double cosine =
-                dot / std::max(1e-30, std::sqrt(sq_lhs) * std::sqrt(sq_rhs));
-            if (rel_l2 > options.gdn_relative_l2_tolerance ||
-                max_abs > options.gdn_max_abs_tolerance ||
-                cosine < options.gdn_min_cosine)
+                both_zero
+                    ? 1.0
+                    : (norm_product > 1e-30 ? dot / norm_product : 0.0);
+            const bool relative_l2_passed =
+                !options.gdn_relative_l2_tolerance ||
+                rel_l2 <= *options.gdn_relative_l2_tolerance;
+            const bool max_abs_passed =
+                !options.gdn_max_abs_tolerance ||
+                max_abs <= *options.gdn_max_abs_tolerance;
+            const bool passed =
+                finite && relative_l2_passed && max_abs_passed &&
+                cosine >= options.gdn_min_cosine;
+
+            gdn_numerical.compared = true;
+            gdn_numerical.passed =
+                gdn_numerical.payloads == 0u
+                    ? passed
+                    : gdn_numerical.passed && passed;
+            ++gdn_numerical.payloads;
+            gdn_numerical.elements += expected_values;
+            gdn_numerical.minimum_cosine = std::min(
+                gdn_numerical.minimum_cosine, cosine);
+            gdn_numerical.maximum_relative_l2 = std::max(
+                gdn_numerical.maximum_relative_l2, rel_l2);
+            gdn_numerical.maximum_abs = std::max(
+                gdn_numerical.maximum_abs, max_abs);
+
+            if (!passed)
             {
                 std::ostringstream msg;
-                msg << "GDN " << state_name << " value mismatch at layer "
+                msg << "GDN " << state_name << " numerical mismatch at layer "
                     << layer
+                    << " epochs=" << oracle.moe_runtime_movement_epoch
+                    << "/" << candidate.moe_runtime_movement_epoch
+                    << " elements=" << expected_values
+                    << " finite=" << (finite ? "true" : "false")
                     << " rel_l2=" << rel_l2
                     << " max_abs=" << max_abs
                     << " cosine=" << cosine
-                    << " tolerances(rel_l2="
-                    << options.gdn_relative_l2_tolerance
-                    << ", max_abs=" << options.gdn_max_abs_tolerance
-                    << ", min_cosine=" << options.gdn_min_cosine << ")";
+                    << " tolerances(rel_l2=";
+                if (options.gdn_relative_l2_tolerance)
+                    msg << *options.gdn_relative_l2_tolerance;
+                else
+                    msg << "not_gated";
+                msg << ", max_abs=";
+                if (options.gdn_max_abs_tolerance)
+                    msg << *options.gdn_max_abs_tolerance;
+                else
+                    msg << "not_gated";
+                msg << ", min_cosine=" << options.gdn_min_cosine << ")";
                 return mismatch(msg.str());
             }
             return MTPStateValidationResult::success();
@@ -1181,30 +1239,55 @@ namespace llaminar2
                 return mismatch("GDN recurrence value count mismatch");
             if (lhs.conv_values != rhs.conv_values)
                 return mismatch("GDN short-conv value count mismatch");
-            const bool compare_device_gdn_hashes =
-                lhs.device_state_hash_available &&
-                rhs.device_state_hash_available;
-            if (options.compare_gdn_values_if_available)
+            if (options.gdn_state_policy ==
+                MTPGDNStateComparisonPolicy::LogicalMetadataOnly)
             {
-                if (auto recurrence_result = compare_gdn_values(
-                        lhs.recurrence_sample_values,
-                        rhs.recurrence_sample_values,
-                        lhs.global_layer,
-                        "recurrence");
-                    !recurrence_result)
-                {
-                    return recurrence_result;
-                }
-                if (auto conv_result = compare_gdn_values(
-                        lhs.conv_sample_values,
-                        rhs.conv_sample_values,
-                        lhs.global_layer,
-                        "short-conv");
-                    !conv_result)
-                {
-                    return conv_result;
-                }
+                continue;
             }
+            if (lhs.device_state_hash_available !=
+                rhs.device_state_hash_available)
+            {
+                return mismatch(
+                    "GDN device-state hash availability mismatch at layer " +
+                    std::to_string(lhs.global_layer));
+            }
+            const bool compare_device_gdn_hashes =
+                lhs.device_state_hash_available;
+            const size_t recurrence_expected_values =
+                compare_device_gdn_hashes
+                    ? lhs.recurrence_device_bytes / sizeof(float)
+                    : lhs.recurrence_values;
+            const size_t conv_expected_values =
+                compare_device_gdn_hashes
+                    ? lhs.conv_device_bytes / sizeof(float)
+                    : lhs.conv_values;
+            const uint64_t lhs_recurrence_hash =
+                compare_device_gdn_hashes
+                    ? lhs.recurrence_device_hash
+                    : lhs.recurrence_hash;
+            const uint64_t rhs_recurrence_hash =
+                compare_device_gdn_hashes
+                    ? rhs.recurrence_device_hash
+                    : rhs.recurrence_hash;
+            const uint64_t lhs_conv_hash =
+                compare_device_gdn_hashes
+                    ? lhs.conv_device_hash
+                    : lhs.conv_hash;
+            const uint64_t rhs_conv_hash =
+                compare_device_gdn_hashes
+                    ? rhs.conv_device_hash
+                    : rhs.conv_hash;
+            const bool recurrence_hash_changed =
+                lhs_recurrence_hash != rhs_recurrence_hash;
+            const bool conv_hash_changed = lhs_conv_hash != rhs_conv_hash;
+            const bool compare_recurrence_numerically =
+                always_numerical_gdn ||
+                (placement_aware_gdn && placement_changed &&
+                 recurrence_hash_changed);
+            const bool compare_conv_numerically =
+                always_numerical_gdn ||
+                (placement_aware_gdn && placement_changed &&
+                 conv_hash_changed);
             if (compare_device_gdn_hashes)
             {
                 if (lhs.recurrence_device_bytes != rhs.recurrence_device_bytes)
@@ -1221,50 +1304,64 @@ namespace llaminar2
                         << lhs.global_layer;
                     return mismatch(msg.str());
                 }
-                if (options.compare_gdn_hashes &&
-                    lhs.recurrence_device_hash != rhs.recurrence_device_hash)
-                {
-                    std::ostringstream msg;
-                    msg << "GDN recurrence device hash mismatch at layer "
-                        << lhs.global_layer;
-                    return mismatch(msg.str());
-                }
-                if (options.compare_gdn_hashes &&
-                    lhs.conv_device_hash != rhs.conv_device_hash)
-                {
-                    std::ostringstream msg;
-                    msg << "GDN short-conv device hash mismatch at layer "
-                        << lhs.global_layer;
-                    return mismatch(msg.str());
-                }
-                /*
-                 * Phase 9.5 makes GPU GDN/short-conv state device-owned.
-                 * Host mirror zero flags can be stale after a device-only
-                 * publication, so a probe with device hashes must be judged
-                 * by those hashes rather than by host-mirror all-zero flags.
-                 */
-                continue;
             }
-            if (options.compare_gdn_hashes &&
-                lhs.recurrence_hash != rhs.recurrence_hash)
+
+            if (compare_recurrence_numerically)
+            {
+                if (auto result = compare_gdn_values(
+                        lhs.recurrence_sample_values,
+                        rhs.recurrence_sample_values,
+                        recurrence_expected_values,
+                        lhs.global_layer,
+                        "recurrence");
+                    !result)
+                {
+                    return result;
+                }
+            }
+            else if (recurrence_hash_changed)
             {
                 std::ostringstream msg;
-                msg << "GDN recurrence hash mismatch at layer "
+                msg << "GDN recurrence "
+                    << (compare_device_gdn_hashes ? "device " : "")
+                    << "hash mismatch at layer "
                     << lhs.global_layer;
                 return mismatch(msg.str());
             }
-            if (options.compare_gdn_hashes &&
-                lhs.conv_hash != rhs.conv_hash)
+
+            if (compare_conv_numerically)
+            {
+                if (auto result = compare_gdn_values(
+                        lhs.conv_sample_values,
+                        rhs.conv_sample_values,
+                        conv_expected_values,
+                        lhs.global_layer,
+                        "short-conv");
+                    !result)
+                {
+                    return result;
+                }
+            }
+            else if (conv_hash_changed)
             {
                 std::ostringstream msg;
-                msg << "GDN short-conv hash mismatch at layer "
+                msg << "GDN short-conv "
+                    << (compare_device_gdn_hashes ? "device " : "")
+                    << "hash mismatch at layer "
                     << lhs.global_layer;
                 return mismatch(msg.str());
             }
-            if (lhs.recurrence_all_zero != rhs.recurrence_all_zero)
-                return mismatch("GDN recurrence zero-state flag mismatch");
-            if (lhs.conv_all_zero != rhs.conv_all_zero)
-                return mismatch("GDN short-conv zero-state flag mismatch");
+
+            /* GPU host mirrors may lag device-only publication.  When device
+             * bytes are authoritative, their exact/numerical proof supersedes
+             * the host-mirror zero flags. */
+            if (!compare_device_gdn_hashes)
+            {
+                if (lhs.recurrence_all_zero != rhs.recurrence_all_zero)
+                    return mismatch("GDN recurrence zero-state flag mismatch");
+                if (lhs.conv_all_zero != rhs.conv_all_zero)
+                    return mismatch("GDN short-conv zero-state flag mismatch");
+            }
         }
 
         MTPStateValidationResult result =
@@ -1272,6 +1369,7 @@ namespace llaminar2
         result.terminal_hidden_numerical = terminal_hidden_numerical;
         result.terminal_logits_numerical = terminal_logits_numerical;
         result.main_kv_numerical = main_kv_numerical;
+        result.gdn_numerical = gdn_numerical;
         return result;
     }
 

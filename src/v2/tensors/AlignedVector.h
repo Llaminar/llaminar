@@ -23,7 +23,10 @@
 #include <stdexcept>
 #include <algorithm>
 #include <initializer_list>
+#include <limits>
 #include <memory> // uninitialized_copy, uninitialized_fill
+#include <new>    // bad_alloc
+#include <utility>
 #include <vector>
 #ifdef __linux__
 #include <sys/mman.h> // madvise, MADV_HUGEPAGE
@@ -59,6 +62,20 @@ namespace llaminar2
 
         /// Cache line alignment (64 bytes on x86-64)
         static constexpr size_t ALIGNMENT = 64;
+
+        /**
+         * @brief Physical allocation authority retained by this vector.
+         *
+         * Ordinary tensor storage uses the process heap.  Exact NUMA receive
+         * buffers use a private anonymous mapping so destroying the owner
+         * revokes the complete virtual range instead of returning potentially
+         * accelerator-pinned pages to a reusable libc arena.
+         */
+        enum class StorageKind : std::uint8_t
+        {
+            Heap,
+            AnonymousPageMapping,
+        };
 
         // ========== Constructors ==========
 
@@ -128,11 +145,17 @@ namespace llaminar2
 
         /// Move constructor
         AlignedVector(AlignedVector &&other) noexcept
-            : data_(other.data_), size_(other.size_), capacity_(other.capacity_)
+            : data_(other.data_), size_(other.size_), capacity_(other.capacity_),
+              allocation_bytes_(other.allocation_bytes_),
+              allocation_alignment_(other.allocation_alignment_),
+              storage_kind_(other.storage_kind_)
         {
             other.data_ = nullptr;
             other.size_ = 0;
             other.capacity_ = 0;
+            other.allocation_bytes_ = 0;
+            other.allocation_alignment_ = ALIGNMENT;
+            other.storage_kind_ = StorageKind::Heap;
         }
 
         /// Destructor
@@ -145,7 +168,7 @@ namespace llaminar2
                 {
                     data_[i - 1].~T();
                 }
-                std::free(data_);
+                release_raw(data_, allocation_bytes_, storage_kind_);
             }
         }
 
@@ -185,7 +208,12 @@ namespace llaminar2
             if (new_capacity <= capacity_)
                 return;
 
-            T *new_data = allocate_raw(new_capacity, ALIGNMENT);
+            size_t new_allocation_bytes = 0;
+            T *new_data = allocate_raw(
+                new_capacity,
+                std::max(ALIGNMENT, allocation_alignment_),
+                storage_kind_,
+                new_allocation_bytes);
 
             if (data_)
             {
@@ -197,11 +225,12 @@ namespace llaminar2
                 {
                     data_[i].~T();
                 }
-                std::free(data_);
+                release_raw(data_, allocation_bytes_, storage_kind_);
             }
 
             data_ = new_data;
             capacity_ = new_capacity;
+            allocation_bytes_ = new_allocation_bytes;
         }
 
         /**
@@ -235,17 +264,50 @@ namespace llaminar2
 
             const size_t target_capacity =
                 std::max(new_capacity, capacity_);
+            size_t new_allocation_bytes = 0;
             T *new_data = allocate_raw(
-                target_capacity, minimum_alignment);
+                target_capacity,
+                minimum_alignment,
+                storage_kind_,
+                new_allocation_bytes);
             if (data_)
             {
                 std::uninitialized_copy_n(data_, size_, new_data);
                 for (size_t i = 0; i < size_; ++i)
                     data_[i].~T();
-                std::free(data_);
+                release_raw(data_, allocation_bytes_, storage_kind_);
             }
             data_ = new_data;
             capacity_ = target_capacity;
+            allocation_bytes_ = new_allocation_bytes;
+            allocation_alignment_ = minimum_alignment;
+        }
+
+        /**
+         * @brief Create uninitialized storage in one dedicated page mapping.
+         *
+         * The returned vector has ordinary value semantics, but its complete
+         * capacity is released with `munmap` rather than `free`.  This is the
+         * required owner for buffers whose placement will subsequently be
+         * established and certified by NUMA first touch.
+         *
+         * @param element_count Logical number of elements in the mapping.
+         * @return A page-aligned vector whose elements remain uninitialized.
+         * @throws std::bad_alloc If the mapping cannot be created.
+         * @throws std::runtime_error On platforms without anonymous mappings.
+         */
+        [[nodiscard]] static AlignedVector pageMappedUninitialized(
+            size_t element_count)
+        {
+            AlignedVector result;
+            result.storage_kind_ = StorageKind::AnonymousPageMapping;
+            if (element_count != 0)
+            {
+                result.reserve_aligned(
+                    element_count, runtimePageSize());
+                result.size_ = element_count;
+            }
+            return result;
         }
 
         /// Resize vector (may allocate/deallocate)
@@ -449,6 +511,9 @@ namespace llaminar2
             std::swap(data_, other.data_);
             std::swap(size_, other.size_);
             std::swap(capacity_, other.capacity_);
+            std::swap(allocation_bytes_, other.allocation_bytes_);
+            std::swap(allocation_alignment_, other.allocation_alignment_);
+            std::swap(storage_kind_, other.storage_kind_);
         }
 
         // ========== Alignment Query ==========
@@ -462,6 +527,61 @@ namespace llaminar2
         /// Get alignment of data pointer
         size_t alignment() const { return ALIGNMENT; }
 
+        /** @return The allocation authority that owns the current capacity. */
+        [[nodiscard]] StorageKind storageKind() const noexcept
+        {
+            return storage_kind_;
+        }
+
+        /** @return Page-rounded bytes owned by the active allocation. */
+        [[nodiscard]] size_t allocationBytes() const noexcept
+        {
+            return allocation_bytes_;
+        }
+
+        /**
+         * @brief Resolve the exact physical byte extent for a future allocation.
+         *
+         * Memory admission calls this same arithmetic before construction and
+         * the allocator calls it again while materializing storage. Keeping
+         * page promotion, caller alignment, and overflow handling here prevents
+         * subsystem planners from maintaining approximate copies of the heap
+         * or anonymous-mapping contract.
+         *
+         * @param element_count Number of `T` elements to own.
+         * @param minimum_alignment Minimum power-of-two address alignment.
+         * @param storage_kind Heap or dedicated anonymous mapping authority.
+         * @return Exact byte extent later passed to `free` or `munmap`.
+         * @throws std::invalid_argument for an invalid alignment/storage pair.
+         * @throws std::overflow_error when element or rounding arithmetic wraps.
+         */
+        [[nodiscard]] static size_t requiredAllocationBytes(
+            size_t element_count,
+            size_t minimum_alignment = ALIGNMENT,
+            StorageKind storage_kind = StorageKind::Heap)
+        {
+            if (element_count == 0u)
+                return 0u;
+            if (element_count >
+                std::numeric_limits<size_t>::max() / sizeof(T))
+            {
+                throw std::overflow_error(
+                    "AlignedVector element byte count overflows size_t");
+            }
+            const size_t logical_bytes = element_count * sizeof(T);
+            const size_t allocation_alignment = effectiveAllocationAlignment(
+                logical_bytes, minimum_alignment, storage_kind);
+            if (logical_bytes >
+                std::numeric_limits<size_t>::max() -
+                    (allocation_alignment - 1u))
+            {
+                throw std::overflow_error(
+                    "AlignedVector allocation rounding overflows size_t");
+            }
+            return (logical_bytes + allocation_alignment - 1u) &
+                   ~(allocation_alignment - 1u);
+        }
+
         /** @return Whether the current address satisfies @p byte_alignment. */
         bool is_aligned_to(size_t byte_alignment) const
         {
@@ -474,41 +594,123 @@ namespace llaminar2
         T *data_;
         size_t size_;
         size_t capacity_;
+        size_t allocation_bytes_ = 0;
+        size_t allocation_alignment_ = ALIGNMENT;
+        StorageKind storage_kind_ = StorageKind::Heap;
 
-        /// Allocate aligned memory (raw, uninitialized)
-        T *allocate_raw(size_t n, size_t minimum_alignment)
+        /** @return The platform page size required by anonymous mappings. */
+        static size_t runtimePageSize()
+        {
+#ifdef __linux__
+            const long page_size = sysconf(_SC_PAGESIZE);
+            if (page_size <= 0)
+                throw std::runtime_error(
+                    "AlignedVector could not resolve the runtime page size");
+            return static_cast<size_t>(page_size);
+#else
+            throw std::runtime_error(
+                "AlignedVector anonymous page mappings require Linux");
+#endif
+        }
+
+        /**
+         * @brief Resolve address alignment from allocator and payload geometry.
+         *
+         * Heap allocations at least one page large are page-aligned so NUMA
+         * tooling never rounds into a neighboring allocation. Anonymous
+         * mappings inherently begin on a runtime page boundary and cannot
+         * promise a stronger alignment without an over-allocation owner.
+         */
+        static size_t effectiveAllocationAlignment(
+            size_t logical_bytes,
+            size_t minimum_alignment,
+            StorageKind storage_kind)
+        {
+            minimum_alignment = std::max(minimum_alignment, ALIGNMENT);
+            if ((minimum_alignment & (minimum_alignment - 1u)) != 0u)
+            {
+                throw std::invalid_argument(
+                    "AlignedVector minimum alignment must be a power of two");
+            }
+
+            size_t allocation_alignment = minimum_alignment;
+#ifdef __linux__
+            const size_t page_size = runtimePageSize();
+            if (logical_bytes >= page_size)
+            {
+                allocation_alignment = std::max(
+                    allocation_alignment, page_size);
+            }
+            if (storage_kind == StorageKind::AnonymousPageMapping)
+            {
+                if (allocation_alignment > page_size)
+                {
+                    throw std::invalid_argument(
+                        "AlignedVector anonymous mapping alignment exceeds the runtime page size");
+                }
+                allocation_alignment = page_size;
+            }
+#else
+            if (storage_kind == StorageKind::AnonymousPageMapping)
+            {
+                throw std::runtime_error(
+                    "AlignedVector anonymous page mappings require Linux");
+            }
+#endif
+            return allocation_alignment;
+        }
+
+        /**
+         * @brief Allocate raw storage using the vector's exact owner kind.
+         * @param n Element capacity.
+         * @param minimum_alignment Required power-of-two address alignment.
+         * @param storage_kind Heap or dedicated anonymous mapping authority.
+         * @param allocation_bytes Receives the exact releasable byte extent.
+         * @return Uninitialized aligned storage.
+         */
+        static T *allocate_raw(
+            size_t n,
+            size_t minimum_alignment,
+            StorageKind storage_kind,
+            size_t &allocation_bytes)
         {
             if (n == 0)
                 return nullptr;
 
-            // Calculate allocation size.  Small SIMD scratch buffers only need
-            // cache-line alignment, but large weight buffers participate in
-            // strict NUMA placement.  Linux NUMA APIs bind and migrate whole
-            // pages, so a large allocation that starts at only a 64-byte
-            // boundary can cause callers to round the range outward and touch
-            // neighboring heap bytes.  Page-aligning large allocations keeps
-            // strict mbind()/move_pages() checks scoped to this vector.
-            size_t alloc_bytes = n * sizeof(T);
-            size_t allocation_alignment =
-                std::max(ALIGNMENT, minimum_alignment);
-#ifdef __linux__
-            const long page_size = sysconf(_SC_PAGESIZE);
-            if (page_size > static_cast<long>(ALIGNMENT) &&
-                alloc_bytes >= static_cast<size_t>(page_size))
-            {
-                allocation_alignment = std::max(
-                    allocation_alignment,
-                    static_cast<size_t>(page_size));
-            }
-#endif
-            size_t aligned_bytes = (alloc_bytes + allocation_alignment - 1) &
-                                   ~(allocation_alignment - 1);
+            /* Admission and allocation deliberately share these two helpers. */
+            const size_t aligned_bytes = requiredAllocationBytes(
+                n, minimum_alignment, storage_kind);
+            const size_t logical_bytes = n * sizeof(T);
+            const size_t allocation_alignment = effectiveAllocationAlignment(
+                logical_bytes, minimum_alignment, storage_kind);
 
-            void *ptr = std::aligned_alloc(allocation_alignment, aligned_bytes);
-            if (!ptr)
+            void *ptr = nullptr;
+            if (storage_kind == StorageKind::Heap)
             {
-                throw std::bad_alloc();
+                ptr = std::aligned_alloc(
+                    allocation_alignment, aligned_bytes);
+                if (!ptr)
+                    throw std::bad_alloc();
             }
+            else
+            {
+#ifdef __linux__
+                ptr = ::mmap(
+                    nullptr,
+                    aligned_bytes,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0);
+                if (ptr == MAP_FAILED)
+                    throw std::bad_alloc();
+#else
+                (void)aligned_bytes;
+                throw std::runtime_error(
+                    "AlignedVector anonymous page mappings require Linux");
+#endif
+            }
+            allocation_bytes = aligned_bytes;
 
 #ifdef __linux__
             // Request transparent huge pages for large allocations (>2MB).
@@ -522,10 +724,45 @@ namespace llaminar2
             return static_cast<T *>(ptr);
         }
 
-        /// Allocate and default-initialize
+        /**
+         * @brief Release storage through the authority that created it.
+         * @param ptr Allocation base.
+         * @param allocation_bytes Exact releasable byte extent.
+         * @param storage_kind Heap or anonymous-mapping owner.
+         */
+        static void release_raw(
+            T *ptr,
+            size_t allocation_bytes,
+            StorageKind storage_kind) noexcept
+        {
+            if (!ptr)
+                return;
+            if (storage_kind == StorageKind::Heap)
+            {
+                std::free(ptr);
+                return;
+            }
+#ifdef __linux__
+            if (allocation_bytes == 0 ||
+                ::munmap(ptr, allocation_bytes) != 0)
+            {
+                std::terminate();
+            }
+#else
+            (void)allocation_bytes;
+            std::terminate();
+#endif
+        }
+
+        /** @brief Allocate ordinary default-kind storage for constructors. */
         void allocate(size_t n)
         {
-            data_ = allocate_raw(n, ALIGNMENT);
+            data_ = allocate_raw(
+                n,
+                ALIGNMENT,
+                storage_kind_,
+                allocation_bytes_);
+            allocation_alignment_ = ALIGNMENT;
         }
     };
 

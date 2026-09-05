@@ -26,7 +26,45 @@ namespace llaminar2::test::parity
     {
         NotEntered,
         Active,
+        TeardownEntered,
+        OutcomeConverged,
         Retired,
+    };
+
+    /** @brief This rank's GoogleTest result before parity-cell retirement. */
+    enum class ParityCellLocalOutcome : std::uint8_t
+    {
+        Passed,
+        Failed,
+    };
+
+    /** @brief Rank-wide result agreed on the isolated teardown channel. */
+    enum class ParityCellAggregateOutcome : std::uint8_t
+    {
+        AllRanksPassed,
+        AtLeastOneRankFailed,
+    };
+
+    /**
+     * @brief Immutable receipt proving every rank agreed on the cell outcome.
+     *
+     * `originating_failed_ranks` counts only ranks that were already failed
+     * when consensus began. Passing peers use this receipt to publish the same
+     * failure into GoogleTest before fail-fast is allowed to select another
+     * generated cell.
+     */
+    struct ParityCellOutcomeConsensus final
+    {
+        ParityCellAggregateOutcome outcome =
+            ParityCellAggregateOutcome::AllRanksPassed;
+        int originating_failed_ranks = 0;
+        int participant_count = 1;
+
+        /** @return Whether every participating rank entered as passing. */
+        [[nodiscard]] bool allRanksPassed() const noexcept
+        {
+            return outcome == ParityCellAggregateOutcome::AllRanksPassed;
+        }
     };
 
     /**
@@ -113,9 +151,10 @@ namespace llaminar2::test::parity
      * @brief Single authority for all test-only MPI state owned by one cell.
      *
      * Entering constructs both protocol lanes atomically from the caller's
-     * perspective. The control lane carries evidence and setup coordination;
-     * the teardown lane carries exactly the entry and exit teardown barriers.
-     * Retirement releases both only after production execution state is gone.
+     * perspective. The control lane carries evidence and setup coordination.
+     * The teardown lane owns one typed sequence: entry rendezvous, rank-wide
+     * outcome consensus, exit rendezvous, retirement. This sequence prevents
+     * rank-local GoogleTest fail-fast from advancing only part of an MPI cell.
      */
     class ParityCellLifecycle final
     {
@@ -149,7 +188,7 @@ namespace llaminar2::test::parity
             return state_;
         }
 
-        /** @return Whether both isolated channels are currently active. */
+        /** @return Whether the cell still admits setup/evidence operations. */
         [[nodiscard]] bool active() const noexcept
         {
             return state_ == ParityCellLifecycleState::Active &&
@@ -168,23 +207,96 @@ namespace llaminar2::test::parity
         }
 
         /**
-         * @brief Rendezvous on the teardown-only lane.
+         * @brief Close cell work and rendezvous before resource retirement.
+         *
+         * No rank may inspect fail-fast or begin another generated cell after
+         * this transition. The following legal operation is exactly one call
+         * to `convergeOutcome()`.
+         *
          * @throws std::logic_error outside the active state.
          */
-        void teardownBarrier() const
+        void beginTeardown()
         {
             requireActive(
-                "Parity teardown requires an active isolated lifecycle");
+                "Parity teardown may begin only from an active lifecycle");
             channels_->teardown_context->barrier();
+            state_ = ParityCellLifecycleState::TeardownEntered;
         }
 
         /**
-         * @brief Release both lanes and make the lifecycle permanently retired.
-         * @throws std::logic_error unless the lifecycle is active.
+         * @brief Agree whether any rank failed before teardown began.
+         * @param local_outcome This rank's typed GoogleTest outcome.
+         * @return Rank-wide immutable outcome receipt.
+         * @throws std::logic_error unless teardown has begun exactly once.
+         * @throws std::invalid_argument for a corrupted enum value.
+         * @throws std::runtime_error when MPI cannot complete the consensus.
          */
-        void retire()
+        [[nodiscard]] ParityCellOutcomeConsensus convergeOutcome(
+            ParityCellLocalOutcome local_outcome)
         {
-            requireActive("Only an active parity cell lifecycle may retire");
+            requireState(
+                ParityCellLifecycleState::TeardownEntered,
+                "Parity outcome consensus requires the teardown-entered state");
+
+            int local_failed = 0;
+            switch (local_outcome)
+            {
+            case ParityCellLocalOutcome::Passed:
+                break;
+            case ParityCellLocalOutcome::Failed:
+                local_failed = 1;
+                break;
+            default:
+                throw std::invalid_argument(
+                    "Parity cell received an invalid local outcome");
+            }
+
+            int failed_ranks = 0;
+            if (MPI_Allreduce(
+                    &local_failed,
+                    &failed_ranks,
+                    1,
+                    MPI_INT,
+                    MPI_SUM,
+                    channels_->teardown_channel->communicator()) !=
+                MPI_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "Parity cell could not converge its rank outcomes");
+            }
+            if (failed_ranks < 0 ||
+                failed_ranks > channels_->teardown_channel->worldSize())
+            {
+                throw std::runtime_error(
+                    "Parity cell outcome consensus returned an impossible failure count");
+            }
+
+            state_ = ParityCellLifecycleState::OutcomeConverged;
+            return {
+                .outcome = failed_ranks == 0
+                               ? ParityCellAggregateOutcome::AllRanksPassed
+                               : ParityCellAggregateOutcome::AtLeastOneRankFailed,
+                .originating_failed_ranks = failed_ranks,
+                .participant_count =
+                    channels_->teardown_channel->worldSize(),
+            };
+        }
+
+        /**
+         * @brief Rendezvous after cleanup, release both lanes, and retire.
+         *
+         * Every rank has already imported the aggregate result into its local
+         * test state before this barrier. Consequently GoogleTest can apply
+         * fail-fast only after all participants have left the same cell.
+         *
+         * @throws std::logic_error unless outcome consensus completed.
+         */
+        void finishTeardown()
+        {
+            requireState(
+                ParityCellLifecycleState::OutcomeConverged,
+                "Parity teardown may finish only after outcome consensus");
+            channels_->teardown_context->barrier();
             channels_.reset();
             state_ = ParityCellLifecycleState::Retired;
         }
@@ -235,6 +347,15 @@ namespace llaminar2::test::parity
         void requireActive(const char *message) const
         {
             if (!active())
+                throw std::logic_error(message);
+        }
+
+        /** @brief Require one exact non-active lifecycle transition state. */
+        void requireState(
+            ParityCellLifecycleState required,
+            const char *message) const
+        {
+            if (state_ != required || !channels_)
                 throw std::logic_error(message);
         }
 

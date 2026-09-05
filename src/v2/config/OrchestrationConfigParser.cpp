@@ -411,6 +411,13 @@ namespace llaminar2
                         value,
                         "moe.migration_transfer_slots");
             }
+            else if (normalized_key == "migration_execution_streams")
+            {
+                config.moe_rebalance.migration_execution_streams =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.migration_execution_streams");
+            }
             else if (normalized_key == "migration_cycles_per_wave")
             {
                 config.moe_rebalance.migration_cycles_per_wave =
@@ -874,10 +881,6 @@ namespace llaminar2
                         const auto mb = std::stoull(value);
                         tier.memory_budget_bytes = mb * 1024ULL * 1024ULL;
                     }
-                }
-                else if (key == "fallback")
-                {
-                    tier.fallback = parseBoolValue(value);
                 }
                 else
                 {
@@ -1817,7 +1820,12 @@ namespace llaminar2
             .long_name = "--moe-migration-payoff-horizon-tokens",
             .category = "MoE Configuration",
             .value_label = "<tokens>",
-            .description = "Expected routed-token residency lifetime used to amortize measured expert migration cost (default: 2048)",
+            .description =
+                std::string(
+                    "Expected routed-token residency lifetime used to amortize measured expert migration cost (default: ") +
+                std::to_string(
+                    moe_rebalance_policy::kDefaultMigrationPayoffHorizonTokens) +
+                ")",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1831,7 +1839,12 @@ namespace llaminar2
             .long_name = "--moe-migration-transfer-slots",
             .category = "MoE Configuration",
             .value_label = "<slots>",
-            .description = "Preallocated parallel expert-migration cycle slots and setup-time physical capacity (default: 1)",
+            .description =
+                std::string(
+                    "Preallocated expert-migration staging/event/command slots (default: ") +
+                std::to_string(
+                    moe_rebalance_policy::kDefaultMigrationTransferSlots) +
+                ")",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1839,6 +1852,25 @@ namespace llaminar2
                         parsePositiveUint32Value(
                             v,
                             "--moe-migration-transfer-slots");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-migration-execution-streams",
+            .category = "MoE Configuration",
+            .value_label = "<streams>",
+            .description =
+                std::string(
+                    "Physical background GPU streams shared by migration slots; defaults to min(slot count, ") +
+                std::to_string(
+                    moe_rebalance_policy::kDefaultMigrationExecutionStreams) +
+                ")",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.migration_execution_streams =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-migration-execution-streams");
                 }),
         });
         spec.add({
@@ -1995,7 +2027,12 @@ namespace llaminar2
             .long_name = "--moe-dynamic-max-swaps-per-layer",
             .category = "MoE Configuration",
             .value_label = "<n>",
-            .description = "Shared Dynamic paired ownership swaps per layer (default: 4; one accepted swap moves two experts)",
+            .description =
+                std::string(
+                    "Shared Dynamic paired ownership swaps per layer (default: ") +
+                std::to_string(
+                    moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer) +
+                "; one accepted swap moves two experts)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -2007,7 +2044,12 @@ namespace llaminar2
             .long_name = "--moe-dynamic-max-plan-entries-per-wave",
             .category = "MoE Configuration",
             .value_label = "<n>",
-            .description = "Shared Dynamic expert movement command entries per rebalance wave/cycle (default: 16)",
+            .description =
+                std::string(
+                    "Shared Dynamic expert movement command entries per rebalance wave/cycle (default: ") +
+                std::to_string(
+                    moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave) +
+                ")",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -2277,7 +2319,7 @@ namespace llaminar2
             .long_name = "--moe-routed-expert-tier",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define a routed-expert placement tier: \"name@domain;priority=N[;max-experts-per-layer=N][;memory-mb=N|auto][;fallback=true]\"",
+            .description = "Define a routed-expert placement tier: \"name@domain;priority=N[;max-experts-per-layer=N][;memory-mb=N|auto]\"; the greatest numeric priority is the automatic final-coverage tier",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -3381,6 +3423,14 @@ namespace llaminar2
                     parsePositiveUint32Value(
                         value,
                         "moe_migration_transfer_slots");
+            }
+            else if (normalized_key ==
+                     "moe_migration_execution_streams")
+            {
+                config.moe_rebalance.migration_execution_streams =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_migration_execution_streams");
             }
             else if (normalized_key ==
                      "moe_migration_cycles_per_wave")

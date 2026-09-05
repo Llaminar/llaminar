@@ -1,6 +1,6 @@
 /**
  * @file DeviceSwiGLUNumericalContract.h
- * @brief Cross-backend FP32 arithmetic contract for movable-expert SwiGLU.
+ * @brief Cross-backend FP32 arithmetic contract for GPU-aligned expert SwiGLU.
  *
  * A heterogeneous ExpertOverlay request may execute the same logical expert
  * on CPU, CUDA, or ROCm in adjacent epochs. Vendor `expf()` implementations

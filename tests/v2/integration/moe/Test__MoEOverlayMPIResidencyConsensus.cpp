@@ -17,6 +17,7 @@
 #include "execution/moe/MoEOverlayEconomyCertificationController.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
+#include "execution/moe/MoEOverlayCapacityResolver.h"
 #include "execution/moe/MoEOverlayResidencyMaintenanceService.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "execution/moe/CpuExpertSlotPool.h"
@@ -401,6 +402,10 @@ namespace llaminar2::test
                                 MoERoutedTierServiceProfile>();
                             profile->identity =
                                 "mpi-maintenance-service-profile-v1";
+                            profile->production_topology =
+                                ExpertHistogramProductionTopology::uniform(
+                                    1,
+                                    kAllExpertHistogramProductionSources);
                             profile->costs = {
                                 {.tier_index = 0,
                                  .layer = 0,
@@ -462,6 +467,209 @@ namespace llaminar2::test
                 throw std::logic_error(
                     "Real MPI fixture did not produce a residency wave");
             }
+            return fixture;
+        }
+
+        /**
+         * @brief Model-free two-axis authority used by the MPI admission proof.
+         *
+         * Layer zero makes one tier cycle absorb participant intent. Layer one
+         * retains an independent CPU swap whose owners live on different MPI
+         * ranks. The production policy exposes three physical cycle slots and
+         * sixteen participant entries, so an internal one-swap policy cap is
+         * observable as a missing cross-rank cycle before any transport runs.
+         */
+        struct TwoAxisAdmissionFixture
+        {
+            std::unique_ptr<DecodeExpertHistogram> histogram;
+            std::unique_ptr<MoEOverlayResidencyAuthority> authority;
+            std::shared_ptr<const DecodeExpertHistogramWindow> window;
+        };
+
+        /** @return Identical typed two-axis authority state on every MPI rank. */
+        TwoAxisAdmissionFixture twoAxisAdmissionFixture()
+        {
+            constexpr int layer_count = 2;
+            constexpr int expert_count = 12;
+
+            MoERoutedExpertPlacementPlan plan;
+            plan.enabled = true;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+            plan.continuation_domain = "gpu_priority0";
+            plan.shared_expert_domain = "gpu_priority0";
+            plan.residency_policy =
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            plan.owner_order = RoutedExpertOwnerOrder::Ordinal;
+            plan.domains.push_back(domain(
+                "gpu_priority0",
+                GlobalDeviceAddress::cuda(0, 0, "node-a"),
+                /*world_rank=*/0,
+                CollectiveBackendType::NCCL));
+
+            RoutedExpertDomain cpu_domain;
+            cpu_domain.name = "cpu_priority1";
+            cpu_domain.scope = ExecutionDomainScope::NODE_LOCAL;
+            cpu_domain.backend = CollectiveBackendType::UPI;
+            cpu_domain.participants = {
+                GlobalDeviceAddress::cpu(0, "node-a"),
+                GlobalDeviceAddress::cpu(1, "node-a"),
+            };
+            cpu_domain.world_ranks = {0, 1};
+            cpu_domain.owner_rank = 0;
+            cpu_domain.routed_compute_policy =
+                RoutedExpertComputePolicy::Apportioned;
+            plan.domains.push_back(std::move(cpu_domain));
+            plan.routed_tiers = {
+                tier("priority0", "gpu_priority0", 0, 6),
+                tier("priority1", "cpu_priority1", 1, 0, true),
+            };
+
+            MoERoutedExpertModelMetadata metadata;
+            metadata.num_layers = layer_count;
+            metadata.num_experts = expert_count;
+            metadata.d_model = 16;
+            metadata.routed_intermediate_size = 8;
+            metadata.routed_quant_type = "F32";
+
+            DecodeExpertHistogramConfig histogram_config;
+            histogram_config.num_layers = layer_count;
+            histogram_config.num_experts = expert_count;
+            histogram_config.top_k = 2;
+            histogram_config.window_size = 4;
+            histogram_config.sockets = {
+                DeviceId::cuda(0),
+                DeviceId::cpu(),
+                DeviceId::cpu(),
+            };
+            histogram_config.ownership =
+                MoELayeredExpertOwnership::uniform(
+                    layer_count,
+                    3,
+                    {0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2});
+
+            auto service_profile =
+                std::make_shared<MoERoutedTierServiceProfile>();
+            service_profile->identity =
+                "mpi-two-axis-admission-service-v1";
+            service_profile->production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    layer_count,
+                    kAllExpertHistogramProductionSources);
+            for (int layer = 0; layer < layer_count; ++layer)
+            {
+                service_profile->costs.insert(
+                    service_profile->costs.end(),
+                    {
+                        {.tier_index = 0,
+                         .layer = layer,
+                         .nanoseconds_per_activation = {10, 20, 30}},
+                        {.tier_index = 1,
+                         .layer = layer,
+                         .nanoseconds_per_activation = {100, 200, 300}},
+                    });
+                for (int participant = 0; participant < 3; ++participant)
+                {
+                    service_profile->participant_costs.push_back({
+                        .participant_id = participant,
+                        .layer = layer,
+                        .nanoseconds_per_activation =
+                            participant == 0
+                                ? std::array<
+                                      std::uint64_t,
+                                      kExpertHistogramProductionSourceCount>{
+                                      10, 20, 30}
+                                : std::array<
+                                      std::uint64_t,
+                                      kExpertHistogramProductionSourceCount>{
+                                      100, 200, 300},
+                    });
+                }
+            }
+
+            auto migration_profile =
+                std::make_shared<MoEOverlayMigrationCostProfile>();
+            migration_profile->identity =
+                "mpi-two-axis-admission-migration-v1";
+            for (int layer = 0; layer < layer_count; ++layer)
+            {
+                for (int source = 0; source < 3; ++source)
+                {
+                    for (int destination = 0; destination < 3; ++destination)
+                    {
+                        if (source == destination)
+                            continue;
+                        migration_profile->costs.push_back({
+                            .source_participant = source,
+                            .destination_participant = destination,
+                            .layer = layer,
+                            .transfer_and_repack_ns = 1,
+                            .inference_interference_ns = 1,
+                        });
+                    }
+                }
+            }
+
+            auto window = std::make_shared<DecodeExpertHistogramWindow>();
+            window->generation = 1;
+            window->num_layers = layer_count;
+            window->num_experts = expert_count;
+            window->expert_counts = {
+                100, 10, 800, 800, 800, 800,
+                1'000, 50, 50, 900, 0, 0,
+                101, 101, 101, 101, 101, 101,
+                100, 90, 80, 1, 1, 1,
+            };
+            window->source_expert_counts.assign(
+                window->expert_counts.size() *
+                    kExpertHistogramProductionSourceCount,
+                0u);
+            std::copy(
+                window->expert_counts.begin(),
+                window->expert_counts.end(),
+                window->source_expert_counts.begin());
+            for (const std::uint64_t count : window->expert_counts)
+                window->token_count += count;
+            window->source_token_counts[0] = window->token_count;
+            if (!window->valid())
+                throw std::logic_error(
+                    "MPI two-axis admission window is invalid");
+
+            TwoAxisAdmissionFixture fixture;
+            fixture.histogram =
+                std::make_unique<DecodeExpertHistogram>(histogram_config);
+            fixture.authority =
+                std::make_unique<MoEOverlayResidencyAuthority>(
+                    MoEOverlayResidencyAuthority::Config{
+                        .initial_plan = std::move(plan),
+                        .model_metadata = metadata,
+                        .maintenance_mode =
+                            MoERebalanceRuntimeMode::Dynamic,
+                        .histogram = fixture.histogram.get(),
+                        .phase_service_profile =
+                            std::move(service_profile),
+                        .migration_cost_profile =
+                            std::move(migration_profile),
+                        .migration_economy_policy =
+                            MoEOverlayMigrationEconomyPolicy{
+                                .historical_window_weight = 0,
+                                .current_window_weight = 1,
+                                .payoff_horizon_tokens = 1'000,
+                                .minimum_net_benefit_ns = 0,
+                                .minimum_residency_generations = 0,
+                            },
+                        .participant_rebalance_policy = {
+                            .enabled = true,
+                            .imbalance_threshold_per_mille = 1001,
+                            .minimum_improvement_per_mille = 1,
+                            .maximum_swaps_per_layer = 4,
+                            .maximum_plan_entries_per_wave = 16,
+                            .minimum_window_activations = 1,
+                        },
+                        .shadow_slots_per_endpoint_layer = 2,
+                        .max_concurrent_cycles = 3,
+                        .perf_device = "mpi-two-axis-admission",
+                    });
+            fixture.window = std::move(window);
             return fixture;
         }
 
@@ -569,11 +777,23 @@ namespace llaminar2::test
             : public IMoEOverlayResidencyProposalPublisher
         {
         public:
-            /** @brief Retain the real MPI publisher whose polls will be gated. */
+            /**
+             * @brief Retain the real MPI publisher whose polls will be gated.
+             *
+             * @param publisher Production MPI proposal lane.
+             * @param pause_follower_after_delivery When true, a follower may
+             *        receive and authenticate the proposal but cannot observe
+             *        its posted acknowledgement completion until explicitly
+             *        resumed. This exposes the exact stop-token race between
+             *        adoption and the next maintenance poll.
+             */
             explicit PollGatedProposalPublisher(
                 std::shared_ptr<MoEOverlayMPIResidencyProposalPublisher>
-                    publisher)
-                : publisher_(std::move(publisher))
+                    publisher,
+                bool pause_follower_after_delivery = false)
+                : publisher_(std::move(publisher)),
+                  follower_acknowledgement_polling_enabled_(
+                      !pause_follower_after_delivery)
             {
                 if (!publisher_)
                 {
@@ -604,7 +824,31 @@ namespace llaminar2::test
                         error->clear();
                     return MoEOverlayResidencyWaveProgress::Pending;
                 }
-                return publisher_->poll(received_proposal, error);
+                if (!publisher_->isCoordinator() &&
+                    follower_delivery_observed_.load(
+                        std::memory_order_acquire) &&
+                    !follower_acknowledgement_polling_enabled_.load(
+                        std::memory_order_acquire))
+                {
+                    if (received_proposal)
+                        received_proposal->reset();
+                    if (error)
+                        error->clear();
+                    return MoEOverlayResidencyWaveProgress::Pending;
+                }
+
+                const auto progress =
+                    publisher_->poll(received_proposal, error);
+                if (!publisher_->isCoordinator() &&
+                    progress == MoEOverlayResidencyWaveProgress::Ready &&
+                    received_proposal && *received_proposal)
+                {
+                    /* The caller will authenticate this immutable proposal and
+                     * post its acknowledgement before the following poll. */
+                    follower_delivery_observed_.store(
+                        true, std::memory_order_release);
+                }
+                return progress;
             }
 
             /** @brief Delegate post-adoption semantic acceptance. */
@@ -649,10 +893,32 @@ namespace llaminar2::test
                 polling_enabled_.store(true, std::memory_order_release);
             }
 
+            /** @return Whether the follower received the immutable proposal. */
+            [[nodiscard]] bool followerDeliveryObserved() const noexcept
+            {
+                return follower_delivery_observed_.load(
+                    std::memory_order_acquire);
+            }
+
+            /**
+             * @brief Release the follower's already-posted acknowledgement.
+             *
+             * This does not admit a new proposal. It only lets the maintenance
+             * worker observe the terminal edge for the transaction it already
+             * authenticated before its stop token became visible.
+             */
+            void resumeFollowerAcknowledgementPolling() noexcept
+            {
+                follower_acknowledgement_polling_enabled_.store(
+                    true, std::memory_order_release);
+            }
+
         private:
             std::shared_ptr<MoEOverlayMPIResidencyProposalPublisher>
                 publisher_;
             std::atomic<bool> polling_enabled_{false};
+            std::atomic<bool> follower_delivery_observed_{false};
+            std::atomic<bool> follower_acknowledgement_polling_enabled_{true};
         };
 
         /** @brief Progress one authority wave without a blocking MPI wait. */
@@ -665,6 +931,9 @@ namespace llaminar2::test
                 if (result.status != MoEOverlayResidencyApplyStatus::Staging &&
                     result.status !=
                         MoEOverlayResidencyApplyStatus::Preparing &&
+                    result.status !=
+                        MoEOverlayResidencyApplyStatus::
+                            AwaitingGraphSequenceBoundary &&
                     result.status !=
                         MoEOverlayResidencyApplyStatus::Publishing)
                 {
@@ -922,7 +1191,7 @@ namespace llaminar2::test
             int expert_id,
             std::uint8_t seed)
         {
-            auto pool = CpuExpertSlotPool::create({
+            auto pool = CpuExpertSlotPool::createForTest({
                 .participant_id = participant_id,
                 .layer_idx = 0,
                 .capacity = 1,
@@ -1040,6 +1309,51 @@ namespace llaminar2::test
                     },
                 }},
             }};
+        }
+
+        /**
+         * @brief Admit the exact destination-bank bytes used by the MPI fabric.
+         *
+         * Both ranks independently reconstruct the same topology-wide proof,
+         * then bind only their rank-local CPU allocator.  The prepared
+         * footprint resolver is the same arithmetic authority used by
+         * production capacity admission; the fixture therefore cannot drift
+         * from the slot pool's codebook or allocator rounding.
+         */
+        std::shared_ptr<PhysicalMemoryAuthority>
+        distributedCpuFabricMemoryAuthority(int world_rank)
+        {
+            const auto footprints =
+                MoEOverlayCapacityResolver::preparedFootprints(
+                    distributedCpuLayerManifest());
+            if (footprints.size() != 1u ||
+                footprints.front().cpu_shadow_bytes == 0u)
+            {
+                throw std::logic_error(
+                    "Distributed CPU fabric fixture has no canonical shadow footprint");
+            }
+
+            const std::size_t shadow_bytes =
+                footprints.front().cpu_shadow_bytes;
+            PhysicalMemoryPlanBuilder topology;
+            for (int rank = 0; rank < 2; ++rank)
+            {
+                PhysicalMemoryBOMBuilder resource({
+                    .world_rank = rank,
+                    .device = DeviceId::cpu(),
+                    .total_bytes = shadow_bytes,
+                    .admission_available_bytes = shadow_bytes,
+                });
+                resource.add(
+                    PhysicalMemoryOwner::ExpertShadowSlots,
+                    shadow_bytes);
+                topology.add(resource.build());
+            }
+            auto admission = std::make_shared<
+                const PhysicalMemoryPlanAdmissionCertificate>(
+                topology.build());
+            return std::make_shared<PhysicalMemoryAuthority>(
+                std::move(admission), world_rank);
         }
 
         /** @brief Verify every final byte against the source's fill function. */
@@ -1211,7 +1525,11 @@ namespace llaminar2::test
         MoEOverlayMPIEconomyEvidenceExchange exchange({
             .mpi_context = context,
             .owner_map = owner_map,
-            .num_layers = 1,
+            .production_topology =
+                ExpertHistogramProductionTopology::forRetainedExecution(
+                    /*retained_layer_count=*/1,
+                    /*main_inference_layer_count=*/1,
+                    ExpertHistogramServingRegime::PositiveDepthMTP),
             .perf_device = "mpi_economy_evidence_cpu_test",
         });
 
@@ -1753,6 +2071,10 @@ namespace llaminar2::test
             auto service =
                 std::make_shared<MoERoutedTierServiceProfile>();
             service->identity = "root-service-profile";
+            service->production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    1,
+                    kAllExpertHistogramProductionSources);
             service->costs = {
                 {.tier_index = 0,
                  .layer = 0,
@@ -1852,6 +2174,8 @@ namespace llaminar2::test
                 .perf_device = "mpi-distributed-physical-cpu",
             });
         auto fabric = MoEOverlayPhysicalResidencyFabric::create({
+            .memory_authority =
+                distributedCpuFabricMemoryAuthority(context->rank()),
             .registry = registry,
             .initial_snapshot = initial_snapshot,
             .remote_projection_transport = remote_projection_transport,
@@ -2195,10 +2519,14 @@ namespace llaminar2::test
             MoEOverlayMPIEconomyEvidenceExchange::Config{
                 .mpi_context = context,
                 .owner_map = owner_map,
-                .num_layers = 1,
+                .production_topology =
+                    ExpertHistogramProductionTopology::uniform(
+                        1, kAllExpertHistogramProductionSources),
                 .perf_device = "mpi-distributed-economy-cpu",
             });
         auto fabric = MoEOverlayPhysicalResidencyFabric::create({
+            .memory_authority =
+                distributedCpuFabricMemoryAuthority(context->rank()),
             .registry = registry,
             .initial_snapshot = initial_snapshot,
             .remote_projection_transport = remote_projection_transport,
@@ -2287,6 +2615,10 @@ namespace llaminar2::test
                 .payoff_horizon_tokens = 1'000'000,
                 .minimum_residency_generations = 0,
             },
+            .production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    1,
+                    kAllExpertHistogramProductionSources),
             .evidence_exchange = evidence_exchange,
             .service_readiness_retry_interval =
                 stop_while_peer_waits
@@ -2532,6 +2864,103 @@ namespace llaminar2::test
                 stats.bytes_received,
                 moeOverlayDistributedResidencyProposalWireBytes(2, 3));
         }
+        EXPECT_EQ(publisher.stats().blocking_inference_waits, 0u);
+    }
+
+    /**
+     * @brief Preserve every configured movement axis through MPI publication.
+     *
+     * The coordinator admits a combined tier cycle plus an independent
+     * cross-rank CPU participant cycle. The follower adopts the pointer-free
+     * authoritative plan and must reconstruct both exact physical cycles. This
+     * closes the model-free preflight gap that allowed the real 122B campaign
+     * to reach numerically correct inference without exercising distributed
+     * CPU movement.
+     */
+    TEST(
+        Test__MoEOverlayMPIResidencyConsensus,
+        ConfiguredParticipantSlotSurvivesAuthoritativeMPIProposal)
+    {
+        auto context = worldContext();
+        if (!requireTwoRanks(*context))
+            GTEST_SKIP() << "Two-axis proposal proof requires two ranks";
+
+        auto fixture = twoAxisAdmissionFixture();
+        constexpr int coordinator_world_rank = 1;
+        MoEOverlayMPIResidencyProposalPublisher publisher({
+            .mpi_context = context,
+            .coordinator_world_rank = coordinator_world_rank,
+            .num_layers = 2,
+            .num_experts = 12,
+            .perf_device = "mpi-two-axis-admission",
+        });
+
+        MoEOverlayResidencyTransaction transaction;
+        if (publisher.isCoordinator())
+        {
+            transaction = fixture.authority
+                              ->proposeFromFrozenHistogramWindow(
+                                  fixture.window);
+            ASSERT_TRUE(transaction.valid());
+            ASSERT_EQ(transaction.migration_cycles.size(), 2u)
+                << "the coordinator left a configured physical cycle idle";
+            ASSERT_TRUE(transaction.host_admission.has_value());
+            EXPECT_EQ(
+                transaction.host_admission->maximum_concurrent_cycles,
+                3u);
+            EXPECT_EQ(
+                transaction.host_admission
+                    ->participant_axis_budget_rejected_cycles,
+                0u);
+            const auto proposal =
+                makeMoEOverlayDistributedResidencyProposal(
+                    fixture.authority
+                        ->exportAuthoritativeResidencyPlan(transaction),
+                    transaction);
+            std::string error;
+            ASSERT_TRUE(publisher.beginPublish(proposal, &error)) << error;
+        }
+
+        const auto received = finishProposalPublication(publisher);
+        if (!publisher.isCoordinator())
+        {
+            ASSERT_NE(received, nullptr);
+            transaction = fixture.authority
+                              ->adoptAuthoritativeResidencyPlan(
+                                  received->plan);
+            ASSERT_TRUE(transaction.valid());
+            EXPECT_EQ(
+                fingerprintMoEOverlayResidencyExecutionPlan(transaction),
+                received->execution_fingerprint);
+        }
+
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_EQ(transaction.migration_cycles.size(), 2u);
+        const bool combined_tier_cycle = std::any_of(
+            transaction.migrations.begin(),
+            transaction.migrations.end(),
+            [](const auto &migration)
+            {
+                return migration.axis ==
+                       MoEOptimizationMovementAxis::Combined;
+            });
+        const bool distributed_participant_cycle = std::any_of(
+            transaction.migrations.begin(),
+            transaction.migrations.end(),
+            [](const auto &migration)
+            {
+                return !migration.crossesTier() &&
+                       migration.crossesWorldRank() &&
+                       migration.axis ==
+                           MoEOptimizationMovementAxis::ParticipantPlacement;
+            });
+        EXPECT_TRUE(combined_tier_cycle);
+        EXPECT_TRUE(distributed_participant_cycle)
+            << "MPI publication dropped the independently admitted CPU tier swap";
+        EXPECT_EQ(
+            transaction.economy.enabled,
+            publisher.isCoordinator())
+            << "only the host policy authority owns movement economics";
         EXPECT_EQ(publisher.stats().blocking_inference_waits, 0u);
     }
 
@@ -3064,7 +3493,13 @@ namespace llaminar2::test
         auto fixture = realTransaction(coordinator_world_rank);
         if (context->rank() == coordinator_world_rank)
         {
-            const std::vector<std::uint64_t> counts{1, 2, 100, 90};
+            /* The hottest experts already occupy the priority-zero tier. The
+             * proposal is still distributed and acknowledged, but each rank
+             * must classify it as DynamicNoMovement without starting a
+             * physical-wave collective. That is the only legal lifecycle in
+             * which the coordinator can cross drain barrier two while the
+             * follower still owns its posted acknowledgement. */
+            const std::vector<std::uint64_t> counts{100, 90, 2, 1};
             fixture.histogram->mergeLayerCounts(
                 0,
                 counts.data(),
@@ -3102,7 +3537,9 @@ namespace llaminar2::test
                     .perf_device = "real_mpi_maintenance_test",
                 });
         auto poll_gate =
-            std::make_shared<PollGatedProposalPublisher>(publisher);
+            std::make_shared<PollGatedProposalPublisher>(
+                publisher,
+                /*pause_follower_after_delivery=*/true);
         auto authority = std::shared_ptr<MoEOverlayResidencyAuthority>(
             std::move(fixture.authority));
         MoEOverlayResidencyMaintenanceService service({
@@ -3187,18 +3624,71 @@ namespace llaminar2::test
 
         poll_gate->enablePolling();
         service.notifyMaintenanceProgress();
+
+        /* Deterministically hold the follower after it has authenticated the
+         * packet and posted its acknowledgement. The coordinator can finish
+         * the same acknowledgement and cross drain barrier two first. The
+         * follower must then observe its stop token before the acknowledgement
+         * poll is released: this is the production race which previously left
+         * PublishingProposal live forever during join(). */
+        int follower_received = 0;
+        if (context->rank() != coordinator_world_rank)
+        {
+            follower_received = waitForService(
+                [&]
+                {
+                    return poll_gate->followerDeliveryObserved();
+                })
+                ? 1
+                : 0;
+        }
+        ASSERT_EQ(
+            MPI_Bcast(
+                &follower_received,
+                1,
+                MPI_INT,
+                1 - coordinator_world_rank,
+                control.get()),
+            MPI_SUCCESS);
+        ASSERT_EQ(follower_received, 1);
+
+        int follower_entered_drain = 0;
+        if (context->rank() != coordinator_world_rank)
+        {
+            follower_entered_drain = waitForService(
+                [&]
+                {
+                    return service.state() ==
+                           MoEOverlayMaintenanceState::Draining;
+                })
+                ? 1
+                : 0;
+        }
+        ASSERT_EQ(
+            MPI_Bcast(
+                &follower_entered_drain,
+                1,
+                MPI_INT,
+                1 - coordinator_world_rank,
+                control.get()),
+            MPI_SUCCESS);
+        ASSERT_EQ(follower_entered_drain, 1);
+
+        poll_gate->resumeFollowerAcknowledgementPolling();
+        service.notifyMaintenanceProgress();
         drain_thread.join();
 
         ASSERT_TRUE(service.healthy()) << service.failureMessage();
         EXPECT_TRUE(drain_returned.load(std::memory_order_acquire));
         EXPECT_EQ(service.state(), MoEOverlayMaintenanceState::Stopped);
-        EXPECT_EQ(authority->snapshot()->epoch, 2u);
+        EXPECT_EQ(authority->snapshot()->epoch, 1u);
         EXPECT_EQ(service.stats().proposals, 1u);
-        EXPECT_EQ(service.stats().committed_waves, 1u);
-        EXPECT_EQ(local_transport->stats().stage_consensus_ready, 1u);
-        EXPECT_EQ(local_transport->stats().preparation_consensus_ready, 1u);
-        EXPECT_EQ(local_transport->stats().publication_consensus_ready, 1u);
-        EXPECT_EQ(local_transport->stats().waves_published, 1u);
+        EXPECT_EQ(service.stats().dynamic_no_movement, 1u);
+        EXPECT_EQ(service.stats().committed_waves, 0u);
+        EXPECT_EQ(local_transport->stats().stage_consensus_ready, 0u);
+        EXPECT_EQ(local_transport->stats().preparation_consensus_ready, 0u);
+        EXPECT_EQ(local_transport->stats().publication_consensus_ready, 0u);
+        EXPECT_EQ(local_transport->stats().waves_published, 0u);
 
         if (context->rank() == coordinator_world_rank)
         {
@@ -3215,7 +3705,7 @@ namespace llaminar2::test
 
         poll_gate->stopAndDrain();
         EXPECT_TRUE(consensus->idle());
-        ASSERT_EQ(local.fingerprints.size(), 1u);
-        EXPECT_EQ(local.retirements, 1);
+        EXPECT_TRUE(local.fingerprints.empty());
+        EXPECT_EQ(local.retirements, 0);
     }
 } // namespace llaminar2::test

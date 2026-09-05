@@ -24,7 +24,12 @@ namespace llaminar2
      */
     struct PersistentStateEstimate
     {
+        /** Complete persistent bytes owned by committed and shifted caches. */
         size_t kv_cache_bytes = 0;
+        /** Persistent bytes owned only by the committed main-model cache. */
+        size_t main_kv_cache_bytes = 0;
+        /** Persistent bytes owned only by the shifted MTP sidecar cache. */
+        size_t mtp_kv_cache_bytes = 0;
         size_t live_recurrent_state_bytes = 0;
         size_t checkpoint_state_bytes = 0;
         size_t sequence_metadata_bytes = 0;
@@ -53,10 +58,14 @@ namespace llaminar2
          * @param device Target CPU, CUDA, or ROCm device.
          * @param batch_size Maximum simultaneously live request count.
          * @param max_seq_len Full KV horizon, independent of graph row buckets.
-         * @param local_kv_heads Participant-local full-attention KV heads.
+         * @param main_local_kv_heads Participant-local main-attention KV heads.
+         * @param mtp_local_kv_heads Participant-local shifted-sidecar KV heads;
+         *        this may equal the full model width when the predictor is
+         *        replicated beside a sharded main cache.
+         * @param local_query_head_start First globally numbered query head
+         *        owned by this participant.
          * @param local_query_heads Exact participant-local query heads used by
          *        recurrent/GDN state sharding.
-         * @param total_shards Tensor-parallel participant count.
          * @param first_layer First main-model layer owned by this participant.
          * @param last_layer Last main-model layer owned by this participant.
          * @param kv_precision Runtime KV storage format.
@@ -67,9 +76,10 @@ namespace llaminar2
             DeviceId device,
             int batch_size,
             int max_seq_len,
-            int local_kv_heads,
+            int main_local_kv_heads,
+            int mtp_local_kv_heads,
+            int local_query_head_start,
             int local_query_heads,
-            int total_shards,
             int first_layer,
             int last_layer,
             const std::string &kv_precision,

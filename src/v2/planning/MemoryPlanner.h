@@ -12,16 +12,20 @@
 #pragma once
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
+#include "planning/GraphSnapshotMemoryCapacity.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "backends/DeviceId.h"
+#include "config/CollectiveBackendType.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/mtp/MTPGraphOwnerPlan.h"
 #include "loaders/PreparedWeightAdmission.h"
 
 #include <optional>
 #include <stdexcept>
-#include <vector>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace llaminar2
 {
@@ -52,24 +56,25 @@ enum class AdditionalPersistentWeightSet
     MirroredDecodeEmbedding,
     /** Full-vocabulary MTP terminal head retained beside the primary TP shard. */
     MirroredMTPTerminalHead,
+    /** Complete non-routed learned MTP predictor block per TP participant. */
+    ReplicatedMTPSidecarDense,
 };
 
 /**
  * @brief Resolve extra persistent sets implied by one dense execution policy.
  * @param policy Declarative dense/shared execution policy.
  * @param tensor_parallel_degree Number of participants in the primary view.
- * @param terminal_head_policy Exact terminal-head placement policy. A
- *        mirrored policy applies to the serial decode oracle even when MTP is
- *        disabled for the current request, so admission must not key this
- *        persistent view on `mtp.enabled`.
+ * @param mtp Complete retained MTP graph and weight-placement policy. A
+ *        mirrored terminal policy applies to the serial decode oracle even
+ *        when MTP execution is disabled; a replicated predictor is retained
+ *        whenever the graph-capacity envelope exists.
  * @return Complete, duplicate-free list of additional physical weight sets.
  */
 [[nodiscard]] inline std::vector<AdditionalPersistentWeightSet>
 resolveAdditionalPersistentWeightSets(
     DenseParallelPolicy policy,
     int tensor_parallel_degree,
-    MTPTerminalHeadPolicy terminal_head_policy =
-        MTPTerminalHeadPolicy::VocabularySharded)
+    const MTPRuntimeConfig &mtp)
 {
     if (tensor_parallel_degree <= 1)
         return {};
@@ -78,9 +83,8 @@ resolveAdditionalPersistentWeightSets(
 
     std::vector<AdditionalPersistentWeightSet> sets;
     const bool mirrored_mtp_head =
-        mtpTerminalHeadIsMirrored(terminal_head_policy);
-    if (denseParallelPolicyMirrorsDecodeEmbedding(policy) ||
-        mirrored_mtp_head)
+        mtpTerminalHeadIsMirrored(mtp.terminal_head_policy);
+    if (denseParallelPolicyMirrorsDecodeEmbedding(policy))
     {
         sets.push_back(
             AdditionalPersistentWeightSet::MirroredDecodeEmbedding);
@@ -89,6 +93,13 @@ resolveAdditionalPersistentWeightSets(
     {
         sets.push_back(
             AdditionalPersistentWeightSet::MirroredMTPTerminalHead);
+    }
+    if (retainsMTPGraphCapacity(mtp) &&
+        mtp.sidecar_dense_policy ==
+            MTPSidecarDensePolicy::ReplicatedPerParticipant)
+    {
+        sets.push_back(
+            AdditionalPersistentWeightSet::ReplicatedMTPSidecarDense);
     }
     return sets;
 }
@@ -125,27 +136,103 @@ struct CapturedServingGraphMemoryInventory
     std::vector<int> prefill_bucket_rows;
     /** Complete forward executables retained independently of prefill rows. */
     std::size_t fixed_executable_count = 0u;
+    /** Canonical MTP helper/controller cache geometry and graph owners. */
+    MTPGraphOwnerPlan mtp_graph_owners{MTPRuntimeConfig{}};
 
     /** @return true when this declaration names at least one executable. */
     [[nodiscard]] bool enabled() const noexcept
     {
-        return !prefill_bucket_rows.empty() || fixed_executable_count != 0u;
+        return !prefill_bucket_rows.empty() ||
+               fixed_executable_count != 0u ||
+               mtp_graph_owners.auxiliaryExecutableSlotCount() != 0u;
     }
 };
+
+/**
+ * @brief Resolve the exact ordinary serving-graph inventory retained at setup.
+ * @param prefill_bucket_rows Configured captured-prefill bucket boundaries.
+ * @param mtp Runtime execution and retained-capacity policy.
+ * @return Inventory consumed by @ref MemoryPlanner before graph construction.
+ *
+ * The first request in a reusable model context may execute with MTP disabled
+ * while reserving a wider graph family for later requests. Admission must
+ * therefore follow retained capacity, not the current execution depth. CUDA
+ * conditional branches and HIP ticket-selected transactions consume the same
+ * typed cache-owner plan as runtime materialization. Semantic parent fragments
+ * are intentionally absent because they do not own independent executables.
+ */
+[[nodiscard]] inline CapturedServingGraphMemoryInventory
+resolveCapturedServingGraphMemoryInventory(
+    std::vector<int> prefill_bucket_rows,
+    const MTPRuntimeConfig &mtp)
+{
+    const bool retains_mtp = retainsMTPGraphCapacity(mtp);
+    return CapturedServingGraphMemoryInventory{
+        .prefill_bucket_rows = std::move(prefill_bucket_rows),
+        .fixed_executable_count =
+            1u +
+            (retains_mtp ? 1u : 0u) +
+            resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp),
+        .mtp_graph_owners = MTPGraphOwnerPlan(mtp),
+    };
+}
 
 /// Configuration for a single device in a memory plan.
 struct DevicePlanConfig
 {
+    /** MPI rank owning this allocator; -1 is valid for unbound pure estimates. */
+    int world_rank = -1;
     DeviceId device;
     size_t device_total_bytes = 0;
     size_t device_free_bytes = 0;
 
-    /** CUDA SM or ROCm CU count used by capture-time launch/workspace policy. */
+    /**
+     * Host allocator that owns CPU-side state created by this execution graph.
+     * A GPU prefix cache, for example, retains a bounded RAM tier in addition
+     * to its VRAM staging/device tier. CPU graphs leave this empty because
+     * their primary @ref device already names the same physical authority.
+     */
+    std::optional<PhysicalMemoryResource> associated_host_memory;
+
+    /**
+     * @brief Exact transient weight-load allocations for this GPU.
+     *
+     * The device and pinned-host rings are separate physical owners even
+     * though they share one upload geometry. CPU plans and certified retained
+     * weights leave both values at zero. A non-zero host value requires
+     * @ref associated_host_memory so it can be charged to the rank-local CPU
+     * allocator rather than hidden in the GPU subtotal.
+     */
+    struct WeightLoadStaging
+    {
+        std::size_t device_bytes = 0u;
+        std::size_t host_bytes = 0u;
+
+        /** @return Whether either physical side owns a transient allocation. */
+        [[nodiscard]] bool enabled() const noexcept
+        {
+            return device_bytes != 0u || host_bytes != 0u;
+        }
+    } weight_load_staging;
+
+    /**
+     * CUDA SMs, ROCm CUs, or configured physical-core CPU workers used by the
+     * exact runtime launch/workspace policy.
+     */
     int device_compute_units = 0;
 
     // TP configuration for this device
     int shard_index = 0;
     int total_shards = 1;
+
+    /**
+     * Resolved rank-local collective backend for this participant.
+     *
+     * Multi-shard plans must name the same concrete backend installed by
+     * LocalTP. AUTO would make physical scratch ownership unknowable and is
+     * rejected by MemoryPlanner instead of being independently guessed.
+     */
+    CollectiveBackendType local_tp_backend = CollectiveBackendType::AUTO;
 
     /**
      * Exact tensor-parallel slice installed by the production assignment authority.
@@ -182,6 +269,8 @@ struct DevicePlanConfig
     // PP configuration: layer range
     int first_layer = 0;
     int last_layer = -1;  // -1 = all
+    /** Whether this participant owns the graph-captured token embedding. */
+    bool owns_embedding = true;
 
     // KV cache configuration
     std::string kv_precision = "fp16";
@@ -196,13 +285,27 @@ struct DevicePlanConfig
      * Routed-expert-only participants ignore this field because they own no KV
      * or recurrent inference state.
      */
-    PrefixCacheRuntimeConfig prefix_cache;
+    PrefixCacheRuntimeConfig prefix_cache = []
+    {
+        PrefixCacheRuntimeConfig disabled;
+        disabled.enabled = false;
+        disabled.storage_mode = PrefixCacheStorageMode::Disabled;
+        return disabled;
+    }();
 
     // Runtime parameters
     int batch_size = 1;
     int max_seq_len = 0;  // 0 = use profile.max_seq_len
     int activation_seq_len = 0;  // 0 = use max_seq_len for activation/workspace
     bool mtp_enabled = false;
+
+    /**
+     * Exact physical KV-head ownership of the retained shifted MTP cache.
+     * This is resolved from the same sidecar policy used by graph construction;
+     * memory admission must not infer it from the main cache's TP slice.
+     */
+    MTPShiftedKVHeadLayout mtp_shifted_kv_head_layout =
+        MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
 
     /** Flattened target-verifier rows retained by the MTP graph family. */
     int mtp_target_query_rows = 2;
@@ -217,6 +320,14 @@ struct DevicePlanConfig
 
     /** Native graph family whose opaque driver storage must be admitted. */
     CapturedServingGraphMemoryInventory captured_serving_graphs;
+
+    /**
+     * Diagnostic checkpoint storage retained beside captured executables.
+     * Zero is valid only when graph snapshots are disabled. The caller that
+     * selects a snapshot topology owns this complete per-accelerator bound;
+     * MemoryPlanner merely converts it into the canonical physical BOM.
+     */
+    GraphSnapshotMemoryCapacity graph_snapshot_memory;
 
     /**
      * @brief Number of local participants with an independently runnable serial packet.

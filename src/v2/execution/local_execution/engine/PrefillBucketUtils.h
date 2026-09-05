@@ -179,6 +179,23 @@ namespace llaminar2
         int max_segment_rows);
 
     /**
+     * @brief Resolve the live prefill segment independently of shared graph capacity.
+     *
+     * MTP verifier rows and captured prefill rows may inhabit the same physical
+     * graph arena, but they are different executable shapes. A larger MTP
+     * capacity must never manufacture an extra prefill bucket. This helper is
+     * the sole clamping rule used while admitting and later publishing the
+     * prefill schedule.
+     *
+     * @param admitted_prefill_rows Prefill rows selected by capacity admission.
+     * @param configured_segment_rows Declarative upper bound for one segment.
+     * @return Positive admitted segment capacity, or zero for invalid inputs.
+     */
+    int resolvePrefillScheduleRowCapacity(
+        int admitted_prefill_rows,
+        int configured_segment_rows) noexcept;
+
+    /**
      * @brief Restrict configured buckets to one resident graph-row capacity.
      *
      * The capacity itself is included as a final boundary when it is positive,

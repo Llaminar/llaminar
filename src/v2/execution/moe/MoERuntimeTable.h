@@ -33,6 +33,7 @@ namespace llaminar2
 
     class DecodeExpertHistogram;
     class DeviceMoEOverlayEpochArena;
+    class MoEOverlayEconomyCalibrationLayerCatalog;
     using DeviceMoERuntimeHistogramBank =
         moe_runtime_abi::DeviceMoERuntimeHistogramBank;
     using RuntimeExpertHistogramSourceMask =
@@ -41,6 +42,57 @@ namespace llaminar2
     /** Every runtime phase is collected by a non-overlay table. */
     inline constexpr RuntimeExpertHistogramSourceMask
         kAllRuntimeExpertHistogramSources{true, true, true};
+
+    /**
+     * @brief Model-lifetime ownership policy for accepted MTP route history.
+     *
+     * Accepted grouped-verifier rows are published after the main verifier has
+     * completed, potentially long after the ordinary decode graph was
+     * materialized.  A collecting durable table therefore owns one stable
+     * CUDA/HIP stream across every retained accepted-state graph identity.
+     * This policy is independent of whether a host maintenance authority also
+     * installs asynchronous histogram-drain banks.
+     */
+    enum class GroupedVerifierHistogramPublicationMode : uint8_t
+    {
+        /** Static placement and child tables publish no accepted route history. */
+        Disabled = 0,
+        /** Observe/Dynamic durable placement publishes accepted rows on one stream. */
+        AcceptedRows,
+    };
+
+    /**
+     * @brief Typed scope of device service markers embedded in retained graphs.
+     *
+     * Production Dynamic ExpertOverlay uses `CatalogStratifiedSample`: a
+     * deterministic sublinear sample of each exact weight-manifest equivalence
+     * class carries timing markers, and the economy composer pools then expands
+     * that measured class cost to its members.
+     * `AllRuntimeLayers` exists for low-level telemetry kernel tests which do
+     * not own a GGUF manifest. Static/Observe graphs use `Disabled`.
+     */
+    enum class MoEOverlayServiceTelemetryCoverage : uint8_t
+    {
+        Disabled = 0,
+        AllRuntimeLayers,
+        CatalogStratifiedSample,
+    };
+
+    /**
+     * @brief Native-capture activity of one admitted histogram producer.
+     *
+     * A CUDA/HIP stream cannot accept an externally recorded event while it is
+     * inside `beginCapture()`/`endCapture()`. The graph owner therefore
+     * publishes Entering before native capture and exactly one terminal edge
+     * afterward. Histogram maintenance treats any active Entering reference as
+     * transiently unavailable and returns Pending without touching the backend.
+     */
+    enum class RuntimeHistogramProducerCaptureTransition : uint8_t
+    {
+        Entering = 0, ///< An admitted producer is about to enter native capture.
+        Completed,   ///< Capture closed and produced a retained graph unit.
+        Aborted,     ///< Capture closed or failed without a usable graph unit.
+    };
 
     inline constexpr uint32_t kDeviceMoEMaxExperts = 256;
     /**
@@ -384,6 +436,117 @@ namespace llaminar2
                   moe_runtime_abi::kOverlayPlacementBanksOffset);
     static_assert(offsetof(DeviceMoELayerRuntime, overlay_epoch_status) ==
                   moe_runtime_abi::kOverlayEpochStatusOffset);
+
+    /**
+     * @brief Device publication that owns the weights for one routed workload.
+     *
+     * Serial decode writes the final, readiness-filtered weights into the
+     * embedded @ref DeviceMoELayerRuntime::topk_weights array. Grouped prefill
+     * and grouped verification instead publish one weight per original route
+     * slot through @ref DeviceMoELayerRuntime::route_weights. Keeping that
+     * distinction typed prevents a consumer from pairing a current participant
+     * ledger with stale weights from another workload.
+     */
+    enum class MoERuntimeRouteWeightProjection : std::uint8_t
+    {
+        /** No producer has been selected. */
+        Unspecified = 0,
+        /** One serial-decode row in the runtime structure's embedded top-k. */
+        DecodeTopK,
+        /** M-by-top-k grouped route-slot scratch. */
+        GroupedRouteSlots,
+    };
+
+    /**
+     * @brief Typed, non-owning binding to exact device execution weights.
+     *
+     * The pointer is capture-stable storage owned by a runtime table. Capacity
+     * is expressed in FP32 route weights, not bytes. Consumers must validate
+     * their exact graph geometry through @ref validFor before constructing a
+     * view or recording a graph node.
+     */
+    struct MoERuntimeRouteWeightBinding
+    {
+        const float *weights = nullptr;
+        std::uint32_t capacity = 0u;
+        MoERuntimeRouteWeightProjection projection =
+            MoERuntimeRouteWeightProjection::Unspecified;
+
+        /**
+         * @brief Validate that this producer can represent an exact route shape.
+         * @param physical_rows Number of physical router rows in the graph.
+         * @param top_k Number of selected experts per physical row.
+         * @return True only when the pointer, projection, and capacity agree.
+         */
+        [[nodiscard]] constexpr bool validFor(
+            std::uint32_t physical_rows,
+            std::uint32_t top_k) const noexcept
+        {
+            if (!weights || physical_rows == 0u || top_k == 0u)
+                return false;
+
+            const std::uint64_t required =
+                static_cast<std::uint64_t>(physical_rows) *
+                static_cast<std::uint64_t>(top_k);
+            switch (projection)
+            {
+            case MoERuntimeRouteWeightProjection::DecodeTopK:
+                return physical_rows == 1u &&
+                       top_k <= kDeviceMoEMaxTopK &&
+                       required <= capacity;
+            case MoERuntimeRouteWeightProjection::GroupedRouteSlots:
+                return required <= capacity;
+            case MoERuntimeRouteWeightProjection::Unspecified:
+                return false;
+            }
+            return false;
+        }
+    };
+
+    /**
+     * @brief Resolve the exact device weight publication for one workload.
+     *
+     * @param device_layer Capture-stable device address of the runtime record.
+     * @param host_recipe Host-owned pointer/capacity recipe for that record.
+     * @param projection Workload-specific producer selected by graph lowering.
+     * @return A typed binding; malformed recipes return an invalid binding with
+     *         the requested projection preserved for precise diagnostics.
+     *
+     * No device memory is dereferenced. The decode address is derived from the
+     * stable runtime-record base and its ABI-checked member offset, which is
+     * equally valid for CUDA, ROCm, and CPU-backed test records.
+     */
+    inline MoERuntimeRouteWeightBinding bindMoERuntimeRouteWeights(
+        DeviceMoELayerRuntime *device_layer,
+        const DeviceMoELayerRuntime &host_recipe,
+        MoERuntimeRouteWeightProjection projection) noexcept
+    {
+        switch (projection)
+        {
+        case MoERuntimeRouteWeightProjection::DecodeTopK:
+            if (!device_layer || host_recipe.top_k == 0u ||
+                host_recipe.top_k > kDeviceMoEMaxTopK)
+            {
+                return {.projection = projection};
+            }
+            return {
+                .weights = reinterpret_cast<const float *>(
+                    reinterpret_cast<std::uintptr_t>(device_layer) +
+                    offsetof(DeviceMoELayerRuntime, topk_weights)),
+                .capacity = host_recipe.top_k,
+                .projection = projection,
+            };
+        case MoERuntimeRouteWeightProjection::GroupedRouteSlots:
+            return {
+                .weights = host_recipe.route_weights,
+                .capacity = host_recipe.prefill_route_capacity,
+                .projection = projection,
+            };
+        case MoERuntimeRouteWeightProjection::Unspecified:
+            return {};
+        }
+        return {};
+    }
 
     /**
      * @brief Count active experts backed by graph-owned transient transfer slots.
@@ -735,6 +898,21 @@ namespace llaminar2
          */
         virtual void prepareDecodeHistogramProducerStream(void *stream) = 0;
         /**
+         * @brief Publish native-capture activity for an admitted producer.
+         *
+         * Multiple per-layer publishers may share one runtime table and exact
+         * stream, so Entering is reference counted and every caller must emit a
+         * matching terminal edge. The transition performs host bookkeeping
+         * only; it never calls a CUDA/HIP API.
+         *
+         * @param stream Exact producer previously admitted by
+         *        @ref prepareDecodeHistogramProducerStream.
+         * @param transition Typed capture lifecycle edge.
+         */
+        virtual void transitionDecodeHistogramProducerCapture(
+            void *stream,
+            RuntimeHistogramProducerCaptureTransition transition) = 0;
+        /**
          * @brief Publish the exact stream that just enqueued histogram writes.
          *
          * When asynchronous GPU draining is enabled, @p stream must already
@@ -765,12 +943,12 @@ namespace llaminar2
         /**
          * @brief Return the model-lifetime accepted-verifier publication stream.
          *
-         * A mirrored table whose asynchronous source mask includes grouped
-         * verification creates and admits this stream while installing its
-         * histogram banks.  Accepted-state graph families borrow this exact
+         * A mirrored table with an explicit accepted-row publication policy
+         * creates this stream during model setup, independently of host
+         * histogram draining. Accepted-state graph families borrow this exact
          * identity, so their first lazy materialization cannot introduce a new
-         * producer after maintenance has sealed the topology.  The table owns
-         * the stream; callers must neither replace nor destroy it.
+         * producer after optional maintenance has sealed the topology. The
+         * table owns the stream; callers must neither replace nor destroy it.
          *
          * @return Exact non-null CUDA/HIP stream for grouped-verifier
          *         publication, or nullptr when this table owns no such source.
@@ -845,6 +1023,17 @@ namespace llaminar2
             return nullptr;
         }
         /**
+         * @brief Query whether one layer embeds service marker kernels.
+         * @param layer_idx Valid runtime-table layer index.
+         * @return True only when graph execution must bind timing storage.
+         */
+        virtual bool collectsDeviceOverlayServiceTelemetryForLayer(
+            int layer_idx) const noexcept
+        {
+            (void)layer_idx;
+            return deviceOverlayServiceTelemetry() != nullptr;
+        }
+        /**
          * @brief Resolve the complete observation-only binding for one layer.
          *
          * Disabled telemetry returns an empty binding. A partial allocation is
@@ -866,6 +1055,9 @@ namespace llaminar2
                 throw std::out_of_range(
                     "MoE service telemetry binding layer is outside the runtime table");
             }
+
+            if (!collectsDeviceOverlayServiceTelemetryForLayer(layer_idx))
+                return {};
 
             auto *const telemetry = deviceOverlayServiceTelemetry();
             auto *const sample =
@@ -918,14 +1110,30 @@ namespace llaminar2
             int top_k = 0;
             bool mirror_to_device = false;
             /**
-             * @brief Allocate device-local service totals for Dynamic policy.
+             * @brief Select model-lifetime accepted-verifier publication.
              *
-             * This is valid only for a mirrored GPU table. Static overlays
-             * leave it false and therefore pay no timing-kernel or storage
-             * cost. A child table with @ref overlay_placement_source inherits
-             * the canonical source allocation and must use the same value.
+             * `AcceptedRows` is valid only for a canonical mirrored GPU table.
+             * It allocates one exact stream during model setup even when the
+             * table's controller is device resident and no host drain exists.
              */
-            bool collect_overlay_service_telemetry = false;
+            GroupedVerifierHistogramPublicationMode
+                grouped_verifier_histogram_publication =
+                    GroupedVerifierHistogramPublicationMode::Disabled;
+            /**
+             * @brief Select which retained graph layers carry service markers.
+             *
+             * A non-disabled value is valid only for a mirrored GPU table. A
+             * production table uses `CatalogStratifiedSample` together with
+             * @ref overlay_service_telemetry_catalog; a child table must name
+             * the same catalog and coverage as its canonical placement source.
+             */
+            MoEOverlayServiceTelemetryCoverage
+                overlay_service_telemetry_coverage =
+                    MoEOverlayServiceTelemetryCoverage::Disabled;
+            /** Immutable exact-equivalence catalog for stratified coverage. */
+            std::shared_ptr<
+                const MoEOverlayEconomyCalibrationLayerCatalog>
+                overlay_service_telemetry_catalog;
             int prefill_token_capacity = 0;
             /**
              * @brief Rows retained independently for deferred MTP publication.
@@ -991,6 +1199,10 @@ namespace llaminar2
         bool hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const override;
         /** @copydoc IMoERuntimeTable::prepareDecodeHistogramProducerStream */
         void prepareDecodeHistogramProducerStream(void *stream) override;
+        /** @copydoc IMoERuntimeTable::transitionDecodeHistogramProducerCapture */
+        void transitionDecodeHistogramProducerCapture(
+            void *stream,
+            RuntimeHistogramProducerCaptureTransition transition) override;
         /** @copydoc IMoERuntimeTable::recordDecodeHistogramProducerStream */
         void recordDecodeHistogramProducerStream(void *stream) override;
         /** @copydoc IMoERuntimeTable::retireRuntimeHistogramProducerStreams */
@@ -1188,6 +1400,22 @@ namespace llaminar2
         DeviceMoEOverlayServiceTelemetrySample *
         deviceOverlayServiceTelemetrySample(int layer_idx) const noexcept
             override;
+        /** @copydoc IMoERuntimeTable::collectsDeviceOverlayServiceTelemetryForLayer */
+        bool collectsDeviceOverlayServiceTelemetryForLayer(
+            int layer_idx) const noexcept override;
+        /** @return Typed graph-marker coverage owned by this table. */
+        [[nodiscard]] MoEOverlayServiceTelemetryCoverage
+        overlayServiceTelemetryCoverage() const noexcept
+        {
+            return overlay_service_telemetry_coverage_;
+        }
+        /** @return Exact representative catalog, if this table uses one. */
+        [[nodiscard]] const std::shared_ptr<
+            const MoEOverlayEconomyCalibrationLayerCatalog> &
+        overlayServiceTelemetryCatalog() const noexcept
+        {
+            return overlay_service_telemetry_catalog_;
+        }
         bool hasDeferredVerifierRouteLedgerCapacity(int layer_idx,
                                                     int token_count) const;
 
@@ -1197,7 +1425,14 @@ namespace llaminar2
         int num_experts_ = 0;
         int top_k_ = 0;
         bool mirror_to_device_ = false;
-        bool collect_overlay_service_telemetry_ = false;
+        GroupedVerifierHistogramPublicationMode
+            grouped_verifier_histogram_publication_ =
+                GroupedVerifierHistogramPublicationMode::Disabled;
+        MoEOverlayServiceTelemetryCoverage
+            overlay_service_telemetry_coverage_ =
+                MoEOverlayServiceTelemetryCoverage::Disabled;
+        std::shared_ptr<const MoEOverlayEconomyCalibrationLayerCatalog>
+            overlay_service_telemetry_catalog_;
         int prefill_token_capacity_ = 0;
         int deferred_verifier_token_capacity_ = 0;
         std::vector<DeviceMoELayerRuntime> host_layers_;
@@ -1226,11 +1461,11 @@ namespace llaminar2
         /**
          * @brief Table-owned stream for accepted grouped-verifier publication.
          *
-         * This stream is allocated and admitted atomically with the persistent
-         * histogram banks whenever the GroupedVerifier source is selected. It
-         * deliberately outlives every accepted-state graph identity and is
-         * retired only after inference has stopped and borrowed graph caches
-         * have released their native executables.
+         * This stream is allocated during model setup whenever the typed table
+         * policy selects accepted-row publication. It deliberately outlives
+         * every accepted-state graph identity. If a host drain is later
+         * installed, that optional lifecycle admits the already-owned stream
+         * into its producer set rather than replacing it.
          */
         void *grouped_verifier_histogram_publication_stream_ = nullptr;
 
@@ -1263,6 +1498,8 @@ namespace llaminar2
             void *flip_arrival_event = nullptr;
             void *flip_departure_event = nullptr;
             Ownership ownership = Ownership::BorrowedExecutionStream;
+            /** Number of stage publishers currently inside native capture. */
+            uint32_t active_capture_references = 0u;
         };
 
         mutable std::mutex runtime_histogram_drain_mutex_;
@@ -1372,6 +1609,8 @@ namespace llaminar2
         void allocateOverlayServiceTelemetry();
         /** Release only a canonical table's service accumulators. */
         void releaseOverlayServiceTelemetry() noexcept;
+        /** Allocate the accepted-row stream selected by the typed table policy. */
+        void allocateGroupedVerifierHistogramPublicationStream();
         /** Allocate and bind model-lifetime asynchronous histogram resources. */
         void allocateRuntimeHistogramDrainResources();
         /**
@@ -1396,6 +1635,9 @@ namespace llaminar2
          */
         [[nodiscard]] bool isRuntimeHistogramProducerStreamRegisteredLocked(
             void *stream) const noexcept;
+        /** @return true while any admitted producer is in native capture. */
+        [[nodiscard]] bool hasActiveRuntimeHistogramProducerCaptureLocked()
+            const noexcept;
         /**
          * @brief Close the producer DAG while every stream owner is alive.
          *
@@ -1431,7 +1673,7 @@ namespace llaminar2
             uint32_t writer_state,
             std::string &failure);
         /**
-         * @brief Destroy already-retired histogram resources at teardown.
+         * @brief Release optional drain and table-owned publication resources.
          *
          * Borrowed producer streams must have crossed
          * @ref retireRuntimeHistogramProducerStreams before this method runs.
@@ -1439,7 +1681,7 @@ namespace llaminar2
          * table-owned streams internally. Reaching normal destruction with an
          * unretired borrowed stream is a fatal lifetime violation.
          */
-        void releaseRuntimeHistogramDrainResources() noexcept;
+        void releaseRuntimeHistogramResources() noexcept;
         /** Merge one completed pinned generation into the host RCU histogram. */
         bool mergeRuntimeHistogramSnapshot(
             DecodeExpertHistogram &histogram);

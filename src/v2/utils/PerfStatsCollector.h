@@ -1,6 +1,20 @@
 /**
  * @file PerfStatsCollector.h
- * @brief Unified structured performance counter and timer collection.
+ * @brief Typed, process-wide structured performance evidence collection.
+ *
+ * The collector publishes one immutable environment-derived collection policy
+ * and lets hot producers test that snapshot with one atomic load. Environment
+ * parsing, path construction, and filter tokenization happen only at an
+ * explicit configuration boundary. This is important even when collection is
+ * disabled: production graphs contain many dormant evidence sites, and their
+ * disabled checks must not become measurable inference work.
+ *
+ * Record storage is independently synchronized. Reloading policy changes what
+ * future producers may publish; resetting storage changes retained evidence.
+ * Production processes normally configure the environment before startup and
+ * never reload it. Tests and embedding applications that mutate the process
+ * environment must call @ref reloadConfigurationFromEnvironment or one of the
+ * reset methods before starting concurrent producers.
  */
 #pragma once
 
@@ -100,6 +114,18 @@ namespace llaminar2
          * @brief Return whether per-stage GPU event timing is requested.
          */
         static bool gpuStageEventTimingEnabled();
+
+        /**
+         * @brief Publish a new immutable collection policy from the environment.
+         *
+         * This is the sole configuration transition for PerfStats. It is safe
+         * to call while readers use an older policy: published policy snapshots
+         * remain alive for the process lifetime. The method does not clear any
+         * records. Ordinary production code should not call it in the hot path;
+         * environment configuration is process-start state.
+         */
+        static void reloadConfigurationFromEnvironment();
+
         static void reset();
         static void resetPreservingDomains(
             const std::vector<std::string> &domains_to_preserve);

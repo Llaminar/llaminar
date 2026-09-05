@@ -33,6 +33,13 @@ int main(int argc, char **argv)
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
 
+    std::string retirement_error;
+    if (!releaseDenseMTPModelContextCampaignCache(&retirement_error))
+    {
+        std::cerr << retirement_error << '\n';
+        result = 1;
+    }
+
     GlobalBackendRouter::shutdown();
     GPUDeviceContextPool::instance().shutdown();
 

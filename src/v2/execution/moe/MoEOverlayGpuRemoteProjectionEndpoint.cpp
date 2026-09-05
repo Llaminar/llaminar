@@ -123,9 +123,14 @@ namespace llaminar2
         if (!config_.device.is_gpu())
             throw std::invalid_argument(
                 "Remote ExpertOverlay GPU lane requires one exact GPU device");
-        if (config_.staging_capacity_bytes == 0)
+        if (!config_.staging.valid() ||
+            config_.staging.device() != config_.device)
             throw std::invalid_argument(
-                "Remote ExpertOverlay GPU lane requires positive staging capacity");
+                "Remote ExpertOverlay GPU lane requires one matching persistent staging slice");
+        if (!config_.execution.valid() ||
+            config_.execution.device() != config_.device)
+            throw std::invalid_argument(
+                "Remote ExpertOverlay GPU lane requires one matching persistent execution lane");
         if (config_.lane_name.empty())
             throw std::invalid_argument(
                 "Remote ExpertOverlay GPU lane requires a stable name");
@@ -185,17 +190,13 @@ namespace llaminar2
             device_ordinal_ = config_.device.gpu_ordinal();
             context_ = &GPUDeviceContextPool::instance().getContext(
                 config_.device);
-            stream_ = context_->getOrCreateAuxiliaryStream(
-                "moe_overlay_remote_projection:" + config_.lane_name);
+            stream_ = config_.execution.stream();
             completion_event_ = backend_->createEvent(device_ordinal_);
+            /* The pool-wide TransferEngine slab owns both stable addresses. */
             device_chunk_ = static_cast<std::uint8_t *>(
-                backend_->allocate(
-                    config_.staging_capacity_bytes,
-                    device_ordinal_));
+                config_.staging.mutableDeviceData());
             pinned_chunk_ = static_cast<std::uint8_t *>(
-                backend_->allocatePinned(
-                    config_.staging_capacity_bytes,
-                    device_ordinal_));
+                config_.staging.mutablePinnedData());
             if (!stream_ || !completion_event_ || !device_chunk_ ||
                 !pinned_chunk_)
             {
@@ -206,24 +207,14 @@ namespace llaminar2
         catch (const std::exception &exception)
         {
             setGpuRemoteError(error, exception.what());
-            /* No work exists during model-time setup, so partial resources are safe. */
-            if (backend_ && device_ordinal_ >= 0)
-            {
-                if (completion_event_)
-                    backend_->destroyEvent(
-                        completion_event_, device_ordinal_);
-                if (device_chunk_)
-                    backend_->free(device_chunk_, device_ordinal_);
-                if (pinned_chunk_)
-                    backend_->freePinned(pinned_chunk_, device_ordinal_);
-            }
-            backend_ = nullptr;
-            context_ = nullptr;
-            device_ordinal_ = -1;
-            stream_ = nullptr;
-            completion_event_ = nullptr;
-            device_chunk_ = nullptr;
-            pinned_chunk_ = nullptr;
+            /*
+             * No work exists during model-time setup, so the lane-owned event
+             * can be reclaimed immediately.  The two chunk pointers are only
+             * views into TransferEngine-owned slabs retained by config_.staging;
+             * releaseResources() deliberately clears those views without
+             * attempting to free an interior address.
+             */
+            releaseResources();
             return false;
         }
         catch (...)
@@ -231,29 +222,8 @@ namespace llaminar2
             setGpuRemoteError(
                 error,
                 "Remote ExpertOverlay GPU lane setup threw a non-standard exception");
-            /*
-             * Setup is still quiescent, so reclaim the same partial resource
-             * set as the standard-exception path.  Leaving half a lane bound
-             * would make a later idempotent materialization impossible and
-             * could leak device or pinned memory until model teardown.
-             */
-            if (backend_ && device_ordinal_ >= 0)
-            {
-                if (completion_event_)
-                    backend_->destroyEvent(
-                        completion_event_, device_ordinal_);
-                if (device_chunk_)
-                    backend_->free(device_chunk_, device_ordinal_);
-                if (pinned_chunk_)
-                    backend_->freePinned(pinned_chunk_, device_ordinal_);
-            }
-            backend_ = nullptr;
-            context_ = nullptr;
-            device_ordinal_ = -1;
-            stream_ = nullptr;
-            completion_event_ = nullptr;
-            device_chunk_ = nullptr;
-            pinned_chunk_ = nullptr;
+            /* The shared slab owners remain exclusively in config_.staging. */
+            releaseResources();
             return false;
         }
         if (error)
@@ -409,7 +379,7 @@ namespace llaminar2
                 first_unit,
                 unit_count,
                 device_chunk_,
-                config_.staging_capacity_bytes,
+                config_.staging.sizeBytes(),
                 stream_);
 #else
             return false;
@@ -424,7 +394,7 @@ namespace llaminar2
                 first_unit,
                 unit_count,
                 device_chunk_,
-                config_.staging_capacity_bytes,
+                config_.staging.sizeBytes(),
                 stream_);
 #else
             return false;
@@ -532,7 +502,7 @@ namespace llaminar2
             first_unit >= layout.unit_count ||
             unit_count > layout.unit_count - first_unit ||
             unit_count > layout.maximum_units_per_chunk || bytes == 0 ||
-            bytes > config_.staging_capacity_bytes)
+            bytes > config_.staging.sizeBytes())
         {
             if (error && error->empty())
                 *error = "Remote GPU-to-CPU repack chunk is outside its authenticated layout";
@@ -561,7 +531,7 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!canSubmitLocked(owner, true, error) || !source || bytes == 0 ||
-            bytes > config_.staging_capacity_bytes)
+            bytes > config_.staging.sizeBytes())
         {
             if (error && error->empty())
                 *error = "Remote GPU blob read has an invalid source range";
@@ -598,7 +568,7 @@ namespace llaminar2
             first_unit >= layout.unit_count ||
             unit_count > layout.unit_count - first_unit ||
             unit_count > layout.maximum_units_per_chunk || bytes == 0 ||
-            bytes != payload.size() || bytes > config_.staging_capacity_bytes)
+            bytes != payload.size() || bytes > config_.staging.sizeBytes())
         {
             if (error && error->empty())
                 *error = "Remote CPU-to-GPU repack chunk is outside its authenticated layout";
@@ -631,7 +601,7 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(mutex_);
         if (!canSubmitLocked(owner, false, error) || !destination ||
             payload.empty() ||
-            payload.size() > config_.staging_capacity_bytes)
+            payload.size() > config_.staging.sizeBytes())
         {
             if (error && error->empty())
                 *error = "Remote GPU blob write has an invalid destination range";
@@ -753,7 +723,7 @@ namespace llaminar2
         if (!owner || owner_ != owner ||
             progress_ != MoEOverlayGpuRemoteLaneProgress::Ready || !is_read ||
             bytes == 0 || bytes != operation_bytes_ ||
-            bytes > config_.staging_capacity_bytes)
+            bytes > config_.staging.sizeBytes())
         {
             return {};
         }
@@ -832,10 +802,6 @@ namespace llaminar2
         {
             if (completion_event_)
                 backend_->destroyEvent(completion_event_, device_ordinal_);
-            if (device_chunk_)
-                backend_->free(device_chunk_, device_ordinal_);
-            if (pinned_chunk_)
-                backend_->freePinned(pinned_chunk_, device_ordinal_);
         }
         backend_ = nullptr;
         context_ = nullptr;

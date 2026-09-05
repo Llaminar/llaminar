@@ -300,6 +300,11 @@ namespace llaminar2
         std::uint64_t capacity_rejected_cycles = 0u;
         std::uint64_t participant_axis_budget_rejected_cycles = 0u;
 
+        /** Dependency combinations considered outside cycle classification. */
+        std::uint64_t dependent_cohort_candidates = 0u;
+        /** Candidate dependency combinations rejected by joint economics. */
+        std::uint64_t dependent_cohort_payoff_rejections = 0u;
+
         bool physical_cycle_recomposition = false;
         bool capacity_bounded = false;
         bool policy_bounded = false;
@@ -331,7 +336,9 @@ namespace llaminar2
                 !admitted_candidate_axes.matchesTotal(
                     admitted_candidate_cycles) ||
                 !admitted_physical_axes.matchesTotal(
-                    admitted_physical_cycles))
+                    admitted_physical_cycles) ||
+                dependent_cohort_payoff_rejections >
+                    dependent_cohort_candidates)
             {
                 return false;
             }

@@ -653,6 +653,15 @@ namespace llaminar2
             throw std::invalid_argument(
                 "MoELocalExpertSerialBufferArena canonical route storage is CPU-only");
         }
+        if (config.cpu_canonical_route_gpu_consumer &&
+            (config.cpu_canonical_route_storage !=
+                 CPUCanonicalRouteStoragePolicy::RetainSerialMaximum ||
+             !device_id_.is_cpu() ||
+             !config.cpu_canonical_route_gpu_consumer->is_gpu()))
+        {
+            throw std::invalid_argument(
+                "MoELocalExpertSerialBufferArena mapped canonical routes require retained CPU storage and one exact GPU consumer");
+        }
         if (config.cpu_grouped_scratch_storage ==
                 CPUGroupedScratchStoragePolicy::RetainSerialMaximum &&
             (!device_id_.is_cpu() || config.num_experts <= 0 ||
@@ -771,6 +780,7 @@ namespace llaminar2
         }
 
         size_t canonical_route_bytes = 0u;
+        size_t mapped_canonical_route_bytes = 0u;
         if (config.cpu_canonical_route_storage ==
                 CPUCanonicalRouteStoragePolicy::RetainSerialMaximum)
         {
@@ -780,14 +790,57 @@ namespace llaminar2
                 route_rows, d_model, "canonical route elements");
             canonical_route_bytes = checkedMultiply(
                 route_elements, sizeof(float), "canonical route bytes");
+            const std::vector<size_t> canonical_shape{
+                route_rows, static_cast<size_t>(d_model_)};
+            /*
+             * Keep expert arithmetic in ordinary first-touched RAM. Native
+             * CUDA/HIP mapped pages avoid the registration interrupt storm,
+             * but CPU read-modify-write throughput is materially lower on
+             * some NUMA hosts. Publication already applies one router weight
+             * per element, so it can stream cached source rows into the
+             * distinct mapped destination without adding another arithmetic
+             * pass or changing floating-point order.
+             */
             cpu_canonical_routes_ = std::make_shared<FP32Tensor>(
-                std::vector<size_t>{route_rows, d_model});
+                canonical_shape);
+            if (config.cpu_canonical_route_gpu_consumer)
+            {
+                const std::array<DeviceId, 1> endpoints{
+                    *config.cpu_canonical_route_gpu_consumer};
+                mapped_cpu_canonical_routes_ =
+                    TransferEngine::instance().allocateMappedHostRegion(
+                        canonical_route_bytes, endpoints);
+                if (!mapped_cpu_canonical_routes_ ||
+                    !mapped_cpu_canonical_routes_->isBound() ||
+                    !mapped_cpu_canonical_routes_->hasDevice(
+                        *config.cpu_canonical_route_gpu_consumer) ||
+                    !mapped_cpu_canonical_routes_->contains(
+                        0u, canonical_route_bytes))
+                {
+                    throw std::runtime_error(
+                        "MoELocalExpertSerialBufferArena received an incomplete mapped canonical-route allocation");
+                }
+                mapped_canonical_route_bytes = canonical_route_bytes;
+                mapped_cpu_canonical_route_consumer_ =
+                    *config.cpu_canonical_route_gpu_consumer;
+            }
             cpu_canonical_routes_->setDebugName(
                 prefix + ".cpu_canonical_route_rows");
             allocation_bytes_ = checkedAdd(
                 allocation_bytes_,
                 canonical_route_bytes,
                 "canonical route arena bytes");
+            if (mapped_canonical_route_bytes > 0u)
+            {
+                allocation_bytes_ = checkedAdd(
+                    allocation_bytes_,
+                    mapped_canonical_route_bytes,
+                    "mapped canonical route publication bytes");
+                pinned_transfer_bytes_ = checkedAdd(
+                    pinned_transfer_bytes_,
+                    mapped_canonical_route_bytes,
+                    "mapped canonical route pinned bytes");
+            }
         }
 
         size_t cpu_grouped_scratch_bytes = 0u;
@@ -816,6 +869,8 @@ namespace llaminar2
             {"bytes", std::to_string(allocation_bytes_)},
             {"cpu_canonical_route_bytes",
              std::to_string(canonical_route_bytes)},
+            {"cpu_canonical_route_mapped_publication_bytes",
+             std::to_string(mapped_canonical_route_bytes)},
             {"cpu_grouped_scratch_bytes",
              std::to_string(cpu_grouped_scratch_bytes)},
             {"d_model", std::to_string(d_model_)},
@@ -866,6 +921,8 @@ namespace llaminar2
                 " routing_top_k=" + std::to_string(routing_top_k_) +
                 " cpu_canonical_route_bytes=" +
                 std::to_string(canonical_route_bytes) +
+                " cpu_canonical_route_mapped_publication_bytes=" +
+                std::to_string(mapped_canonical_route_bytes) +
                 " cpu_grouped_scratch_bytes=" +
                 std::to_string(cpu_grouped_scratch_bytes) +
                 " pinned_transfer_bytes=" +
@@ -956,16 +1013,32 @@ namespace llaminar2
             {
                 const auto &binding =
                     *params_.cpu_canonical_route_ticket_return;
+                std::shared_ptr<MappedHostTransferRegion>
+                    mapped_publication;
+                if (binding.valid() &&
+                    params_.serial_compact_buffer_arena)
+                {
+                    mapped_publication =
+                        params_.serial_compact_buffer_arena
+                            ->mappedCPUCanonicalRoutes(
+                                binding.storage->continuationDevice());
+                }
                 if (!params_.device_id.is_cpu() || !binding.valid() ||
                     binding.storage->routeCapacity() < entry_capacity ||
                     binding.storage->dModel() != params_.d_model ||
                     binding.storage->layerIndex() != params_.layer_idx ||
                     !params_.serial_compact_buffer_arena ||
                     !params_.serial_compact_buffer_arena
-                         ->cpuCanonicalRoutes())
+                         ->cpuCanonicalRoutes() ||
+                    !mapped_publication ||
+                    binding.storage->contributionRowsHost() !=
+                        mapped_publication->mutableHostData() ||
+                    binding.storage->contributionRowsHost() ==
+                        params_.serial_compact_buffer_arena
+                            ->cpuCanonicalRoutes()->data())
                 {
                     throw std::invalid_argument(
-                        "MoELocalExpertStage canonical ticket return requires CPU execution, matching immutable route geometry, and a canonical serial arena");
+                        "MoELocalExpertStage canonical ticket return requires CPU execution, matching immutable route geometry, and distinct cached-compute/mapped-publication banks");
                 }
             }
             if (!ensureCompactCapacity(row_capacity, params_.top_k))
@@ -1038,32 +1111,16 @@ namespace llaminar2
             throw std::logic_error(
                 "serial CPU canonical-route mapping requires retained CPU rows and an exact GPU consumer");
         }
-        if (mapped_cpu_canonical_routes_)
+        if (!mapped_cpu_canonical_routes_)
         {
-            if (mapped_cpu_canonical_route_consumer_ != continuation_device)
-            {
-                throw std::logic_error(
-                    "serial CPU canonical-route arena cannot be rebound to another continuation device");
-            }
-            return mapped_cpu_canonical_routes_;
+            throw std::logic_error(
+                "serial CPU canonical-route arena was not constructed with a mapped GPU consumer");
         }
-
-        const std::array<DeviceId, 1> devices{continuation_device};
-        mapped_cpu_canonical_routes_ =
-            TransferEngine::instance().registerExternalMappedHostRegion(
-                cpu_canonical_routes_->mutable_data(),
-                cpu_canonical_routes_->size_bytes(),
-                devices,
-                std::static_pointer_cast<void>(cpu_canonical_routes_));
-        if (!mapped_cpu_canonical_routes_ ||
-            !mapped_cpu_canonical_routes_->isBound() ||
-            !mapped_cpu_canonical_routes_->hasDevice(continuation_device))
+        if (mapped_cpu_canonical_route_consumer_ != continuation_device)
         {
-            mapped_cpu_canonical_routes_.reset();
-            throw std::runtime_error(
-                "TransferEngine did not publish the complete serial CPU canonical-route mapping");
+            throw std::logic_error(
+                "serial CPU canonical-route arena cannot be rebound to another continuation device");
         }
-        mapped_cpu_canonical_route_consumer_ = continuation_device;
         return mapped_cpu_canonical_routes_;
     }
 
@@ -1227,6 +1284,7 @@ namespace llaminar2
                 : params_.moe_runtime_table;
         compute_params.overlay_service_telemetry =
             params_.overlay_service_telemetry;
+        compute_params.service_phase = params_.service_phase;
         compute_params.gate_slab_ref = params_.gate_slab_ref;
         compute_params.up_slab_ref = params_.up_slab_ref;
         compute_params.down_slab_ref = params_.down_slab_ref;
@@ -1245,6 +1303,7 @@ namespace llaminar2
                     .binding_kind =
                         MoEExpertComputeStage::SparseOverlayBindingKind::
                             SetupPriming,
+                    .service_phase = params_.service_phase,
                     .expert_mask = &invocation_expert_mask_,
                     .gate_engines = invocation_gate_engines_,
                     .up_engines = invocation_up_engines_,
@@ -1379,6 +1438,7 @@ namespace llaminar2
             compute_params.expert_registry = params_.expert_registry;
             compute_params.overlay_service_telemetry =
                 params_.overlay_service_telemetry;
+            compute_params.service_phase = params_.service_phase;
             compute_params.gate_slab_ref = params_.gate_slab_ref;
             compute_params.up_slab_ref = params_.up_slab_ref;
             compute_params.down_slab_ref = params_.down_slab_ref;
@@ -1407,6 +1467,7 @@ namespace llaminar2
                         .binding_kind =
                             MoEExpertComputeStage::
                                 SparseOverlayBindingKind::SetupPriming,
+                        .service_phase = params_.service_phase,
                         .expert_mask = &invocation_expert_mask_,
                         .gate_engines = invocation_gate_engines_,
                         .up_engines = invocation_up_engines_,
@@ -2448,6 +2509,18 @@ namespace llaminar2
         return executePacketOnCurrentThread(ctx);
     }
 
+    bool MoELocalExpertStage::publishConcurrentManualFailure() noexcept
+    {
+        if (concurrentManualFailureRole() !=
+                ConcurrentManualFailureRole::DeviceIngressPublisher ||
+            !params_.cpu_canonical_route_ticket_return)
+        {
+            return false;
+        }
+        const auto &binding = *params_.cpu_canonical_route_ticket_return;
+        return binding.valid() && binding.storage->publishAbort();
+    }
+
     bool MoELocalExpertStage::executePacketOnCurrentThread(
         IDeviceContext *ctx)
     {
@@ -3215,6 +3288,7 @@ namespace llaminar2
                         .routing_weights = compact_routing_weights_.get(),
                         .output = compact_output_.get(),
                         .live_rows = static_cast<int>(compact_capacity_),
+                        .service_phase = params_.service_phase,
                         .engine_binding_generation =
                             engine_binding_generation,
                         .expert_mask = &invocation_expert_mask_,
@@ -3333,6 +3407,7 @@ namespace llaminar2
                                                    : params_.moe_runtime_table;
             compute_params.overlay_service_telemetry =
                 params_.overlay_service_telemetry;
+            compute_params.service_phase = params_.service_phase;
             compute_params.gate_slab_ref = params_.gate_slab_ref;
             compute_params.up_slab_ref = params_.up_slab_ref;
             compute_params.down_slab_ref = params_.down_slab_ref;
@@ -3677,7 +3752,8 @@ namespace llaminar2
                     active_routes_.size() == input.live_entry_count &&
                     output_input_rows_.size() == input.live_row_count &&
                     input.live_entry_count <= ticket.routeCapacity() &&
-                    ticket.contributionRowsHost() == compact_result;
+                    ticket.contributionRowsHost() &&
+                    ticket.contributionRowsHost() != compact_result;
                 std::int32_t previous_original_slot = -1;
                 for (size_t compact_row = 0;
                      exact_packet &&
@@ -3761,6 +3837,7 @@ namespace llaminar2
                     ticket.compactRouteSlotsHost();
                 float *const contribution_rows =
                     ticket.contributionRowsHost();
+                const float *const computed_rows = compact_result;
                 const size_t d_model =
                     static_cast<size_t>(params_.d_model);
                 const auto publish_entry = [&](size_t entry)
@@ -3774,11 +3851,13 @@ namespace llaminar2
                         input.original_route_slots_host[entry];
                     compact_slots[entry] =
                         static_cast<std::int32_t>(source_slot);
-                    float *const row =
+                    const float *const source_row =
+                        computed_rows + source_slot * d_model;
+                    float *const published_row =
                         contribution_rows + source_slot * d_model;
                     const float weight = input.route_weights_host[entry];
                     for (size_t col = 0; col < d_model; ++col)
-                        row[col] *= weight;
+                        published_row[col] = source_row[col] * weight;
                 };
 
                 /*

@@ -108,13 +108,10 @@ namespace llaminar2
                 if (disable_reason != BenchmarkPrefillBucketDisableReason::None)
                 {
                     setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "0", 1);
-                    if (mpi_ctx && mpi_ctx->rank() == 0)
-                    {
-                        const char *reason = benchmarkPrefillBucketDisableMessage(disable_reason);
-                        LOG_INFO("[Benchmark] " << reason
-                                                << " — leaving prefill graph bucketing disabled "
-                                                   "(running exact prefill length)");
-                    }
+                    const char *reason = benchmarkPrefillBucketDisableMessage(disable_reason);
+                    LOG_INFO("[Benchmark] " << reason
+                                            << " — leaving prefill graph bucketing disabled "
+                                               "(running exact prefill length)");
                 }
                 else
                 {
@@ -133,26 +130,27 @@ namespace llaminar2
             mutable_env.presence.reload();
             mutable_env.execution.reload();
 
-            if (mpi_ctx && mpi_ctx->rank() == 0)
-            {
-                const auto &exec = debugEnv().execution;
-                LOG_INFO("[Benchmark] Prefill graph buckets "
-                         << (exec.prefill_graph_buckets ? "enabled" : "disabled")
-                         << "; bucket_sizes=" << formatBucketList(exec.prefill_graph_bucket_sizes)
-                         << (user_selected_bucket_sizes ? " (bucket env override)" : " (production default)")
-                         << "; mode=" << (user_selected_bucket_mode ? "env override" : "benchmark default")
-                         << "; gpu_graphs=" << (exec.gpu_graphs ? "enabled" : "disabled")
-                         << (user_selected_gpu_graphs ? " (env override)" : ""));
-            }
+            const auto &exec = debugEnv().execution;
+            LOG_INFO("[Benchmark] Prefill graph buckets "
+                     << (exec.prefill_graph_buckets ? "enabled" : "disabled")
+                     << "; bucket_sizes=" << formatBucketList(exec.prefill_graph_bucket_sizes)
+                     << (user_selected_bucket_sizes ? " (bucket env override)" : " (production default)")
+                     << "; mode=" << (user_selected_bucket_mode ? "env override" : "benchmark default")
+                     << "; gpu_graphs=" << (exec.gpu_graphs ? "enabled" : "disabled")
+                     << (user_selected_gpu_graphs ? " (env override)" : ""));
         }
 
         int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
-            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
-            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
+            const bool is_authority =
+                ctx.runner &&
+                ctx.coordinatedRequestRole() ==
+                    CoordinatedRequestRole::Authority;
+            const bool notify_workers =
+                has_mpi && ctx.mpi_ctx->world_size() > 1 && is_authority;
 
-            if (is_root)
+            if (is_authority)
                 LOG_ERROR("Benchmark mode failed with unhandled exception: " << detail);
 
             if (ctx.runner)
@@ -182,13 +180,18 @@ namespace llaminar2
         auto &tokenizer = ctx.tokenizer;
 
         const bool mpi_coordinated = mpi_ctx->world_size() > 1;
-        if (mpi_coordinated && mpi_ctx->rank() != 0)
+        const CoordinatedRequestRole request_role =
+            ctx.coordinatedRequestRole();
+        const bool is_authority =
+            request_role == CoordinatedRequestRole::Authority;
+        if (mpi_coordinated && !is_authority)
         {
             /*
              * BenchmarkRunner is the request controller, not a rank-local
              * graph driver.  Exactly one controller must issue clear/prefill/
              * decode commands; every other rank remains in the production
-             * command loop and participates when rank zero admits a command.
+             * command loop and participates when the continuation authority
+             * admits a command.
              * Running one BenchmarkRunner per rank creates two competing MPI
              * collective schedules (for example CLEAR_CACHE versus PREFILL).
              */
@@ -215,10 +218,8 @@ namespace llaminar2
             return success ? 0 : 1;
         };
 
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_DEBUG("Running benchmark mode...");
-        }
+        LOG_DEBUG("Running benchmark mode on coordinated authority rank "
+                  << runner->coordinatedRootRank() << "...");
 
         configureBenchmarkPrefillBuckets(mpi_ctx, ctx.config);
 
@@ -243,7 +244,7 @@ namespace llaminar2
 
         BenchmarkResult result = benchmark.run(ctx.config);
         benchmark.printResults(result);
-        if (mpi_ctx->rank() == 0 && !ctx.config.benchmark_json_output_path.empty())
+        if (!ctx.config.benchmark_json_output_path.empty())
         {
             std::ofstream json_out(ctx.config.benchmark_json_output_path);
             if (!json_out)

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
+#include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 #include "utils/Sha256.h"
 
@@ -46,7 +47,75 @@ namespace
         return directory /
                (std::string(kModelArtifactIdentity) + ".kvcache");
     }
+
+    /** @brief Admit exactly one production archive scratch on rank zero. */
+    std::shared_ptr<PhysicalMemoryAuthority> makeArchiveAuthority()
+    {
+        constexpr size_t kHostBytes = 64u * 1024u * 1024u;
+        PhysicalMemoryPlanBuilder builder;
+        builder.add(
+            PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = DeviceId::cpu(),
+                .total_bytes = kHostBytes,
+                .admission_available_bytes = kHostBytes,
+            },
+            PhysicalMemoryOwner::PrefixArchiveStaging,
+            PrefixArchiveIOGeometry::scratchBytes());
+        auto admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(builder.build());
+        return std::make_shared<PhysicalMemoryAuthority>(
+            std::move(admission), 0);
+    }
 } // namespace
+
+TEST(Test__DiskPrefixStorageBackend,
+     SharedProductionArchiveOwnsExactlyOneCanonicalScratchClaim)
+{
+    const auto dir = tempDir();
+    const auto cleanup = [&]() { std::filesystem::remove_all(dir); };
+    auto authority = makeArchiveAuthority();
+    std::string error;
+
+    auto first = DiskPrefixStorageBackend::openShared(
+        archivePath(dir),
+        1024u,
+        kModelArtifactIdentity,
+        authority,
+        &error);
+    ASSERT_NE(first, nullptr) << error;
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::PrefixArchiveStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        PrefixArchiveIOGeometry::scratchBytes());
+
+    auto second = DiskPrefixStorageBackend::openShared(
+        archivePath(dir),
+        1024u,
+        kModelArtifactIdentity,
+        authority,
+        &error);
+    ASSERT_EQ(second.get(), first.get());
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::PrefixArchiveStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        PrefixArchiveIOGeometry::scratchBytes())
+        << "LocalTP users must share the one admitted archive I/O buffer.";
+
+    second.reset();
+    first.reset();
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::PrefixArchiveStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
+    cleanup();
+}
 
 TEST(Test__DiskPrefixStorageBackend, UsesStableModelArtifactIdentityForArchiveNaming)
 {

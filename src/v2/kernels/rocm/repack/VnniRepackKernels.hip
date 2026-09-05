@@ -2,7 +2,7 @@
  * @file VnniRepackKernels.hip
  * @brief HIP kernels for repacking raw GGUF blocks into VNNI-interleaved layout
  *
- * Contains the complete canonical movable-expert codebook family. Each kernel
+ * Contains the complete canonical GPU-aligned expert codebook family. Each kernel
  * maps one thread to one (n, b) block position, performing the same payload
  * repack and metadata derivation as the CPU reference path. Computed binary16
  * metadata is published through the shared cross-backend encoding contract.

@@ -6,8 +6,10 @@ description: Run, extend, maintain, and diagnose Llaminar V2 real-weight product
 # Model Parity Testing
 
 Use the production campaign system to prove the live inference path against an
-authenticated reference pack made from the exact GGUF bytes. Preserve every
-stage comparison and canonical CSV while amortizing immutable model setup.
+independent reference pack generated from the declared real GGUF. Preserve
+every stage comparison and canonical CSV while amortizing immutable model
+setup; numerical checkpoints, not an extra whole-model hash pass, prove weight
+equivalence.
 
 ## Start with the contract
 
@@ -69,20 +71,25 @@ The audit must reject wildcard GTest filters, missing production labels,
 missing `forward_graph` PerfStats, wrong timeouts, duplicate cases, and empty
 selection. Record campaign and exact-cell counts when changing coverage.
 
-Every non-list campaign invocation first runs the CMake-owned
-`ProductionParityPreflight` integration label, before the model fixture or RAM
-staging. This is the short, model-free gate for MPI/rank lifecycle,
-orchestration, explicit-stream event ordering, graph capture/replay, retained
-heterogeneous tickets, prepared ExpertOverlay weights, and CUDA/ROCm overlay
-epochs. Its inventory lives only in `tests/v2/CMakeLists.txt`; the Python
-driver discovers and validates the label instead of copying test names. A
-preflight member must be an `Integration` test, require no fixture or external
-file, and have a timeout no greater than 120 seconds. Any failure stops model
-admission and is recorded in the campaign report.
+Every non-list campaign invocation first builds the CMake-owned `v2_unit_gate`
+target and runs the complete `V2_Unit_*` namespace. It then runs the
+`ProductionParityPreflight` integration label, all before the model fixture or
+RAM staging. Unit tests prove device-free policy and state-machine invariants;
+preflight proves MPI/rank lifecycle, orchestration, explicit-stream event
+ordering, graph capture/replay, retained heterogeneous tickets, prepared
+ExpertOverlay weights, and CUDA/ROCm overlay epochs. Both inventories live only
+in CTest registration: the Python driver discovers and validates them instead
+of copying test or executable names. A preflight-label member must be an
+`Integration` test, require no fixture or external file, and have a timeout no
+greater than 120 seconds. Any build, unit, or preflight failure stops model
+admission and is recorded by the combined preflight receipt.
 
-Run the same gate directly when developing its infrastructure:
+Run the same prerequisite phases directly when developing their infrastructure:
 
 ```bash
+cmake --build build_v2_integration --parallel --target v2_unit_gate
+ctest --test-dir build_v2_integration \
+  --output-on-failure --parallel --no-tests=error -R '^V2_Unit_'
 ctest --test-dir build_v2_integration \
   --output-on-failure --parallel --no-tests=error \
   -L '^ProductionParityPreflight$'
@@ -100,9 +107,9 @@ python3 scripts/ci/run_production_parity_campaigns.py \
 
 Do not invoke a registered `ProductionCampaign_*` child directly with CTest.
 Those entries are the driver's internal discovery/scheduling units and fail
-before model mapping when the authenticated tmpfs contract is absent. Narrow a
+before model mapping when the identity-bound tmpfs contract is absent. Narrow a
 real campaign with the driver's `--campaign`, `--backend`, and `--precision`
-selectors so staging, locking, digest reuse, artifacts, and the global timing
+selectors so staging, identity locking, artifacts, and the global timing
 authority remain intact.
 
 Then run the unfiltered matrix. The 75-minute requirement is one wall-clock
@@ -111,7 +118,13 @@ combined. It is not a per-campaign timeout or a reason to abort unfinished
 cells. Each exact generated GTest cell nevertheless has a fixed 600-second
 progress watchdog. A newly published per-cell `test_log.txt` transfers the
 deadline to that cell; expiry kills its complete CTest/MPI process group and
-records the exact identity as `exact_cell_timeout`. Use
+records the exact identity as `exact_cell_timeout`. `GTEST_FAIL_FAST=1` is part
+of every registered production campaign contract:
+the first exact red ends its process-amortized aggregate. The driver publishes
+that aggregate as the sole first-failure authority, cancels already-running
+backend-disjoint sibling process groups, records them as cancelled rather than
+additional reds, and admits no pending campaigns. Diagnose that preserved
+first-failure evidence before restarting the unfiltered matrix. Use
 `scripts/ci/setup_production_parity_tmpfs.sh` once for persistent
 local iteration. Its named mount is independent of host-login `/dev/shm` IPC
 cleanup, and repeated setup preserves the existing cache. Persistence still
@@ -129,15 +142,25 @@ python3 scripts/ci/run_production_parity_campaigns.py \
   --report parity-results/production-campaigns.json
 ```
 
+After an interrupted local sweep, repeat
+`--prioritize-unseen-from-artifact-root PATH` for each preserved campaign
+artifact root to run wholly unseen aggregates before partial aggregates and
+previously complete aggregates. This is an explicit scheduling hint only. It
+never removes a selected exact cell, reuses an old pass, or weakens the active
+run's freshness and full CSV validation; the restarted unfiltered run must
+still rerun the complete discovered matrix for certification.
+
 Success requires exit zero, every discovered campaign completed, every exact
 cell represented, `correctness_passed: true`, `global_target_met: true`,
 `performance_requirements_met: true`, and `global_elapsed_seconds <= 4500`.
-It also requires `preflight_return_code: 0` and a nonempty
-`preflight_tests` inventory. Preflight elapsed time is part of that single
-global wall-clock budget.
-The separate completion timeout is only a hang guard and must remain generous
-enough to collect the complete correctness matrix after a performance miss.
-It never replaces or weakens the fixed ten-minute exact-cell watchdog.
+It also requires `preflight_return_code: 0` and a nonempty `preflight_tests`
+inventory containing the complete Unit namespace and Integration preflight
+label. Unit build/test and preflight elapsed time are part of that single global
+wall-clock budget.
+The separate completion timeout guards setup phases that cannot publish an
+exact-cell transition. It is not a cumulative matrix deadline. Once inference
+starts, the fixed ten-minute exact-cell watchdog is the sole timeout authority;
+each fresh `test_log.txt` transition renews that complete budget.
 Keep the JSON and CSVs as CI artifacts, but never commit local result
 directories.
 
@@ -161,7 +184,7 @@ complete `full_graph_*` capture or replay. An MTP row must report
   conditional loop.
 
 The ROCm certificate is not granted from the policy spelling. PerfStats must
-prove the exact 48-byte `immutable_scheduler_snapshot` with
+prove the exact ABI-v2 52-byte `immutable_scheduler_snapshot` with
 `state_payload=false`, authenticated observations, retained HIP graph-family
 materialization, per-device captured transaction/terminal submissions, matching
 controller and compact-reducer ledgers, and either exact standalone launches or
@@ -200,6 +223,16 @@ two-axis topologies require at least one ledger edge whose axis advances tier
 residency and one whose axis advances participant placement; a `combined` edge
 satisfies both without demanding a gratuitous extra transfer.
 
+Do not equate physical-movement coverage with the longer matched throughput
+cohort. Every Dynamic cell owns `EconomicMovement`. A model/topology definition
+may additionally select `dynamic_speedup_witness` as ordinal, random, both
+owner orders, or disabled. The expander places that before/after speed proof on
+only the first activation/KV pair, ordinary prefill profile, and MTP-off cell;
+all remaining cells retain their complete movement, numerical, graph, prefix,
+and CSV obligations. Add a representative only when a new transport class or
+materially different topology economy needs one, and never infer witnesses in
+the fixture from a test name or from the mere presence of CPU participants.
+
 Use `moe_placement` separately to authenticate the requested ordinal or seeded
 random physical owner map. Setup placement is not request-time movement.
 ExpertOverlay cells also retain `expert_residency_diagnostics.csv` (and one
@@ -235,11 +268,13 @@ proof. MoE MTP inherits the same policy and placement movement contract.
 6. Reproduce with one exact CTest/GTest cell. Loop a flaky case up to 20 times.
 7. Fix the production implementation. Do not weaken the reference, skip a
    checkpoint, raise a timeout, or enter another path.
-8. Add a focused device-free or backend integration regression for the root
-   invariant. If it is model-free and guards campaign infrastructure or a
-   production mechanism used by parity, add the existing CTest registration to
-   `V2_PRODUCTION_PARITY_PREFLIGHT_TESTS`; do not copy it into the Python
-   driver. Then rerun preflight, the affected campaign, and the full matrix.
+8. Add a focused device-free unit or backend integration regression for the
+root invariant. Every `V2_Unit_*` test joins the prerequisite automatically. If
+an Integration test is model-free and guards campaign infrastructure or a
+production mechanism used by parity, add its existing CTest registration to
+`V2_PRODUCTION_PARITY_PREFLIGHT_TESTS`; do not copy either inventory into the
+Python driver. Then rerun both prerequisite phases, the affected campaign, and
+the full matrix.
 
 If only the full campaign fails, inspect reuse boundaries: `ModelContext` may
 retain immutable prepared weights only when its complete physical identity is

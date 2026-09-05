@@ -83,6 +83,23 @@ namespace llaminar2
 
     FP32Tensor::FP32Tensor(
         const std::vector<size_t> &shape,
+        DeviceId device,
+        MappedStorageConstructionTag)
+        : shape_(shape), device_(device), is_view_(false),
+          parent_data_ptr_(nullptr), view_offset_(0), parent_(nullptr)
+    {
+        if (shape_.empty() ||
+            std::any_of(
+                shape_.begin(), shape_.end(),
+                [](size_t dimension) { return dimension == 0u; }))
+        {
+            throw std::invalid_argument(
+                "FP32Tensor mapped storage requires a non-empty positive shape");
+        }
+    }
+
+    FP32Tensor::FP32Tensor(
+        const std::vector<size_t> &shape,
         AlignedVector<float> host_data,
         DeviceId device)
         : shape_(shape), device_(device), is_view_(false),
@@ -116,6 +133,21 @@ namespace llaminar2
         const std::vector<size_t> &shape,
         DeviceId target_device)
     {
+        return createMappedWithHome(shape, target_device, target_device);
+    }
+
+    std::unique_ptr<FP32Tensor> FP32Tensor::createHostOwnedMapped(
+        const std::vector<size_t> &shape,
+        DeviceId mapped_device)
+    {
+        return createMappedWithHome(shape, DeviceId::cpu(), mapped_device);
+    }
+
+    std::unique_ptr<FP32Tensor> FP32Tensor::createMappedWithHome(
+        const std::vector<size_t> &shape,
+        DeviceId home_device,
+        DeviceId mapped_device)
+    {
         // Calculate tensor size
         size_t count = 1;
         for (auto dim : shape)
@@ -124,16 +156,19 @@ namespace llaminar2
         }
         size_t bytes = count * sizeof(float);
 
-        // Create tensor with regular constructor first (no host allocation for mapped)
-        auto tensor = std::make_unique<FP32Tensor>(shape, target_device);
+        auto tensor = std::unique_ptr<FP32Tensor>(new FP32Tensor(
+            shape,
+            home_device,
+            MappedStorageConstructionTag{}));
 
         // Mapped allocation is an explicit placement contract. Returning a
         // regular tensor here would silently move the caller onto a different
         // storage and synchronization architecture.
-        if (!tensor->initMappedMemory(bytes, target_device))
+        if (!tensor->initMappedMemory(bytes, mapped_device))
         {
-            LOG_ERROR("[FP32Tensor::createMapped] Failed to allocate required mapped memory ("
-                      << bytes << " bytes) on " << target_device.toString());
+            LOG_ERROR("[FP32Tensor::createMappedWithHome] Failed to allocate required mapped memory ("
+                      << bytes << " bytes) on " << mapped_device.toString()
+                      << " for logical home " << home_device.toString());
             return nullptr;
         }
 

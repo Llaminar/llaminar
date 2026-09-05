@@ -1,6 +1,6 @@
 /**
  * @file DeviceNativeVNNIContributionContract.h
- * @brief One FP32 contribution program for every movable expert codebook.
+ * @brief One FP32 contribution program for every GPU-aligned expert codebook.
  *
  * NativeVNNI payload decoding is codebook-specific, while its persisted scale
  * application is not backend-specific. ExpertOverlay can move one prepared

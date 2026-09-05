@@ -437,6 +437,10 @@ namespace llaminar2
                     digest.addScalar(admission.capacity_rejected_cycles);
                     digest.addScalar(
                         admission.participant_axis_budget_rejected_cycles);
+                    digest.addScalar(
+                        admission.dependent_cohort_candidates);
+                    digest.addScalar(
+                        admission.dependent_cohort_payoff_rejections);
                     digest.addScalar(admission.physical_cycle_recomposition);
                     digest.addScalar(admission.capacity_bounded);
                     digest.addScalar(admission.policy_bounded);

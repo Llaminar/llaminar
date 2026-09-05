@@ -760,7 +760,8 @@ namespace llaminar2
                 descriptor.physical_rows_per_request,
                 descriptor.draft_depth,
                 descriptor.sidecar_depth,
-                descriptor.prefill_schedule_workload);
+                descriptor.prefill_schedule_workload,
+                descriptor.retired_decode_progress_tokens);
         }
         catch (const std::exception &exception)
         {
@@ -821,6 +822,7 @@ namespace llaminar2
     bool MoEOverlayInferenceTransactionPublisher::publishTerminal(
         MoEOverlayInferenceTransactionAction action,
         std::uint64_t placement_epoch,
+        std::uint64_t retired_decode_progress_tokens,
         int error_code,
         std::string *error)
     {
@@ -841,7 +843,8 @@ namespace llaminar2
                 protocol_.nextTransactionOrdinal(),
                 placement_epoch,
                 action,
-                error_code);
+                error_code,
+                retired_decode_progress_tokens);
         }
         catch (const std::exception &exception)
         {
@@ -873,11 +876,13 @@ namespace llaminar2
 
     bool MoEOverlayInferenceTransactionPublisher::complete(
         std::uint64_t placement_epoch,
+        std::uint64_t retired_decode_progress_tokens,
         std::string *error)
     {
         return publishTerminal(
             MoEOverlayInferenceTransactionAction::Complete,
             placement_epoch,
+            retired_decode_progress_tokens,
             /*error_code=*/0,
             error);
     }
@@ -890,6 +895,7 @@ namespace llaminar2
         return publishTerminal(
             MoEOverlayInferenceTransactionAction::Abort,
             placement_epoch,
+            /*retired_decode_progress_tokens=*/0u,
             error_code,
             error);
     }
@@ -1308,6 +1314,7 @@ namespace llaminar2
         graph_sequence_count_ = 0;
         last_hosted_sequence_transition_id_ = 0;
         last_hosted_sequence_next_draft_depth_.reset();
+        last_hosted_sequence_committed_output_tokens_ = 0u;
         current_placement_epoch_ = command.initial_placement_epoch;
         failure_.clear();
 
@@ -1573,6 +1580,17 @@ namespace llaminar2
                 &result.error);
             return result;
         }
+
+        /*
+         * The device generation ticket is the sole authority for committed
+         * output.  Every symmetric participant descriptor is therefore
+         * stamped here, under the coordinator lock, rather than trusting an
+         * ordinary graph caller to mirror that device-owned frontier.  All
+         * graph tickets in one retained sequence intentionally carry the same
+         * value; the remote follower turns only strict advances into wakes.
+         */
+        descriptor.retired_decode_progress_tokens =
+            last_hosted_sequence_committed_output_tokens_;
         if (participant_index < 0 ||
             participant_index >= config_.continuation_participant_count ||
             descriptor.graph_role == MoEOverlayInferenceGraphRole::None ||
@@ -2386,6 +2404,7 @@ namespace llaminar2
         advanceHostedGraphSequence(
             std::uint64_t transaction_id,
             std::optional<int> next_draft_depth,
+            std::uint64_t committed_output_tokens,
             std::string *error)
     {
         std::lock_guard lock(mutex_);
@@ -2416,7 +2435,9 @@ namespace llaminar2
         if (transaction_id == last_hosted_sequence_transition_id_)
         {
             if (next_draft_depth !=
-                last_hosted_sequence_next_draft_depth_)
+                    last_hosted_sequence_next_draft_depth_ ||
+                committed_output_tokens !=
+                    last_hosted_sequence_committed_output_tokens_)
             {
                 return failLocked(
                     "ExpertOverlay symmetric participants presented divergent hosted graph transitions",
@@ -2430,6 +2451,13 @@ namespace llaminar2
                 "ExpertOverlay hosted graph transition replayed a stale transaction id",
                 error);
         }
+        if (committed_output_tokens <=
+            last_hosted_sequence_committed_output_tokens_)
+        {
+            return failLocked(
+                "ExpertOverlay hosted graph transition did not advance its authenticated committed-token frontier",
+                error);
+        }
 
         if (!retireCompletedGraphSequenceLocked(error))
             return false;
@@ -2439,8 +2467,27 @@ namespace llaminar2
             return false;
         }
 
+        const std::uint64_t completed_delta =
+            committed_output_tokens -
+            last_hosted_sequence_committed_output_tokens_;
+        if (config_.retired_decode_progress_sink)
+        {
+            std::string progress_error;
+            if (!config_.retired_decode_progress_sink(
+                    completed_delta, &progress_error))
+            {
+                return failLocked(
+                    progress_error.empty()
+                        ? "ExpertOverlay hosted decode progress sideband rejected a retired transaction"
+                        : std::move(progress_error),
+                    error);
+            }
+        }
+
         last_hosted_sequence_transition_id_ = transaction_id;
         last_hosted_sequence_next_draft_depth_ = next_draft_depth;
+        last_hosted_sequence_committed_output_tokens_ =
+            committed_output_tokens;
         PerfStatsCollector::addCounter(
             "moe_overlay_transaction",
             "hosted_sequence_transitions",
@@ -2453,6 +2500,10 @@ namespace llaminar2
               next_draft_depth
                   ? std::to_string(*next_draft_depth)
                   : "terminal"},
+             {"completed_logical_tokens",
+              std::to_string(completed_delta)},
+             {"committed_output_tokens",
+              std::to_string(committed_output_tokens)},
              {"authority", "idempotent_ticket"}});
         return true;
     }
@@ -2505,7 +2556,9 @@ namespace llaminar2
         {
             std::string publisher_error;
             if (!publisher->complete(
-                    current_placement_epoch_, &publisher_error))
+                    current_placement_epoch_,
+                    last_hosted_sequence_committed_output_tokens_,
+                    &publisher_error))
             {
                 return failLocked(
                     publisher_error.empty()
@@ -2781,7 +2834,9 @@ namespace llaminar2
           protocol_(std::move(config.protocol)),
           interference_probe_(std::move(config.interference_probe)),
           retired_prefill_progress_sink_(
-              std::move(config.retired_prefill_progress_sink))
+              std::move(config.retired_prefill_progress_sink)),
+          retired_decode_progress_sink_(
+              std::move(config.retired_decode_progress_sink))
     {
         validateConstruction();
     }
@@ -2813,6 +2868,7 @@ namespace llaminar2
         std::optional<MoEOverlayInferenceInterferenceScope>
             active_prefill_scope;
         int active_prefill_transactions = 0;
+        std::uint64_t last_retired_decode_progress_tokens = 0u;
         const auto discard_active_prefill = [&]() noexcept
         {
             if (active_prefill_scope)
@@ -2820,6 +2876,49 @@ namespace llaminar2
             active_prefill_scope.reset();
             active_prefill_schedule.reset();
             active_prefill_transactions = 0;
+        };
+        const auto publish_retired_decode_progress =
+            [&](const MoEOverlayInferenceTransactionTicket &ticket,
+                const char *boundary) -> bool
+        {
+            const std::uint64_t frontier =
+                ticket.retired_decode_progress_tokens;
+            if (frontier < last_retired_decode_progress_tokens)
+            {
+                result.error =
+                    "ExpertOverlay follower observed a regressing retired-decode frontier at " +
+                    std::string(boundary) + ": previous=" +
+                    std::to_string(last_retired_decode_progress_tokens) +
+                    ", received=" + std::to_string(frontier);
+                return false;
+            }
+            if (frontier == last_retired_decode_progress_tokens)
+                return true;
+
+            const std::uint64_t delta =
+                frontier - last_retired_decode_progress_tokens;
+            if (retired_decode_progress_sink_ &&
+                !retired_decode_progress_sink_(delta, &result.error))
+            {
+                if (result.error.empty())
+                {
+                    result.error =
+                        "ExpertOverlay follower decode progress sideband rejected a retired transaction";
+                }
+                return false;
+            }
+            last_retired_decode_progress_tokens = frontier;
+            PerfStatsCollector::addCounter(
+                "moe_overlay_transaction",
+                "follower_decode_progress_notifications",
+                static_cast<double>(delta),
+                "decode",
+                "expert_follower_rank",
+                {{"boundary", boundary},
+                 {"cumulative_tokens", std::to_string(frontier)},
+                 {"blocking", "false"},
+                 {"sideband", "existing_transaction_ticket"}});
+            return true;
         };
         while (true)
         {
@@ -2857,6 +2956,10 @@ namespace llaminar2
                         "ExpertOverlay follower received Complete before its aggregate prefill schedule terminal";
                     return result;
                 }
+                if (!publish_retired_decode_progress(ticket, "complete"))
+                    return result;
+                result.retired_decode_progress_tokens =
+                    last_retired_decode_progress_tokens;
                 result.ok = true;
                 return result;
             }
@@ -2875,6 +2978,18 @@ namespace llaminar2
                 result.error = admission.error.empty()
                                    ? "ExpertOverlay follower rejected a transaction ticket"
                                    : admission.error;
+                return result;
+            }
+
+            /*
+             * A strict frontier advance names graph work retired before this
+             * ticket. Wake maintenance before submitting the next graph so
+             * staging overlaps useful inference without touching the live
+             * placement epoch pinned by that graph sequence.
+             */
+            if (!publish_retired_decode_progress(ticket, "execute"))
+            {
+                discard_active_prefill();
                 return result;
             }
 

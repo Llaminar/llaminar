@@ -508,6 +508,68 @@ namespace llaminar2
         return config_;
     }
 
+    bool NamedDomainGlobalRunner::configureMTPRequestPolicy(
+        const MTPRequestPolicy &policy)
+    {
+        if (!inner_)
+        {
+            last_error_ =
+                "Cannot configure MTP request policy before the named-domain runner is initialized";
+            return false;
+        }
+        if (!inner_->configureMTPRequestPolicy(policy))
+        {
+            last_error_ = inner_->lastError();
+            return false;
+        }
+        return true;
+    }
+
+    MTPRequestPolicy NamedDomainGlobalRunner::mtpRequestPolicy() const
+    {
+        return inner_ ? inner_->mtpRequestPolicy()
+                      : makeMTPRequestPolicy(config_.mtp);
+    }
+
+    void NamedDomainGlobalRunner::runMPIWorkerLoop()
+    {
+        if (inner_)
+            inner_->runMPIWorkerLoop();
+    }
+
+    bool NamedDomainGlobalRunner::yieldMPIWorkersForRetainedRunner()
+    {
+        if (!inner_)
+        {
+            last_error_ =
+                "Cannot yield MPI workers before the named-domain runner is initialized";
+            return false;
+        }
+        if (!inner_->yieldMPIWorkersForRetainedRunner())
+        {
+            last_error_ = inner_->lastError();
+            return false;
+        }
+        return true;
+    }
+
+    void NamedDomainGlobalRunner::shutdownMPIWorkers()
+    {
+        if (inner_)
+            inner_->shutdownMPIWorkers();
+    }
+
+    void NamedDomainGlobalRunner::setMPICoordinatedMode(bool enabled)
+    {
+        if (inner_)
+            inner_->setMPICoordinatedMode(enabled);
+    }
+
+    int NamedDomainGlobalRunner::coordinatedRootRank() const
+    {
+        return inner_ ? inner_->coordinatedRootRank() : 0;
+    }
+
     bool NamedDomainGlobalRunner::isInitialized() const
     {
         return initialized_;

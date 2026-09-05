@@ -239,6 +239,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief Return whether TP participants bind a complete MTP predictor block.
+         * @return True only when a retained MTP graph family explicitly owns
+         *         replicated dense/shared sidecar weights.
+         *
+         * This predicate requires a resolved multi-participant TP assignment;
+         * `dense_tp_enabled` alone is only a capability bit during early graph
+         * construction. It does not cover routed experts. Their residency and
+         * sparse execution remain authoritative in the ExpertOverlay plan even
+         * when the compact predictor block is replicated.
+         */
+        [[nodiscard]] bool mtpUsesReplicatedDenseSidecarBinding() const noexcept
+        {
+            const int participant_count =
+                tp_config ? tp_config->worldSize() : 1;
+            return resolveMTPShiftedKVHeadLayout(
+                       mtp,
+                       dense_tp_enabled,
+                       participant_count) ==
+                   MTPShiftedKVHeadLayout::FullModelPerParticipant;
+        }
+
+        /**
          * @brief Return whether each participant writes a vocabulary shard.
          * @return True only for an explicitly vocabulary-sharded MTP head on a
          *         column-parallel primary LM-head topology.

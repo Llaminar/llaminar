@@ -32,6 +32,7 @@ namespace llaminar2
 {
     class ITensorGemm;
     class ITensorFusedGateUpGemm;
+    class PhysicalMemoryAuthority;
     class TensorBase;
 
     /**
@@ -56,11 +57,44 @@ namespace llaminar2
         /// store was unbound or already bound to the same id; false on mismatch.
         bool bindModelIdIfUnset(ModelContextId model_id);
 
+        /**
+         * @brief Publish the model context's sole physical-memory authority.
+         *
+         * Graph builders and prepared expert services already share this
+         * model-owned store.  Carrying the admitted authority through that
+         * existing lifetime avoids introducing a process-global registry or a
+         * second graph-local accountant.  The store does not perform memory
+         * arithmetic; it preserves object identity across setup workers.
+         *
+         * @param authority Rank-bound authority selected before materialization.
+         * @throws std::invalid_argument for a null authority.
+         * @throws std::logic_error when a different authority is already bound.
+         */
+        void installPhysicalMemoryAuthority(
+            std::shared_ptr<PhysicalMemoryAuthority> authority);
+
+        /**
+         * @brief Return the model context's admitted allocation authority.
+         * @return Shared authority, or null before memory admission.
+         */
+        [[nodiscard]] std::shared_ptr<PhysicalMemoryAuthority>
+        physicalMemoryAuthority() const;
+
         // =========================================================================
         // GEMM Preparation & Resolution
         // =========================================================================
 
+        /**
+         * @brief Prepare a CPU GEMM binding under its admitted weight owner.
+         * @param binding Immutable materialized weight binding.
+         * @param memory_owner Exact persistent-weight BOM owner.
+         */
+        /** @brief Prepare an ordinary primary-model CPU GEMM binding. */
         PreparedWeightRef prepareGemm(const WeightBinding &binding);
+
+        PreparedWeightRef prepareGemm(
+            const WeightBinding &binding,
+            PhysicalMemoryOwner memory_owner);
         PreparedWeightRef registerPreparedForTest(
             const WeightBinding &binding,
             PreparedWeightKind kind,
@@ -164,6 +198,21 @@ namespace llaminar2
             int d_model,
             size_t vocab_offset = 0,
             size_t total_vocab = 0);
+
+        /**
+         * @brief Prepare an embedding against an explicit persistent owner.
+         * @param binding Immutable embedding binding.
+         * @param d_model Logical embedding width.
+         * @param vocab_offset First row in the global vocabulary.
+         * @param total_vocab Global vocabulary size.
+         * @param memory_owner Exact admitted persistent-weight owner.
+         */
+        PreparedWeightRef prepareEmbedding(
+            const WeightBinding &binding,
+            int d_model,
+            size_t vocab_offset,
+            size_t total_vocab,
+            PhysicalMemoryOwner memory_owner);
 
         /// Register an already-prepared embedding handle from the pipeline.
         PreparedWeightRef registerPreparedEmbeddingFromPipeline(
@@ -382,6 +431,8 @@ namespace llaminar2
 
         ModelContextId model_id_;
         mutable std::mutex mutex_;
+        /** Sole admitted authority carried to graph-owned allocation sites. */
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_;
         std::unordered_map<PreparedBindingKey, Entry, PreparedBindingKeyHash> entries_;
         mutable std::unordered_map<FusedCacheKey, std::unique_ptr<ITensorFusedGateUpGemm>, FusedCacheHash> fused_cache_;
 

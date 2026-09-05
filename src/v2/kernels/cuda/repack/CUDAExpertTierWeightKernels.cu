@@ -226,6 +226,48 @@ namespace llaminar2
         }
 
         /**
+         * @brief Build the canonical Q16 multiplier for an IQ2 grid half.
+         * @param factor Published source scale for this sixteen-value half.
+         * @param inverse_scale Reciprocal of the destination Q8 scale.
+         * @return Positive Q16 multiplier rounded before integer application.
+         *
+         * CPU AVX-512 preparation intentionally rounds only this multiplier;
+         * the later integer multiply is truncated. Keeping those two edges
+         * separate prevents GPU demotion from silently reverting to FP32
+         * round-to-nearest and changing migrated weights by one byte.
+         */
+        __device__ __forceinline__ std::int32_t tierIQ2Q16RatioCUDA(
+            float factor,
+            float inverse_scale)
+        {
+            const float scaled = __fmul_rn(
+                __fmul_rn(factor, inverse_scale), 65536.0f);
+            return static_cast<std::int32_t>(__fadd_rn(scaled, 0.5f));
+        }
+
+        /**
+         * @brief Apply one canonical Q16 IQ2 transcode while retaining sign.
+         * @param signed_grid_value Signed integer decoded from an IQ2 grid.
+         * @param ratio Positive Q16 multiplier for the value's source half.
+         * @return Signed Q8 payload byte in an integer container.
+         *
+         * The unsigned shift exactly mirrors AVX-512 `mullo` followed by
+         * `srli`; sign application deliberately happens after truncation.
+         */
+        __device__ __forceinline__ int applyTierIQ2Q16RatioCUDA(
+            int signed_grid_value,
+            std::int32_t ratio)
+        {
+            const std::uint32_t magnitude = static_cast<std::uint32_t>(
+                signed_grid_value < 0 ? -signed_grid_value : signed_grid_value);
+            const std::uint32_t prepared =
+                (magnitude * static_cast<std::uint32_t>(ratio)) >> 16;
+            return signed_grid_value < 0
+                       ? -static_cast<int>(prepared)
+                       : static_cast<int>(prepared);
+        }
+
+        /**
          * @brief Transcode one non-reversible source codebook into final CPU
          * expanded-INT8 unit bytes.
          * @tparam Codebook One of 6, 7, 9-17, raw-INT8 19, or normalized
@@ -357,10 +399,77 @@ namespace llaminar2
                     }
                 }
             }
+            else if constexpr (Codebook == 13 || Codebook == 15)
+            {
+                // IQ2_S and IQ2_XXS use the CPU AVX-512 Q16 transcode
+                // contract. Find the integer grid maxima first, round one Q16
+                // ratio per half, then truncate each integer product before
+                // applying its sign. This remains one thread per output column
+                // and adds no synchronization or staging traffic.
+                int maximum_grid_low = 0;
+                int maximum_grid_high = 0;
+                for (int value = 0; value < 32; ++value)
+                {
+                    const int signed_grid =
+                        decodedGroupValue(decoded_groups, value);
+                    const int magnitude =
+                        signed_grid < 0 ? -signed_grid : signed_grid;
+                    if (value < 16)
+                        maximum_grid_low =
+                            magnitude > maximum_grid_low
+                                ? magnitude
+                                : maximum_grid_low;
+                    else
+                        maximum_grid_high =
+                            magnitude > maximum_grid_high
+                                ? magnitude
+                                : maximum_grid_high;
+                }
+
+                const float factor_low = primary;
+                const float factor_high =
+                    Codebook == 13 ? secondary : primary;
+                const float maximum_low = __fmul_rn(
+                    factor_low, static_cast<float>(maximum_grid_low));
+                const float maximum_high = __fmul_rn(
+                    factor_high, static_cast<float>(maximum_grid_high));
+                const float maximum_absolute =
+                    fmaxf(maximum_low, maximum_high);
+                output_minimum = 0.0f;
+                if (maximum_absolute < 1.0e-6f)
+                {
+                    output_scale = 0.0f;
+                    for (int value = 0; value < 32; ++value)
+                    {
+                        unit[interleavedValueOffset(
+                            local_column, value)] = 0u;
+                    }
+                }
+                else
+                {
+                    output_scale = fminf(
+                        __fdiv_rn(maximum_absolute, 127.0f),
+                        65504.0f);
+                    const float inverse_scale =
+                        __fdiv_rn(1.0f, output_scale);
+                    const std::int32_t ratio_low =
+                        tierIQ2Q16RatioCUDA(factor_low, inverse_scale);
+                    const std::int32_t ratio_high =
+                        tierIQ2Q16RatioCUDA(factor_high, inverse_scale);
+                    for (int value = 0; value < 32; ++value)
+                    {
+                        const int quantized = applyTierIQ2Q16RatioCUDA(
+                            decodedGroupValue(decoded_groups, value),
+                            value < 16 ? ratio_low : ratio_high);
+                        unit[interleavedValueOffset(local_column, value)] =
+                            static_cast<std::uint8_t>(
+                                static_cast<std::int8_t>(quantized));
+                    }
+                }
+            }
             else if constexpr (
-                Codebook == 11 || Codebook == 12 || Codebook == 13 ||
-                Codebook == 14 || Codebook == 15 || Codebook == 16 ||
-                Codebook == 17)
+                Codebook == 11 || Codebook == 12 || Codebook == 14 ||
+                Codebook == 16 || Codebook == 17)
             {
                 // IQ formats are normalized exactly as Q8_0: choose one
                 // block-wide absmax scale, then round each represented value.

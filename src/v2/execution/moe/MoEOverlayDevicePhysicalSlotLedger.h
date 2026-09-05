@@ -74,6 +74,40 @@ namespace llaminar2
     };
 
     /**
+     * @brief One immutable entry in a quiescent device-owned physical epoch.
+     *
+     * Shared prepared-engine ownership makes this snapshot cheap: copying an
+     * entry retains three engine lifetimes but never copies weight bytes.  The
+     * terminal model-context sealer uses these entries instead of consulting a
+     * deliberately stale host participant-bank mirror.
+     */
+    struct MoEOverlayDeviceActivePhysicalSlot
+    {
+        MoEOverlayDevicePhysicalSlotKey key;
+        std::uint64_t entered_epoch = 0u;
+        bool bootstrap_allocation = false;
+        MoEOverlayPreparedExpertTriplet triplet;
+
+        /** @return Whether identity, birth epoch, and engine triplet are complete. */
+        [[nodiscard]] bool valid() const noexcept;
+    };
+
+    /**
+     * @brief Complete process-local physical inventory at one durable epoch.
+     *
+     * This value contains allocation lifetimes only. It cannot express an
+     * owner policy, histogram, runtime selector, or candidate transaction.
+     */
+    struct MoEOverlayDevicePhysicalInventorySnapshot
+    {
+        std::uint64_t epoch = 0u;
+        std::vector<MoEOverlayDeviceActivePhysicalSlot> slots;
+
+        /** @return Whether the epoch is positive and every retained slot is valid. */
+        [[nodiscard]] bool valid() const noexcept;
+    };
+
+    /**
      * @brief Thread-safe physical lifetime follower for device-owned Dynamic RCU.
      *
      * Lifecycle is strictly `begin -> stage -> publish -> retire`, or
@@ -178,6 +212,23 @@ namespace llaminar2
         [[nodiscard]] bool abort(
             const MoEOverlayDevicePhysicalMovementBatch &batch,
             std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Retain an immutable copy of the current quiescent inventory.
+         * @param epoch Exact durable epoch certified by the device controller.
+         * @param error Optional exact lifecycle or inventory diagnostic.
+         * @return Complete process-local snapshot, or no value on rejection.
+         *
+         * A snapshot is legal only after the transaction pipeline has drained:
+         * the requested epoch must equal the ledger's current epoch and no
+         * begun/staged/published wave may remain. Copying shared triplets does
+         * not copy, download, synchronize, or repack their weight bytes.
+         */
+        [[nodiscard]] std::optional<
+            MoEOverlayDevicePhysicalInventorySnapshot>
+        snapshot(
+            std::uint64_t epoch,
+            std::string *error = nullptr) const noexcept;
 
         /** @return Durable physical epoch currently represented by active slots. */
         [[nodiscard]] std::uint64_t currentEpoch() const noexcept;

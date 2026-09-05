@@ -15,6 +15,7 @@
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
 #include "execution/prefix_cache/PrefixCacheStateProbe.h"
 
+#include <optional>
 #include <string>
 
 namespace llaminar2
@@ -94,6 +95,24 @@ namespace llaminar2
             double maximum_abs = 0.0;
         };
 
+        /**
+         * @brief Aggregate proof for numerically compared GDN live state.
+         *
+         * Exact hashes remain the default.  This evidence is populated only
+         * when a typed comparison policy requires every retained recurrence
+         * and short-convolution value to be materialized and compared.
+         */
+        struct GDNStateNumericalEvidence
+        {
+            bool compared = false;
+            bool passed = false;
+            size_t payloads = 0;
+            size_t elements = 0;
+            double minimum_cosine = 1.0;
+            double maximum_relative_l2 = 0.0;
+            double maximum_abs = 0.0;
+        };
+
         /// Evidence for the persistent final hidden row.
         TerminalPayloadNumericalEvidence terminal_hidden_numerical;
 
@@ -102,6 +121,9 @@ namespace llaminar2
 
         /// Evidence for placement-aware main-KV suffix recomputation.
         MainKVNumericalEvidence main_kv_numerical;
+
+        /// Evidence for placement-aware or explicitly numerical GDN state.
+        GDNStateNumericalEvidence gdn_numerical;
 
         explicit operator bool() const { return ok; }
 
@@ -141,6 +163,33 @@ namespace llaminar2
     };
 
     /**
+     * @brief Legal comparison contracts for persistent GDN live state.
+     */
+    enum class MTPGDNStateComparisonPolicy
+    {
+        /** Compare geometry only; used by continuation-based diagnostics. */
+        LogicalMetadataOnly,
+
+        /** Require identical recurrence and short-convolution bytes. */
+        ExactBytes,
+
+        /**
+         * Compare every retained FP32 value against the configured numerical
+         * thresholds regardless of hash identity.  This is intended for
+         * focused serial/grouped publication diagnostics.
+         */
+        NumericalValues,
+
+        /**
+         * Require exact bytes while placement is unchanged.  After the
+         * snapshots prove a movement-epoch transition, compare every live GDN
+         * value numerically because the recomputed suffix can inherit a
+         * backend- or participant-order rounding difference from MoE.
+         */
+        ExactUnlessMoEPlacementChanged,
+    };
+
+    /**
      * @brief Default full-row cosine floor after a cross-device expert move.
      *
      * Callers may require a stricter model-specific threshold, but a
@@ -153,6 +202,14 @@ namespace llaminar2
     /** Strict default cosine floor for a recomputed KV suffix row. */
     inline constexpr double
         kDefaultPlacementAwareMainKVSuffixMinimumCosine = 0.99;
+
+    /** Cosine floor for a complete GDN bank after placement changed. */
+    inline constexpr double
+        kDefaultPlacementAwareGDNMinimumCosine = 0.99;
+
+    /** Scale-aware error ceiling for a complete placement-aware GDN bank. */
+    inline constexpr double
+        kDefaultPlacementAwareGDNMaximumRelativeL2 = 0.05;
 
     /**
      * @brief Options for comparing two authenticated runtime-state snapshots.
@@ -191,8 +248,8 @@ namespace llaminar2
             kDefaultPlacementAwareMainKVSuffixMinimumCosine;
 
         bool compare_shifted_mtp_kv = true;
-        bool compare_gdn_hashes = true;
-        bool compare_gdn_values_if_available = false;
+        MTPGDNStateComparisonPolicy gdn_state_policy =
+            MTPGDNStateComparisonPolicy::ExactBytes;
         MTPTerminalPayloadComparisonPolicy terminal_hidden_policy =
             MTPTerminalPayloadComparisonPolicy::ExactBytes;
         /** Minimum full-row cosine after a proven MoE placement change. */
@@ -203,8 +260,10 @@ namespace llaminar2
         /** Minimum full-logits-row cosine after a proven placement change. */
         double terminal_logits_min_cosine =
             kDefaultPlacementAwareTerminalPayloadMinimumCosine;
-        double gdn_relative_l2_tolerance = 1e-4;
-        double gdn_max_abs_tolerance = 1e-4;
+        /** Optional scale-aware bound; nullopt records but does not gate it. */
+        std::optional<double> gdn_relative_l2_tolerance = 1e-4;
+        /** Optional scale-dependent bound; nullopt records but does not gate it. */
+        std::optional<double> gdn_max_abs_tolerance = 1e-4;
         double gdn_min_cosine = 0.999999;
     };
 

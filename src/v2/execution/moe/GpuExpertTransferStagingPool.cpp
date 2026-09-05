@@ -27,14 +27,63 @@ namespace llaminar2
         DeviceId device,
         int device_ordinal,
         int capacity,
+        std::vector<ProjectionSpec> specs,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
+    {
+        return createImpl(
+            backend,
+            device,
+            device_ordinal,
+            capacity,
+            std::move(specs),
+            std::move(memory_authority),
+            /*explicit_test_allocation=*/false);
+    }
+
+    std::shared_ptr<GpuExpertTransferStagingPool>
+    GpuExpertTransferStagingPool::createForTest(
+        IBackend *backend,
+        DeviceId device,
+        int device_ordinal,
+        int capacity,
         std::vector<ProjectionSpec> specs)
+    {
+        return createImpl(
+            backend,
+            device,
+            device_ordinal,
+            capacity,
+            std::move(specs),
+            nullptr,
+            /*explicit_test_allocation=*/true);
+    }
+
+    std::shared_ptr<GpuExpertTransferStagingPool>
+    GpuExpertTransferStagingPool::createImpl(
+        IBackend *backend,
+        DeviceId device,
+        int device_ordinal,
+        int capacity,
+        std::vector<ProjectionSpec> specs,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+        bool explicit_test_allocation)
     {
         if (capacity <= 0)
             throw std::invalid_argument("GpuExpertTransferStagingPool capacity must be positive");
         if (specs.empty())
             throw std::invalid_argument("GpuExpertTransferStagingPool requires at least one projection spec");
+        if (!explicit_test_allocation && !memory_authority)
+            throw std::invalid_argument(
+                "GpuExpertTransferStagingPool production allocation requires a physical-memory authority");
 
-        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        auto orchestrator = explicit_test_allocation
+                                ? std::make_shared<LoadOrchestrator>(
+                                      backend,
+                                      kTestOnlyUnadmittedGPUAllocation)
+                                : std::make_shared<LoadOrchestrator>(
+                                      backend,
+                                      std::move(memory_authority),
+                                      PhysicalMemoryOwner::ExpertMigrationStaging);
         orchestrator->addDevice(device_ordinal);
 
         for (int slot = 0; slot < capacity; ++slot)

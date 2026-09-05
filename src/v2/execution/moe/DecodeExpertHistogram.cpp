@@ -17,6 +17,21 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Ordering for the cross-atomic RCU bank handoff handshake.
+         *
+         * Bank acquisition publishes a reader count and then validates the
+         * active epoch. Rotation publishes the next epoch and then observes
+         * the old reader count. Those operations touch two different atomics,
+         * so acquire/release ordering alone permits the store-buffering
+         * outcome in which both sides observe the old value: a writer may
+         * accept the old bank while rotation incorrectly observes it drained.
+         * One sequentially consistent order makes those observations mutually
+         * exclusive without adding a lock, allocation, or inference wait.
+         */
+        inline constexpr std::memory_order kHistogramBankHandoffOrder =
+            std::memory_order_seq_cst;
+
         /** @brief Map production sources, with SyntheticTest ingesting as decode. */
         std::size_t ingestionSourceIndex(ExpertHistogramSource source)
         {
@@ -58,6 +73,65 @@ namespace llaminar2
                    static_cast<std::size_t>(expert_id);
         }
     } // namespace
+
+    ExpertHistogramProductionTopology
+    ExpertHistogramProductionTopology::forRetainedExecution(
+        int retained_layer_count,
+        int main_inference_layer_count,
+        ExpertHistogramServingRegime regime)
+    {
+        if (retained_layer_count <= 0 ||
+            main_inference_layer_count <= 0 ||
+            main_inference_layer_count > retained_layer_count)
+        {
+            throw std::invalid_argument(
+                "Expert histogram production topology requires a valid main/retained layer boundary");
+        }
+
+        const bool mtp_enabled =
+            regime != ExpertHistogramServingRegime::Serial;
+        const bool serial_decode_is_recurring =
+            regime != ExpertHistogramServingRegime::PositiveDepthMTP;
+
+        std::vector<ExpertHistogramProductionSourceMask> layers(
+            static_cast<std::size_t>(retained_layer_count));
+        std::vector<ExpertHistogramProductionSourceMask> economy_layers(
+            static_cast<std::size_t>(retained_layer_count));
+        for (int layer = 0;
+             layer < main_inference_layer_count;
+             ++layer)
+        {
+            /* MTP never removes the serial graph family: it is required for
+             * terminal catch-up and short remaining-output tails. */
+            layers[static_cast<std::size_t>(layer)] = {
+                true,
+                true,
+                mtp_enabled,
+            };
+            economy_layers[static_cast<std::size_t>(layer)] = {
+                serial_decode_is_recurring,
+                true,
+                mtp_enabled,
+            };
+        }
+        for (int layer = main_inference_layer_count;
+             layer < retained_layer_count;
+             ++layer)
+        {
+            layers[static_cast<std::size_t>(layer)] = {
+                false,
+                false,
+                mtp_enabled,
+            };
+            economy_layers[static_cast<std::size_t>(layer)] = {
+                false,
+                false,
+                mtp_enabled,
+            };
+        }
+        return ExpertHistogramProductionTopology(
+            std::move(layers), std::move(economy_layers));
+    }
 
     bool DecodeExpertHistogramWindow::valid() const noexcept
     {
@@ -346,7 +420,7 @@ namespace llaminar2
         if (!bank_)
             return;
         const uint64_t previous =
-            bank_->active_users.fetch_sub(1, std::memory_order_acq_rel);
+            bank_->active_users.fetch_sub(1, kHistogramBankHandoffOrder);
         if (previous == 0)
             std::terminate();
         bank_ = nullptr;
@@ -358,15 +432,15 @@ namespace llaminar2
         for (;;)
         {
             const uint64_t epoch =
-                active_bank_epoch_.load(std::memory_order_acquire);
+                active_bank_epoch_.load(kHistogramBankHandoffOrder);
             const uint32_t index = static_cast<uint32_t>(epoch & 1u);
             HistogramBank *bank = banks_[index].get();
-            bank->active_users.fetch_add(1, std::memory_order_acq_rel);
-            if (active_bank_epoch_.load(std::memory_order_acquire) == epoch)
+            bank->active_users.fetch_add(1, kHistogramBankHandoffOrder);
+            if (active_bank_epoch_.load(kHistogramBankHandoffOrder) == epoch)
                 return BankLease(bank);
 
             const uint64_t previous =
-                bank->active_users.fetch_sub(1, std::memory_order_acq_rel);
+                bank->active_users.fetch_sub(1, kHistogramBankHandoffOrder);
             if (previous == 0)
                 std::terminate();
         }
@@ -542,7 +616,8 @@ namespace llaminar2
 
     ExpertHistogramMergeResult DecodeExpertHistogram::mergeRoutedExpertRows(
         const int *expert_indices,
-        const RoutedExpertHistogramMerge &merge)
+        const RoutedExpertHistogramMerge &merge,
+        std::span<uint64_t> expert_count_scratch)
     {
         ExpertHistogramMergeResult result;
 
@@ -583,8 +658,103 @@ namespace llaminar2
             result.error = "route_stride must be at least top_k";
             return result;
         }
+        if (expert_count_scratch.size() <
+            static_cast<std::size_t>(config_.num_experts))
+        {
+            result.error = "expert_count_scratch does not cover num_experts";
+            return result;
+        }
 
-        std::vector<uint64_t> counts(static_cast<size_t>(config_.num_experts), 0);
+        const auto real_rows = static_cast<std::size_t>(
+            merge.real_token_count);
+        const auto top_k = static_cast<std::size_t>(merge.top_k);
+        if (real_rows != 0u &&
+            top_k > std::numeric_limits<std::size_t>::max() / real_rows)
+        {
+            result.error = "real routed prefix geometry overflows size_t";
+            return result;
+        }
+        const std::size_t route_count = real_rows * top_k;
+
+        /*
+         * Validate the complete prefix before acquiring the mutable bank. A
+         * malformed late route must never leave a partial histogram update.
+         * Small decode and MTP prefixes are then cheaper as direct relaxed
+         * increments than as a 256-counter clear plus dense scan. Integer
+         * addition remains exact even when one expert occurs more than once.
+         */
+        if (route_count <= static_cast<std::size_t>(config_.num_experts))
+        {
+            for (int token = 0; token < merge.real_token_count; ++token)
+            {
+                const int *row = expert_indices +
+                    static_cast<std::size_t>(token) *
+                        static_cast<std::size_t>(route_stride);
+                for (int slot = 0; slot < merge.top_k; ++slot)
+                {
+                    const int expert_id = row[slot];
+                    if (expert_id < 0 || expert_id >= config_.num_experts)
+                    {
+                        result.error = "expert id is out of range";
+                        return result;
+                    }
+                }
+            }
+
+            auto bank_lease = acquireAdmittedBank();
+            if (!bank_lease)
+            {
+                result.activations_merged = route_count;
+                result.ok = true;
+                return result;
+            }
+            auto &bank = bank_lease.mutableBank();
+            auto &layer = bank.layers[
+                static_cast<std::size_t>(merge.layer_idx)];
+            const std::size_t source_index =
+                ingestionSourceIndex(merge.source);
+            for (int token = 0; token < merge.real_token_count; ++token)
+            {
+                const int *row = expert_indices +
+                    static_cast<std::size_t>(token) *
+                        static_cast<std::size_t>(route_stride);
+                for (int slot = 0; slot < merge.top_k; ++slot)
+                {
+                    const auto expert = static_cast<std::size_t>(row[slot]);
+                    layer.expert_counts[expert].fetch_add(
+                        1u, std::memory_order_relaxed);
+                    layer.source_expert_counts[source_index][expert]
+                        .fetch_add(1u, std::memory_order_relaxed);
+                }
+            }
+
+            if (merge.count_window_tokens &&
+                isTokenBoundaryLayer(merge.layer_idx) &&
+                merge.real_token_count > 0)
+            {
+                const auto token_count = static_cast<std::uint64_t>(
+                    merge.real_token_count);
+                bank.token_count.fetch_add(
+                    token_count, std::memory_order_relaxed);
+                bank.source_token_counts[source_index].fetch_add(
+                    token_count, std::memory_order_relaxed);
+                result.tokens_counted = token_count;
+            }
+            result.activations_merged = route_count;
+            result.ok = true;
+            return result;
+        }
+
+        /*
+         * This storage belongs to the calling stage and was materialized while
+         * the graph was built. Clearing a compact 256-counter Qwen table is
+         * deterministic bounded work; allocating it for every layer/token was
+         * both unnecessary and a measurable Dynamic-mode host tax.
+         */
+        std::fill_n(
+            expert_count_scratch.begin(),
+            config_.num_experts,
+            uint64_t{0});
         uint64_t candidate_activations = 0;
         for (int token = 0; token < merge.real_token_count; ++token)
         {
@@ -597,7 +767,7 @@ namespace llaminar2
                     result.error = "expert id is out of range";
                     return result;
                 }
-                counts[static_cast<size_t>(expert_id)] += 1;
+                expert_count_scratch[static_cast<size_t>(expert_id)] += 1;
                 candidate_activations += 1;
             }
         }
@@ -613,7 +783,8 @@ namespace llaminar2
         const std::size_t source_index = ingestionSourceIndex(merge.source);
         for (int expert_id = 0; expert_id < config_.num_experts; ++expert_id)
         {
-            const uint64_t delta = counts[static_cast<size_t>(expert_id)];
+            const uint64_t delta =
+                expert_count_scratch[static_cast<size_t>(expert_id)];
             if (delta != 0)
             {
                 layer.expert_counts[static_cast<size_t>(expert_id)].fetch_add(
@@ -1113,7 +1284,7 @@ namespace llaminar2
         std::lock_guard<std::mutex> rotation_lock(rotation_mutex_);
 
         const uint64_t frozen_epoch =
-            active_bank_epoch_.load(std::memory_order_acquire);
+            active_bank_epoch_.load(kHistogramBankHandoffOrder);
         const uint32_t frozen_index =
             static_cast<uint32_t>(frozen_epoch & 1u);
         const uint32_t next_index = frozen_index == 0 ? 1u : 0u;
@@ -1126,7 +1297,7 @@ namespace llaminar2
          * access, but maintenance waits for that atomic pin before recycling
          * the bank. Live inference continues on `frozen` during this wait.
          */
-        while (next.active_users.load(std::memory_order_acquire) != 0)
+        while (next.active_users.load(kHistogramBankHandoffOrder) != 0)
             std::this_thread::yield();
         next.reset();
         next.generation = frozen.generation + 1;
@@ -1136,8 +1307,10 @@ namespace llaminar2
          * bank. Writers that already passed their acquire/recheck finish in the
          * old generation; they never wait for this maintenance operation.
          */
-        active_bank_epoch_.store(frozen_epoch + 1u, std::memory_order_release);
-        while (frozen.active_users.load(std::memory_order_acquire) != 0)
+        active_bank_epoch_.store(
+            frozen_epoch + 1u,
+            kHistogramBankHandoffOrder);
+        while (frozen.active_users.load(kHistogramBankHandoffOrder) != 0)
             std::this_thread::yield();
 
         DecodeExpertHistogramWindow window;

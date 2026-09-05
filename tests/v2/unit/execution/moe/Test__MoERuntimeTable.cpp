@@ -159,6 +159,68 @@ namespace llaminar2::test
         EXPECT_EQ(layer0->participant_count, 1u);
     }
 
+    /**
+     * @brief Route evidence must bind the execution producer for its workload.
+     *
+     * Serial decode and grouped prefill deliberately use different stable
+     * device publications. This regression prevents graph lowering from
+     * pairing a current decode participant assignment with stale grouped
+     * weights, which previously produced contradictory ExpertOverlay evidence.
+     */
+    TEST(Test__MoERuntimeTable,
+         RouteWeightBindingRejectsCrossWorkloadGeometry)
+    {
+        DeviceMoELayerRuntime device_layer{};
+        DeviceMoELayerRuntime host_recipe{};
+        float grouped_route_weights[8] = {};
+        host_recipe.top_k = 2u;
+        host_recipe.route_weights = grouped_route_weights;
+        host_recipe.prefill_route_capacity = 8u;
+
+        const auto decode = bindMoERuntimeRouteWeights(
+            &device_layer,
+            host_recipe,
+            MoERuntimeRouteWeightProjection::DecodeTopK);
+        EXPECT_EQ(decode.weights, device_layer.topk_weights);
+        EXPECT_EQ(decode.capacity, 2u);
+        EXPECT_EQ(
+            decode.projection,
+            MoERuntimeRouteWeightProjection::DecodeTopK);
+        EXPECT_TRUE(decode.validFor(/*physical_rows=*/1u, /*top_k=*/2u));
+        EXPECT_FALSE(decode.validFor(/*physical_rows=*/2u, /*top_k=*/2u))
+            << "embedded decode top-k cannot masquerade as grouped rows";
+        EXPECT_FALSE(decode.validFor(/*physical_rows=*/1u, /*top_k=*/3u));
+
+        const auto grouped = bindMoERuntimeRouteWeights(
+            &device_layer,
+            host_recipe,
+            MoERuntimeRouteWeightProjection::GroupedRouteSlots);
+        EXPECT_EQ(grouped.weights, grouped_route_weights);
+        EXPECT_EQ(grouped.capacity, 8u);
+        EXPECT_EQ(
+            grouped.projection,
+            MoERuntimeRouteWeightProjection::GroupedRouteSlots);
+        EXPECT_TRUE(grouped.validFor(/*physical_rows=*/4u, /*top_k=*/2u));
+        EXPECT_FALSE(grouped.validFor(/*physical_rows=*/5u, /*top_k=*/2u));
+
+        const auto missing_decode_runtime = bindMoERuntimeRouteWeights(
+            nullptr,
+            host_recipe,
+            MoERuntimeRouteWeightProjection::DecodeTopK);
+        EXPECT_EQ(missing_decode_runtime.weights, nullptr);
+        EXPECT_FALSE(missing_decode_runtime.validFor(1u, 2u));
+
+        const auto unspecified = bindMoERuntimeRouteWeights(
+            &device_layer,
+            host_recipe,
+            MoERuntimeRouteWeightProjection::Unspecified);
+        EXPECT_EQ(unspecified.weights, nullptr);
+        EXPECT_EQ(
+            unspecified.projection,
+            MoERuntimeRouteWeightProjection::Unspecified);
+        EXPECT_FALSE(unspecified.validFor(1u, 2u));
+    }
+
     TEST(Test__MoERuntimeTable,
          CompleteInitialRuntimeRequiresDormantRetainedLayers)
     {
@@ -3125,6 +3187,18 @@ namespace llaminar2::test
         EXPECT_THROW({ MoERuntimeTable table(prefill_without_mirror); }, std::runtime_error);
         prefill_without_mirror.prefill_token_capacity = -1;
         EXPECT_THROW({ MoERuntimeTable table(prefill_without_mirror); }, std::invalid_argument);
+
+        DeviceMoERuntimeTable::Config accepted_rows_without_mirror;
+        accepted_rows_without_mirror.device_id = DeviceId::cpu();
+        accepted_rows_without_mirror.num_layers = 1;
+        accepted_rows_without_mirror.num_experts = 4;
+        accepted_rows_without_mirror.top_k = 2;
+        accepted_rows_without_mirror.grouped_verifier_histogram_publication =
+            GroupedVerifierHistogramPublicationMode::AcceptedRows;
+        EXPECT_THROW(
+            { MoERuntimeTable table(accepted_rows_without_mirror); },
+            std::invalid_argument)
+            << "Accepted verifier history must have one exact GPU stream authority";
     }
 
 #ifdef HAVE_ROCM

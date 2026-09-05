@@ -152,7 +152,8 @@ namespace llaminar2::test
                         descriptor.physical_rows_per_request,
                         descriptor.draft_depth,
                         descriptor.sidecar_depth,
-                        descriptor.prefill_schedule_workload);
+                        descriptor.prefill_schedule_workload,
+                        descriptor.retired_decode_progress_tokens);
                 }
                 catch (const std::exception &exception)
                 {
@@ -179,6 +180,7 @@ namespace llaminar2::test
 
             bool complete(
                 std::uint64_t placement_epoch,
+                std::uint64_t retired_decode_progress_tokens,
                 std::string *error) override
             {
                 if (error)
@@ -186,6 +188,8 @@ namespace llaminar2::test
                 if (!active_ || placement_epoch == 0)
                     return false;
                 active_ = false;
+                completed_retired_decode_progress_tokens_ =
+                    retired_decode_progress_tokens;
                 ++complete_count_;
                 return true;
             }
@@ -214,6 +218,11 @@ namespace llaminar2::test
             std::size_t retireCount() const noexcept { return retire_count_; }
             std::size_t completeCount() const noexcept { return complete_count_; }
             std::size_t abortCount() const noexcept { return abort_count_; }
+            std::uint64_t completedRetiredDecodeProgressTokens()
+                const noexcept
+            {
+                return completed_retired_decode_progress_tokens_;
+            }
             const std::vector<MoEOverlayInferenceTransactionTicket> &tickets()
                 const noexcept
             {
@@ -229,6 +238,7 @@ namespace llaminar2::test
             std::size_t retire_count_ = 0;
             std::size_t complete_count_ = 0;
             std::size_t abort_count_ = 0;
+            std::uint64_t completed_retired_decode_progress_tokens_ = 0u;
             std::vector<MoEOverlayInferenceTransactionTicket> tickets_;
         };
 
@@ -1632,6 +1642,8 @@ namespace llaminar2::test
          HostedSequenceTransitionIsIdempotentAcrossSymmetricParticipants)
     {
         auto publisher = std::make_shared<RecordingPublisher>(1);
+        std::uint64_t retired_decode_tokens = 0u;
+        std::uint64_t retired_decode_notifications = 0u;
         auto coordinator =
             std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
                 MoEOverlayInferenceTransactionCoordinator::Config{
@@ -1647,6 +1659,16 @@ namespace llaminar2::test
                     },
                     .max_transactions_per_command = 4,
                     .max_mtp_draft_depth = 3,
+                    .retired_decode_progress_sink =
+                        [&retired_decode_tokens,
+                         &retired_decode_notifications](
+                            std::uint64_t completed_tokens,
+                            std::string *)
+                    {
+                        retired_decode_tokens += completed_tokens;
+                        ++retired_decode_notifications;
+                        return true;
+                    },
                 });
         ASSERT_TRUE(coordinator->beginCommand(command()));
 
@@ -1695,27 +1717,49 @@ namespace llaminar2::test
             std::launch::async,
             [&]
             {
-                return coordinator->advanceHostedGraphSequence(1, 2);
+                return coordinator->advanceHostedGraphSequence(
+                    1, 2, /*committed_output_tokens=*/3);
             });
         auto sibling_advance = std::async(
             std::launch::async,
             [&]
             {
-                return coordinator->advanceHostedGraphSequence(1, 2);
+                return coordinator->advanceHostedGraphSequence(
+                    1, 2, /*committed_output_tokens=*/3);
             });
         EXPECT_TRUE(first_advance.get());
         EXPECT_TRUE(sibling_advance.get());
         EXPECT_EQ(coordinator->activeMTPDraftDepth(), 2);
         EXPECT_EQ(publisher->publishCount(), publisher->retireCount());
+        EXPECT_EQ(retired_decode_tokens, 3u);
+        EXPECT_EQ(retired_decode_notifications, 1u);
 
         execute_active_sequence(2);
-        EXPECT_TRUE(coordinator->advanceHostedGraphSequence(2, std::nullopt));
-        EXPECT_TRUE(coordinator->advanceHostedGraphSequence(2, std::nullopt));
+        EXPECT_TRUE(coordinator->advanceHostedGraphSequence(
+            2, std::nullopt, /*committed_output_tokens=*/5));
+        EXPECT_TRUE(coordinator->advanceHostedGraphSequence(
+            2, std::nullopt, /*committed_output_tokens=*/5));
         EXPECT_EQ(coordinator->activeMTPDraftDepth(), -1);
+        EXPECT_EQ(retired_decode_tokens, 5u);
+        EXPECT_EQ(retired_decode_notifications, 2u);
         EXPECT_EQ(publisher->publishCount(), 5u);
         EXPECT_EQ(publisher->retireCount(), 5u);
+        ASSERT_EQ(publisher->tickets().size(), 5u);
+        EXPECT_EQ(
+            publisher->tickets()[0].retired_decode_progress_tokens, 0u);
+        EXPECT_EQ(
+            publisher->tickets()[1].retired_decode_progress_tokens, 0u);
+        for (std::size_t index = 2u; index < 5u; ++index)
+        {
+            EXPECT_EQ(
+                publisher->tickets()[index]
+                    .retired_decode_progress_tokens,
+                3u);
+        }
         ASSERT_TRUE(coordinator->completeCommand(41));
         EXPECT_EQ(publisher->completeCount(), 1u);
+        EXPECT_EQ(
+            publisher->completedRetiredDecodeProgressTokens(), 5u);
     }
 
     /**

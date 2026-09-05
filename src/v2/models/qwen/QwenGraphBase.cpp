@@ -439,6 +439,12 @@ namespace llaminar2
                hasDecodeReplicatedDenseWeightSource();
     }
 
+    bool QwenGraphBase::useReplicatedMTPSidecarDenseWeights() const
+    {
+        return mtp_replicated_dense_graph_active_ &&
+               hasDecodeReplicatedDenseWeightSource();
+    }
+
     bool QwenGraphBase::hasDecodeMirroredEmbeddingWeightSource() const
     {
         return decode_replicated_dense_weight_bindings_.embedding_table != nullptr;
@@ -598,16 +604,51 @@ namespace llaminar2
             return 0;
 
         if (config_.vocab_local <= 0 || config_.vocab_size <= 0 ||
-            config_.vocab_local > config_.vocab_size ||
-            (config_.vocab_size % config_.vocab_local) != 0)
+            config_.vocab_local > config_.vocab_size)
         {
             throw std::logic_error(
-                "[QwenGraphBase] Mirrored MTP LM head requires an equal, positive serial vocabulary partition");
+                "[QwenGraphBase] Mirrored MTP LM head requires a positive serial vocabulary partition");
         }
 
-        return config_.vocab_local == config_.vocab_size
+        int canonical_partition_width = config_.vocab_local;
+        if (config_.tp_config)
+        {
+            if (config_.tp_config->totalVocab() != config_.vocab_size)
+            {
+                throw std::logic_error(
+                    "[QwenGraphBase] Mirrored MTP LM-head TP assignments do not cover the configured vocabulary");
+            }
+
+            const auto *const local_assignment = config_.getAssignment();
+            if (!local_assignment ||
+                local_assignment->vocab_count != config_.vocab_local)
+            {
+                throw std::logic_error(
+                    "[QwenGraphBase] Mirrored MTP LM-head local vocabulary width disagrees with its typed TP assignment");
+            }
+
+            canonical_partition_width = 0;
+            for (const auto &assignment : config_.tp_config->assignments())
+            {
+                if (assignment.vocab_count <= 0)
+                {
+                    throw std::logic_error(
+                        "[QwenGraphBase] Mirrored MTP LM-head TP assignment contains an empty vocabulary shard");
+                }
+                canonical_partition_width =
+                    std::max(canonical_partition_width, assignment.vocab_count);
+            }
+        }
+
+        /*
+         * Equal TP division is not required. The largest assignment is the
+         * canonical serial launch policy and any smaller assignment is a tail
+         * shard. Every mirrored participant therefore uses one reduction tree
+         * even when the vocabulary leaves a remainder at this TP degree.
+         */
+        return canonical_partition_width == config_.vocab_size
                    ? 0
-                   : config_.vocab_local;
+                   : canonical_partition_width;
     }
 
     bool QwenGraphBase::denseDecodeReplicatedActiveForTokens(int total_tokens) const
@@ -676,12 +717,14 @@ namespace llaminar2
 
     bool QwenGraphBase::denseTPAllreduceEnabledForCurrentGraph() const
     {
-        return !useDecodeReplicatedDenseWeights();
+        return !useDecodeReplicatedDenseWeights() &&
+               !useReplicatedMTPSidecarDenseWeights();
     }
 
     bool QwenGraphBase::attentionTPAllreduceEnabledForCurrentGraph() const
     {
-        return !useReplicatedAttentionStateWeights();
+        return !useReplicatedAttentionStateWeights() &&
+               !useReplicatedMTPSidecarDenseWeights();
     }
 
     bool QwenGraphBase::useColumnParallelLMHeadForGraph(
@@ -701,13 +744,15 @@ namespace llaminar2
             return false;
 
         /*
-         * Dense decode-replicated graphs, including compact all-position
-         * verifier rows, must project through the same full-vocab LM head that
-         * ordinary serial decode uses.  Running the verifier through the primary
-         * sharded LM head changes both the WeightBinding and the prepared GEMM
-         * descriptor, so the hidden states can be identical while logits drift.
+         * Full dense-decode replication includes the terminal projection and
+         * therefore cannot bind the primary vocabulary shard.  The narrower
+         * replicated MTP predictor deliberately does not: its dense/shared
+         * collective policy is orthogonal to terminal-head ownership.  Using
+         * denseTPAllreduceEnabledForCurrentGraph() here previously made those
+         * two policies alias and silently projected a sharded head as if it
+         * were full vocabulary.
          */
-        return denseTPAllreduceEnabledForCurrentGraph();
+        return !useDecodeReplicatedDenseWeights();
     }
 
     bool QwenGraphBase::needsDistributedLMHeadAllGather(
@@ -740,6 +785,26 @@ namespace llaminar2
         {
             return false;
         }
+        /*
+         * A replicated MTP sidecar already projects every KV head into a
+         * full-width row on each participant.  The phase-split handoff exists
+         * only for a TP-local projection feeding a replicated decode cache.
+         * Sending a full sidecar row through that handoff would compact only
+         * `local_n_kv_heads`, all-gather those prefixes, and publish a row whose
+         * second half is another participant's copy of the first half.  Apart
+         * from corrupting shifted-prefill history, this also introduces a
+         * needless collective into the retained sidecar graph.
+         *
+         * Query the active typed sidecar policy rather than inferring layout
+         * from tensor capacity: an arena may reserve full-width buffers for
+         * several graph families, but only this graph scope establishes which
+         * bytes the projection owns.
+         */
+        if (mtp_kv_cache_only_graph_active_ &&
+            useReplicatedMTPSidecarDenseWeights())
+        {
+            return false;
+        }
         if (!mtp_kv_cache_only_graph_active_ &&
             (useReplicatedAttentionStateWeights() || useDecodeReplicatedDenseWeights()))
             return false;
@@ -757,18 +822,36 @@ namespace llaminar2
 
     QwenGraphBase::DecodeReplicatedDenseScope::DecodeReplicatedDenseScope(
         QwenGraphBase &owner,
-        int total_tokens)
+        int total_tokens,
+        bool force_replicated_dense)
         : owner_(owner),
           previous_(owner.decode_replicated_dense_graph_active_),
+          previous_mtp_dense_(owner.mtp_replicated_dense_graph_active_),
           previous_attention_(owner.replicated_attention_state_graph_active_),
           previous_embedding_(owner.decode_mirrored_embedding_graph_active_),
           previous_mtp_head_(owner.mtp_mirrored_lm_head_graph_active_)
     {
+        if (force_replicated_dense &&
+            !owner_.hasDecodeReplicatedDenseWeightSource())
+        {
+            throw std::runtime_error(
+                "[QwenGraphBase] Replicated MTP sidecar is configured but its dense/shared weight bindings are missing: " +
+                owner_.describeDecodeReplicatedDenseBindingState());
+        }
+
+        /*
+         * A replicated MTP predictor is a graph-family ownership decision, not
+         * an M-based heuristic. The caller has already selected a frozen full
+         * sidecar weight set, so both dense and attention-state bindings must
+         * enter the same scope and their TP allreduces must disappear together.
+         */
         owner_.decode_replicated_dense_graph_active_ =
             owner_.denseDecodeReplicatedActiveForTokens(total_tokens);
+        owner_.mtp_replicated_dense_graph_active_ = force_replicated_dense;
         owner_.decode_mirrored_embedding_graph_active_ =
             owner_.denseDecodeMirroredEmbeddingActiveForTokens(total_tokens);
         owner_.replicated_attention_state_graph_active_ =
+            force_replicated_dense ||
             owner_.replicatedAttentionStateActiveForTokens(total_tokens);
         owner_.mtp_mirrored_lm_head_graph_active_ =
             owner_.mirroredMTPHeadActiveForProjectedRows(total_tokens);
@@ -777,6 +860,7 @@ namespace llaminar2
     QwenGraphBase::DecodeReplicatedDenseScope::~DecodeReplicatedDenseScope()
     {
         owner_.decode_replicated_dense_graph_active_ = previous_;
+        owner_.mtp_replicated_dense_graph_active_ = previous_mtp_dense_;
         owner_.replicated_attention_state_graph_active_ = previous_attention_;
         owner_.decode_mirrored_embedding_graph_active_ = previous_embedding_;
         owner_.mtp_mirrored_lm_head_graph_active_ = previous_mtp_head_;
@@ -911,7 +995,8 @@ namespace llaminar2
                 decode_replicated_dense_weight_bindings_.get_layer_weights(layer_idx));
         }
 
-        if (useDecodeReplicatedDenseWeights() &&
+        if ((useDecodeReplicatedDenseWeights() ||
+             useReplicatedMTPSidecarDenseWeights()) &&
             decode_replicated_dense_weight_bindings_.get_layer_weights)
         {
             bindings = mergeDenseDecodeBindings(
@@ -1938,6 +2023,7 @@ namespace llaminar2
         prev_node = maybeAddEmbeddingDiagnosticCheckpoints(
             graph,
             embed_output,
+            BufferId::HIDDEN_STATE,
             prev_node,
             total_tokens,
             device);
@@ -3767,6 +3853,37 @@ namespace llaminar2
             static_cast<size_t>(std::max(
                 std::max(1, seq_len),
                 resolveMTPMaxTargetQueryRows(config_.mtp)));
+
+        /*
+         * Main prefill remains TP-sharded when only the compact MTP predictor
+         * is replicated. Its sidecar graph nevertheless binds complete Q/K/V
+         * and dense-FFN weights on every participant. Keep that graph family's
+         * arena geometry independent of the main graph's local dimensions;
+         * otherwise the first full-width projection overwrites a TP-local MTP
+         * buffer before graph capture can publish its diagnostic snapshot.
+         */
+        const bool reserve_full_mtp_sidecar_buffers =
+            config_.mtpUsesReplicatedDenseSidecarBinding();
+        const int mtp_n_heads =
+            reserve_full_mtp_sidecar_buffers
+                ? config_.n_heads
+                : config.local_n_heads;
+        const int mtp_n_kv_heads =
+            reserve_full_mtp_sidecar_buffers
+                ? config_.n_kv_heads
+                : config.local_n_kv_heads;
+        const int mtp_d_ff =
+            reserve_full_mtp_sidecar_buffers
+                ? config_.d_ff
+                : config.local_d_ff;
+        config.custom_formulas["mtp_q_dim"] =
+            static_cast<size_t>(mtp_n_heads) *
+            static_cast<size_t>(config_.head_dim);
+        config.custom_formulas["mtp_kv_dim"] =
+            static_cast<size_t>(mtp_n_kv_heads) *
+            static_cast<size_t>(config_.head_dim);
+        config.custom_formulas["mtp_d_ff"] =
+            static_cast<size_t>(mtp_d_ff);
         config.custom_formulas["mtp_vocab"] =
             static_cast<size_t>(reserve_full_mtp_head_buffers
                                     ? config_.vocab_size
@@ -3844,6 +3961,7 @@ namespace llaminar2
                 graph,
                 "final_norm_input",
                 hidden,
+                input_buffer_id,
                 prev_node,
                 n_tokens,
                 device,
@@ -3860,6 +3978,7 @@ namespace llaminar2
             graph,
             "final_norm_output",
             normalized_out,
+            BufferId::NORMALIZED,
             "final_norm",
             n_tokens,
             device,
@@ -3899,6 +4018,63 @@ namespace llaminar2
         return false;
     }
 
+    QwenGraphBase::TPAllreducePlan QwenGraphBase::resolveTPAllreducePlan(
+        const TensorBase *buffer,
+        size_t count,
+        DeviceId device,
+        int layer_idx,
+        const std::optional<std::string> &precision_override) const
+    {
+        TPAllreducePlan plan{
+            .arithmetic_policy =
+                TPAllreduceArithmeticPolicy::NativeCollective,
+            .transport_precision = precision_override.value_or(
+                config_.getAllreducePrecisionForLayer(layer_idx)),
+        };
+
+        /*
+         * Prefill has a throughput contract, while every decode row has the
+         * serial-row equivalence contract.  Do not consult mtp.enabled here:
+         * speculative execution is required to be observationally equivalent
+         * to the exact same M1 graph with speculation disabled.
+         */
+        if (!forwardPhaseAllowsDecodeTopology())
+            return plan;
+
+        if (!config_.tp_ctx || !config_.tp_ctx->isLocal() ||
+            config_.tp_ctx->degree() <= 2)
+        {
+            return plan;
+        }
+
+        const auto backend = config_.tp_ctx->backend();
+        const bool native_gpu_transport =
+            backend == CollectiveBackendType::NCCL ||
+            backend == CollectiveBackendType::RCCL;
+        if (!device.is_gpu() || !native_gpu_transport)
+        {
+            throw std::logic_error(
+                "[QwenGraphBase] Decode TP degree greater than two requires "
+                "a canonical rank-order implementation for its declared "
+                "device/backend topology");
+        }
+
+        const size_t row_elements = buffer ? buffer->cols() : 0u;
+        if (!buffer || buffer->native_type() != TensorType::FP32 ||
+            row_elements == 0u || count == 0u ||
+            count % row_elements != 0u)
+        {
+            throw std::logic_error(
+                "[QwenGraphBase] Canonical decode TP reduction requires a "
+                "non-empty integral FP32 row matrix");
+        }
+
+        plan.arithmetic_policy =
+            TPAllreduceArithmeticPolicy::CanonicalRankOrder;
+        plan.transport_precision = "fp32";
+        return plan;
+    }
+
     std::unique_ptr<IComputeStage> QwenGraphBase::createTPAllreduceStage(
         TensorBase *buffer,
         size_t count,
@@ -3927,8 +4103,15 @@ namespace llaminar2
             params.tensor = buffer;
             params.count = count;
             params.stage_name = stage_name;
-            params.precision = precision_override.value_or(
-                config_.getAllreducePrecisionForLayer(layer_idx));
+            const TPAllreducePlan arithmetic_plan =
+                resolveTPAllreducePlan(
+                    buffer,
+                    count,
+                    device,
+                    layer_idx,
+                    precision_override);
+            params.arithmetic_policy = arithmetic_plan.arithmetic_policy;
+            params.precision = arithmetic_plan.transport_precision;
             params.tensor_buffer_id = tensor_buffer_id;
             params.sideband_device_index = config_.tp_device_idx;
             params.sideband_workspace_bindings = std::move(sideband_workspace_bindings);
@@ -4560,7 +4743,24 @@ namespace llaminar2
                 phase_split_handoff ? config_.n_kv_heads : local_n_kv_heads;
             attn_params.n_kv_heads = attention_n_kv_heads;
             attn_params.head_dim = config_.head_dim;
-            attn_params.head_start = config_.head_start;
+            /*
+             * `head_start` maps a participant-local Q head index into the
+             * global GQA head space.  A replicated dense graph instead binds
+             * the complete Q row `[0, n_heads)` on every participant, so its
+             * local index is already the global index and the offset must be
+             * zero.  Retaining the primary TP assignment here made identical
+             * replicated Q/K/V and shifted-cache bytes select different KV
+             * heads on non-zero participants.
+             *
+             * Resolve this from the emitted tensor geometry rather than from
+             * a mode name: any graph that owns all query heads starts at zero;
+             * a genuinely sharded prefill continues to use its typed TP
+             * assignment below.
+             */
+            const bool owns_full_query_head_range =
+                local_n_heads == config_.n_heads;
+            attn_params.head_start =
+                owns_full_query_head_range ? 0 : config_.head_start;
             // GQA rep: only when KV heads are replicated (not column-parallel)
             if (attention_n_kv_heads == config_.n_kv_heads &&
                 config_.n_kv_heads > 0 &&
@@ -4633,18 +4833,16 @@ namespace llaminar2
         return prefix + "attention";
     }
 
-    std::string QwenGraphBase::addWoProjectionAndAllreduce(
+    std::string QwenGraphBase::addWoProjection(
         ComputeGraph &graph,
         const std::string &prefix,
         ActivationBuffers &buffers,
         TensorBase *wo_weight,
         const WeightBinding *wo_binding,
         int total_tokens,
-        int layer_idx,
         DeviceId device,
         const std::string &dependency,
-        const std::string &wo_node_suffix,
-        const std::string &allreduce_node_suffix)
+        const std::string &wo_node_suffix)
     {
         if (!wo_weight)
             return dependency;
@@ -4686,28 +4884,46 @@ namespace llaminar2
                       }),
                       device);
         graph.addDependency(wo_node, dependency);
+        return wo_node;
+    }
 
-        std::string terminal = wo_node;
-
-        // TP allreduce if row-parallel sharded
-        if (isRowParallelSharded(wo_weight) && needsTPAllreduce() && attentionTPAllreduceEnabledForCurrentGraph())
+    std::string QwenGraphBase::addWoAllreduce(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        TensorBase *wo_weight,
+        int total_tokens,
+        int layer_idx,
+        DeviceId device,
+        const std::string &dependency,
+        const std::string &allreduce_node_suffix)
+    {
+        if (!wo_weight ||
+            !isRowParallelSharded(wo_weight) ||
+            !needsTPAllreduce() ||
+            !attentionTPAllreduceEnabledForCurrentGraph())
         {
-            size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-            std::string ar_node = prefix + allreduce_node_suffix;
-
-            auto allreduce_stage = createTPAllreduceStage(
-                buffers.attn_proj, allreduce_count, device, layer_idx,
-                /*is_attention=*/true, ar_node, buffers.idFor(BufferId::ATTN_PROJ));
-
-            if (allreduce_stage)
-            {
-                graph.addNode(ar_node, std::move(allreduce_stage), device);
-                graph.addDependency(ar_node, wo_node);
-                terminal = ar_node;
-            }
+            return dependency;
         }
 
-        return terminal;
+        const size_t allreduce_count =
+            static_cast<size_t>(total_tokens) *
+            static_cast<size_t>(config_.d_model);
+        const std::string allreduce_node = prefix + allreduce_node_suffix;
+        auto allreduce_stage = createTPAllreduceStage(
+            buffers.attn_proj,
+            allreduce_count,
+            device,
+            layer_idx,
+            /*is_attention=*/true,
+            allreduce_node,
+            buffers.idFor(BufferId::ATTN_PROJ));
+        if (!allreduce_stage)
+            return dependency;
+
+        graph.addNode(allreduce_node, std::move(allreduce_stage), device);
+        graph.addDependency(allreduce_node, dependency);
+        return allreduce_node;
     }
 
 } // namespace llaminar2

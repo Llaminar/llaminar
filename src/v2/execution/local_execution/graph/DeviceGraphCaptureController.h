@@ -112,14 +112,15 @@ namespace llaminar2
             /// Executes one stage through executor's canonical node path.
             std::function<bool(ComputeNode &)> execute_node;
             /**
-             * @brief Preallocates point-in-time snapshot descriptors/storage.
+             * @brief Freezes the complete snapshot manifest and binds its arena.
              *
-             * The arena frontier is complete before this hook runs. The hook is
-             * host-side preparation only: it must not enqueue stream work,
-             * publish an event, or copy payload bytes. Device-to-device copies
+             * The controller invokes this graph-wide setup hook exactly once,
+             * after every capturable stage has prepared immutable launch metadata
+             * and before the first native capture begins. It must not enqueue
+             * payload work or publish a producer event. Device-to-device copies
              * are recorded by @ref record_snapshot_copies after each producer.
              */
-            std::function<bool(ComputeNode &, void *)> prepare_snapshot_copies;
+            std::function<bool()> prepare_snapshot_manifest;
             /// Records point-in-time snapshot copies after direct stage execution.
             std::function<bool(ComputeNode &, void *)> record_snapshot_copies;
             /// Runs post-launch lifecycle hooks (dirty marking, callbacks, step bookkeeping).
@@ -151,6 +152,19 @@ namespace llaminar2
              */
             DeviceGraphExecutor::RetainedParentCompositionHook
                 retained_parent_composer;
+            /**
+             * @brief Submit an authority parent with its pre-armed CPU service.
+             *
+             * Required exactly for a retained parent whose typed plan contains
+             * concurrent ticket-service units. The executor owns the persistent
+             * worker and invokes the controller's service body on it; this hook
+             * keeps worker ownership out of the stateless capture controller.
+             */
+            std::function<bool(
+                IGPUGraphCapture &,
+                std::span<const size_t>,
+                uint64_t)>
+                submit_parent_with_concurrent_ticket_service;
             /**
              * Optional cache-owned branch recorded in parallel with one full
              * native graph. The pointer remains valid for the complete cache
@@ -505,6 +519,32 @@ namespace llaminar2
             uint64_t current_step,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb);
+
+        /**
+         * @brief Service typed CPU ticket units pre-armed beside one GPU parent.
+         *
+         * The caller dispatches this method to a persistent host worker before
+         * entering the backend's native parent-submission call. Each manual
+         * stage acquire-waits on its mapped producer ticket and publishes the
+         * matching mapped return. If any stage fails, every declared device-
+         * ingress publisher emits an authenticated abort. The caller then owns
+         * the exceptional stream drain after graph submission has returned;
+         * keeping the drain outside this worker avoids racing a still-active
+         * backend submission call from another host thread.
+         *
+         * @param segment_indices Exact manual units frozen into the retained plan.
+         * @param execute_node_cb Canonical executor hook used for host-owned work.
+         * @return True when all ticket units completed; false after a safely
+         *         drained service failure.
+         */
+        static bool executeConcurrentTicketService(
+            ComputeGraph &graph,
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            IDeviceContext *ctx,
+            IWorkerGPUContext *gpu_ctx,
+            uint64_t current_step,
+            std::span<const size_t> segment_indices,
+            const std::function<bool(ComputeNode &)> &execute_node_cb);
 
         /**
          * @brief Run stage-owned preparation required at one graph lifecycle boundary.

@@ -27,8 +27,8 @@ TEST(Test__WeightIdentity, InfersCommonWeightRoles)
     EXPECT_EQ(inferWeightRole("output_norm.weight"), WeightRole::OutputNorm);
     EXPECT_EQ(inferWeightRole("blk.3.attn_qkv.weight"), WeightRole::FusedQKV);
     EXPECT_EQ(inferWeightRole("blk.3.attn_output.weight"), WeightRole::AttentionWO);
-    EXPECT_EQ(inferWeightRole("blk.3.ssm_alpha.weight"), WeightRole::GDNProjection);
-    EXPECT_EQ(inferWeightRole("blk.3.ssm_beta.weight"), WeightRole::GDNProjection);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_alpha.weight"), WeightRole::GDNAlphaBetaProjection);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_beta.weight"), WeightRole::GDNAlphaBetaProjection);
     EXPECT_EQ(inferWeightRole("blk.3.ssm_a"), WeightRole::GDNSsmParam);
     EXPECT_EQ(inferWeightRole("blk.3.ssm_dt.bias"), WeightRole::Bias);
     EXPECT_EQ(inferWeightRole("blk.3.ssm_conv1d.weight"), WeightRole::GDNSsmParam);

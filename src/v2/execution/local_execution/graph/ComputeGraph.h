@@ -270,6 +270,29 @@ namespace llaminar2
             GraphHeterogeneousTicketUnitContract contract);
 
         /**
+         * @brief Move the sole heterogeneous transaction terminal to a new leaf.
+         *
+         * Graph decorators may append a captured control-only terminal after a
+         * model builder has sealed its logical tensor output. The ticket-unit
+         * terminal must follow that extension or capture planning would close
+         * the transaction before the appended control operation. This typed
+         * transition moves the existing terminal contract and graph-terminal
+         * identity together; it never changes dependency order.
+         *
+         * @param current_terminal Existing explicit graph terminal carrying a
+         *        `TransactionTerminal` ticket-unit contract.
+         * @param replacement_terminal Existing sole graph leaf that will own
+         *        the moved contract and terminal identity.
+         * @return Reference to this graph for fluent construction.
+         * @throws std::logic_error when the graph envelope, terminal contract,
+         *         destination contract, or leaf frontier is inconsistent.
+         * @throws std::out_of_range when either named node is absent.
+         */
+        ComputeGraph &moveHeterogeneousTicketTransactionTerminal(
+            const std::string &current_terminal,
+            const std::string &replacement_terminal);
+
+        /**
          * @brief Select the typed native-capture lifecycle for this graph.
          *
          * Repeated selection of the same envelope is idempotent. Merging graph

@@ -155,6 +155,9 @@ namespace llaminar2
             {"mtp_state_restored", request.mtp_state_restored},
             {"hybrid_state_restored", request.hybrid_state_restored},
             {"storage_tier", request.storage_tier},
+            {"admission_movement_epoch", request.admission_movement_epoch},
+            {"completion_movement_epoch", request.completion_movement_epoch},
+            {"crossed_movement_epoch", request.crossedMovementEpoch()},
         };
     }
 
@@ -582,6 +585,7 @@ namespace llaminar2
               {"decode", iteration.decode_tokens_per_sec},
               {"decode_after_prefill",
                iteration.decode_after_prefill_tokens_per_sec}}},
+            {"generated_token_ids", iteration.generated_token_ids},
             {"moe_runtime_movement_epoch_start",
              iteration.moe_runtime_movement_epoch_start},
             {"moe_runtime_movement_epoch",
@@ -593,7 +597,17 @@ namespace llaminar2
               {"promotions", iteration.dynamic_promotions},
               {"demotions", iteration.dynamic_demotions},
               {"same_priority_moves",
-               iteration.dynamic_same_priority_moves}}}};
+               iteration.dynamic_same_priority_moves}}},
+            {"mtp",
+             {{"draft_steps", iteration.mtp_draft_steps},
+              {"accepted_tokens", iteration.mtp_accepted_tokens},
+              {"rejected_tokens", iteration.mtp_rejected_tokens},
+              {"verifier_runs", iteration.mtp_verifier_runs},
+              {"verifier_token_count", iteration.mtp_verifier_token_count},
+              {"acceptance_rate",
+               mtpTokenAcceptanceRate(
+                   iteration.mtp_accepted_tokens,
+                   iteration.mtp_rejected_tokens)}}}};
         result["decode_windows"] = nlohmann::json::array();
         for (const auto &window : iteration.decode_windows)
         {
@@ -1171,10 +1185,10 @@ namespace llaminar2
          * synchronize unrelated streams or the whole device.
          */
         if (success &&
-            !runner_->waitForLastForwardCompletionForBenchmark())
+            !runner_->waitForLastInferenceCompletionForBenchmark())
         {
             last_failure_reason_ =
-                "prefill benchmark could not observe the durable forward completion event";
+                "prefill benchmark could not observe the durable inference-transaction completion event";
             success = false;
         }
 
@@ -1859,6 +1873,28 @@ namespace llaminar2
         // visible because host-side sampling is the CPU implementation.
         runner_->setSkipLogitsGatherPrefill(has_gpu);
 
+        /*
+         * A throughput sample named "prefill" must execute the prompt, not
+         * restore an identical prompt archived by graph preparation or the
+         * preceding warmup. Request reset deliberately preserves reusable
+         * prefix records for serving, so benchmark mode composes that boundary
+         * with the distinct administrative purge before every full-prefill
+         * submission. Both operations remain outside the measured interval;
+         * retained graph topology and prepared weights survive both.
+         */
+        auto resetForFullPrefill = [&](const char *context) -> bool
+        {
+            runner_->clear_cache();
+            if (runner_->purgePrefixCache())
+                return true;
+
+            last_failure_reason_ =
+                std::string("benchmark could not purge reusable prefix state before ") +
+                (context && *context ? context : "full prefill");
+            LOG_ERROR(last_failure_reason_);
+            return false;
+        };
+
         auto requirePrefillGraphCapture = [&](const char *context) -> bool
         {
             if (!debugEnv().execution.prefill_graph_required)
@@ -1935,7 +1971,8 @@ namespace llaminar2
             for (; submissions < kMaxPrefillGraphPreparationSubmissions;
                  ++submissions)
             {
-                runner_->clear_cache();
+                if (!resetForFullPrefill("prefill graph preparation"))
+                    return false;
                 auto [graph_warmup_success, graph_warmup_time] = runPrefill(tokens);
                 if (!graph_warmup_success)
                 {
@@ -2011,11 +2048,11 @@ namespace llaminar2
         {
             return capture_and_return();
         }
-        runner_->clear_cache();
 
         for (int iter = 0; iter < warmup_iterations; ++iter)
         {
-            runner_->clear_cache();
+            if (!resetForFullPrefill("warmup"))
+                return capture_and_return();
             logGPUMemorySnapshot(("before-warmup iter=" + std::to_string(iter + 1)).c_str());
 
             auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
@@ -2059,7 +2096,8 @@ namespace llaminar2
             // transfers can evict hot data from LLC, causing the first benchmark
             // iteration to measure cold-cache performance).
             LOG_DEBUG("Re-warming caches after post-warmup setup...");
-            runner_->clear_cache();
+            if (!resetForFullPrefill("post-warmup cache rewarm"))
+                return capture_and_return();
             auto [rw_ok, rw_time] = runPrefill(tokens);
             if (rw_ok && n_decode > 0)
             {
@@ -2176,8 +2214,9 @@ namespace llaminar2
 
         for (int iter = 0; iter < benchmark_iterations; ++iter)
         {
-            // Reset pipeline state before each iteration
-            runner_->clear_cache();
+            // Reset live request state and force an actual full-prefill sample.
+            if (!resetForFullPrefill("measured iteration"))
+                return capture_and_return();
             logGPUMemorySnapshot(("after-clear-cache iter=" + std::to_string(iter + 1)).c_str());
 
             LOG_DEBUG("  Iteration " << (iter + 1) << "/" << benchmark_iterations << "...");
@@ -2299,9 +2338,25 @@ namespace llaminar2
                     decode_result.token_latencies_ms.begin(),
                     decode_result.token_latencies_ms.end());
                 last_generated_text = decode_result.generated_text;
+                iteration_result.generated_token_ids =
+                    decode_result.generated_token_ids;
                 result.generated_token_ids = std::move(decode_result.generated_token_ids);
                 const PrefixRuntimeStateSnapshot iteration_state =
                     runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+                /* Request reset also resets the runner-owned MTP ledger. Copy
+                 * this request's exact terminal projection before the next
+                 * reset so adaptive placement timing can be normalized by
+                 * verifier work without enabling hot-path instrumentation. */
+                iteration_result.mtp_draft_steps =
+                    iteration_state.mtp_draft_steps;
+                iteration_result.mtp_accepted_tokens =
+                    iteration_state.mtp_accepted_tokens;
+                iteration_result.mtp_rejected_tokens =
+                    iteration_state.mtp_rejected_tokens;
+                iteration_result.mtp_verifier_runs =
+                    iteration_state.mtp_verifier_runs;
+                iteration_result.mtp_verifier_token_count =
+                    iteration_state.mtp_verifier_token_count;
                 iteration_result.moe_runtime_movement_epoch =
                     runner_ ? runner_->moeRuntimeMovementEpoch() : 0u;
                 if (!has_measured_mtp_state)

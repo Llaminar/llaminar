@@ -4,7 +4,8 @@
  *
  * The helpers in this file keep the live production runner as the system under
  * test while authenticating every reusable CPU/FP32 Hugging Face reference
- * pack against the exact GGUF, prompt, and tokenization.  Checkpoint campaigns
+ * pack against the declared GGUF descriptor, prompt, and tokenization.
+ * Checkpoint campaigns
  * retain captured graph, device-state, depth-policy, and CSV evidence instead
  * of reducing correctness to final-token agreement.
  */
@@ -28,6 +29,7 @@
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/mtp/MTPStateTransaction.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "execution/runner/ModelContextRetirement.h"
 #include "kernels/KernelFactory.h"
 #include "loaders/ModelContext.h"
 #include "utils/DebugEnv.h"
@@ -3012,11 +3014,10 @@ namespace llaminar2::test::parity::qwen36
     /**
      * @brief Authenticate one CPU/FP32 PyTorch pack against live model inputs.
      *
-     * Directory names and model path strings are not identity authorities.
-     * Long-lived dense and MoE packs are reusable only when their metadata
-     * proves the exact GGUF bytes, prompt bytes, and tokenizer output.  The
-     * aggregate runner's identity-bound digest cache prevents every backend
-     * process from rescanning the same read-only RAM-disk model.
+     * Typed campaign registration binds the model and pack. The inexpensive
+     * filename/size descriptor catches accidental fixture selection, while
+     * prompt/token digests and full numerical checkpoints prove the actual
+     * inference inputs without rescanning the GGUF payload.
      */
     inline bool qwen36ReferenceIdentityMatches(
         const std::filesystem::path &metadata_path,
@@ -3044,25 +3045,11 @@ namespace llaminar2::test::parity::qwen36
         }
 
         std::string digest_error;
-        const auto digest_cache =
-            productionParityDigestCacheFromEnvironment();
-        const auto model_digest = digest_cache
-                                      ? sha256FileHexShared(
-                                            model_path,
-                                            *digest_cache,
-                                            &digest_error)
-                                      : sha256FileHex(
-                                            model_path,
-                                            &digest_error);
-        const auto observed_model_digest =
-            readStringFromMetadata(metadata_path, "model_sha256");
-        if (!model_digest || !observed_model_digest ||
-            *observed_model_digest != *model_digest)
-        {
-            return fail(
-                "model_sha256 does not match the live GGUF bytes" +
-                (digest_error.empty() ? std::string{} : ": " + digest_error));
-        }
+        if (const auto model_error = productionParityModelDescriptorError(
+                model_path,
+                readStringFromMetadata(metadata_path, "model_filename"),
+                readStringFromMetadata(metadata_path, "model_size_bytes")))
+            return fail(*model_error);
 
         const auto prompt_digest = sha256BytesHex(prompt, &digest_error);
         const auto observed_prompt_digest =
@@ -4092,6 +4079,53 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
+     * @brief Retire the dense campaign's exclusive final prepared-model owner.
+     *
+     * Production campaign binaries terminate with `_exit` after explicitly
+     * shutting down MPI and backend singletons, so process-static destructors
+     * are intentionally bypassed.  This function creates the missing typed
+     * final-owner edge before that shutdown: prepared weights and sealed
+     * workspace backing are released, and every GPU runtime generation is
+     * reset and certified through the same core API used by JIT eviction.
+     *
+     * @param error Receives the exact ownership or backend failure.
+     * @return True when the slot was empty or retired completely.
+     */
+    inline bool releaseDenseMTPModelContextCampaignCache(
+        std::string *error)
+    {
+        if (error)
+            error->clear();
+        auto &cache = denseMTPModelContextCampaignCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (!cache.contract)
+        {
+            cache.key.clear();
+            return true;
+        }
+
+        try
+        {
+            llaminar::v2::kernels::KernelFactory::clearCache();
+            (void)retireExclusiveModelContextReuseContract(
+                *cache.contract);
+            cache.contract.reset();
+            cache.key.clear();
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+            {
+                *error =
+                    "dense MTP campaign final model retirement failed: " +
+                    std::string(exception.what());
+            }
+            return false;
+        }
+    }
+
+    /**
      * @brief Return the complete dense predictor checkpoint surface.
      *
      * ``FFN_SWIGLU`` is intentionally absent: production fuses that activation
@@ -5009,7 +5043,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 3;
 
@@ -5242,7 +5275,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = false;
 
         auto runner = createInferenceRunner(
@@ -6213,7 +6245,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 3;
 
@@ -6374,7 +6405,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = false;
 
         auto runner = createInferenceRunner(
@@ -6518,7 +6548,6 @@ namespace llaminar2::test::parity::qwen36
             config.force_graph = true;
             config.activation_precision = ActivationPrecision::FP32;
             config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-            config.use_mapped_memory = false;
             config.mtp.enabled = enable_mtp;
             config.mtp.draft_tokens = 1;
             return config;
@@ -6659,7 +6688,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = verifier_row_count;
 
@@ -6984,7 +7012,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = verifier_row_count;
 

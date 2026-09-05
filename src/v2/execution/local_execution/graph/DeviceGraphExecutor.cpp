@@ -1,11 +1,20 @@
 /**
  * @file DeviceGraphExecutor.cpp
- * @brief Compute graph execution engine implementation
+ * @brief Participant-local eager and native-graph execution implementation.
+ *
+ * This file owns launch preparation, immutable graph-cache identity, captured
+ * stage execution, and diagnostic snapshot publication for one device. GPU
+ * snapshot checkpoints are copied at their exact stage boundary into a
+ * graph-owned VRAM arena. The complete arena is downloaded once after replay;
+ * individual captured nodes never write PCIe-mapped host pages. Keeping that
+ * ordering explicit preserves every parity checkpoint without multiplying
+ * host-memory packets or runtime completion objects.
  * @author David Sanftenberg
  * @date December 2025
  */
 
 #include "DeviceGraphExecutor.h"
+#include "RetainedParentTicketServiceWorker.h"
 #include "StageVerifier.h"
 #include "DeviceGraphCaptureController.h"
 #include "GraphCaptureGuard.h"
@@ -735,7 +744,7 @@ namespace llaminar2
 
     void GraphExecutorStats::recordPerfStats(const std::string &device_name) const
     {
-        if (!PerfStatsCollector::isEnabled())
+        if (!PerfStatsCollector::isDomainEnabled("stage_executor_cpu"))
             return;
 
         auto record_phase = [&](const char *phase_name, const PhaseStats &phase)
@@ -813,6 +822,38 @@ namespace llaminar2
         : config_(config) {}
 
     DeviceGraphExecutor::~DeviceGraphExecutor() = default;
+
+    DeviceGraphExecutor::DeviceGraphExecutor(DeviceGraphExecutor &&) noexcept =
+        default;
+
+    DeviceGraphExecutor &DeviceGraphExecutor::operator=(
+        DeviceGraphExecutor &&) noexcept = default;
+
+    void DeviceGraphExecutor::setGraphSnapshotMemoryReservation(
+        std::shared_ptr<PhysicalMemoryOwnerReservation> reservation)
+    {
+        if (!graph_snapshot_shared_arenas_.empty() ||
+            !transient_snapshot_manifest_.empty())
+        {
+            throw std::logic_error(
+                "Graph snapshot memory authority cannot change after snapshot storage materialization");
+        }
+        if (reservation &&
+            (!reservation->valid() ||
+             reservation->owner() !=
+                 PhysicalMemoryOwner::GraphSnapshotArena))
+        {
+            throw std::invalid_argument(
+                "Graph snapshot memory reservation has the wrong physical owner or is closed");
+        }
+        if (graph_snapshot_memory_reservation_ &&
+            graph_snapshot_memory_reservation_ != reservation)
+        {
+            throw std::logic_error(
+                "Graph snapshot memory authority cannot be replaced");
+        }
+        graph_snapshot_memory_reservation_ = std::move(reservation);
+    }
 
     // =============================================================================
     // Execution
@@ -1306,6 +1347,11 @@ namespace llaminar2
             return false;
         }
 
+        GraphSnapshotManifest &manifest =
+            snapshot_manifest ? *snapshot_manifest
+                              : transient_snapshot_manifest_;
+        manifest.beginDescriptorCollection();
+
         for (const auto &name : graph.getExecutionOrder())
         {
             ComputeNode *node = graph.getNode(name);
@@ -1318,9 +1364,6 @@ namespace llaminar2
             if (!target_device.is_valid())
                 target_device = fallback_device;
 
-            GraphSnapshotManifest &manifest =
-                snapshot_manifest ? *snapshot_manifest
-                                  : transient_snapshot_manifest_;
             if (!prepareGraphSnapshotCopies(
                     *node,
                     target_device,
@@ -1334,6 +1377,372 @@ namespace llaminar2
             }
         }
 
+        if (!bindGraphSnapshotArena(
+                graph, fallback_device, producer_stream, manifest))
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Failed to bind graph snapshot arena"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+
+        return true;
+    }
+
+    bool DeviceGraphExecutor::bindGraphSnapshotArena(
+        ComputeGraph &graph,
+        DeviceId fallback_device,
+        void *setup_stream,
+        GraphSnapshotManifest &snapshot_manifest)
+    {
+        if (snapshot_manifest.storage_state !=
+            GraphSnapshotManifest::StorageState::CollectingDescriptors)
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Graph snapshot arena binding requires a complete descriptor-collection phase");
+            return false;
+        }
+        if (!fallback_device.is_gpu())
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Graph snapshot arena binding requires an exact GPU device");
+            return false;
+        }
+        if (!setup_stream)
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Graph snapshot arena binding requires an exact non-null setup stream");
+            return false;
+        }
+
+        constexpr size_t kSlotAlignment = alignof(float);
+        size_t required_bytes = 0;
+        size_t slot_count = 0;
+        DeviceId arena_device = DeviceId::invalid();
+        std::unordered_set<std::string> visited_stages;
+        visited_stages.reserve(snapshot_manifest.stage_copies.size());
+
+        /*
+         * Layout follows the graph's declarative order, never unordered-map
+         * iteration. Capture identity is therefore reproducible across process
+         * starts and independent of hash-table implementation details.
+         */
+        for (const auto &stage_name : graph.getExecutionOrder())
+        {
+            auto stage_it = snapshot_manifest.stage_copies.find(stage_name);
+            if (stage_it == snapshot_manifest.stage_copies.end())
+                continue;
+            visited_stages.insert(stage_name);
+
+            for (auto &copy : stage_it->second.outputs)
+            {
+                if (!copy.descriptor_finalized || copy.byte_size == 0 ||
+                    copy.storage_bytes < copy.byte_size ||
+                    !copy.device.is_gpu())
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Stage '" << stage_name
+                                                               << "' has an incomplete snapshot descriptor before arena binding"
+                                                               << " output='" << copy.name << "'"
+                                                               << " bytes=" << copy.byte_size
+                                                               << " storage_bytes=" << copy.storage_bytes);
+                    return false;
+                }
+                if (!arena_device.is_valid())
+                    arena_device = copy.device;
+                if (copy.device != arena_device || copy.device != fallback_device)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] One participant-local snapshot arena cannot span "
+                              << arena_device.toString() << ", "
+                              << copy.device.toString() << " and capture device "
+                              << fallback_device.toString());
+                    return false;
+                }
+
+                if (required_bytes >
+                    std::numeric_limits<size_t>::max() -
+                        (kSlotAlignment - 1))
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Graph snapshot arena alignment overflow");
+                    return false;
+                }
+                const size_t aligned_offset =
+                    (required_bytes + kSlotAlignment - 1) &
+                    ~(kSlotAlignment - 1);
+                if (copy.storage_bytes >
+                    std::numeric_limits<size_t>::max() - aligned_offset)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Graph snapshot arena size overflow at stage '"
+                              << stage_name << "' output '" << copy.name << "'");
+                    return false;
+                }
+                copy.storage_offset_bytes = aligned_offset;
+                required_bytes = aligned_offset + copy.storage_bytes;
+                ++slot_count;
+            }
+        }
+
+        if (visited_stages.size() != snapshot_manifest.stage_copies.size())
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Graph snapshot manifest contains descriptors outside the graph execution order");
+            return false;
+        }
+
+        snapshot_manifest.storage_required_bytes = required_bytes;
+        snapshot_manifest.bound_slot_count = slot_count;
+        if (slot_count == 0)
+        {
+            snapshot_manifest.storage_arena.reset();
+            snapshot_manifest.storage_allocation_lease.reset();
+            snapshot_manifest.storage_device = DeviceId::invalid();
+            snapshot_manifest.storage_capacity_bytes = 0;
+            snapshot_manifest.storage_state =
+                GraphSnapshotManifest::StorageState::StorageBound;
+            return true;
+        }
+
+        const size_t arena_elements =
+            std::max<size_t>(
+                1,
+                (required_bytes + sizeof(float) - 1) / sizeof(float));
+        const size_t arena_capacity_bytes = arena_elements * sizeof(float);
+        const bool needs_new_arena =
+            !snapshot_manifest.storage_arena ||
+            snapshot_manifest.storage_device != arena_device ||
+            snapshot_manifest.storage_capacity_bytes < arena_capacity_bytes ||
+            snapshot_manifest.storage_arena->isMapped() ||
+            !snapshot_manifest.storage_arena->gpu_data_ptr();
+
+        if (needs_new_arena)
+        {
+            const auto allocation_begin = std::chrono::steady_clock::now();
+            std::shared_ptr<PhysicalMemorySuballocationLease>
+                replacement_lease;
+            std::shared_ptr<FP32Tensor> replacement;
+            bool allocated_device_arena = false;
+
+            const auto &reuse_policy =
+                snapshot_manifest.storage_reuse_policy;
+            if (!reuse_policy.valid())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Graph snapshot arena has an incomplete typed reuse policy");
+                return false;
+            }
+
+            if (reuse_policy.shared())
+            {
+                const GraphSnapshotSharedArenaKey key{
+                    .device = arena_device,
+                    .reuse_class = reuse_policy.reuse_class,
+                    .configuration_identity =
+                        reuse_policy.configuration_identity,
+                };
+                const auto pool_it =
+                    graph_snapshot_shared_arenas_.find(key);
+                if (pool_it != graph_snapshot_shared_arenas_.end())
+                {
+                    replacement = pool_it->second.tensor;
+                    replacement_lease =
+                        pool_it->second.allocation_lease;
+                    if (!replacement || replacement->isMapped() ||
+                        !replacement->gpu_data_ptr() ||
+                        replacement->size_bytes() < arena_capacity_bytes)
+                    {
+                        LOG_ERROR(
+                            "[DeviceGraphExecutor] A shared graph snapshot arena cannot grow after an alternative executable captured its address"
+                            << " device=" << arena_device.toString()
+                            << " reuse_class="
+                            << static_cast<unsigned int>(
+                                   reuse_policy.reuse_class)
+                            << " configuration_identity="
+                            << reuse_policy.configuration_identity
+                            << " frozen_bytes="
+                            << (replacement
+                                    ? replacement->size_bytes()
+                                    : size_t{0})
+                            << " required_bytes="
+                            << arena_capacity_bytes
+                            << "; materialize the largest alternative first");
+                        return false;
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        if (!graph_snapshot_memory_reservation_)
+                        {
+                            if (config_.require_snapshot_memory_authority)
+                            {
+                                throw std::logic_error(
+                                    "Production graph snapshot allocation has no physical-memory reservation");
+                            }
+                        }
+                        else
+                        {
+                            replacement_lease = std::make_shared<
+                                PhysicalMemorySuballocationLease>(
+                                graph_snapshot_memory_reservation_
+                                    ->claimAllocation(
+                                        arena_capacity_bytes));
+                        }
+                        replacement = std::make_shared<FP32Tensor>(
+                            std::vector<size_t>{arena_elements},
+                            arena_device);
+                    }
+                    catch (const std::exception &error)
+                    {
+                        LOG_ERROR(
+                            "[DeviceGraphExecutor] Graph snapshot arena admission failed for "
+                            << arena_capacity_bytes << " bytes on "
+                            << arena_device.toString() << ": "
+                            << error.what());
+                        return false;
+                    }
+                    allocated_device_arena = true;
+                }
+            }
+            else
+            {
+                try
+                {
+                    if (!graph_snapshot_memory_reservation_)
+                    {
+                        if (config_.require_snapshot_memory_authority)
+                        {
+                            throw std::logic_error(
+                                "Production graph snapshot allocation has no physical-memory reservation");
+                        }
+                    }
+                    else
+                    {
+                        replacement_lease = std::make_shared<
+                            PhysicalMemorySuballocationLease>(
+                            graph_snapshot_memory_reservation_
+                                ->claimAllocation(arena_capacity_bytes));
+                    }
+                    replacement = std::make_shared<FP32Tensor>(
+                        std::vector<size_t>{arena_elements}, arena_device);
+                }
+                catch (const std::exception &error)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Graph snapshot arena admission failed for "
+                        << arena_capacity_bytes << " bytes on "
+                        << arena_device.toString() << ": "
+                        << error.what());
+                    return false;
+                }
+                allocated_device_arena = true;
+            }
+
+            const bool device_allocation_bound =
+                !allocated_device_arena ||
+                replacement->allocateOnDevice(arena_device, setup_stream);
+            const auto allocation_end = std::chrono::steady_clock::now();
+            if (!device_allocation_bound || replacement->isMapped() ||
+                !replacement->gpu_data_ptr() || !replacement->raw_data())
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Failed to allocate required device-resident graph snapshot arena"
+                          << " bytes=" << arena_capacity_bytes
+                          << " slots=" << slot_count
+                          << " device=" << arena_device.toString());
+                return false;
+            }
+
+            if (reuse_policy.shared() && allocated_device_arena)
+            {
+                const GraphSnapshotSharedArenaKey key{
+                    .device = arena_device,
+                    .reuse_class = reuse_policy.reuse_class,
+                    .configuration_identity =
+                        reuse_policy.configuration_identity,
+                };
+                const auto [pool_it, inserted] =
+                    graph_snapshot_shared_arenas_.emplace(
+                        key,
+                        GraphSnapshotSharedArena{
+                            .allocation_lease = replacement_lease,
+                            .tensor = replacement,
+                        });
+                if (!inserted ||
+                    pool_it->second.tensor != replacement ||
+                    pool_it->second.allocation_lease !=
+                        replacement_lease)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Shared graph snapshot arena publication raced with another setup owner");
+                    return false;
+                }
+            }
+
+            snapshot_manifest.storage_allocation_lease =
+                replacement_lease;
+            snapshot_manifest.storage_arena = replacement;
+            snapshot_manifest.storage_device = arena_device;
+            snapshot_manifest.storage_capacity_bytes =
+                replacement->size_bytes();
+            if (allocated_device_arena)
+                ++snapshot_manifest.storage_allocation_count;
+
+            const auto allocation_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    allocation_end - allocation_begin)
+                    .count();
+            if (allocated_device_arena)
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "snapshot_device_arena_allocations",
+                    1.0,
+                    "setup",
+                    arena_device.toString());
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "snapshot_device_arena_bytes",
+                    static_cast<double>(
+                        snapshot_manifest.storage_capacity_bytes),
+                    "setup",
+                    arena_device.toString());
+            }
+            else
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "snapshot_device_arena_shared_bindings",
+                    1.0,
+                    "setup",
+                    arena_device.toString());
+            }
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "snapshot_device_arena_slots",
+                static_cast<double>(slot_count),
+                "setup",
+                arena_device.toString());
+            PerfStatsCollector::recordTimingNs(
+                "forward_graph",
+                "snapshot_device_arena_allocation",
+                static_cast<uint64_t>(allocation_ns),
+                "setup",
+                arena_device.toString());
+
+            LOG_DEBUG("[GraphCaptureMaterialization] phase=snapshot_arena_allocation"
+                      << " device=" << arena_device.toString()
+                      << " bytes="
+                      << snapshot_manifest.storage_capacity_bytes
+                      << " required_bytes=" << arena_capacity_bytes
+                      << " slots=" << slot_count
+                      << " shared="
+                      << (reuse_policy.shared() ? "true" : "false")
+                      << " allocated="
+                      << (allocated_device_arena ? "true" : "false")
+                      << " elapsed_ms="
+                      << static_cast<double>(allocation_ns) / 1.0e6);
+        }
+
+        snapshot_manifest.storage_state =
+            GraphSnapshotManifest::StorageState::StorageBound;
         return true;
     }
 
@@ -1343,6 +1752,123 @@ namespace llaminar2
     {
         return !config_.snapshot_stage_filter ||
                config_.snapshot_stage_filter(node_name, dump_info);
+    }
+
+    uint64_t DeviceGraphExecutor::resolveGraphSnapshotConfigurationIdentity(
+        ComputeGraph &graph,
+        GraphSegmentCache &segment_cache)
+    {
+        constexpr uint64_t kNoCapturedSnapshotCopiesIdentity =
+            GraphSegmentCache::SnapshotSelectionIdentity::
+                kNoCapturedCopiesIdentity;
+        const uint64_t source_identity = snapshot_configuration_epoch_;
+        const uint64_t topology_generation = graph.topologyGeneration();
+        if (segment_cache.snapshot_selection_identity.matches(
+                source_identity, topology_generation))
+        {
+            return segment_cache.snapshot_selection_identity.
+                effective_configuration_identity;
+        }
+
+        uint64_t effective_identity =
+            kNoCapturedSnapshotCopiesIdentity;
+        if (config_.snapshot_callback)
+        {
+            /*
+             * Launch preparation is the authority for persistent snapshot
+             * descriptors. A pristine helper may still expose an empty or stale
+             * descriptor here, so conservatively give its first executable the
+             * complete configured identity. Initialized graphs have already
+             * frozen their descriptors and can be narrowed without recapture.
+             */
+            effective_identity = source_identity;
+            if (segment_cache.initialized)
+            {
+                effective_identity = kNoCapturedSnapshotCopiesIdentity;
+                std::unordered_set<std::string> filtered_stages;
+                std::unordered_set<std::string> outputless_stages;
+                for (const std::string &name : graph.getExecutionOrder())
+                {
+                    ComputeNode *const node = graph.getNode(name);
+                    if (!node || !node->stage)
+                        continue;
+
+                    DeviceId snapshot_device =
+                        node->device.is_valid()
+                            ? node->device
+                            : node->stage->device();
+                    if (!snapshot_device.is_gpu())
+                        continue;
+
+                    StageDumpInfo dump_info =
+                        node->stage->refreshDumpInfoSnapshot();
+                    if (!shouldCaptureSnapshotStage(name, dump_info))
+                    {
+                        filtered_stages.insert(name);
+                        continue;
+                    }
+
+                    bool selected_tensor_output = false;
+                    for (const auto &output : dump_info.outputs)
+                    {
+                        if (!isDeviceTensorSnapshotOutput(output))
+                            continue;
+                        if (config_.snapshot_stage_filter)
+                        {
+                            StageDumpInfo output_view = dump_info;
+                            output_view.outputs.clear();
+                            output_view.outputs.push_back(output);
+                            if (!shouldCaptureSnapshotStage(
+                                    name, output_view))
+                            {
+                                continue;
+                            }
+                        }
+                        selected_tensor_output = true;
+                        break;
+                    }
+                    if (selected_tensor_output)
+                    {
+                        effective_identity = source_identity;
+                        break;
+                    }
+                    outputless_stages.insert(name);
+                }
+
+                if (effective_identity ==
+                        kNoCapturedSnapshotCopiesIdentity &&
+                    segment_cache.snapshot_configuration_epoch ==
+                        kNoCapturedSnapshotCopiesIdentity)
+                {
+                    /*
+                     * This cache already owns the canonical lean native graph.
+                     * Its executable needs no mutation: publish only the frozen
+                     * negative selection that post-launch diagnostics consume.
+                     * A contradictory arena/copy descriptor would mean identity
+                     * one was attached to a non-lean executable, so force the
+                     * ordinary exact-identity rebuild instead of destroying a
+                     * pointer that may still be embedded in that graph.
+                     */
+                    if (segment_cache.snapshot_manifest.
+                            ownsCapturedCopyTopology())
+                    {
+                        effective_identity = source_identity;
+                    }
+                    else
+                    {
+                        segment_cache.snapshot_manifest.bindNoCopySelection(
+                            std::move(filtered_stages),
+                            std::move(outputless_stages));
+                    }
+                }
+            }
+        }
+
+        segment_cache.snapshot_selection_identity.publish(
+            source_identity,
+            topology_generation,
+            effective_identity);
+        return effective_identity;
     }
 
     bool DeviceGraphExecutor::prepareGraphSnapshotCopies(
@@ -1393,13 +1919,26 @@ namespace llaminar2
             return false;
         }
 
+        const auto required_storage_state =
+            record_device_copy
+                ? GraphSnapshotManifest::StorageState::StorageBound
+                : GraphSnapshotManifest::StorageState::CollectingDescriptors;
+        if (snapshot_manifest.storage_state != required_storage_state)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
+                                                       << "' entered graph snapshot "
+                                                       << (record_device_copy ? "recording" : "preparation")
+                                                       << " with an invalid manifest lifecycle state");
+            return false;
+        }
+
         StageDumpInfo dump_info = node.stage->refreshDumpInfoSnapshot();
         const bool capture_active = isGraphCaptureActive();
         const bool selected =
             shouldCaptureSnapshotStage(node.name, dump_info);
         if (!selected)
         {
-            if (capture_active &&
+            if (record_device_copy &&
                 !snapshot_manifest.filtered_stages.contains(node.name))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage '"
@@ -1408,13 +1947,16 @@ namespace llaminar2
                 return false;
             }
 
-            snapshot_manifest.stage_copies.erase(node.name);
-            snapshot_manifest.outputless_stages.erase(node.name);
-            snapshot_manifest.filtered_stages.insert(node.name);
+            if (!record_device_copy)
+            {
+                snapshot_manifest.stage_copies.erase(node.name);
+                snapshot_manifest.outputless_stages.erase(node.name);
+                snapshot_manifest.filtered_stages.insert(node.name);
+            }
             return true;
         }
 
-        if (capture_active &&
+        if (record_device_copy &&
             snapshot_manifest.filtered_stages.contains(node.name))
         {
             LOG_ERROR("[DeviceGraphExecutor] Stage '"
@@ -1422,7 +1964,8 @@ namespace llaminar2
                       << "' changed snapshot filter selection during graph capture");
             return false;
         }
-        snapshot_manifest.filtered_stages.erase(node.name);
+        if (!record_device_copy)
+            snapshot_manifest.filtered_stages.erase(node.name);
 
         std::vector<size_t> graph_output_indices;
         graph_output_indices.reserve(dump_info.outputs.size());
@@ -1452,7 +1995,7 @@ namespace llaminar2
 
         if (graph_output_indices.empty())
         {
-            if (capture_active)
+            if (record_device_copy)
             {
                 if (snapshot_manifest.outputless_stages.contains(node.name))
                     return true;
@@ -1473,60 +2016,37 @@ namespace llaminar2
             return true;
         }
 
-        snapshot_manifest.outputless_stages.erase(node.name);
+        if (!record_device_copy)
+            snapshot_manifest.outputless_stages.erase(node.name);
 
-        auto &stage_copies = snapshot_manifest.stage_copies[node.name];
-        if (stage_copies.outputs.size() != graph_output_indices.size())
+        GraphSnapshotStageCopies *stage_copies_ptr = nullptr;
+        if (record_device_copy)
         {
-            if (isGraphCaptureActive())
+            auto stage_it = snapshot_manifest.stage_copies.find(node.name);
+            if (stage_it == snapshot_manifest.stage_copies.end())
             {
-                std::vector<GraphSnapshotOutputCopy> reconciled;
-                reconciled.resize(graph_output_indices.size());
-                std::vector<bool> consumed(stage_copies.outputs.size(), false);
-                bool matched_all = true;
-
-                for (size_t i = 0; i < graph_output_indices.size(); ++i)
-                {
-                    const auto &output = dump_info.outputs[graph_output_indices[i]];
-                    const std::string output_name = snapshotOutputName(output);
-                    size_t match_index = stage_copies.outputs.size();
-                    if (!output_name.empty())
-                    {
-                        for (size_t j = 0; j < stage_copies.outputs.size(); ++j)
-                        {
-                            if (!consumed[j] && stage_copies.outputs[j].name == output_name)
-                            {
-                                consumed[j] = true;
-                                match_index = j;
-                                break;
-                            }
-                        }
-                    }
-                    if (match_index == stage_copies.outputs.size())
-                    {
-                        matched_all = false;
-                        break;
-                    }
-                    reconciled[i] = std::move(stage_copies.outputs[match_index]);
-                }
-
-                if (!matched_all)
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
-                                                             << "' changed snapshot output count during graph capture (old="
-                                                             << stage_copies.outputs.size()
-                                                             << " new=" << graph_output_indices.size()
-                                                             << ") and the device-backed outputs could not be reconciled by name");
-                    return false;
-                }
-
-                stage_copies.outputs = std::move(reconciled);
+                LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
+                                                           << "' appeared only after snapshot storage binding");
+                return false;
             }
-            else
-            {
-                stage_copies.outputs.clear();
-                stage_copies.outputs.resize(graph_output_indices.size());
-            }
+            stage_copies_ptr = &stage_it->second;
+        }
+        else
+        {
+            stage_copies_ptr = &snapshot_manifest.stage_copies[node.name];
+            stage_copies_ptr->outputs.clear();
+            stage_copies_ptr->outputs.resize(graph_output_indices.size());
+        }
+
+        auto &stage_copies = *stage_copies_ptr;
+        if (record_device_copy &&
+            stage_copies.outputs.size() != graph_output_indices.size())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
+                                                       << "' changed snapshot output count after storage binding (prepared="
+                                                       << stage_copies.outputs.size()
+                                                       << " recorded=" << graph_output_indices.size() << ")");
+            return false;
         }
 
         for (size_t i = 0; i < graph_output_indices.size(); ++i)
@@ -1579,7 +2099,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (capture_active)
+            if (record_device_copy)
             {
                 /*
                  * GPU graph snapshot descriptors are immutable capture inputs.
@@ -1631,68 +2151,40 @@ namespace llaminar2
                 copy.device = copy_device;
                 copy.source_ptr = source_ptr;
                 copy.descriptor_finalized = true;
-            }
-
-            const size_t storage_elements =
-                std::max<size_t>(1, (copy.byte_size + sizeof(float) - 1) / sizeof(float));
-            const size_t storage_bytes = storage_elements * sizeof(float);
-            const bool needs_new_storage =
-                !copy.storage ||
-                copy.device != copy_device ||
-                copy.storage_bytes < storage_bytes ||
-                !copy.storage->isMapped();
-
-            if (needs_new_storage)
-            {
-                if (isGraphCaptureActive())
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
-                                                             << "' needs new graph snapshot storage during graph capture"
-                                                             << " for output '" << copy.name << "' bytes="
-                                                             << copy.byte_size);
-                    return false;
-                }
-
-                /*
-                 * Snapshot values are intentional debug results surfaced to
-                 * the host. Give each immutable graph slot mapped host storage
-                 * and record the point-in-time D2D copy into its device-visible
-                 * address. This preserves arena-aliased stage values without
-                 * reserving one full HBM tensor per output.
-                 */
-                copy.storage = FP32Tensor::createMapped(
-                    std::vector<size_t>{storage_elements},
-                    copy_device);
-                if (!copy.storage || !copy.storage->isMapped())
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Failed to allocate required mapped graph "
-                              "snapshot storage for stage '"
-                              << node.name << "' output '" << copy.name << "' bytes="
-                              << copy.byte_size << " on " << copy_device.toString());
-                    return false;
-                }
-                copy.device = copy_device;
-                copy.storage_bytes = storage_bytes;
-            }
-
-            if (!copy.storage->gpu_data_ptr())
-            {
-                LOG_ERROR("[DeviceGraphExecutor] Mapped graph snapshot storage has no device-visible pointer for stage '"
-                          << node.name << "' output '" << copy.name << "' on "
-                          << copy_device.toString());
-                return false;
+                const size_t storage_elements =
+                    std::max<size_t>(
+                        1,
+                        (copy.byte_size + sizeof(float) - 1) /
+                            sizeof(float));
+                copy.storage_bytes = storage_elements * sizeof(float);
             }
 
             if (!record_device_copy)
                 continue;
 
-            void *dst_ptr = copy.storage->gpu_data_ptr();
-            if (!dst_ptr)
+            if (!snapshot_manifest.storageBound() ||
+                !snapshot_manifest.storage_arena ||
+                snapshot_manifest.storage_device != copy_device ||
+                snapshot_manifest.storage_arena->isMapped() ||
+                !snapshot_manifest.storage_arena->gpu_data_ptr() ||
+                copy.storage_offset_bytes >
+                    snapshot_manifest.storage_capacity_bytes ||
+                copy.byte_size >
+                    snapshot_manifest.storage_capacity_bytes -
+                        copy.storage_offset_bytes)
             {
-                LOG_ERROR("[DeviceGraphExecutor] Graph snapshot storage has no device pointer for stage '"
-                          << node.name << "' output '" << copy.name << "'");
+                LOG_ERROR("[DeviceGraphExecutor] Graph snapshot slot is not bound to an in-bounds device arena"
+                          << " stage='" << node.name << "' output='" << copy.name
+                          << "' offset=" << copy.storage_offset_bytes
+                          << " bytes=" << copy.byte_size
+                          << " capacity=" << snapshot_manifest.storage_capacity_bytes
+                          << " device=" << copy_device.toString());
                 return false;
             }
+
+            auto *arena_device_bytes = static_cast<uint8_t *>(
+                snapshot_manifest.storage_arena->gpu_data_ptr());
+            void *dst_ptr = arena_device_bytes + copy.storage_offset_bytes;
 
             IBackend *backend = getBackendFor(copy_device);
             if (!backend)
@@ -1715,7 +2207,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (isGraphCaptureActive())
+            if (capture_active)
             {
                 /*
                  * The D2D copy has been recorded as a graph node, but it has
@@ -1726,18 +2218,87 @@ namespace llaminar2
                  * after the captured graph is launched.
                  */
                 TransferEngine::publishGraphOwnedDeviceWrite(
-                    copy.storage.get(),
+                    snapshot_manifest.storage_arena.get(),
                     copy_device);
             }
-            else
-            {
-                TransferEngine::publishDeviceWrite(
-                    copy.storage.get(),
-                    copy_device,
-                    producer_stream);
-            }
+            /*
+             * Eager diagnostics publish after the complete selected stage copy.
+             * The publisher owns that one arena event; recording one here for
+             * every output would recreate the redundant per-slot lifecycle this
+             * arena removes.
+             */
         }
 
+        return true;
+    }
+
+    bool DeviceGraphExecutor::acquireGraphSnapshotArenaOnHost(
+        void *producer_stream,
+        GraphSnapshotManifest &snapshot_manifest)
+    {
+        if (!snapshot_manifest.storageBound())
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Cannot publish a graph snapshot arena before storage binding completes");
+            return false;
+        }
+        if (snapshot_manifest.bound_slot_count == 0)
+            return true;
+        if (!producer_stream || !snapshot_manifest.storage_arena ||
+            !snapshot_manifest.storage_device.is_gpu() ||
+            snapshot_manifest.storage_arena->isMapped() ||
+            !snapshot_manifest.storage_arena->gpu_data_ptr() ||
+            !snapshot_manifest.storage_arena->raw_data())
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Bound graph snapshot arena has incomplete publication state");
+            return false;
+        }
+
+        /*
+         * Every captured D2D node writes a disjoint VRAM range on this graph
+         * stream. Publish the complete producer transaction, then let
+         * TransferEngine issue exactly one whole-tensor D2H copy. Per-slot host
+         * writes or events add no ordering strength and can overwhelm the GPU
+         * runtime's host-memory completion path on large parity manifests.
+         */
+        TransferEngine::publishDeviceWrite(
+            snapshot_manifest.storage_arena.get(),
+            snapshot_manifest.storage_device,
+            producer_stream);
+        const auto download_begin = std::chrono::steady_clock::now();
+        if (!snapshot_manifest.storage_arena->ensureOnHost(producer_stream))
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Failed to bulk-download graph snapshot arena"
+                      << " device="
+                      << snapshot_manifest.storage_device.toString()
+                      << " bytes="
+                      << snapshot_manifest.storage_required_bytes);
+            return false;
+        }
+        const auto download_end = std::chrono::steady_clock::now();
+        ++snapshot_manifest.bulk_download_count;
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "snapshot_device_arena_bulk_downloads",
+            1.0,
+            "diagnostic",
+            snapshot_manifest.storage_device.toString());
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "snapshot_device_arena_bulk_download_bytes",
+            static_cast<double>(snapshot_manifest.storage_required_bytes),
+            "diagnostic",
+            snapshot_manifest.storage_device.toString());
+        PerfStatsCollector::recordTimingNs(
+            "forward_graph",
+            "snapshot_device_arena_bulk_download",
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    download_end - download_begin)
+                    .count()),
+            "diagnostic",
+            snapshot_manifest.storage_device.toString());
         return true;
     }
 
@@ -1745,7 +2306,8 @@ namespace llaminar2
         const std::string &stage_name,
         void *producer_stream,
         GraphSnapshotManifest &snapshot_manifest,
-        const GraphSnapshotLogicalRows *logical_rows)
+        const GraphSnapshotLogicalRows *logical_rows,
+        GraphSnapshotPublicationMode publication_mode)
     {
         if (!config_.snapshot_callback)
             return true;
@@ -1784,12 +2346,37 @@ namespace llaminar2
             return false;
         }
 
+        if (publication_mode ==
+                GraphSnapshotPublicationMode::PublishAndAcquireArena &&
+            !acquireGraphSnapshotArenaOnHost(
+                producer_stream, snapshot_manifest))
+        {
+            return false;
+        }
+        if (!snapshot_manifest.storageBound() ||
+            !snapshot_manifest.storage_arena ||
+            !snapshot_manifest.storage_arena->raw_data())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] GPU snapshot stage '" << stage_name
+                                                                   << "' has no acquired graph-owned arena");
+            return false;
+        }
+
+        const auto *arena_host_bytes = static_cast<const uint8_t *>(
+            snapshot_manifest.storage_arena->raw_data());
+
         StageDumpInfo snapshot_info;
         snapshot_info.outputs.reserve(stage_copies.outputs.size());
         for (auto &copy : stage_copies.outputs)
         {
-            if (!copy.storage || !copy.device.is_gpu() || copy.byte_size == 0 ||
-                copy.name.empty() || copy.dtype.empty())
+            if (!copy.device.is_gpu() || copy.byte_size == 0 ||
+                copy.name.empty() || copy.dtype.empty() ||
+                copy.device != snapshot_manifest.storage_device ||
+                copy.storage_offset_bytes >
+                    snapshot_manifest.storage_capacity_bytes ||
+                copy.byte_size >
+                    snapshot_manifest.storage_capacity_bytes -
+                        copy.storage_offset_bytes)
             {
                 LOG_ERROR("[DeviceGraphExecutor] GPU snapshot stage '" << stage_name
                                                                        << "' has an incomplete captured slot for output '"
@@ -1797,28 +2384,23 @@ namespace llaminar2
                 return false;
             }
 
-            // Replay updates the mapped storage through a captured D2D node, but
-            // no CPU stage code runs then. Mark each slot dirty with a real
-            // post-launch event so host publication waits for the just-replayed
-            // bytes before reading the host-visible mapping.
-            TransferEngine::publishDeviceWrite(
-                copy.storage.get(),
-                copy.device,
-                producer_stream);
-
             StageDumpInfo::OutputBuffer output;
             output.name = copy.name.c_str();
-            output.data = copy.storage->raw_data();
+            output.data = arena_host_bytes + copy.storage_offset_bytes;
             output.rows = copy.rows;
             output.cols = copy.cols;
             output.dtype = copy.dtype.c_str();
             output.element_size = copy.element_size;
             output.byte_size = copy.byte_size;
-            output.tensor = copy.storage.get();
+            /*
+             * The arena was already acquired through TransferEngine. Keeping
+             * this subrange as a raw diagnostic view prevents StageDumpInfo from
+             * replacing the offset pointer with the arena base address.
+             */
+            output.tensor = nullptr;
             snapshot_info.outputs.push_back(output);
         }
 
-        snapshot_info.ensureOutputsOnHost(producer_stream);
         std::vector<std::vector<uint8_t>> compacted_outputs;
         if (!projectSnapshotOutputsToLogicalRows(
                 stage_name,
@@ -1867,6 +2449,52 @@ namespace llaminar2
                 << logical_rows->logical_rows_per_sequence.front());
         }
 
+        GraphSnapshotManifest &manifest =
+            snapshot_manifest ? *snapshot_manifest
+                              : transient_snapshot_manifest_;
+        if (manifest.bound_slot_count > 0)
+        {
+            void *arena_producer_stream = producer_stream_override;
+            bool found_gpu_snapshot_producer = false;
+            for (const auto &name : order)
+            {
+                ComputeNode *node = graph.getNode(name);
+                if (!node || !node->stage ||
+                    !manifest.stage_copies.contains(name))
+                {
+                    continue;
+                }
+                const DeviceId snapshot_device =
+                    node->device.is_valid() ? node->device
+                                            : node->stage->device();
+                if (!snapshot_device.is_gpu())
+                    continue;
+
+                found_gpu_snapshot_producer = true;
+                void *const stage_stream = node->stage->gpuStream();
+                if (!arena_producer_stream)
+                    arena_producer_stream = stage_stream;
+                if (!producer_stream_override &&
+                    stage_stream != arena_producer_stream)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Graph snapshot arena has multiple producer streams without an explicit graph-stream override");
+                    return false;
+                }
+            }
+            if (!found_gpu_snapshot_producer || !arena_producer_stream)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Graph snapshot arena has slots but no exact GPU producer stream");
+                return false;
+            }
+            if (!acquireGraphSnapshotArenaOnHost(
+                    arena_producer_stream, manifest))
+            {
+                return false;
+            }
+        }
+
         auto total_start = std::chrono::high_resolution_clock::now();
         size_t callback_count = 0;
 
@@ -1897,14 +2525,12 @@ namespace llaminar2
                      * resolve a different cache view, logical row count, or
                      * arena alias than the source pointer baked into the graph.
                      */
-                    GraphSnapshotManifest &manifest =
-                        snapshot_manifest ? *snapshot_manifest
-                                          : transient_snapshot_manifest_;
                     if (!publishGraphSnapshotCopies(
                             name,
                             producer_stream,
                             manifest,
-                            logical_rows))
+                            logical_rows,
+                            GraphSnapshotPublicationMode::ArenaAlreadyAcquired))
                         return false;
                 }
                 else
@@ -2677,7 +3303,10 @@ namespace llaminar2
                  * *_ALLREDUCED diagnostics permanently stuck at warmup bytes
                  * for monolithic prefill graphs.
                  */
-                if (ok && config_.snapshot_callback)
+                if (ok && config_.snapshot_callback &&
+                    policy.snapshot_recording_authority ==
+                        StageRunPolicy::SnapshotRecordingAuthority::
+                            StageExecutor)
                 {
                     DeviceId snapshot_device = target_device;
                     if (!snapshot_device.is_valid() && ctx)
@@ -3111,7 +3740,10 @@ namespace llaminar2
             }
         }
 
-        if (success && config_.snapshot_callback && !policy.snapshot_callback)
+        if (success && config_.snapshot_callback &&
+            policy.snapshot_recording_authority ==
+                StageRunPolicy::SnapshotRecordingAuthority::StageExecutor &&
+            !policy.snapshot_callback)
         {
             DeviceId snapshot_device = target_device;
             if (!snapshot_device.is_valid() && ctx)
@@ -3183,6 +3815,8 @@ namespace llaminar2
         // Snapshot Callback
         // =====================================================================
         if (success &&
+            policy.snapshot_recording_authority ==
+                StageRunPolicy::SnapshotRecordingAuthority::StageExecutor &&
             policy.snapshot_callback &&
             config_.snapshot_callback)
         {

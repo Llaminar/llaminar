@@ -59,6 +59,7 @@
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/VerifierRowTestInventory.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/MoEOverlayServiceTelemetryCoverageTest.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../moe/ActiveExpertCompactionTestOracle.h"
 #include "../moe/CanonicalMoEPublicationTestOracle.h"
@@ -1552,6 +1553,67 @@ TEST(Test__ROCmMoEKernel,
 }
 
 /**
+ * @brief Prove device-resident Dynamic owns accepted publication without a drain.
+ *
+ * A homogeneous GPU controller reads the runtime table's embedded histograms
+ * directly and therefore installs no host asynchronous drain. MTP accepted
+ * rows still need one model-lifetime capture stream. This is the production
+ * combination that previously failed only when Dynamic and MTP were composed.
+ */
+TEST(Test__ROCmMoEKernel,
+     DeviceResidentGroupedVerifierPublicationOwnsStreamWithoutHostDrain)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    SKIP_IF_NO_ROCM();
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    DeviceMoERuntimeTable::Config config;
+    config.device_id = DeviceId::rocm(0);
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.mirror_to_device = true;
+    config.grouped_verifier_histogram_publication =
+        GroupedVerifierHistogramPublicationMode::AcceptedRows;
+    DeviceMoERuntimeTable table(config);
+
+    void *const publication_stream =
+        table.groupedVerifierHistogramPublicationStream();
+    ASSERT_NE(publication_stream, nullptr);
+    ASSERT_NO_THROW(
+        table.prepareDecodeHistogramProducerStream(publication_stream));
+
+    HipAllocation graph_witness(sizeof(uint32_t));
+    ScopedHipTestGraph graph(
+        /*device_ordinal=*/0,
+        static_cast<hipStream_t>(publication_stream),
+        "device-resident accepted histogram publication");
+    ASSERT_NO_THROW(
+        table.recordDecodeHistogramProducerStream(publication_stream));
+    ASSERT_EQ(
+        hipMemsetAsync(
+            graph_witness.get(),
+            0x3c,
+            sizeof(uint32_t),
+            static_cast<hipStream_t>(publication_stream)),
+        hipSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
+    ASSERT_EQ(
+        hipStreamSynchronize(static_cast<hipStream_t>(publication_stream)),
+        hipSuccess);
+
+    EXPECT_THROW(
+        table.enableAsyncDecodeHistogramDrain(
+            RuntimeExpertHistogramSourceMask{true, true, false}),
+        std::invalid_argument)
+        << "A host drain may not silently discard the table's accepted-row source";
+#endif
+}
+
+/**
  * @brief Prove async histogram setup is joined before HIP graph capture.
  *
  * HIP has the same producer/maintenance ordering requirement as CUDA even
@@ -1577,6 +1639,8 @@ TEST(Test__ROCmMoEKernel,
     config.num_experts = 4;
     config.top_k = 2;
     config.mirror_to_device = true;
+    config.grouped_verifier_histogram_publication =
+        GroupedVerifierHistogramPublicationMode::AcceptedRows;
     DeviceMoERuntimeTable table(config);
     table.enableAsyncDecodeHistogramDrain(
         kAllRuntimeExpertHistogramSources);
@@ -1613,21 +1677,54 @@ TEST(Test__ROCmMoEKernel,
         std::logic_error);
 
     HipAllocation graph_witness(sizeof(uint32_t));
-    ScopedHipTestGraph graph(
-        /*device_ordinal=*/0,
-        static_cast<hipStream_t>(publication_stream),
-        "pre-admitted histogram publication after topology seal");
-    ASSERT_NO_THROW(
-        table.recordDecodeHistogramProducerStream(publication_stream));
-    ASSERT_EQ(
-        hipMemsetAsync(
+    RuntimeExpertHistogramDrainResult capture_drain;
+    bool producer_recorded = false;
+    hipError_t memset_status = hipErrorUnknown;
+    bool graph_instantiated = false;
+    bool capture_activity_open = true;
+    table.transitionDecodeHistogramProducerCapture(
+        publication_stream,
+        RuntimeHistogramProducerCaptureTransition::Entering);
+    try
+    {
+        ScopedHipTestGraph graph(
+            /*device_ordinal=*/0,
+            static_cast<hipStream_t>(publication_stream),
+            "pre-admitted histogram publication after topology seal");
+        capture_drain = table.progressAsyncDecodeHistogramDrain(histogram);
+        table.recordDecodeHistogramProducerStream(publication_stream);
+        producer_recorded = true;
+        memset_status = hipMemsetAsync(
             graph_witness.get(),
             0xa5,
             sizeof(uint32_t),
-            static_cast<hipStream_t>(publication_stream)),
-        hipSuccess);
-    ASSERT_TRUE(graph.finishAndInstantiate());
-    ASSERT_TRUE(graph.launch());
+            static_cast<hipStream_t>(publication_stream));
+        graph_instantiated = graph.finishAndInstantiate();
+        table.transitionDecodeHistogramProducerCapture(
+            publication_stream,
+            graph_instantiated
+                ? RuntimeHistogramProducerCaptureTransition::Completed
+                : RuntimeHistogramProducerCaptureTransition::Aborted);
+        capture_activity_open = false;
+        ASSERT_TRUE(graph_instantiated);
+        ASSERT_TRUE(graph.launch());
+    }
+    catch (...)
+    {
+        if (capture_activity_open)
+        {
+            table.transitionDecodeHistogramProducerCapture(
+                publication_stream,
+                RuntimeHistogramProducerCaptureTransition::Aborted);
+        }
+        throw;
+    }
+    EXPECT_EQ(
+        capture_drain.progress,
+        RuntimeExpertHistogramDrainProgress::Pending)
+        << capture_drain.error;
+    EXPECT_TRUE(producer_recorded);
+    EXPECT_EQ(memset_status, hipSuccess);
     ASSERT_EQ(
         hipStreamSynchronize(
             static_cast<hipStream_t>(publication_stream)),
@@ -1663,6 +1760,8 @@ TEST(Test__ROCmMoEKernel,
     config.num_experts = 4;
     config.top_k = 2;
     config.mirror_to_device = true;
+    config.grouped_verifier_histogram_publication =
+        GroupedVerifierHistogramPublicationMode::AcceptedRows;
     auto table = std::make_unique<DeviceMoERuntimeTable>(config);
     ScopedRuntimeHistogramProducerRetirement histogram_retirement(*table);
 
@@ -1728,7 +1827,10 @@ TEST(Test__ROCmMoEKernel,
     table_config.num_experts = kNumExperts;
     table_config.top_k = kTopK;
     table_config.mirror_to_device = true;
-    table_config.collect_overlay_service_telemetry = true;
+    table_config.grouped_verifier_histogram_publication =
+        GroupedVerifierHistogramPublicationMode::AcceptedRows;
+    table_config.overlay_service_telemetry_coverage =
+        MoEOverlayServiceTelemetryCoverage::AllRuntimeLayers;
     DeviceMoERuntimeTable table(table_config);
     ScopedRuntimeHistogramProducerRetirement histogram_retirement(table);
     table.enableAsyncDecodeHistogramDrain(
@@ -1799,6 +1901,21 @@ TEST(Test__ROCmMoEKernel,
     /* The writer state is now encoded as bank-one plus quarantine (3). */
     ASSERT_TRUE(graph.launch());
     ASSERT_EQ(hipStreamSynchronize(producer_stream.get()), hipSuccess);
+#endif
+}
+
+/** @brief Prove equivalent ROCm layers omit redundant captured markers. */
+TEST(Test__ROCmMoEKernel,
+     ServiceTelemetryBindsOnlyExactCatalogStrata)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    SKIP_IF_NO_ROCM();
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    llaminar2::test::
+        verifyStratifiedMoEOverlayServiceTelemetryCoverage(
+            DeviceId::rocm(0));
 #endif
 }
 
@@ -20077,7 +20194,7 @@ TEST(Test__ROCmMoEKernel, RuntimeGroupedDecodeFusedPathMatchesTwoStepAndCaptures
             {transfer_projection_specs});
     auto *rocm_backend = getROCmBackend();
     ASSERT_NE(rocm_backend, nullptr);
-    auto transfer_directory = DeviceMoETransferSlotDirectory::create(
+    auto transfer_directory = DeviceMoETransferSlotDirectory::createForTest(
         rocm_backend,
         device,
         /*device_ordinal=*/0,
@@ -20565,7 +20682,7 @@ TEST(Test__ROCmMoEKernel, TransferSlotDirectoriesArePhysicallyParticipantLocal)
         auto profile =
             DeviceMoETransferSlotDirectory::profileForLayerFormats({specs});
         directories[static_cast<size_t>(ordinal)] =
-            DeviceMoETransferSlotDirectory::create(
+            DeviceMoETransferSlotDirectory::createForTest(
                 backend,
                 DeviceId::rocm(ordinal),
                 ordinal,
@@ -20694,7 +20811,7 @@ TEST(Test__ROCmMoEKernel,
     auto profile =
         DeviceMoETransferSlotDirectory::profileForLayerFormats({specs});
     auto directory =
-        DeviceMoETransferSlotDirectory::create(
+        DeviceMoETransferSlotDirectory::createForTest(
             backend,
             DeviceId::rocm(0),
             /*device_ordinal=*/0,
@@ -28085,6 +28202,30 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_PrefillScale)
               << " sum_counts=" << sum_counts
               << " all_tokens_accounted=" << (all_tokens_accounted ? "true" : "false")
               << " weights_match=" << (weights_match ? "true" : "false") << std::endl;
+}
+
+/**
+ * @brief Prove every quantized GPU-aligned expert is CPU/ROCm byte-identical.
+ *
+ * This exercises the two physical execution domains using identical source
+ * weights and the production grouped sparse-MoE implementation across decode,
+ * verifier, and prefill row counts. No dequantized reference or
+ * residency-specific tolerance can hide a mismatch.
+ */
+TEST(
+    Test__ROCmMoEKernel,
+    CPUAndROCmAllQuantizedExpertFormatsAreByteExactAcrossM)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    llaminar2::test::runCPUToGPUAllFormatExpertArithmeticParity(
+        "ROCm",
+        llaminar2::DeviceId::rocm(0),
+        rocmMoETestStream());
 }
 
 /**

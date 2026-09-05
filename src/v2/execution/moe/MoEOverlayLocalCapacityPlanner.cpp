@@ -15,11 +15,13 @@
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "planning/MemoryPlanner.h"
 #include "planning/WeightMemoryEstimator.h"
+#include "config/BackendSelector.h"
 #include "utils/Logger.h"
 
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -29,20 +31,6 @@ namespace llaminar2
 {
     namespace
     {
-        [[nodiscard]] std::size_t checkedAdd(
-            std::size_t left,
-            std::size_t right,
-            const char *what)
-        {
-            if (right > std::numeric_limits<std::size_t>::max() - left)
-            {
-                throw std::overflow_error(
-                    std::string("ExpertOverlay local capacity ") + what +
-                    " overflows size_t");
-            }
-            return left + right;
-        }
-
         [[nodiscard]] std::pair<std::size_t, std::size_t> inventoryMemory(
             const RankInventory &inventory,
             DeviceId device)
@@ -139,12 +127,13 @@ namespace llaminar2
         }
     } // namespace
 
-    CapturedGraphExecutableInventory
-    resolveMoEOverlayCapturedGraphExecutableInventory(
+    MoEOverlayCapturedGraphPlan
+    resolveMoEOverlayCapturedGraphPlan(
         int model_layer_count,
         MoEOverlayAuthorityExecutionKind authority_execution,
         std::size_t model_graph_identity_count,
-        std::size_t auxiliary_native_executable_count)
+        std::size_t model_graph_topology_variant_count,
+        std::size_t auxiliary_executable_count)
     {
         if (model_layer_count <= 0)
         {
@@ -158,8 +147,14 @@ namespace llaminar2
                 "ExpertOverlay captured graph inventory requires a frozen authority topology");
         }
 
-        std::size_t native_segments_per_model_graph =
+        std::size_t compilation_units_per_model_graph =
             model_graph_identity_count == 0u ? 0u : 1u;
+        if ((model_graph_identity_count == 0u) !=
+            (model_graph_topology_variant_count == 0u))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay captured graph inventory requires topology variants exactly when model graphs are retained");
+        }
         if (model_graph_identity_count != 0u &&
             authority_execution ==
                 MoEOverlayAuthorityExecutionKind::HostResident)
@@ -171,15 +166,23 @@ namespace llaminar2
                 throw std::overflow_error(
                     "ExpertOverlay captured graph segment count overflows size_t");
             }
-            native_segments_per_model_graph = layers + 1u;
+            compilation_units_per_model_graph = layers + 1u;
         }
 
         return {
-            .model_graph_identity_count = model_graph_identity_count,
-            .native_segments_per_model_graph =
-                native_segments_per_model_graph,
-            .auxiliary_native_executable_count =
-                auxiliary_native_executable_count,
+            .resident_executables = {
+                .model_graph_identity_count = model_graph_identity_count,
+                .model_graph_topology_variant_count =
+                    model_graph_topology_variant_count,
+                .auxiliary_executable_count = auxiliary_executable_count,
+            },
+            .compilation = {
+                .model_graph_identity_count = model_graph_identity_count,
+                .model_graph_topology_variant_count =
+                    model_graph_topology_variant_count,
+                .compilation_units_per_model_graph =
+                    compilation_units_per_model_graph,
+            },
         };
     }
 
@@ -357,6 +360,11 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay local capacity planner received invalid model/rank geometry");
         }
+        if (!input.captured_graph_plan.valid())
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay local capacity planner requires one consistent captured-graph compile/residency plan");
+        }
         if (retainsMTPGraphCapacity(rank_plan.runtime.mtp) &&
             input.resident_graph_rows > 0 &&
             input.resident_graph_rows <
@@ -420,11 +428,15 @@ namespace llaminar2
         std::set<DeviceId> resource_devices = endpoint_devices;
         if (input.require_host_memory_authority)
             resource_devices.insert(DeviceId::cpu());
+        for (const auto &charge : activation_channel_plan.staging_charges)
+        {
+            if (charge.world_rank == rank_plan.rank)
+                resource_devices.insert(charge.device);
+        }
 
         const std::vector<int> no_routed_experts(
             static_cast<std::size_t>(profile.n_layers), 0);
         std::vector<DevicePlanConfig> configs;
-        std::map<DeviceId, GPUWeightLoadMemoryBOM> gpu_weight_load_boms;
         const auto makeConfig = [&](
             DeviceId device,
             int shard_index,
@@ -434,6 +446,7 @@ namespace llaminar2
             const auto [total_bytes, available_bytes] =
                 inventoryMemory(inventory, device);
             DevicePlanConfig config;
+            config.world_rank = rank_plan.rank;
             config.device = device;
             config.device_total_bytes = total_bytes;
             config.device_free_bytes = usableMemory(
@@ -453,19 +466,29 @@ namespace llaminar2
                  * by MemoryPlanner and the global quota resolver respectively;
                  * charging them here would double-count them.
                  */
-                const auto load_bom = gpuWeightLoadMemoryBOM(
-                    /*planned_weight_bytes=*/0,
+                const auto load_geometry =
+                    resolveGPUWeightLoadMemoryGeometry(
                     input.gpu_weight_load->maximum_source_bytes,
-                    config.device_free_bytes,
                     input.gpu_weight_load->policy);
-                gpu_weight_load_boms[device] = load_bom;
+                config.weight_load_staging = {
+                    .device_bytes = load_geometry.staging_bytes,
+                    .host_bytes = load_geometry.host_staging_bytes,
+                };
             }
             config.device_compute_units =
                 inventoryComputeUnits(inventory, device);
+            if (device.is_gpu())
+            {
+                config.graph_snapshot_memory =
+                    input.graph_snapshot_memory;
+            }
             config.shard_index = shard_index;
             config.total_shards = total_shards;
             config.first_layer = rank_plan.first_layer;
             config.last_layer = rank_plan.last_layer;
+            config.owns_embedding =
+                role == DeviceExecutionMemoryRole::ContinuationGraph &&
+                rank_plan.has_embedding;
             config.batch_size = rank_plan.runtime.batch_size;
             config.max_seq_len = rank_plan.runtime.max_seq_len;
             config.activation_seq_len =
@@ -485,6 +508,11 @@ namespace llaminar2
              */
             config.mtp_enabled =
                 retainsMTPGraphCapacity(rank_plan.runtime.mtp);
+            config.mtp_shifted_kv_head_layout =
+                resolveMTPShiftedKVHeadLayout(
+                    rank_plan.runtime.mtp,
+                    /*dense_tensor_parallel=*/total_shards > 1,
+                    total_shards);
             config.mtp_target_query_rows =
                 std::max(
                     1,
@@ -504,6 +532,27 @@ namespace llaminar2
                     rank_plan.runtime.kv_cache_precision,
                     device.is_cpu()));
             config.prefix_cache = rank_plan.runtime.prefix_cache;
+            const bool owns_host_prefix_tier =
+                role == DeviceExecutionMemoryRole::ContinuationGraph &&
+                config.prefix_cache.enabled &&
+                config.prefix_cache.storage_mode !=
+                    PrefixCacheStorageMode::Disabled &&
+                config.prefix_cache.storage_mode !=
+                    PrefixCacheStorageMode::Device;
+            if (device.is_gpu() &&
+                (owns_host_prefix_tier ||
+                 config.weight_load_staging.host_bytes != 0u))
+            {
+                const auto [host_total, host_available] =
+                    inventoryMemory(inventory, DeviceId::cpu());
+                config.associated_host_memory = PhysicalMemoryResource{
+                    .world_rank = rank_plan.rank,
+                    .device = DeviceId::cpu(),
+                    .total_bytes = host_total,
+                    .admission_available_bytes = usableMemory(
+                        host_available, DeviceId::cpu(), input),
+                };
+            }
             if (total_shards > 1 && profile.n_kv_heads > 0)
             {
                 config.local_kv_heads =
@@ -534,7 +583,7 @@ namespace llaminar2
                         overlay_plan.continuation_domain_spec
                             .effectiveDensePolicy(),
                         total_shards,
-                        rank_plan.runtime.mtp.terminal_head_policy);
+                        rank_plan.runtime.mtp);
             }
             config.weight_residency =
                 role == DeviceExecutionMemoryRole::ContinuationGraph
@@ -590,8 +639,16 @@ namespace llaminar2
                 DeviceExecutionMemoryRole::ContinuationGraph);
             config.first_layer = shard.first_layer;
             config.last_layer = shard.last_layer;
+            config.owns_embedding =
+                rank_plan.has_embedding && shard.first_layer == 0;
             if (rank_plan.usesLocalTP())
             {
+                std::vector<DeviceId> tp_devices;
+                tp_devices.reserve(rank_plan.local_tp_devices.size());
+                for (const auto &participant : rank_plan.local_tp_devices)
+                    tp_devices.push_back(participant.toLocalDeviceId());
+                config.local_tp_backend = BackendSelector::resolve(
+                    rank_plan.local_tp_backend, tp_devices);
                 bindRankLocalTPAssignment(
                     config,
                     rank_plan.local_tp_devices,
@@ -618,6 +675,13 @@ namespace llaminar2
                         config,
                         stage_tp.devices,
                         stage_tp.tp_weights);
+                    std::vector<DeviceId> tp_devices;
+                    tp_devices.reserve(stage_tp.devices.size());
+                    for (const auto &participant : stage_tp.devices)
+                        tp_devices.push_back(
+                            participant.toLocalDeviceId());
+                    config.local_tp_backend = BackendSelector::resolve(
+                        stage_tp.tp_backend, tp_devices);
                     break;
                 }
             }
@@ -643,74 +707,79 @@ namespace llaminar2
             std::move(activation_channel_plan);
         result.fixed_memory_plan = MemoryPlanner::plan(profile, configs);
 
-        std::map<DeviceId, std::size_t> grouped_fixed_bytes;
+        PhysicalMemoryPlanBuilder physical_plan_builder;
         for (const auto &device_plan : result.fixed_memory_plan.devices)
         {
+            resource_devices.insert(device_plan.device());
             LOG_DEBUG(
                 "[MoEOverlayCapacity] fixed component BOM device="
-                << device_plan.device.toString()
-                << " weights=" << device_plan.weight_bytes
+                << device_plan.device().toString()
+                << " weights=" << device_plan.weight_bytes()
                 << " additional_weights="
-                << device_plan.additional_weight_bytes
-                << " kv_cache=" << device_plan.kv_cache_bytes
+                << device_plan.additional_weight_bytes()
+                << " kv_cache=" << device_plan.kv_cache_bytes()
                 << " persistent_state="
-                << device_plan.persistent_state_bytes
+                << device_plan.persistent_state_bytes()
                 << " prefix_staging="
-                << device_plan.prefix_cache_staging_bytes
+                << device_plan.prefix_cache_staging_bytes()
                 << " prefix_device_hot="
-                << device_plan.prefix_cache_device_hot_bytes
-                << " collective=" << device_plan.collective_bytes
-                << " activations=" << device_plan.activation_bytes
-                << " workspace=" << device_plan.workspace_bytes
+                << device_plan.prefix_cache_device_hot_bytes()
+                << " collective=" << device_plan.collective_bytes()
+                << " activations=" << device_plan.activation_bytes()
+                << " workspace=" << device_plan.workspace_bytes()
                 << " retained_workspace="
-                << device_plan.retained_workspace_bytes
+                << device_plan.retained_workspace_bytes()
                 << " total=" << device_plan.total_bytes());
-            auto &fixed_bytes = grouped_fixed_bytes[device_plan.device];
-            fixed_bytes = checkedAdd(
-                fixed_bytes,
-                device_plan.total_bytes(),
-                "fixed device BOM");
+            physical_plan_builder.add(device_plan.bom());
         }
 
-        result.physical_budgets.reserve(resource_devices.size());
         for (const DeviceId device : resource_devices)
         {
             const auto [total_bytes, available_bytes] =
                 inventoryMemory(inventory, device);
-            (void)total_bytes;
-            const auto found = grouped_fixed_bytes.find(device);
-            const std::size_t fixed_bytes =
-                found == grouped_fixed_bytes.end() ? 0u : found->second;
-            const auto gpu_load = gpu_weight_load_boms.find(device);
-            const std::size_t gpu_load_staging_bytes =
-                gpu_load == gpu_weight_load_boms.end()
-                    ? 0
-                    : gpu_load->second.staging_bytes;
+            const PhysicalMemoryResource resource{
+                .world_rank = rank_plan.rank,
+                .device = device,
+                .total_bytes = total_bytes,
+                .admission_available_bytes = usableMemory(
+                    available_bytes, device, input),
+            };
             const std::size_t activation_staging_bytes =
                 result.activation_channel_plan.stagingBytesFor(
                     rank_plan.rank, device);
             const std::size_t captured_graph_bytes =
                 device.is_gpu()
                     ? estimateCapturedGraphExecutableBytes(
-                          profile.n_layers,
-                          input.captured_graph_inventory)
+                          device,
+                          input.captured_graph_plan.resident_executables)
                     : 0u;
-            result.physical_budgets.push_back({
-                .world_rank = rank_plan.rank,
-                .device = device,
-                .resource_id = physicalResourceId(rank_plan.rank, device),
-                .usable_budget_bytes = usableMemory(
-                    available_bytes, device, input),
-                .fixed_bytes = checkedAdd(
-                    fixed_bytes,
-                    captured_graph_bytes,
-                    "captured graph driver storage"),
-                .additional_transfer_staging_bytes =
-                    checkedAdd(
-                        gpu_load_staging_bytes,
-                        activation_staging_bytes,
-                        "combined transfer staging"),
-            });
+            PhysicalMemoryBOMBuilder additions(resource);
+            additions
+                .add(
+                    PhysicalMemoryOwner::NativeGraphExecutable,
+                    captured_graph_bytes)
+                .add(
+                    PhysicalMemoryOwner::ActivationTransportStaging,
+                    activation_staging_bytes);
+            physical_plan_builder.add(additions.build());
+        }
+
+        result.physical_memory_admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(
+            physical_plan_builder.build());
+        result.physical_budgets.reserve(
+            result.physical_memory_admission->plan().resources().size());
+        for (const auto &bom :
+             result.physical_memory_admission->plan().resources())
+        {
+            const PhysicalMemoryAllocatorIdentity identity{
+                .world_rank = bom.resource().world_rank,
+                .device = bom.resource().device,
+            };
+            result.physical_budgets.emplace_back(
+                physicalResourceId(identity.world_rank, identity.device),
+                result.physical_memory_admission,
+                identity);
         }
         return result;
     }

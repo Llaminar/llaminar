@@ -118,6 +118,89 @@ namespace llaminar2::test::parity
             std::numeric_limits<double>::quiet_NaN();
     };
 
+    /** @brief Mathematical authority that certified routed contribution parity. */
+    enum class MoERoutedContributionAuthority
+    {
+        None,
+        SparseRoutingWeights,
+        BoundaryEquivalentRoutedOutput,
+    };
+
+    /**
+     * @brief Complete evidence for a routed contribution with an unstable cutoff.
+     *
+     * Sparse routing weights remain the preferred direct proof. When a
+     * measured router perturbation legitimately swaps one low-weight expert at
+     * the top-k boundary, sparse vectors can have a poor cosine even though
+     * both routers selected their own mathematically valid top-k and the
+     * resulting expert contribution remains equivalent. The latter case is
+     * admitted only with the independent router-distribution KL and routed
+     * expert-output proofs present.
+     */
+    struct MoERoutedContributionEvidence
+    {
+        MoERoutingBoundaryResult routing_boundary;
+        bool sparse_routing_weights_equivalent = false;
+        bool routed_expert_output_equivalent = false;
+        double router_symmetric_kl =
+            std::numeric_limits<double>::infinity();
+        double maximum_router_symmetric_kl =
+            std::numeric_limits<double>::quiet_NaN();
+    };
+
+    /** @brief Result of one fail-closed routed-contribution adjudication. */
+    struct MoERoutedContributionResult
+    {
+        bool evaluated = false;
+        bool equivalent = false;
+        MoERoutedContributionAuthority authority =
+            MoERoutedContributionAuthority::None;
+    };
+
+    /**
+     * @brief Adjudicate routed contribution parity from complete typed evidence.
+     *
+     * A literal sparse-weight match wins directly. Otherwise, acceptance
+     * requires a mathematically unresolved top-k boundary, a bounded
+     * probability-space router difference, and an equivalent routed expert
+     * output. This prevents a blanket cosine relaxation from hiding a router,
+     * top-k, routing-weight, or expert-compute defect.
+     *
+     * @param evidence Complete selection, distribution, and output evidence.
+     * @return Whether the evidence was complete, whether it was equivalent,
+     * and the exact authority that established equivalence.
+     */
+    inline MoERoutedContributionResult adjudicateMoERoutedContribution(
+        const MoERoutedContributionEvidence &evidence) noexcept
+    {
+        MoERoutedContributionResult result;
+        result.evaluated = evidence.routing_boundary.evaluated &&
+            std::isfinite(evidence.router_symmetric_kl) &&
+            std::isfinite(evidence.maximum_router_symmetric_kl) &&
+            evidence.maximum_router_symmetric_kl >= 0.0;
+        if (!result.evaluated || !evidence.routing_boundary.equivalent)
+            return result;
+
+        if (evidence.sparse_routing_weights_equivalent)
+        {
+            result.equivalent = true;
+            result.authority =
+                MoERoutedContributionAuthority::SparseRoutingWeights;
+            return result;
+        }
+
+        if (evidence.router_symmetric_kl <=
+                evidence.maximum_router_symmetric_kl &&
+            evidence.routed_expert_output_equivalent)
+        {
+            result.equivalent = true;
+            result.authority =
+                MoERoutedContributionAuthority::
+                    BoundaryEquivalentRoutedOutput;
+        }
+        return result;
+    }
+
     /**
      * @brief Compare top-k expert selections using their originating routers.
      *

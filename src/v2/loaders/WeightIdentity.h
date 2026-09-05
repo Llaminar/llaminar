@@ -39,6 +39,8 @@ namespace llaminar2
         AttentionWO,
         FusedQKV,
         GDNProjection,
+        /** Alpha/beta projections feeding GDN recurrence and input gating. */
+        GDNAlphaBetaProjection,
         GDNSsmParam,
         FFNGate,
         FFNUp,

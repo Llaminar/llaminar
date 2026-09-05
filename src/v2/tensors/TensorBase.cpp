@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <vector>
 #include <chrono>
@@ -207,49 +208,58 @@ namespace llaminar2
     // ===== Zero-Copy Mapped Memory Implementation =====
     bool TensorBase::initMappedMemory(size_t bytes, DeviceId target_device)
     {
-        // Validate target device - must be a GPU
-        if (!target_device.is_gpu())
+        if (bytes == 0u || !target_device.is_gpu())
         {
-            LOG_ERROR("[TensorBase::initMappedMemory] Target device must be GPU, got: " << target_device.toString());
+            LOG_ERROR("[TensorBase::initMappedMemory] Positive bytes and an exact GPU are required, got bytes="
+                      << bytes << " device=" << target_device.toString());
+            return false;
+        }
+        if (is_mapped_ || mapped_transfer_region_ || gpu_data_ptr_)
+        {
+            LOG_ERROR("[TensorBase::initMappedMemory] Tensor storage was already materialized");
             return false;
         }
 
-        // Get backend for target device
-        IBackend *backend = resolveBackend(target_device);
-        if (!backend)
+        std::shared_ptr<MappedHostTransferRegion> region;
+        try
         {
-            LOG_ERROR("[TensorBase::initMappedMemory] No backend available for device " << target_device.toString());
+            const std::array<DeviceId, 1> endpoints{target_device};
+            region = TransferEngine::instance().allocateMappedHostRegion(
+                bytes, endpoints);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[TensorBase::initMappedMemory] TransferEngine could not allocate "
+                      << bytes << " mapped bytes on "
+                      << target_device.toString() << ": " << error.what());
+            return false;
+        }
+        if (!region || !region->isBound() ||
+            !region->hasDevice(target_device) ||
+            !region->contains(0u, bytes))
+        {
+            LOG_ERROR("[TensorBase::initMappedMemory] TransferEngine returned an incomplete mapped region for "
+                      << target_device.toString());
             return false;
         }
 
-        // Allocate mapped memory
-        int backend_device_id = target_device.gpu_ordinal();
-        void *device_ptr = nullptr;
-        void *host_ptr = backend->allocateMapped(bytes, backend_device_id, &device_ptr);
-
-        if (!host_ptr || !device_ptr)
-        {
-            LOG_WARN("[TensorBase::initMappedMemory] Failed to allocate mapped memory ("
-                     << bytes << " bytes on device " << target_device.toString() << ")");
-            return false;
-        }
-
-        // Zero-initialize the mapped memory
-        std::memset(host_ptr, 0, bytes);
-
-        // Set up mapped memory state
+        /* The region is the sole allocation/free authority. The tensor retains
+         * it and publishes only the two immutable aliases needed by ordinary
+         * tensor consumers; it must never register or free these pages itself. */
+        mapped_transfer_region_ = std::move(region);
         is_mapped_ = true;
-        mapped_host_ptr_ = host_ptr;
-        mapped_device_ptr_ = device_ptr;
-        gpu_data_ptr_ = device_ptr; // GPU pointer is the device-visible mapped pointer
+        mapped_host_ptr_ = mapped_transfer_region_->mutableHostData();
+        mapped_device_ptr_ =
+            mapped_transfer_region_->deviceAlias(target_device);
+        gpu_data_ptr_ = mapped_device_ptr_;
         gpu_device_ = target_device;
 
         // Both host and device are always valid for mapped memory
         memory_residency_ = MemoryResidency::MAPPED;
         setCoherenceState_(TensorCoherenceState::MAPPED);
 
-        LOG_TRACE("[TensorBase::initMappedMemory] Allocated " << bytes << " bytes mapped memory"
-                                                              << " host_ptr=" << host_ptr << " device_ptr=" << device_ptr
+        LOG_TRACE("[TensorBase::initMappedMemory] TransferEngine allocated " << bytes << " bytes mapped memory"
+                                                              << " host_ptr=" << mapped_host_ptr_ << " device_ptr=" << mapped_device_ptr_
                                                               << " on device " << target_device.toString());
 
         return true;
@@ -257,26 +267,19 @@ namespace llaminar2
 
     void TensorBase::freeMappedMemory()
     {
-        if (!is_mapped_ || !mapped_host_ptr_)
+        if (!is_mapped_)
         {
             return; // Not mapped or already freed
         }
 
-        if (gpu_device_.has_value())
-        {
-            IBackend *backend = resolveBackend(*gpu_device_);
-            if (backend)
-            {
-                int backend_device_id = gpu_device_->gpu_ordinal();
-                backend->freeMapped(mapped_host_ptr_, backend_device_id);
-                LOG_TRACE("[TensorBase::freeMappedMemory] Freed mapped memory");
-            }
-        }
-
         mapped_host_ptr_ = nullptr;
-        gpu_data_ptr_ = nullptr; // gpu_data_ptr_ was pointing to mapped_device_ptr_
+        gpu_data_ptr_ = nullptr;
         mapped_device_ptr_ = nullptr;
         is_mapped_ = false;
+        /* Reset last: the region deleter may release the native mapping, so no
+         * tensor pointer may remain observable when that happens. */
+        mapped_transfer_region_.reset();
+        LOG_TRACE("[TensorBase::freeMappedMemory] Released TransferEngine mapped region");
     }
 
     void TensorBase::to_fp32_via_blocks(float *dst) const

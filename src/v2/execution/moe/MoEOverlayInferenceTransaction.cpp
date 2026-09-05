@@ -467,6 +467,8 @@ namespace llaminar2
                << ",logical_step=" << logical_step_id
                << ",workspace_generation=" << workspace_generation
                << ",placement_epoch=" << placement_epoch
+               << ",retired_decode_progress_tokens="
+               << retired_decode_progress_tokens
                << ",topology_low=" << topology_fingerprint_low
                << ",topology_high=" << topology_fingerprint_high
                << ",source_rank=" << source_world_rank
@@ -504,7 +506,8 @@ namespace llaminar2
         int draft_depth,
         int sidecar_depth,
         const MoEOverlayInferenceWorkloadIdentity &
-            prefill_schedule_workload)
+            prefill_schedule_workload,
+        std::uint64_t retired_decode_progress_tokens)
     {
         const bool carries_prefill_schedule =
             prefill_schedule_workload.valid();
@@ -529,6 +532,8 @@ namespace llaminar2
             .logical_step_id = logical_step_id,
             .workspace_generation = topology.workspace_generation,
             .placement_epoch = placement_epoch,
+            .retired_decode_progress_tokens =
+                retired_decode_progress_tokens,
             .topology_fingerprint_low = topology.topology_fingerprint_low,
             .topology_fingerprint_high = topology.topology_fingerprint_high,
             .source_world_rank = topology.source_world_rank,
@@ -574,7 +579,8 @@ namespace llaminar2
         std::uint64_t transaction_ordinal,
         std::uint64_t placement_epoch,
         MoEOverlayInferenceTransactionAction action,
-        int error_code)
+        int error_code,
+        std::uint64_t retired_decode_progress_tokens)
     {
         MoEOverlayInferenceTransactionTicket ticket{
             .magic = MoEOverlayInferenceTransactionTicket::kMagic,
@@ -587,6 +593,8 @@ namespace llaminar2
             .transaction_ordinal = transaction_ordinal,
             .workspace_generation = topology.workspace_generation,
             .placement_epoch = placement_epoch,
+            .retired_decode_progress_tokens =
+                retired_decode_progress_tokens,
             .topology_fingerprint_low = topology.topology_fingerprint_low,
             .topology_fingerprint_high = topology.topology_fingerprint_high,
             .source_world_rank = topology.source_world_rank,

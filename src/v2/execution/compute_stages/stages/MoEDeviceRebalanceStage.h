@@ -8,6 +8,7 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../execution/moe/DeviceMoERebalanceController.h"
+#include "../../../execution/moe/DeviceMoERebalanceWorkspaceContract.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 
 #include <memory>
@@ -20,76 +21,6 @@ namespace llaminar2
     class IMoEKernel;
     class IMoERuntimeTable;
     class DeviceMoEOverlayEpochArena;
-
-    enum class DeviceMoERebalanceStagePhase
-    {
-        /**
-         * Atomic maintenance transaction: collect and gather state, run the
-         * controller, publish command metadata, prepare immutable payload
-         * bytes, transport arrivals, and apply the ready wave before recording
-         * one terminal completion edge.
-         *
-         * This is the required standalone maintenance-graph path. It prevents
-         * the host from observing intermediate state or selecting a follow-up
-         * graph while preserving explicit auxiliary-stream overlap inside the
-         * captured transaction.
-         */
-        PlanCopyApply,
-
-        /**
-         * Graph-capturable collection phase for piggybacked rebalance metadata:
-         * pack local histogram/directory state only. A following LocalTP
-         * collective sideband all-gathers these compact buffers on an existing
-         * compute collective.
-         */
-        CollectState,
-
-        /**
-         * Graph-capturable producer phase: pack histograms/directories, run the
-         * device controller, enqueue transfer-slot copies on the context-owned
-         * transfer stream, and record completion without joining the compute
-         * stream.
-         */
-        PlanAndCopy,
-
-        /**
-         * Graph-capturable producer phase after a sideband collective has
-         * already gathered local histogram/directory state. This runs the
-         * device controller and transfer path without launching standalone
-         * state all-gathers.
-         */
-        PlanAndCopyAfterSideband,
-
-        /**
-         * Pack this participant's requested expert payloads after command
-         * buffers have been all-gathered as sidebands on an existing decode
-         * collective. This phase must not launch a rebalance-specific TP
-         * collective.
-         */
-        PackCollectivePayloadAfterSideband,
-
-        /**
-         * Unpack all-gathered collective payload sideband bytes into local
-         * transfer slots and publish transfer completion. This phase must not
-         * launch a rebalance-specific TP collective.
-         */
-        UnpackCollectivePayloadAfterSideband,
-
-        /**
-         * Graph-capturable consumer phase: wait for the transfer completion
-         * event and apply arrived transfer slots to the mirrored runtime table.
-         */
-        Apply,
-
-        /**
-         * Graph-captured stream-join phase. Split producers enqueue transfer
-         * work on the context-owned transfer stream without joining immediately;
-         * a late JoinTransfer stage waits on the transfer completion event near
-         * the end of the decode graph so transfer can overlap later compute
-         * while stream capture still has an explicit rejoin edge.
-         */
-        JoinTransfer,
-    };
 
     /**
      * @brief Declares which completion records one rebalance stage publishes.
@@ -210,29 +141,48 @@ namespace llaminar2
     class MoEDeviceRebalanceStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
-        static constexpr const char *WS_LOCAL_HISTOGRAM = "moe_rebalance_local_histogram";
-        static constexpr const char *WS_GATHERED_HISTOGRAM = "moe_rebalance_gathered_histogram";
-        static constexpr const char *WS_TRANSFER_PLAN = "moe_rebalance_transfer_plan";
-        static constexpr const char *WS_TRANSFER_PLAN_COUNT = "moe_rebalance_transfer_plan_count";
-        static constexpr const char *WS_COMMAND_HEADER = "moe_rebalance_command_header";
-        static constexpr const char *WS_CONTROLLER_STATE = "moe_rebalance_controller_state";
+        static constexpr const char *WS_LOCAL_HISTOGRAM =
+            DeviceMoERebalanceWorkspaceContract::WS_LOCAL_HISTOGRAM;
+        static constexpr const char *WS_GATHERED_HISTOGRAM =
+            DeviceMoERebalanceWorkspaceContract::WS_GATHERED_HISTOGRAM;
+        static constexpr const char *WS_TRANSFER_PLAN =
+            DeviceMoERebalanceWorkspaceContract::WS_TRANSFER_PLAN;
+        static constexpr const char *WS_TRANSFER_PLAN_COUNT =
+            DeviceMoERebalanceWorkspaceContract::WS_TRANSFER_PLAN_COUNT;
+        static constexpr const char *WS_COMMAND_HEADER =
+            DeviceMoERebalanceWorkspaceContract::WS_COMMAND_HEADER;
+        static constexpr const char *WS_CONTROLLER_STATE =
+            DeviceMoERebalanceWorkspaceContract::WS_CONTROLLER_STATE;
         static constexpr const char *WS_PLACEMENT_PLAN_SCRATCH =
-            "moe_rebalance_placement_plan_scratch";
-        static constexpr const char *WS_LLEP_LAYER_PLANS = "moe_rebalance_llep_layer_plans";
-        static constexpr const char *WS_GATHERED_TRANSFER_PLAN = "moe_rebalance_gathered_transfer_plan";
-        static constexpr const char *WS_GATHERED_COMMAND_HEADER = "moe_rebalance_gathered_command_header";
+            DeviceMoERebalanceWorkspaceContract::WS_PLACEMENT_PLAN_SCRATCH;
+        static constexpr const char *WS_LLEP_LAYER_PLANS =
+            DeviceMoERebalanceWorkspaceContract::WS_LLEP_LAYER_PLANS;
+        static constexpr const char *WS_GATHERED_TRANSFER_PLAN =
+            DeviceMoERebalanceWorkspaceContract::WS_GATHERED_TRANSFER_PLAN;
+        static constexpr const char *WS_GATHERED_COMMAND_HEADER =
+            DeviceMoERebalanceWorkspaceContract::WS_GATHERED_COMMAND_HEADER;
         static constexpr const char *WS_TRANSFER_SLOT_CLAIM_INDEX =
-            "moe_rebalance_transfer_slot_claim_index";
-        static constexpr const char *WS_WAVE_STATE = "moe_rebalance_wave_state";
-        static constexpr const char *WS_GATHERED_WAVE_STATE = "moe_rebalance_gathered_wave_state";
-        static constexpr const char *WS_STATUS = "moe_rebalance_status";
-        static constexpr const char *WS_LOCAL_DIRECTORY = "moe_rebalance_local_directory";
-        static constexpr const char *WS_LOCAL_SOURCE_DESCRIPTORS = "moe_rebalance_local_source_descriptors";
-        static constexpr const char *WS_LOCAL_TRANSFER_PAYLOAD = "moe_rebalance_local_transfer_payload";
-        static constexpr const char *WS_GATHERED_TRANSFER_PAYLOAD = "moe_rebalance_gathered_transfer_payload";
-        static constexpr const char *WS_COPY_STATUS = "moe_rebalance_copy_status";
-        static constexpr const char *WS_GATHERED_COPY_STATUS = "moe_rebalance_gathered_copy_status";
-        static constexpr const char *WS_APPLY_STATUS = "moe_rebalance_apply_status";
+            DeviceMoERebalanceWorkspaceContract::WS_TRANSFER_SLOT_CLAIM_INDEX;
+        static constexpr const char *WS_WAVE_STATE =
+            DeviceMoERebalanceWorkspaceContract::WS_WAVE_STATE;
+        static constexpr const char *WS_GATHERED_WAVE_STATE =
+            DeviceMoERebalanceWorkspaceContract::WS_GATHERED_WAVE_STATE;
+        static constexpr const char *WS_STATUS =
+            DeviceMoERebalanceWorkspaceContract::WS_STATUS;
+        static constexpr const char *WS_LOCAL_DIRECTORY =
+            DeviceMoERebalanceWorkspaceContract::WS_LOCAL_DIRECTORY;
+        static constexpr const char *WS_LOCAL_SOURCE_DESCRIPTORS =
+            DeviceMoERebalanceWorkspaceContract::WS_LOCAL_SOURCE_DESCRIPTORS;
+        static constexpr const char *WS_LOCAL_TRANSFER_PAYLOAD =
+            DeviceMoERebalanceWorkspaceContract::WS_LOCAL_TRANSFER_PAYLOAD;
+        static constexpr const char *WS_GATHERED_TRANSFER_PAYLOAD =
+            DeviceMoERebalanceWorkspaceContract::WS_GATHERED_TRANSFER_PAYLOAD;
+        static constexpr const char *WS_COPY_STATUS =
+            DeviceMoERebalanceWorkspaceContract::WS_COPY_STATUS;
+        static constexpr const char *WS_GATHERED_COPY_STATUS =
+            DeviceMoERebalanceWorkspaceContract::WS_GATHERED_COPY_STATUS;
+        static constexpr const char *WS_APPLY_STATUS =
+            DeviceMoERebalanceWorkspaceContract::WS_APPLY_STATUS;
 
         struct Params
         {
@@ -410,6 +360,10 @@ namespace llaminar2
         bool runsApply() const;
         bool validateCommon(const char *context) const;
         std::string workspaceSuffix() const;
+        /** @return Pointer-free capacity projected from this stage's parameters. */
+        DeviceMoERebalanceWorkspaceCapacity workspaceCapacity() const noexcept;
+        /** @return Complete canonical workspace binding for this stage. */
+        DeviceMoERebalanceWorkspaceBinding workspaceBinding() const;
         bool requireMaterializedAsyncTransferState() const;
         DeviceMoERebalanceTransferState *transferState() const;
     };

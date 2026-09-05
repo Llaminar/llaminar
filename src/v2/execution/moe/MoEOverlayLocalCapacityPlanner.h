@@ -19,6 +19,7 @@
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "loaders/GPUVramPreflight.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
+#include "planning/GraphSnapshotMemoryCapacity.h"
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
 
@@ -44,27 +45,58 @@ namespace llaminar2
     };
 
     /**
-     * @brief Resolve the physical native graph inventory for ExpertOverlay.
+     * @brief Captured-graph topology with disjoint compile and residency facts.
+     *
+     * Heterogeneous execution records one child per authenticated model-layer
+     * frontier and then imports them into a single retained parent. Keeping the
+     * two inventories in separate types prevents compile cost from becoming a
+     * fictitious VRAM charge.
+     */
+    struct MoEOverlayCapturedGraphPlan
+    {
+        /** Physical executable owners consumed by memory admission. */
+        CapturedGraphExecutableInventory resident_executables;
+        /** Diagnostic-only recording topology; never converted to bytes. */
+        CapturedGraphCompilationInventory compilation;
+
+        /** @return Whether both views describe the same logical graph family. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return resident_executables.valid() && compilation.valid() &&
+                   resident_executables.model_graph_identity_count ==
+                       compilation.model_graph_identity_count &&
+                   resident_executables
+                           .model_graph_topology_variant_count ==
+                       compilation.model_graph_topology_variant_count;
+        }
+    };
+
+    /**
+     * @brief Resolve compile and resident graph inventories for ExpertOverlay.
      * @param model_layer_count Number of main-model routed layers.
      * @param authority_execution Frozen host/device authority topology.
-     * @param model_graph_identity_count Retained prefill/decode/bridge graphs.
-     * @param auxiliary_native_executable_count Retained activation and MTP
-     *        helper/controller graphs.
-     * @return Valid inventory consumed by device-memory admission.
+     * @param model_graph_identity_count Complete graphs in one topology variant.
+     * @param model_graph_topology_variant_count Simultaneously retained
+     *        snapshot/launch-topology variants.
+     * @param auxiliary_executable_count Retained helper/controller executable
+     *        owners; semantic branch descriptors are excluded.
+     * @return Valid plan whose resident view is consumed by memory admission.
      * @throws std::invalid_argument for unresolved authority or bad geometry.
      * @throws std::overflow_error when the segment count exceeds size_t.
      *
      * Host-resident overlays contain an intentional CPU ticket boundary at
-     * every routed layer. Their continuation graph therefore owns one captured
-     * unit before each boundary plus one terminal unit. All-GPU device-owned
-     * timelines remain one native executable per complete graph identity.
+     * every routed layer, so they compile one unit before each frontier plus a
+     * terminal unit. The retained-parent composer still produces exactly one
+     * executable per complete graph identity. All-GPU device-owned timelines
+     * both compile and retain one unit per complete graph identity.
      */
-    [[nodiscard]] CapturedGraphExecutableInventory
-    resolveMoEOverlayCapturedGraphExecutableInventory(
+    [[nodiscard]] MoEOverlayCapturedGraphPlan
+    resolveMoEOverlayCapturedGraphPlan(
         int model_layer_count,
         MoEOverlayAuthorityExecutionKind authority_execution,
         std::size_t model_graph_identity_count,
-        std::size_t auxiliary_native_executable_count);
+        std::size_t model_graph_topology_variant_count,
+        std::size_t auxiliary_executable_count);
 
     /** @brief Complete immutable input for one rank's zero-routed-expert BOM. */
     struct MoEOverlayLocalCapacityPlannerInput
@@ -89,8 +121,10 @@ namespace llaminar2
         int activation_channel_row_capacity = 0;
         /** Main plus routed MTP graph families sharing each channel. */
         std::size_t activation_graph_family_count = 0;
-        /** Exact physical forward/segment/helper inventory retained per GPU. */
-        CapturedGraphExecutableInventory captured_graph_inventory;
+        /** Exact compile/resident graph topology retained per GPU. */
+        MoEOverlayCapturedGraphPlan captured_graph_plan;
+        /** Graph-resident diagnostic checkpoint capacity per accelerator. */
+        GraphSnapshotMemoryCapacity graph_snapshot_memory;
         /** Required whenever this rank's physical resources include a GPU. */
         std::optional<MoEOverlayGPUWeightLoadCapacityInput>
             gpu_weight_load;
@@ -103,6 +137,9 @@ namespace llaminar2
         MemoryPlan fixed_memory_plan;
         /** Shared pure topology/BOM also consumed by transport preflight. */
         MoEOverlayActivationChannelPlan activation_channel_plan;
+        /** Sole admitted aggregate behind every per-resource capacity view. */
+        std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>
+            physical_memory_admission;
         std::vector<MoEOverlayBoundPhysicalMemoryBudget> physical_budgets;
     };
 

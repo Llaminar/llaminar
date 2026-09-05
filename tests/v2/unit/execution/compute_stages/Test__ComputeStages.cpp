@@ -372,6 +372,20 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
 
     const WorkspaceRequirements compact_reqs = compact_stage.getWorkspaceRequirements(0, 0, 0);
     ASSERT_EQ(compact_reqs.buffers.size(), 19u);
+    auto unmaterialized_compact_params = compact_params;
+    unmaterialized_compact_params.local_transfer_slots = nullptr;
+    const MoEDeviceRebalanceStage unmaterialized_compact_stage(
+        unmaterialized_compact_params);
+    const WorkspaceRequirements unmaterialized_compact_reqs =
+        unmaterialized_compact_stage.getWorkspaceRequirements(0, 0, 0);
+    EXPECT_EQ(
+        unmaterialized_compact_reqs.total_bytes_with_alignment(),
+        compact_reqs.total_bytes_with_alignment())
+        << "Workspace identity must be capacity-owned before device pointers materialize.";
+    EXPECT_EQ(
+        unmaterialized_compact_stage.estimatedMemoryBytes(),
+        compact_stage.estimatedMemoryBytes())
+        << "A null setup-time pointer cannot hide transfer workspace from admission.";
     EXPECT_NE(
         compact_reqs.find(
             "moe_rebalance_placement_plan_scratch_decode_rebalance"),
@@ -556,6 +570,72 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::GPU_ROCM));
 #endif
     EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::CPU));
+}
+
+/**
+ * @brief Reproduce the complete maintenance workspace from the 35B ROCm cell.
+ *
+ * The production failure admitted only the ordinary graph workspace, then
+ * discovered these persistent maintenance buffers while constructing the
+ * serial graph family.  Keep the model geometry, transfer-directory capacity,
+ * and Q4_K_XL wire stride explicit here so a later lifecycle refactor cannot
+ * silently drop any portion of the 10.5 MB physical claim again.
+ */
+TEST_F(ComputeStagesTest,
+       MoEDeviceRebalanceWorkspaceContract_CoversQwen35DynamicProductionGeometry)
+{
+    const DeviceMoERebalanceWorkspaceCapacity capacity{
+        .num_layers = 40u,
+        .num_experts = 256u,
+        .participant_count = 2u,
+        .layer_window_count = 39u,
+        .layer_wave_count = 4u,
+        .max_hot_replicas_per_participant = 25u,
+        .flags = static_cast<std::uint32_t>(
+                     DeviceMoERebalanceFlags::ResetHistogramsAfterApply) |
+                 static_cast<std::uint32_t>(
+                     DeviceMoERebalanceFlags::DeferRuntimeApply) |
+                 static_cast<std::uint32_t>(
+                     DeviceMoERebalanceFlags::PlanMissingArrivals) |
+                 static_cast<std::uint32_t>(
+                     DeviceMoERebalanceFlags::HotReplicaCache),
+        .local_transfer_slot_count = 1004u,
+        .collective_payload_slot_capacity = 1u,
+        .phase = DeviceMoERebalanceStagePhase::PlanCopyApply,
+        .transfer_mode =
+            DeviceMoERebalanceTransferMode::CompactTransferSlots,
+    };
+    const DeviceMoERebalanceWorkspaceBinding binding{
+        .capacity = capacity,
+        .collective_payload_slot_bytes = 3277312u,
+        .workspace_suffix = "qwen35_dynamic_production_geometry",
+    };
+
+    const auto requirements =
+        DeviceMoERebalanceWorkspaceContract::requirements(binding);
+    ASSERT_EQ(requirements.buffers.size(), 19u);
+    EXPECT_EQ(
+        DeviceMoERebalanceWorkspaceContract::logicalBytes(binding),
+        10498656u);
+    EXPECT_EQ(
+        DeviceMoERebalanceWorkspaceContract::allocationBytes(binding),
+        10500608u);
+    EXPECT_EQ(
+        requirements.total_bytes_with_alignment(),
+        DeviceMoERebalanceWorkspaceContract::allocationBytes(binding));
+
+    const auto *local_payload = requirements.find(
+        "moe_rebalance_local_transfer_payload_qwen35_dynamic_production_geometry");
+    const auto *gathered_payload = requirements.find(
+        "moe_rebalance_gathered_transfer_payload_qwen35_dynamic_production_geometry");
+    const auto *claim_index = requirements.find(
+        "moe_rebalance_transfer_slot_claim_index_qwen35_dynamic_production_geometry");
+    ASSERT_NE(local_payload, nullptr);
+    ASSERT_NE(gathered_payload, nullptr);
+    ASSERT_NE(claim_index, nullptr);
+    EXPECT_EQ(local_payload->size_bytes, 3277312u);
+    EXPECT_EQ(gathered_payload->size_bytes, 6554624u);
+    EXPECT_EQ(claim_index->size_bytes, 16208u);
 }
 
 /**

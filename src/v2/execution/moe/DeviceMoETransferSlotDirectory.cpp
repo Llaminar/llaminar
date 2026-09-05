@@ -11,11 +11,14 @@
 #include "DeviceMoETransferSlotDirectory.h"
 
 #include "../../backends/IBackend.h"
+#include "../../loaders/GPUVramPreflight.h"
 #include "../../loaders/gpu_pipeline/LoadOrchestrator.h"
+#include "MoEOverlayPhysicalResidencyFabric.h"
 #include "../../utils/Logger.h"
 #include "../../utils/VramBillOfMaterials.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -120,6 +123,54 @@ namespace llaminar2
                 bytes += projectionPayloadBytes(spec);
             return bytes;
         }
+
+        /** @return Stable key shared by pure planning and live allocation. */
+        std::string directorySlotName(
+            uint32_t slot_index,
+            const std::string &label)
+        {
+            return "moe_device_rebalance_transfer_slot_" +
+                   std::to_string(slot_index) + "_" + label;
+        }
+
+        /** @return Allocator label for one typed model-manifest projection. */
+        const char *projectionLabel(ExpertTierWeightProjection projection)
+        {
+            switch (projection)
+            {
+            case ExpertTierWeightProjection::Gate:
+                return "gate";
+            case ExpertTierWeightProjection::Up:
+                return "up";
+            case ExpertTierWeightProjection::Down:
+                return "down";
+            }
+            throw std::invalid_argument(
+                "DeviceMoETransferSlotDirectory received an unknown projection role");
+        }
+
+        /** @brief Submit every slot region to the allocator-owned byte planner. */
+        void planDirectoryPayload(
+            WeightVRAMPool &pool,
+            uint32_t slot_count,
+            const std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>
+                &specs)
+        {
+            for (uint32_t slot = 0; slot < slot_count; ++slot)
+            {
+                for (const auto &spec : specs)
+                {
+                    pool.planWeight(
+                        directorySlotName(slot, spec.label),
+                        spec.N,
+                        spec.K,
+                        spec.payload_bytes_per_block,
+                        spec.is_asymmetric,
+                        spec.has_emins,
+                        /*raw_gguf_bytes=*/0);
+                }
+            }
+        }
     } // namespace
 
     DeviceMoETransferSlotDirectory::FormatProfile
@@ -179,6 +230,78 @@ namespace llaminar2
             }
         }
         return profile;
+    }
+
+    DeviceMoETransferSlotDirectory::FormatProfile
+    DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(
+        const std::vector<MoEOverlayLayerWeightManifest> &
+            layer_weight_manifest)
+    {
+        if (layer_weight_manifest.empty())
+        {
+            throw std::invalid_argument(
+                "DeviceMoETransferSlotDirectory requires a non-empty model manifest");
+        }
+
+        std::vector<std::vector<ProjectionSpec>> layer_formats;
+        layer_formats.reserve(layer_weight_manifest.size());
+        for (std::size_t layer_offset = 0;
+             layer_offset < layer_weight_manifest.size();
+             ++layer_offset)
+        {
+            const auto &layer = layer_weight_manifest[layer_offset];
+            if (!layer.valid() ||
+                layer.layer_idx != static_cast<int>(layer_offset))
+            {
+                throw std::invalid_argument(
+                    "DeviceMoETransferSlotDirectory manifest must be valid and contiguous from layer zero");
+            }
+
+            std::vector<ProjectionSpec> specs;
+            specs.reserve(layer.projections.size());
+            for (const auto &projection : layer.projections)
+            {
+                if (!projection.format.isNativeVnni())
+                {
+                    throw std::invalid_argument(
+                        "DeviceMoETransferSlotDirectory currently requires NativeVNNI expert weights");
+                }
+                const auto *source =
+                    native_vnni_formats::forSourceIdentity(
+                        projection.format.native_vnni.codebook_id,
+                        projection.format.native_vnni.is_superblock);
+                if (!source)
+                {
+                    throw std::invalid_argument(
+                        "DeviceMoETransferSlotDirectory manifest contains an uncatalogued NativeVNNI source format");
+                }
+
+                /*
+                 * The prepared engine can later carry either its initial
+                 * compact bytes or a migration-stable representation. Its
+                 * exported allocation fields describe that union, so
+                 * setup-time admission must derive the identical capacity.
+                 */
+                const auto reusable =
+                    reusableDeviceVnniAllocationFormat(*source);
+                specs.push_back({
+                    .label = projectionLabel(projection.projection),
+                    .N = projection.N,
+                    .K = projection.K,
+                    .payload_bytes_per_block =
+                        static_cast<int>(
+                            reusable.payload_bytes_per_block),
+                    .is_asymmetric = reusable.has_mins,
+                    .has_emins = reusable.has_emins,
+                    .codebook_id =
+                        canonicalDeviceVnniCodebookId(
+                            source->codebook_id),
+                    .format = projection.format,
+                });
+            }
+            layer_formats.push_back(std::move(specs));
+        }
+        return profileForLayerFormats(layer_formats);
     }
 
     uint64_t DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(
@@ -246,14 +369,130 @@ namespace llaminar2
         };
     }
 
+    DeviceMoETransferSlotDirectory::BufferedCapacity
+    DeviceMoETransferSlotDirectory::planRuntimeCapacity(
+        const DeviceMoERebalanceConfig &config,
+        uint64_t minimum_active_slots,
+        uint32_t transfer_wave_slots,
+        uint32_t transfer_buffer_count)
+    {
+        return planBufferedCapacity(
+            std::max(
+                persistentActiveSlotDemand(config),
+                minimum_active_slots),
+            transfer_wave_slots,
+            transfer_buffer_count);
+    }
+
+    DeviceMoETransferSlotDirectory::AllocationBOM
+    DeviceMoETransferSlotDirectory::allocationBOM(
+        BufferedCapacity capacity,
+        const FormatProfile &format_profile)
+    {
+        if (capacity.active_slots == 0u ||
+            capacity.staging_slots == 0u ||
+            capacity.total_slots == 0u ||
+            static_cast<uint64_t>(capacity.active_slots) +
+                    static_cast<uint64_t>(capacity.staging_slots) !=
+                capacity.total_slots)
+        {
+            throw std::invalid_argument(
+                "DeviceMoETransferSlotDirectory allocation BOM requires a coherent active/staging capacity");
+        }
+        validateSpecs(format_profile.allocation_specs);
+        if (format_profile.max_wire_payload_bytes == 0u ||
+            format_profile.max_wire_payload_bytes >
+                expertPayloadBytes(format_profile.allocation_specs))
+        {
+            throw std::invalid_argument(
+                "DeviceMoETransferSlotDirectory allocation BOM has an invalid wire payload capacity");
+        }
+
+        WeightVRAMPool planner;
+        planDirectoryPayload(
+            planner,
+            capacity.total_slots,
+            format_profile.allocation_specs);
+        const size_t payload_bytes = alignGPUWeightLoadAllocation(
+            planner.totalPlannedBytes());
+        if (capacity.total_slots >
+            std::numeric_limits<size_t>::max() /
+                sizeof(DeviceMoEExpertDirectoryEntry) / 2u)
+        {
+            throw std::overflow_error(
+                "DeviceMoETransferSlotDirectory descriptor BOM overflows size_t");
+        }
+        const size_t descriptor_bytes =
+            static_cast<size_t>(capacity.total_slots) *
+            sizeof(DeviceMoEExpertDirectoryEntry) * 2u;
+        if (descriptor_bytes >
+            std::numeric_limits<size_t>::max() - payload_bytes)
+        {
+            throw std::overflow_error(
+                "DeviceMoETransferSlotDirectory complete BOM overflows size_t");
+        }
+        return {
+            .payload_bytes = payload_bytes,
+            .descriptor_bytes = descriptor_bytes,
+            .total_bytes = payload_bytes + descriptor_bytes,
+        };
+    }
+
     std::shared_ptr<DeviceMoETransferSlotDirectory>
     DeviceMoETransferSlotDirectory::create(
         IBackend *backend,
         DeviceId device,
         int device_ordinal,
         uint32_t participant_id,
+        BufferedCapacity capacity,
+        FormatProfile format_profile,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
+    {
+        return createImpl(
+            backend,
+            device,
+            device_ordinal,
+            participant_id,
+            capacity,
+            std::move(format_profile),
+            std::move(memory_authority),
+            /*explicit_test_allocation=*/false);
+    }
+
+    std::shared_ptr<DeviceMoETransferSlotDirectory>
+    DeviceMoETransferSlotDirectory::createForTest(
+        IBackend *backend,
+        DeviceId device,
+        int device_ordinal,
+        uint32_t participant_id,
         uint32_t slot_count,
         FormatProfile format_profile)
+    {
+        return createImpl(
+            backend,
+            device,
+            device_ordinal,
+            participant_id,
+            BufferedCapacity{
+                .active_slots = slot_count,
+                .staging_slots = 0u,
+                .total_slots = slot_count,
+            },
+            std::move(format_profile),
+            nullptr,
+            /*explicit_test_allocation=*/true);
+    }
+
+    std::shared_ptr<DeviceMoETransferSlotDirectory>
+    DeviceMoETransferSlotDirectory::createImpl(
+        IBackend *backend,
+        DeviceId device,
+        int device_ordinal,
+        uint32_t participant_id,
+        BufferedCapacity capacity,
+        FormatProfile format_profile,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+        bool explicit_test_allocation)
     {
         if (!backend)
             throw std::invalid_argument("DeviceMoETransferSlotDirectory requires a backend");
@@ -268,8 +507,23 @@ namespace llaminar2
                 device.to_string() + " allocator_ordinal=" +
                 std::to_string(device_ordinal));
         }
+        const uint32_t slot_count = capacity.total_slots;
         if (slot_count == 0)
             throw std::invalid_argument("DeviceMoETransferSlotDirectory requires at least one slot");
+        if (!explicit_test_allocation &&
+            (capacity.active_slots == 0u || capacity.staging_slots == 0u ||
+             static_cast<uint64_t>(capacity.active_slots) +
+                     static_cast<uint64_t>(capacity.staging_slots) !=
+                 capacity.total_slots))
+        {
+            throw std::invalid_argument(
+                "DeviceMoETransferSlotDirectory production allocation requires coherent active/staging capacity");
+        }
+        if (!explicit_test_allocation && !memory_authority)
+        {
+            throw std::invalid_argument(
+                "DeviceMoETransferSlotDirectory production allocation requires a physical-memory authority");
+        }
         auto &specs = format_profile.allocation_specs;
         validateSpecs(specs);
         const size_t slot_storage_capacity_bytes = expertPayloadBytes(specs);
@@ -280,13 +534,18 @@ namespace llaminar2
                 "DeviceMoETransferSlotDirectory wire payload exceeds allocation capacity");
         }
 
-        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        auto orchestrator = explicit_test_allocation
+                                ? std::make_shared<LoadOrchestrator>(
+                                      backend,
+                                      kTestOnlyUnadmittedGPUAllocation)
+                                : std::make_shared<LoadOrchestrator>(
+                                      backend,
+                                      memory_authority,
+                                      PhysicalMemoryOwner::ExpertMigrationStaging);
         orchestrator->addDevice(device_ordinal);
 
         for (uint32_t slot = 0; slot < slot_count; ++slot)
-        {
             for (const auto &spec : specs)
-            {
                 orchestrator->planWeight(
                     device_ordinal,
                     slotName(slot, spec.label),
@@ -296,14 +555,21 @@ namespace llaminar2
                     spec.is_asymmetric,
                     spec.has_emins,
                     /*raw_gguf_bytes=*/0);
-            }
-        }
         orchestrator->allocate(/*pinned_slot_size=*/0, /*num_h2d_streams=*/0);
 
         const auto *weight_pool = orchestrator->getPool(device_ordinal);
         if (!weight_pool || !weight_pool->isAllocated())
             throw std::runtime_error("DeviceMoETransferSlotDirectory failed to allocate slot weights");
         const size_t planned_bytes = weight_pool->totalPlannedBytes();
+        if (!explicit_test_allocation)
+        {
+            const auto expected = allocationBOM(capacity, format_profile);
+            if (planned_bytes != expected.payload_bytes)
+            {
+                throw std::logic_error(
+                    "DeviceMoETransferSlotDirectory allocator bytes diverged from setup admission");
+            }
+        }
 
         std::vector<DeviceMoEExpertDirectoryEntry> host_entries(slot_count);
         for (uint32_t slot = 0; slot < slot_count; ++slot)
@@ -344,14 +610,39 @@ namespace llaminar2
             host_entries[slot] = entry;
         }
 
+        if (host_entries.size() >
+            std::numeric_limits<size_t>::max() /
+                sizeof(host_entries[0]))
+        {
+            throw std::overflow_error(
+                "DeviceMoETransferSlotDirectory descriptor byte count overflows size_t");
+        }
+        const size_t directory_bytes =
+            host_entries.size() * sizeof(host_entries[0]);
+        if (directory_bytes > std::numeric_limits<size_t>::max() / 2u)
+        {
+            throw std::overflow_error(
+                "DeviceMoETransferSlotDirectory baseline byte count overflows size_t");
+        }
+        std::optional<PhysicalMemoryAllocationLease>
+            directory_entries_lease;
+        if (!explicit_test_allocation)
+        {
+            directory_entries_lease.emplace(
+                memory_authority->claimNewAllocation(
+                    device,
+                    PhysicalMemoryOwner::ExpertMigrationStaging,
+                    directory_bytes * 2u));
+        }
+
         DeviceMoEExpertDirectoryEntry *device_entries =
             static_cast<DeviceMoEExpertDirectoryEntry *>(
-                backend->allocate(host_entries.size() * sizeof(host_entries[0]), device_ordinal));
+                backend->allocate(directory_bytes, device_ordinal));
         if (!device_entries)
             throw std::runtime_error("DeviceMoETransferSlotDirectory failed to allocate device directory");
         DeviceMoEExpertDirectoryEntry *device_baseline_entries =
             static_cast<DeviceMoEExpertDirectoryEntry *>(
-                backend->allocate(host_entries.size() * sizeof(host_entries[0]), device_ordinal));
+                backend->allocate(directory_bytes, device_ordinal));
         if (!device_baseline_entries)
         {
             backend->free(device_entries, device_ordinal);
@@ -367,7 +658,6 @@ namespace llaminar2
             throw std::runtime_error("DeviceMoETransferSlotDirectory failed to create upload stream");
         }
 
-        const size_t directory_bytes = host_entries.size() * sizeof(host_entries[0]);
         const bool uploaded =
             backend->hostToDeviceOnStream(
                 device_entries,
@@ -396,12 +686,13 @@ namespace llaminar2
                 device,
                 device_ordinal,
                 participant_id,
-                slot_count,
+                capacity,
                 std::move(format_profile.allocation_specs),
                 std::move(orchestrator),
                 device_entries,
                 device_baseline_entries,
                 std::move(host_entries),
+                std::move(directory_entries_lease),
                 planned_bytes,
                 format_profile.max_wire_payload_bytes,
                 slot_storage_capacity_bytes));
@@ -413,6 +704,10 @@ namespace llaminar2
                 " device_id=" + std::to_string(device_ordinal) +
                 " participant=" + std::to_string(participant_id) +
                 " slots=" + std::to_string(slot_count) +
+                " active_slots=" +
+                std::to_string(capacity.active_slots) +
+                " staging_slots=" +
+                std::to_string(capacity.staging_slots) +
                 " projections_per_slot=" + std::to_string(directory->specs_.size()) +
                 " collective_slot_payload_bytes=" + std::to_string(directory->wire_payload_bytes_) +
                 " slot_storage_capacity_bytes=" + std::to_string(slot_storage_capacity_bytes) +
@@ -428,12 +723,14 @@ namespace llaminar2
         DeviceId device,
         int device_ordinal,
         uint32_t participant_id,
-        uint32_t slot_count,
+        BufferedCapacity capacity,
         std::vector<ProjectionSpec> specs,
         std::shared_ptr<LoadOrchestrator> orchestrator,
         DeviceMoEExpertDirectoryEntry *device_entries,
         DeviceMoEExpertDirectoryEntry *device_baseline_entries,
         std::vector<DeviceMoEExpertDirectoryEntry> host_entries,
+        std::optional<PhysicalMemoryAllocationLease>
+            directory_entries_lease,
         size_t planned_bytes,
         size_t wire_payload_bytes,
         size_t slot_storage_capacity_bytes)
@@ -441,12 +738,14 @@ namespace llaminar2
           device_(device),
           device_ordinal_(device_ordinal),
           participant_id_(participant_id),
-          slot_count_(slot_count),
+          slot_count_(capacity.total_slots),
+          capacity_(capacity),
           specs_(std::move(specs)),
           orchestrator_(std::move(orchestrator)),
           device_entries_(device_entries),
           device_baseline_entries_(device_baseline_entries),
           host_entries_(std::move(host_entries)),
+          directory_entries_lease_(std::move(directory_entries_lease)),
           planned_bytes_(planned_bytes),
           wire_payload_bytes_(wire_payload_bytes),
           slot_storage_capacity_bytes_(slot_storage_capacity_bytes)
@@ -559,8 +858,7 @@ namespace llaminar2
         uint32_t slot_index,
         const std::string &label)
     {
-        return "moe_device_rebalance_transfer_slot_" +
-               std::to_string(slot_index) + "_" + label;
+        return directorySlotName(slot_index, label);
     }
 
 } // namespace llaminar2

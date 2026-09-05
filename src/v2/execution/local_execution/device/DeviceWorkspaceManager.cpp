@@ -18,8 +18,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <map>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace llaminar2
@@ -71,19 +73,75 @@ namespace llaminar2
         domain_it->second[slot_] = false;
     }
 
-    DeviceWorkspaceManager::DeviceWorkspaceManager(DeviceId device, size_t budget_bytes)
+    DeviceWorkspaceManager::DeviceWorkspaceManager(
+        DeviceId device,
+        size_t budget_bytes)
         : device_(device),
-          id_(g_next_workspace_manager_id.fetch_add(1, std::memory_order_relaxed)),
+          id_(g_next_workspace_manager_id.fetch_add(
+              1, std::memory_order_relaxed)),
           budget_bytes_(budget_bytes)
     {
+        LOG_DEBUG("[DeviceWorkspaceManager] Created test/unbound manager for device "
+                  << device_.to_string() << " id=" << id_
+                  << " with budget " << budget_bytes_ << " bytes");
+    }
+
+    DeviceWorkspaceManager::DeviceWorkspaceManager(
+        DeviceId device,
+        size_t budget_bytes,
+        std::shared_ptr<PhysicalMemoryAuthority>
+            physical_memory_authority)
+        : DeviceWorkspaceManager(
+              device,
+              budget_bytes,
+              std::move(physical_memory_authority),
+              PhysicalMemoryOwner::ExecutionWorkspace)
+    {
+    }
+
+    DeviceWorkspaceManager::DeviceWorkspaceManager(
+        DeviceId device,
+        size_t budget_bytes,
+        std::shared_ptr<PhysicalMemoryAuthority>
+            physical_memory_authority,
+        PhysicalMemoryOwner physical_memory_owner)
+        : device_(device),
+          id_(g_next_workspace_manager_id.fetch_add(1, std::memory_order_relaxed)),
+          budget_bytes_(budget_bytes),
+          physical_memory_authority_(
+              std::move(physical_memory_authority)),
+          physical_memory_owner_(physical_memory_owner)
+    {
+        if (!physical_memory_authority_ ||
+            !physical_memory_authority_->contains(device_))
+        {
+            throw std::invalid_argument(
+                "DeviceWorkspaceManager requires the canonical authority for " +
+                device_.toString());
+        }
+        if (physical_memory_owner_ == PhysicalMemoryOwner::Count)
+        {
+            throw std::invalid_argument(
+                "DeviceWorkspaceManager requires a concrete physical-memory owner");
+        }
         LOG_DEBUG("[DeviceWorkspaceManager] Created for device " << device_.to_string()
                                                                  << " id=" << id_
+                                                                 << " owner=" << toString(physical_memory_owner_)
                                                                  << " with budget " << budget_bytes_ << " bytes");
     }
 
     DeviceWorkspaceManager::~DeviceWorkspaceManager()
     {
         release();
+    }
+
+    PhysicalMemoryAllocationLease
+    DeviceWorkspaceManager::claimPhysicalAllocation(size_t bytes)
+    {
+        if (!physical_memory_authority_)
+            return {};
+        return physical_memory_authority_->claimNewAllocation(
+            device_, physical_memory_owner_, bytes);
     }
 
     // =========================================================================
@@ -1107,6 +1165,21 @@ namespace llaminar2
             return false;
         }
 
+        // The accounting edge precedes the physical edge. If allocation fails,
+        // the local lease rolls back without publishing a stale live claim.
+        PhysicalMemoryAllocationLease allocation_lease;
+        try
+        {
+            allocation_lease = claimPhysicalAllocation(total_size);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Physical-memory authority rejected "
+                      << total_size << " workspace bytes on "
+                      << device_.to_string() << ": " << error.what());
+            return false;
+        }
+
         // Allocate single contiguous block
         int device_ordinal = device_.is_cpu() ? 0 : device_.ordinal;
         block_ = backend->allocate(total_size, device_ordinal);
@@ -1238,6 +1311,7 @@ namespace llaminar2
 
         used_bytes_ = total_size;
         allocated_ = true;
+        primary_block_lease_ = std::move(allocation_lease);
 
         LOG_TRACE("[DeviceWorkspaceManager] Allocated " << buffers_.size() << " buffers, "
                                                         << used_bytes_ << "/" << budget_bytes_ << " bytes used");
@@ -1260,6 +1334,19 @@ namespace llaminar2
             LOG_ERROR("[DeviceWorkspaceManager] Invalid append-only extension size "
                       << total_size << " with " << remaining()
                       << " bytes remaining on " << device_.to_string());
+            return false;
+        }
+
+        PhysicalMemoryAllocationLease allocation_lease;
+        try
+        {
+            allocation_lease = claimPhysicalAllocation(total_size);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[DeviceWorkspaceManager] Physical-memory authority rejected append-only workspace extension of "
+                      << total_size << " bytes on "
+                      << device_.to_string() << ": " << error.what());
             return false;
         }
 
@@ -1327,7 +1414,11 @@ namespace llaminar2
             current_offset += buffer->size_bytes;
         }
 
-        extension_blocks_.push_back({extension_base, total_size});
+        extension_blocks_.push_back(ExtensionBlock{
+            .base = extension_base,
+            .size = total_size,
+            .allocation_lease = std::move(allocation_lease),
+        });
         used_bytes_ += total_size;
         PerfStatsCollector::addCounter(
             "memory",
@@ -1360,37 +1451,46 @@ namespace llaminar2
             const size_t release_bytes = block_size_;
             const size_t release_buffer_count = buffers_.size();
             IBackend *backend = getBackendFor(device_);
-            if (backend)
+            if (!backend)
             {
-                int device_ordinal = device_.is_cpu() ? 0 : device_.ordinal;
-                backend->free(block_, device_ordinal);
-                LOG_DEBUG("[DeviceWorkspaceManager] Released " << block_size_
-                                                               << " bytes on device " << device_.to_string());
-                PerfStatsCollector::addCounter(
-                    "memory",
-                    "workspace_release_bytes",
-                    static_cast<double>(release_bytes),
-                    "release",
-                    device_.to_string(),
-                    {{"buffer_count", std::to_string(release_buffer_count)},
-                     {"bytes", std::to_string(release_bytes)}});
+                LOG_ERROR("[DeviceWorkspaceManager] Lost backend while a primary workspace block remained live on "
+                          << device_.to_string());
+                std::terminate();
             }
+            int device_ordinal = device_.is_cpu() ? 0 : device_.ordinal;
+            backend->free(block_, device_ordinal);
             block_ = nullptr;
             block_size_ = 0;
+            primary_block_lease_ = {};
+            LOG_DEBUG("[DeviceWorkspaceManager] Released " << release_bytes
+                                                           << " bytes on device " << device_.to_string());
+            PerfStatsCollector::addCounter(
+                "memory",
+                "workspace_release_bytes",
+                static_cast<double>(release_bytes),
+                "release",
+                device_.to_string(),
+                {{"buffer_count", std::to_string(release_buffer_count)},
+                 {"bytes", std::to_string(release_bytes)}});
         }
         if (!extension_blocks_.empty())
         {
             IBackend *backend = getBackendFor(device_);
-            if (backend)
+            if (!backend)
             {
-                const int device_ordinal =
-                    device_.is_cpu() ? 0 : device_.ordinal;
-                for (const ExtensionBlock &extension : extension_blocks_)
-                {
-                    if (extension.base)
-                        backend->free(extension.base, device_ordinal);
-                }
+                LOG_ERROR("[DeviceWorkspaceManager] Lost backend while append-only workspace blocks remained live on "
+                          << device_.to_string());
+                std::terminate();
             }
+            const int device_ordinal =
+                device_.is_cpu() ? 0 : device_.ordinal;
+            for (const ExtensionBlock &extension : extension_blocks_)
+            {
+                if (extension.base)
+                    backend->free(extension.base, device_ordinal);
+            }
+            // Clearing happens only after every physical free; each block's
+            // accounting lease is the final field destroyed by this edge.
             extension_blocks_.clear();
         }
 

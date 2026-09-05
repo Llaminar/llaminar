@@ -765,8 +765,7 @@ TEST(
                "kernel's stable primary and secondary bindings";
     }
 
-    const std::array<std::string, 2> handoff_sources = {
-        "src/v2/execution/compute_stages/stages/GDNLiveStateLocalizeStage.cpp",
+    const std::array<std::string, 1> handoff_sources = {
         "src/v2/execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp",
     };
     for (const auto &relative : handoff_sources)
@@ -810,9 +809,20 @@ TEST(
         << "KernelFactory must bind both short-conv and recurrence state";
     EXPECT_EQ(factory.find("allocateGPUState("), std::string::npos);
 
-    EXPECT_EQ(countOccurrences(handoff, "importStateForSize("), 2u)
-        << "LocalTP handoff must select the prebound full-size conv and "
-           "recurrence banks by exact geometry";
+    const auto compact_handoff = removeAsciiWhitespace(handoff);
+    EXPECT_EQ(countOccurrences(handoff, "importStateForSize("), 1u)
+        << "The typed handoff must have one generic exact-size import authority";
+    EXPECT_EQ(countOccurrences(compact_handoff, "gather_state("), 2u)
+        << "The generic handoff must run exactly once for each state owner";
+    EXPECT_NE(
+        compact_handoff.find("gather_state(params_.conv_kernel,*conv_shape,"),
+        std::string::npos)
+        << "The short-conv owner must receive its resolved linked-state geometry";
+    EXPECT_NE(
+        compact_handoff.find(
+            "gather_state(params_.recurrence_kernel,*recurrence_shape,"),
+        std::string::npos)
+        << "The recurrence owner must receive its resolved linked-state geometry";
     EXPECT_EQ(handoff.find("allocateGPUState("), std::string::npos);
 }
 
@@ -2319,6 +2329,63 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSidecarGraphCaptureInstallsLocalTPBo
         << "LocalTP participants must install capture entry/exit rendezvous before sidecar execution.";
     EXPECT_LT(boundary_call, execute_call)
         << "The sidecar hook must be installed before entering the executor capture path.";
+}
+
+/**
+ * @brief MTP sidecars must use the same retained-parent authority as forward.
+ *
+ * The sidecar bypasses ForwardExecutionEngine during the hosted HIP generation
+ * loop. If its centralized graph-policy helper only applies the native envelope,
+ * the authority endpoint silently reverts to captured/manual/captured host
+ * replay even though the shared ExpertOverlay composer can submit one retained
+ * parent and service the CPU ticket concurrently.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     MTPSidecarPolicyInstallsAndReplaysSharedRetainedParent)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto compact =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+
+    const auto policy = sliceBetween(
+        compact,
+        "DeviceGraphOrchestrator::buildDecodeCapturePolicyForGraph(",
+        "boolDeviceGraphOrchestrator::hasHeterogeneousCollectiveExecutionDomain(");
+    ASSERT_FALSE(policy.empty());
+    EXPECT_NE(
+        policy.find("makeMoEOverlayRetainedParentPlan(graph)"),
+        std::string::npos)
+        << "Every direct graph caller must resolve the shared ExpertOverlay "
+           "parent after applying its native envelope.";
+    EXPECT_NE(
+        policy.find(
+            "policy.graph_replay_plan_policy=retained_parent->replay_policy"),
+        std::string::npos);
+    EXPECT_NE(
+        policy.find(
+            "policy.retained_parent_composer=std::move(retained_parent->composer)"),
+        std::string::npos);
+
+    const auto hosted = sliceBetween(
+        compact,
+        "boolDeviceGraphOrchestrator::replayHostedMTPSidecar(",
+        "boolDeviceGraphOrchestrator::replayHostedMTPGroupedVerifier(");
+    ASSERT_FALSE(hosted.empty());
+    EXPECT_NE(
+        hosted.find(
+            "cache->segment_cache.graph_replay_plan_policy!="
+            "capture_policy.graph_replay_plan_policy"),
+        std::string::npos)
+        << "Hosted replay must reject a policy that differs from setup.";
+    EXPECT_NE(
+        hosted.find("capture_policy.retained_parent_composer"),
+        std::string::npos)
+        << "Hosted replay must pass the shared composer back to the sealed "
+           "cache instead of walking its child units.";
+    EXPECT_EQ(hosted.find("constboolsegmented="), std::string::npos)
+        << "A child-unit count is not a replay authority.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPFirstUseCaptureAndParentPublicationAreAtomic)
@@ -4879,7 +4946,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixSnapshotsObserveAcceptedSpecPubli
     expectNeedleBefore(
         compact_checkpoint,
         "waitForLiveInferenceStateReadyForObservation(",
-        "constintdraft_tokens=",
+        "constintretained_draft_tokens=",
         "captureLivePrefixCheckpoint must order after all live inference-state producers before reading live metadata.");
 }
 
@@ -5972,9 +6039,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy, TerminalDeviceGenerationBridgeIsSingleA
         countOccurrences(terminal_bridge, "waitForEvent("),
         1u)
         << "The sole terminal host boundary waits only for its own result event.";
+    const auto production_terminal_bridge = sliceBetween(
+        terminal_bridge,
+        "bool DeviceGraphOrchestrator::finishDeviceResidentGeneration(",
+        "const bool terminal_transaction_diagnostic_requested");
     EXPECT_EQ(
-        terminal_bridge.find("deviceToHostFast("),
-        std::string::npos);
+        production_terminal_bridge.find("deviceToHostFast("),
+        std::string::npos)
+        << "The mandatory terminal result bridge may queue only its two "
+           "preallocated copies and one event wait; opt-in post-terminal "
+           "diagnostics are outside this production boundary.";
+    EXPECT_NE(
+        terminal_bridge.find(
+            "DebugEnv::isTruthyEnv(\n"
+            "                \"LLAMINAR_MTP_TERMINAL_TRANSACTION_DIAGNOSTICS\")"),
+        std::string::npos)
+        << "Any additional terminal readback must remain explicitly diagnostic.";
     EXPECT_EQ(
         terminal_bridge.find("createStream("),
         std::string::npos)
@@ -9585,6 +9665,13 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_NE(
         materialize.find("PublishGroupSnapshot"),
         std::string::npos);
+    EXPECT_NE(
+        materialize.find(
+            "action==MoEOverlayDeviceControllerAction::"
+            "AuthorPreparedContextRestore"),
+        std::string::npos)
+        << "The retained restoration author must receive the same persistent "
+           "policy-result storage as every other device policy author.";
 
     const auto run_one = sliceBetween(
         compact,
@@ -9614,6 +9701,114 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_LT(participant_receipts, group_launch);
     EXPECT_LT(group_launch, group_receipts);
     EXPECT_LT(group_receipts, author_launch);
+}
+
+/**
+ * @brief Keep Dynamic RCU publication free of device-resident peer waits.
+ *
+ * A monolithic publication graph can begin on one participant while another
+ * participant's copy is still queued behind live sparse inference.  Any peer
+ * wait in that first graph then forms an indirect scheduler cycle with the
+ * inference transaction.  Publication must instead cross every participant,
+ * group, and topology fan-in only after the corresponding mapped receipt is
+ * acquire-visible to the maintenance scheduler.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     DynamicPublicationSplitsEveryPeerFanInIntoFiniteEpochs)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp");
+    const auto compact =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+
+    const auto materialize = sliceBetween(
+        compact,
+        "voidMoEOverlayDeviceControllerGraphService::materializeEndpoint(",
+        "boolMoEOverlayDeviceControllerGraphService::launchAll(");
+    ASSERT_FALSE(materialize.empty());
+    constexpr std::array<const char *, 7> publication_graphs{
+        "dynamic_prepare_candidate_graph",
+        "dynamic_acknowledge_prepared_graph",
+        "dynamic_begin_commit_graph",
+        "dynamic_publish_candidate_graph",
+        "dynamic_acknowledge_published_graph",
+        "dynamic_publish_admission_graph",
+        "dynamic_retirement_readiness_graph",
+    };
+    for (const char *graph : publication_graphs)
+    {
+        EXPECT_NE(materialize.find(graph), std::string::npos) << graph;
+    }
+    EXPECT_EQ(materialize.find("dynamic_publish_graph"), std::string::npos)
+        << "RCU publication must not collapse back into one peer-wait chain.";
+
+    const auto run_one = sliceBetween(
+        compact,
+        "boolMoEOverlayDeviceControllerGraphService::DynamicWorker::runOne(",
+        "std::size_tMoEOverlayDeviceControllerGraphService::localGraphCount(");
+    ASSERT_FALSE(run_one.empty());
+    const size_t prepare = run_one.find(
+        "run_epoch(DynamicGraphEpoch::PrepareRuntimeCandidate,");
+    const size_t participants_prepared = run_one.find(
+        "protocol->preparationReady(command)", prepare);
+    const size_t acknowledge_prepared = run_one.find(
+        "run_epoch(DynamicGraphEpoch::AcknowledgePrepared,",
+        participants_prepared);
+    const size_t groups_prepared = run_one.find(
+        "protocol->allGroupsPrepared(command)", acknowledge_prepared);
+    const size_t commit = run_one.find(
+        "run_epoch(DynamicGraphEpoch::BeginCommit,", groups_prepared);
+    const size_t commit_visible = run_one.find(
+        "protocol->commitRequested(command)", commit);
+    const size_t publish = run_one.find(
+        "run_epoch(DynamicGraphEpoch::PublishRuntimeCandidate,",
+        commit_visible);
+    const size_t participants_published = run_one.find(
+        "protocol->publicationReady(command)", publish);
+    const size_t acknowledge_published = run_one.find(
+        "run_epoch(DynamicGraphEpoch::AcknowledgePublished,",
+        participants_published);
+    const size_t groups_published = run_one.find(
+        "protocol->allGroupsPublished(command)", acknowledge_published);
+    const size_t admission = run_one.find(
+        "run_epoch(DynamicGraphEpoch::PublishAdmission,", groups_published);
+    const size_t retirement_open = run_one.find(
+        "protocol->retirementOpen(command)", admission);
+    const size_t readiness = run_one.find(
+        "run_epoch(DynamicGraphEpoch::PublishRetirementReadiness,",
+        retirement_open);
+    const size_t readers_ready = run_one.find(
+        "protocol->runtimeReadersReady(command)", readiness);
+
+    constexpr size_t missing = std::string::npos;
+    ASSERT_NE(prepare, missing);
+    ASSERT_NE(participants_prepared, missing);
+    ASSERT_NE(acknowledge_prepared, missing);
+    ASSERT_NE(groups_prepared, missing);
+    ASSERT_NE(commit, missing);
+    ASSERT_NE(commit_visible, missing);
+    ASSERT_NE(publish, missing);
+    ASSERT_NE(participants_published, missing);
+    ASSERT_NE(acknowledge_published, missing);
+    ASSERT_NE(groups_published, missing);
+    ASSERT_NE(admission, missing);
+    ASSERT_NE(retirement_open, missing);
+    ASSERT_NE(readiness, missing);
+    ASSERT_NE(readers_ready, missing);
+    EXPECT_LT(prepare, participants_prepared);
+    EXPECT_LT(participants_prepared, acknowledge_prepared);
+    EXPECT_LT(acknowledge_prepared, groups_prepared);
+    EXPECT_LT(groups_prepared, commit);
+    EXPECT_LT(commit, commit_visible);
+    EXPECT_LT(commit_visible, publish);
+    EXPECT_LT(publish, participants_published);
+    EXPECT_LT(participants_published, acknowledge_published);
+    EXPECT_LT(acknowledge_published, groups_published);
+    EXPECT_LT(groups_published, admission);
+    EXPECT_LT(admission, retirement_open);
+    EXPECT_LT(retirement_open, readiness);
+    EXPECT_LT(readiness, readers_ready);
 }
 
 /**
@@ -11262,6 +11457,43 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUKVCheckpointAndTruncateStayDeviceRes
         << "ROCm TurboQuant must inherit the one canonical device truncate path.";
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, AttentionSnapshotDescriptorsNeverObserveGPUSequenceState)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/compute_stages/stages/AttentionComputeStage.cpp");
+    const auto dump_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(
+        sliceBetween(
+            source,
+            "StageDumpInfo AttentionComputeStage::buildDumpInfoImpl() const",
+            "StageBufferRequirements AttentionComputeStage::getBufferRequirements() const")));
+
+    EXPECT_NE(
+        dump_body.find("if(debug_effective_k_tensor_&&debug_effective_v_tensor_)"),
+        std::string::npos)
+        << "captured snapshot metadata must use the cache view published by execute()";
+    EXPECT_NE(
+        dump_body.find("elseif(params_.kv_cache&&params_.layer_idx>=0&&!params_.device_id.is_gpu())"),
+        std::string::npos)
+        << "host sequence-state inspection must be confined to host-owned CPU caches";
+
+    const auto gpu_branch_end = dump_body.find(
+        "if(params_.Q)",
+        dump_body.find("if(debug_effective_k_tensor_"));
+    ASSERT_NE(gpu_branch_end, std::string::npos);
+    const auto descriptor_selection = dump_body.substr(0, gpu_branch_end);
+    const auto cpu_branch = descriptor_selection.find("!params_.device_id.is_gpu()");
+    ASSERT_NE(cpu_branch, std::string::npos);
+    EXPECT_EQ(
+        descriptor_selection.substr(0, cpu_branch).find("get_cached_tokens("),
+        std::string::npos)
+        << "a GPU snapshot manifest must not download the canonical cache count";
+    EXPECT_EQ(
+        descriptor_selection.substr(0, cpu_branch).find("get_kv("),
+        std::string::npos)
+        << "a GPU snapshot manifest must not enter the scalar cache retrieval path";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, KVCacheDevicePublicationPrimitiveIsWrappedRingSafe)
 {
     const auto cuda_base_source =
@@ -12281,9 +12513,15 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUHybridRecurrentStateHasNoHostMirror)
         const auto source = readFile(path);
         const auto compact =
             removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
-        EXPECT_NE(compact.find("state.initializeShape(qkv_dim)"), std::string::npos)
+        EXPECT_NE(
+            compact.find(
+                "state.initializeShape(geometry.local_qkv_dim)"),
+            std::string::npos)
             << path;
-        EXPECT_EQ(compact.find("state.initializeCPUState(qkv_dim)"), std::string::npos)
+        EXPECT_EQ(
+            compact.find(
+                "state.initializeCPUState(geometry.local_qkv_dim)"),
+            std::string::npos)
             << path;
         EXPECT_EQ(compact.find("metadata.host_bytes=gdnMemoryBytes()"), std::string::npos)
             << path;
@@ -12895,7 +13133,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ROCmVerifierDispatchPolicyIsWorkerLocal
     const auto grouped_policy = sliceBetween(
         kernel_source,
         "if (g_rocm_native_vnni_decode_equivalent_scope)",
-        "if (PerfStatsCollector::isEnabled() && !batched_bypass_reason.empty())");
+        "if (PerfStatsCollector::isDomainEnabled(\"kernel\") &&\n"
+        "                !batched_bypass_reason.empty())");
     EXPECT_FALSE(grouped_policy.empty());
     EXPECT_EQ(
         grouped_policy.find("projections.size() > 1"),
@@ -13219,8 +13458,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, HiddenStateRowSelectGraphManagedPathDoe
         "        const auto *input_device =",
         "        return true;");
 
-    EXPECT_NE(execute_gpu.find("const bool graph_managed"), std::string::npos);
-    EXPECT_NE(execute_gpu.find("if (!graph_managed)"), std::string::npos);
+    EXPECT_NE(execute_gpu.find("const bool output_graph_managed"), std::string::npos);
+    EXPECT_NE(execute_gpu.find("if (!output_graph_managed)"), std::string::npos);
     EXPECT_EQ(execute_gpu.find("output_base->ensureOnDevice("), std::string::npos)
         << "Row-select writes must allocate outputs without uploading stale host contents";
     EXPECT_EQ(launch_path.find("ensureOnDevice("), std::string::npos)
@@ -13229,7 +13468,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, HiddenStateRowSelectGraphManagedPathDoe
         << "Graph-managed row-select execution must rely on executor/arena output allocation";
     const auto direct_publication = sliceBetween(
         execute_gpu,
-        "        if (!graph_managed)\n        {\n            /*\n             * A direct-output row selector",
+        "        if (!output_graph_managed)\n        {\n            /*\n             * A direct-output row selector",
         "        return true;");
     EXPECT_NE(direct_publication.find("if (isGraphCaptureActive())"), std::string::npos);
     EXPECT_NE(
@@ -13290,12 +13529,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUKVConversionScratchCoversResidentHis
 
     for (const auto *requirements : {&cuda_requirements, &rocm_requirements})
     {
-        EXPECT_NE(requirements->find("std::max(m, max_seq_len_)"), std::string::npos)
-            << "A prefill graph bucket bounds new rows, not the resident KV horizon";
+        EXPECT_NE(
+            requirements->find(
+                "kv_cache_workspace::conversionRequirements(geometry)"),
+            std::string::npos)
+            << "CUDA and ROCm must delegate conversion-buffer admission to "
+               "the one typed KV-cache workspace authority";
         EXPECT_NE(requirements->find("batch_size_"), std::string::npos)
-            << "Scratch must retain the cache's full configured request capacity";
-        EXPECT_NE(requirements->find("KVCacheWorkspaceBuffers::CONV_SCRATCH_K"), std::string::npos);
-        EXPECT_NE(requirements->find("KVCacheWorkspaceBuffers::CONV_SCRATCH_V"), std::string::npos);
+            << "The canonical geometry must receive the configured request capacity";
+        EXPECT_NE(requirements->find("max_seq_len_"), std::string::npos)
+            << "The canonical geometry must receive the resident KV horizon";
+        EXPECT_EQ(
+            requirements->find("requirements.buffers.emplace_back"),
+            std::string::npos)
+            << "Backends may contribute typed geometry but must not recreate "
+               "the canonical K/V workspace ledger";
     }
 }
 
@@ -14826,9 +15074,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CachedGraphSnapshotsHavePerGraphOwners)
         std::string::npos)
         << "Cached capture and replay must resolve the manifest from their exact segment cache.";
     EXPECT_NE(
-        compact_cached_replay.find("prepare_graph_snapshot_copies"),
+        compact_cached_replay.find("prepare_graph_snapshot_manifest"),
         std::string::npos)
-        << "Capture must prepare descriptors in the same manifest that records and publishes snapshots.";
+        << "Capture must prepare and bind the graph-owned snapshot manifest "
+           "before that same manifest records and publishes snapshots.";
     EXPECT_EQ(compact_cached_replay.find("runStages("), std::string::npos)
         << "Snapshot manifests must not require eager model execution before capture.";
     EXPECT_EQ(
@@ -16437,7 +16686,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             conditional_builder,
             "appendDeviceControlledFragment("),
         2u)
-        << "Fixed WHILE and dynamic SWITCH/WHILE must share exactly one typed "
+        << "Fixed and dynamic selector-gated WHILE must share exactly one typed "
            "fragment-lowering authority.";
     EXPECT_EQ(
         cuda_capture.find("lowerCudaConditionalBodyEventHandoffs"),

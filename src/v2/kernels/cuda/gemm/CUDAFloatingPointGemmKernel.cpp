@@ -490,7 +490,7 @@ namespace llaminar2
                         cuda_device_id_,
                         gpu_stream_);
                 }
-                if (success && PerfStatsCollector::isEnabled())
+                if (success && PerfStatsCollector::isDomainEnabled("kernel"))
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -586,7 +586,7 @@ namespace llaminar2
                         cuda_device_id_,
                         gpu_stream_);
                 }
-                if (success && PerfStatsCollector::isEnabled())
+                if (success && PerfStatsCollector::isDomainEnabled("kernel"))
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -780,7 +780,7 @@ namespace llaminar2
                     }
                 }
 
-                if (PerfStatsCollector::isEnabled())
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -963,7 +963,7 @@ namespace llaminar2
                 }
             }
 
-            if (success && PerfStatsCollector::isEnabled())
+            if (success && PerfStatsCollector::isDomainEnabled("kernel"))
             {
                 PerfStatsCollector::addCounter(
                     "kernel",
@@ -1227,7 +1227,7 @@ namespace llaminar2
                     for (size_t local = 0; local < group_count; ++local)
                         completed[group_indices[group_offset + local]] = true;
 
-                    if (PerfStatsCollector::isEnabled())
+                    if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
@@ -1432,7 +1432,7 @@ namespace llaminar2
                     gpu_stream_);
             }
 
-            if (success && PerfStatsCollector::isEnabled())
+            if (success && PerfStatsCollector::isDomainEnabled("kernel"))
             {
                 PerfStatsCollector::addCounter(
                     "kernel",

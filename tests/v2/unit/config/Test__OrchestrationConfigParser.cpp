@@ -83,10 +83,24 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(config.moe_rebalance.window_size, 256);
     EXPECT_EQ(
         config.moe_rebalance.migration_payoff_horizon_tokens,
-        2048u);
-    EXPECT_EQ(config.moe_rebalance.migration_transfer_slots, 1u);
+        moe_rebalance_policy::kDefaultMigrationPayoffHorizonTokens);
+    EXPECT_EQ(
+        config.moe_rebalance.migration_transfer_slots,
+        moe_rebalance_policy::kDefaultMigrationTransferSlots);
+    EXPECT_FALSE(config.moe_rebalance.migration_execution_streams.has_value());
+    EXPECT_EQ(
+        config.moe_rebalance.resolvedMigrationExecutionStreams(),
+        moe_rebalance_policy::kDefaultMigrationExecutionStreams);
     EXPECT_FALSE(config.moe_rebalance.migration_cycles_per_wave.has_value());
-    EXPECT_EQ(config.moe_rebalance.resolvedMigrationCyclesPerWave(), 1u);
+    EXPECT_EQ(
+        config.moe_rebalance.resolvedMigrationCyclesPerWave(),
+        moe_rebalance_policy::kDefaultMigrationTransferSlots);
+    EXPECT_EQ(
+        config.moe_rebalance.dynamic_max_swaps_per_layer,
+        moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer);
+    EXPECT_EQ(
+        config.moe_rebalance.dynamic_max_plan_entries_per_wave,
+        moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave);
     EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 0);
     EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 8192u);
     EXPECT_EQ(config.moe_routed_prefill.llep_alpha_numerator, 1u);
@@ -485,7 +499,7 @@ TEST(Test__OrchestrationConfigParser,
         "--moe-routed-expert-domain",
         "portable_gpu_pool=cuda:0,cuda:1;scope=auto;backend=nccl;routed_compute=apportioned",
         "--moe-routed-expert-tier",
-        "priority_0@portable_gpu_pool;priority=0;fallback=true",
+        "priority_0@portable_gpu_pool;priority=0",
     };
     OrchestrationConfigParser parser;
 
@@ -511,7 +525,7 @@ TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonic
                             "--moe-routed-expert-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=rank_local;backend=rccl;routed_compute=apportioned;owner=0",
                             "--moe-routed-expert-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;ranks=0,1",
                             "--moe-routed-expert-tier", "hot@rocm_hot;priority=0",
-                            "--moe-routed-expert-tier", "cold@cpu_cold;priority=1;fallback=true"};
+                            "--moe-routed-expert-tier", "cold@cpu_cold;priority=1"};
 
     const auto named_config = parser.parseArgs(named_args.argc(), named_args.argv());
     const auto overlay_config = parser.parseArgs(overlay_args.argc(), overlay_args.argv());
@@ -537,6 +551,8 @@ TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonic
     ASSERT_EQ(inventory.size(), 2u);
     EXPECT_EQ(inventory[0].logicalIdentity(), "rocm_hot");
     EXPECT_EQ(inventory[1].logicalIdentity(), "cpu_cold");
+    EXPECT_FALSE(overlay_config.moe_routed_expert_plan->routed_tiers[0].fallback);
+    EXPECT_TRUE(overlay_config.moe_routed_expert_plan->routed_tiers[1].fallback);
 }
 
 TEST(Test__OrchestrationConfigParser, Phase9B_OverlayDenseTPOptIn)
@@ -1184,6 +1200,7 @@ moe:
     residency_maintenance_window_growth: 2.5
     migration_payoff_horizon_tokens: 16384
     migration_transfer_slots: 3
+    migration_execution_streams: 2
     migration_cycles_per_wave: 2
     routed_prefill_assignment_window_tokens: 96
     overlay_prefill_segment_rows: 320
@@ -1225,6 +1242,11 @@ moe:
         config.moe_rebalance.migration_payoff_horizon_tokens,
         16'384u);
     EXPECT_EQ(config.moe_rebalance.migration_transfer_slots, 3u);
+    ASSERT_TRUE(config.moe_rebalance.migration_execution_streams.has_value());
+    EXPECT_EQ(*config.moe_rebalance.migration_execution_streams, 2u);
+    EXPECT_EQ(
+        config.moe_rebalance.resolvedMigrationExecutionStreams(),
+        2u);
     ASSERT_TRUE(config.moe_rebalance.migration_cycles_per_wave.has_value());
     EXPECT_EQ(*config.moe_rebalance.migration_cycles_per_wave, 2u);
     EXPECT_EQ(config.moe_rebalance.resolvedMigrationCyclesPerWave(), 2u);
@@ -1269,6 +1291,7 @@ moe_residency_maintenance_max_window: 1024
 moe_residency_maintenance_window_growth: 1.25
 moe_migration_payoff_horizon_tokens: 32768
 moe_migration_transfer_slots: 4
+moe_migration_execution_streams: 2
 moe_migration_cycles_per_wave: 3
 moe_routed_prefill_assignment_window_tokens: 192
 moe_overlay_prefill_segment_rows: 384
@@ -1309,6 +1332,11 @@ moe_release_raw_expert_weights: false
         config.moe_rebalance.migration_payoff_horizon_tokens,
         32'768u);
     EXPECT_EQ(config.moe_rebalance.migration_transfer_slots, 4u);
+    ASSERT_TRUE(config.moe_rebalance.migration_execution_streams.has_value());
+    EXPECT_EQ(*config.moe_rebalance.migration_execution_streams, 2u);
+    EXPECT_EQ(
+        config.moe_rebalance.resolvedMigrationExecutionStreams(),
+        2u);
     ASSERT_TRUE(config.moe_rebalance.migration_cycles_per_wave.has_value());
     EXPECT_EQ(*config.moe_rebalance.migration_cycles_per_wave, 3u);
     EXPECT_EQ(config.moe_rebalance.resolvedMigrationCyclesPerWave(), 3u);
@@ -1353,7 +1381,7 @@ moe_routed_expert_placement:
     domains:
         - "gpu_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0"
     routed_tiers:
-        - "hot@gpu_hot;priority=0;fallback=true"
+        - "hot@gpu_hot;priority=0"
     )";
 
     const auto config = parser.parseYamlString(yaml);
@@ -1367,6 +1395,20 @@ moe_routed_expert_placement:
     EXPECT_EQ(
         config.moe_routed_expert_plan->domains.front().routed_compute_policy,
         RoutedExpertComputePolicy::Apportioned);
+    ASSERT_EQ(config.moe_routed_expert_plan->routed_tiers.size(), 1u);
+    EXPECT_TRUE(config.moe_routed_expert_plan->routed_tiers.front().fallback);
+}
+
+TEST(Test__OrchestrationConfigParser, RejectsAuthoredFallbackTier)
+{
+    ArgvHelper args{
+        "llaminar2",
+        "--moe-routed-expert-placement", "tiered-overlay",
+        "--moe-routed-expert-tier", "priority0@gpu;priority=0;fallback=true",
+    };
+    OrchestrationConfigParser parser;
+
+    EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
 }
 
 TEST(Test__OrchestrationConfigParser, RejectsObsoleteRoutedExpertYamlNames)
@@ -2002,6 +2044,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
                     "--moe-residency-maintenance-window-growth", "2.0",
                     "--moe-migration-payoff-horizon-tokens", "65536",
                     "--moe-migration-transfer-slots", "5",
+                    "--moe-migration-execution-streams", "3",
                     "--moe-migration-cycles-per-wave", "4",
                     "--moe-routed-prefill-assignment-window", "384",
                     "--moe-overlay-prefill-segment-rows", "448",
@@ -2038,6 +2081,11 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
         config.moe_rebalance.migration_payoff_horizon_tokens,
         65'536u);
     EXPECT_EQ(config.moe_rebalance.migration_transfer_slots, 5u);
+    ASSERT_TRUE(config.moe_rebalance.migration_execution_streams.has_value());
+    EXPECT_EQ(*config.moe_rebalance.migration_execution_streams, 3u);
+    EXPECT_EQ(
+        config.moe_rebalance.resolvedMigrationExecutionStreams(),
+        3u);
     ASSERT_TRUE(config.moe_rebalance.migration_cycles_per_wave.has_value());
     EXPECT_EQ(*config.moe_rebalance.migration_cycles_per_wave, 4u);
     EXPECT_EQ(config.moe_rebalance.resolvedMigrationCyclesPerWave(), 4u);
@@ -2105,6 +2153,20 @@ TEST(Test__OrchestrationConfigParser,
     ArgvHelper args{
         "llaminar2",
         "--moe-migration-cycles-per-wave",
+        "0"};
+    OrchestrationConfigParser parser;
+
+    EXPECT_THROW(
+        parser.parseArgs(args.argc(), args.argv()),
+        std::invalid_argument);
+}
+
+TEST(Test__OrchestrationConfigParser,
+     ParseArgs_MigrationExecutionStreamsMustBePositive)
+{
+    ArgvHelper args{
+        "llaminar2",
+        "--moe-migration-execution-streams",
         "0"};
     OrchestrationConfigParser parser;
 

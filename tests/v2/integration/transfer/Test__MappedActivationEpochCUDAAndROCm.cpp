@@ -1291,6 +1291,8 @@ TEST(Test__MappedActivationEpochCUDAAndROCm,
     double regions = 0.0;
     double aliases = 0.0;
     double families = 0.0;
+    double device_local_registrations = 0.0;
+    double portable_registrations = 0.0;
     double waits = 0.0;
     double publications = 0.0;
     for (const auto &record : PerfStatsCollector::snapshot(
@@ -1299,11 +1301,24 @@ TEST(Test__MappedActivationEpochCUDAAndROCm,
         if (record.domain != "moe_overlay_activation_epoch")
             continue;
         if (record.name == "mapped_regions_registered")
+        {
             regions += record.value;
+            EXPECT_EQ(record.tags.at("mapping"), "typed_external_host_pages");
+        }
         else if (record.name == "mapped_endpoint_aliases")
             aliases += record.value;
         else if (record.name == "mapped_backend_families")
             families += record.value;
+        else if (record.name == "mapped_backend_registrations")
+        {
+            const auto &scope = record.tags.at("registration_scope");
+            if (scope == "device_local")
+                device_local_registrations += record.value;
+            else if (scope == "backend_portable")
+                portable_registrations += record.value;
+            else
+                ADD_FAILURE() << "Unknown mapped registration scope: " << scope;
+        }
         else if (record.name == "device_timeline_waits_enqueued")
         {
             waits += record.value;
@@ -1322,6 +1337,8 @@ TEST(Test__MappedActivationEpochCUDAAndROCm,
     EXPECT_EQ(regions, 1.0);
     EXPECT_EQ(aliases, 2.0);
     EXPECT_EQ(families, 2.0);
+    EXPECT_EQ(device_local_registrations, 2.0);
+    EXPECT_EQ(portable_registrations, 0.0);
     EXPECT_EQ(waits, expected_direction_operations);
     EXPECT_EQ(publications, expected_direction_operations);
 }
@@ -1350,6 +1367,126 @@ TEST(Test__MappedActivationEpochCUDAAndROCm,
     EXPECT_EQ(lane.returnSignal(0u), 7u);
     EXPECT_EQ(lane.dispatchSignal(1u), 0u);
     EXPECT_EQ(lane.returnSignal(1u), 0u);
+}
+
+/**
+ * @test Late ROCm mappings remain graph-addressable at production cardinality.
+ *
+ * A production ExpertOverlay model owns independent logical ticket storage for
+ * several prefill buckets, decode, and every retained MTP depth. The model-owned
+ * arena must preserve every logical address while reducing native mapped-host
+ * backing regions from linear ticket cardinality to logarithmic growth.
+ * This regression retains production-scale slices, captures publications
+ * against the final layer-sized suffix, and replays twice. It proves both late
+ * slice stability and the structural mapped-backing bound that prevents ROCm
+ * IOMMU workqueue/IH-ring exhaustion.
+ */
+TEST(Test__MappedActivationEpochCUDAAndROCm,
+     ArenaBackedLateROCmMappingsRemainCapturedAtProductionCardinality)
+{
+    IBackend *const rocm = getROCmBackend();
+    ASSERT_NE(rocm, nullptr);
+    if (rocm->deviceCount() < 1)
+    {
+        GTEST_SKIP() << "Requires at least one ROCm device";
+    }
+
+    constexpr size_t kRetainedRegionCount = 640u;
+    constexpr size_t kCapturedSuffixCount = 48u;
+    constexpr std::uint64_t kPublishedTimeline = 11u;
+    static_assert(kCapturedSuffixCount <= kRetainedRegionCount);
+
+    TransferEngine engine;
+    const DeviceId device = DeviceId::rocm(0);
+    const std::array devices{device};
+    auto arena = engine.createMappedHostArena(devices);
+    ASSERT_NE(arena, nullptr);
+    std::vector<std::shared_ptr<MappedHostTransferRegion>> regions;
+    regions.reserve(kRetainedRegionCount);
+    for (size_t index = 0u; index < kRetainedRegionCount; ++index)
+    {
+        SCOPED_TRACE(::testing::Message()
+                     << "mapped_region_index=" << index);
+        auto region = arena->allocate(
+            2u * sizeof(std::uint64_t), /*alignment=*/64u);
+        ASSERT_NE(region, nullptr);
+        ASSERT_TRUE(region->isBound());
+        auto *const words = static_cast<std::uint64_t *>(
+            region->mutableHostData());
+        words[0] = 0u;
+        words[1] = 0u;
+        regions.push_back(std::move(region));
+    }
+
+    const auto arena_snapshot = arena->snapshot();
+    size_t logarithmic_registration_bound = 1u;
+    for (size_t remaining = kRetainedRegionCount;
+         remaining > 1u;
+         remaining = (remaining + 1u) / 2u)
+    {
+        ++logarithmic_registration_bound;
+    }
+    EXPECT_EQ(arena_snapshot.slice_count, kRetainedRegionCount);
+    EXPECT_LE(
+        arena_snapshot.backing_region_count,
+        logarithmic_registration_bound)
+        << "mapped backing regions grew linearly with logical tickets";
+
+    void *const stream = rocm->createStream(0);
+    void *const terminal = rocm->createEvent(0);
+    ASSERT_NE(stream, nullptr);
+    ASSERT_NE(terminal, nullptr);
+
+    auto &context = GPUDeviceContextPool::instance().getContext(device);
+    auto graph = context.createGraphCapture(stream);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_TRUE(graph->beginCapture());
+    for (size_t index = kRetainedRegionCount - kCapturedSuffixCount;
+         index < kRetainedRegionCount;
+         ++index)
+    {
+        // These are the mappings most likely to expose a backend mapping
+        // ceiling because they are created after every simulated prefill page.
+        engine.enqueueMappedTimelinePublish64(
+            *regions[index],
+            0u,
+            kPublishedTimeline,
+            device,
+            stream);
+    }
+    ASSERT_TRUE(graph->endCapture());
+    ASSERT_EQ(graph->nodeCount(), kCapturedSuffixCount);
+    ASSERT_TRUE(graph->instantiate());
+
+    for (size_t replay = 0u; replay < 2u; ++replay)
+    {
+        for (size_t index = kRetainedRegionCount - kCapturedSuffixCount;
+             index < kRetainedRegionCount;
+             ++index)
+        {
+            *static_cast<std::uint64_t *>(regions[index]->mutableHostData()) = 0u;
+        }
+        ASSERT_TRUE(graph->launch());
+        ASSERT_TRUE(rocm->recordEvent(terminal, 0, stream));
+        ASSERT_TRUE(awaitEvent(
+            rocm, 0, terminal, std::chrono::seconds(10)))
+            << "late mapped publication graph did not complete on replay "
+            << replay;
+        for (size_t index = kRetainedRegionCount - kCapturedSuffixCount;
+             index < kRetainedRegionCount;
+             ++index)
+        {
+            EXPECT_EQ(
+                *static_cast<std::uint64_t *>(
+                    regions[index]->mutableHostData()),
+                kPublishedTimeline)
+                << "replay=" << replay << " mapped_region_index=" << index;
+        }
+    }
+
+    graph.reset();
+    rocm->destroyEvent(terminal, 0);
+    rocm->destroyStream(stream, 0);
 }
 
 /**

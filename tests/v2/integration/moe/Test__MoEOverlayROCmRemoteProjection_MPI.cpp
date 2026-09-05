@@ -2,8 +2,8 @@
  * @file Test__MoEOverlayROCmRemoteProjection_MPI.cpp
  * @brief Real-MPI proof for secondary-ROCm ExpertOverlay weight movement.
  *
- * A two-rank production composition streams one Q8_0 projection in both
- * directions between a CPU rank and ROCm device one.  Every wave deliberately
+ * A two-rank production composition streams complete Q8_0 expert triplets in
+ * both directions between a CPU rank and ROCm device one. Every wave deliberately
  * leaves the maintenance thread's current device set to ROCm device zero, then
  * exercises the production GPU endpoint and MPI transport.  This locks down
  * device selection, chunk ownership, event-polled progress, exact final bytes,
@@ -43,7 +43,7 @@ namespace llaminar2::test
         constexpr int kCpuOwnerRank = 0;
         constexpr int kSecondaryRocmOrdinal = 1;
         constexpr std::uint32_t kUnitsPerChunk = 2;
-        constexpr std::size_t kWaveCount = 32;
+        constexpr std::size_t kWaveCount = 8;
 
         /** @brief Bind the two-rank world communicator used by the data plane. */
         std::shared_ptr<MPIContext> worldContext()
@@ -61,11 +61,14 @@ namespace llaminar2::test
         }
 
         /** @brief Create deterministic, structurally valid separated Q8_0 bytes. */
-        HostGpuExpertPackedProjection q8GpuProjection()
+        HostGpuExpertPackedProjection q8GpuProjection(
+            int n,
+            int k,
+            std::uint32_t seed)
         {
             HostGpuExpertPackedProjection projection;
-            projection.N = 128;
-            projection.K = 1024;
+            projection.N = n;
+            projection.K = k;
             projection.blocks_per_row = projection.K / 32;
             projection.source_codebook_id = 19;
             projection.codebook_id = 19;
@@ -82,12 +85,12 @@ namespace llaminar2::test
             {
                 projection.payload[index] =
                     static_cast<std::uint8_t>(
-                        (index * 131u + (index >> 3u) * 17u + 29u) & 0xffu);
+                        (index * 131u + (index >> 3u) * 17u + seed) & 0xffu);
             }
             for (std::size_t index = 0; index < projection.scales.size(); ++index)
             {
                 projection.scales[index] = static_cast<std::uint16_t>(
-                    0x2400u + ((index * 19u + 7u) & 0x01ffu));
+                    0x2400u + ((index * 19u + seed) & 0x01ffu));
             }
             return projection;
         }
@@ -282,6 +285,7 @@ namespace llaminar2::test
         MoEOverlayRemoteProjectionIdentity projectionIdentity(
             std::uint64_t epoch,
             std::uint64_t migration_index,
+            ExpertTierWeightProjection projection,
             int source_rank,
             int destination_rank,
             DeviceId source_device,
@@ -297,9 +301,7 @@ namespace llaminar2::test
                 .migration_index = migration_index,
                 .layer_idx = 7,
                 .expert_id = static_cast<int>(11u + migration_index),
-                .projection = migration_index == 0u
-                    ? ExpertTierWeightProjection::Up
-                    : ExpertTierWeightProjection::Down,
+                .projection = projection,
                 .source_participant = source_rank,
                 .destination_participant = destination_rank,
                 .source_world_rank = source_rank,
@@ -338,106 +340,162 @@ namespace llaminar2::test
             GTEST_SKIP() << "The regression requires at least two ROCm devices";
         ASSERT_NE(rocm, nullptr);
 
-        const HostGpuExpertPackedProjection expected_gpu = q8GpuProjection();
-        cpu::native_vnni::CPUNativeVNNIPackedWeights cpu_weights;
+        constexpr std::size_t kProjectionCount = 3;
+        constexpr std::array<ExpertTierWeightProjection, kProjectionCount>
+            kExpertProjections{
+                ExpertTierWeightProjection::Gate,
+                ExpertTierWeightProjection::Up,
+                ExpertTierWeightProjection::Down,
+            };
+        const std::array<HostGpuExpertPackedProjection, kProjectionCount>
+            expected_gpu{
+                q8GpuProjection(1024, 3072, 31u),
+                q8GpuProjection(1024, 3072, 73u),
+                q8GpuProjection(3072, 1024, 109u),
+            };
+        std::array<cpu::native_vnni::CPUNativeVNNIPackedWeights,
+                   kProjectionCount>
+            cpu_weights;
         std::string error;
-        ASSERT_TRUE(gpuToCpuExpertPackedReference(
-            expected_gpu, cpu_weights, &error)) << error;
-        HostGpuExpertPackedProjection round_trip_gpu;
-        ASSERT_TRUE(cpuToGpuExpertPackedReference(
-            cpu_weights, round_trip_gpu, &error)) << error;
-        expectSameProjection(round_trip_gpu, expected_gpu);
+        for (std::size_t projection = 0;
+             projection < kProjectionCount;
+             ++projection)
+        {
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(
+                expected_gpu[projection], cpu_weights[projection], &error))
+                << error;
+            HostGpuExpertPackedProjection round_trip_gpu;
+            ASSERT_TRUE(cpuToGpuExpertPackedReference(
+                cpu_weights[projection], round_trip_gpu, &error)) << error;
+            expectSameProjection(round_trip_gpu, expected_gpu[projection]);
+        }
 
         const DeviceId gpu_device = DeviceId::rocm(kSecondaryRocmOrdinal);
-        std::unique_ptr<DeviceQ8Projection> gpu_source;
-        std::unique_ptr<DeviceQ8Projection> gpu_destination;
-        std::shared_ptr<MoEOverlayGpuRemoteProjectionLane> source_lane;
-        std::shared_ptr<MoEOverlayGpuRemoteProjectionLane> destination_lane;
-        std::shared_ptr<ITensorGemm> destination_engine;
+        std::array<std::unique_ptr<DeviceQ8Projection>, kProjectionCount>
+            gpu_sources;
+        std::array<std::unique_ptr<DeviceQ8Projection>, kProjectionCount>
+            gpu_destinations;
+        std::array<std::shared_ptr<MoEOverlayGpuRemoteProjectionLane>,
+                   kProjectionCount>
+            source_lanes;
+        std::array<std::shared_ptr<MoEOverlayGpuRemoteProjectionLane>,
+                   kProjectionCount>
+            destination_lanes;
+        std::array<std::shared_ptr<ITensorGemm>, kProjectionCount>
+            destination_engines;
         std::shared_ptr<void> gpu_slot_lifetime;
         void *observation_stream = nullptr;
 
         const std::size_t cpu_block_stride = static_cast<std::size_t>(
-            cpu_weights.interleaved_block_stride);
+            cpu_weights.front().interleaved_block_stride);
         const std::size_t staging_bytes =
             cpu_block_stride * kUnitsPerChunk;
         ASSERT_LE(staging_bytes, static_cast<std::size_t>(UINT32_MAX));
 
         if (context->rank() == kGpuOwnerRank)
         {
-            gpu_source = std::make_unique<DeviceQ8Projection>(
-                *rocm, gpu_device, expected_gpu);
-            gpu_destination = std::make_unique<DeviceQ8Projection>(
-                *rocm, gpu_device, expected_gpu);
             IWorkerGPUContext &gpu_context =
                 GPUDeviceContextPool::instance().getContext(gpu_device);
             observation_stream = gpu_context.getOrCreateAuxiliaryStream(
                 "rocm_mpi_remote_projection_observation");
             ASSERT_NE(observation_stream, nullptr);
-            ASSERT_TRUE(gpu_source->upload(expected_gpu, observation_stream));
-            ASSERT_TRUE(gpu_destination->upload(
-                HostGpuExpertPackedProjection{
-                    .N = expected_gpu.N,
-                    .K = expected_gpu.K,
-                    .blocks_per_row = expected_gpu.blocks_per_row,
-                    .source_codebook_id = expected_gpu.source_codebook_id,
-                    .codebook_id = expected_gpu.codebook_id,
-                    .payload_bytes_per_block =
-                        expected_gpu.payload_bytes_per_block,
-                    .is_asymmetric = false,
-                    .is_superblock = expected_gpu.is_superblock,
-                    .has_emins = false,
-                    .payload = std::vector<std::uint8_t>(
-                        expected_gpu.payload.size(), 0xa5u),
-                    .scales = std::vector<std::uint16_t>(
-                        expected_gpu.scales.size(), 0x7bffu),
-                },
-                observation_stream));
+            for (std::size_t projection = 0;
+                 projection < kProjectionCount;
+                 ++projection)
+            {
+                gpu_sources[projection] =
+                    std::make_unique<DeviceQ8Projection>(
+                        *rocm, gpu_device, expected_gpu[projection]);
+                gpu_destinations[projection] =
+                    std::make_unique<DeviceQ8Projection>(
+                        *rocm, gpu_device, expected_gpu[projection]);
+                ASSERT_TRUE(gpu_sources[projection]->upload(
+                    expected_gpu[projection], observation_stream));
+                auto poisoned = expected_gpu[projection];
+                std::fill(poisoned.payload.begin(), poisoned.payload.end(), 0xa5u);
+                std::fill(poisoned.scales.begin(), poisoned.scales.end(), 0x7bffu);
+                ASSERT_TRUE(gpu_destinations[projection]->upload(
+                    poisoned, observation_stream));
+            }
             ASSERT_TRUE(awaitStreamEdge(
                 *rocm, gpu_context, gpu_device, observation_stream));
 
-            source_lane = std::make_shared<
-                MoEOverlayGpuRemoteProjectionLane>(
-                MoEOverlayGpuRemoteProjectionLane::Config{
-                    .device = gpu_device,
-                    .staging_capacity_bytes = staging_bytes,
-                    .lane_name = "rocm1_mpi_q8_demotion",
-                    .perf_device = "rocm:1",
-                });
-            destination_lane = std::make_shared<
-                MoEOverlayGpuRemoteProjectionLane>(
-                MoEOverlayGpuRemoteProjectionLane::Config{
-                    .device = gpu_device,
-                    .staging_capacity_bytes = staging_bytes,
-                    .lane_name = "rocm1_mpi_q8_promotion",
-                    .perf_device = "rocm:1",
-                });
-            ASSERT_TRUE(source_lane->materialize(&error)) << error;
-            ASSERT_TRUE(destination_lane->materialize(&error)) << error;
+            const auto remote_staging = TransferEngine::instance()
+                                            .allocatePersistentTransferStagingSlices(
+                                                staging_bytes,
+                                                2u * kProjectionCount,
+                                                gpu_device);
+            const auto remote_execution = TransferEngine::instance()
+                                              .allocatePersistentTransferExecutionLanes(
+                                                  2u * kProjectionCount,
+                                                  gpu_device,
+                                                  "rocm_mpi_remote_projection");
 
             gpu_slot_lifetime = std::make_shared<int>(91);
-            const auto descriptor = gpu_destination->descriptor();
-            destination_engine = std::make_shared<
-                rocm::ROCmQuantisedGemmKernel>(
-                descriptor.n,
-                descriptor.k,
-                kSecondaryRocmOrdinal,
-                descriptor.ptrs.d_vnni,
-                descriptor.ptrs.d_scales,
-                descriptor.ptrs.d_mins,
-                descriptor.ptrs.d_emins,
-                descriptor.codebook_id,
-                descriptor.blocks_per_row,
-                gpu_slot_lifetime,
-                NativeVnniSourceIdentity{
-                    .codebook_id = expected_gpu.source_codebook_id,
-                    .is_superblock = expected_gpu.is_superblock,
-                    .present = true,
-                });
+            for (std::size_t projection = 0;
+                 projection < kProjectionCount;
+                 ++projection)
+            {
+                source_lanes[projection] = std::make_shared<
+                    MoEOverlayGpuRemoteProjectionLane>(
+                    MoEOverlayGpuRemoteProjectionLane::Config{
+                        .device = gpu_device,
+                        .staging = remote_staging[projection],
+                        .execution = remote_execution[projection],
+                        .lane_name = "rocm1_mpi_q8_demotion_" +
+                                     std::to_string(projection),
+                        .perf_device = "rocm:1",
+                    });
+                destination_lanes[projection] = std::make_shared<
+                    MoEOverlayGpuRemoteProjectionLane>(
+                    MoEOverlayGpuRemoteProjectionLane::Config{
+                        .device = gpu_device,
+                        .staging = remote_staging[
+                            kProjectionCount + projection],
+                        .execution = remote_execution[
+                            kProjectionCount + projection],
+                        .lane_name = "rocm1_mpi_q8_promotion_" +
+                                     std::to_string(projection),
+                        .perf_device = "rocm:1",
+                    });
+                ASSERT_TRUE(source_lanes[projection]->materialize(&error))
+                    << error;
+                ASSERT_TRUE(destination_lanes[projection]->materialize(&error))
+                    << error;
+
+                const auto descriptor =
+                    gpu_destinations[projection]->descriptor();
+                destination_engines[projection] = std::make_shared<
+                    rocm::ROCmQuantisedGemmKernel>(
+                    descriptor.n,
+                    descriptor.k,
+                    kSecondaryRocmOrdinal,
+                    descriptor.ptrs.d_vnni,
+                    descriptor.ptrs.d_scales,
+                    descriptor.ptrs.d_mins,
+                    descriptor.ptrs.d_emins,
+                    descriptor.codebook_id,
+                    descriptor.blocks_per_row,
+                    gpu_slot_lifetime,
+                    NativeVnniSourceIdentity{
+                        .codebook_id =
+                            expected_gpu[projection].source_codebook_id,
+                        .is_superblock =
+                            expected_gpu[projection].is_superblock,
+                        .present = true,
+                    });
+            }
         }
 
-        std::vector<std::uint8_t> demoted_cpu_bytes(
-            cpu_weights.native_interleaved.size(), 0xa5u);
+        std::array<std::vector<std::uint8_t>, kProjectionCount>
+            demoted_cpu_bytes;
+        for (std::size_t projection = 0;
+             projection < kProjectionCount;
+             ++projection)
+        {
+            demoted_cpu_bytes[projection].assign(
+                cpu_weights[projection].native_interleaved.size(), 0xa5u);
+        }
         const auto cpu_source_lifetime = std::make_shared<int>(37);
         const auto cpu_destination_lifetime = std::make_shared<int>(43);
 
@@ -447,7 +505,7 @@ namespace llaminar2::test
                 .lane_budget = {
                     .maximum_participants_per_cycle = 2,
                     .maximum_concurrent_cycles = 1,
-                    .projections_per_expert = 1,
+                    .projections_per_expert = kProjectionCount,
                 },
                 .staging_capacity_bytes = staging_bytes,
                 .perf_device = "rocm1_mpi_remote_projection",
@@ -458,144 +516,179 @@ namespace llaminar2::test
                  ++wave_index)
             {
                 const std::uint64_t epoch = 1000u + wave_index * 2u;
-                const auto demotion_identity = projectionIdentity(
-                    epoch,
-                    0u,
-                    kGpuOwnerRank,
-                    kCpuOwnerRank,
-                    gpu_device,
-                    DeviceId::cpu());
-                const auto promotion_identity = projectionIdentity(
-                    epoch,
-                    1u,
-                    kCpuOwnerRank,
-                    kGpuOwnerRank,
-                    DeviceId::cpu(),
-                    gpu_device);
                 const auto *source_format =
                     native_vnni_formats::forSourceIdentity(
-                        expected_gpu.source_codebook_id,
-                        expected_gpu.is_superblock);
+                        expected_gpu.front().source_codebook_id,
+                        expected_gpu.front().is_superblock);
                 ASSERT_NE(source_format, nullptr);
-                const auto demotion_stream =
-                    makeGpuToCpuExpertTierWeightStreamManifest(
-                        *source_format,
-                        expected_gpu.N,
-                        expected_gpu.K,
-                        demotion_identity.expected_epoch,
-                        demotion_identity.layer_idx,
-                        demotion_identity.expert_id,
-                        demotion_identity.projection,
-                        kUnitsPerChunk);
-                const auto promotion_stream =
-                    makeCpuToGpuExpertTierWeightStreamManifest(
-                        cpu_weights,
-                        promotion_identity.candidate_epoch,
-                        promotion_identity.layer_idx,
-                        promotion_identity.expert_id,
-                        promotion_identity.projection,
-                        kUnitsPerChunk);
-                const auto demotion_manifest =
-                    makeMoEOverlayRemoteCpuProjectionManifest(
-                        demotion_identity,
-                        demotion_stream,
-                        static_cast<std::uint32_t>(staging_bytes));
-                const auto promotion_manifest =
-                    makeMoEOverlayRemoteCpuProjectionManifest(
-                        promotion_identity,
-                        promotion_stream,
-                        static_cast<std::uint32_t>(staging_bytes));
+                std::array<MoEOverlayRemoteProjectionIdentity,
+                           kProjectionCount>
+                    demotion_identities;
+                std::array<MoEOverlayRemoteProjectionIdentity,
+                           kProjectionCount>
+                    promotion_identities;
+                std::array<MoEOverlayRemoteProjectionManifest,
+                           kProjectionCount>
+                    demotion_manifests;
+                std::array<MoEOverlayRemoteProjectionManifest,
+                           kProjectionCount>
+                    promotion_manifests;
+                for (std::size_t projection = 0;
+                     projection < kProjectionCount;
+                     ++projection)
+                {
+                    demotion_identities[projection] = projectionIdentity(
+                        epoch, 0u, kExpertProjections[projection],
+                        kGpuOwnerRank, kCpuOwnerRank, gpu_device,
+                        DeviceId::cpu());
+                    promotion_identities[projection] = projectionIdentity(
+                        epoch, 1u, kExpertProjections[projection],
+                        kCpuOwnerRank, kGpuOwnerRank, DeviceId::cpu(),
+                        gpu_device);
+                    const auto demotion_stream =
+                        makeGpuToCpuExpertTierWeightStreamManifest(
+                            *source_format,
+                            expected_gpu[projection].N,
+                            expected_gpu[projection].K,
+                            demotion_identities[projection].expected_epoch,
+                            demotion_identities[projection].layer_idx,
+                            demotion_identities[projection].expert_id,
+                            demotion_identities[projection].projection,
+                            kUnitsPerChunk);
+                    const auto promotion_stream =
+                        makeCpuToGpuExpertTierWeightStreamManifest(
+                            cpu_weights[projection],
+                            promotion_identities[projection].candidate_epoch,
+                            promotion_identities[projection].layer_idx,
+                            promotion_identities[projection].expert_id,
+                            promotion_identities[projection].projection,
+                            kUnitsPerChunk);
+                    demotion_manifests[projection] =
+                        makeMoEOverlayRemoteCpuProjectionManifest(
+                            demotion_identities[projection],
+                            demotion_stream,
+                            static_cast<std::uint32_t>(staging_bytes));
+                    promotion_manifests[projection] =
+                        makeMoEOverlayRemoteCpuProjectionManifest(
+                            promotion_identities[projection],
+                            promotion_stream,
+                            static_cast<std::uint32_t>(staging_bytes));
+                }
 
                 std::vector<MoEOverlayMPIRemoteProjectionBinding> bindings;
-                bindings.reserve(2);
+                bindings.reserve(2u * kProjectionCount);
                 if (context->rank() == kGpuOwnerRank)
                 {
                     ASSERT_TRUE(rocm->setDevice(0));
-                    auto gpu_source_endpoint = std::make_shared<
-                        MoEOverlayGpuRemoteProjectionSource>(
-                        demotion_manifest,
-                        source_lane,
-                        gpu_source->descriptor(),
-                        ExpertTierSourceReadiness::publishedResidencyBank(
-                            demotion_identity.expected_epoch),
-                        gpu_slot_lifetime);
-                    auto gpu_destination_endpoint = std::make_shared<
-                        MoEOverlayGpuRemoteProjectionDestination>(
-                        promotion_identity,
-                        destination_lane,
-                        [&, promotion_manifest](
-                            const MoEOverlayRemoteProjectionManifest &received,
-                            MoEOverlayGpuRemoteProjectionDestinationBinding *binding,
-                            std::string *factory_error) -> bool
-                        {
-                            if (!binding || received != promotion_manifest)
-                            {
-                                if (factory_error)
+                    for (std::size_t projection = 0;
+                         projection < kProjectionCount;
+                         ++projection)
+                    {
+                        bindings.push_back({
+                            .lane_index = projection,
+                            .identity = demotion_identities[projection],
+                            .source = std::make_shared<
+                                MoEOverlayGpuRemoteProjectionSource>(
+                                demotion_manifests[projection],
+                                source_lanes[projection],
+                                gpu_sources[projection]->descriptor(),
+                                ExpertTierSourceReadiness::publishedResidencyBank(
+                                    demotion_identities[projection]
+                                        .expected_epoch),
+                                gpu_slot_lifetime),
+                        });
+                    }
+                    for (std::size_t projection = 0;
+                         projection < kProjectionCount;
+                         ++projection)
+                    {
+                        const auto expected_manifest =
+                            promotion_manifests[projection];
+                        bindings.push_back({
+                            .lane_index = kProjectionCount + projection,
+                            .identity = promotion_identities[projection],
+                            .destination = std::make_shared<
+                                MoEOverlayGpuRemoteProjectionDestination>(
+                                promotion_identities[projection],
+                                destination_lanes[projection],
+                                [&, projection, expected_manifest](
+                                    const MoEOverlayRemoteProjectionManifest &received,
+                                    MoEOverlayGpuRemoteProjectionDestinationBinding *binding,
+                                    std::string *factory_error) -> bool
                                 {
-                                    *factory_error =
-                                        "ROCm MPI promotion factory received a different manifest";
-                                }
-                                return false;
-                            }
-                            *binding = {
-                                .descriptor = gpu_destination->descriptor(),
-                                .engine = destination_engine,
-                            };
-                            if (factory_error)
-                                factory_error->clear();
-                            return true;
-                        },
-                        gpu_slot_lifetime);
-                    bindings.push_back({
-                        .lane_index = 0,
-                        .identity = demotion_identity,
-                        .source = std::move(gpu_source_endpoint),
-                    });
-                    bindings.push_back({
-                        .lane_index = 1,
-                        .identity = promotion_identity,
-                        .destination =
-                            std::move(gpu_destination_endpoint),
-                    });
+                                    if (!binding ||
+                                        received != expected_manifest)
+                                    {
+                                        if (factory_error)
+                                            *factory_error =
+                                                "ROCm MPI promotion factory received a different manifest";
+                                        return false;
+                                    }
+                                    *binding = {
+                                        .descriptor =
+                                            gpu_destinations[projection]
+                                                ->descriptor(),
+                                        .engine =
+                                            destination_engines[projection],
+                                    };
+                                    if (factory_error)
+                                        factory_error->clear();
+                                    return true;
+                                },
+                                gpu_slot_lifetime),
+                        });
+                    }
                 }
                 else
                 {
-                    std::fill(
-                        demoted_cpu_bytes.begin(),
-                        demoted_cpu_bytes.end(),
-                        0xa5u);
-                    bindings.push_back({
-                        .lane_index = 0,
-                        .identity = demotion_identity,
-                        .destination = std::make_shared<
-                            MoEOverlayHostRemoteProjectionDestination>(
-                            demotion_identity,
-                            cpuDestinationRegions(demoted_cpu_bytes),
-                            cpu_destination_lifetime,
-                            demotion_manifest),
-                    });
-                    bindings.push_back({
-                        .lane_index = 1,
-                        .identity = promotion_identity,
-                        .source = std::make_shared<
-                            MoEOverlayHostRemoteProjectionSource>(
-                            promotion_manifest,
-                            cpuSourceRegions(cpu_weights),
-                            cpu_source_lifetime),
-                    });
+                    for (std::size_t projection = 0;
+                         projection < kProjectionCount;
+                         ++projection)
+                    {
+                        std::fill(
+                            demoted_cpu_bytes[projection].begin(),
+                            demoted_cpu_bytes[projection].end(),
+                            0xa5u);
+                        bindings.push_back({
+                            .lane_index = projection,
+                            .identity = demotion_identities[projection],
+                            .destination = std::make_shared<
+                                MoEOverlayHostRemoteProjectionDestination>(
+                                demotion_identities[projection],
+                                cpuDestinationRegions(
+                                    demoted_cpu_bytes[projection]),
+                                cpu_destination_lifetime,
+                                demotion_manifests[projection]),
+                        });
+                    }
+                    for (std::size_t projection = 0;
+                         projection < kProjectionCount;
+                         ++projection)
+                    {
+                        bindings.push_back({
+                            .lane_index = kProjectionCount + projection,
+                            .identity = promotion_identities[projection],
+                            .source = std::make_shared<
+                                MoEOverlayHostRemoteProjectionSource>(
+                                promotion_manifests[projection],
+                                cpuSourceRegions(cpu_weights[projection]),
+                                cpu_source_lifetime),
+                        });
+                    }
                 }
 
                 auto wave = transport.reserveWave(std::move(bindings));
                 ASSERT_EQ(
                     wave.status,
                     MoEOverlayResidencyStageStartStatus::Started) << wave.error;
-                ASSERT_EQ(wave.operations.size(), 2u);
+                ASSERT_EQ(wave.operations.size(), 2u * kProjectionCount);
 
-                std::array<bool, 2> ready{false, false};
+                std::array<bool, 2u * kProjectionCount> ready{};
                 const auto deadline =
                     std::chrono::steady_clock::now() +
                     std::chrono::seconds(10);
-                while ((!ready[0] || !ready[1]) &&
+                while (std::find(ready.begin(), ready.end(), false) !=
+                           ready.end() &&
                        std::chrono::steady_clock::now() < deadline)
                 {
                     for (std::size_t operation = 0;
@@ -614,31 +707,44 @@ namespace llaminar2::test
                     }
                     std::this_thread::yield();
                 }
-                ASSERT_TRUE(ready[0]);
-                ASSERT_TRUE(ready[1]);
+                EXPECT_TRUE(std::all_of(
+                    ready.begin(), ready.end(), [](bool value) { return value; }));
                 wave.operations.clear();
 
                 ASSERT_EQ(MPI_Barrier(MPI_COMM_WORLD), MPI_SUCCESS);
                 if (context->rank() == kCpuOwnerRank)
                 {
-                    EXPECT_TRUE(std::equal(
-                        demoted_cpu_bytes.begin(),
-                        demoted_cpu_bytes.end(),
-                        cpu_weights.native_interleaved.begin(),
-                        cpu_weights.native_interleaved.end()));
+                    for (std::size_t projection = 0;
+                         projection < kProjectionCount;
+                         ++projection)
+                    {
+                        EXPECT_TRUE(std::equal(
+                            demoted_cpu_bytes[projection].begin(),
+                            demoted_cpu_bytes[projection].end(),
+                            cpu_weights[projection].native_interleaved.begin(),
+                            cpu_weights[projection].native_interleaved.end()));
+                    }
                 }
                 else
                 {
-                    HostGpuExpertPackedProjection observed;
-                    ASSERT_TRUE(gpu_destination->download(
-                        observation_stream, &observed));
-                    expectSameProjection(observed, expected_gpu);
+                    for (std::size_t projection = 0;
+                         projection < kProjectionCount;
+                         ++projection)
+                    {
+                        HostGpuExpertPackedProjection observed;
+                        ASSERT_TRUE(gpu_destinations[projection]->download(
+                            observation_stream, &observed));
+                        expectSameProjection(
+                            observed, expected_gpu[projection]);
+                    }
                 }
             }
 
             const auto stats = transport.stats();
             EXPECT_EQ(stats.wave_reservations_started, kWaveCount);
-            EXPECT_EQ(stats.operations_completed, kWaveCount * 2u);
+            EXPECT_EQ(
+                stats.operations_completed,
+                kWaveCount * 2u * kProjectionCount);
             EXPECT_EQ(stats.active_mpi_requests, 0u);
             EXPECT_EQ(stats.mpi_failures, 0u);
             EXPECT_EQ(stats.protocol_failures, 0u);
@@ -649,23 +755,34 @@ namespace llaminar2::test
 
         if (context->rank() == kGpuOwnerRank)
         {
-            const auto source_stats = source_lane->stats();
-            const auto destination_stats = destination_lane->stats();
-            EXPECT_EQ(source_stats.gpu_to_cpu_repack_chunks,
-                      destination_stats.cpu_to_gpu_repack_chunks);
-            EXPECT_GT(source_stats.gpu_to_cpu_repack_chunks, kWaveCount);
-            EXPECT_EQ(source_stats.inference_stream_waits, 0u);
-            EXPECT_EQ(destination_stats.inference_stream_waits, 0u);
-            EXPECT_EQ(source_stats.blocking_synchronizations, 0u);
-            EXPECT_EQ(destination_stats.blocking_synchronizations, 0u);
+            for (std::size_t projection = 0;
+                 projection < kProjectionCount;
+                 ++projection)
+            {
+                const auto source_stats = source_lanes[projection]->stats();
+                const auto destination_stats =
+                    destination_lanes[projection]->stats();
+                EXPECT_EQ(source_stats.gpu_to_cpu_repack_chunks,
+                          destination_stats.cpu_to_gpu_repack_chunks);
+                EXPECT_GT(source_stats.gpu_to_cpu_repack_chunks, kWaveCount);
+                EXPECT_EQ(source_stats.inference_stream_waits, 0u);
+                EXPECT_EQ(destination_stats.inference_stream_waits, 0u);
+                EXPECT_EQ(source_stats.blocking_synchronizations, 0u);
+                EXPECT_EQ(destination_stats.blocking_synchronizations, 0u);
+            }
         }
 
         /* Retire executable aliases, lanes, then their backing allocations. */
-        destination_engine.reset();
-        source_lane.reset();
-        destination_lane.reset();
-        gpu_destination.reset();
-        gpu_source.reset();
+        for (auto &engine : destination_engines)
+            engine.reset();
+        for (auto &lane : source_lanes)
+            lane.reset();
+        for (auto &lane : destination_lanes)
+            lane.reset();
+        for (auto &projection : gpu_destinations)
+            projection.reset();
+        for (auto &projection : gpu_sources)
+            projection.reset();
         ASSERT_EQ(MPI_Barrier(MPI_COMM_WORLD), MPI_SUCCESS);
     }
 } // namespace llaminar2::test

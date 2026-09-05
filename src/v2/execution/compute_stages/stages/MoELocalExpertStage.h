@@ -113,6 +113,16 @@ namespace llaminar2
              */
             CPUCanonicalRouteStoragePolicy cpu_canonical_route_storage =
                 CPUCanonicalRouteStoragePolicy::Disabled;
+            /**
+             * @brief Exact GPU that consumes retained CPU canonical rows.
+             *
+             * When present, construction allocates a distinct TransferEngine
+             * mapped publication bank beside the ordinary first-touched CPU
+             * compute tensor. It is illegal to add or change a consumer after
+             * construction because captured graphs retain the publication
+             * bank's device alias.
+             */
+            std::optional<DeviceId> cpu_canonical_route_gpu_consumer;
             /** @brief Setup-time policy for CPU grouped-MoE execution scratch. */
             CPUGroupedScratchStoragePolicy cpu_grouped_scratch_storage =
                 CPUGroupedScratchStoragePolicy::Disabled;
@@ -244,7 +254,12 @@ namespace llaminar2
         {
             return logical_participant_id_;
         }
-        /** @brief Return all compact, canonical-route, and CPU scratch bytes. */
+        /**
+         * @brief Return all compact, canonical-route, and CPU scratch bytes.
+         *
+         * A mapped CPU-to-GPU canonical route owns both its ordinary compute
+         * bank and its mapped publication bank; both are included.
+         */
         size_t allocationBytes() const noexcept { return allocation_bytes_; }
         /** @brief Return setup-owned pinned bytes used by captured GPU transfers. */
         size_t pinnedTransferBytes() const noexcept
@@ -301,12 +316,14 @@ namespace llaminar2
         }
 
         /**
-         * @brief Return serial CPU storage for unweighted canonical route rows.
+         * @brief Return cached CPU storage for unweighted canonical route rows.
          *
          * The pointer is null unless construction explicitly selected
          * @ref CPUCanonicalRouteStoragePolicy::RetainSerialMaximum. It is
-         * never captured by a GPU graph and remains safe to reuse only under
-         * this arena's serial-family contract.
+         * ordinary first-touched CPU memory, is never captured by a GPU graph,
+         * and remains safe to reuse only under this arena's serial-family
+         * contract. A colocated GPU consumes a distinct mapped publication
+         * bank returned by @ref mappedCPUCanonicalRoutes.
          */
         const std::shared_ptr<FP32Tensor> &cpuCanonicalRoutes() const noexcept
         {
@@ -314,16 +331,19 @@ namespace llaminar2
         }
 
         /**
-         * @brief Register serial CPU canonical rows for one exact GPU consumer.
+         * @brief Return the publication bank prebound to one GPU consumer.
          *
-         * Registration is setup-only and idempotent for the same device. The
-         * maximum route tensor is already shared by every serial graph family,
-         * so this mapping avoids a top-k return allocation for every layer while
-         * retaining one immutable address in captured ingress kernels.
+         * The native mapped allocation is created beside the cached compute
+         * tensor before any caller can observe either address. This accessor
+         * is idempotent for the configured device and never registers existing
+         * anonymous pages. The stage streams its already-computed rows into
+         * this bank while applying the router weight, avoiding read-modify-
+         * write traffic against slower GPU-mapped pages.
          *
          * @param continuation_device Exact local CUDA/ROCm continuation owner.
          * @return Model-lifetime mapped region containing the canonical rows.
-         * @throws std::logic_error for absent storage or a conflicting consumer.
+         * @throws std::logic_error for absent/pre-unmapped storage or a
+         *         conflicting consumer.
          */
         std::shared_ptr<MappedHostTransferRegion>
         mappedCPUCanonicalRoutes(DeviceId continuation_device);
@@ -349,8 +369,8 @@ namespace llaminar2
         size_t allocation_bytes_ = 0;
         size_t pinned_transfer_bytes_ = 0;
         std::vector<TensorFamily> families_;
-        std::shared_ptr<FP32Tensor> cpu_canonical_routes_; ///< Maximum-capacity raw route rows shared by serial CPU families.
-        /** TransferEngine mapping of @ref cpu_canonical_routes_. */
+        std::shared_ptr<FP32Tensor> cpu_canonical_routes_; ///< Cached maximum-capacity raw rows shared by serial CPU families.
+        /** Distinct TransferEngine publication bank consumed by one GPU. */
         std::shared_ptr<MappedHostTransferRegion>
             mapped_cpu_canonical_routes_;
         /** Exact continuation endpoint embedded by the mapped route region. */
@@ -583,6 +603,18 @@ namespace llaminar2
              */
             DeviceMoEOverlayServiceTelemetryBinding
                 overlay_service_telemetry;
+            /**
+             * @brief Immutable serving phase of this participant-local graph.
+             *
+             * Continuation graphs are constructed separately for ordinary
+             * decode, prefill, and MTP work, so the graph builder can name the
+             * phase exactly. `Auto` is reserved for mapped follower graphs
+             * whose authenticated device-side transaction role changes
+             * between replays. In particular, row count is not phase identity:
+             * a one-row MTP draft remains MTP-routed service.
+             */
+            MoEOverlayServicePhaseHint service_phase =
+                MoEOverlayServicePhaseHint::Auto;
             /// Optional logical participant id recorded in runtime placement descriptors.
             int runtime_participant_index = -1;
             /**
@@ -680,6 +712,33 @@ namespace llaminar2
         bool isGraphCapturable() const override { return false; }
         /** @return true because ExpertOverlay local expert work is an explicit heterogeneous replay unit. */
         bool isManualGraphBoundary() const override { return true; }
+        /**
+         * @brief Admit CPU work behind one mapped canonical-route ticket.
+         *
+         * The binding gives the captured GPU parent both an immutable payload
+         * address and a device-side sequence wait. GPU endpoints and legacy
+         * dense CPU returns retain host-sequenced execution.
+         */
+        ManualGraphBoundaryScheduling
+        manualGraphBoundaryScheduling() const noexcept override
+        {
+            return params_.device_id.is_cpu() &&
+                           params_.cpu_canonical_route_ticket_return &&
+                           params_.cpu_canonical_route_ticket_return->valid()
+                       ? ManualGraphBoundaryScheduling::ConcurrentTicketService
+                       : ManualGraphBoundaryScheduling::BetweenExecutableLaunches;
+        }
+        /** @return This stage owns the CPU-to-GPU canonical ticket publication. */
+        ConcurrentManualFailureRole
+        concurrentManualFailureRole() const noexcept override
+        {
+            return manualGraphBoundaryScheduling() ==
+                           ManualGraphBoundaryScheduling::ConcurrentTicketService
+                       ? ConcurrentManualFailureRole::DeviceIngressPublisher
+                       : ConcurrentManualFailureRole::None;
+        }
+        /** @copydoc IComputeStage::publishConcurrentManualFailure */
+        bool publishConcurrentManualFailure() noexcept override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override
         {
             return true;

@@ -15,6 +15,7 @@
 
 #include "ExpertTierSourceReadiness.h"
 #include "MoEOverlayMPIRemoteProjectionTransport.h"
+#include "../../transfer/TransferEngine.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -76,7 +77,10 @@ namespace llaminar2
         struct Config
         {
             DeviceId device = DeviceId::invalid();
-            std::size_t staging_capacity_bytes = 0;
+            /** Exclusive host/device staging region from one shared slab. */
+            PersistentTransferStagingSlice staging;
+            /** Exact participant/cycle stream shared across compatible work. */
+            PersistentTransferExecutionLane execution;
             std::string lane_name;
             std::string perf_device;
         };
@@ -103,7 +107,7 @@ namespace llaminar2
             const MoEOverlayGpuRemoteProjectionLane &) = delete;
 
         /**
-         * @brief Allocate the named stream, event, and two staging buffers.
+         * @brief Bind the pooled stream/slab slice and create one lane event.
          * @param error Optional exact setup failure.
          * @return True when every persistent model-time resource exists.
          */
@@ -234,7 +238,7 @@ namespace llaminar2
         /** @return Immutable staging capacity used by the MPI endpoint. */
         [[nodiscard]] std::size_t stagingCapacityBytes() const noexcept
         {
-            return config_.staging_capacity_bytes;
+            return config_.staging.sizeBytes();
         }
 
         /** @return Race-safe cumulative non-blocking-path evidence. */

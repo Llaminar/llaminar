@@ -130,6 +130,10 @@ namespace llaminar2
         void waitEvent(void *event, void *stream) override;
         bool waitEventChecked(void *event, void *stream) override;
         bool queryEventChecked(void *event, bool &ready) override;
+        /** @copydoc IWorkerGPUContext::queryStreamExecutionState */
+        [[nodiscard]] GPUStreamExecutionState queryStreamExecutionState(
+            void *stream,
+            std::string_view boundary) override;
         void synchronizeEvent(void *event) override;
         bool synchronizeEventChecked(void *event) override;
         float eventElapsedTime(void *start, void *stop) override;

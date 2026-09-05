@@ -14,7 +14,9 @@
 #include "backends/ComputeBackend.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/compute_stages/stages/GDNLinkedLiveStateGeometry.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "kernels/common/GDNLinkedStateLayout.h"
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
@@ -709,6 +711,46 @@ namespace
             max_abs = std::max(max_abs, std::abs(values[offset + i]));
         return max_abs;
     }
+
+    /**
+     * @brief Build rank-major collective bytes from a canonical state bank.
+     *
+     * This oracle deliberately implements participant slicing directly rather
+     * than calling the production offset mapper exercised by the GPU kernel.
+     */
+    std::vector<float> makeRankMajorLinkedState(
+        const std::vector<float> &full,
+        const GDNLinkedLiveStateShape &shape)
+    {
+        std::vector<float> gathered;
+        gathered.reserve(full.size());
+        const int local_key_group = shape.localKeyGroupFloats();
+        const int full_key_group = shape.fullKeyGroupFloats();
+        const int local_value_group = shape.localValueGroupFloats();
+        const int full_value_group = shape.fullValueGroupFloats();
+        const int full_prefix = shape.prefix_group_count * full_key_group;
+
+        for (int participant = 0; participant < shape.degree; ++participant)
+        {
+            for (int group = 0; group < shape.prefix_group_count; ++group)
+            {
+                const auto begin = full.begin() +
+                                   group * full_key_group +
+                                   participant * local_key_group;
+                gathered.insert(
+                    gathered.end(), begin, begin + local_key_group);
+            }
+            for (int repeat = 0; repeat < shape.repeat_factor; ++repeat)
+            {
+                const auto begin = full.begin() + full_prefix +
+                                   repeat * full_value_group +
+                                   participant * local_value_group;
+                gathered.insert(
+                    gathered.end(), begin, begin + local_value_group);
+            }
+        }
+        return gathered;
+    }
 #endif
 } // namespace
 
@@ -717,6 +759,69 @@ class Test__CUDAGDNPaddedRealLength : public CUDATestBase
 };
 
 #ifdef HAVE_CUDA
+
+/**
+ * @brief Proves captured CUDA reassembly is byte exact for TP=2/4/8.
+ *
+ * Both short-convolution and recurrence layouts are covered, including the
+ * Qwen-style four value-head repeats linked to every key head.
+ */
+TEST_F(Test__CUDAGDNPaddedRealLength, LinkedStateReassemblyTP2ThroughTP8IsCapturedAndByteExact)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+    CudaStreamHandle stream;
+    const GDNLinkedLiveStateGeometry geometry{
+        .global_key_heads = 8,
+        .global_value_heads = 32,
+        .key_width = 2,
+        .value_width = 3,
+        .conv_history_length = 2,
+    };
+
+    for (const int degree : {2, 4, 8})
+    {
+        for (const auto kind : {
+                 GDNLinkedLiveStateKind::ConvHistory,
+                 GDNLinkedLiveStateKind::Recurrence,
+             })
+        {
+            const auto shape = geometry.resolve(kind, degree);
+            ASSERT_TRUE(shape.has_value()) << "TP=" << degree;
+            std::vector<float> expected(
+                static_cast<size_t>(shape->full_state_floats));
+            for (size_t i = 0; i < expected.size(); ++i)
+                expected[i] = static_cast<float>(i) + 0.25F;
+            const std::vector<float> gathered =
+                makeRankMajorLinkedState(expected, *shape);
+            ASSERT_EQ(gathered.size(), expected.size());
+
+            CudaFloatBuffer device_gathered(gathered);
+            CudaFloatBuffer device_full(expected.size(), -1.0F);
+            CudaCapturedGraph captured(stream.stream, [&]
+            {
+                return cudaGDN_reassemble_modulo_linked_state(
+                    device_gathered.ptr,
+                    device_full.ptr,
+                    degree,
+                    shape->global_key_heads,
+                    geometry.global_value_heads,
+                    shape->key_elements_per_head,
+                    shape->value_elements_per_head,
+                    shape->prefix_group_count,
+                    cuda_ordinal_,
+                    reinterpret_cast<void *>(stream.stream));
+            });
+            captured.launch(stream.stream);
+            checkCuda(
+                cudaStreamSynchronize(stream.stream),
+                "cudaStreamSynchronize(linked-state graph)");
+            EXPECT_EQ(device_full.toHost(), expected)
+                << "TP=" << degree
+                << " kind=" << static_cast<int>(kind);
+        }
+    }
+}
 
 /**
  * @brief Proves native request batching is byte-identical to independent decode.

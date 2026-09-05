@@ -9,22 +9,28 @@ one process so immutable model and prepared-weight ownership is amortized while
 runner, arena, graph, stream, and KV state remain exact per cell.
 
 The performance target belongs to the whole selected matrix. Before model
-staging, the driver runs the CMake-owned ``ProductionParityPreflight`` label: a
-fast, model-free integration gate for MPI lifecycle, orchestration, graph,
-stream/event, collective, and movement invariants. It then prepares the model
+staging, the driver builds and runs the complete CMake-owned ``V2_Unit_*``
+suite, then runs the ``ProductionParityPreflight`` label: a model-free
+integration gate for MPI lifecycle, orchestration, graph, stream/event,
+collective, and movement invariants. It then prepares the model
 fixture once, capacity-checks and atomically stages the complete selected GGUF
 corpus into tmpfs, gives CPU, CUDA, and ROCm exclusive resource identities, and
 overlaps only campaigns whose backend sets are disjoint. Every production child
-then SHA-authenticates the staged bytes against its reference pack through one
-shared identity-keyed digest cache before inference. Staging is private and
-run-scoped by default. An explicit persistent-cache directory instead retains
-atomically published, source-identity-bound read-only GGUFs and authenticated
-digest evidence for rapid iteration; the driver never removes that cache.
+then consumes the exact immutable staged paths declared by the typed campaign.
+Staging is private and run-scoped by default. An explicit persistent-cache
+directory instead retains atomically published, source-identity-bound read-only
+GGUFs for rapid iteration; the driver never removes that cache. Model-byte
+hashing is deliberately absent: the copy transaction proves its exact byte
+count and stable source/destination identities, while the numerical checkpoints
+are the authoritative proof that those weights match the reference.
 Hybrid campaigns claim every backend they name. Crossing the target is recorded
 as a performance failure after the complete matrix has run; it never stops
-campaign admission or truncates correctness evidence. A separate completion
-timeout bounds the complete run, while every exact GTest matrix cell has an
-independent ten-minute progress deadline. The driver observes the fresh
+campaign admission or truncates correctness evidence. A correctness red stops
+its GTest aggregate immediately, publishes one first-failure identity, cancels
+already-running disjoint-backend siblings, and prevents further admission while
+preserving completed and failing evidence. A separate completion timeout bounds
+setup phases that do not publish exact-cell progress. Every exact GTest matrix
+cell instead has one independent ten-minute progress deadline. The driver observes the fresh
 per-cell log publication already owned by the artifact contract, so this
 watchdog preserves one-process model-context amortization and still terminates
 a stuck CTest/MPI process group with the exact cell identity. No campaign gets
@@ -34,7 +40,11 @@ CTest/GTest registration remains the matrix source of truth.  The driver never
 copies model, topology, backend, or precision tables into another manifest.
 Use ``--list`` for a deterministic coverage inventory without running models.
 Use ``--stage-models-only`` with an explicit persistent cache to prepare that
-same authenticated corpus for repeated focused production-path debugging.
+same identity-bound corpus for repeated focused production-path debugging.
+Individual fixup invocations may reuse a passed preflight report only while the
+Ninja build log and CTest registration remain older than that report. This
+amortizes the integration gate across unchanged exact cells without creating an
+unchecked skip path; any rebuild or reconfiguration invalidates the evidence.
 """
 
 from __future__ import annotations
@@ -53,6 +63,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -71,9 +82,13 @@ REGISTERED_TIMEOUT_SECONDS = COMPLETION_TIMEOUT_SECONDS
 MODEL_FIXTURE_NAME = "V2_Models"
 MODEL_FIXTURE_TEST = "V2_FetchModelsFixture"
 PRODUCTION_PARITY_PREFLIGHT_LABEL = "ProductionParityPreflight"
+PRODUCTION_PARITY_UNIT_PREFIX = "V2_Unit_"
+PRODUCTION_PARITY_UNIT_LABEL = "Unit"
+PRODUCTION_PARITY_UNIT_BUILD_TARGET = "v2_unit_gate"
 MODEL_RAMDISK_ROOT = Path("/dev/shm")
 SESSION_IPC_RAMDISK_ROOT = Path("/dev/shm")
-PERSISTENT_MODEL_CACHE_SCHEMA_VERSION = 1
+PERSISTENT_MODEL_CACHE_SCHEMA_VERSION = 2
+CAMPAIGN_REPORT_SCHEMA_VERSION = 13
 MODEL_COPY_CHUNK_BYTES = 16 * 1024 * 1024
 MODEL_RAMDISK_MINIMUM_RESERVE_BYTES = 1024 * 1024 * 1024
 MODEL_RAMDISK_RESERVE_FRACTION = 0.05
@@ -148,7 +163,11 @@ REQUIRED_CSV_HEADERS = {
         "main_kv_minimum_cosine,"
         "main_kv_maximum_relative_l2,"
         "main_kv_maximum_abs,"
-        "main_kv_numerically_passed,terminal_hidden_policy,"
+        "main_kv_numerically_passed,gdn_state_policy,"
+        "gdn_numerically_compared,gdn_numerical_payloads,"
+        "gdn_numerical_elements,gdn_minimum_cosine,"
+        "gdn_maximum_relative_l2,gdn_maximum_abs,"
+        "gdn_numerically_passed,terminal_hidden_policy,"
         "terminal_hidden_numerically_compared,"
         "terminal_hidden_numerical_elements,"
         "terminal_hidden_numerical_cosine,"
@@ -195,7 +214,14 @@ MTP_TRANSACTIONS_HEADER = (
     "verifier_identity_depth,production_verifier_draft_tokens,"
     "before_position,after_position,"
     "before_draft_steps,after_draft_steps,before_verifier_runs,"
-    "after_verifier_runs,dynamic_policy_witness_executed,"
+    "after_verifier_runs,acceptance_witness_executed,"
+    "acceptance_witness_serial_token_exact,"
+    "acceptance_witness_accepted_token_delta,"
+    "acceptance_witness_attempted_draft_tokens,"
+    "acceptance_witness_verifier_transactions,"
+    "acceptance_witness_emitted_tokens,"
+    "acceptance_witness_serial_oracle_tokens,"
+    "dynamic_policy_witness_executed,"
     "dynamic_policy_witness_serial_token_exact,"
     "dynamic_policy_witness_window_delta,"
     "dynamic_policy_witness_attempted_draft_tokens,"
@@ -220,12 +246,22 @@ REQUIRED_CAMPAIGN_LABELS = {
     "WholeMatrix75MinuteTarget",
 }
 REQUIRED_CAMPAIGN_ENV = {
+    "GTEST_FAIL_FAST=1",
     "LLAMINAR_PRODUCTION_PARITY=1",
     "LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN=1",
     "LLAMINAR_PRODUCTION_PARITY_TARGET_SECONDS=4500",
     "LLAMINAR_GPU_GRAPHS=1",
     "LLAMINAR_PERF_STATS_SUMMARY=1",
 }
+INDIVIDUAL_GREEN_LEDGER_SCHEMA_VERSION = 1
+INDIVIDUAL_PROGRESS_REPORT_SCHEMA_VERSION = 2
+INDIVIDUAL_GREEN_PROVENANCE = frozenset(
+    {
+        "exact_process_exit_zero_and_fresh_artifact_contract",
+        "aggregate_exit_zero_and_fresh_artifact_contract",
+        "aggregate_gtest_fail_fast_prefix_before_declared_first_red",
+    }
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -249,6 +285,9 @@ class CampaignCell:
     group: CampaignGroup
     gtest_cases: tuple[str, ...] = ()
     model_files: tuple[str, ...] = ()
+    command: tuple[str, ...] = ()
+    environment: tuple[str, ...] = ()
+    working_directory: str = ""
 
     @property
     def test_type(self) -> str:
@@ -276,12 +315,69 @@ class CampaignCell:
         return tuple(present) if present else ("TOPOLOGY_DEFAULT",)
 
 
-class ProcessTimeoutKind(str, Enum):
+class PriorEvidenceCoverageKind(str, Enum):
+    """Typed prior-artifact coverage state for one campaign aggregate."""
+
+    UNSEEN = "unseen"
+    PARTIAL = "partial"
+    COMPLETE = "complete"
+
+
+@dataclass(frozen=True)
+class PriorEvidenceCoverage:
+    """Exact-cell coverage supplied only as a campaign scheduling hint."""
+
+    kind: PriorEvidenceCoverageKind
+    observed_exact_cells: int
+    total_exact_cells: int
+
+    @property
+    def unseen_exact_cells(self) -> int:
+        """Return exact cells for which no complete prior artifact exists."""
+
+        return self.total_exact_cells - self.observed_exact_cells
+
+
+@dataclass(frozen=True)
+class PriorArtifactEvidenceIndex:
+    """Immutable union of complete exact-cell artifacts from explicit roots.
+
+    This index is never correctness evidence for the active run. It can only
+    prioritize aggregates so interrupted local campaigns discover new cells
+    before rerunning cells already observed on the same binary slice.
+    """
+
+    roots: tuple[Path, ...]
+    observed_gtest_cases: frozenset[str]
+
+    def coverage_for(self, cell: CampaignCell) -> PriorEvidenceCoverage:
+        """Classify one aggregate without changing its selected exact cells."""
+
+        total = len(cell.gtest_cases)
+        observed = sum(
+            gtest_case in self.observed_gtest_cases
+            for gtest_case in cell.gtest_cases
+        )
+        if observed == 0:
+            kind = PriorEvidenceCoverageKind.UNSEEN
+        elif observed == total:
+            kind = PriorEvidenceCoverageKind.COMPLETE
+        else:
+            kind = PriorEvidenceCoverageKind.PARTIAL
+        return PriorEvidenceCoverage(
+            kind=kind,
+            observed_exact_cells=observed,
+            total_exact_cells=total,
+        )
+
+
+class ProcessTerminationKind(str, Enum):
     """Typed reason that the campaign driver terminated a process group."""
 
     NONE = "none"
-    COMPLETION = "completion"
-    EXACT_CELL = "exact_cell"
+    COMPLETION_TIMEOUT = "completion_timeout"
+    EXACT_CELL_TIMEOUT = "exact_cell_timeout"
+    CAMPAIGN_CANCELLED = "campaign_cancelled"
 
 
 @dataclass(frozen=True)
@@ -300,11 +396,70 @@ class ExactCellTimeoutWatch:
 
 
 @dataclass
-class ProcessTimeoutEvidence:
-    """Evidence published when ``_run_process`` times out a process group."""
+class ProcessTerminationEvidence:
+    """Evidence published when ``_run_process`` terminates a process group."""
 
-    kind: ProcessTimeoutKind = ProcessTimeoutKind.NONE
+    kind: ProcessTerminationKind = ProcessTerminationKind.NONE
     exact_gtest_case: str = ""
+    cancelling_campaign: str = ""
+
+
+class CampaignCancellation:
+    """First-failure authority shared by all workers in one matrix run.
+
+    A worker owns and terminates only its own subprocess group. This authority
+    publishes the first genuine campaign failure to those workers, avoiding
+    unsafe cross-thread access to ``Popen`` while still making cancellation
+    immediate and process-group complete.
+    """
+
+    def __init__(self) -> None:
+        self._requested = threading.Event()
+        self._lock = threading.Lock()
+        self._failing_campaign = ""
+
+    def request_after_failure(self, campaign: str) -> bool:
+        """Publish ``campaign`` as the first failure, returning true once."""
+
+        if not campaign:
+            raise ValueError("failing campaign identity must not be empty")
+        with self._lock:
+            if self._requested.is_set():
+                return False
+            self._failing_campaign = campaign
+            self._requested.set()
+            return True
+
+    @property
+    def requested(self) -> bool:
+        """Return whether a worker has published a campaign failure."""
+
+        return self._requested.is_set()
+
+    @property
+    def failing_campaign(self) -> str:
+        """Return the immutable first-failure identity, or an empty string."""
+
+        with self._lock:
+            return self._failing_campaign
+
+
+def _publish_campaign_failure(
+    cancellation: CampaignCancellation | None,
+    campaign: str,
+) -> None:
+    """Publish and log the first failure in a concurrent campaign matrix."""
+
+    if (
+        cancellation is not None
+        and cancellation.request_after_failure(campaign)
+    ):
+        print(
+            "[production-parity] fail_fast_status=CANCELLING "
+            f"first_failed_campaign={campaign}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -326,6 +481,7 @@ class CampaignResult:
     completion_timeout_seconds: float = 0.0
     exact_cell_timeout_seconds: float = 0.0
     timed_out_gtest_case: str = ""
+    cancelled_by_campaign: str = ""
     outcome: str = "completed"
     artifact_contract_passed: bool = True
     validated_artifact_file_count: int = 0
@@ -335,12 +491,11 @@ class CampaignResult:
 
 @dataclass(frozen=True)
 class StagedModelEvidence:
-    """Authenticated evidence for one GGUF available in the selected tmpfs."""
+    """Identity-bound evidence for one GGUF available in the selected tmpfs."""
 
     source_path: str
     filename: str
     size_bytes: int
-    sha256: str
     elapsed_seconds: float
     cache_status: str = "copied"
     source_identity: tuple[int, ...] = ()
@@ -374,14 +529,75 @@ class CampaignMatrixResult:
     staged_model_count: int
     staged_model_bytes: int
     staged_models: tuple[StagedModelEvidence, ...]
+    prior_evidence_roots: tuple[str, ...]
+    prior_observed_exact_cell_count: int
+    unseen_first_scheduling: bool
     scheduling_policy: str
     campaign_count: int
     exact_matrix_cell_count: int
-    authenticated_model_digest_count: int
     artifact_contract_passed: bool
     validated_artifact_file_count: int
     artifact_error_count: int
     campaigns: tuple[CampaignResult, ...]
+
+
+@dataclass(frozen=True)
+class IndividualGreenEvidence:
+    """Durable proof that one exact command and fresh CSV contract passed.
+
+    This evidence is intentionally diagnostic progress, not certification.
+    Code may change between entries while a failing slice is repaired; only a
+    final fresh unfiltered campaign can prove the combined tree remains green.
+    """
+
+    gtest_case: str
+    campaign: str
+    git_revision: str
+    passed_wall_time_ns: int
+    elapsed_seconds: float
+    validated_artifact_file_count: int
+    artifact_directory: str
+    execution_contract_sha256: str
+    provenance: str = "exact_process_exit_zero_and_fresh_artifact_contract"
+
+
+@dataclass(frozen=True)
+class IndividualGreenLedger:
+    """Atomically persisted exact-cell progress for an interrupted fixup."""
+
+    schema_version: int
+    certification_eligible: bool
+    entries: tuple[IndividualGreenEvidence, ...]
+
+    @property
+    def green_cases(self) -> frozenset[str]:
+        """Return exact identities already proved green individually."""
+
+        return frozenset(entry.gtest_case for entry in self.entries)
+
+
+@dataclass(frozen=True)
+class IndividualProgressReport:
+    """Non-certifying report for one sequential unseen-cell invocation."""
+
+    schema_version: int
+    mode: str
+    certification_eligible: bool
+    selected_exact_cell_count: int
+    green_before_count: int
+    attempted_count: int
+    newly_green_count: int
+    green_after_count: int
+    remaining_unseen_count: int
+    stopped_on_failure: bool
+    preflight_return_code: int
+    preflight_test_count: int
+    preflight_tests: tuple[str, ...]
+    fixture_return_code: int
+    model_staging_return_code: int
+    artifact_root: str
+    green_ledger: str
+    results: tuple[CampaignResult, ...]
 
 
 def _property_map(test: dict[str, Any]) -> dict[str, Any]:
@@ -408,6 +624,82 @@ def _as_string_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
     return []
+
+
+def discover_production_parity_unit_tests(
+    build_dir: Path,
+) -> tuple[str, ...]:
+    """Discover and validate the complete device-free unit prerequisite.
+
+    CTest registration is the sole inventory authority.  Looking at the full
+    JSON document lets this audit reject either half of a naming/label drift:
+    a ``V2_Unit_*`` entry without the Unit label, or a Unit-labelled entry
+    outside the canonical namespace.  CMake's ``v2_unit_gate`` owns executable
+    construction; Python never copies its target list.
+    """
+
+    completed = subprocess.run(
+        [
+            "ctest",
+            "--test-dir",
+            str(build_dir),
+            "--show-only=json-v1",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "CTest unit-gate discovery failed:\n"
+            + (completed.stderr or completed.stdout)
+        )
+
+    document = json.loads(completed.stdout)
+    names: list[str] = []
+    for test in document.get("tests", []):
+        name = str(test.get("name", ""))
+        properties = _property_map(test)
+        labels = _as_string_list(properties.get("LABELS", []))
+        has_unit_name = name.startswith(PRODUCTION_PARITY_UNIT_PREFIX)
+        has_unit_label = PRODUCTION_PARITY_UNIT_LABEL in labels
+        if has_unit_name != has_unit_label:
+            raise RuntimeError(
+                "unit test naming/label contract disagrees: "
+                f"{name or '<unnamed>'} labels={labels}"
+            )
+        if not has_unit_name:
+            continue
+        if "Campaign" in labels or "FullModel" in labels:
+            raise RuntimeError(
+                f"unit prerequisite contains a model campaign: {name}"
+            )
+        if _as_string_list(properties.get("FIXTURES_REQUIRED", [])):
+            raise RuntimeError(
+                f"unit prerequisite requires a fixture: {name}"
+            )
+        if _as_string_list(properties.get("REQUIRED_FILES", [])):
+            raise RuntimeError(
+                f"unit prerequisite requires external files: {name}"
+            )
+        try:
+            timeout = float(properties.get("TIMEOUT", 0.0))
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"unit prerequisite timeout is not numeric: {name}"
+            ) from error
+        if timeout <= 0.0:
+            raise RuntimeError(
+                f"unit prerequisite has no positive timeout: {name}"
+            )
+        names.append(name)
+
+    names.sort()
+    if not names:
+        raise RuntimeError("no V2 unit tests discovered")
+    if len(set(names)) != len(names):
+        raise RuntimeError("CTest returned duplicate V2 unit tests")
+    return tuple(names)
 
 
 def discover_production_parity_preflight_tests(
@@ -516,7 +808,13 @@ def _exact_gtest_cases(test: dict[str, Any]) -> tuple[str, ...]:
 
 def _validate_campaign_registration(
     test: dict[str, Any],
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+) -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    str,
+]:
     """Fail closed when CTest no longer carries production/economy contracts."""
 
     properties = _property_map(test)
@@ -571,7 +869,22 @@ def _validate_campaign_registration(
         raise ValueError(
             "campaign runtime model manifest does not match REQUIRED_FILES"
         )
-    return _exact_gtest_cases(test), model_files
+
+    command = tuple(_as_string_list(test.get("command", [])))
+    if not command or any(not argument for argument in command):
+        raise ValueError("campaign has an empty registered command")
+    working_directory = str(properties.get("WORKING_DIRECTORY", ""))
+    if not working_directory or not Path(working_directory).is_absolute():
+        raise ValueError(
+            "campaign WORKING_DIRECTORY must be an absolute path"
+        )
+    return (
+        _exact_gtest_cases(test),
+        model_files,
+        command,
+        tuple(_as_string_list(properties.get("ENVIRONMENT", []))),
+        working_directory,
+    )
 
 
 def classify_campaign(name: str) -> CampaignGroup:
@@ -656,7 +969,13 @@ def discover_campaigns(
         ):
             continue
         try:
-            exact_cases, model_files = _validate_campaign_registration(test)
+            (
+                exact_cases,
+                model_files,
+                command,
+                environment,
+                working_directory,
+            ) = _validate_campaign_registration(test)
         except ValueError as error:
             raise RuntimeError(f"invalid production campaign {name}: {error}") from error
         cells.append(
@@ -665,6 +984,9 @@ def discover_campaigns(
                 group=group,
                 gtest_cases=exact_cases,
                 model_files=model_files,
+                command=command,
+                environment=environment,
+                working_directory=working_directory,
             )
         )
 
@@ -732,37 +1054,29 @@ class ModelStagingError(RuntimeError):
 
 @dataclass(frozen=True)
 class ModelStagingWorkspace:
-    """Paths and lifetime mode for one authenticated model-cache workspace."""
+    """Paths and lifetime mode for one identity-bound model-cache workspace."""
 
     root: Path
     models: Path
-    digests: Path
     mode: str
     persistent: bool
 
     def protect_published_models(self) -> None:
-        """Seal persistent model metadata while child campaigns may write digests.
+        """Seal persistent model metadata while child campaigns consume it.
 
         The cache lock remains held by the driver.  Removing owner-write from
         the root and model directory makes an unrelated ``rm -rf /dev/shm/*``
-        fail before it can unlink the published manifest or GGUFs.  The digest
-        directory stays writable because production children publish their
-        independently authenticated SHA evidence there.
+        fail before it can unlink the published manifest or GGUFs.
         """
 
         if self.persistent:
-            _set_persistent_cache_write_access(
-                self.root,
-                writable=False,
-                digest_writable=True,
-            )
+            _set_persistent_cache_write_access(self.root, writable=False)
 
 
 def _set_persistent_cache_write_access(
     root: Path,
     *,
     writable: bool,
-    digest_writable: bool = False,
 ) -> None:
     """Apply the portable same-owner deletion guard for a persistent cache.
 
@@ -775,8 +1089,6 @@ def _set_persistent_cache_write_access(
     Args:
         root: Exact persistent cache root.
         writable: Whether staging metadata and model entries may be mutated.
-        digest_writable: Keep only the digest directory writable while model
-            files are consumed by active child campaigns.
     """
 
     if not root.exists() or root.is_symlink() or not root.is_dir():
@@ -784,7 +1096,7 @@ def _set_persistent_cache_write_access(
             f"persistent cache root disappeared or changed type: {root}"
         )
 
-    paths = [root, root / "models", root / "digests"]
+    paths = [root, root / "models"]
     existing: list[Path] = []
     for path in paths:
         if not path.exists():
@@ -800,10 +1112,7 @@ def _set_persistent_cache_write_access(
     # writable model directory sits below an already advertised protected root.
     ordered = existing if writable else list(reversed(existing))
     for path in ordered:
-        mode = 0o700 if writable else 0o500
-        if not writable and digest_writable and path == root / "digests":
-            mode = 0o700
-        path.chmod(mode)
+        path.chmod(0o700 if writable else 0o500)
 
 
 def _reclaim_interrupted_persistent_transactions(root: Path) -> tuple[int, int]:
@@ -817,7 +1126,7 @@ def _reclaim_interrupted_persistent_transactions(root: Path) -> tuple[int, int]:
     be idempotent.
 
     Only the two cache-owned transaction namespaces are eligible.  Published
-    GGUFs, digest records, the lock, and operator-owned files are never touched.
+    GGUFs, the lock, and operator-owned files are never touched.
     A matching directory is treated as corrupt state rather than recursively
     removed.
 
@@ -890,7 +1199,6 @@ def model_staging_workspace(
             yield ModelStagingWorkspace(
                 root=root,
                 models=root / "models",
-                digests=root / "digests",
                 mode="run_scoped",
                 persistent=False,
             )
@@ -987,7 +1295,6 @@ def model_staging_workspace(
         yield ModelStagingWorkspace(
             root=root,
             models=root / "models",
-            digests=root / "digests",
             mode="persistent",
             persistent=True,
         )
@@ -1117,26 +1424,6 @@ def _source_identity(stat_result: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _hash_file(path: Path, completion_deadline: float | None) -> str:
-    """Hash a file while honoring only the stuck-run safety deadline."""
-
-    digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as stream:
-        while True:
-            if (
-                completion_deadline is not None
-                and time.monotonic() >= completion_deadline
-            ):
-                raise TimeoutError(
-                    "completion timeout expired during GGUF authentication"
-                )
-            chunk = stream.read(MODEL_COPY_CHUNK_BYTES)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _persistent_manifest_path(staging_directory: Path) -> Path:
     """Return the cache-owned manifest beside the persistent model directory."""
 
@@ -1144,7 +1431,13 @@ def _persistent_manifest_path(staging_directory: Path) -> Path:
 
 
 def _load_persistent_manifest(staging_directory: Path) -> dict[str, Any]:
-    """Load the persistent cache authority, failing closed on malformed state."""
+    """Load and cheaply migrate the persistent cache authority.
+
+    Schema 1 stored full-file SHA-256 values. Schema 2 deliberately relies on
+    stable source and destination filesystem identities instead. Existing
+    schema-1 entries can be upgraded without rereading model payloads; entries
+    that predate destination identity binding simply miss and are recopied.
+    """
 
     path = _persistent_manifest_path(staging_directory)
     if not path.exists():
@@ -1158,15 +1451,21 @@ def _load_persistent_manifest(staging_directory: Path) -> dict[str, Any]:
         raise ModelStagingError(
             f"persistent model cache manifest is unreadable: {path}: {error}"
         ) from error
-    if (
-        not isinstance(document, dict)
-        or document.get("schema_version")
-        != PERSISTENT_MODEL_CACHE_SCHEMA_VERSION
-        or not isinstance(document.get("models"), dict)
-    ):
+    if not isinstance(document, dict) or not isinstance(document.get("models"), dict):
         raise ModelStagingError(
             f"persistent model cache manifest has an unsupported shape: {path}"
         )
+    schema_version = document.get("schema_version")
+    if schema_version not in {1, PERSISTENT_MODEL_CACHE_SCHEMA_VERSION}:
+        raise ModelStagingError(
+            f"persistent model cache manifest has an unsupported shape: {path}"
+        )
+    if schema_version == 1:
+        document["schema_version"] = PERSISTENT_MODEL_CACHE_SCHEMA_VERSION
+        for raw_entry in document["models"].values():
+            if isinstance(raw_entry, dict):
+                raw_entry.pop("sha256", None)
+        _publish_persistent_manifest(staging_directory, document)
     return document
 
 
@@ -1206,7 +1505,6 @@ def _persistent_manifest_entry(
         "source_identity": list(evidence.source_identity),
         "cached_identity": list(_source_identity(cached_stat)),
         "size_bytes": evidence.size_bytes,
-        "sha256": evidence.sha256,
     }
 
 
@@ -1214,22 +1512,15 @@ def _reuse_persistent_model(
     source: Path,
     destination: Path,
     raw_entry: Any,
-    completion_deadline: float | None,
-) -> tuple[StagedModelEvidence, bool] | None:
+) -> StagedModelEvidence | None:
     """Authenticate and reuse one immutable tmpfs entry when its source is unchanged.
 
     The source's device/inode/size/mtime/ctime tuple makes an ordinary source
     replacement or mutation invalidate the entry without rereading slow model
-    storage. The first successful cache publication records the SHA-256 computed
-    while streaming the source plus the read-only tmpfs file identity. Every
-    production child independently authenticates that exact staged identity
-    against its reference pack before inference. Unchanged source and cached
-    identities can therefore be reused without an extra staging-layer reread.
-    Legacy entries lacking the cached identity receive one final SHA-256
-    validation and request an atomic manifest upgrade.
-
-    @return Evidence plus whether the caller must republish the upgraded
-            manifest, or ``None`` when the entry must be recopied.
+    storage. The read-only tmpfs identity is bound to that source identity at
+    atomic publication, so an unchanged pair can be reused using metadata-only
+    checks. An entry without either identity is a miss, never an invitation to
+    scan the model payload.
     """
 
     if not isinstance(raw_entry, dict):
@@ -1241,7 +1532,6 @@ def _reuse_persistent_model(
         or raw_entry.get("source_identity")
         != list(_source_identity(source_before))
         or raw_entry.get("size_bytes") != source_before.st_size
-        or not isinstance(raw_entry.get("sha256"), str)
     ):
         return None
     try:
@@ -1256,15 +1546,8 @@ def _reuse_persistent_model(
         return None
 
     cached_identity = _source_identity(cached_before)
-    expected_cached_identity = raw_entry.get("cached_identity")
-    manifest_upgrade_required = False
-    if expected_cached_identity == list(cached_identity):
-        cached_digest = raw_entry["sha256"]
-    else:
-        # Version-1 manifests predate destination identity binding. Perform
-        # exactly one full RAM-resident verification before installing it.
-        cached_digest = _hash_file(destination, completion_deadline)
-        manifest_upgrade_required = True
+    if raw_entry.get("cached_identity") != list(cached_identity):
+        return None
 
     cached_after = destination.stat(follow_symlinks=False)
     source_after = source.stat()
@@ -1276,21 +1559,13 @@ def _reuse_persistent_model(
         raise ModelStagingError(
             f"persistent cached GGUF changed while it was validated: {destination}"
         )
-    if cached_digest != raw_entry["sha256"]:
-        return None
-    if manifest_upgrade_required:
-        raw_entry["cached_identity"] = list(_source_identity(cached_after))
-    return (
-        StagedModelEvidence(
-            source_path=str(source),
-            filename=destination.name,
-            size_bytes=cached_before.st_size,
-            sha256=cached_digest,
-            elapsed_seconds=time.monotonic() - started,
-            cache_status="reused",
-            source_identity=_source_identity(source_before),
-        ),
-        manifest_upgrade_required,
+    return StagedModelEvidence(
+        source_path=str(source),
+        filename=destination.name,
+        size_bytes=cached_before.st_size,
+        elapsed_seconds=time.monotonic() - started,
+        cache_status="reused",
+        source_identity=_source_identity(source_before),
     )
 
 
@@ -1301,12 +1576,9 @@ def _stage_one_model(
 ) -> StagedModelEvidence:
     """Stream one source into an atomic, identity-bound tmpfs transaction.
 
-    SHA-256 is accumulated while the cold source bytes are already in flight and
-    retained as evidence. A second SHA pass over the just-written RAM copy would
-    duplicate the mandatory reference-pack authentication performed by every
-    production child before inference. Full-write and byte-count checks, source
-    mutation checks, fsync, read-only publication, and destination identity
-    binding make the cache transaction safe until that canonical check runs.
+    Full-write and byte-count checks, source mutation checks, fsync, read-only
+    publication, and destination identity binding make the cache transaction
+    exact without forcing a CPU-bound content-hash pass over every model byte.
     """
 
     started = time.monotonic()
@@ -1314,7 +1586,6 @@ def _stage_one_model(
     temporary = destination.with_name(
         f".{destination.name}.copying-{os.getpid()}"
     )
-    source_digest = hashlib.sha256()
     copied_bytes = 0
     try:
         with source.open("rb", buffering=0) as input_stream:
@@ -1341,7 +1612,6 @@ def _stage_one_model(
                         raise ModelStagingError(
                             f"short tmpfs write for {source}: {written}/{len(chunk)}"
                         )
-                    source_digest.update(chunk)
                     copied_bytes += len(chunk)
                 output_stream.flush()
                 os.fsync(output_stream.fileno())
@@ -1371,7 +1641,6 @@ def _stage_one_model(
         source_path=str(source),
         filename=destination.name,
         size_bytes=copied_bytes,
-        sha256=source_digest.hexdigest(),
         elapsed_seconds=elapsed,
         source_identity=_source_identity(source_before),
     )
@@ -1388,11 +1657,10 @@ def stage_models_in_ramdisk(
 
     Run-scoped staging always creates an empty private directory. Persistent
     staging instead owns a versioned manifest and keeps immutable model files
-    across invocations. A persistent hit requires an unchanged source identity
-    and unchanged read-only cached-file identity bound to the source-stream
-    digest; misses are copied and published atomically without exposing partial
-    weights. The production reference gate authenticates the staged destination
-    bytes before inference and coalesces that result in the digest cache.
+    across invocations. A persistent hit requires unchanged source and read-only
+    cached-file identities; misses are copied and published atomically without
+    exposing partial weights. Exact byte counts and mutation checks protect the
+    copy, while numerical parity proves the loaded weight contents.
     """
 
     sources = selected_model_files(cells)
@@ -1410,23 +1678,15 @@ def stage_models_in_ramdisk(
         else None
     )
     reusable: dict[Path, StagedModelEvidence] = {}
-    manifest_upgrade_required = False
     if manifest is not None:
         for source in sources:
-            reusable_result = _reuse_persistent_model(
+            reusable_record = _reuse_persistent_model(
                 source,
                 staging_directory / source.name,
                 manifest["models"].get(source.name),
-                completion_deadline,
             )
-            if reusable_result is not None:
-                record, entry_upgraded = reusable_result
-                reusable[source] = record
-                manifest_upgrade_required = (
-                    manifest_upgrade_required or entry_upgraded
-                )
-        if manifest_upgrade_required:
-            _publish_persistent_manifest(staging_directory, manifest)
+            if reusable_record is not None:
+                reusable[source] = reusable_record
 
     sources_to_copy = tuple(source for source in sources if source not in reusable)
     required_bytes = sum(source.stat().st_size for source in sources_to_copy)
@@ -1474,8 +1734,7 @@ def stage_models_in_ramdisk(
             print(
                 f"[production-parity] reused_model={cached_record.filename} "
                 f"elapsed_seconds={cached_record.elapsed_seconds:.3f} "
-                f"validation_throughput_mib_s={throughput_mib_s:.1f} "
-                f"sha256={cached_record.sha256}",
+                f"metadata_validation_throughput_mib_s={throughput_mib_s:.1f}",
                 flush=True,
             )
             continue
@@ -1504,7 +1763,7 @@ def stage_models_in_ramdisk(
         print(
             f"[production-parity] staged_model={record.filename} "
             f"elapsed_seconds={record.elapsed_seconds:.3f} "
-            f"throughput_mib_s={throughput_mib_s:.1f} sha256={record.sha256}",
+            f"throughput_mib_s={throughput_mib_s:.1f}",
             flush=True,
         )
     return tuple(evidence), filesystem_type
@@ -1518,6 +1777,96 @@ def _ctest_exact_regex(cells: Iterable[CampaignCell]) -> str:
     # Python/PCRE syntax.  In particular, a non-capturing group (`(?:...)`) is
     # rejected and can otherwise degrade into a misleading zero-test success.
     return "^(" + "|".join(names) + ")$"
+
+
+def _exact_registered_command(
+    cell: CampaignCell,
+    gtest_case: str,
+) -> tuple[str, ...]:
+    """Narrow one registered aggregate command to one exact matrix cell.
+
+    The CTest-discovered argv remains authoritative for MPI rank count,
+    affinity, backend exports, executable, and every other production launch
+    detail. Only its already validated exact GTest filter may be narrowed.
+    """
+
+    if gtest_case not in cell.gtest_cases:
+        raise ValueError(
+            f"exact case {gtest_case} is not registered by {cell.name}"
+        )
+    filter_indexes = [
+        index
+        for index, argument in enumerate(cell.command)
+        if argument.startswith("--gtest_filter=")
+    ]
+    if len(filter_indexes) != 1:
+        raise ValueError(
+            f"campaign {cell.name} must have exactly one registered GTest filter"
+        )
+    filter_index = filter_indexes[0]
+    registered_cases = tuple(
+        cell.command[filter_index]
+        .removeprefix("--gtest_filter=")
+        .split(":")
+    )
+    if registered_cases != cell.gtest_cases:
+        raise ValueError(
+            f"campaign {cell.name} command/filter identity is inconsistent"
+        )
+    command = list(cell.command)
+    command[filter_index] = f"--gtest_filter={gtest_case}"
+    return tuple(command)
+
+
+def _registered_environment(cell: CampaignCell) -> dict[str, str]:
+    """Convert CTest's exact environment contract to a process mapping."""
+
+    environment: dict[str, str] = {}
+    for assignment in cell.environment:
+        name, separator, value = assignment.partition("=")
+        if not separator or not name or "\x00" in assignment:
+            raise ValueError(
+                f"campaign {cell.name} has invalid environment assignment"
+            )
+        environment[name] = value
+    return environment
+
+
+def _exact_execution_contract_sha256(
+    cell: CampaignCell,
+    gtest_case: str,
+) -> str:
+    """Hash the registered argv, environment, and working directory."""
+
+    command = _exact_registered_command(cell, gtest_case)
+    environment = _registered_environment(cell)
+    payload = json.dumps(
+        {
+            "command": command,
+            "environment": sorted(environment.items()),
+            "working_directory": cell.working_directory,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _single_exact_cell(
+    cell: CampaignCell,
+    gtest_case: str,
+) -> CampaignCell:
+    """Return one typed view of an aggregate for exact artifact validation."""
+
+    return CampaignCell(
+        name=cell.name,
+        group=cell.group,
+        gtest_cases=(gtest_case,),
+        model_files=cell.model_files,
+        command=_exact_registered_command(cell, gtest_case),
+        environment=cell.environment,
+        working_directory=cell.working_directory,
+    )
 
 
 def _current_git_short_hash() -> str:
@@ -1587,6 +1936,110 @@ def _required_csv_headers_for_case(gtest_case: str) -> dict[str, str]:
     ):
         headers["mtp_transactions.csv"] = MTP_TRANSACTIONS_HEADER
     return headers
+
+
+def _prior_artifact_file_has_evidence(
+    path: Path,
+    expected_header: str,
+    *,
+    requires_data: bool,
+) -> bool:
+    """Check the minimum immutable artifact shape needed for scheduling.
+
+    Prior files are deliberately inspected only far enough to reject missing,
+    empty, schema-mismatched, or header-only required evidence. The active run
+    still performs complete freshness and row-shape validation; this
+    lightweight predicate can never certify or skip an exact cell.
+    """
+
+    try:
+        file_stat = path.stat()
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size == 0:
+            return False
+        with path.open("r", encoding="utf-8", newline="") as stream:
+            reader = csv.reader(stream)
+            header = next(reader, None)
+            expected_columns = next(csv.reader([expected_header]))
+            if header != expected_columns:
+                return False
+            if requires_data:
+                evidence_row = next(reader, None)
+                if (
+                    evidence_row is None
+                    or len(evidence_row) != len(expected_columns)
+                ):
+                    return False
+    except (OSError, UnicodeError, csv.Error):
+        return False
+    return True
+
+
+def _prior_root_contains_complete_cell(
+    root: Path,
+    gtest_case: str,
+) -> bool:
+    """Return whether one prior root contains the complete cell contract."""
+
+    try:
+        directory = root / _gtest_artifact_directory_name(gtest_case)
+    except ValueError:
+        return False
+    return all(
+        _prior_artifact_file_has_evidence(
+            directory / filename,
+            expected_header,
+            requires_data=(
+                filename in CSV_ARTIFACTS_REQUIRING_DATA
+                or filename == "mtp_transactions.csv"
+            ),
+        )
+        for filename, expected_header in _required_csv_headers_for_case(
+            gtest_case
+        ).items()
+    )
+
+
+def inspect_prior_artifact_evidence(
+    cells: Iterable[CampaignCell],
+    roots: Iterable[Path],
+) -> PriorArtifactEvidenceIndex:
+    """Index complete exact cells from explicit prior artifact roots."""
+
+    selected = tuple(cells)
+    normalized_roots = tuple(
+        dict.fromkeys(Path(root).resolve() for root in roots)
+    )
+    exact_cases = sorted(
+        {
+            gtest_case
+            for cell in selected
+            for gtest_case in cell.gtest_cases
+        }
+    )
+    observed = frozenset(
+        gtest_case
+        for gtest_case in exact_cases
+        if any(
+            _prior_root_contains_complete_cell(root, gtest_case)
+            for root in normalized_roots
+        )
+    )
+    return PriorArtifactEvidenceIndex(
+        roots=normalized_roots,
+        observed_gtest_cases=observed,
+    )
+
+
+def prior_evidence_campaign_counts(
+    cells: Iterable[CampaignCell],
+    evidence: PriorArtifactEvidenceIndex,
+) -> dict[PriorEvidenceCoverageKind, int]:
+    """Count aggregates in each typed prior-evidence state."""
+
+    counts = {kind: 0 for kind in PriorEvidenceCoverageKind}
+    for cell in cells:
+        counts[evidence.coverage_for(cell).kind] += 1
+    return counts
 
 
 def validate_campaign_artifacts(
@@ -1700,6 +2153,395 @@ def create_campaign_artifact_root(report_path: Path) -> Path:
     return root
 
 
+def _empty_individual_green_ledger() -> IndividualGreenLedger:
+    """Return the only valid initial state for an exact-cell progress ledger."""
+
+    return IndividualGreenLedger(
+        schema_version=INDIVIDUAL_GREEN_LEDGER_SCHEMA_VERSION,
+        certification_eligible=False,
+        entries=(),
+    )
+
+
+def _decode_individual_green_ledger(document: Any) -> IndividualGreenLedger:
+    """Validate a persisted progress ledger without trusting loose JSON."""
+
+    if not isinstance(document, dict):
+        raise ValueError("individual green ledger must be a JSON object")
+    if document.get("schema_version") != INDIVIDUAL_GREEN_LEDGER_SCHEMA_VERSION:
+        raise ValueError("individual green ledger schema version is unsupported")
+    if document.get("certification_eligible") is not False:
+        raise ValueError(
+            "individual green ledger must be explicitly non-certifying"
+        )
+    raw_entries = document.get("entries")
+    if not isinstance(raw_entries, (list, tuple)):
+        raise ValueError("individual green ledger entries must be a sequence")
+    entries: list[IndividualGreenEvidence] = []
+    for index, raw_entry in enumerate(raw_entries):
+        if not isinstance(raw_entry, dict):
+            raise ValueError(f"individual green ledger entry {index} is invalid")
+        try:
+            entry = IndividualGreenEvidence(**raw_entry)
+        except TypeError as error:
+            raise ValueError(
+                f"individual green ledger entry {index} has invalid fields"
+            ) from error
+        if (
+            not entry.gtest_case
+            or not entry.campaign
+            or not entry.git_revision
+            or entry.passed_wall_time_ns <= 0
+            or entry.elapsed_seconds < 0.0
+            or entry.validated_artifact_file_count <= 0
+            or not entry.artifact_directory
+            or re.fullmatch(r"[0-9a-f]{64}", entry.execution_contract_sha256)
+            is None
+            or entry.provenance not in INDIVIDUAL_GREEN_PROVENANCE
+        ):
+            raise ValueError(
+                f"individual green ledger entry {index} has invalid evidence"
+            )
+        entries.append(entry)
+    cases = [entry.gtest_case for entry in entries]
+    if len(set(cases)) != len(cases):
+        raise ValueError("individual green ledger contains duplicate exact cells")
+    return IndividualGreenLedger(
+        schema_version=INDIVIDUAL_GREEN_LEDGER_SCHEMA_VERSION,
+        certification_eligible=False,
+        entries=tuple(entries),
+    )
+
+
+def load_individual_green_ledger(path: Path) -> IndividualGreenLedger:
+    """Load one durable progress ledger, or return an empty typed ledger."""
+
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _empty_individual_green_ledger()
+    try:
+        return _decode_individual_green_ledger(json.loads(payload))
+    except (json.JSONDecodeError, UnicodeError) as error:
+        raise ValueError(f"cannot parse individual green ledger {path}") from error
+
+
+def _write_individual_green_ledger_unlocked(
+    path: Path,
+    ledger: IndividualGreenLedger,
+) -> None:
+    """Atomically publish a fully validated non-certifying progress ledger."""
+
+    validated = _decode_individual_green_ledger(asdict(ledger))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(asdict(validated), stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def record_individual_green(
+    path: Path,
+    cell: CampaignCell,
+    result: CampaignResult,
+) -> IndividualGreenLedger:
+    """Record one green only after exact exit-zero and fresh CSV validation."""
+
+    if len(result.gtest_cases) != 1:
+        raise ValueError("individual green result must name exactly one GTest cell")
+    gtest_case = result.gtest_cases[0]
+    expected_artifact_count = len(_required_csv_headers_for_case(gtest_case))
+    if (
+        result.campaign != cell.name
+        or gtest_case not in cell.gtest_cases
+        or result.return_code != 0
+        or result.outcome != "completed"
+        or not result.artifact_contract_passed
+        or result.artifact_errors
+        or result.validated_artifact_file_count != expected_artifact_count
+        or len(result.artifact_directories) != 1
+    ):
+        raise ValueError(
+            f"refusing to record non-green exact result for {gtest_case}"
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ledger = load_individual_green_ledger(path)
+        if gtest_case in ledger.green_cases:
+            raise ValueError(f"exact cell is already green: {gtest_case}")
+        entry = IndividualGreenEvidence(
+            gtest_case=gtest_case,
+            campaign=cell.name,
+            git_revision=_current_git_short_hash(),
+            passed_wall_time_ns=time.time_ns(),
+            elapsed_seconds=result.elapsed_seconds,
+            validated_artifact_file_count=(
+                result.validated_artifact_file_count
+            ),
+            artifact_directory=result.artifact_directories[0],
+            execution_contract_sha256=_exact_execution_contract_sha256(
+                cell,
+                gtest_case,
+            ),
+        )
+        updated = IndividualGreenLedger(
+            schema_version=INDIVIDUAL_GREEN_LEDGER_SCHEMA_VERSION,
+            certification_eligible=False,
+            entries=(*ledger.entries, entry),
+        )
+        _write_individual_green_ledger_unlocked(path, updated)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    return updated
+
+
+def seed_individual_green_ledger_from_campaign_report(
+    report_path: Path,
+    cells: Iterable[CampaignCell],
+    ledger_path: Path,
+    *,
+    declared_first_reds: Iterable[tuple[str, str]] = (),
+) -> IndividualGreenLedger:
+    """Import only aggregate greens and audited fail-fast green prefixes.
+
+    A failed aggregate is never inferred green from complete CSVs. Its prefix
+    is importable only when the caller supplies the exact first-red identity
+    observed in GTest output and the current registration still requires
+    ``GTEST_FAIL_FAST=1``. This is an interruption-recovery tool; imported
+    entries remain explicitly non-certifying.
+    """
+
+    selected = tuple(cells)
+    by_campaign = {cell.name: cell for cell in selected}
+    if len(by_campaign) != len(selected):
+        raise ValueError("selected campaigns contain duplicate identities")
+    first_red_items = tuple(declared_first_reds)
+    first_red_map = dict(first_red_items)
+    if len(first_red_map) != len(first_red_items):
+        raise ValueError("declared first-red campaigns must be unique")
+    unknown_first_reds = set(first_red_map) - set(by_campaign)
+    if unknown_first_reds:
+        raise ValueError(
+            "declared first red names an unselected campaign: "
+            + ", ".join(sorted(unknown_first_reds))
+        )
+
+    try:
+        document = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read campaign report {report_path}") from error
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") not in {12, CAMPAIGN_REPORT_SCHEMA_VERSION}
+    ):
+        raise ValueError("campaign report has an unsupported schema")
+    raw_campaigns = document.get("campaigns")
+    if not isinstance(raw_campaigns, list):
+        raise ValueError("campaign report has no campaign result list")
+    try:
+        artifact_root = Path(str(document["artifact_root"])).resolve(strict=True)
+    except (KeyError, OSError) as error:
+        raise ValueError("campaign report artifact root is unavailable") from error
+    if not artifact_root.is_dir():
+        raise ValueError("campaign report artifact root is not a directory")
+
+    report_results: dict[str, dict[str, Any]] = {}
+    for raw_result in raw_campaigns:
+        if not isinstance(raw_result, dict):
+            raise ValueError("campaign report contains an invalid result")
+        campaign_name = str(raw_result.get("campaign", ""))
+        if campaign_name in report_results:
+            raise ValueError("campaign report contains duplicate results")
+        report_results[campaign_name] = raw_result
+
+    candidates: list[tuple[CampaignCell, str, str]] = []
+    consumed_first_reds: set[str] = set()
+    for campaign_name, raw_result in report_results.items():
+        cell = by_campaign.get(campaign_name)
+        if cell is None:
+            continue
+        reported_cases = tuple(str(case) for case in raw_result.get("gtest_cases", []))
+        if reported_cases != cell.gtest_cases:
+            raise ValueError(
+                f"campaign report matrix changed for {campaign_name}"
+            )
+        if (
+            raw_result.get("return_code") == 0
+            and raw_result.get("outcome") == "completed"
+            and raw_result.get("artifact_contract_passed") is True
+            and not raw_result.get("artifact_errors")
+        ):
+            expected_count = sum(
+                len(_required_csv_headers_for_case(gtest_case))
+                for gtest_case in cell.gtest_cases
+            )
+            if raw_result.get("validated_artifact_file_count") != expected_count:
+                raise ValueError(
+                    f"green campaign report has incomplete artifacts: {campaign_name}"
+                )
+            candidates.extend(
+                (
+                    cell,
+                    gtest_case,
+                    "aggregate_exit_zero_and_fresh_artifact_contract",
+                )
+                for gtest_case in cell.gtest_cases
+            )
+            continue
+
+        first_red = first_red_map.get(campaign_name)
+        if first_red is None:
+            continue
+        if raw_result.get("return_code") in (None, 0):
+            raise ValueError(
+                f"declared first-red campaign did not fail: {campaign_name}"
+            )
+        if "GTEST_FAIL_FAST=1" not in cell.environment:
+            raise ValueError(
+                f"declared first-red campaign lacks fail-fast: {campaign_name}"
+            )
+        try:
+            first_red_index = cell.gtest_cases.index(first_red)
+        except ValueError as error:
+            raise ValueError(
+                f"declared first red is not registered by {campaign_name}"
+            ) from error
+        candidates.extend(
+            (
+                cell,
+                gtest_case,
+                "aggregate_gtest_fail_fast_prefix_before_declared_first_red",
+            )
+            for gtest_case in cell.gtest_cases[:first_red_index]
+        )
+        consumed_first_reds.add(campaign_name)
+    if consumed_first_reds != set(first_red_map):
+        missing = set(first_red_map) - consumed_first_reds
+        raise ValueError(
+            "declared first-red campaign is absent from report: "
+            + ", ".join(sorted(missing))
+        )
+
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = ledger_path.with_name(ledger_path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ledger = load_individual_green_ledger(ledger_path)
+        validate_green_ledger_selection(selected, ledger)
+        entries = list(ledger.entries)
+        observed = set(ledger.green_cases)
+        revision = _current_git_short_hash()
+        for cell, gtest_case, provenance in candidates:
+            if gtest_case in observed:
+                continue
+            if not _prior_root_contains_complete_cell(
+                artifact_root,
+                gtest_case,
+            ):
+                raise ValueError(
+                    f"campaign report lacks complete artifacts for {gtest_case}"
+                )
+            directory = artifact_root / _gtest_artifact_directory_name(
+                gtest_case
+            )
+            passed_wall_time_ns = max(
+                (directory / filename).stat().st_mtime_ns
+                for filename in _required_csv_headers_for_case(gtest_case)
+            )
+            entries.append(
+                IndividualGreenEvidence(
+                    gtest_case=gtest_case,
+                    campaign=cell.name,
+                    git_revision=revision,
+                    passed_wall_time_ns=passed_wall_time_ns,
+                    elapsed_seconds=0.0,
+                    validated_artifact_file_count=len(
+                        _required_csv_headers_for_case(gtest_case)
+                    ),
+                    artifact_directory=str(directory),
+                    execution_contract_sha256=(
+                        _exact_execution_contract_sha256(cell, gtest_case)
+                    ),
+                    provenance=provenance,
+                )
+            )
+            observed.add(gtest_case)
+        updated = IndividualGreenLedger(
+            schema_version=INDIVIDUAL_GREEN_LEDGER_SCHEMA_VERSION,
+            certification_eligible=False,
+            entries=tuple(entries),
+        )
+        _write_individual_green_ledger_unlocked(ledger_path, updated)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    return updated
+
+
+def unseen_individual_cells(
+    cells: Iterable[CampaignCell],
+    ledger: IndividualGreenLedger,
+) -> tuple[tuple[CampaignCell, str], ...]:
+    """Return only exact identities absent from proven-green progress."""
+
+    selected = tuple(cells)
+    all_cases = [
+        gtest_case
+        for cell in selected
+        for gtest_case in cell.gtest_cases
+    ]
+    if len(set(all_cases)) != len(all_cases):
+        raise ValueError("selected campaigns contain duplicate exact GTest cells")
+    return tuple(
+        (cell, gtest_case)
+        for cell in selected
+        for gtest_case in cell.gtest_cases
+        if gtest_case not in ledger.green_cases
+    )
+
+
+def validate_green_ledger_selection(
+    cells: Iterable[CampaignCell],
+    ledger: IndividualGreenLedger,
+) -> None:
+    """Reject selected ledger entries whose registered launch contract moved."""
+
+    owners = {
+        gtest_case: cell
+        for cell in cells
+        for gtest_case in cell.gtest_cases
+    }
+    for entry in ledger.entries:
+        cell = owners.get(entry.gtest_case)
+        if cell is None:
+            continue
+        if entry.campaign != cell.name:
+            raise ValueError(
+                f"green ledger campaign changed for {entry.gtest_case}"
+            )
+        current_contract = _exact_execution_contract_sha256(
+            cell,
+            entry.gtest_case,
+        )
+        if entry.execution_contract_sha256 != current_contract:
+            raise ValueError(
+                f"green ledger execution contract changed for "
+                f"{entry.gtest_case}"
+            )
+
+
 def campaign_resources(cell: CampaignCell) -> frozenset[str]:
     """Return the exclusive backend resources claimed by one campaign."""
 
@@ -1712,17 +2554,56 @@ def campaign_resources(cell: CampaignCell) -> frozenset[str]:
     return resources
 
 
-def scheduling_order(cells: Iterable[CampaignCell]) -> list[CampaignCell]:
-    """Put wide hybrid claims first while retaining deterministic ordering."""
+def scheduling_order(
+    cells: Iterable[CampaignCell],
+    prior_artifact_roots: Iterable[Path] = (),
+    *,
+    prior_evidence: PriorArtifactEvidenceIndex | None = None,
+) -> list[CampaignCell]:
+    """Prioritize unseen work, then wide claims, deterministically.
 
-    return sorted(
-        cells,
-        key=lambda cell: (
+    Without explicit prior roots this preserves the canonical wide-first
+    ordering exactly. Prior evidence only changes ordering: every selected
+    aggregate and every exact GTest case remains in the returned schedule.
+    """
+
+    selected = list(cells)
+    roots = tuple(prior_artifact_roots)
+    if prior_evidence is not None and roots:
+        raise ValueError(
+            "provide prior artifact roots or a prior evidence index, not both"
+        )
+    evidence = prior_evidence
+    if evidence is None and roots:
+        evidence = inspect_prior_artifact_evidence(selected, roots)
+
+    if evidence is None or not evidence.roots:
+        return sorted(
+            selected,
+            key=lambda cell: (
+                -len(campaign_resources(cell)),
+                cell.group.backends,
+                cell.name,
+            ),
+        )
+
+    coverage_rank = {
+        PriorEvidenceCoverageKind.UNSEEN: 0,
+        PriorEvidenceCoverageKind.PARTIAL: 1,
+        PriorEvidenceCoverageKind.COMPLETE: 2,
+    }
+
+    def priority(cell: CampaignCell) -> tuple[int, int, int, str, str]:
+        coverage = evidence.coverage_for(cell)
+        return (
+            coverage_rank[coverage.kind],
+            -coverage.unseen_exact_cells,
             -len(campaign_resources(cell)),
             cell.group.backends,
             cell.name,
-        ),
-    )
+        )
+
+    return sorted(selected, key=priority)
 
 
 def select_runnable_campaigns(
@@ -1763,16 +2644,21 @@ def _run_process(
     timeout_seconds: float | None,
     environment_overrides: dict[str, str] | None = None,
     *,
+    working_directory: Path | None = None,
     exact_cell_watch: ExactCellTimeoutWatch | None = None,
-    timeout_evidence: ProcessTimeoutEvidence | None = None,
+    cancellation: CampaignCancellation | None = None,
+    termination_evidence: ProcessTerminationEvidence | None = None,
 ) -> int:
-    """Run one process group under global and optional exact-cell deadlines.
+    """Run one process group under cancellation and exact typed deadlines.
 
     The exact-cell watchdog is deliberately file-driven. CTest buffers child
     output, whereas the parity fixture publishes its unique ``test_log.txt``
     synchronously when a generated cell starts. Observing that existing
     artifact boundary keeps the watchdog independent of MPI stdout ordering
     and avoids splitting an aggregate that shares immutable prepared weights.
+    When that typed watch exists it is the sole timeout authority: each exact
+    cell receives the complete budget, so a healthy many-cell aggregate cannot
+    be killed by an unrelated cumulative setup deadline.
     """
 
     if exact_cell_watch is not None:
@@ -1785,9 +2671,23 @@ def _run_process(
         if len(set(paths)) != len(paths):
             raise ValueError("exact-cell timeout watch contains duplicate paths")
 
-    if timeout_evidence is not None:
-        timeout_evidence.kind = ProcessTimeoutKind.NONE
-        timeout_evidence.exact_gtest_case = ""
+    if termination_evidence is not None:
+        termination_evidence.kind = ProcessTerminationKind.NONE
+        termination_evidence.exact_gtest_case = ""
+        termination_evidence.cancelling_campaign = ""
+
+    # A worker selected before the first failure can reach this boundary after
+    # cancellation publication. Do not create even a short-lived CTest/MPI
+    # process in that state.
+    if cancellation is not None and cancellation.requested:
+        if termination_evidence is not None:
+            termination_evidence.kind = (
+                ProcessTerminationKind.CAMPAIGN_CANCELLED
+            )
+            termination_evidence.cancelling_campaign = (
+                cancellation.failing_campaign
+            )
+        return 130
 
     environment = None
     if environment_overrides:
@@ -1797,13 +2697,16 @@ def _run_process(
         command,
         start_new_session=True,
         env=environment,
+        cwd=working_directory,
     )
     started = time.monotonic()
     completion_deadline = (
-        None if timeout_seconds is None else started + max(timeout_seconds, 0.001)
+        None
+        if timeout_seconds is None or exact_cell_watch is not None
+        else started + max(timeout_seconds, 0.001)
     )
 
-    if exact_cell_watch is None:
+    if exact_cell_watch is None and cancellation is None:
         try:
             if completion_deadline is None:
                 return process.wait()
@@ -1811,10 +2714,49 @@ def _run_process(
                 timeout=max(completion_deadline - time.monotonic(), 0.001)
             )
         except subprocess.TimeoutExpired:
-            if timeout_evidence is not None:
-                timeout_evidence.kind = ProcessTimeoutKind.COMPLETION
+            if termination_evidence is not None:
+                termination_evidence.kind = (
+                    ProcessTerminationKind.COMPLETION_TIMEOUT
+                )
             _terminate_process_group(process)
             return 124
+
+    if exact_cell_watch is None:
+        while True:
+            if cancellation is not None and cancellation.requested:
+                if termination_evidence is not None:
+                    termination_evidence.kind = (
+                        ProcessTerminationKind.CAMPAIGN_CANCELLED
+                    )
+                    termination_evidence.cancelling_campaign = (
+                        cancellation.failing_campaign
+                    )
+                _terminate_process_group(process)
+                return 130
+
+            return_code = process.poll()
+            if return_code is not None:
+                return return_code
+
+            now = time.monotonic()
+            if completion_deadline is not None and now >= completion_deadline:
+                if termination_evidence is not None:
+                    termination_evidence.kind = (
+                        ProcessTerminationKind.COMPLETION_TIMEOUT
+                    )
+                _terminate_process_group(process)
+                return 124
+
+            poll_seconds = 0.25
+            if completion_deadline is not None:
+                poll_seconds = min(
+                    poll_seconds,
+                    max(completion_deadline - now, 0.001),
+                )
+            try:
+                return process.wait(timeout=poll_seconds)
+            except subprocess.TimeoutExpired:
+                pass
 
     # Startup belongs to the first exact cell. Creating its progress file does
     # not restart the clock; only publication of a different cell transfers
@@ -1829,6 +2771,17 @@ def _run_process(
     observed_paths: set[Path] = set()
 
     while True:
+        if cancellation is not None and cancellation.requested:
+            if termination_evidence is not None:
+                termination_evidence.kind = (
+                    ProcessTerminationKind.CAMPAIGN_CANCELLED
+                )
+                termination_evidence.cancelling_campaign = (
+                    cancellation.failing_campaign
+                )
+            _terminate_process_group(process)
+            return 130
+
         now = time.monotonic()
         newly_started: list[tuple[int, str, Path]] = []
         for case, path in exact_cell_watch.progress_files:
@@ -1863,9 +2816,11 @@ def _run_process(
         if exact_cell_expired and (
             completion_deadline is None or cell_deadline <= completion_deadline
         ):
-            if timeout_evidence is not None:
-                timeout_evidence.kind = ProcessTimeoutKind.EXACT_CELL
-                timeout_evidence.exact_gtest_case = current_case
+            if termination_evidence is not None:
+                termination_evidence.kind = (
+                    ProcessTerminationKind.EXACT_CELL_TIMEOUT
+                )
+                termination_evidence.exact_gtest_case = current_case
             print(
                 "[production-parity] exact_cell_timeout "
                 f"seconds={exact_cell_watch.timeout_seconds:.3f} "
@@ -1876,8 +2831,10 @@ def _run_process(
             _terminate_process_group(process)
             return 124
         if completion_expired:
-            if timeout_evidence is not None:
-                timeout_evidence.kind = ProcessTimeoutKind.COMPLETION
+            if termination_evidence is not None:
+                termination_evidence.kind = (
+                    ProcessTerminationKind.COMPLETION_TIMEOUT
+                )
             _terminate_process_group(process)
             return 124
 
@@ -1895,19 +2852,104 @@ def run_production_parity_preflight(
     build_dir: Path,
     timeout_seconds: float | None,
 ) -> tuple[int, float, tuple[str, ...]]:
-    """Run the CMake-owned model-free integration gate before model staging."""
+    """Build and run every model-free prerequisite before model staging.
 
-    tests = discover_production_parity_preflight_tests(build_dir)
+    The phases deliberately have separate, source-owned inventories: CTest's
+    complete Unit namespace and the Integration-only preflight label.  Their
+    concatenated identities remain the existing report receipt, so a green
+    campaign proves both without adding a parallel manifest.
+    """
+
+    unit_tests = discover_production_parity_unit_tests(build_dir)
+    integration_tests = discover_production_parity_preflight_tests(build_dir)
+    tests = unit_tests + integration_tests
     timeout_text = (
         "disabled" if timeout_seconds is None else f"{timeout_seconds:.3f}"
     )
+    started = time.monotonic()
+    deadline = (
+        None if timeout_seconds is None else started + timeout_seconds
+    )
+
+    def remaining_timeout() -> float | None:
+        """Return this prerequisite transaction's remaining wall time."""
+
+        if deadline is None:
+            return None
+        return max(deadline - time.monotonic(), 0.001)
+
     print(
         "[production-parity] preflight_status=RUNNING "
+        f"unit_test_count={len(unit_tests)} "
+        f"integration_test_count={len(integration_tests)} "
         f"test_count={len(tests)} "
         f"completion_timeout_remaining_seconds={timeout_text}",
         flush=True,
     )
-    command = [
+
+    build_command = [
+        "cmake",
+        "--build",
+        str(build_dir),
+        "--parallel",
+        "--target",
+        PRODUCTION_PARITY_UNIT_BUILD_TARGET,
+    ]
+    print(
+        "[production-parity] unit_build_status=RUNNING "
+        f"target={PRODUCTION_PARITY_UNIT_BUILD_TARGET}",
+        flush=True,
+    )
+    return_code = _run_process(build_command, remaining_timeout())
+    print(
+        "[production-parity] unit_build_status="
+        f"{'PASS' if return_code == 0 else 'FAIL'} "
+        f"target={PRODUCTION_PARITY_UNIT_BUILD_TARGET}",
+        flush=True,
+    )
+    if return_code != 0:
+        elapsed = time.monotonic() - started
+        print(
+            "[production-parity] preflight_status=FAIL "
+            f"phase=unit_build test_count={len(tests)} "
+            f"elapsed_seconds={elapsed:.3f}",
+            flush=True,
+        )
+        return return_code, elapsed, tests
+
+    unit_command = [
+        "ctest",
+        "--test-dir",
+        str(build_dir),
+        "--output-on-failure",
+        "--parallel",
+        "--no-tests=error",
+        "-R",
+        f"^{PRODUCTION_PARITY_UNIT_PREFIX}",
+    ]
+    print(
+        "[production-parity] unit_test_status=RUNNING "
+        f"test_count={len(unit_tests)}",
+        flush=True,
+    )
+    return_code = _run_process(unit_command, remaining_timeout())
+    print(
+        "[production-parity] unit_test_status="
+        f"{'PASS' if return_code == 0 else 'FAIL'} "
+        f"test_count={len(unit_tests)}",
+        flush=True,
+    )
+    if return_code != 0:
+        elapsed = time.monotonic() - started
+        print(
+            "[production-parity] preflight_status=FAIL "
+            f"phase=unit_test test_count={len(tests)} "
+            f"elapsed_seconds={elapsed:.3f}",
+            flush=True,
+        )
+        return return_code, elapsed, tests
+
+    integration_command = [
         "ctest",
         "--test-dir",
         str(build_dir),
@@ -1917,9 +2959,19 @@ def run_production_parity_preflight(
         "-L",
         f"^{PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
     ]
-    started = time.monotonic()
-    return_code = _run_process(command, timeout_seconds)
+    print(
+        "[production-parity] integration_preflight_status=RUNNING "
+        f"test_count={len(integration_tests)}",
+        flush=True,
+    )
+    return_code = _run_process(integration_command, remaining_timeout())
     elapsed = time.monotonic() - started
+    print(
+        "[production-parity] integration_preflight_status="
+        f"{'PASS' if return_code == 0 else 'FAIL'} "
+        f"test_count={len(integration_tests)}",
+        flush=True,
+    )
     print(
         "[production-parity] preflight_status="
         f"{'PASS' if return_code == 0 else 'FAIL'} "
@@ -1927,6 +2979,85 @@ def run_production_parity_preflight(
         flush=True,
     )
     return return_code, elapsed, tests
+
+
+def reuse_unchanged_production_parity_preflight(
+    build_dir: Path,
+    report_path: Path,
+) -> tuple[int, float, tuple[str, ...]]:
+    """Reuse a passed individual preflight only for an unchanged build tree.
+
+    The prior report is evidence that the canonical runner admitted its cell
+    only after a successful preflight. Ninja's append-only command log is the
+    conservative rebuild boundary, while every generated CTest registration
+    file is the inventory boundary. A newer boundary makes the receipt stale
+    and forces the caller to run preflight again; there is deliberately no raw
+    ``--skip-preflight`` switch.
+    """
+
+    resolved_report = report_path.expanduser().resolve(strict=True)
+    try:
+        document = json.loads(resolved_report.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeError, OSError) as error:
+        raise ValueError(
+            f"cannot read reusable preflight report {resolved_report}"
+        ) from error
+    if not isinstance(document, dict):
+        raise ValueError("reusable preflight report must be a JSON object")
+    if (
+        document.get("schema_version") != INDIVIDUAL_PROGRESS_REPORT_SCHEMA_VERSION
+        or document.get("mode") != "sequential_unseen_exact_cells"
+        or document.get("certification_eligible") is not False
+        or document.get("preflight_return_code") != 0
+    ):
+        raise ValueError(
+            "reusable preflight report is not a passed individual-run receipt"
+        )
+
+    resolved_build = build_dir.expanduser().resolve(strict=True)
+    build_boundaries = [
+        resolved_build / ".ninja_log",
+        resolved_build / "build.ninja",
+        *sorted(resolved_build.rglob("CTestTestfile.cmake")),
+    ]
+    if len(build_boundaries) < 3:
+        raise ValueError(
+            f"build tree has no generated CTest registration: {resolved_build}"
+        )
+    report_mtime_ns = resolved_report.stat().st_mtime_ns
+    for boundary in build_boundaries:
+        try:
+            boundary_mtime_ns = boundary.stat().st_mtime_ns
+        except OSError as error:
+            raise ValueError(
+                f"preflight build-identity boundary is unavailable: {boundary}"
+            ) from error
+        if boundary_mtime_ns > report_mtime_ns:
+            raise ValueError(
+                "reusable preflight report is stale because the build or CTest "
+                f"registration changed afterward: {boundary}"
+            )
+
+    tests = (
+        discover_production_parity_unit_tests(resolved_build)
+        + discover_production_parity_preflight_tests(resolved_build)
+    )
+    reported_tests = tuple(document.get("preflight_tests", ()))
+    if (
+        document.get("preflight_test_count") != len(tests)
+        or reported_tests != tests
+    ):
+        raise ValueError(
+            "reusable preflight report does not prove the current complete "
+            "unit and integration prerequisite inventory"
+        )
+    print(
+        "[production-parity] preflight_status=REUSED "
+        f"test_count={len(tests)} evidence_report={resolved_report} "
+        "build_identity=unchanged",
+        flush=True,
+    )
+    return 0, 0.0, tests
 
 
 def prepare_model_fixture(
@@ -1949,6 +3080,142 @@ def prepare_model_fixture(
     return return_code, time.monotonic() - started
 
 
+def run_individual_cell(
+    cell: CampaignCell,
+    gtest_case: str,
+    completion_timeout_seconds: float | None,
+    *,
+    exact_cell_timeout_seconds: float = EXACT_CELL_TIMEOUT_SECONDS,
+    global_started_at: float | None = None,
+    target_seconds: float = GLOBAL_TARGET_SECONDS,
+    environment_overrides: dict[str, str] | None = None,
+    artifact_results_root: Path | None = None,
+) -> CampaignResult:
+    """Run one exact registered production command and validate fresh CSVs.
+
+    This path exists only for sequential failure discovery. It deliberately
+    bypasses CTest's aggregate boundary while retaining CTest's exact launch
+    argv, environment, working directory, MPI topology, and model declaration.
+    The resulting progress is non-certifying until the ordinary unfiltered
+    campaign reruns every cell together.
+    """
+
+    exact_cell = _single_exact_cell(cell, gtest_case)
+    if not exact_cell.working_directory:
+        raise ValueError(
+            f"campaign {cell.name} has no registered working directory"
+        )
+    environment = _registered_environment(exact_cell)
+    if environment_overrides:
+        environment.update(environment_overrides)
+    timeout_text = (
+        "disabled"
+        if completion_timeout_seconds is None
+        else f"{completion_timeout_seconds:.3f}"
+    )
+    print(
+        "[production-parity] individual_cell_status=RUNNING "
+        f"campaign={cell.name} gtest_case={gtest_case} "
+        f"resources={'+'.join(sorted(campaign_resources(cell)))} "
+        f"completion_timeout_remaining_seconds={timeout_text} "
+        f"exact_cell_timeout_seconds={exact_cell_timeout_seconds:.3f}",
+        flush=True,
+    )
+
+    started = time.monotonic()
+    started_wall_time_ns = time.time_ns()
+    termination_evidence = ProcessTerminationEvidence()
+    process_return_code = _run_process(
+        list(exact_cell.command),
+        completion_timeout_seconds,
+        environment_overrides=environment,
+        working_directory=Path(exact_cell.working_directory),
+        exact_cell_watch=_exact_cell_timeout_watch(
+            exact_cell,
+            artifact_results_root,
+            exact_cell_timeout_seconds,
+            started_wall_time_ns,
+        ),
+        termination_evidence=termination_evidence,
+    )
+    try:
+        artifact_count, artifact_directories, artifact_errors = (
+            validate_campaign_artifacts(
+                exact_cell,
+                started_wall_time_ns,
+                revision_results_root=artifact_results_root,
+            )
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        artifact_count = 0
+        artifact_directories = ()
+        artifact_errors = (f"artifact validation failed: {error}",)
+
+    return_code = process_return_code
+    if (
+        process_return_code == 124
+        and termination_evidence.kind
+        is ProcessTerminationKind.EXACT_CELL_TIMEOUT
+    ):
+        outcome = "exact_cell_timeout"
+    elif process_return_code == 124:
+        outcome = "completion_timeout"
+    else:
+        outcome = "completed"
+    if process_return_code == 0 and artifact_errors:
+        return_code = 126
+        outcome = "artifact_contract_failed"
+    for error in artifact_errors:
+        print(
+            "[production-parity] individual_cell_artifact_error "
+            f"gtest_case={gtest_case} error={error}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    finished = time.monotonic()
+    elapsed = finished - started
+    finished_offset = (
+        finished - global_started_at
+        if global_started_at is not None
+        else elapsed
+    )
+    result = CampaignResult(
+        campaign=cell.name,
+        test_type=cell.test_type,
+        backends=cell.group.backends,
+        precision_set=cell.group.kv_precision,
+        precision_types=exact_cell.precision_types,
+        gtest_cases=(gtest_case,),
+        elapsed_seconds=elapsed,
+        target_seconds=target_seconds,
+        return_code=return_code,
+        target_met=finished_offset <= target_seconds,
+        started_offset_seconds=(
+            started - global_started_at
+            if global_started_at is not None
+            else 0.0
+        ),
+        finished_offset_seconds=finished_offset,
+        completion_timeout_seconds=(completion_timeout_seconds or 0.0),
+        exact_cell_timeout_seconds=exact_cell_timeout_seconds,
+        timed_out_gtest_case=termination_evidence.exact_gtest_case,
+        outcome=outcome,
+        artifact_contract_passed=not artifact_errors,
+        validated_artifact_file_count=artifact_count,
+        artifact_directories=artifact_directories,
+        artifact_errors=artifact_errors,
+    )
+    print(
+        "[production-parity] individual_cell_status="
+        f"{'PASS' if result.return_code == 0 else 'FAIL'} "
+        f"gtest_case={gtest_case} elapsed_seconds={elapsed:.3f} "
+        f"validated_artifacts={artifact_count}",
+        flush=True,
+    )
+    return result
+
+
 def run_campaign(
     build_dir: Path,
     cell: CampaignCell,
@@ -1959,6 +3226,7 @@ def run_campaign(
     target_seconds: float = GLOBAL_TARGET_SECONDS,
     environment_overrides: dict[str, str] | None = None,
     artifact_results_root: Path | None = None,
+    cancellation: CampaignCancellation | None = None,
 ) -> CampaignResult:
     """Run one campaign and authenticate its newly written CSV evidence."""
 
@@ -1988,7 +3256,7 @@ def run_campaign(
     )
     started = time.monotonic()
     started_wall_time_ns = time.time_ns()
-    timeout_evidence = ProcessTimeoutEvidence()
+    termination_evidence = ProcessTerminationEvidence()
     process_return_code = _run_process(
         command,
         completion_timeout_seconds,
@@ -1999,27 +3267,46 @@ def run_campaign(
             exact_cell_timeout_seconds,
             started_wall_time_ns,
         ),
-        timeout_evidence=timeout_evidence,
+        cancellation=cancellation,
+        termination_evidence=termination_evidence,
     )
-    try:
-        artifact_count, artifact_directories, artifact_errors = (
-            validate_campaign_artifacts(
-                cell,
-                started_wall_time_ns,
-                revision_results_root=artifact_results_root,
-            )
-        )
-    except (OSError, RuntimeError, ValueError) as error:
+
+    cancelled = (
+        termination_evidence.kind
+        is ProcessTerminationKind.CAMPAIGN_CANCELLED
+    )
+    if process_return_code != 0 and not cancelled:
+        # Publish a process failure before parsing artifacts so active sibling
+        # campaigns stop immediately rather than consuming more model time.
+        _publish_campaign_failure(cancellation, cell.name)
+
+    if cancelled:
         artifact_count = 0
         artifact_directories = ()
-        artifact_errors = (f"artifact validation failed: {error}",)
+        artifact_errors = ()
+    else:
+        try:
+            artifact_count, artifact_directories, artifact_errors = (
+                validate_campaign_artifacts(
+                    cell,
+                    started_wall_time_ns,
+                    revision_results_root=artifact_results_root,
+                )
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            artifact_count = 0
+            artifact_directories = ()
+            artifact_errors = (f"artifact validation failed: {error}",)
 
     return_code = process_return_code
     if (
         process_return_code == 124
-        and timeout_evidence.kind is ProcessTimeoutKind.EXACT_CELL
+        and termination_evidence.kind
+        is ProcessTerminationKind.EXACT_CELL_TIMEOUT
     ):
         outcome = "exact_cell_timeout"
+    elif cancelled:
+        outcome = "cancelled_after_campaign_failure"
     elif process_return_code == 124:
         outcome = "completion_timeout"
     else:
@@ -2027,6 +3314,7 @@ def run_campaign(
     if process_return_code == 0 and artifact_errors:
         return_code = 126
         outcome = "artifact_contract_failed"
+        _publish_campaign_failure(cancellation, cell.name)
         for error in artifact_errors:
             print(
                 f"[production-parity] campaign={cell.name} "
@@ -2060,13 +3348,52 @@ def run_campaign(
         finished_offset_seconds=finished_offset,
         completion_timeout_seconds=(completion_timeout_seconds or 0.0),
         exact_cell_timeout_seconds=exact_cell_timeout_seconds,
-        timed_out_gtest_case=timeout_evidence.exact_gtest_case,
+        timed_out_gtest_case=termination_evidence.exact_gtest_case,
+        cancelled_by_campaign=termination_evidence.cancelling_campaign,
         outcome=outcome,
-        artifact_contract_passed=not artifact_errors,
+        artifact_contract_passed=not cancelled and not artifact_errors,
         validated_artifact_file_count=artifact_count,
         artifact_directories=artifact_directories,
         artifact_errors=artifact_errors,
     )
+
+
+def _run_campaign_and_publish_failure(
+    build_dir: Path,
+    cell: CampaignCell,
+    completion_timeout_seconds: float | None,
+    *,
+    exact_cell_timeout_seconds: float,
+    global_started_at: float,
+    target_seconds: float,
+    environment_overrides: dict[str, str] | None,
+    artifact_results_root: Path | None,
+    cancellation: CampaignCancellation,
+) -> CampaignResult:
+    """Run one worker and publish even catastrophic worker-boundary failures."""
+
+    try:
+        result = run_campaign(
+            build_dir,
+            cell,
+            completion_timeout_seconds,
+            exact_cell_timeout_seconds=exact_cell_timeout_seconds,
+            global_started_at=global_started_at,
+            target_seconds=target_seconds,
+            environment_overrides=environment_overrides,
+            artifact_results_root=artifact_results_root,
+            cancellation=cancellation,
+        )
+    except BaseException:
+        _publish_campaign_failure(cancellation, cell.name)
+        raise
+
+    if (
+        result.return_code != 0
+        and result.outcome != "cancelled_after_campaign_failure"
+    ):
+        _publish_campaign_failure(cancellation, cell.name)
+    return result
 
 
 def _not_run_result(
@@ -2076,6 +3403,7 @@ def _not_run_result(
     *,
     return_code: int = 124,
     outcome: str = "not_started_before_completion_timeout",
+    cancelled_by_campaign: str = "",
 ) -> CampaignResult:
     """Describe a campaign that infrastructure prevented from starting."""
 
@@ -2093,9 +3421,14 @@ def _not_run_result(
         started_offset_seconds=elapsed_seconds,
         finished_offset_seconds=elapsed_seconds,
         completion_timeout_seconds=0.0,
+        cancelled_by_campaign=cancelled_by_campaign,
         outcome=outcome,
         artifact_contract_passed=False,
-        artifact_errors=("campaign did not execute, so no fresh artifacts exist",),
+        artifact_errors=(
+            ()
+            if cancelled_by_campaign
+            else ("campaign did not execute, so no fresh artifacts exist",)
+        ),
     )
 
 
@@ -2103,30 +3436,26 @@ def run_campaign_matrix(
     build_dir: Path,
     cells: Iterable[CampaignCell],
     target_seconds: float,
-    completion_timeout_seconds: float | None,
     *,
     exact_cell_timeout_seconds: float = EXACT_CELL_TIMEOUT_SECONDS,
     global_started_at: float | None = None,
-    global_completion_deadline: float | None = None,
     environment_overrides: dict[str, str] | None = None,
     artifact_results_root: Path | None = None,
+    prior_evidence: PriorArtifactEvidenceIndex | None = None,
 ) -> tuple[list[CampaignResult], float]:
-    """Run every cell, measuring one SLA and enforcing only a safety timeout."""
+    """Run until the first red, cancelling siblings and preserving evidence.
+
+    Exact-cell progress is the only inference timeout authority. The soft
+    whole-matrix target remains reporting evidence and never controls campaign
+    admission, regardless of how many process-amortized aggregates are
+    selected.
+    """
 
     selected = list(cells)
     started = (
         global_started_at if global_started_at is not None else time.monotonic()
     )
-    completion_deadline = (
-        global_completion_deadline
-        if global_completion_deadline is not None
-        else (
-            started + completion_timeout_seconds
-            if completion_timeout_seconds is not None
-            else None
-        )
-    )
-    pending = scheduling_order(selected)
+    pending = scheduling_order(selected, prior_evidence=prior_evidence)
     original_order = {cell.name: index for index, cell in enumerate(selected)}
     results: list[CampaignResult] = []
     running: dict[
@@ -2134,62 +3463,63 @@ def run_campaign_matrix(
         tuple[CampaignCell, frozenset[str]],
     ] = {}
     occupied: set[str] = set()
+    cancellation = CampaignCancellation()
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=len(BACKEND_ORDER),
         thread_name_prefix="production-parity",
     ) as executor:
         while pending or running:
-            now = time.monotonic()
-            completion_time_remains = (
-                completion_deadline is None or now < completion_deadline
-            )
-            if completion_time_remains:
+            if cancellation.requested and pending:
+                elapsed = time.monotonic() - started
+                failing_campaign = cancellation.failing_campaign
+                for cell in pending:
+                    results.append(
+                        _not_run_result(
+                            cell,
+                            target_seconds,
+                            elapsed,
+                            return_code=130,
+                            outcome="not_started_after_campaign_failure",
+                            cancelled_by_campaign=failing_campaign,
+                        )
+                    )
+                    print(
+                        f"[production-parity] campaign={cell.name} "
+                        "correctness_status=NOT_STARTED "
+                        f"cancelled_by_campaign={failing_campaign}",
+                        flush=True,
+                    )
+                pending.clear()
+
+            if not cancellation.requested:
                 runnable = select_runnable_campaigns(pending, occupied)
                 for cell in runnable:
+                    # Failure may be published by a worker while this launch
+                    # set is being admitted. Recheck before every submission.
+                    if cancellation.requested:
+                        break
                     resources = campaign_resources(cell)
                     pending.remove(cell)
                     occupied.update(resources)
-                    timeout_seconds = (
-                        max(completion_deadline - time.monotonic(), 0.001)
-                        if completion_deadline is not None
-                        else None
-                    )
                     future = executor.submit(
-                        run_campaign,
+                        _run_campaign_and_publish_failure,
                         build_dir,
                         cell,
-                        timeout_seconds,
+                        None,
                         exact_cell_timeout_seconds=exact_cell_timeout_seconds,
                         global_started_at=started,
                         target_seconds=target_seconds,
                         environment_overrides=environment_overrides,
                         artifact_results_root=artifact_results_root,
+                        cancellation=cancellation,
                     )
                     running[future] = (cell, resources)
-            elif pending:
-                elapsed = time.monotonic() - started
-                results.extend(
-                    _not_run_result(cell, target_seconds, elapsed)
-                    for cell in pending
-                )
-                pending.clear()
-
             if not running:
                 continue
 
-            wait_seconds = (
-                max(completion_deadline - time.monotonic(), 0.0)
-                if completion_deadline is not None
-                else None
-            )
             done, _ = concurrent.futures.wait(
                 running,
-                timeout=(
-                    wait_seconds
-                    if wait_seconds is None or wait_seconds > 0.0
-                    else 0.1
-                ),
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
             if not done:
@@ -2225,7 +3555,12 @@ def run_campaign_matrix(
                         ),
                     )
                 results.append(result)
-                correctness_status = "PASS" if result.return_code == 0 else "FAIL"
+                if result.outcome == "cancelled_after_campaign_failure":
+                    correctness_status = "CANCELLED"
+                else:
+                    correctness_status = (
+                        "PASS" if result.return_code == 0 else "FAIL"
+                    )
                 target_status = "MET" if result.target_met else "MISSED"
                 print(
                     f"[production-parity] campaign={cell.name} "
@@ -2236,7 +3571,9 @@ def run_campaign_matrix(
                     f"{result.validated_artifact_file_count} "
                     f"whole_matrix_target={target_status} "
                     f"elapsed_seconds={result.elapsed_seconds:.3f} "
-                    f"global_elapsed_seconds={result.finished_offset_seconds:.3f}",
+                    f"global_elapsed_seconds={result.finished_offset_seconds:.3f} "
+                    f"cancelled_by_campaign="
+                    f"{result.cancelled_by_campaign or '<none>'}",
                     flush=True,
                 )
 
@@ -2244,7 +3581,10 @@ def run_campaign_matrix(
     return results, time.monotonic() - started
 
 
-def write_report(path: Path, result: CampaignMatrixResult) -> None:
+def write_report(
+    path: Path,
+    result: CampaignMatrixResult | IndividualProgressReport,
+) -> None:
     """Atomically publish global matrix coverage and timing evidence."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2261,6 +3601,63 @@ def _positive_seconds(raw: str) -> float:
     if not math.isfinite(value) or not value > 0.0:
         raise argparse.ArgumentTypeError("duration must be finite and positive")
     return value
+
+
+def _positive_integer(raw: str) -> int:
+    """Parse one strictly positive diagnostic work-admission bound."""
+
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "count must be a positive integer"
+        ) from error
+    if value <= 0:
+        raise argparse.ArgumentTypeError("count must be a positive integer")
+    return value
+
+
+def _existing_directory(raw: str) -> Path:
+    """Resolve one existing directory for explicit scheduling evidence."""
+
+    try:
+        path = Path(raw).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise argparse.ArgumentTypeError(
+            f"artifact root does not exist: {raw}: {error}"
+        ) from error
+    if not path.is_dir():
+        raise argparse.ArgumentTypeError(
+            f"artifact root is not a directory: {path}"
+        )
+    return path
+
+
+def _existing_file(raw: str) -> Path:
+    """Resolve one existing regular file for explicit recovery evidence."""
+
+    try:
+        path = Path(raw).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise argparse.ArgumentTypeError(
+            f"evidence file does not exist: {raw}: {error}"
+        ) from error
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(
+            f"evidence path is not a regular file: {path}"
+        )
+    return path
+
+
+def _campaign_case_pair(raw: str) -> tuple[str, str]:
+    """Parse one explicit ``CAMPAIGN=GTEST_CASE`` fail-fast declaration."""
+
+    campaign, separator, gtest_case = raw.partition("=")
+    if not separator or not campaign or not gtest_case:
+        raise argparse.ArgumentTypeError(
+            "first-red declaration must be CAMPAIGN=GTEST_CASE"
+        )
+    return campaign, gtest_case
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -2300,8 +3697,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=_positive_seconds,
         default=COMPLETION_TIMEOUT_SECONDS,
         help=(
-            "independent stuck-run safety timeout for fixture staging and the "
-            "complete matrix"
+            "independent safety timeout for setup phases that do not publish "
+            "exact-cell progress; inference uses the fixed per-cell watchdog"
         ),
     )
     parser.add_argument(
@@ -2314,7 +3711,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=MODEL_RAMDISK_ROOT,
         help=(
-            "existing tmpfs/ramfs mount used for authenticated GGUF staging"
+            "existing tmpfs/ramfs mount used for identity-bound GGUF staging"
         ),
     )
     parser.add_argument(
@@ -2322,10 +3719,50 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "stable child directory of --model-ramdisk-root; authenticated "
-            "GGUFs and digest evidence are reused idempotently and never "
-            "removed automatically, then owner-write-sealed between campaigns "
-            "on the same tmpfs mount"
+            "stable child directory of --model-ramdisk-root; identity-bound "
+            "GGUFs are reused idempotently and never removed automatically, "
+            "then owner-write-sealed between campaigns on the same tmpfs mount"
+        ),
+    )
+    parser.add_argument(
+        "--prioritize-unseen-from-artifact-root",
+        dest="prior_artifact_roots",
+        action="append",
+        type=_existing_directory,
+        default=[],
+        help=(
+            "repeatable prior campaign artifact root used only to schedule "
+            "unseen aggregates before partial and previously complete ones; "
+            "all selected exact cells still rerun and publish fresh evidence"
+        ),
+    )
+    parser.add_argument(
+        "--green-ledger",
+        type=Path,
+        default=None,
+        help=(
+            "durable non-certifying exact-cell progress ledger; required by "
+            "--run-unseen-cells-individually"
+        ),
+    )
+    parser.add_argument(
+        "--seed-green-from-report",
+        type=_existing_file,
+        default=None,
+        help=(
+            "interrupted schema-12 campaign report whose aggregate greens "
+            "seed the non-certifying ledger before individual execution"
+        ),
+    )
+    parser.add_argument(
+        "--declare-first-red",
+        dest="declared_first_reds",
+        action="append",
+        type=_campaign_case_pair,
+        default=[],
+        help=(
+            "repeatable CAMPAIGN=GTEST_CASE declaration from preserved GTest "
+            "output; imports only the fail-fast green prefix before that red"
         ),
     )
     operation = parser.add_mutually_exclusive_group()
@@ -2342,6 +3779,34 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="print coverage without running",
     )
+    operation.add_argument(
+        "--run-unseen-cells-individually",
+        action="store_true",
+        help=(
+            "diagnostic mode: execute only exact cells absent from the green "
+            "ledger, sequentially, stopping at the first red; this mode never "
+            "certifies the complete campaign"
+        ),
+    )
+    parser.add_argument(
+        "--max-unseen-cells",
+        type=_positive_integer,
+        default=None,
+        help=(
+            "maximum unseen exact cells admitted by one individual-mode "
+            "invocation; successful bounded work exits zero while remaining "
+            "cells stay absent from the non-certifying ledger"
+        ),
+    )
+    parser.add_argument(
+        "--reuse-passed-preflight-report",
+        type=_existing_file,
+        default=None,
+        help=(
+            "individual-mode report from a passed preflight; reuse is accepted "
+            "only when Ninja and CTest build-identity boundaries are unchanged"
+        ),
+    )
     arguments = parser.parse_args(argv)
     if (
         arguments.stage_models_only
@@ -2350,6 +3815,61 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(
             "--stage-models-only requires --persistent-model-cache-dir"
         )
+    if (
+        arguments.run_unseen_cells_individually
+        and arguments.green_ledger is None
+    ):
+        parser.error(
+            "--run-unseen-cells-individually requires --green-ledger"
+        )
+    if (
+        not arguments.run_unseen_cells_individually
+        and arguments.green_ledger is not None
+    ):
+        parser.error(
+            "--green-ledger is only valid with "
+            "--run-unseen-cells-individually"
+        )
+    if (
+        not arguments.run_unseen_cells_individually
+        and arguments.max_unseen_cells is not None
+    ):
+        parser.error(
+            "--max-unseen-cells requires "
+            "--run-unseen-cells-individually"
+        )
+    if (
+        not arguments.run_unseen_cells_individually
+        and arguments.reuse_passed_preflight_report is not None
+    ):
+        parser.error(
+            "--reuse-passed-preflight-report requires "
+            "--run-unseen-cells-individually"
+        )
+    if (
+        not arguments.run_unseen_cells_individually
+        and (
+            arguments.seed_green_from_report is not None
+            or arguments.declared_first_reds
+        )
+    ):
+        parser.error(
+            "green-ledger recovery options require "
+            "--run-unseen-cells-individually"
+        )
+    if (
+        arguments.declared_first_reds
+        and arguments.seed_green_from_report is None
+    ):
+        parser.error("--declare-first-red requires --seed-green-from-report")
+    if len(dict(arguments.declared_first_reds)) != len(
+        arguments.declared_first_reds
+    ):
+        parser.error("--declare-first-red campaign identities must be unique")
+    arguments.prior_artifact_roots = tuple(
+        dict.fromkeys(arguments.prior_artifact_roots)
+    )
+    arguments.declared_first_reds = tuple(arguments.declared_first_reds)
     return arguments
 
 
@@ -2402,7 +3922,6 @@ def stage_selected_models_only(
                 completion_deadline,
                 persistent=workspace.persistent,
             )
-            workspace.digests.mkdir(mode=0o700, parents=True, exist_ok=True)
             workspace.protect_published_models()
             print(
                 "[production-parity] stage_models_only_status=PASS "
@@ -2433,6 +3952,259 @@ def stage_selected_models_only(
         return 2
 
 
+def run_unseen_cells_individually(
+    args: argparse.Namespace,
+    selected: tuple[CampaignCell, ...],
+) -> int:
+    """Run unseen exact cells sequentially and persist only authenticated greens.
+
+    The ledger is a resumable diagnostic queue, never a substitute for the
+    final unfiltered matrix. A red remains unseen and is therefore the first
+    cell retried after its focused fix. Previously green identities are never
+    relaunched by this mode while their registered execution contract is
+    unchanged.
+    """
+
+    if args.green_ledger is None:
+        raise ValueError("individual mode requires an explicit green ledger")
+    ledger_path = args.green_ledger.expanduser().resolve()
+    if args.seed_green_from_report is not None:
+        seed_individual_green_ledger_from_campaign_report(
+            args.seed_green_from_report,
+            selected,
+            ledger_path,
+            declared_first_reds=args.declared_first_reds,
+        )
+    ledger = load_individual_green_ledger(ledger_path)
+    validate_green_ledger_selection(selected, ledger)
+    all_pending = unseen_individual_cells(selected, ledger)
+    pending = (
+        all_pending
+        if args.max_unseen_cells is None
+        else all_pending[: args.max_unseen_cells]
+    )
+    selected_cases = frozenset(
+        gtest_case
+        for cell in selected
+        for gtest_case in cell.gtest_cases
+    )
+    green_before = len(selected_cases & ledger.green_cases)
+
+    if not pending:
+        report = IndividualProgressReport(
+            schema_version=INDIVIDUAL_PROGRESS_REPORT_SCHEMA_VERSION,
+            mode="sequential_unseen_exact_cells",
+            certification_eligible=False,
+            selected_exact_cell_count=len(selected_cases),
+            green_before_count=green_before,
+            attempted_count=0,
+            newly_green_count=0,
+            green_after_count=green_before,
+            remaining_unseen_count=0,
+            stopped_on_failure=False,
+            preflight_return_code=125,
+            preflight_test_count=0,
+            preflight_tests=(),
+            fixture_return_code=0,
+            model_staging_return_code=0,
+            artifact_root="",
+            green_ledger=str(ledger_path),
+            results=(),
+        )
+        write_report(args.report, report)
+        print(
+            "[production-parity] individual_sweep_status=COMPLETE "
+            f"green={green_before}/{len(selected_cases)} "
+            "certification_eligible=false next=run_unfiltered_campaign",
+            flush=True,
+        )
+        return 0
+
+    artifact_root = create_campaign_artifact_root(args.report)
+    started = time.monotonic()
+    completion_deadline = started + args.completion_timeout_seconds
+    results: list[CampaignResult] = []
+    preflight_return_code = 125
+    preflight_tests: tuple[str, ...] = ()
+    fixture_return_code = 125
+    model_staging_return_code = 125
+    stopped_on_failure = False
+    exit_code = 0
+
+    print(
+        "[production-parity] individual_sweep_status=RUNNING "
+        f"green_before={green_before} unseen={len(all_pending)} "
+        f"admitted_unseen={len(pending)} "
+        f"selected={len(selected_cases)} certification_eligible=false",
+        flush=True,
+    )
+    if args.reuse_passed_preflight_report is None:
+        (
+            preflight_return_code,
+            _,
+            preflight_tests,
+        ) = run_production_parity_preflight(
+            args.build_dir,
+            max(completion_deadline - time.monotonic(), 0.001),
+        )
+    else:
+        (
+            preflight_return_code,
+            _,
+            preflight_tests,
+        ) = reuse_unchanged_production_parity_preflight(
+            args.build_dir,
+            args.reuse_passed_preflight_report,
+        )
+    if preflight_return_code != 0:
+        exit_code = preflight_return_code
+        stopped_on_failure = True
+    else:
+        fixture_return_code, _ = prepare_model_fixture(
+            args.build_dir,
+            max(completion_deadline - time.monotonic(), 0.001),
+        )
+        if fixture_return_code != 0:
+            exit_code = fixture_return_code
+            stopped_on_failure = True
+
+    if not stopped_on_failure:
+        try:
+            with model_staging_workspace(
+                args.model_ramdisk_root,
+                args.persistent_model_cache_dir,
+                completion_deadline,
+            ) as workspace:
+                staged_directory = workspace.models
+                stage_models_in_ramdisk(
+                    selected,
+                    staged_directory,
+                    completion_deadline,
+                    persistent=workspace.persistent,
+                )
+                workspace.protect_published_models()
+                model_staging_return_code = 0
+                environment_overrides = {
+                    MODEL_RAMDISK_ENV: str(staged_directory),
+                    ARTIFACT_ROOT_ENV: str(artifact_root),
+                }
+                ordinal = {
+                    gtest_case: index
+                    for index, gtest_case in enumerate(
+                        (
+                            gtest_case
+                            for cell in selected
+                            for gtest_case in cell.gtest_cases
+                        ),
+                        start=1,
+                    )
+                }
+                for cell, gtest_case in pending:
+                    print(
+                        "[production-parity] individual_cell_progress="
+                        f"{ordinal[gtest_case]}/{len(selected_cases)} "
+                        f"gtest_case={gtest_case}",
+                        flush=True,
+                    )
+                    result = run_individual_cell(
+                        cell,
+                        gtest_case,
+                        None,
+                        exact_cell_timeout_seconds=EXACT_CELL_TIMEOUT_SECONDS,
+                        global_started_at=started,
+                        target_seconds=args.target_seconds,
+                        environment_overrides=environment_overrides,
+                        artifact_results_root=artifact_root,
+                    )
+                    results.append(result)
+                    if result.return_code != 0:
+                        exit_code = result.return_code
+                        stopped_on_failure = True
+                        break
+                    ledger = record_individual_green(
+                        ledger_path,
+                        cell,
+                        result,
+                    )
+                    print(
+                        "[production-parity] individual_cell_recorded_green "
+                        f"gtest_case={gtest_case} "
+                        f"green={len(selected_cases & ledger.green_cases)}/"
+                        f"{len(selected_cases)}",
+                        flush=True,
+                    )
+        except TimeoutError as error:
+            model_staging_return_code = 124
+            exit_code = 124
+            stopped_on_failure = True
+            print(
+                f"[production-parity] individual_sweep_error={error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except (OSError, ModelStagingError) as error:
+            model_staging_return_code = 2
+            exit_code = 2
+            stopped_on_failure = True
+            print(
+                f"[production-parity] individual_sweep_error={error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    ledger = load_individual_green_ledger(ledger_path)
+    validate_green_ledger_selection(selected, ledger)
+    remaining = unseen_individual_cells(selected, ledger)
+    green_after = len(selected_cases & ledger.green_cases)
+    report = IndividualProgressReport(
+        schema_version=INDIVIDUAL_PROGRESS_REPORT_SCHEMA_VERSION,
+        mode="sequential_unseen_exact_cells",
+        certification_eligible=False,
+        selected_exact_cell_count=len(selected_cases),
+        green_before_count=green_before,
+        attempted_count=len(results),
+        newly_green_count=green_after - green_before,
+        green_after_count=green_after,
+        remaining_unseen_count=len(remaining),
+        stopped_on_failure=stopped_on_failure,
+        preflight_return_code=preflight_return_code,
+        preflight_test_count=len(preflight_tests),
+        preflight_tests=preflight_tests,
+        fixture_return_code=fixture_return_code,
+        model_staging_return_code=model_staging_return_code,
+        artifact_root=str(artifact_root),
+        green_ledger=str(ledger_path),
+        results=tuple(results),
+    )
+    write_report(args.report, report)
+    if not remaining and not stopped_on_failure:
+        print(
+            "[production-parity] individual_sweep_status=COMPLETE "
+            f"green={green_after}/{len(selected_cases)} "
+            "certification_eligible=false next=run_unfiltered_campaign",
+            flush=True,
+        )
+        return 0
+    if not stopped_on_failure and args.max_unseen_cells is not None:
+        print(
+            "[production-parity] individual_sweep_status=PAUSED "
+            f"green={green_after}/{len(selected_cases)} "
+            f"remaining_unseen={len(remaining)} "
+            f"admission_limit={args.max_unseen_cells} "
+            "certification_eligible=false",
+            flush=True,
+        )
+        return 0
+    print(
+        "[production-parity] individual_sweep_status="
+        f"{'FAIL' if stopped_on_failure else 'INCOMPLETE'} "
+        f"green={green_after}/{len(selected_cases)} "
+        f"remaining_unseen={len(remaining)} certification_eligible=false",
+        flush=True,
+    )
+    return exit_code if exit_code != 0 else 3
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
@@ -2452,6 +4224,26 @@ def main(argv: list[str] | None = None) -> int:
         print("production parity campaign selection is empty", file=sys.stderr)
         return 2
 
+    prior_evidence = inspect_prior_artifact_evidence(
+        selected,
+        args.prior_artifact_roots,
+    )
+    if prior_evidence.roots:
+        prior_counts = prior_evidence_campaign_counts(selected, prior_evidence)
+        print(
+            "[production-parity] unseen_first_scheduling=true "
+            f"prior_evidence_roots={len(prior_evidence.roots)} "
+            "prior_observed_exact_cells="
+            f"{len(prior_evidence.observed_gtest_cases)} "
+            "unseen_campaigns="
+            f"{prior_counts[PriorEvidenceCoverageKind.UNSEEN]} "
+            "partial_campaigns="
+            f"{prior_counts[PriorEvidenceCoverageKind.PARTIAL]} "
+            "complete_campaigns="
+            f"{prior_counts[PriorEvidenceCoverageKind.COMPLETE]}",
+            flush=True,
+        )
+
     if args.list:
         print(
             f"coverage: {len(selected)} campaigns, "
@@ -2469,6 +4261,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.stage_models_only:
         return stage_selected_models_only(args, tuple(selected))
+
+    if args.run_unseen_cells_individually:
+        try:
+            return run_unseen_cells_individually(args, tuple(selected))
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+            print(
+                f"production parity individual sweep error: {error}",
+                file=sys.stderr,
+            )
+            return 2
 
     try:
         artifact_root = create_campaign_artifact_root(args.report)
@@ -2517,7 +4319,6 @@ def main(argv: list[str] | None = None) -> int:
             args.build_dir,
             max(global_completion_deadline - time.monotonic(), 0.001),
         )
-    authenticated_model_digest_count = 0
     model_staging_return_code = 125
     model_staging_elapsed = 0.0
     model_staging_filesystem = ""
@@ -2538,8 +4339,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             # Run-scoped workspaces disappear after the children exit. An
             # explicitly selected persistent workspace remains locked for that
-            # same lifetime but retains authenticated weights and digest records
-            # for the next invocation.
+            # same lifetime but retains identity-bound weights for the next
+            # invocation.
             with model_staging_workspace(
                 args.model_ramdisk_root,
                 args.persistent_model_cache_dir,
@@ -2558,37 +4359,19 @@ def main(argv: list[str] | None = None) -> int:
                 model_staging_error = ""
                 model_staging_elapsed = time.monotonic() - staging_started
 
-                # Every production cell checks the reference pack's recorded
-                # model SHA-256. This private cache coalesces the canonical
-                # staged-destination validation across child processes. The
-                # staging loop deliberately does not perform the same expensive
-                # RAM-resident SHA pass a second time.
-                digest_cache = workspace.digests
-                digest_cache.mkdir(
-                    mode=0o700,
-                    parents=True,
-                    exist_ok=workspace.persistent,
-                )
                 workspace.protect_published_models()
                 results, global_elapsed = run_campaign_matrix(
                     args.build_dir,
                     selected,
                     args.target_seconds,
-                    args.completion_timeout_seconds,
                     exact_cell_timeout_seconds=EXACT_CELL_TIMEOUT_SECONDS,
                     global_started_at=global_started,
-                    global_completion_deadline=global_completion_deadline,
                     environment_overrides={
-                        "LLAMINAR_PRODUCTION_PARITY_DIGEST_CACHE": str(
-                            digest_cache
-                        ),
                         MODEL_RAMDISK_ENV: str(staged_directory),
                         ARTIFACT_ROOT_ENV: str(artifact_root),
                     },
                     artifact_results_root=artifact_root,
-                )
-                authenticated_model_digest_count = sum(
-                    1 for _ in digest_cache.glob("*.sha256")
+                    prior_evidence=prior_evidence,
                 )
         except TimeoutError as error:
             model_staging_return_code = 124
@@ -2666,7 +4449,7 @@ def main(argv: list[str] | None = None) -> int:
     global_target_met = global_elapsed <= args.target_seconds
     performance_requirements_met = global_target_met
     report = CampaignMatrixResult(
-        schema_version=10,
+        schema_version=CAMPAIGN_REPORT_SCHEMA_VERSION,
         global_target_seconds=args.target_seconds,
         global_elapsed_seconds=global_elapsed,
         global_target_met=global_target_met,
@@ -2690,17 +4473,29 @@ def main(argv: list[str] | None = None) -> int:
         staged_model_count=len(staged_models),
         staged_model_bytes=sum(model.size_bytes for model in staged_models),
         staged_models=staged_models,
+        prior_evidence_roots=tuple(
+            str(root) for root in prior_evidence.roots
+        ),
+        prior_observed_exact_cell_count=len(
+            prior_evidence.observed_gtest_cases
+        ),
+        unseen_first_scheduling=bool(prior_evidence.roots),
         scheduling_policy=(
             "model_free_integration_preflight_"
             "exclusive_backend_sets_maximal_disjoint_"
+            + (
+                "prior_artifact_unseen_first_"
+                if prior_evidence.roots
+                else ""
+            )
+            +
             "identity_bound_tmpfs_model_staging_"
-            f"{model_staging_mode}_reference_authenticated_model_digests"
+            f"{model_staging_mode}_numerical_reference_proof"
         ),
         campaign_count=len(selected),
         exact_matrix_cell_count=sum(
             len(cell.gtest_cases) for cell in selected
         ),
-        authenticated_model_digest_count=authenticated_model_digest_count,
         artifact_contract_passed=artifact_contract_passed,
         validated_artifact_file_count=sum(
             result.validated_artifact_file_count for result in results

@@ -153,24 +153,22 @@ namespace llaminar2
          * @brief Merge locally owned service rows into the complete topology.
          * @param rank_rows One row vector per world rank.
          * @param owner_map Global participant and world-rank authority.
-         * @param num_layers Exact model layer count.
-         * @param active_sources Immutable runtime phase availability.
+         * @param production_topology Exact retained-layer graph reachability.
          * @return Canonically participant/layer-ordered complete totals.
-         * Active phases may be coherently empty in individual equivalent
-         * layers; the certifier subsequently requires measured coverage after
-         * exact-class pooling. Disabled phases must remain empty here.
+         * Reachable phases may be coherently empty in individual equivalent
+         * layers; the certifier subsequently requires economy-priced coverage
+         * after exact-class pooling. Unreachable layer/phase coordinates must
+         * remain empty here, including main-only phases on MTP sidecars.
          *
          * @throws std::invalid_argument For missing, duplicate, wrong-rank,
-         *         malformed, overflowed, or disabled-phase rows.
+         *         malformed, overflowed, or unreachable-phase rows.
          */
         [[nodiscard]] static std::vector<
             MoEOverlayParticipantLayerServiceTotals> mergeService(
             const std::vector<std::vector<
                 MoEOverlayParticipantLayerServiceTotals>> &rank_rows,
             const MoEExpertOwnerMap &owner_map,
-            int num_layers,
-            ExpertHistogramProductionSourceMask active_sources =
-                kAllExpertHistogramProductionSources);
+            const ExpertHistogramProductionTopology &production_topology);
     };
 
     /**

@@ -81,6 +81,16 @@ namespace llaminar2
     {
         if (params_.moe_runtime_table && params_.layer_idx >= 0)
             moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+        if (params_.decode_histogram)
+        {
+            if (params_.num_experts <= 0)
+            {
+                throw std::invalid_argument(
+                    "MoE routing histogram publication requires positive expert geometry");
+            }
+            routing_evidence_count_scratch_.resize(
+                static_cast<std::size_t>(params_.num_experts));
+        }
     }
 
     void MoERoutingStage::resetSessionState()
@@ -265,7 +275,8 @@ namespace llaminar2
                     .top_k = params_.top_k,
                     .route_stride = params_.top_k,
                     .count_window_tokens = true,
-                });
+                },
+                routing_evidence_count_scratch_);
         if (!merged)
         {
             LOG_ERROR("[MoERoutingStage] CPU grouped-routing evidence publication failed"
@@ -402,7 +413,8 @@ namespace llaminar2
                         .top_k = params_.top_k,
                         .route_stride = params_.top_k,
                         .count_window_tokens = true,
-                    });
+                    },
+                    routing_evidence_count_scratch_);
             if (!merged)
             {
                 if (error)
@@ -792,6 +804,44 @@ namespace llaminar2
             LOG_ERROR(
                 "[MoERoutingStage] Overlay verifier histogram producer "
                 "preparation failed"
+                << " layer=" << params_.layer_idx
+                << " reason=" << error.what());
+            return false;
+        }
+        return true;
+    }
+
+    bool MoERoutingStage::
+        transitionGroupedVerifierHistogramProducerCapture(
+            void *producer_stream,
+            RuntimeHistogramProducerCaptureTransition transition)
+    {
+        void *const publication_stream =
+            groupedVerifierHistogramPublicationStream();
+        if (groupedVerifierHistogramRole() !=
+                MoEGroupedVerifierHistogramRole::DeferredAcceptedRows ||
+            !params_.moe_runtime_table || !producer_stream ||
+            !publication_stream || producer_stream != publication_stream)
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Overlay verifier histogram capture "
+                "transition requires the table-owned publication stream"
+                << " layer=" << params_.layer_idx
+                << " stream=" << producer_stream
+                << " expected=" << publication_stream);
+            return false;
+        }
+        try
+        {
+            params_.moe_runtime_table
+                ->transitionDecodeHistogramProducerCapture(
+                    producer_stream, transition);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Overlay verifier histogram capture "
+                "transition failed"
                 << " layer=" << params_.layer_idx
                 << " reason=" << error.what());
             return false;

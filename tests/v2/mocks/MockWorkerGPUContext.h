@@ -83,6 +83,10 @@ namespace llaminar2::testing
 
         [[nodiscard]] bool supportsExecutableUpdate() const noexcept override { return true; }
         bool hasExecutable() const override { return executable_; }
+        [[nodiscard]] std::size_t residentMemoryBytes() const noexcept override
+        {
+            return 0u;
+        }
         size_t nodeCount() const override { return node_count_; }
 
         void reset() override
@@ -188,6 +192,14 @@ namespace llaminar2::testing
         bool synchronizeChecked() override { return true; }
         void synchronizeStream(void *) override {}
         bool synchronizeStreamChecked(void *stream) override { return stream != nullptr; }
+        GPUStreamExecutionState queryStreamExecutionState(
+            void *stream,
+            std::string_view boundary) override
+        {
+            if (!stream || boundary.empty())
+                throw std::invalid_argument("mock stream query requires an exact stream and boundary");
+            return GPUStreamExecutionState::Complete;
+        }
         bool insertStreamDependency(void *, void *) override { return true; }
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override

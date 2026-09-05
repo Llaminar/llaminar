@@ -99,9 +99,10 @@ namespace llaminar2
      *
      * `nanoseconds_per_activation` follows the retained production histogram
      * order: decode, real prefill, then accepted grouped-verifier rows. Values
-     * are positive setup evidence for the exact model projection geometry and
-     * prepared codebook. They are not inferred from a tier label or backend,
-     * and phase-specific backend crossovers are valid measured outcomes.
+     * are positive setup evidence for economy-priced recurring phases and exact
+     * zero for reachable-but-exceptional or unreachable phases. The values are
+     * not inferred from a tier label or backend, and phase-specific backend
+     * crossovers are valid measured outcomes.
      */
     struct MoERoutedTierLayerPhaseServiceCost
     {
@@ -141,9 +142,8 @@ namespace llaminar2
     struct MoERoutedTierServiceProfile
     {
         std::string identity;
-        /** Phases reachable under the immutable runtime MTP policy. */
-        ExpertHistogramProductionSourceMask active_sources =
-            kAllExpertHistogramProductionSources;
+        /** Graph reachability and economy-priced subset for every layer. */
+        ExpertHistogramProductionTopology production_topology;
         std::vector<MoERoutedTierLayerPhaseServiceCost> costs;
         std::vector<MoERoutedParticipantLayerPhaseServiceCost>
             participant_costs;

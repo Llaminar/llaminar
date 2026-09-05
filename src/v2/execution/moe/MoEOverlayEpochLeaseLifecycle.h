@@ -135,25 +135,24 @@ namespace llaminar2
     /**
      * @brief Select the sole residency envelope for one GPU forward graph.
      * @param has_epoch_binding Whether this participant owns a device epoch slot.
-     * @param topology_wide_device_authority Whether one all-GPU controller owns
-     *        a complete captured main transaction for the topology.
      * @param main_inference Whether this graph is the ordinary main forward.
      * @return One total, typed submission policy.
      *
-     * Auxiliary graphs and every heterogeneous/host-authority graph use retained
-     * boundary graphs on their exact execution stream.  Only the main graph of a
-     * topology-wide device authority embeds both boundaries in its capture.
+     * Every ordinary GPU main graph is already one complete captured production
+     * transaction, independent of whether placement authority is host- or
+     * device-owned. It therefore embeds both epoch boundaries in that same
+     * graph. Auxiliary and MTP child graphs deliberately retain the external
+     * envelope owned by their enclosing sequence or hosted parent.
      */
     [[nodiscard]] constexpr MoEOverlayForwardEpochSubmissionPolicy
     moeOverlayForwardEpochSubmissionPolicy(
         bool has_epoch_binding,
-        bool topology_wide_device_authority,
         bool main_inference) noexcept
     {
         using Policy = MoEOverlayForwardEpochSubmissionPolicy;
         if (!has_epoch_binding)
             return Policy::Unbound;
-        if (topology_wide_device_authority && main_inference)
+        if (main_inference)
             return Policy::CapturedMainTransaction;
         return Policy::RetainedPerForwardTransaction;
     }

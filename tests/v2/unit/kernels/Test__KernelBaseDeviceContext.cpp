@@ -94,6 +94,14 @@ public:
     // Synchronization
     void synchronize() override {}
     void synchronizeStream(void * /*stream*/) override {}
+    GPUStreamExecutionState queryStreamExecutionState(
+        void *stream,
+        std::string_view boundary) override
+    {
+        if (!stream || boundary.empty())
+            throw std::invalid_argument("mock stream query requires an exact stream and boundary");
+        return GPUStreamExecutionState::Complete;
+    }
     bool insertStreamDependency(void * /*dependent_stream*/, void * /*dependency_stream*/) override { return true; }
 
     // Graph Capture

@@ -19,6 +19,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,13 +65,33 @@ namespace llaminar2
     /// Number of separately retained production inference phases.
     inline constexpr std::size_t kExpertHistogramProductionSourceCount = 3;
 
-    /** @brief Typed availability mask in decode/prefill/grouped order. */
+    /** @brief Typed availability mask in decode/prefill/MTP-routed order. */
     using ExpertHistogramProductionSourceMask =
         std::array<bool, kExpertHistogramProductionSourceCount>;
 
     /** Every production phase is enabled unless runtime policy says otherwise. */
     inline constexpr ExpertHistogramProductionSourceMask
         kAllExpertHistogramProductionSources{true, true, true};
+
+    /**
+     * @brief Serving-policy role of serial decode in an MTP-capable graph family.
+     *
+     * Graph reachability and movement economics are intentionally distinct.
+     * Positive-depth MTP retains serial decode for bounded catch-up and short
+     * tails, but those exceptional rows must not prevent the steady-state
+     * prefill/grouped-verifier service profile from becoming ready.  Adaptive
+     * depth with a selectable zero-depth state, by contrast, uses serial decode
+     * as an ordinary serving phase and must price it before moving experts.
+     */
+    enum class ExpertHistogramServingRegime : std::uint8_t
+    {
+        /** MTP execution is disabled; serial decode and prefill are primary. */
+        Serial,
+        /** MTP depth stays positive; serial decode is catch-up/tail only. */
+        PositiveDepthMTP,
+        /** Runtime policy may select either serial decode or positive-depth MTP. */
+        AdaptiveSerialOrMTP,
+    };
 
     /** @return Dense retained-phase index, or the source-count sentinel. */
     [[nodiscard]] constexpr std::size_t expertHistogramProductionSourceIndex(
@@ -89,13 +111,246 @@ namespace llaminar2
         return kExpertHistogramProductionSourceCount;
     }
 
-    /** @return Whether decode/prefill are present and every bit is typed. */
+    /** @return Whether at least one typed production source is reachable. */
     [[nodiscard]] constexpr bool validExpertHistogramProductionSourceMask(
         const ExpertHistogramProductionSourceMask &mask) noexcept
     {
-        /* Decode and prefill are universal; grouped verification is optional. */
-        return mask[0] && mask[1];
+        return mask[0] || mask[1] || mask[2];
     }
+
+    /**
+     * @brief Exact service-phase reachability for every retained routed layer.
+     *
+     * Retained model storage and executable graph families are different
+     * concepts. An MTP-capable model may retain ordinary main-model layers and
+     * one or more predictor sidecar layers, while ordinary prefill reaches only
+     * the main interval and MTP routed work reaches both intervals. A single
+     * global bit mask cannot express that topology and caused economy
+     * certification to wait forever for impossible layer/phase observations.
+     *
+     * This value is the sole semantic authority. Global masks used by bounded
+     * MPI/device wire records are derived with @ref activeSources; they are not
+     * independently configurable policy.
+     */
+    class ExpertHistogramProductionTopology final
+    {
+    public:
+        /** Construct an invalid placeholder suitable only for later assignment. */
+        ExpertHistogramProductionTopology() = default;
+
+        /**
+         * @brief Retain one source mask per contiguous routed layer.
+         * @param layer_sources Layer-ordered masks; individual retained but
+         *        inactive auxiliary layers may have an all-false mask.
+         * @throws std::invalid_argument when the vector is empty or its union
+         *         contains no reachable production phase.
+         */
+        explicit ExpertHistogramProductionTopology(
+            std::vector<ExpertHistogramProductionSourceMask> layer_sources)
+            : layer_sources_(std::move(layer_sources)),
+              service_economy_sources_(layer_sources_)
+        {
+            if (!valid())
+            {
+                throw std::invalid_argument(
+                    "Expert histogram production topology requires retained layers and at least one reachable phase");
+            }
+        }
+
+        /**
+         * @brief Retain graph reachability and the economy-priced subset.
+         * @param layer_sources Exact phases that a retained graph may execute.
+         * @param service_economy_sources Phases whose recurring service cost
+         *        participates in migration admission. Every set bit must also
+         *        be reachable at the same layer.
+         * @throws std::invalid_argument for empty, mismatched, or contradictory
+         *         topology.
+         */
+        ExpertHistogramProductionTopology(
+            std::vector<ExpertHistogramProductionSourceMask> layer_sources,
+            std::vector<ExpertHistogramProductionSourceMask>
+                service_economy_sources)
+            : layer_sources_(std::move(layer_sources)),
+              service_economy_sources_(
+                  std::move(service_economy_sources))
+        {
+            if (!valid())
+            {
+                throw std::invalid_argument(
+                    "Expert histogram production topology requires consistent reachable and economy-priced layer phases");
+            }
+        }
+
+        /** @return A uniform topology used by phase-symmetric graph families. */
+        [[nodiscard]] static ExpertHistogramProductionTopology uniform(
+            int layer_count,
+            ExpertHistogramProductionSourceMask sources)
+        {
+            if (layer_count <= 0 ||
+                !validExpertHistogramProductionSourceMask(sources))
+            {
+                throw std::invalid_argument(
+                    "Uniform expert histogram topology requires positive layers and a reachable phase");
+            }
+            return ExpertHistogramProductionTopology(
+                std::vector<ExpertHistogramProductionSourceMask>(
+                    static_cast<std::size_t>(layer_count), sources));
+        }
+
+        /**
+         * @brief Describe the graph phases reachable by a retained model.
+         *
+         * Ordinary main-model decode remains graph-reachable when MTP is
+         * enabled: terminal catch-up and short-tail transactions execute the
+         * serial one-row graph even though steady-state verification is
+         * grouped. @p regime states whether that serial path is recurring
+         * service that must participate in movement economics or only an
+         * exceptional legal path. Retained predictor-only layers execute only
+         * as part of MTP and remain phase-empty when MTP is disabled.
+         *
+         * @param retained_layer_count Total main plus predictor layer count.
+         * @param main_inference_layer_count Exclusive main-layer boundary.
+         * @param regime Typed serving policy governing MTP and serial decode.
+         * @return Exact immutable per-layer production reachability.
+         * @throws std::invalid_argument for an invalid layer boundary.
+         */
+        [[nodiscard]] static ExpertHistogramProductionTopology
+        forRetainedExecution(
+            int retained_layer_count,
+            int main_inference_layer_count,
+            ExpertHistogramServingRegime regime);
+
+        /** @return Whether retained geometry and its derived source union exist. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            if (layer_sources_.empty() ||
+                layer_sources_.size() != service_economy_sources_.size() ||
+                !validExpertHistogramProductionSourceMask(activeSources()) ||
+                !validExpertHistogramProductionSourceMask(
+                    economyActiveSources()))
+            {
+                return false;
+            }
+            for (std::size_t layer = 0; layer < layer_sources_.size(); ++layer)
+            {
+                for (std::size_t source = 0;
+                     source < kExpertHistogramProductionSourceCount;
+                     ++source)
+                {
+                    if (service_economy_sources_[layer][source] &&
+                        !layer_sources_[layer][source])
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        /** @return Number of contiguous retained routed layers described. */
+        [[nodiscard]] std::size_t layerCount() const noexcept
+        {
+            return layer_sources_.size();
+        }
+
+        /**
+         * @return Exact reachable-source mask for @p layer.
+         * @throws std::out_of_range when the layer is outside retained geometry.
+         */
+        [[nodiscard]] const ExpertHistogramProductionSourceMask &sources(
+            int layer) const
+        {
+            if (layer < 0)
+                throw std::out_of_range("Negative expert histogram layer");
+            return layer_sources_.at(static_cast<std::size_t>(layer));
+        }
+
+        /** @return Whether one exact layer/phase coordinate can execute. */
+        [[nodiscard]] bool reachable(int layer, std::size_t source) const
+        {
+            if (source >= kExpertHistogramProductionSourceCount)
+            {
+                throw std::out_of_range(
+                    "Expert histogram production source is out of range");
+            }
+            return sources(layer)[source];
+        }
+
+        /**
+         * @return Exact economy-priced source mask for @p layer.
+         * @throws std::out_of_range when the layer is outside retained geometry.
+         */
+        [[nodiscard]] const ExpertHistogramProductionSourceMask &
+        economySources(int layer) const
+        {
+            if (layer < 0)
+            {
+                throw std::out_of_range(
+                    "Negative expert histogram economy layer");
+            }
+            return service_economy_sources_.at(
+                static_cast<std::size_t>(layer));
+        }
+
+        /**
+         * @return Whether one reachable layer/phase needs measured service cost.
+         */
+        [[nodiscard]] bool requiresServiceEvidence(
+            int layer,
+            std::size_t source) const
+        {
+            if (source >= kExpertHistogramProductionSourceCount)
+            {
+                throw std::out_of_range(
+                    "Expert histogram economy source is out of range");
+            }
+            return economySources(layer)[source];
+        }
+
+        /** @return Union of phases reachable by at least one retained layer. */
+        [[nodiscard]] ExpertHistogramProductionSourceMask activeSources()
+            const noexcept
+        {
+            ExpertHistogramProductionSourceMask result{};
+            for (const auto &layer : layer_sources_)
+            {
+                for (std::size_t source = 0;
+                     source < kExpertHistogramProductionSourceCount;
+                     ++source)
+                {
+                    result[source] = result[source] || layer[source];
+                }
+            }
+            return result;
+        }
+
+        /** @return Union of phases included in migration service economics. */
+        [[nodiscard]] ExpertHistogramProductionSourceMask
+        economyActiveSources() const noexcept
+        {
+            ExpertHistogramProductionSourceMask result{};
+            for (const auto &layer : service_economy_sources_)
+            {
+                for (std::size_t source = 0;
+                     source < kExpertHistogramProductionSourceCount;
+                     ++source)
+                {
+                    result[source] = result[source] || layer[source];
+                }
+            }
+            return result;
+        }
+
+        /** @brief Compare the complete retained-layer semantic topology. */
+        bool operator==(
+            const ExpertHistogramProductionTopology &) const = default;
+
+    private:
+        std::vector<ExpertHistogramProductionSourceMask> layer_sources_;
+        /** Reachable phases whose recurring cost is part of movement policy. */
+        std::vector<ExpertHistogramProductionSourceMask>
+            service_economy_sources_;
+    };
 
     struct RoutedExpertHistogramMerge
     {
@@ -293,11 +548,26 @@ namespace llaminar2
                               ExpertHistogramSource source =
                                   ExpertHistogramSource::SyntheticTest);
 
-        /// Merge a routed-token slice into the histogram. Only the leading
-        /// real_token_count rows are counted; padded bucket rows are ignored.
+        /**
+         * @brief Merge one validated routed-row prefix without allocating.
+         *
+         * Only the leading `real_token_count` rows are counted; padded bucket
+         * rows are ignored. The caller supplies invocation-exclusive scratch
+         * retained for at least `num_experts` counters. Requiring that storage
+         * in the type-level interface keeps decode publication allocation-free
+         * and makes concurrent stage ownership explicit instead of hiding a
+         * heap allocation or shared mutable accumulator inside the histogram.
+         * The method clears and reuses the leading `num_experts` entries.
+         *
+         * @param expert_indices Row-major selected expert identifiers.
+         * @param merge Exact logical/physical row and source contract.
+         * @param expert_count_scratch Invocation-exclusive count accumulator.
+         * @return Typed success evidence or a diagnostic with no mutation.
+         */
         ExpertHistogramMergeResult mergeRoutedExpertRows(
             const int *expert_indices,
-            const RoutedExpertHistogramMerge &merge);
+            const RoutedExpertHistogramMerge &merge,
+            std::span<uint64_t> expert_count_scratch);
 
         using RuntimeHistogramSyncCallback = std::function<bool()>;
         using RuntimeHistogramDrainCallback =

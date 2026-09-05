@@ -162,7 +162,8 @@ def test_sidecar_capacity_promotion_preserves_authenticated_metadata(tmp_path):
     original = [
         "snapshot_version: 4",
         "reference_engine: pytorch",
-        "model_sha256: " + "a" * 64,
+        "model_filename: model.gguf",
+        "model_size_bytes: 1234",
         "mtp_sidecar_max_draft_depth: 3",
         "decode_tokens: 1,2,3,4",
     ]
@@ -171,9 +172,9 @@ def test_sidecar_capacity_promotion_preserves_authenticated_metadata(tmp_path):
     promote_mtp_sidecar_metadata(metadata, 15)
 
     assert metadata.read_text(encoding="utf-8").splitlines() == [
-        *original[:3],
+        *original[:4],
         "mtp_sidecar_max_draft_depth: 15",
-        original[4],
+        original[5],
     ]
     assert not list(tmp_path.glob(".metadata.txt.*.tmp"))
 

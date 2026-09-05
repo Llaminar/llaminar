@@ -10766,7 +10766,7 @@ namespace llaminar2
             }
             group_active_expert_slots_ = active_expert_slots;
 
-            if (PerfStatsCollector::isEnabled())
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
             {
                 PerfStatsCollector::addCounter(
                     "kernel",
@@ -10813,7 +10813,7 @@ namespace llaminar2
             return false;
         }
 
-        if (PerfStatsCollector::isEnabled())
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
         {
             /*
              * Wider runtime-M verifier groups intentionally use the scalable
@@ -11225,7 +11225,7 @@ namespace llaminar2
         }
 
         group_active_expert_slots_ = 1;
-        if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("kernel"))
         {
             PerfStatsCollector::addCounter(
                 "kernel",
@@ -11597,7 +11597,8 @@ namespace llaminar2
                 : output,
             DeviceId::rocm(device_ordinal_),
             getStream());
-        if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
+            if (PerfStatsCollector::isDomainEnabled("kernel") &&
+                active_expert_slots > 0)
         {
             const MoEPrefillPairPolicyTags policy =
                 queryMoEPrefillPairPolicyTags(
@@ -11936,7 +11937,8 @@ namespace llaminar2
                 : output,
             DeviceId::rocm(device_ordinal_),
             getStream());
-        if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
+            if (PerfStatsCollector::isDomainEnabled("kernel") &&
+                active_expert_slots > 0)
         {
             const MoEPrefillPairPolicyTags policy =
                 queryMoEPrefillPairPolicyTags(

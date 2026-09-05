@@ -628,6 +628,203 @@ namespace llaminar2
         };
 
         /**
+         * @test TransferEngine exposes exactly the requested reusable CUDA queues.
+         *
+         * Pointer identity is the contract authority here. PerfStats remains
+         * diagnostic evidence and cannot manufacture or validate a live lane.
+         */
+        TEST_F(
+            CUDAExpertTierWeightKernelsTest,
+            PersistentTransferExecutionPoolIsBoundedAndIdempotent)
+        {
+            constexpr std::size_t lane_count = 4u;
+            const DeviceId device = DeviceId::cuda(0);
+            const std::string pool_name =
+                "cuda_expert_tier_execution_pool_contract";
+
+            const auto first = TransferEngine::instance()
+                                   .allocatePersistentTransferExecutionLanes(
+                                       lane_count,
+                                       device,
+                                       pool_name);
+            ASSERT_EQ(first.size(), lane_count);
+            for (std::size_t lane = 0u; lane < first.size(); ++lane)
+            {
+                EXPECT_TRUE(first[lane].valid());
+                EXPECT_EQ(first[lane].device(), device);
+                EXPECT_EQ(first[lane].laneIndex(), lane);
+                EXPECT_NE(first[lane].stream(), nullptr);
+                for (std::size_t other = lane + 1u;
+                     other < first.size();
+                     ++other)
+                {
+                    EXPECT_NE(first[lane].stream(), first[other].stream());
+                }
+            }
+
+            const auto reused = TransferEngine::instance()
+                                    .allocatePersistentTransferExecutionLanes(
+                                        lane_count,
+                                        device,
+                                        pool_name);
+            ASSERT_EQ(reused.size(), lane_count);
+            for (std::size_t lane = 0u; lane < reused.size(); ++lane)
+            {
+                EXPECT_TRUE(reused[lane].valid());
+                EXPECT_EQ(reused[lane].laneIndex(), lane);
+                EXPECT_EQ(reused[lane].stream(), first[lane].stream());
+            }
+        }
+
+        /**
+         * @test Independent CUDA lane events remain correct on one pooled stream.
+         *
+         * The two submissions race from separate host threads, use disjoint
+         * staging slices, and then advance chunk-by-chunk in an interleaved
+         * poll loop. This is the exact safe-sharing boundary used when several
+         * logical ExpertOverlay operations map to one physical cycle queue.
+         */
+        TEST_F(
+            CUDAExpertTierWeightKernelsTest,
+            SharedPersistentExecutionLanePreservesConcurrentTransfersByteExactly)
+        {
+            constexpr std::size_t bytes = 1u << 20u;
+            constexpr std::size_t staging_bytes = 4096u;
+            constexpr int n = 1;
+            constexpr int k =
+                static_cast<int>(bytes / sizeof(std::uint16_t));
+            const DeviceId device = DeviceId::cuda(0);
+
+            const auto staging = TransferEngine::instance()
+                                     .allocatePersistentTransferStagingSlices(
+                                         staging_bytes,
+                                         2u,
+                                         device);
+            const auto execution = TransferEngine::instance()
+                                       .allocatePersistentTransferExecutionLanes(
+                                           1u,
+                                           device,
+                                           "cuda_shared_execution_race_contract")
+                                       .front();
+            ExpertTierWeightTransferLane first({
+                .device = device,
+                .staging = staging[0],
+                .execution = execution,
+                .lane_name = "cuda_shared_execution_first",
+                .perf_device = "cuda:0",
+            });
+            ExpertTierWeightTransferLane second({
+                .device = device,
+                .staging = staging[1],
+                .execution = execution,
+                .lane_name = "cuda_shared_execution_second",
+                .perf_device = "cuda:0",
+            });
+            std::string setup_error;
+            ASSERT_TRUE(first.materialize(&setup_error)) << setup_error;
+            ASSERT_TRUE(second.materialize(&setup_error)) << setup_error;
+
+            std::array<std::vector<std::uint8_t>, 2> source{
+                std::vector<std::uint8_t>(bytes),
+                std::vector<std::uint8_t>(bytes),
+            };
+            for (std::size_t byte = 0u; byte < bytes; ++byte)
+            {
+                source[0][byte] = static_cast<std::uint8_t>(
+                    (byte * 29u + 7u) & 0xffu);
+                source[1][byte] = static_cast<std::uint8_t>(
+                    (byte * 131u + 19u) & 0xffu);
+            }
+            TestCUDABuffer<std::uint8_t> first_destination(bytes);
+            TestCUDABuffer<std::uint8_t> second_destination(bytes);
+            const std::array<ContiguousFloatingPointWeightDescriptor, 2>
+                destinations{
+                    ContiguousFloatingPointWeightDescriptor{
+                        .data = first_destination.data(),
+                        .type = TensorType::FP16,
+                        .n = n,
+                        .k = k,
+                        .bytes = bytes,
+                    },
+                    ContiguousFloatingPointWeightDescriptor{
+                        .data = second_destination.data(),
+                        .type = TensorType::BF16,
+                        .n = n,
+                        .k = k,
+                        .bytes = bytes,
+                    },
+                };
+            ASSERT_TRUE(destinations[0].valid());
+            ASSERT_TRUE(destinations[1].valid());
+
+            std::array<ExpertTierWeightTransferLane *, 2> lanes{
+                &first,
+                &second,
+            };
+            std::array<bool, 2> started{false, false};
+            std::array<std::string, 2> errors;
+            std::thread first_submitter(
+                [&]
+                {
+                    started[0] = lanes[0]->startCpuToGpuContiguous(
+                        source[0], destinations[0], &errors[0]);
+                });
+            std::thread second_submitter(
+                [&]
+                {
+                    started[1] = lanes[1]->startCpuToGpuContiguous(
+                        source[1], destinations[1], &errors[1]);
+                });
+            first_submitter.join();
+            second_submitter.join();
+            ASSERT_TRUE(started[0]) << errors[0];
+            ASSERT_TRUE(started[1]) << errors[1];
+
+            std::array<ExpertTierWeightTransferProgress, 2> progress{
+                lanes[0]->progress(),
+                lanes[1]->progress(),
+            };
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while ((progress[0] == ExpertTierWeightTransferProgress::Pending ||
+                    progress[1] == ExpertTierWeightTransferProgress::Pending) &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                for (std::size_t lane = 0u; lane < lanes.size(); ++lane)
+                {
+                    if (progress[lane] ==
+                        ExpertTierWeightTransferProgress::Pending)
+                    {
+                        progress[lane] = lanes[lane]->poll(&errors[lane]);
+                    }
+                }
+                std::this_thread::yield();
+            }
+            ASSERT_EQ(progress[0], ExpertTierWeightTransferProgress::Ready)
+                << errors[0];
+            ASSERT_EQ(progress[1], ExpertTierWeightTransferProgress::Ready)
+                << errors[1];
+
+            std::vector<std::uint8_t> first_observed;
+            std::vector<std::uint8_t> second_observed;
+            ASSERT_EQ(
+                first_destination.download(first_observed), cudaSuccess);
+            ASSERT_EQ(
+                second_destination.download(second_observed), cudaSuccess);
+            EXPECT_EQ(first_observed, source[0]);
+            EXPECT_EQ(second_observed, source[1]);
+            for (const auto *lane : lanes)
+            {
+                const auto stats = lane->stats();
+                EXPECT_EQ(stats.transfers_started, 1u);
+                EXPECT_EQ(stats.transfers_completed, 1u);
+                EXPECT_GT(stats.chunks_submitted, 1u);
+                EXPECT_EQ(stats.inference_stream_waits, 0u);
+                EXPECT_EQ(stats.blocking_synchronizations, 0u);
+            }
+        }
+
+        /**
          * @test Both CUDA directions match the host oracle for arbitrary chunks.
          */
         TEST_P(
@@ -958,7 +1155,18 @@ namespace llaminar2
 
             ExpertTierWeightTransferLane lane({
                 .device = DeviceId::cuda(0),
-                .staging_capacity_bytes = demotion_layout.chunkBytes(2),
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   demotion_layout.chunkBytes(2),
+                                   1u,
+                                   DeviceId::cuda(0))
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     DeviceId::cuda(0),
+                                     "cuda_tier_round_trip")
+                                 .front(),
                 .lane_name = "cuda_tier_round_trip",
                 .perf_device = "cuda:0",
             });
@@ -1107,8 +1315,18 @@ namespace llaminar2
             auto lane = std::make_shared<MoEOverlayGpuRemoteProjectionLane>(
                 MoEOverlayGpuRemoteProjectionLane::Config{
                     .device = DeviceId::cuda(device_ordinal),
-                    .staging_capacity_bytes =
-                        layout.chunkBytes(units_per_chunk),
+                    .staging = TransferEngine::instance()
+                                   .allocatePersistentTransferStagingSlices(
+                                       layout.chunkBytes(units_per_chunk),
+                                       1u,
+                                       DeviceId::cuda(device_ordinal))
+                                   .front(),
+                    .execution = TransferEngine::instance()
+                                     .allocatePersistentTransferExecutionLanes(
+                                         1u,
+                                         DeviceId::cuda(device_ordinal),
+                                         "cuda_secondary_device_remote_projection")
+                                     .front(),
                     .lane_name = "cuda_secondary_device_remote_projection",
                     .perf_device = "cuda:1",
                 });
@@ -1191,7 +1409,18 @@ namespace llaminar2
             ASSERT_NE(backend, nullptr);
             ExpertTierWeightTransferLane lane({
                 .device = DeviceId::cuda(0),
-                .staging_capacity_bytes = staging_bytes,
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   staging_bytes,
+                                   1u,
+                                   DeviceId::cuda(0))
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     DeviceId::cuda(0),
+                                     "cuda_floating_tier_round_trip")
+                                 .front(),
                 .lane_name = "cuda_floating_tier_round_trip",
                 .perf_device = "cuda:0",
             });
@@ -1396,8 +1625,18 @@ namespace llaminar2
                 MoEOverlayGpuRemoteProjectionLane>(
                 MoEOverlayGpuRemoteProjectionLane::Config{
                     .device = DeviceId::cuda(0),
-                    .staging_capacity_bytes =
-                        promotion_manifest.maximum_chunk_bytes,
+                    .staging = TransferEngine::instance()
+                                   .allocatePersistentTransferStagingSlices(
+                                       promotion_manifest.maximum_chunk_bytes,
+                                       1u,
+                                       DeviceId::cuda(0))
+                                   .front(),
+                    .execution = TransferEngine::instance()
+                                     .allocatePersistentTransferExecutionLanes(
+                                         1u,
+                                         DeviceId::cuda(0),
+                                         "cuda_remote_q51_roundtrip")
+                                     .front(),
                     .lane_name = "cuda_remote_q51_roundtrip",
                     .perf_device = "cuda:0",
                 });
@@ -1690,7 +1929,18 @@ namespace llaminar2
             std::string error;
             ExpertTierWeightTransferLane lane({
                 .device = DeviceId::cuda(0),
-                .staging_capacity_bytes = production_staging_bytes,
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   production_staging_bytes,
+                                   1u,
+                                   DeviceId::cuda(0))
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     DeviceId::cuda(0),
+                                     "cuda_asymmetric_promotion_execution")
+                                 .front(),
                 .lane_name = "cuda_asymmetric_promotion_execution",
                 .perf_device = "cuda:0",
             });
@@ -1843,23 +2093,47 @@ namespace llaminar2
 
             const std::size_t activation_elements =
                 static_cast<std::size_t>(prefill_rows) * K;
+            const std::size_t activation_blocks_per_row =
+                static_cast<std::size_t>(K) / 32u;
+            const std::size_t activation_block_elements =
+                static_cast<std::size_t>(prefill_rows) *
+                activation_blocks_per_row;
             std::vector<std::int8_t> host_activation(activation_elements);
-            std::vector<std::int32_t> host_activation_sums(prefill_rows, 0);
+            std::vector<std::int32_t> host_activation_sums(
+                activation_block_elements, 0);
             for (std::size_t index = 0; index < activation_elements; ++index)
             {
                 host_activation[index] = static_cast<std::int8_t>(
                     static_cast<int>((index * 11u + 3u) % 29u) - 14);
-                host_activation_sums[index / K] += host_activation[index];
+                const std::size_t row = index / static_cast<std::size_t>(K);
+                const std::size_t column =
+                    index % static_cast<std::size_t>(K);
+                const std::size_t block = column / 32u;
+                host_activation_sums[
+                    row * activation_blocks_per_row + block] +=
+                    host_activation[index];
             }
-            std::vector<float> host_activation_scales(prefill_rows);
+            std::vector<float> host_activation_scales(
+                activation_block_elements);
             for (int row = 0; row < prefill_rows; ++row)
             {
-                host_activation_scales[static_cast<std::size_t>(row)] =
-                    0.03137f + static_cast<float>(row) * 0.00019f;
+                for (std::size_t block = 0;
+                     block < activation_blocks_per_row;
+                     ++block)
+                {
+                    host_activation_scales[
+                        static_cast<std::size_t>(row) *
+                            activation_blocks_per_row +
+                        block] =
+                        0.03137f + static_cast<float>(row) * 0.00019f +
+                        static_cast<float>(block) * 0.000003f;
+                }
             }
             TestCUDABuffer<std::int8_t> activation(activation_elements);
-            TestCUDABuffer<float> activation_scales(prefill_rows);
-            TestCUDABuffer<std::int32_t> activation_sums(prefill_rows);
+            TestCUDABuffer<float> activation_scales(
+                activation_block_elements);
+            TestCUDABuffer<std::int32_t> activation_sums(
+                activation_block_elements);
             ASSERT_EQ(activation.upload(host_activation), cudaSuccess);
             ASSERT_EQ(
                 activation_scales.upload(host_activation_scales),
@@ -2108,7 +2382,7 @@ namespace llaminar2
             };
             IBackend *backend = getCUDABackend();
             ASSERT_NE(backend, nullptr);
-            auto pool = GpuExpertSlotPool::create(
+            auto pool = GpuExpertSlotPool::createForTest(
                 backend,
                 DeviceId::cuda(0),
                 /*device_ordinal=*/0,
@@ -2189,7 +2463,18 @@ namespace llaminar2
 
             ExpertTierWeightTransferLane lane({
                 .device = DeviceId::cuda(0),
-                .staging_capacity_bytes = staging_bytes,
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   staging_bytes,
+                                   1u,
+                                   DeviceId::cuda(0))
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     DeviceId::cuda(0),
+                                     "cuda_production_shadow_slot_q5k")
+                                 .front(),
                 .lane_name = "cuda_production_shadow_slot_q5k",
                 .perf_device = "cuda:0",
             });
@@ -2340,7 +2625,18 @@ namespace llaminar2
 
             ExpertTierWeightTransferLane lane({
                 .device = DeviceId::cuda(0),
-                .staging_capacity_bytes = layout.chunkBytes(1),
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   layout.chunkBytes(1),
+                                   1u,
+                                   DeviceId::cuda(0))
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     DeviceId::cuda(0),
+                                     "cuda_inference_overlap")
+                                 .front(),
                 .lane_name = "cuda_inference_overlap",
                 .perf_device = "cuda:0",
             });

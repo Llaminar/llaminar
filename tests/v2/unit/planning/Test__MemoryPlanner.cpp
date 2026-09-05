@@ -10,12 +10,15 @@
 
 #include <gtest/gtest.h>
 #include "planning/MemoryPlanner.h"
+#include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/ActivationBufferSizing.h"
 #include "planning/KVCacheMemoryEstimator.h"
 #include "planning/CollectiveMemoryEstimator.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
+#include "kernels/attention/AttentionWorkspaceContract.h"
+#include "kernels/HybridGDNStateGeometry.h"
 #include "backends/DeviceId.h"
 
 #include <string>
@@ -84,7 +87,7 @@ namespace
     ModelMemoryProfile createQwen36DenseLikeProfile(size_t device_weight_bytes)
     {
         ModelMemoryProfile p;
-        p.architecture = "qwen3.6";
+        p.architecture = "qwen35";
         p.n_layers = 65;
         p.d_model = 5120;
         p.d_ff = 27648;
@@ -110,7 +113,7 @@ namespace
     ModelMemoryProfile createQwen36HybridMTPStateProfile()
     {
         ModelMemoryProfile profile;
-        profile.architecture = "qwen3.6";
+        profile.architecture = "qwen35";
         profile.n_layers = 65;
         profile.mtp_layer_count = 1;
         profile.d_model = 5120;
@@ -144,7 +147,7 @@ namespace
     ModelMemoryProfile createMoEOverlayProfile()
     {
         ModelMemoryProfile profile;
-        profile.architecture = "qwen3.5moe";
+        profile.architecture = "qwen35moe";
         profile.n_layers = 2;
         profile.d_model = 32;
         profile.d_ff = 64;
@@ -234,12 +237,17 @@ TEST(Test__MemoryPlanner, SingleGPU_Fits)
     auto plan = MemoryPlanner::plan(profile, {cfg});
 
     EXPECT_EQ(plan.devices.size(), 1u);
-    EXPECT_GT(plan.devices[0].weight_bytes, 0u);
-    EXPECT_GT(plan.devices[0].kv_cache_bytes, 0u);
-    EXPECT_GT(plan.devices[0].activation_bytes, 0u);
-    EXPECT_GT(plan.devices[0].workspace_bytes, 0u);
+    EXPECT_GT(plan.devices[0].weight_bytes(), 0u);
+    EXPECT_GT(plan.devices[0].kv_cache_bytes(), 0u);
+    EXPECT_GT(plan.devices[0].activation_bytes(), 0u);
+    EXPECT_GT(plan.devices[0].workspace_bytes(), 0u);
     EXPECT_TRUE(plan.devices[0].fits());
     EXPECT_TRUE(plan.fits());
+    ASSERT_EQ(plan.physicalPlan().resources().size(), 1u);
+    EXPECT_EQ(
+        &plan.physicalPlan().resources().front(),
+        plan.physicalPlan().find({-1, DeviceId::cuda(0)}));
+    EXPECT_NO_THROW((void)plan.admit());
 }
 
 TEST(Test__MemoryPlanner, Qwen36DenseLike_UsesTerminalLogitsAndPreparedEmbeddingWorkspace)
@@ -262,12 +270,12 @@ TEST(Test__MemoryPlanner, Qwen36DenseLike_UsesTerminalLogitsAndPreparedEmbedding
     ASSERT_EQ(plan.devices.size(), 1u);
     const auto &device_plan = plan.devices.front();
     EXPECT_TRUE(device_plan.fits()) << plan.renderTable();
-    EXPECT_LT(device_plan.activation_bytes, 2ULL * GiB)
+    EXPECT_LT(device_plan.activation_bytes(), 2ULL * GiB)
         << "normal prefill must not reserve full-context all-position logits";
-    EXPECT_GT(device_plan.workspace_bytes, 768ULL * 1024ULL * 1024ULL)
+    EXPECT_GT(device_plan.workspace_bytes(), 768ULL * 1024ULL * 1024ULL)
         << "large grouped-prefill accumulators must exceed the minimum floor";
     EXPECT_LT(
-        device_plan.workspace_bytes,
+        device_plan.workspace_bytes(),
         size_t{151936} * size_t{5120} * sizeof(float))
         << "prepared embedding must not reserve a vocab-by-hidden fallback table";
 }
@@ -285,15 +293,50 @@ TEST(Test__MemoryPlanner, Qwen36HybridMTP_AccountsExactKVAndPersistentState)
     cfg.max_seq_len = 4096;
     cfg.kv_precision = "fp16";
     cfg.mtp_enabled = true;
+    cfg.prefix_cache = PrefixCacheRuntimeConfig{};
+    cfg.associated_host_memory = PhysicalMemoryResource{
+        .world_rank = -1,
+        .device = DeviceId::cpu(),
+        .total_bytes = 64ULL * 1024ULL * 1024ULL * 1024ULL,
+        .admission_available_bytes =
+            64ULL * 1024ULL * 1024ULL * 1024ULL,
+    };
 
     const auto plan = MemoryPlanner::plan(profile, {cfg});
-    ASSERT_EQ(plan.devices.size(), 1u);
-    const auto &device = plan.devices.front();
+    ASSERT_EQ(plan.devices.size(), 2u);
+    const auto gpu = std::find_if(
+        plan.devices.begin(), plan.devices.end(), [](const auto &candidate)
+        { return candidate.device().is_cuda(); });
+    const auto host = std::find_if(
+        plan.devices.begin(), plan.devices.end(), [](const auto &candidate)
+        { return candidate.device().is_cpu(); });
+    ASSERT_NE(gpu, plan.devices.end());
+    ASSERT_NE(host, plan.devices.end());
+    const auto &device = *gpu;
+    EXPECT_EQ(
+        host->bom().bytes(PhysicalMemoryOwner::PrefixHostTier),
+        cfg.prefix_cache.ram_budget_bytes);
+    EXPECT_EQ(
+        host->bom().bytes(PhysicalMemoryOwner::PrefixArchiveStaging),
+        PrefixArchiveIOGeometry::scratchBytes())
+        << "Tiered disk restore owns one bounded host I/O window.";
 
-    constexpr size_t expected_main_gdn_payload =
-        156893184ULL;
-    constexpr size_t expected_live_gdn_arena =
-        313786368ULL;
+    const HybridGDNStateGeometry gdn_geometry =
+        HybridGDNStateGeometry::resolve(
+            profile.n_heads,
+            /*local_head_start=*/0,
+            /*local_attention_heads=*/profile.n_heads,
+            profile.gdn_group_count,
+            profile.gdn_time_step_rank,
+            profile.gdn_state_size,
+            profile.gdn_inner_size,
+            profile.gdn_conv_kernel_size);
+    const size_t expected_main_gdn_payload =
+        gdn_geometry.deviceSerializedPayloadBytes(/*gdn_layers=*/48);
+    const size_t expected_live_gdn_arena =
+        gdn_geometry.deviceArenaBytes(
+            /*gdn_layers=*/48,
+            cfg.batch_size);
     constexpr size_t expected_terminal_hidden =
         5120ULL * sizeof(float);
     const size_t expected_kv = KVCacheMemoryEstimator::estimate(
@@ -305,21 +348,21 @@ TEST(Test__MemoryPlanner, Qwen36HybridMTP_AccountsExactKVAndPersistentState)
         "fp16",
         DeviceId::cuda(0));
 
-    EXPECT_EQ(device.kv_cache_bytes, expected_kv)
+    EXPECT_EQ(device.kv_cache_bytes(), expected_kv)
         << "Only 16 main FA layers plus one shifted MTP FA layer own KV.";
     EXPECT_EQ(
-        device.live_recurrent_state_bytes,
+        device.live_recurrent_state_bytes(),
         expected_live_gdn_arena);
     EXPECT_EQ(
-        device.checkpoint_state_bytes,
+        device.checkpoint_state_bytes(),
         4ULL *
             (expected_main_gdn_payload +
              expected_terminal_hidden))
         << "The shifted FA cache must not reserve a recurrent payload slot.";
     EXPECT_GT(
-        device.persistent_state_bytes,
-        device.live_recurrent_state_bytes +
-            device.checkpoint_state_bytes)
+        device.persistent_state_bytes(),
+        device.live_recurrent_state_bytes() +
+            device.checkpoint_state_bytes())
         << "Device sequence metadata must remain explicitly accounted.";
 
     const auto logical_prefix =
@@ -330,31 +373,236 @@ TEST(Test__MemoryPlanner, Qwen36HybridMTP_AccountsExactKVAndPersistentState)
             cfg.kv_precision,
             cfg.device);
     EXPECT_EQ(
-        device.prefix_cache_staging_bytes,
+        device.prefix_cache_staging_bytes(),
         expected_main_gdn_payload +
             2ULL * logical_prefix.totalBytes())
         << "Main KV, hybrid state, and shifted-MTP KV each own one archive slot.";
+
+    const size_t expected_prefix_block =
+        17ULL * logical_prefix.totalBytes() +
+        expected_main_gdn_payload + expected_terminal_hidden +
+        static_cast<size_t>(profile.vocab_size) * sizeof(float);
     EXPECT_EQ(
-        device.prefix_cache_device_hot_bytes,
-        cfg.prefix_cache.device_budget_bytes)
-        << "The default tier must retain its configured bounded hot capacity.";
+        device.prefix_cache_device_hot_bytes(),
+        prefixCacheWholeBlockReservationBytes(
+            cfg.prefix_cache.device_budget_bytes,
+            expected_prefix_block))
+        << "Admission must charge the same whole-block reservation that the "
+           "device-hot backend can physically allocate.";
 
     DevicePlanConfig rocm_cfg = cfg;
     rocm_cfg.device = DeviceId::rocm(0);
     const auto rocm_plan = MemoryPlanner::plan(profile, {rocm_cfg});
-    ASSERT_EQ(rocm_plan.devices.size(), 1u);
+    ASSERT_EQ(rocm_plan.devices.size(), 2u);
+    const auto rocm = std::find_if(
+        rocm_plan.devices.begin(),
+        rocm_plan.devices.end(),
+        [](const auto &candidate) { return candidate.device().is_rocm(); });
+    ASSERT_NE(rocm, rocm_plan.devices.end());
     EXPECT_EQ(
-        rocm_plan.devices.front().prefix_cache_staging_bytes,
-        device.prefix_cache_staging_bytes);
+        rocm->prefix_cache_staging_bytes(),
+        device.prefix_cache_staging_bytes());
     EXPECT_EQ(
-        rocm_plan.devices.front().prefix_cache_device_hot_bytes,
-        device.prefix_cache_device_hot_bytes);
+        rocm->prefix_cache_device_hot_bytes(),
+        device.prefix_cache_device_hot_bytes());
+}
+
+/**
+ * @brief A replicated TP predictor owns a full-width shifted cache.
+ *
+ * The committed Qwen hybrid cache remains TP-sharded, but the learned MTP
+ * predictor is a complete per-participant block and consequently projects all
+ * KV heads. This reproduces the 2xROCm ExpertOverlay admission failure where
+ * runtime requested an 8 MiB shifted cache after planning only its 4 MiB
+ * sharded counterpart.
+ */
+TEST(Test__MemoryPlanner,
+     ReplicatedMTPShiftedCacheUsesFullKVHeadsBesideShardedMain)
+{
+    const auto profile = createQwen36HybridMTPStateProfile();
+
+    DevicePlanConfig cfg;
+    cfg.device = DeviceId::rocm(0);
+    cfg.device_compute_units = 60;
+    cfg.device_total_bytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;
+    cfg.device_free_bytes = cfg.device_total_bytes;
+    cfg.batch_size = 1;
+    cfg.max_seq_len = 4096;
+    cfg.kv_precision = "fp16";
+    cfg.total_shards = 2;
+    cfg.shard_index = 0;
+    cfg.local_kv_heads = 4;
+    cfg.local_tp_backend = CollectiveBackendType::RCCL;
+    cfg.mtp_enabled = true;
+    cfg.mtp_shifted_kv_head_layout =
+        MTPShiftedKVHeadLayout::FullModelPerParticipant;
+    cfg.prefix_cache = PrefixCacheRuntimeConfig{};
+    cfg.associated_host_memory = PhysicalMemoryResource{
+        .world_rank = -1,
+        .device = DeviceId::cpu(),
+        .total_bytes = 64ULL * 1024ULL * 1024ULL * 1024ULL,
+        .admission_available_bytes =
+            64ULL * 1024ULL * 1024ULL * 1024ULL,
+    };
+
+    const auto replicated_plan = MemoryPlanner::plan(profile, {cfg});
+    ASSERT_EQ(replicated_plan.devices.size(), 2u);
+    const auto replicated = std::find_if(
+        replicated_plan.devices.begin(),
+        replicated_plan.devices.end(),
+        [](const auto &candidate) { return candidate.device().is_rocm(); });
+    ASSERT_NE(replicated, replicated_plan.devices.end());
+
+    const size_t expected_main = KVCacheMemoryEstimator::estimate(
+        /*n_layers=*/16,
+        cfg.batch_size,
+        cfg.max_seq_len,
+        /*n_kv_heads=*/4,
+        profile.head_dim,
+        cfg.kv_precision,
+        cfg.device);
+    const size_t expected_shifted = KVCacheMemoryEstimator::estimate(
+        /*n_layers=*/1,
+        cfg.batch_size,
+        cfg.max_seq_len,
+        /*n_kv_heads=*/8,
+        profile.head_dim,
+        cfg.kv_precision,
+        cfg.device);
+    EXPECT_EQ(
+        replicated->kv_cache_bytes(),
+        expected_main + expected_shifted);
+
+    const auto main_prefix =
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            cfg.prefix_cache.block_size,
+            /*n_kv_heads=*/4,
+            profile.head_dim,
+            cfg.kv_precision,
+            cfg.device);
+    const auto shifted_prefix =
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            cfg.prefix_cache.block_size,
+            /*n_kv_heads=*/8,
+            profile.head_dim,
+            cfg.kv_precision,
+            cfg.device);
+    const HybridGDNStateGeometry gdn_geometry =
+        HybridGDNStateGeometry::resolve(
+            profile.n_heads,
+            /*local_head_start=*/0,
+            /*local_attention_heads=*/20,
+            profile.gdn_group_count,
+            profile.gdn_time_step_rank,
+            profile.gdn_state_size,
+            profile.gdn_inner_size,
+            profile.gdn_conv_kernel_size);
+    EXPECT_EQ(
+        replicated->prefix_cache_staging_bytes(),
+        main_prefix.totalBytes() + shifted_prefix.totalBytes() +
+            gdn_geometry.deviceSerializedPayloadBytes(
+                /*gdn_layers=*/48));
+
+    DevicePlanConfig sharded_cfg = cfg;
+    sharded_cfg.mtp_shifted_kv_head_layout =
+        MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
+    const auto sharded_plan = MemoryPlanner::plan(profile, {sharded_cfg});
+    const auto sharded = std::find_if(
+        sharded_plan.devices.begin(),
+        sharded_plan.devices.end(),
+        [](const auto &candidate) { return candidate.device().is_rocm(); });
+    ASSERT_NE(sharded, sharded_plan.devices.end());
+    EXPECT_EQ(
+        sharded->kv_cache_bytes(),
+        expected_main + KVCacheMemoryEstimator::estimate(
+                            /*n_layers=*/1,
+                            cfg.batch_size,
+                            cfg.max_seq_len,
+                            /*n_kv_heads=*/4,
+                            profile.head_dim,
+                            cfg.kv_precision,
+                            cfg.device));
+    EXPECT_LT(
+        sharded->kv_cache_bytes(),
+        replicated->kv_cache_bytes());
+}
+
+TEST(Test__MemoryPlanner,
+     HybridGDNStateUsesTheExactModuloLinkedParticipantGeometry)
+{
+    const auto profile = createQwen36HybridMTPStateProfile();
+
+    DevicePlanConfig cfg;
+    cfg.device = DeviceId::rocm(0);
+    cfg.device_compute_units = 60;
+    cfg.device_total_bytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;
+    cfg.device_free_bytes = cfg.device_total_bytes;
+    cfg.batch_size = 2;
+    cfg.max_seq_len = 128;
+    cfg.kv_precision = "fp16";
+    cfg.total_shards = 4;
+    cfg.local_tp_backend = CollectiveBackendType::RCCL;
+    cfg.shard_index = 1;
+    cfg.mtp_enabled = true;
+
+    const auto plan = MemoryPlanner::plan(profile, {cfg});
+    ASSERT_EQ(plan.devices.size(), 1u);
+
+    const HybridGDNStateGeometry geometry =
+        HybridGDNStateGeometry::resolve(
+            profile.n_heads,
+            /*local_head_start=*/10,
+            /*local_attention_heads=*/10,
+            profile.gdn_group_count,
+            profile.gdn_time_step_rank,
+            profile.gdn_state_size,
+            profile.gdn_inner_size,
+            profile.gdn_conv_kernel_size);
+    EXPECT_EQ(geometry.local_key_heads, 4);
+    EXPECT_EQ(geometry.local_value_heads, 12);
+    EXPECT_EQ(
+        plan.devices.front().live_recurrent_state_bytes(),
+        geometry.deviceArenaBytes(
+            /*gdn_layers=*/48,
+            cfg.batch_size));
+
+    const size_t device_checkpoint_payload =
+        geometry.deviceSerializedPayloadBytes(/*gdn_layers=*/48);
+    const size_t host_checkpoint_payload =
+        geometry.localPayloadBytes(/*gdn_layers=*/48);
+    const size_t terminal_hidden =
+        static_cast<size_t>(profile.d_model) * sizeof(float);
+    ASSERT_GT(device_checkpoint_payload, host_checkpoint_payload)
+        << "TP-local and full banks must differ or this regression cannot "
+           "detect under-admission.";
+    EXPECT_EQ(
+        plan.devices.front().checkpoint_state_bytes(),
+        4ULL * (device_checkpoint_payload + terminal_hidden))
+        << "ROCm rollback admission must include every distinct device bank.";
+
+    DevicePlanConfig cuda_cfg = cfg;
+    cuda_cfg.device = DeviceId::cuda(0);
+    const auto cuda_plan = MemoryPlanner::plan(profile, {cuda_cfg});
+    ASSERT_EQ(cuda_plan.devices.size(), 1u);
+    EXPECT_EQ(
+        cuda_plan.devices.front().checkpoint_state_bytes(),
+        plan.devices.front().checkpoint_state_bytes())
+        << "CUDA and ROCm serialize the same packed recurrent-state shape.";
+
+    DevicePlanConfig cpu_cfg = cfg;
+    cpu_cfg.device = DeviceId::cpu();
+    const auto cpu_plan = MemoryPlanner::plan(profile, {cpu_cfg});
+    ASSERT_EQ(cpu_plan.devices.size(), 1u);
+    EXPECT_EQ(
+        cpu_plan.devices.front().checkpoint_state_bytes(),
+        4ULL * (host_checkpoint_payload + terminal_hidden))
+        << "CPU rollback owns only its host-local recurrent vectors.";
 }
 
 TEST(Test__MemoryPlanner, TerminalParticipantOwnsTrailingMTPWeights)
 {
     ModelMemoryProfile profile;
-    profile.architecture = "qwen3.6";
+    profile.architecture = "qwen35";
     profile.n_layers = 3;
     profile.mtp_layer_count = 1;
     profile.d_model = 32;
@@ -397,8 +645,8 @@ TEST(Test__MemoryPlanner, TerminalParticipantOwnsTrailingMTPWeights)
     ASSERT_EQ(without_mtp.devices.size(), 1u);
     ASSERT_EQ(with_mtp.devices.size(), 1u);
     EXPECT_EQ(
-        with_mtp.devices.front().weight_bytes -
-            without_mtp.devices.front().weight_bytes,
+        with_mtp.devices.front().weight_bytes() -
+            without_mtp.devices.front().weight_bytes(),
         32ULL * 32ULL * sizeof(float))
         << "The terminal main-graph participant must reserve the trailing "
            "predictor block loaded by the MTP sidecar.";
@@ -441,15 +689,15 @@ TEST(Test__MemoryPlanner, LongContext_KeepsKVFullContextButCapsActivationWorkspa
     const auto &short_device = short_plan.devices.front();
     const auto &long_device = long_plan.devices.front();
 
-    EXPECT_GT(long_device.kv_cache_bytes, short_device.kv_cache_bytes)
+    EXPECT_GT(long_device.kv_cache_bytes(), short_device.kv_cache_bytes())
         << "KV cache must still reserve the requested long context";
-    EXPECT_EQ(long_device.activation_bytes, short_device.activation_bytes)
+    EXPECT_EQ(long_device.activation_bytes(), short_device.activation_bytes())
         << "Activation arena must be sized to graph chunk capacity, not context capacity";
-    EXPECT_GT(long_device.workspace_bytes, short_device.workspace_bytes)
+    EXPECT_GT(long_device.workspace_bytes(), short_device.workspace_bytes())
         << "FA2 context-summary capacity follows the full KV horizon even "
            "when ordinary activation rows remain bucketed";
-    EXPECT_EQ(long_device.max_seq_len, 16384);
-    EXPECT_EQ(long_device.activation_seq_len, 4096);
+    EXPECT_EQ(long_device.max_seq_len(), 16384);
+    EXPECT_EQ(long_device.activation_seq_len(), 4096);
     EXPECT_TRUE(long_plan.fits()) << long_plan.renderTable();
 }
 
@@ -484,8 +732,8 @@ TEST(Test__MemoryPlanner, ResidentGraphSelection_ChoosesLargestFittingBucket)
     ASSERT_TRUE(selected.fits()) << selected.memory_plan.renderTable();
     EXPECT_EQ(selected.resident_graph_rows, 2048);
     ASSERT_EQ(selected.memory_plan.devices.size(), 1u);
-    EXPECT_EQ(selected.memory_plan.devices.front().activation_seq_len, 2048);
-    EXPECT_EQ(selected.memory_plan.devices.front().max_seq_len, 16384)
+    EXPECT_EQ(selected.memory_plan.devices.front().activation_seq_len(), 2048);
+    EXPECT_EQ(selected.memory_plan.devices.front().max_seq_len(), 16384)
         << "resident graph rows must not shrink full KV context capacity";
 }
 
@@ -512,22 +760,22 @@ TEST(Test__MemoryPlanner,
     const auto plan_64 = MemoryPlanner::plan(profile, {cfg});
     ASSERT_EQ(plan_64.devices.size(), 1u);
     EXPECT_EQ(
-        plan_64.devices.front().captured_graph_bytes,
+        plan_64.devices.front().captured_graph_bytes(),
         estimateCapturedGraphExecutableBytes(
-            profile.n_layers,
+            cfg.device,
             /*two prefill + decode + prefix bridge=*/4u));
 
     cfg.activation_seq_len = 128;
     const auto plan_128 = MemoryPlanner::plan(profile, {cfg});
     ASSERT_EQ(plan_128.devices.size(), 1u);
     EXPECT_EQ(
-        plan_128.devices.front().captured_graph_bytes,
+        plan_128.devices.front().captured_graph_bytes(),
         estimateCapturedGraphExecutableBytes(
-            profile.n_layers,
+            cfg.device,
             /*three prefill + decode + prefix bridge=*/5u));
     EXPECT_GT(
-        plan_128.devices.front().captured_graph_bytes,
-        plan_64.devices.front().captured_graph_bytes);
+        plan_128.devices.front().captured_graph_bytes(),
+        plan_64.devices.front().captured_graph_bytes());
 
     cfg.device_free_bytes =
         plan_64.devices.front().incremental_bytes();
@@ -539,8 +787,233 @@ TEST(Test__MemoryPlanner,
     ASSERT_TRUE(selected.fits()) << selected.memory_plan.renderTable();
     EXPECT_EQ(selected.resident_graph_rows, 64);
     EXPECT_EQ(
-        selected.memory_plan.devices.front().captured_graph_bytes,
-        plan_64.devices.front().captured_graph_bytes);
+        selected.memory_plan.devices.front().captured_graph_bytes(),
+        plan_64.devices.front().captured_graph_bytes());
+}
+
+TEST(Test__MemoryPlanner,
+     CapturedServingFamilyPricesRuntimeOwnerSlotsNotSemanticFragments)
+{
+    constexpr size_t GiB = 1024ULL * 1024ULL * 1024ULL;
+    auto profile = createTestProfile();
+
+    DevicePlanConfig cfg;
+    cfg.device = DeviceId::cuda(0);
+    cfg.device_compute_units = 82;
+    cfg.device_total_bytes = 64ULL * GiB;
+    cfg.device_free_bytes = cfg.device_total_bytes;
+    cfg.batch_size = 1;
+    cfg.max_seq_len = 4096;
+    cfg.activation_seq_len = 64;
+    cfg.kv_precision = "fp16";
+    MTPRuntimeConfig retained_mtp;
+    retained_mtp.enabled = false;
+    retained_mtp.graph_capacity_draft_tokens = 15;
+    cfg.captured_serving_graphs =
+        resolveCapturedServingGraphMemoryInventory(
+            {32, 64, 128},
+            retained_mtp);
+    EXPECT_EQ(cfg.captured_serving_graphs.fixed_executable_count, 5u);
+    const MTPGraphOwnerPlan owner_plan(retained_mtp);
+    EXPECT_EQ(owner_plan.sidecarGraphSlots(), 21u);
+    EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 35u);
+    EXPECT_EQ(owner_plan.draftPublicationGraphSlots(), 15u);
+    EXPECT_EQ(owner_plan.verifierPreparationGraphSlots(), 32u);
+    EXPECT_EQ(owner_plan.controllerGraphSlots(), 4u);
+    EXPECT_EQ(
+        cfg.captured_serving_graphs.mtp_graph_owners
+            .auxiliaryExecutableSlotCount(),
+        107u);
+    EXPECT_EQ(
+        resolveMTPRetainedDeviceGenerationFragmentCapacity(15),
+        375u)
+        << "Semantic parent descriptors are a separate host-scratch inventory.";
+
+    const auto plan = MemoryPlanner::plan(profile, {cfg});
+    ASSERT_EQ(plan.devices.size(), 1u);
+    EXPECT_EQ(
+        plan.devices.front().captured_graph_bytes(),
+        estimateCapturedGraphExecutableBytes(
+            cfg.device,
+            CapturedGraphExecutableInventory{
+                .model_graph_identity_count =
+                    /*two prefill + decode + prefix bridge + three MTP forwards=*/7u,
+                .model_graph_topology_variant_count = 1u,
+                .auxiliary_executable_count =
+                    owner_plan.auxiliaryExecutableSlotCount(),
+            }));
+    EXPECT_GT(
+        plan.devices.front().captured_graph_bytes(),
+        estimateCapturedGraphExecutableBytes(
+            cfg.device,
+            /*two prefill + decode + prefix bridge + three MTP forwards=*/7u));
+}
+
+TEST(Test__MemoryPlanner,
+     CapturedGraphEstimatorPricesSimultaneousTopologyVariants)
+{
+    constexpr std::size_t kIdentitiesPerVariant = 8u;
+    constexpr std::size_t kTopologyVariants = 2u;
+    constexpr std::size_t kAuxiliaryExecutables = 13u;
+    const CapturedGraphExecutableInventory inventory{
+        .model_graph_identity_count = kIdentitiesPerVariant,
+        .model_graph_topology_variant_count = kTopologyVariants,
+        .auxiliary_executable_count = kAuxiliaryExecutables,
+    };
+
+    const std::size_t estimated =
+        estimateCapturedGraphExecutableBytes(DeviceId::cuda(0), inventory);
+    const std::size_t physical_model_graphs =
+        kIdentitiesPerVariant * kTopologyVariants;
+    EXPECT_EQ(
+        estimated,
+        (physical_model_graphs + kAuxiliaryExecutables) *
+            GPUGraphMemoryContract::kCUDAExecutableReservationBytes);
+    EXPECT_GT(
+        estimated,
+        estimateCapturedGraphExecutableBytes(
+            DeviceId::cuda(0),
+            CapturedGraphExecutableInventory{
+                .model_graph_identity_count = kIdentitiesPerVariant,
+                .model_graph_topology_variant_count = 1u,
+                .auxiliary_executable_count =
+                    kAuxiliaryExecutables,
+            }))
+        << "Prepared diagnostic and lean graphs coexist and must not share one driver-memory charge.";
+}
+
+/**
+ * @brief A shared driver-pool growth event belongs to the complete family.
+ *
+ * CUDA and HIP may grow their opaque graph pool while instantiating one graph
+ * and then charge zero bytes to several later siblings. The event can therefore
+ * exceed one slot unit without violating the family reservation. This is the
+ * focused regression for the production ExpertOverlay prefill parent that
+ * observed 30 MiB against a three-or-more-slot admitted family.
+ */
+TEST(Test__MemoryPlanner,
+     CapturedGraphPoolGrowthIsCertifiedAgainstTheCompleteFamily)
+{
+    for (const DeviceId device :
+         {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        constexpr std::size_t kRetainedSlots = 3u;
+        const std::size_t slot_bytes =
+            GPUGraphMemoryContract::reservationBytesPerExecutable(device);
+        const std::size_t observed_pool_growth = slot_bytes + 1u;
+        const std::size_t admitted_family_bytes =
+            estimateCapturedGraphExecutableBytes(
+                device,
+                CapturedGraphExecutableInventory::monolithic(
+                    kRetainedSlots));
+
+        EXPECT_GT(observed_pool_growth, slot_bytes);
+        EXPECT_TRUE(
+            GPUGraphMemoryContract::acceptsFamilyObservation(
+                device,
+                observed_pool_growth,
+                admitted_family_bytes));
+        EXPECT_FALSE(
+            GPUGraphMemoryContract::acceptsFamilyObservation(
+                device,
+                admitted_family_bytes + 1u,
+                admitted_family_bytes));
+    }
+}
+
+TEST(Test__MemoryPlanner,
+     PrefixDeviceHotAdmissionUsesTheRuntimeWholeBlockReservation)
+{
+    EXPECT_EQ(prefixCacheWholeBlockReservationBytes(0u, 128u), 0u);
+    EXPECT_EQ(prefixCacheWholeBlockReservationBytes(1024u, 0u), 0u);
+    EXPECT_EQ(prefixCacheWholeBlockReservationBytes(127u, 128u), 0u);
+    EXPECT_EQ(prefixCacheWholeBlockReservationBytes(128u, 128u), 128u);
+    EXPECT_EQ(prefixCacheWholeBlockReservationBytes(1024u, 300u), 900u);
+    EXPECT_EQ(
+        prefixCacheWholeBlockReservationBytes(1024u, 256u),
+        1024u);
+}
+
+/**
+ * @brief Pin prefix-terminal ownership across a two-stage GPU pipeline.
+ *
+ * The first stage owns only its logical K/V blocks; the last stage additionally
+ * owns the terminal FP32 logits row.  This exact distinction must feed the
+ * whole-slot rounding performed by both admission and runtime materialization.
+ */
+TEST(Test__MemoryPlanner,
+     PipelinePrefixDeviceHotAdmissionMatchesTerminalOwnership)
+{
+    const auto profile = createTestProfile();
+
+    DevicePlanConfig first_stage;
+    first_stage.device = DeviceId::rocm(0);
+    first_stage.device_compute_units = 60;
+    first_stage.device_total_bytes =
+        32ULL * 1024ULL * 1024ULL * 1024ULL;
+    first_stage.device_free_bytes = first_stage.device_total_bytes;
+    first_stage.first_layer = 0;
+    first_stage.last_layer = 11;
+    first_stage.batch_size = 1;
+    first_stage.max_seq_len = 4096;
+    first_stage.kv_precision = "fp16";
+    first_stage.prefix_cache = PrefixCacheRuntimeConfig{};
+    first_stage.associated_host_memory = PhysicalMemoryResource{
+        .world_rank = -1,
+        .device = DeviceId::cpu(),
+        .total_bytes = 64ULL * 1024ULL * 1024ULL * 1024ULL,
+        .admission_available_bytes =
+            64ULL * 1024ULL * 1024ULL * 1024ULL,
+    };
+
+    DevicePlanConfig terminal_stage = first_stage;
+    terminal_stage.device = DeviceId::rocm(1);
+    terminal_stage.first_layer = 12;
+    terminal_stage.last_layer = 23;
+
+    const auto plan = MemoryPlanner::plan(
+        profile,
+        {first_stage, terminal_stage});
+    ASSERT_EQ(plan.devices.size(), 3u);
+
+    const auto first = std::find_if(
+        plan.devices.begin(),
+        plan.devices.end(),
+        [](const auto &candidate)
+        { return candidate.device() == DeviceId::rocm(0); });
+    const auto terminal = std::find_if(
+        plan.devices.begin(),
+        plan.devices.end(),
+        [](const auto &candidate)
+        { return candidate.device() == DeviceId::rocm(1); });
+    ASSERT_NE(first, plan.devices.end());
+    ASSERT_NE(terminal, plan.devices.end());
+
+    const auto logical_block =
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            first_stage.prefix_cache.block_size,
+            profile.n_kv_heads,
+            profile.head_dim,
+            first_stage.kv_precision,
+            first_stage.device);
+    const size_t stage_kv_bytes =
+        12ULL * logical_block.totalBytes();
+    const size_t terminal_block_bytes =
+        stage_kv_bytes +
+        static_cast<size_t>(profile.vocab_size) * sizeof(float);
+
+    EXPECT_EQ(
+        first->prefix_cache_device_hot_bytes(),
+        prefixCacheWholeBlockReservationBytes(
+            first_stage.prefix_cache.device_budget_bytes,
+            stage_kv_bytes))
+        << "A non-terminal PP stage must not price a logits payload it cannot archive.";
+    EXPECT_EQ(
+        terminal->prefix_cache_device_hot_bytes(),
+        prefixCacheWholeBlockReservationBytes(
+            terminal_stage.prefix_cache.device_budget_bytes,
+            terminal_block_bytes))
+        << "The terminal PP stage must retain the exact full-vocabulary logits slot.";
 }
 
 TEST(Test__MemoryPlanner,
@@ -576,9 +1049,60 @@ TEST(Test__MemoryPlanner,
         << "The graph identity must cover depth-fifteen's sixteen target rows, "
            "not only the nine-row exact prefill bucket";
     ASSERT_EQ(selected.memory_plan.devices.size(), 2u);
-    EXPECT_EQ(selected.memory_plan.devices[0].activation_seq_len, 16);
-    EXPECT_EQ(selected.memory_plan.devices[1].activation_seq_len, 16)
+    EXPECT_EQ(selected.memory_plan.devices[0].activation_seq_len(), 16);
+    EXPECT_EQ(selected.memory_plan.devices[1].activation_seq_len(), 16)
         << "CUDA and ROCm participants must receive the same retained shape";
+}
+
+/**
+ * @brief Several local GPU caches share one physical archive-I/O window.
+ *
+ * The runtime registry keys durable archives by rank and normalized path.
+ * Admission must use that same identity: RAM cache tiers remain participant
+ * owned, while checksum/compaction scratch is one allocation shared by every
+ * local participant opening the archive.
+ */
+TEST(Test__MemoryPlanner,
+     HeterogeneousLocalGPUsChargeOneSharedPrefixArchiveScratch)
+{
+    auto profile = createQwen36HybridMTPStateProfile();
+
+    DevicePlanConfig cuda;
+    cuda.world_rank = 0;
+    cuda.device = DeviceId::cuda(0);
+    cuda.device_compute_units = 82;
+    cuda.device_total_bytes = 24ULL * 1024ULL * 1024ULL * 1024ULL;
+    cuda.device_free_bytes = cuda.device_total_bytes;
+    cuda.batch_size = 1;
+    cuda.max_seq_len = 4096;
+    cuda.kv_precision = "fp16";
+    cuda.prefix_cache = PrefixCacheRuntimeConfig{};
+    cuda.associated_host_memory = PhysicalMemoryResource{
+        .world_rank = 0,
+        .device = DeviceId::cpu(),
+        .total_bytes = 128ULL * 1024ULL * 1024ULL * 1024ULL,
+        .admission_available_bytes =
+            128ULL * 1024ULL * 1024ULL * 1024ULL,
+    };
+
+    DevicePlanConfig rocm = cuda;
+    rocm.device = DeviceId::rocm(0);
+    rocm.device_compute_units = 60;
+
+    const auto plan = MemoryPlanner::plan(profile, {cuda, rocm});
+    ASSERT_EQ(plan.devices.size(), 3u);
+    const auto host = std::find_if(
+        plan.devices.begin(), plan.devices.end(), [](const auto &candidate)
+        { return candidate.device().is_cpu(); });
+    ASSERT_NE(host, plan.devices.end());
+    EXPECT_EQ(
+        host->bom().bytes(PhysicalMemoryOwner::PrefixHostTier),
+        2u * cuda.prefix_cache.ram_budget_bytes)
+        << "Each participant retains its own bounded RAM cache";
+    EXPECT_EQ(
+        host->bom().bytes(PhysicalMemoryOwner::PrefixArchiveStaging),
+        PrefixArchiveIOGeometry::scratchBytes())
+        << "One rank/path archive owns exactly one reusable I/O scratch";
 }
 
 TEST(Test__MemoryPlanner, SingleGPU_DoesNotFit)
@@ -620,11 +1144,11 @@ TEST(Test__MemoryPlanner, CertifiedRetainedWeightsUseIncrementalAdmissionOnCPUAn
         const auto complete = MemoryPlanner::plan(profile, {config});
         ASSERT_EQ(complete.devices.size(), 1u);
         const auto &complete_device = complete.devices.front();
-        ASSERT_GT(complete_device.weight_bytes, 0u);
-        ASSERT_EQ(complete_device.retained_weight_bytes, 0u);
+        ASSERT_GT(complete_device.weight_bytes(), 0u);
+        ASSERT_EQ(complete_device.retained_weight_bytes(), 0u);
 
         const size_t non_weight_bytes =
-            complete_device.total_bytes() - complete_device.weight_bytes;
+            complete_device.total_bytes() - complete_device.weight_bytes();
         config.device_free_bytes =
             non_weight_bytes + 1ULL * 1024ULL * 1024ULL;
 
@@ -639,11 +1163,11 @@ TEST(Test__MemoryPlanner, CertifiedRetainedWeightsUseIncrementalAdmissionOnCPUAn
         ASSERT_EQ(retained.devices.size(), 1u);
         const auto &retained_device = retained.devices.front();
         EXPECT_TRUE(retained.fits()) << retained.renderTable();
-        EXPECT_EQ(retained_device.weight_bytes, complete_device.weight_bytes)
+        EXPECT_EQ(retained_device.weight_bytes(), complete_device.weight_bytes())
             << "The final capacity BOM must retain the complete model footprint";
         EXPECT_EQ(
-            retained_device.retained_weight_bytes,
-            retained_device.weight_bytes);
+            retained_device.retained_weight_bytes(),
+            retained_device.weight_bytes());
         EXPECT_EQ(retained_device.incremental_weight_bytes(), 0u);
         EXPECT_EQ(retained_device.incremental_bytes(), non_weight_bytes);
         EXPECT_NE(retained.renderTable().find("Retained"), std::string::npos);
@@ -666,10 +1190,10 @@ TEST(Test__MemoryPlanner, RetainedWorkspaceReducesOnlyIncrementalAdmission)
     const auto fresh = MemoryPlanner::plan(profile, {config});
     ASSERT_EQ(fresh.devices.size(), 1u);
     const DeviceMemoryPlan fresh_device = fresh.devices.front();
-    ASSERT_GT(fresh_device.workspace_bytes, 0u);
-    ASSERT_EQ(fresh_device.retained_workspace_bytes, 0u);
+    ASSERT_GT(fresh_device.workspace_bytes(), 0u);
+    ASSERT_EQ(fresh_device.retained_workspace_bytes(), 0u);
 
-    config.retained_workspace_bytes = fresh_device.workspace_bytes;
+    config.retained_workspace_bytes = fresh_device.workspace_bytes();
     const auto reused = MemoryPlanner::plan(profile, {config});
     ASSERT_EQ(reused.devices.size(), 1u);
     const DeviceMemoryPlan &reused_device = reused.devices.front();
@@ -677,11 +1201,11 @@ TEST(Test__MemoryPlanner, RetainedWorkspaceReducesOnlyIncrementalAdmission)
     EXPECT_EQ(reused_device.total_bytes(), fresh_device.total_bytes())
         << "Retained workspace remains part of the final device BOM";
     EXPECT_EQ(
-        reused_device.retained_workspace_bytes,
-        fresh_device.workspace_bytes);
+        reused_device.retained_workspace_bytes(),
+        fresh_device.workspace_bytes());
     EXPECT_EQ(
         fresh_device.incremental_bytes() - reused_device.incremental_bytes(),
-        fresh_device.workspace_bytes)
+        fresh_device.workspace_bytes())
         << "Only bytes proven reusable by the typed lease reduce admission";
     EXPECT_NE(reused.renderTable().find("Ret.Wksp"), std::string::npos);
     EXPECT_NE(
@@ -709,18 +1233,20 @@ TEST(Test__MemoryPlanner, TP2_ReducesPerDeviceWeight)
     DevicePlanConfig shard0 = single;
     shard0.shard_index = 0;
     shard0.total_shards = 2;
+    shard0.local_tp_backend = CollectiveBackendType::NCCL;
 
     DevicePlanConfig shard1 = single;
     shard1.device = DeviceId::cuda(1);
     shard1.shard_index = 1;
     shard1.total_shards = 2;
+    shard1.local_tp_backend = CollectiveBackendType::NCCL;
 
     auto tp_plan = MemoryPlanner::plan(profile, {shard0, shard1});
 
     EXPECT_EQ(tp_plan.devices.size(), 2u);
     // Each shard should have less weight than single
-    EXPECT_LT(tp_plan.devices[0].weight_bytes, single_plan.devices[0].weight_bytes);
-    EXPECT_LT(tp_plan.devices[1].weight_bytes, single_plan.devices[0].weight_bytes);
+    EXPECT_LT(tp_plan.devices[0].weight_bytes(), single_plan.devices[0].weight_bytes());
+    EXPECT_LT(tp_plan.devices[1].weight_bytes(), single_plan.devices[0].weight_bytes());
 }
 
 TEST(Test__MemoryPlanner,
@@ -730,6 +1256,7 @@ TEST(Test__MemoryPlanner,
     auto config = overlayDeviceConfig(DeviceId::cuda(0));
     config.shard_index = 0;
     config.total_shards = 2;
+    config.local_tp_backend = CollectiveBackendType::NCCL;
     const std::vector<int> no_routed_experts(
         static_cast<std::size_t>(profile.n_layers), 0);
     config.weight_residency =
@@ -739,7 +1266,8 @@ TEST(Test__MemoryPlanner,
     config.additional_weight_sets =
         resolveAdditionalPersistentWeightSets(
             DenseParallelPolicy::PrefillTensorParallelDecodeReplicated,
-            config.total_shards);
+            config.total_shards,
+            MTPRuntimeConfig{});
 
     const auto planned = MemoryPlanner::plan(profile, {config});
     ASSERT_EQ(planned.devices.size(), 1u);
@@ -762,9 +1290,9 @@ TEST(Test__MemoryPlanner,
             profile.expert_count,
             no_routed_experts));
 
-    EXPECT_EQ(planned.devices.front().weight_bytes, primary.device_bytes);
+    EXPECT_EQ(planned.devices.front().weight_bytes(), primary.device_bytes);
     EXPECT_EQ(
-        planned.devices.front().additional_weight_bytes,
+        planned.devices.front().additional_weight_bytes(),
         replicated_decode.device_bytes);
     EXPECT_EQ(
         planned.devices.front().total_weight_bytes(),
@@ -788,6 +1316,7 @@ TEST(Test__MemoryPlanner,
     config.device_compute_units = 82;
     config.shard_index = 0;
     config.total_shards = 2;
+    config.local_tp_backend = CollectiveBackendType::NCCL;
     config.first_layer = 0;
     config.last_layer = profile.n_layers - 1;
     config.batch_size = 1;
@@ -795,11 +1324,17 @@ TEST(Test__MemoryPlanner,
     config.mtp_enabled = true;
     config.mtp_terminal_logits_layout =
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 2;
+    mtp.sidecar_dense_policy = MTPSidecarDensePolicy::TensorParallel;
+    mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
     config.additional_weight_sets =
         resolveAdditionalPersistentWeightSets(
             DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding,
             config.total_shards,
-            MTPTerminalHeadPolicy::MirroredFullVocabulary);
+            mtp);
 
     ASSERT_EQ(config.additional_weight_sets.size(), 2u);
     EXPECT_EQ(
@@ -827,16 +1362,49 @@ TEST(Test__MemoryPlanner,
         config.weight_residency);
     const auto planned = MemoryPlanner::plan(profile, {config});
     ASSERT_EQ(planned.devices.size(), 1u);
-    EXPECT_EQ(planned.devices.front().weight_bytes, primary.device_bytes);
+    EXPECT_EQ(planned.devices.front().weight_bytes(), primary.device_bytes);
     EXPECT_EQ(
-        planned.devices.front().additional_weight_bytes,
+        planned.devices.front().additional_weight_bytes(),
         mirrored.prepared_embedding_bytes + mirrored.lm_head_bytes);
     EXPECT_EQ(
-        planned.devices.front().collective_bytes,
+        planned.devices.front().collective_bytes(),
         CollectiveMemoryEstimator::localTP(
             config.max_seq_len,
-            profile.d_model)
+            profile.d_model,
+            config.local_tp_backend)
             .perDeviceBytes());
+}
+
+/**
+ * @brief Logical collective payload capacity must not masquerade as VRAM.
+ *
+ * Homogeneous NCCL/RCCL retain only the guarded FP16 conversion scratch. The
+ * wider FP32 payload value is still passed to the backend as protocol capacity,
+ * but no allocation exists for admission to charge.
+ */
+TEST(Test__MemoryPlanner,
+     LocalTPCollectiveBomSeparatesLogicalCapacityFromPhysicalScratch)
+{
+    constexpr int max_rows = 10;
+    constexpr int hidden = 20;
+    constexpr std::size_t logical_elements = 200u;
+    constexpr std::size_t margined_elements = 220u;
+
+    const auto bom = CollectiveMemoryEstimator::localTP(
+        max_rows, hidden, CollectiveBackendType::RCCL);
+
+    EXPECT_EQ(
+        bom.backend_payload_capacity_bytes,
+        logical_elements * sizeof(float) * 11u / 10u);
+    EXPECT_EQ(bom.fp16_scratch_elements, margined_elements);
+    EXPECT_EQ(
+        bom.fp16_scratch_bytes,
+        margined_elements * sizeof(std::uint16_t) +
+            CollectiveMemoryEstimator::kFP16ScratchGuardBytes);
+    EXPECT_EQ(
+        bom.perDeviceBytes(),
+        bom.fp16_scratch_bytes + bom.graph_capture_boundary_bytes)
+        << "Protocol payload capacity is not a second physical GPU buffer";
 }
 
 TEST(Test__MemoryPlanner,
@@ -850,16 +1418,21 @@ TEST(Test__MemoryPlanner,
     config.device_compute_units = 82;
     config.shard_index = 0;
     config.total_shards = 2;
+    config.local_tp_backend = CollectiveBackendType::NCCL;
     config.first_layer = 0;
     config.last_layer = profile.n_layers - 1;
     config.batch_size = 1;
     config.max_seq_len = 64;
     config.mtp_enabled = false;
+    MTPRuntimeConfig mtp;
+    mtp.enabled = false;
+    mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
     config.additional_weight_sets =
         resolveAdditionalPersistentWeightSets(
             DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding,
             config.total_shards,
-            MTPTerminalHeadPolicy::MirroredFullVocabulary);
+            mtp);
 
     ASSERT_EQ(config.additional_weight_sets.size(), 2u);
     EXPECT_EQ(
@@ -880,9 +1453,128 @@ TEST(Test__MemoryPlanner,
     const auto planned = MemoryPlanner::plan(profile, {config});
     ASSERT_EQ(planned.devices.size(), 1u);
     EXPECT_EQ(
-        planned.devices.front().additional_weight_bytes,
+        planned.devices.front().additional_weight_bytes(),
         mirrored.prepared_embedding_bytes + mirrored.lm_head_bytes)
         << "Serial decode and grouped MTP must retain the same mirrored terminal surface.";
+}
+
+/**
+ * @brief Ordinary TP must admit its mirrored terminal head before loading it.
+ *
+ * The ordinary LocalTP graph keeps its embedding vocabulary-sharded, while
+ * the default MTP terminal-head policy gives each participant a complete Q8
+ * terminal projection for serial decode and grouped verification.  Treating
+ * terminal mirroring as embedding mirroring both overstates admission and
+ * obscures the exact allocation that PhysicalMemoryAuthority must authorize.
+ */
+TEST(Test__MemoryPlanner,
+     OrdinaryTensorParallelMTPOffPricesOnlyMirroredTerminalHead)
+{
+    const auto profile = createTestProfile();
+    DevicePlanConfig config;
+    config.device = DeviceId::rocm(0);
+    config.device_total_bytes = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+    config.device_free_bytes = config.device_total_bytes;
+    config.device_compute_units = 60;
+    config.shard_index = 0;
+    config.total_shards = 2;
+    config.local_tp_backend = CollectiveBackendType::RCCL;
+    config.first_layer = 0;
+    config.last_layer = profile.n_layers - 1;
+    config.batch_size = 1;
+    config.max_seq_len = 64;
+
+    MTPRuntimeConfig mtp;
+    mtp.enabled = false;
+    mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    config.additional_weight_sets =
+        resolveAdditionalPersistentWeightSets(
+            DenseParallelPolicy::TensorParallel,
+            config.total_shards,
+            mtp);
+
+    ASSERT_EQ(config.additional_weight_sets.size(), 1u);
+    EXPECT_EQ(
+        config.additional_weight_sets.front(),
+        AdditionalPersistentWeightSet::MirroredMTPTerminalHead);
+
+    const auto mirrored = WeightMemoryEstimator::estimate(
+        profile,
+        config.device,
+        /*shard_index=*/0,
+        /*total_shards=*/1,
+        config.first_layer,
+        config.last_layer,
+        config.weight_residency);
+    const auto planned = MemoryPlanner::plan(profile, {config});
+    ASSERT_EQ(planned.devices.size(), 1u);
+    EXPECT_EQ(
+        planned.devices.front().additional_weight_bytes(),
+        mirrored.lm_head_bytes);
+}
+
+TEST(Test__MemoryPlanner,
+     ReplicatedMTPSidecarPricesTrailingDenseAndSharedWeights)
+{
+    auto profile = createMoEOverlayProfile();
+    profile.mtp_layer_count = 1;
+
+    DevicePlanConfig config = overlayDeviceConfig(DeviceId::rocm(0));
+    config.shard_index = 0;
+    config.total_shards = 2;
+    config.local_tp_backend = CollectiveBackendType::RCCL;
+    config.mtp_enabled = true;
+    config.weight_residency =
+        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,
+            std::vector<int>(
+                static_cast<std::size_t>(profile.n_layers),
+                0));
+
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 2;
+    mtp.sidecar_dense_policy =
+        MTPSidecarDensePolicy::ReplicatedPerParticipant;
+    mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
+    config.additional_weight_sets =
+        resolveAdditionalPersistentWeightSets(
+            DenseParallelPolicy::TensorParallel,
+            config.total_shards,
+            mtp);
+
+    ASSERT_EQ(config.additional_weight_sets.size(), 1u);
+    EXPECT_EQ(
+        config.additional_weight_sets.front(),
+        AdditionalPersistentWeightSet::ReplicatedMTPSidecarDense);
+
+    const auto sidecar_and_globals = WeightMemoryEstimator::estimate(
+        profile,
+        config.device,
+        /*shard_index=*/0,
+        /*total_shards=*/1,
+        /*first_layer=*/profile.n_layers - profile.mtp_layer_count,
+        /*last_layer=*/profile.n_layers - 1,
+        config.weight_residency);
+    const auto globals_only = WeightMemoryEstimator::estimate(
+        profile,
+        config.device,
+        /*shard_index=*/0,
+        /*total_shards=*/1,
+        /*first_layer=*/profile.n_layers,
+        /*last_layer=*/profile.n_layers - 1,
+        config.weight_residency);
+    ASSERT_GT(sidecar_and_globals.device_bytes, globals_only.device_bytes);
+
+    const auto planned = MemoryPlanner::plan(profile, {config});
+    ASSERT_EQ(planned.devices.size(), 1u);
+    EXPECT_EQ(
+        planned.devices.front().additional_weight_bytes(),
+        sidecar_and_globals.device_bytes - globals_only.device_bytes)
+        << "The auxiliary BOM must include the complete unsharded MTP "
+           "predictor while ExpertOverlay retains routed-parent authority.";
 }
 
 TEST(Test__MemoryPlanner, TP2_ReducesKVCachePerDevice)
@@ -905,18 +1597,20 @@ TEST(Test__MemoryPlanner, TP2_ReducesKVCachePerDevice)
     DevicePlanConfig shard0 = single;
     shard0.shard_index = 0;
     shard0.total_shards = 2;
+    shard0.local_tp_backend = CollectiveBackendType::NCCL;
 
     DevicePlanConfig shard1 = single;
     shard1.device = DeviceId::cuda(1);
     shard1.shard_index = 1;
     shard1.total_shards = 2;
+    shard1.local_tp_backend = CollectiveBackendType::NCCL;
 
     auto tp_plan = MemoryPlanner::plan(profile, {shard0, shard1});
 
     // Each shard should have less KV cache than the full model
     // (n_kv_heads=2, so TP-2 gives 1 head per shard)
-    EXPECT_LT(tp_plan.devices[0].kv_cache_bytes, single_plan.devices[0].kv_cache_bytes);
-    EXPECT_LT(tp_plan.devices[1].kv_cache_bytes, single_plan.devices[0].kv_cache_bytes);
+    EXPECT_LT(tp_plan.devices[0].kv_cache_bytes(), single_plan.devices[0].kv_cache_bytes());
+    EXPECT_LT(tp_plan.devices[1].kv_cache_bytes(), single_plan.devices[0].kv_cache_bytes());
 }
 
 /**
@@ -955,6 +1649,7 @@ TEST(Test__MemoryPlanner, RankLocalTP4UsesExactUnevenQAndReplicatedKVGeometry)
         config.device_free_bytes = config.device_total_bytes;
         config.shard_index = static_cast<int>(rank);
         config.total_shards = static_cast<int>(devices.size());
+        config.local_tp_backend = CollectiveBackendType::RCCL;
         config.batch_size = 1;
         config.max_seq_len = 64;
         config.activation_seq_len = 16;
@@ -969,12 +1664,12 @@ TEST(Test__MemoryPlanner, RankLocalTP4UsesExactUnevenQAndReplicatedKVGeometry)
     for (std::size_t rank = 0; rank < devices.size(); ++rank)
     {
         EXPECT_EQ(assignments.forRank(static_cast<int>(rank)).kv_head_count, 2);
-        EXPECT_GT(plan.devices[rank].kv_cache_bytes, 0u);
-        EXPECT_GT(plan.devices[rank].activation_bytes, 0u);
-        EXPECT_GT(plan.devices[rank].workspace_bytes, 0u);
+        EXPECT_GT(plan.devices[rank].kv_cache_bytes(), 0u);
+        EXPECT_GT(plan.devices[rank].activation_bytes(), 0u);
+        EXPECT_GT(plan.devices[rank].workspace_bytes(), 0u);
     }
-    EXPECT_GT(plan.devices[0].activation_bytes,
-              plan.devices[3].activation_bytes)
+    EXPECT_GT(plan.devices[0].activation_bytes(),
+              plan.devices[3].activation_bytes())
         << "The two-query-head remainder shard must not be priced as a uniform three-head shard.";
 }
 
@@ -1017,12 +1712,12 @@ TEST(Test__MemoryPlanner, PP2_SplitsLayersAcrossDevices)
 
     auto full_plan = MemoryPlanner::plan(profile, {full});
 
-    EXPECT_LT(pp_plan.devices[0].weight_bytes, full_plan.devices[0].weight_bytes);
-    EXPECT_LT(pp_plan.devices[1].weight_bytes, full_plan.devices[0].weight_bytes);
+    EXPECT_LT(pp_plan.devices[0].weight_bytes(), full_plan.devices[0].weight_bytes());
+    EXPECT_LT(pp_plan.devices[1].weight_bytes(), full_plan.devices[0].weight_bytes());
 
     // Each stage should have half the KV cache layers (12 vs 24)
-    EXPECT_LT(pp_plan.devices[0].kv_cache_bytes, full_plan.devices[0].kv_cache_bytes);
-    EXPECT_EQ(pp_plan.devices[0].kv_cache_bytes, pp_plan.devices[1].kv_cache_bytes);
+    EXPECT_LT(pp_plan.devices[0].kv_cache_bytes(), full_plan.devices[0].kv_cache_bytes());
+    EXPECT_EQ(pp_plan.devices[0].kv_cache_bytes(), pp_plan.devices[1].kv_cache_bytes());
 }
 
 TEST(Test__MemoryPlanner, MixedDevices_CUDAAndROCm)
@@ -1039,6 +1734,7 @@ TEST(Test__MemoryPlanner, MixedDevices_CUDAAndROCm)
     cuda_cfg.kv_precision = "fp16";
     cuda_cfg.shard_index = 0;
     cuda_cfg.total_shards = 2;
+    cuda_cfg.local_tp_backend = CollectiveBackendType::HETEROGENEOUS;
 
     DevicePlanConfig rocm_cfg;
     rocm_cfg.device = DeviceId::rocm(0);
@@ -1050,6 +1746,7 @@ TEST(Test__MemoryPlanner, MixedDevices_CUDAAndROCm)
     rocm_cfg.kv_precision = "fp16";
     rocm_cfg.shard_index = 1;
     rocm_cfg.total_shards = 2;
+    rocm_cfg.local_tp_backend = CollectiveBackendType::HETEROGENEOUS;
 
     auto plan = MemoryPlanner::plan(profile, {cuda_cfg, rocm_cfg});
 
@@ -1057,11 +1754,11 @@ TEST(Test__MemoryPlanner, MixedDevices_CUDAAndROCm)
     EXPECT_TRUE(plan.fits());
 
     // Both devices should have weight estimates (GPU packing applies to both)
-    EXPECT_GT(plan.devices[0].weight_bytes, 0u);
-    EXPECT_GT(plan.devices[1].weight_bytes, 0u);
+    EXPECT_GT(plan.devices[0].weight_bytes(), 0u);
+    EXPECT_GT(plan.devices[1].weight_bytes(), 0u);
 
     // Weight bytes should be equal (same sharding, same packing formula)
-    EXPECT_EQ(plan.devices[0].weight_bytes, plan.devices[1].weight_bytes);
+    EXPECT_EQ(plan.devices[0].weight_bytes(), plan.devices[1].weight_bytes());
 
     // Render table should contain both device types
     auto table = plan.renderTable();
@@ -1069,7 +1766,71 @@ TEST(Test__MemoryPlanner, MixedDevices_CUDAAndROCm)
     EXPECT_NE(table.find("ROCm:0"), std::string::npos);
 }
 
-TEST(Test__MemoryPlanner, CPUOnly_ZeroWorkspace)
+/**
+ * @brief GPU upload rings aggregate against one shared rank-local RAM authority.
+ *
+ * Each accelerator owns an independent device staging allocation, but both
+ * pinned rings consume the same CPU allocator. The topology plan must merge
+ * those host charges before admission rather than allowing either logical GPU
+ * view to fit against the complete host capacity on its own.
+ */
+TEST(Test__MemoryPlanner,
+     MixedGPUWeightLoadStagingHasOneAggregatedHostAuthority)
+{
+    constexpr size_t MiB = 1024ULL * 1024ULL;
+    constexpr size_t GiB = 1024ULL * MiB;
+    const auto profile = createMoEOverlayProfile();
+    const PhysicalMemoryResource host{
+        .world_rank = 4,
+        .device = DeviceId::cpu(),
+        .total_bytes = 128ULL * GiB,
+        .admission_available_bytes = 96ULL * GiB,
+    };
+
+    auto cuda = overlayDeviceConfig(DeviceId::cuda(0));
+    cuda.world_rank = 4;
+    cuda.associated_host_memory = host;
+    cuda.weight_load_staging = {
+        .device_bytes = 4ULL * MiB,
+        .host_bytes = 6ULL * MiB,
+    };
+
+    auto rocm = overlayDeviceConfig(DeviceId::rocm(1));
+    rocm.world_rank = 4;
+    rocm.associated_host_memory = host;
+    rocm.weight_load_staging = {
+        .device_bytes = 8ULL * MiB,
+        .host_bytes = 10ULL * MiB,
+    };
+
+    const auto plan = MemoryPlanner::plan(profile, {cuda, rocm});
+    ASSERT_TRUE(plan.fits()) << plan.renderTable();
+    ASSERT_EQ(plan.physicalPlan().resources().size(), 3u);
+
+    const auto *cuda_bom = plan.physicalPlan().find(
+        {4, DeviceId::cuda(0)});
+    const auto *rocm_bom = plan.physicalPlan().find(
+        {4, DeviceId::rocm(1)});
+    const auto *host_bom = plan.physicalPlan().find(
+        {4, DeviceId::cpu()});
+    ASSERT_NE(cuda_bom, nullptr);
+    ASSERT_NE(rocm_bom, nullptr);
+    ASSERT_NE(host_bom, nullptr);
+    EXPECT_EQ(
+        cuda_bom->bytes(PhysicalMemoryOwner::WeightLoadStaging),
+        4ULL * MiB);
+    EXPECT_EQ(
+        rocm_bom->bytes(PhysicalMemoryOwner::WeightLoadStaging),
+        8ULL * MiB);
+    EXPECT_EQ(
+        host_bom->bytes(PhysicalMemoryOwner::WeightLoadStaging),
+        16ULL * MiB);
+
+    const auto admission = plan.admit();
+    EXPECT_EQ(admission.plan().resources().size(), 3u);
+}
+
+TEST(Test__MemoryPlanner, CPUOnly_AttentionWorkspaceUsesPhysicalWorkerBOM)
 {
     auto profile = createTestProfile();
 
@@ -1077,13 +1838,29 @@ TEST(Test__MemoryPlanner, CPUOnly_ZeroWorkspace)
     cfg.device = DeviceId::cpu();
     cfg.device_total_bytes = 128ULL * 1024 * 1024 * 1024;
     cfg.device_free_bytes = 64ULL * 1024 * 1024 * 1024;
+    cfg.device_compute_units = 28;
     cfg.batch_size = 1;
     cfg.max_seq_len = 4096;
     cfg.kv_precision = "fp32";
 
     auto plan = MemoryPlanner::plan(profile, {cfg});
 
-    EXPECT_EQ(plan.devices[0].workspace_bytes, 0u);
+    const auto expected = attention_workspace::cpuParallelRequirements({
+        .compact_query_rows =
+            attention::kMaxGroupedVerifierAttentionRows,
+        .local_query_heads = profile.n_heads,
+        .head_dim = profile.head_dim,
+        .worker_count = cfg.device_compute_units,
+    });
+    EXPECT_EQ(
+        plan.devices[0].workspace_bytes(),
+        expected.total_bytes_with_alignment());
+    const auto *host_bom = plan.physicalPlan().find(
+        {-1, DeviceId::cpu()});
+    ASSERT_NE(host_bom, nullptr);
+    EXPECT_EQ(
+        host_bom->bytes(PhysicalMemoryOwner::ExecutionWorkspace),
+        expected.total_bytes_with_alignment());
     EXPECT_TRUE(plan.fits());
 }
 
@@ -1189,8 +1966,8 @@ TEST(Test__MemoryPlanner, PP2_DoesNotFit_WithoutLayerSplit)
 
     auto good_plan = MemoryPlanner::plan(profile, {good_stage0, good_stage1});
     // Each device should have less weight than the full model
-    EXPECT_LT(good_plan.devices[0].weight_bytes, full_plan.devices[0].weight_bytes);
-    EXPECT_LT(good_plan.devices[1].weight_bytes, full_plan.devices[0].weight_bytes);
+    EXPECT_LT(good_plan.devices[0].weight_bytes(), full_plan.devices[0].weight_bytes());
+    EXPECT_LT(good_plan.devices[1].weight_bytes(), full_plan.devices[0].weight_bytes());
 }
 
 TEST(Test__MemoryPlanner, PP_LayerRange_ReducesWeightEstimate_Proportionally)
@@ -1212,7 +1989,7 @@ TEST(Test__MemoryPlanner, PP_LayerRange_ReducesWeightEstimate_Proportionally)
     full.last_layer = 23;
 
     auto full_plan = MemoryPlanner::plan(profile, {full});
-    size_t full_weight = full_plan.devices[0].weight_bytes;
+    size_t full_weight = full_plan.devices[0].weight_bytes();
 
     // Half layers (0-11)
     DevicePlanConfig half = full;
@@ -1220,7 +1997,7 @@ TEST(Test__MemoryPlanner, PP_LayerRange_ReducesWeightEstimate_Proportionally)
     half.last_layer = 11;
 
     auto half_plan = MemoryPlanner::plan(profile, {half});
-    size_t half_weight = half_plan.devices[0].weight_bytes;
+    size_t half_weight = half_plan.devices[0].weight_bytes();
 
     // Half should have less weight than full
     EXPECT_LT(half_weight, full_weight);
@@ -1232,14 +2009,21 @@ TEST(Test__MemoryPlanner, PP_LayerRange_ReducesWeightEstimate_Proportionally)
 
 TEST(Test__MemoryPlanner, DeviceMemoryPlan_Summary)
 {
-    DeviceMemoryPlan plan;
-    plan.device = DeviceId::cuda(0);
-    plan.weight_bytes = 1024 * 1024 * 100; // 100 MB
-    plan.kv_cache_bytes = 1024 * 1024 * 50;
-    plan.activation_bytes = 1024 * 1024 * 30;
-    plan.workspace_bytes = 1024 * 1024 * 200;
-    plan.device_total_bytes = 1024ULL * 1024 * 1024 * 24;
-    plan.device_free_bytes = 1024ULL * 1024 * 1024 * 23;
+    PhysicalMemoryBOMBuilder builder({
+        .world_rank = -1,
+        .device = DeviceId::cuda(0),
+        .total_bytes = 1024ULL * 1024 * 1024 * 24,
+        .admission_available_bytes = 1024ULL * 1024 * 1024 * 23,
+    });
+    builder
+        .add(
+            PhysicalMemoryOwner::PrimaryModelWeights,
+            1024 * 1024 * 100)
+        .add(PhysicalMemoryOwner::KVCache, 1024 * 1024 * 50)
+        .add(PhysicalMemoryOwner::ActivationArena, 1024 * 1024 * 30)
+        .add(PhysicalMemoryOwner::ExecutionWorkspace, 1024 * 1024 * 200);
+    DeviceMemoryPlan plan(
+        builder.build(), /*max_seq_len=*/0, /*activation_seq_len=*/0);
 
     auto summary = plan.summary();
     EXPECT_FALSE(summary.empty());
@@ -1271,16 +2055,16 @@ TEST(Test__MemoryPlanner, RoutedExpertParticipantOwnsNoDensePersistentState)
     ASSERT_EQ(plan.devices.size(), 2u);
     const auto &continuation_plan = plan.devices[0];
     const auto &participant_plan = plan.devices[1];
-    EXPECT_GT(continuation_plan.kv_cache_bytes, 0u);
-    EXPECT_GT(continuation_plan.activation_bytes, 0u);
-    EXPECT_GT(continuation_plan.workspace_bytes, 0u);
-    EXPECT_EQ(participant_plan.kv_cache_bytes, 0u);
-    EXPECT_EQ(participant_plan.live_recurrent_state_bytes, 0u);
-    EXPECT_EQ(participant_plan.checkpoint_state_bytes, 0u);
-    EXPECT_EQ(participant_plan.persistent_state_bytes, 0u);
-    EXPECT_GT(participant_plan.activation_bytes, 0u);
-    EXPECT_GT(participant_plan.workspace_bytes, 0u);
-    EXPECT_LT(participant_plan.weight_bytes, continuation_plan.weight_bytes);
+    EXPECT_GT(continuation_plan.kv_cache_bytes(), 0u);
+    EXPECT_GT(continuation_plan.activation_bytes(), 0u);
+    EXPECT_GT(continuation_plan.workspace_bytes(), 0u);
+    EXPECT_EQ(participant_plan.kv_cache_bytes(), 0u);
+    EXPECT_EQ(participant_plan.live_recurrent_state_bytes(), 0u);
+    EXPECT_EQ(participant_plan.checkpoint_state_bytes(), 0u);
+    EXPECT_EQ(participant_plan.persistent_state_bytes(), 0u);
+    EXPECT_GT(participant_plan.activation_bytes(), 0u);
+    EXPECT_GT(participant_plan.workspace_bytes(), 0u);
+    EXPECT_LT(participant_plan.weight_bytes(), continuation_plan.weight_bytes());
 }
 
 TEST(Test__MemoryPlanner, OverlayContinuationReservesItsOwnCompactRouteBuffers)
@@ -1316,8 +2100,8 @@ TEST(Test__MemoryPlanner, OverlayContinuationReservesItsOwnCompactRouteBuffers)
         route_rows * bytes_per_route * static_cast<size_t>(profile.n_layers);
 
     EXPECT_EQ(
-        overlay_plan.devices.front().activation_bytes,
-        dense_plan.devices.front().activation_bytes + expected_compact_bytes)
+        overlay_plan.devices.front().activation_bytes(),
+        dense_plan.devices.front().activation_bytes() + expected_compact_bytes)
         << "A continuation that owns hot routed experts must account for the "
            "same persistent compact tensors as an expert-only endpoint";
 }
@@ -1363,8 +2147,8 @@ TEST(Test__MemoryPlanner,
         static_cast<size_t>(serial_overlay.serial_routed_expert_participant_count);
 
     EXPECT_EQ(
-        serial_plan.devices.front().activation_bytes,
-        dense_plan.devices.front().activation_bytes + expected_compact_bytes)
+        serial_plan.devices.front().activation_bytes(),
+        dense_plan.devices.front().activation_bytes() + expected_compact_bytes)
         << "The serial packet arena may alias layers and graph roles, but never "
            "two independently runnable overlay participants";
 }
@@ -1406,8 +2190,8 @@ TEST(Test__MemoryPlanner,
             serial_overlay.serial_routed_expert_participant_count);
 
     EXPECT_EQ(
-        serial_plan.devices.front().activation_bytes,
-        dense_plan.devices.front().activation_bytes +
+        serial_plan.devices.front().activation_bytes(),
+        dense_plan.devices.front().activation_bytes() +
             expected_compact_bytes);
 }
 
@@ -1455,7 +2239,66 @@ TEST(Test__MemoryPlanner, CpuExpertParticipantUsesTheSameResidentTicketBucket)
     ASSERT_TRUE(selected.fits()) << selected.memory_plan.renderTable();
     EXPECT_EQ(selected.resident_graph_rows, 32);
     ASSERT_EQ(selected.memory_plan.devices.size(), 2u);
-    EXPECT_EQ(selected.memory_plan.devices[0].activation_seq_len, 32);
-    EXPECT_EQ(selected.memory_plan.devices[1].activation_seq_len, 32)
+    EXPECT_EQ(selected.memory_plan.devices[0].activation_seq_len(), 32);
+    EXPECT_EQ(selected.memory_plan.devices[1].activation_seq_len(), 32)
         << "CPU cold endpoints consume the same segmented ticket geometry as captured GPU participants";
+}
+
+/**
+ * @brief Diagnostic graph storage is an exact accelerator BOM owner.
+ *
+ * This regression prevents parity capture from returning to the historical
+ * pattern of allocating an unpriced VRAM arena after routed-expert admission.
+ * CPU participants do not own device graph snapshots, while every GPU plan
+ * must carry the caller-declared capacity byte-for-byte.
+ */
+TEST(Test__MemoryPlanner,
+     GraphSnapshotCapacityIsChargedExactlyOnceToEachAccelerator)
+{
+    const auto profile = createTestProfile();
+
+    DevicePlanConfig baseline;
+    baseline.device = DeviceId::rocm(0);
+    baseline.device_compute_units = 60;
+    baseline.device_total_bytes = 32ULL * 1024 * 1024 * 1024;
+    baseline.device_free_bytes = 31ULL * 1024 * 1024 * 1024;
+    baseline.batch_size = 1;
+    baseline.max_seq_len = 256;
+    baseline.kv_precision = "fp16";
+
+    constexpr std::size_t kSnapshotBytes = 417'234'944u;
+    DevicePlanConfig diagnostic = baseline;
+    diagnostic.graph_snapshot_memory.per_accelerator_bytes =
+        kSnapshotBytes;
+
+    const auto baseline_plan = MemoryPlanner::plan(profile, {baseline});
+    const auto diagnostic_plan =
+        MemoryPlanner::plan(profile, {diagnostic});
+    ASSERT_EQ(baseline_plan.devices.size(), 1u);
+    ASSERT_EQ(diagnostic_plan.devices.size(), 1u);
+    EXPECT_EQ(
+        diagnostic_plan.devices.front().graph_snapshot_bytes(),
+        kSnapshotBytes);
+    EXPECT_EQ(
+        diagnostic_plan.devices.front().total_bytes(),
+        baseline_plan.devices.front().total_bytes() + kSnapshotBytes);
+
+    const auto *gpu_bom = diagnostic_plan.physicalPlan().find(
+        {-1, DeviceId::rocm(0)});
+    ASSERT_NE(gpu_bom, nullptr);
+    EXPECT_EQ(
+        gpu_bom->bytes(PhysicalMemoryOwner::GraphSnapshotArena),
+        kSnapshotBytes);
+
+    DevicePlanConfig cpu = diagnostic;
+    cpu.device = DeviceId::cpu();
+    const auto cpu_plan = MemoryPlanner::plan(profile, {cpu});
+    ASSERT_EQ(cpu_plan.devices.size(), 1u);
+    EXPECT_EQ(cpu_plan.devices.front().graph_snapshot_bytes(), 0u);
+    const auto *cpu_bom = cpu_plan.physicalPlan().find(
+        {-1, DeviceId::cpu()});
+    ASSERT_NE(cpu_bom, nullptr);
+    EXPECT_EQ(
+        cpu_bom->bytes(PhysicalMemoryOwner::GraphSnapshotArena),
+        0u);
 }

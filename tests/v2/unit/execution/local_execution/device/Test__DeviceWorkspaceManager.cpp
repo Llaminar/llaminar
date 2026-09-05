@@ -27,6 +27,29 @@ using namespace llaminar2;
 
 namespace
 {
+    /** @brief Build one rank-local CPU workspace admission for focused tests. */
+    std::shared_ptr<PhysicalMemoryAuthority> workspaceAuthority(
+        size_t workspace_bytes,
+        PhysicalMemoryOwner owner =
+            PhysicalMemoryOwner::ExecutionWorkspace)
+    {
+        PhysicalMemoryPlanBuilder builder;
+        builder.add(
+            PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = DeviceId::cpu(),
+                .total_bytes = 16u * 1024u * 1024u,
+                .admission_available_bytes = 16u * 1024u * 1024u,
+            },
+            owner,
+            workspace_bytes);
+        const auto admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(
+            builder.build());
+        return std::make_shared<PhysicalMemoryAuthority>(
+            admission, 0);
+    }
+
     class ScopedEnv
     {
     public:
@@ -138,6 +161,119 @@ TEST_F(Test__DeviceWorkspaceManager, ManagerIdsAreUniqueAcrossInstances)
     EXPECT_NE(second.id(), 0u);
     EXPECT_NE(first.id(), second.id())
         << "Kernel workspace scratch caches depend on manager identity, not just host pointer equality";
+}
+
+TEST_F(Test__DeviceWorkspaceManager,
+       CanonicalAuthorityTracksPrimaryBlockThroughReusableSealAndFree)
+{
+    constexpr size_t kWorkspaceBytes = 4096u;
+    auto authority = workspaceAuthority(kWorkspaceBytes);
+    DeviceWorkspaceManager manager(
+        device, kWorkspaceBytes, authority);
+    WorkspaceRequirements requirements;
+    requirements.buffers.push_back(
+        {"authority_owned", kWorkspaceBytes, 256u, true});
+
+    ASSERT_TRUE(manager.allocate(requirements));
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        kWorkspaceBytes);
+    EXPECT_EQ(
+        authority->remainingAdmittedNewAllocationBytes(
+            device, PhysicalMemoryOwner::ExecutionWorkspace),
+        0u);
+
+    std::string seal_error;
+    ASSERT_TRUE(manager.sealPrimaryBlockForReuse(&seal_error))
+        << seal_error;
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        kWorkspaceBytes)
+        << "Sealing retires graph names, not the retained physical block";
+
+    manager.release();
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
+    EXPECT_EQ(
+        authority->remainingAdmittedNewAllocationBytes(
+            device, PhysicalMemoryOwner::ExecutionWorkspace),
+        kWorkspaceBytes);
+}
+
+TEST_F(Test__DeviceWorkspaceManager,
+       IndependentManagersCannotOvercommitOneWorkspaceOwnerLine)
+{
+    auto authority = workspaceAuthority(1024u);
+    DeviceWorkspaceManager first(device, 1024u, authority);
+    DeviceWorkspaceManager second(device, 1024u, authority);
+    WorkspaceRequirements first_requirements;
+    first_requirements.buffers.push_back(
+        {"first", 768u, 1u, true});
+    WorkspaceRequirements second_requirements;
+    second_requirements.buffers.push_back(
+        {"second", 512u, 1u, true});
+
+    ASSERT_TRUE(first.allocate(first_requirements));
+    EXPECT_FALSE(second.allocate(second_requirements));
+    EXPECT_FALSE(second.isAllocated());
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        768u);
+
+    first.release();
+    ASSERT_TRUE(second.allocate(second_requirements));
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        512u);
+}
+
+TEST_F(Test__DeviceWorkspaceManager,
+       StableArenaCanChargeItsExactNonWorkspaceOwner)
+{
+    constexpr size_t kStateBytes = 2048u;
+    auto authority = workspaceAuthority(
+        kStateBytes, PhysicalMemoryOwner::RecurrentLiveState);
+    DeviceWorkspaceManager manager(
+        device,
+        kStateBytes,
+        authority,
+        PhysicalMemoryOwner::RecurrentLiveState);
+    WorkspaceRequirements requirements;
+    requirements.buffers.push_back(
+        {"recurrent_state", kStateBytes, 256u, true});
+
+    ASSERT_TRUE(manager.allocate(requirements));
+    EXPECT_EQ(
+        manager.physicalMemoryOwner(),
+        PhysicalMemoryOwner::RecurrentLiveState);
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::RecurrentLiveState,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        kStateBytes);
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
 }
 
 // ============================================================================

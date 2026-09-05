@@ -177,8 +177,10 @@ namespace llaminar2
              state_ != State::Ready) ||
             !batch.valid() ||
             !batch.movesWeights() ||
-            batch.kind !=
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement ||
+            (batch.kind !=
+                 MoEOverlayDeviceControllerTransactionKind::DynamicPlacement &&
+             batch.kind != MoEOverlayDeviceControllerTransactionKind::
+                               PreparedContextRestore) ||
             batch.command_count > config_.command_capacity ||
             batch.migrations.size() != batch.command_count ||
             prepared.status != MoEOverlayResidencyStageStartStatus::Started ||

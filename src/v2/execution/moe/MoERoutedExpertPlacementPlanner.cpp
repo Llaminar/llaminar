@@ -204,29 +204,46 @@ namespace llaminar2
                 return profile != nullptr;
             }
 
-            /** @return Whether the immutable runtime can produce this phase. */
-            bool active(ExpertHistogramSource source) const
+            /** @return Whether this exact retained layer may execute @p source. */
+            bool reachable(int layer, ExpertHistogramSource source) const
             {
-                return profile->active_sources[servicePhaseIndex(source)];
+                return profile->production_topology.reachable(
+                    layer, servicePhaseIndex(source));
             }
 
-            /** @return Certified cost, rejecting demand for a disabled phase. */
+            /** @return Whether this exact layer/phase participates in economics. */
+            bool priced(int layer, ExpertHistogramSource source) const
+            {
+                return profile->production_topology.requiresServiceEvidence(
+                    layer, servicePhaseIndex(source));
+            }
+
+            /** @return Certified cost, rejecting an unpriced layer/phase. */
             uint64_t cost(
                 int tier,
                 int layer,
                 ExpertHistogramSource source) const
             {
-                if (!active(source))
+                if (!priced(layer, source))
                 {
                     throw std::logic_error(
-                        "MoE service cost requested for a runtime-disabled inference phase");
+                        "MoE service cost requested for an economy-unpriced layer phase");
                 }
                 const auto offset =
                     static_cast<std::size_t>(tier) *
                         static_cast<std::size_t>(layer_count) +
                     static_cast<std::size_t>(layer);
-                return rows.at(offset)
-                    ->nanoseconds_per_activation[servicePhaseIndex(source)];
+                const auto phase = servicePhaseIndex(source);
+                const auto cost =
+                    rows.at(offset)->nanoseconds_per_activation[phase];
+                if (!profile->production_topology.requiresServiceEvidence(
+                        layer, phase) ||
+                    cost == 0u)
+                {
+                    throw std::logic_error(
+                        "MoE service cost is missing for an economy-priced layer phase");
+                }
+                return cost;
             }
         };
 
@@ -250,11 +267,12 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "MoE tier phase service profile requires a non-empty setup identity");
             }
-            if (!validExpertHistogramProductionSourceMask(
-                    profile->active_sources))
+            if (!profile->production_topology.valid() ||
+                profile->production_topology.layerCount() !=
+                    static_cast<std::size_t>(metadata.num_layers))
             {
                 throw std::invalid_argument(
-                    "MoE tier phase service profile has an invalid runtime phase mask");
+                    "MoE tier phase service profile has invalid layer reachability");
             }
 
             PhaseServiceProfileView view;
@@ -286,14 +304,16 @@ namespace llaminar2
                     const uint64_t value =
                         row.nanoseconds_per_activation[phase];
                     invalid_phase_cost = invalid_phase_cost ||
-                                         (profile->active_sources[phase]
+                                         (profile->production_topology
+                                                  .requiresServiceEvidence(
+                                                      row.layer, phase)
                                               ? value == 0
                                               : value != 0);
                 }
                 if (invalid_phase_cost)
                 {
                     throw std::invalid_argument(
-                        "MoE tier phase service times must be positive exactly for runtime-active phases");
+                        "MoE tier phase service times must be positive exactly for economy-priced phases");
                 }
                 const auto offset =
                     static_cast<std::size_t>(row.tier_index) *
@@ -554,13 +574,21 @@ namespace llaminar2
             {
                 const auto demand = histogram.activationCount(
                     source, layer, expert);
-                if (!profile.active(source))
+                if (!profile.reachable(layer, source))
                 {
                     if (demand != 0)
                     {
                         throw std::logic_error(
                             "MoE histogram contains demand for a runtime-disabled inference phase");
                     }
+                    continue;
+                }
+                if (!profile.priced(layer, source))
+                {
+                    /* Fixed positive-depth MTP can execute a bounded serial
+                     * catch-up/tail graph. Its demand is valid lifecycle
+                     * evidence, but it is deliberately excluded from the
+                     * recurring steady-state placement objective. */
                     continue;
                 }
                 const auto service = profile.cost(

@@ -11,13 +11,17 @@
 
 #include "execution/prefix_cache/DeviceHotPrefixStorageBackend.h"
 
+#include "execution/config/RuntimeConfig.h"
+
 #include "backends/BackendManager.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -69,6 +73,7 @@ namespace llaminar2
             DeviceId device = DeviceId::invalid();
             void *allocation = nullptr;
             size_t allocation_bytes = 0u;
+            std::optional<PhysicalMemoryAllocationLease> memory_lease;
             std::vector<std::shared_ptr<PrefixPayloadReadiness>>
                 latest_slot_readiness;
 
@@ -81,6 +86,13 @@ namespace llaminar2
                 }
                 if (backend && allocation && device.is_gpu())
                     backend->free(allocation, device.gpu_ordinal());
+                allocation = nullptr;
+                allocation_bytes = 0u;
+
+                // The byte claim must remain live through the exact backing
+                // free. Retiring it earlier would let another owner believe
+                // this VRAM was reusable while the backend still owns it.
+                memory_lease.reset();
             }
         };
 
@@ -142,6 +154,7 @@ namespace llaminar2
         DeviceId device,
         size_t budget_bytes,
         size_t slot_bytes,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
         std::string *error)
     {
         const auto fail = [&](const char *message)
@@ -158,17 +171,42 @@ namespace llaminar2
             return fail(
                 "device-hot arena requires a GPU and at least one complete slot");
         }
+        if (!memory_authority || !memory_authority->contains(device))
+        {
+            return fail(
+                "device-hot arena requires the admitted rank-local memory authority");
+        }
         IBackend *backend = getBackendFor(device);
         if (!backend)
             return fail("device-hot arena could not resolve its GPU backend");
 
-        const size_t slot_count = budget_bytes / slot_bytes;
+        const size_t reserved_bytes =
+            prefixCacheWholeBlockReservationBytes(
+                budget_bytes, slot_bytes);
+        const size_t slot_count = reserved_bytes / slot_bytes;
         if (slot_count == 0u ||
             slot_count > std::numeric_limits<size_t>::max() / slot_bytes)
         {
             return fail("device-hot arena slot geometry is invalid");
         }
-        const size_t reserved_bytes = slot_count * slot_bytes;
+
+        std::optional<PhysicalMemoryAllocationLease> memory_lease;
+        try
+        {
+            // Pre-claim before calling the backend allocator. A failed backend
+            // allocation simply destroys this local lease and restores the
+            // owner line; successful construction moves it beside the slab.
+            memory_lease.emplace(memory_authority->claimNewAllocation(
+                device,
+                PhysicalMemoryOwner::PrefixDeviceTier,
+                reserved_bytes));
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+            return nullptr;
+        }
         void *allocation = backend->allocate(
             reserved_bytes, device.gpu_ordinal());
         if (!allocation)
@@ -184,6 +222,7 @@ namespace llaminar2
         pool->device = device;
         pool->allocation = allocation;
         pool->allocation_bytes = reserved_bytes;
+        pool->memory_lease = std::move(memory_lease);
         pool->latest_slot_readiness.resize(slot_count);
 
         result->impl_->device = device;
@@ -287,6 +326,8 @@ namespace llaminar2
         out.has_terminal_logits = ram_archive.has_terminal_logits;
         out.has_model_runtime_state = ram_archive.has_model_runtime_state;
         out.model_runtime_state_storage = ram_archive.model_runtime_state_storage;
+        out.ram_runtime_state_memory_lease =
+            ram_archive.ram_runtime_state_memory_lease;
         out.payload_readiness = readiness;
 
         auto *base = static_cast<uint8_t *>(impl_->pool->allocation) +

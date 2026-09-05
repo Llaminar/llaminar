@@ -34,6 +34,7 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
+    class PhysicalMemoryAuthority;
 
     /**
      * @brief Operation semantics for compact LocalTP control sidebands.
@@ -753,13 +754,19 @@ namespace llaminar2
          *     max_elements_with_margin);
          * @endcode
          *
-         * @param backend_temp_bytes Minimum backend transport workspace capacity.
+         * @param backend_payload_capacity_bytes Maximum logical payload the
+         *        backend must accept. This is not necessarily physical memory;
+         *        concrete backend allocations have their own BOM owner.
          * @param fp16_scratch_elements Maximum logical FP16 transport element count.
+         * @param memory_authority Rank-local physical-memory ledger. Concrete
+         *        allocating contexts require this value; allocation-free test
+         *        doubles may ignore it.
          * @return true only when every participant is fully reserved.
          */
         virtual bool reserveCollectiveResources(
-            size_t backend_temp_bytes,
-            size_t fp16_scratch_elements) = 0;
+            size_t backend_payload_capacity_bytes,
+            size_t fp16_scratch_elements,
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority) = 0;
     };
 
     /**

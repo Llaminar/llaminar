@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
@@ -223,6 +224,11 @@ namespace llaminar2
             policy.capture_terminal_logits_values;
         policy.capture_gdn_values =
             envEnabled("LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES");
+        /* Raw GPU values and their digest must come from the same ordered
+         * device export. This also prevents a tolerance-aware comparison from
+         * accidentally consulting the stale host mirror. */
+        policy.hash_gdn_device_state =
+            policy.hash_gdn_device_state || policy.capture_gdn_values;
         policy.capture_device_logical_state =
             envEnabled(
                 "LLAMINAR_PREFIX_PROBE_CAPTURE_DEVICE_LOGICAL_STATE");
@@ -477,12 +483,14 @@ namespace llaminar2
             return {};
         }
 
+        const HybridPrefixStateMetadata metadata =
+            hybrid->hybridPrefixStateMetadata();
+        const bool has_authoritative_device_state = metadata.device_bytes > 0;
         std::vector<uint8_t> device_state_bytes;
-        if (capture_policy.hash_gdn_device_state)
+        if (capture_policy.hash_gdn_device_state ||
+            capture_policy.capture_gdn_values)
         {
-            const HybridPrefixStateMetadata metadata =
-                hybrid->hybridPrefixStateMetadata();
-            if (metadata.device_bytes > 0)
+            if (has_authoritative_device_state)
             {
                 device_state_bytes.resize(metadata.device_bytes);
                 HybridPrefixStateDescriptor desc;
@@ -542,7 +550,8 @@ namespace llaminar2
                 auto consume_bank =
                     [&](size_t byte_count,
                         size_t *reported_bytes,
-                        uint64_t *reported_hash) -> bool
+                        uint64_t *reported_hash,
+                        std::vector<float> *reported_values) -> bool
                 {
                     *reported_bytes = byte_count;
                     if (byte_count == 0 ||
@@ -554,6 +563,17 @@ namespace llaminar2
                     *reported_hash = hashByteBufferForPrefixProbe(
                         device_state_bytes.data() + device_offset,
                         byte_count);
+                    if (reported_values &&
+                        capture_policy.capture_gdn_values)
+                    {
+                        if (byte_count % sizeof(float) != 0u)
+                            return false;
+                        reported_values->resize(byte_count / sizeof(float));
+                        std::memcpy(
+                            reported_values->data(),
+                            device_state_bytes.data() + device_offset,
+                            byte_count);
+                    }
                     device_offset += byte_count;
                     return true;
                 };
@@ -568,6 +588,8 @@ namespace llaminar2
                 bool full_complete = true;
                 bool has_local_bank = false;
                 bool has_full_bank = false;
+                std::vector<float> local_conv_values;
+                std::vector<float> local_recurrence_values;
 
                 if (has_conv && state->local_conv_state_size > 0)
                 {
@@ -577,7 +599,8 @@ namespace llaminar2
                             static_cast<size_t>(state->local_conv_state_size) *
                                 sizeof(float),
                             &probe.conv_local_device_bytes,
-                            &probe.conv_local_device_hash);
+                            &probe.conv_local_device_hash,
+                            &local_conv_values);
 
                     if (state->full_conv_state_size !=
                         state->local_conv_state_size)
@@ -588,7 +611,8 @@ namespace llaminar2
                                 static_cast<size_t>(state->full_conv_state_size) *
                                     sizeof(float),
                                 &probe.conv_device_bytes,
-                                &probe.conv_device_hash);
+                                &probe.conv_device_hash,
+                                &probe.conv_sample_values);
                     }
                     else
                     {
@@ -597,6 +621,8 @@ namespace llaminar2
                             probe.conv_local_device_bytes;
                         probe.conv_device_hash =
                             probe.conv_local_device_hash;
+                        if (capture_policy.capture_gdn_values)
+                            probe.conv_sample_values = local_conv_values;
                     }
                 }
                 if (has_recurrence &&
@@ -609,7 +635,8 @@ namespace llaminar2
                                 state->local_recurrence_state_size) *
                                 sizeof(float),
                             &probe.recurrence_local_device_bytes,
-                            &probe.recurrence_local_device_hash);
+                            &probe.recurrence_local_device_hash,
+                            &local_recurrence_values);
 
                     if (state->full_recurrence_state_size !=
                         state->local_recurrence_state_size)
@@ -621,7 +648,8 @@ namespace llaminar2
                                     state->full_recurrence_state_size) *
                                     sizeof(float),
                                 &probe.recurrence_device_bytes,
-                                &probe.recurrence_device_hash);
+                                &probe.recurrence_device_hash,
+                                &probe.recurrence_sample_values);
                     }
                     else
                     {
@@ -630,6 +658,11 @@ namespace llaminar2
                             probe.recurrence_local_device_bytes;
                         probe.recurrence_device_hash =
                             probe.recurrence_local_device_hash;
+                        if (capture_policy.capture_gdn_values)
+                        {
+                            probe.recurrence_sample_values =
+                                local_recurrence_values;
+                        }
                     }
                 }
 
@@ -638,7 +671,8 @@ namespace llaminar2
                 probe.device_state_hash_available =
                     has_full_bank && full_complete;
             }
-            if (capture_policy.capture_gdn_values)
+            if (capture_policy.capture_gdn_values &&
+                !has_authoritative_device_state)
             {
                 probe.recurrence_sample_values = state->recurrence_state;
                 probe.conv_sample_values = state->conv_state;

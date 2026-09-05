@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -266,6 +267,149 @@ namespace llaminar2::test
         for (std::int32_t participant = 0; participant < 4; ++participant)
             EXPECT_EQ(ownerCount(plan, participant), 2u);
         expectCanonicalCommands(plan);
+    }
+
+    /**
+     * @brief A bounded device wave must not starve one independent Dynamic axis.
+     *
+     * This reproduces the CUDA2/ROCm4 depth-one production failure.  The
+     * topology exposes profitable tier exchanges and a profitable same-tier
+     * correction, but pure net-benefit ordering spends both available cycle
+     * slots on tier residency.  The device authority must reserve the second
+     * slot for participant placement while retaining every ordinary economy,
+     * capacity, and hysteresis gate.
+     */
+    TEST(Test__MoEOverlayDevicePlacementPolicy,
+         TwoCycleWaveAdvancesTierAndParticipantObjectives)
+    {
+        auto policy_input = input(
+            /*priorities=*/{0, 0, 17, 17, 17, 17},
+            /*owners=*/{
+                2, 3, 1, 0, 0, 1,
+                5, 4, 5, 4, 3, 2,
+            },
+            /*counts=*/{
+                1200, 1100, 1000, 900,
+                850, 825, 800, 700,
+                600, 500, 100, 50,
+            },
+            /*maximum_cycles=*/2u);
+        policy_input.dynamic_maximum_cycles_per_layer = 2u;
+        policy_input.dynamic_imbalance_threshold_per_mille = 1000u;
+        policy_input.dynamic_minimum_improvement_per_mille = 0u;
+
+        const auto plan =
+            MoEOverlayDevicePlacementPolicyReference::planDynamic(
+                policy_input);
+        ASSERT_TRUE(plan.hasMovement());
+        ASSERT_EQ(plan.evidence.accepted_cycles, 2u);
+
+        bool advances_tier = false;
+        bool advances_participant = false;
+        for (const auto &command : plan.commands)
+        {
+            const auto axis = static_cast<MoEOverlayDeviceMovementAxis>(
+                command.flags);
+            advances_tier = advances_tier ||
+                axis == MoEOverlayDeviceMovementAxis::TierResidency ||
+                axis == MoEOverlayDeviceMovementAxis::Combined;
+            advances_participant = advances_participant ||
+                axis == MoEOverlayDeviceMovementAxis::ParticipantPlacement ||
+                axis == MoEOverlayDeviceMovementAxis::Combined;
+        }
+        EXPECT_TRUE(advances_tier);
+        EXPECT_TRUE(advances_participant)
+            << "bounded net-benefit ordering starved within-tier skew correction";
+    }
+
+    /**
+     * @brief Axis reservation searches later layers before spending its slot.
+     *
+     * Layer zero exposes two profitable tier exchanges but no participant
+     * correction. Layer one is already tier-optimal and exposes one profitable
+     * same-tier correction. A two-cycle wave must not consume both slots in
+     * layer zero merely because the participant objective lives later in the
+     * device-owned layer cursor.
+     */
+    TEST(Test__MoEOverlayDevicePlacementPolicy,
+         TwoCycleWaveSearchesLaterLayersBeforeEconomyFallback)
+    {
+        constexpr std::array<std::int32_t, 12> layer_zero_owners = {
+            2, 3, 1, 0, 0, 1,
+            4, 5, 5, 4, 3, 2,
+        };
+        constexpr std::array<std::int32_t, 12> layer_one_owners = {
+            0, 1, 1, 0, 2, 3,
+            5, 4, 5, 4, 3, 2,
+        };
+        constexpr std::array<std::uint64_t, 12> counts = {
+            1200, 1100, 1000, 900,
+            850, 825, 800, 700,
+            600, 500, 100, 50,
+        };
+        auto policy_input = input(
+            /*priorities=*/{0, 0, 17, 17, 17, 17},
+            std::vector<std::int32_t>(
+                layer_zero_owners.begin(), layer_zero_owners.end()),
+            std::vector<std::uint64_t>(counts.begin(), counts.end()),
+            /*maximum_cycles=*/2u);
+        policy_input.num_layers = 2u;
+        policy_input.collected_state.assign(
+            policy_input.participants.size() * policy_input.num_layers *
+                policy_input.num_experts,
+            0u);
+        for (std::uint32_t layer = 0u;
+             layer < policy_input.num_layers;
+             ++layer)
+        {
+            const auto &owners = layer == 0u
+                                     ? layer_zero_owners
+                                     : layer_one_owners;
+            for (std::uint32_t expert = 0u;
+                 expert < policy_input.num_experts;
+                 ++expert)
+            {
+                const auto owner = static_cast<std::uint32_t>(owners[expert]);
+                policy_input.collected_state[
+                    (static_cast<std::size_t>(owner) *
+                         policy_input.num_layers +
+                     layer) *
+                        policy_input.num_experts +
+                    expert] = moe_rebalance_policy::packCollectedState(
+                    counts[expert],
+                    /*active_transfer_slots=*/0u,
+                    /*physically_resident=*/true,
+                    /*transfer_backed=*/false,
+                    /*authoritative_owner=*/true);
+            }
+        }
+        policy_input.payload_bytes_per_layer = {4096u, 4096u};
+        policy_input.dynamic_maximum_cycles_per_layer = 2u;
+        policy_input.dynamic_imbalance_threshold_per_mille = 1000u;
+        policy_input.dynamic_minimum_improvement_per_mille = 0u;
+        attachMeasuredEconomy(&policy_input);
+
+        const auto plan =
+            MoEOverlayDevicePlacementPolicyReference::planDynamic(
+                policy_input);
+        ASSERT_EQ(plan.evidence.accepted_cycles, 2u);
+        EXPECT_EQ(plan.evidence.changed_layers, 2u);
+
+        bool advances_tier = false;
+        bool advances_participant = false;
+        for (const auto &command : plan.commands)
+        {
+            const auto axis = static_cast<MoEOverlayDeviceMovementAxis>(
+                command.flags);
+            advances_tier = advances_tier ||
+                axis == MoEOverlayDeviceMovementAxis::TierResidency ||
+                axis == MoEOverlayDeviceMovementAxis::Combined;
+            advances_participant = advances_participant ||
+                axis == MoEOverlayDeviceMovementAxis::ParticipantPlacement ||
+                axis == MoEOverlayDeviceMovementAxis::Combined;
+        }
+        EXPECT_TRUE(advances_tier);
+        EXPECT_TRUE(advances_participant);
     }
 
     TEST(Test__MoEOverlayDevicePlacementPolicy,

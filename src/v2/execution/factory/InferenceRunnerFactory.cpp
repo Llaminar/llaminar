@@ -8,9 +8,11 @@
 #include "InferenceRunnerFactory.h"
 #include "backends/HostMemoryCapacity.h"
 #include "loaders/GPUHostLoadPreflight.h"
+#include "loaders/GPUVramPreflight.h"
 #include "EagerWeightValidator.h"
 #include "../../backends/DeviceId.h"
 #include "../../backends/BackendManager.h"
+#include "../../collective/LocalTPCollectiveInventory.h"
 #include "../local_execution/collective/CollectiveContext.h"
 #include "../mpi_orchestration/DeviceInventory.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
@@ -47,6 +49,7 @@
 #include "../../execution/moe/RoutedExpertOwnerAssignment.h"
 #include "../../execution/mtp/MTPWeightManifest.h"
 #include "../../planning/ActivationBufferSizing.h"
+#include "../../planning/PhysicalMemoryAuthority.h"
 #include "../../loaders/WeightLoadProgress.h"
 #include "../../loaders/WeightLoadProgressAggregator.h"
 #include <algorithm>
@@ -143,6 +146,29 @@ namespace llaminar2
 
     namespace
     {
+        /**
+         * @brief Resolve the model-setup memory authority at the factory edge.
+         *
+         * ModelContext and WeightManager own preparation lifetime, but child
+         * graph orchestrators receive the authority as an explicit peer
+         * dependency. Keeping this lookup here prevents caches and arenas from
+         * downcasting an unrelated allocation owner later in setup.
+         */
+        std::shared_ptr<PhysicalMemoryAuthority>
+        physicalMemoryAuthorityForModel(
+            const std::shared_ptr<IModelContext> &model_ctx)
+        {
+            const auto concrete_model =
+                std::dynamic_pointer_cast<ModelContext>(model_ctx);
+            const auto weight_manager = concrete_model
+                                            ? concrete_model
+                                                  ->concreteWeightManager()
+                                            : nullptr;
+            return weight_manager
+                       ? weight_manager->physicalMemoryAuthority()
+                       : nullptr;
+        }
+
         /**
          * @brief Resolve the immutable flattened-row envelope for one graph family.
          *
@@ -862,46 +888,59 @@ namespace llaminar2
         // enough allocatable RAM to hold model weights during loading.
         // For GPU: weights are staged in host RAM temporarily before H2D transfer.
         // For CPU: weights remain in host RAM for the entire inference session.
-        // Returns 0 on error (check skipped).
-        size_t getAvailableHostRAM()
+        /** @brief Source payload geometry needed by the canonical load BOM. */
+        struct EagerLoadSourceGeometry
         {
-#ifdef __linux__
-            return observeSystemMemoryCapacity()
-                .admission_available_bytes;
-#else
-            return 0; // Cannot check on non-Linux — skip preflight
-#endif
-        }
+            size_t total_bytes = 0;
+            size_t maximum_tensor_bytes = 0;
+        };
 
-        /// Compute total host RAM required for eager weight loading.
-        /// Sums GGUF tensor sizes for all weights that will be loaded by this rank.
-        size_t computeEagerLoadHostBytes(
+        /// Compute source geometry for all weights loaded by this rank.
+        EagerLoadSourceGeometry computeEagerLoadSourceGeometry(
             const GGUFModel &model,
             const std::vector<std::pair<std::string, bool>> &weights_to_load)
         {
-            size_t total = 0;
+            EagerLoadSourceGeometry result;
+            const auto add = [&](std::uint64_t bytes)
+            {
+                if (bytes > std::numeric_limits<size_t>::max() ||
+                    static_cast<size_t>(bytes) >
+                        std::numeric_limits<size_t>::max() -
+                            result.total_bytes)
+                {
+                    throw std::overflow_error(
+                        "Host model-load source geometry exceeds size_t");
+                }
+                const size_t local_bytes = static_cast<size_t>(bytes);
+                result.total_bytes += local_bytes;
+                result.maximum_tensor_bytes = std::max(
+                    result.maximum_tensor_bytes, local_bytes);
+            };
             for (const auto &[name, is_optional] : weights_to_load)
             {
+                (void)is_optional;
                 if (auto *info = model.findTensor(name))
-                    total += info->size_bytes;
+                    add(info->size_bytes);
             }
             // Global weights loaded separately
             for (const char *global_name : {"output.weight", "token_embd.weight", "output_norm.weight"})
             {
                 if (auto *info = model.findTensor(global_name))
-                    total += info->size_bytes;
+                    add(info->size_bytes);
             }
-            return total;
+            return result;
         }
 
         bool hostRamPreflight(
             const GGUFModel &model,
             const std::vector<std::pair<std::string, bool>> &weights_to_load,
             DeviceId device,
-            bool use_mmap)
+            bool use_mmap,
+            int world_rank)
         {
-            const size_t eager_weight_bytes =
-                computeEagerLoadHostBytes(model, weights_to_load);
+            const EagerLoadSourceGeometry source =
+                computeEagerLoadSourceGeometry(model, weights_to_load);
+            const size_t eager_weight_bytes = source.total_bytes;
             /**
              * Native GPU weights remain file-backed and are read directly into
              * the pinned upload ring. They therefore consume the configured
@@ -910,35 +949,49 @@ namespace llaminar2
              * full eager-footprint requirement.
              */
             const auto &load_config = debugEnv().rocm;
-            const size_t configured_staging_bytes =
-                load_config.repack_budget_mb > 0
-                    ? static_cast<size_t>(load_config.repack_budget_mb) *
-                          1024ULL * 1024ULL
-                    : eager_weight_bytes;
             const bool bounded_gpu_load =
                 device.is_gpu() && use_mmap &&
                 load_config.repack_budget_mb > 0;
-            const size_t required_bytes = gpuHostLoadWorkingSetBytes(
+            const GPUWeightLoadMemoryGeometry upload_geometry =
+                device.is_gpu()
+                    ? resolveGPUWeightLoadMemoryGeometry(
+                          source.maximum_tensor_bytes,
+                          configuredGPUWeightLoadMemoryPolicy())
+                    : GPUWeightLoadMemoryGeometry{};
+            const auto observation = observeSystemMemoryCapacity();
+            if (!observation.valid() ||
+                observation.admission_available_bytes == 0)
+            {
+                LOG_ERROR(
+                    "[HostRAM] Canonical host-memory observation is unavailable; model loading cannot be admitted safely");
+                return false;
+            }
+            const auto memory_bom = hostWeightLoadMemoryBOM(
+                PhysicalMemoryResource{
+                    .world_rank = world_rank,
+                    .device = DeviceId::cpu(),
+                    .total_bytes = observation.total_bytes,
+                    .admission_available_bytes =
+                        observation.admission_available_bytes,
+                },
                 eager_weight_bytes,
                 device.is_gpu(),
                 use_mmap,
-                configured_staging_bytes);
+                upload_geometry.host_staging_bytes);
+            const size_t required_bytes = memory_bom.incrementalBytes();
             if (required_bytes == 0)
                 return true;
 
-            const size_t available_bytes = getAvailableHostRAM();
-            if (available_bytes == 0)
-            {
-                // Cannot determine — skip check (non-Linux or /proc not available)
-                LOG_DEBUG("[HostRAM] Cannot determine available RAM — skipping preflight");
-                return true;
-            }
+            const size_t available_bytes =
+                memory_bom.resource().admission_available_bytes;
 
             const double required_gb = static_cast<double>(required_bytes) / (1024.0 * 1024.0 * 1024.0);
             const double available_gb = static_cast<double>(available_bytes) / (1024.0 * 1024.0 * 1024.0);
 
-            if (required_bytes <= available_bytes)
+            if (memory_bom.fits())
             {
+                const PhysicalMemoryAdmissionCertificate admission(
+                    memory_bom);
                 LOG_DEBUG("[HostRAM] Preflight passed: need "
                           << std::fixed << std::setprecision(1) << required_gb
                           << " GB, available " << available_gb << " GB"
@@ -947,6 +1000,9 @@ namespace llaminar2
                                   : device.is_gpu()
                                         ? " (temporary staging for GPU transfer)"
                                         : " (retained for CPU inference)"));
+                LOG_DEBUG(
+                    "[HostRAM] Certified physical BOM: "
+                    << admission.bom().summary());
                 return true;
             }
 
@@ -1546,6 +1602,9 @@ namespace llaminar2
 
     struct SingleDeviceWeightPlanOptions
     {
+        /** Persistent BOM owner inherited by the complete frozen set. */
+        PhysicalMemoryOwner physical_memory_owner =
+            PhysicalMemoryOwner::PrimaryModelWeights;
         bool include_terminal_mtp_embedding = false;
         int tp_rank_override = -1;
         bool bypass_tensor_parallel = false;
@@ -1559,6 +1618,19 @@ namespace llaminar2
          */
         bool replicate_routed_experts = false;
         bool dense_decode_replicated_subset = false;
+        /**
+         * Materialize only the learned MTP predictor's dense/shared block.
+         * Routed experts are intentionally omitted because ExpertOverlay owns
+         * their complete per-expert residency independently of dense TP.
+         */
+        bool replicated_mtp_sidecar_subset = false;
+        /** Typed physical owner of routed parents in an MTP replica. */
+        MTPRoutedExpertWeightAuthority mtp_routed_expert_weight_authority =
+            MTPRoutedExpertWeightAuthority::SidecarParticipant;
+        /** Include a complete token embedding in the auxiliary frozen set. */
+        bool include_replicated_embedding = false;
+        /** Include output norm and full-vocabulary head in the auxiliary set. */
+        bool include_replicated_terminal_head = false;
         bool dense_decode_mirrored_embedding_only = false;
         bool replicated_terminal_lm_head_only = false;
         bool replicated_terminal_bindings_only = false;
@@ -1595,6 +1667,37 @@ namespace llaminar2
     bool needsMirroredMTPHeadWeights(const GraphConfig &graph_config)
     {
         return graph_config.mtpUsesMirroredTerminalHeadBinding();
+    }
+
+    /**
+     * @brief Return true when TP MTP binds a complete predictor block locally.
+     *
+     * This decision is narrower than replicated dense decode and wider than
+     * terminal-head mirroring. The resulting frozen plan owns the sidecar's
+     * attention, router, and shared-expert weights, while routed experts remain
+     * exclusively owned by the ExpertOverlay residency authority.
+     */
+    bool needsReplicatedMTPSidecarWeights(const GraphConfig &graph_config)
+    {
+        return graph_config.mtpUsesReplicatedDenseSidecarBinding();
+    }
+
+    /**
+     * @brief Resolve routed-parent ownership for the replicated MTP block.
+     *
+     * A plain TP MoE sidecar must carry its complete routed parents.  Only a
+     * frozen ExpertOverlay plan may omit them, because that plan has already
+     * installed the sole prepared per-expert residency authority.
+     */
+    MTPRoutedExpertWeightAuthority mtpRoutedExpertWeightAuthority(
+        const GraphConfig &graph_config)
+    {
+        const bool overlay_owned =
+            graph_config.moe.routed_expert_plan &&
+            graph_config.moe.routed_expert_plan->usesExpertOverlayAuthority();
+        return overlay_owned
+                   ? MTPRoutedExpertWeightAuthority::ExpertOverlay
+                   : MTPRoutedExpertWeightAuthority::SidecarParticipant;
     }
 
     /**
@@ -1721,7 +1824,7 @@ namespace llaminar2
             strategy.devices = {device};
         }
 
-        WeightPlan plan(strategy);
+        WeightPlan plan(strategy, options.physical_memory_owner);
 
         int tp_rank_or_device_index = 0;
         int tp_domain = -1;
@@ -1745,7 +1848,30 @@ namespace llaminar2
                 ? discoverDenseDecodeMTPSourceLayers(validation)
                 : std::unordered_set<int>{};
 
-        if (!options.replicated_terminal_lm_head_only &&
+        const bool sidecar_subset_only =
+            options.replicated_mtp_sidecar_subset &&
+            !options.dense_decode_replicated_subset;
+        std::unordered_set<std::string> replicated_mtp_sidecar_names;
+        if (sidecar_subset_only)
+        {
+            const MTPWeightManifest manifest = discoverMTPWeightManifest(
+                model_ctx.concreteLoader(),
+                model_ctx.architecture(),
+                model_ctx.totalBlockCount(),
+                /*explicit_mtp=*/true);
+            if (!manifest.available)
+            {
+                throw std::invalid_argument(
+                    "Replicated MTP sidecar weight planning could not resolve "
+                    "the model manifest: " +
+                    manifest.diagnostic);
+            }
+            const auto names = manifest.participantReplicaNames(
+                options.mtp_routed_expert_weight_authority);
+            replicated_mtp_sidecar_names.insert(names.begin(), names.end());
+        }
+        if ((!sidecar_subset_only || options.include_replicated_embedding) &&
+            !options.replicated_terminal_lm_head_only &&
             (!pp_config || pp_config->has_embedding || options.include_terminal_mtp_embedding))
         {
             /**
@@ -1773,7 +1899,8 @@ namespace llaminar2
         if (options.dense_decode_mirrored_embedding_only)
             return plan;
 
-        if (!pp_config || pp_config->has_lm_head)
+        if ((!sidecar_subset_only || options.include_replicated_terminal_head) &&
+            (!pp_config || pp_config->has_lm_head))
         {
             plan.add(makeSingleDeviceRequirement(
                 weight_mgr,
@@ -1831,7 +1958,13 @@ namespace llaminar2
 
         for (const auto &[weight_name, is_optional] : validation.weights_to_load)
         {
-            if (options.dense_decode_replicated_subset &&
+            if (sidecar_subset_only &&
+                !replicated_mtp_sidecar_names.contains(weight_name))
+            {
+                continue;
+            }
+            if (!sidecar_subset_only &&
+                options.dense_decode_replicated_subset &&
                 !includeWeightInDenseDecodeReplicatedPlan(
                     weight_name,
                     dense_decode_mtp_source_layers))
@@ -1931,7 +2064,9 @@ namespace llaminar2
         }
 
         InferenceStrategy combined_strategy = base_plan.strategy();
-        WeightPlan combined(std::move(combined_strategy));
+        WeightPlan combined(
+            std::move(combined_strategy),
+            base_plan.physicalMemoryOwner());
         for (const auto &requirement : base_plan.requirements())
         {
             const WeightRole role =
@@ -1982,78 +2117,6 @@ namespace llaminar2
             << graph_device.to_string() << ": requirements="
             << combined.size());
         return combined;
-    }
-
-    // =========================================================================
-    // Helper: Build ClusterInventory for GPU Collective Context
-    // =========================================================================
-
-    /**
-     * @brief Build a ClusterInventory from available GPU backends
-     *
-     * Detects local CUDA and ROCm GPUs via backend APIs and builds a
-     * single-rank ClusterInventory suitable for CollectiveContextFactory.
-     *
-     * For multi-node MPI, each rank builds its local inventory, and
-     * the full cluster inventory would be built via MPI_Allgather.
-     * For now, we support single-node with multiple GPUs.
-     *
-     * @param mpi_ctx MPI context (for rank info)
-     * @return ClusterInventory with detected devices
-     */
-    static ClusterInventory buildLocalClusterInventory(
-        const std::shared_ptr<IMPIContext> &mpi_ctx)
-    {
-        ClusterInventory inventory;
-        RankInventory rank_inv;
-
-        rank_inv.rank = mpi_ctx ? mpi_ctx->rank() : 0;
-        rank_inv.node_id = 0; // Single-node for now
-        rank_inv.local_rank = rank_inv.rank;
-        rank_inv.hostname = "localhost";
-
-#ifdef HAVE_CUDA
-        IBackend *cuda_backend = getCUDABackend();
-        if (cuda_backend)
-        {
-            int cuda_count = cuda_backend->deviceCount();
-            for (int i = 0; i < cuda_count; ++i)
-            {
-                DeviceInfo gpu;
-                gpu.type = DeviceType::CUDA;
-                gpu.local_device_id = i;
-                gpu.memory_bytes = cuda_backend->deviceMemoryTotal(i);
-                gpu.name = cuda_backend->deviceName(i);
-                gpu.supports_p2p = true;
-                rank_inv.gpus.push_back(gpu);
-            }
-            LOG_DEBUG("[InferenceRunner] Detected " << cuda_count << " CUDA GPU(s)");
-        }
-#endif
-
-#ifdef HAVE_ROCM
-        IBackend *rocm_backend = getROCmBackend();
-        if (rocm_backend)
-        {
-            int rocm_count = rocm_backend->deviceCount();
-            for (int i = 0; i < rocm_count; ++i)
-            {
-                DeviceInfo gpu;
-                gpu.type = DeviceType::ROCm;
-                gpu.local_device_id = i;
-                gpu.memory_bytes = rocm_backend->deviceMemoryTotal(i);
-                gpu.name = rocm_backend->deviceName(i);
-                rank_inv.gpus.push_back(gpu);
-            }
-            LOG_DEBUG("[InferenceRunner] Detected " << rocm_count << " ROCm GPU(s)");
-        }
-#endif
-
-        inventory.ranks.push_back(rank_inv);
-        inventory.world_size = mpi_ctx ? mpi_ctx->world_size() : 1;
-        inventory.buildNodeAggregations();
-
-        return inventory;
     }
 
     // =========================================================================
@@ -3032,6 +3095,8 @@ namespace llaminar2
             deps.pp_stage_config = config.pp_stage_config;
             deps.reusable_execution_workspaces =
                 config.reusable_execution_workspaces;
+            deps.physical_memory_authority =
+                physicalMemoryAuthorityForModel(model_ctx);
             deps.weight_manager = weight_mgr;
             orchestrator = std::make_unique<DeviceGraphOrchestrator>(
                 std::move(deps));
@@ -3051,7 +3116,6 @@ namespace llaminar2
 
         // Initialize inference state via schema-driven BufferArena path
         InferenceStateInitConfig init_config;
-        init_config.use_mapped_memory = config.use_mapped_memory;
         init_config.activation_seq_len =
             config.activation_seq_len > 0
                 ? config.activation_seq_len
@@ -3195,8 +3259,17 @@ namespace llaminar2
             ScopedWeightLoadDetailTimer timer("graph.build.collective_setup");
             if (local_tp_collectives_enabled)
             {
-                // Build local cluster inventory (detects CUDA/ROCm GPUs)
-                ClusterInventory cluster_inventory = buildLocalClusterInventory(mpi_ctx);
+                /*
+                 * LocalTP already owns the exact participant topology.  Project
+                 * that authority without touching an unselected backend: a
+                 * CPU+ROCm runner compiled with CUDA support must not create a
+                 * CUDA primary context and consume another campaign's VRAM.
+                 */
+                ClusterInventory cluster_inventory =
+                    buildLocalTPCollectiveInventory(
+                        local_tp_ctx->devices(),
+                        mpi_ctx ? mpi_ctx->rank() : 0,
+                        mpi_ctx ? mpi_ctx->world_size() : 1);
 
                 // Only enable GPU collectives if we have GPUs
                 if (cluster_inventory.hasAnyGPU())
@@ -3392,7 +3465,11 @@ namespace llaminar2
         // Host RAM preflight check: ensure enough memory before loading
         // =====================================================================
         if (!hostRamPreflight(
-                gguf_model, weights_to_load, device, model_ctx->usesMmap()))
+                gguf_model,
+                weights_to_load,
+                device,
+                model_ctx->usesMmap(),
+                graph_config.local_rank))
         {
             WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
             return false;
@@ -3678,19 +3755,24 @@ namespace llaminar2
         std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
         const bool needs_mirrored_mtp_head =
             needsMirroredMTPHeadWeights(graph_config);
+        const bool needs_replicated_mtp_sidecar =
+            needsReplicatedMTPSidecarWeights(graph_config);
         if ((graph_config.dense_tp_decode_replicated ||
              graph_config.dense_tp_decode_mirrored_embedding ||
-             needs_mirrored_mtp_head) &&
+             needs_mirrored_mtp_head ||
+             needs_replicated_mtp_sidecar) &&
             graph_config.tp_config)
         {
             const bool replicated_terminal_lm_head_only =
                 needs_mirrored_mtp_head &&
                 !graph_config.dense_tp_decode_replicated &&
-                !graph_config.dense_tp_decode_mirrored_embedding;
+                !graph_config.dense_tp_decode_mirrored_embedding &&
+                !needs_replicated_mtp_sidecar;
             const bool replicated_terminal_bindings_only =
                 needs_mirrored_mtp_head &&
                 !graph_config.dense_tp_decode_replicated &&
-                graph_config.dense_tp_decode_mirrored_embedding;
+                graph_config.dense_tp_decode_mirrored_embedding &&
+                !needs_replicated_mtp_sidecar;
             const FactoryPPStageConfig *decode_pp_config =
                 config.pp_stage_config.has_value()
                     ? &config.pp_stage_config.value()
@@ -3703,15 +3785,29 @@ namespace llaminar2
                 graph_config.tp_config.get(),
                 decode_pp_config,
                 SingleDeviceWeightPlanOptions{
+                    .physical_memory_owner =
+                        PhysicalMemoryOwner::AdditionalModelWeights,
                     .include_terminal_mtp_embedding =
                         requiresTerminalMTPSidecarEmbedding(graph_config, decode_pp_config),
                     .tp_rank_override = graph_config.local_rank,
                     .bypass_tensor_parallel = true,
                     .dense_decode_replicated_subset = graph_config.dense_tp_decode_replicated,
+                    .replicated_mtp_sidecar_subset =
+                        needs_replicated_mtp_sidecar &&
+                        !graph_config.dense_tp_decode_replicated,
+                    .mtp_routed_expert_weight_authority =
+                        mtpRoutedExpertWeightAuthority(graph_config),
+                    .include_replicated_embedding =
+                        graph_config.dense_tp_decode_replicated ||
+                        graph_config.dense_tp_decode_mirrored_embedding,
+                    .include_replicated_terminal_head =
+                        graph_config.dense_tp_decode_replicated ||
+                        needs_mirrored_mtp_head,
                     .dense_decode_mirrored_embedding_only =
                         graph_config.dense_tp_decode_mirrored_embedding &&
                         !graph_config.dense_tp_decode_replicated &&
-                        !needs_mirrored_mtp_head,
+                        !needs_mirrored_mtp_head &&
+                        !needs_replicated_mtp_sidecar,
                     .replicated_terminal_lm_head_only =
                         replicated_terminal_lm_head_only,
                     .replicated_terminal_bindings_only =
@@ -4159,6 +4255,8 @@ namespace llaminar2
         deps.pipeline_config = pipeline_config;
         deps.reusable_execution_workspaces =
             config.reusable_execution_workspaces;
+        deps.physical_memory_authority =
+            physicalMemoryAuthorityForModel(model_ctx);
 
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(deps));
@@ -4167,7 +4265,6 @@ namespace llaminar2
         // Initialize inference state
         // =====================================================================
         InferenceStateInitConfig init_config;
-        init_config.use_mapped_memory = config.use_mapped_memory;
         init_config.activation_seq_len =
             config.activation_seq_len > 0
                 ? config.activation_seq_len
@@ -4345,6 +4442,8 @@ namespace llaminar2
         deps.kv_rotation = std::move(kv_rotation);
         deps.reusable_execution_workspaces =
             config.reusable_execution_workspaces;
+        deps.physical_memory_authority =
+            physicalMemoryAuthorityForModel(model_ctx);
         deps.weight_manager = model_ctx->concreteWeightManager();
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(deps));
@@ -4360,7 +4459,6 @@ namespace llaminar2
         // Initialize inference state (allocates buffers)
         // =====================================================================
         InferenceStateInitConfig init_config;
-        init_config.use_mapped_memory = config.use_mapped_memory;
         init_config.activation_seq_len =
             config.activation_seq_len > 0
                 ? config.activation_seq_len
@@ -4609,6 +4707,8 @@ namespace llaminar2
         deps.domain_tp_contexts = std::move(owned_domain_tp_contexts);
         deps.reusable_execution_workspaces =
             config.reusable_execution_workspaces;
+        deps.physical_memory_authority =
+            physicalMemoryAuthorityForModel(model_ctx);
         if (config.pp_stage_config.has_value())
             deps.pp_stage_config = config.pp_stage_config.value();
         if (auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx))
@@ -4616,7 +4716,7 @@ namespace llaminar2
         // topology and collective_ctx left as nullptr for single-rank testing
 
         // Create DeviceGraphOrchestrator with injected dependencies
-        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+        auto orchestrator = DeviceGraphOrchestrator::createForTest(
             std::move(deps));
 
         // Initialize graph cache
@@ -4624,7 +4724,6 @@ namespace llaminar2
 
         // Initialize inference state via schema-driven BufferArena path
         InferenceStateInitConfig init_config;
-        init_config.use_mapped_memory = config.use_mapped_memory;
         init_config.activation_seq_len =
             config.activation_seq_len > 0
                 ? config.activation_seq_len
@@ -4759,19 +4858,24 @@ namespace llaminar2
             std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
             const bool needs_mirrored_mtp_head =
                 needsMirroredMTPHeadWeights(graph_config);
+            const bool needs_replicated_mtp_sidecar =
+                needsReplicatedMTPSidecarWeights(graph_config);
             if ((graph_config.dense_tp_decode_replicated ||
                  graph_config.dense_tp_decode_mirrored_embedding ||
-                 needs_mirrored_mtp_head) &&
+                 needs_mirrored_mtp_head ||
+                 needs_replicated_mtp_sidecar) &&
                 graph_config.tp_config)
             {
                 const bool replicated_terminal_lm_head_only =
                     needs_mirrored_mtp_head &&
                     !graph_config.dense_tp_decode_replicated &&
-                    !graph_config.dense_tp_decode_mirrored_embedding;
+                    !graph_config.dense_tp_decode_mirrored_embedding &&
+                    !needs_replicated_mtp_sidecar;
                 const bool replicated_terminal_bindings_only =
                     needs_mirrored_mtp_head &&
                     !graph_config.dense_tp_decode_replicated &&
-                    graph_config.dense_tp_decode_mirrored_embedding;
+                    graph_config.dense_tp_decode_mirrored_embedding &&
+                    !needs_replicated_mtp_sidecar;
                 /*
                  * The decode-replicated dense sidecar is an alternate weight
                  * source for this runner, not a full-model escape hatch. In
@@ -4788,15 +4892,29 @@ namespace llaminar2
                     graph_config.tp_config.get(),
                     &pp_cfg,
                     SingleDeviceWeightPlanOptions{
+                        .physical_memory_owner =
+                            PhysicalMemoryOwner::AdditionalModelWeights,
                         .include_terminal_mtp_embedding =
                             requiresTerminalMTPSidecarEmbedding(graph_config, &pp_cfg),
                         .tp_rank_override = graph_config.local_rank,
                         .bypass_tensor_parallel = true,
                         .dense_decode_replicated_subset = graph_config.dense_tp_decode_replicated,
+                        .replicated_mtp_sidecar_subset =
+                            needs_replicated_mtp_sidecar &&
+                            !graph_config.dense_tp_decode_replicated,
+                        .mtp_routed_expert_weight_authority =
+                            mtpRoutedExpertWeightAuthority(graph_config),
+                        .include_replicated_embedding =
+                            graph_config.dense_tp_decode_replicated ||
+                            graph_config.dense_tp_decode_mirrored_embedding,
+                        .include_replicated_terminal_head =
+                            graph_config.dense_tp_decode_replicated ||
+                            needs_mirrored_mtp_head,
                         .dense_decode_mirrored_embedding_only =
                             graph_config.dense_tp_decode_mirrored_embedding &&
                             !graph_config.dense_tp_decode_replicated &&
-                            !needs_mirrored_mtp_head,
+                            !needs_mirrored_mtp_head &&
+                            !needs_replicated_mtp_sidecar,
                         .replicated_terminal_lm_head_only =
                             replicated_terminal_lm_head_only,
                         .replicated_terminal_bindings_only =
@@ -4942,19 +5060,24 @@ namespace llaminar2
                     std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
                     const bool needs_mirrored_mtp_head =
                         needsMirroredMTPHeadWeights(graph_config);
+                    const bool needs_replicated_mtp_sidecar =
+                        needsReplicatedMTPSidecarWeights(graph_config);
                     if ((graph_config.dense_tp_decode_replicated ||
                          graph_config.dense_tp_decode_mirrored_embedding ||
-                         needs_mirrored_mtp_head) &&
+                         needs_mirrored_mtp_head ||
+                         needs_replicated_mtp_sidecar) &&
                         graph_config.tp_config)
                     {
                         const bool replicated_terminal_lm_head_only =
                             needs_mirrored_mtp_head &&
                             !graph_config.dense_tp_decode_replicated &&
-                            !graph_config.dense_tp_decode_mirrored_embedding;
+                            !graph_config.dense_tp_decode_mirrored_embedding &&
+                            !needs_replicated_mtp_sidecar;
                         const bool replicated_terminal_bindings_only =
                             needs_mirrored_mtp_head &&
                             !graph_config.dense_tp_decode_replicated &&
-                            graph_config.dense_tp_decode_mirrored_embedding;
+                            graph_config.dense_tp_decode_mirrored_embedding &&
+                            !needs_replicated_mtp_sidecar;
                         const FactoryPPStageConfig *decode_pp_config =
                             config.pp_stage_config.has_value()
                                 ? &config.pp_stage_config.value()
@@ -4967,15 +5090,29 @@ namespace llaminar2
                             graph_config.tp_config.get(),
                             decode_pp_config,
                             SingleDeviceWeightPlanOptions{
+                                .physical_memory_owner =
+                                    PhysicalMemoryOwner::AdditionalModelWeights,
                                 .include_terminal_mtp_embedding =
                                     requiresTerminalMTPSidecarEmbedding(graph_config, decode_pp_config),
                                 .tp_rank_override = graph_config.local_rank,
                                 .bypass_tensor_parallel = true,
                                 .dense_decode_replicated_subset = graph_config.dense_tp_decode_replicated,
+                                .replicated_mtp_sidecar_subset =
+                                    needs_replicated_mtp_sidecar &&
+                                    !graph_config.dense_tp_decode_replicated,
+                                .mtp_routed_expert_weight_authority =
+                                    mtpRoutedExpertWeightAuthority(graph_config),
+                                .include_replicated_embedding =
+                                    graph_config.dense_tp_decode_replicated ||
+                                    graph_config.dense_tp_decode_mirrored_embedding,
+                                .include_replicated_terminal_head =
+                                    graph_config.dense_tp_decode_replicated ||
+                                    needs_mirrored_mtp_head,
                                 .dense_decode_mirrored_embedding_only =
                                     graph_config.dense_tp_decode_mirrored_embedding &&
                                     !graph_config.dense_tp_decode_replicated &&
-                                    !needs_mirrored_mtp_head,
+                                    !needs_mirrored_mtp_head &&
+                                    !needs_replicated_mtp_sidecar,
                                 .replicated_terminal_lm_head_only =
                                     replicated_terminal_lm_head_only,
                                 .replicated_terminal_bindings_only =

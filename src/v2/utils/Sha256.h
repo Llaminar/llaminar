@@ -5,8 +5,8 @@
  * Runtime artifacts that outlive a process must be named from the bytes that
  * produced them, not from a pathname that can later point at another file.
  * This helper computes the SHA-256 digest of a file without materializing the
- * whole file in RAM. Concurrent callers asking for the same immutable file
- * identity share one calculation.
+ * whole file in RAM. Concurrent callers in one process asking for the same
+ * immutable file identity share one calculation.
  */
 
 #pragma once
@@ -33,31 +33,6 @@ namespace llaminar2
      */
     std::optional<std::string> sha256FileHex(
         const std::filesystem::path &path,
-        std::string *error = nullptr);
-
-    /**
-     * @brief Compute a file digest through a trusted cross-process cache.
-     *
-     * The cache key binds the canonical path, device/inode identity, byte
-     * length, modification time, and change time. A process takes an advisory
-     * lock for that exact identity, validates the identity again, and either
-     * consumes the already-authenticated digest or streams every file byte and
-     * atomically publishes the result. Consequently several parity processes
-     * can authenticate one immutable GGUF once without accepting a digest for
-     * replaced or modified bytes.
-     *
-     * The caller must provide a private, trusted cache directory. Cache setup,
-     * locking, identity instability, and publication failures are reported as
-     * hard errors; this explicit mode never falls back to independent scans.
-     *
-     * @param path File whose exact contents identify the artifact namespace.
-     * @param cache_directory Private directory shared by cooperating processes.
-     * @param error Optional diagnostic populated when authentication fails.
-     * @return Sixty-four lowercase hexadecimal characters on success.
-     */
-    std::optional<std::string> sha256FileHexShared(
-        const std::filesystem::path &path,
-        const std::filesystem::path &cache_directory,
         std::string *error = nullptr);
 
     /**

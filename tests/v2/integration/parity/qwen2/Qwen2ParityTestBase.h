@@ -1065,6 +1065,8 @@ namespace llaminar2::test::parity::qwen2
                 cfg().mtp_expected_draft_depth;
             config_.mtp_expected_graph_capacity =
                 cfg().mtp_expected_graph_capacity;
+            config_.mtp_recursive_aggregate_cosine_floor =
+                cfg().mtp_recursive_aggregate_cosine_floor;
             config_.graph_snapshot_policy = cfg().graph_snapshot_policy;
         }
 
@@ -2194,7 +2196,6 @@ namespace llaminar2::test::parity::qwen2
             base_runner_config.max_seq_len = 4096;
             base_runner_config.batch_size = 1;
             base_runner_config.force_graph = true;
-            base_runner_config.use_mapped_memory = true; // For GPU snapshot capture
             applyDeclarativeRunnerConfig(base_runner_config);
 
             TreeToRunnerCompiler::CompileContext compile_ctx;
@@ -2425,7 +2426,6 @@ namespace llaminar2::test::parity::qwen2
 
             DeviceId device = getDevice();
             if (device.is_gpu())
-                inf_config.use_mapped_memory = true;
 
             if (cfg().is_cross_rank_pp())
             {

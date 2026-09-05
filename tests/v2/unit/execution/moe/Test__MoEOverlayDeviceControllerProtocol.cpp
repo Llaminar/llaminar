@@ -153,6 +153,39 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoEOverlayDeviceControllerProtocol,
+         PreparedContextRestoreAdvancesThroughTheDurableRetirementStateMachine)
+    {
+        ProtocolFixture fixture(3u);
+        const auto transaction = prepareCommand(
+            fixture,
+            MoEOverlayDeviceControllerTransactionKind::
+                PreparedContextRestore,
+            2u,
+            8u * 1024u * 1024u);
+
+        admit(fixture, transaction);
+        EXPECT_EQ(fixture.protocol.currentDurableEpoch(), 8u);
+        EXPECT_EQ(fixture.header.admission_epoch, 8u);
+        ASSERT_TRUE(fixture.protocol.beginDynamicRetirement(transaction));
+        publishReverse(
+            fixture.groups.size(),
+            [&](std::uint32_t group)
+            {
+                return fixture.protocol.acknowledgeRetired(
+                    group, transaction, 7u);
+            });
+        ASSERT_TRUE(
+            fixture.protocol.completeDynamicRetirement(transaction));
+        EXPECT_EQ(
+            fixture.protocol.state(),
+            MoEOverlayDeviceControllerState::Complete);
+        EXPECT_EQ(fixture.header.completed_transaction, transaction);
+        EXPECT_EQ(
+            fixture.protocol.error(),
+            MoEOverlayDeviceControllerError::None);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerProtocol,
          StaleIdleDrainAcknowledgementCannotSatisfyLaterShutdown)
     {
         MoEOverlayWorkerDrainProtocol drain;

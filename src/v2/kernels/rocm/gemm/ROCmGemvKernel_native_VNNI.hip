@@ -220,7 +220,7 @@ static void recordNativeVNNISmallMLaunch(
     int projections,
     int arithmetic_policy_codebook = -1)
 {
-    if (!llaminar2::PerfStatsCollector::isEnabled())
+    if (!llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
         return;
 
     const char* path = (kb <= 1) ? "direct" : "split_reduce";
@@ -846,7 +846,7 @@ static void recordROCmMoEDescriptorLocalDecode(
     uint32_t policy_codebook_mask,
     const ROCmMoESerialM1PolicyTable& policy_table)
 {
-    if (!llaminar2::PerfStatsCollector::isEnabled())
+    if (!llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
         return;
     llaminar2::PerfStatsCollector::addCounter(
         "kernel",

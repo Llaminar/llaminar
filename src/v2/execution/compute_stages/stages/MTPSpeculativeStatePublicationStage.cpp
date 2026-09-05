@@ -8,6 +8,7 @@
 #include "../../../backends/IBackend.h"
 #include "../../../execution/mtp/MTPSpecStatePublisher.h"
 #include "../../../execution/moe/IMoEGroupedVerifierHistogramPublisher.h"
+#include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../kernels/IKVCache.h"
 #include "../../../kernels/common/SamplingMath.h"
 #include "../../../memory/BufferId.h"
@@ -71,6 +72,136 @@ namespace llaminar2
                             : -1));
                 return false;
             }
+        }
+        return true;
+    }
+
+    bool MTPSpeculativeStatePublicationStage::transitionGraphCaptureActivity(
+        IDeviceContext *ctx,
+        void *stream,
+        GraphCaptureActivityTransition transition)
+    {
+        if (!ctx || !stream)
+        {
+            LOG_ERROR(
+                "[MTPSpeculativeStatePublicationStage] Native-capture "
+                "activity requires an exact context and stream");
+            return false;
+        }
+        if (params_.moe_histogram_publishers.empty())
+            return true;
+        if (stream != params_.moe_histogram_publication_stream)
+        {
+            LOG_ERROR(
+                "[MTPSpeculativeStatePublicationStage] Native-capture "
+                "activity received a foreign histogram publication stream"
+                << " stream=" << stream
+                << " expected="
+                << params_.moe_histogram_publication_stream);
+            return false;
+        }
+
+        RuntimeHistogramProducerCaptureTransition runtime_transition;
+        switch (transition)
+        {
+        case GraphCaptureActivityTransition::Entering:
+            runtime_transition =
+                RuntimeHistogramProducerCaptureTransition::Entering;
+            break;
+        case GraphCaptureActivityTransition::Completed:
+            runtime_transition =
+                RuntimeHistogramProducerCaptureTransition::Completed;
+            break;
+        case GraphCaptureActivityTransition::Aborted:
+            runtime_transition =
+                RuntimeHistogramProducerCaptureTransition::Aborted;
+            break;
+        }
+
+        if (transition != GraphCaptureActivityTransition::Entering)
+        {
+            bool accepted = true;
+            for (IMoEGroupedVerifierHistogramPublisher *publisher :
+                 params_.moe_histogram_publishers)
+            {
+                const bool publisher_accepted =
+                    publisher &&
+                    publisher
+                        ->transitionGroupedVerifierHistogramProducerCapture(
+                            stream, runtime_transition);
+                if (!publisher_accepted)
+                {
+                    LOG_ERROR(
+                        "[MTPSpeculativeStatePublicationStage] Failed to "
+                        "publish a terminal deferred MoE histogram capture "
+                        "transition"
+                        << " publisher="
+                        << (publisher
+                                ? publisher
+                                      ->groupedVerifierHistogramPublisherName()
+                                : std::string_view{"null"})
+                        << " layer="
+                        << (publisher
+                                ? publisher
+                                      ->groupedVerifierHistogramLayerIndex()
+                                : -1));
+                }
+                /* Terminal totality matters more than the first diagnostic:
+                 * visit every publisher so one failure cannot strand later
+                 * runtime tables in capture-active state. */
+                accepted = publisher_accepted && accepted;
+            }
+            return accepted;
+        }
+
+        std::size_t transitioned_count = 0u;
+        for (IMoEGroupedVerifierHistogramPublisher *publisher :
+             params_.moe_histogram_publishers)
+        {
+            if (!publisher ||
+                !publisher->transitionGroupedVerifierHistogramProducerCapture(
+                    stream, runtime_transition))
+            {
+                LOG_ERROR(
+                    "[MTPSpeculativeStatePublicationStage] Failed to publish "
+                    "a deferred MoE histogram capture transition"
+                    << " publisher="
+                    << (publisher
+                            ? publisher->groupedVerifierHistogramPublisherName()
+                            : std::string_view{"null"})
+                    << " layer="
+                    << (publisher
+                            ? publisher->groupedVerifierHistogramLayerIndex()
+                            : -1));
+
+                /* Entering creates state that must be unwound if a later
+                 * publisher rejects the same transaction. */
+                while (transitioned_count > 0u)
+                {
+                    --transitioned_count;
+                    IMoEGroupedVerifierHistogramPublisher *entered =
+                        params_.moe_histogram_publishers[
+                            transitioned_count];
+                    if (!entered ||
+                        !entered
+                             ->transitionGroupedVerifierHistogramProducerCapture(
+                                 stream,
+                                 RuntimeHistogramProducerCaptureTransition::
+                                     Aborted))
+                    {
+                        LOG_ERROR(
+                            "[MTPSpeculativeStatePublicationStage] Failed "
+                            "to unwind a partial histogram capture entry"
+                            << " layer="
+                            << (entered
+                                    ? entered
+                                          ->groupedVerifierHistogramLayerIndex()
+                                    : -1));
+                    }
+                }
+                return false;
+            }
+            ++transitioned_count;
         }
         return true;
     }

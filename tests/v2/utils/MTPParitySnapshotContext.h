@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace llaminar2::test::parity
 {
@@ -56,6 +58,50 @@ namespace llaminar2::test::parity
         MTPParityCheckpointContext context =
             MTPParityCheckpointContext::HostConditionTokenLivePosition;
         int reference_depth = -1;
+    };
+
+    /**
+     * @brief Exact namespaces of one numerically compared production MTP bank.
+     *
+     * A sidecar comparison is reported at a synthetic model-layer index, but
+     * its live snapshot does not use a guessed `layerN_` key. The retained
+     * graph publishes through a typed runtime-context prefix while the
+     * Hugging Face pack uses a depth/branch-qualified prefix. Carrying both
+     * authorities through the comparison callback prevents evidence collectors
+     * from reconstructing either namespace from the synthetic layer number.
+     */
+    struct ComparedMTPParityCheckpoint
+    {
+        int reference_step = -1; ///< Main decode row owning the transaction.
+        int model_layer = -1;    ///< Synthetic sidecar layer in parity CSVs.
+        MTPParityCheckpointIdentity identity; ///< Runtime role/reference depth.
+        std::string production_stage_prefix;  ///< Live prefix ending `MTP0_`.
+        std::string reference_stage_prefix;   ///< HF prefix ending `MTPD_`.
+
+        /** @return Whether this identity names both checkpoint authorities. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return reference_step >= 0 && model_layer >= 0 &&
+                   identity.reference_depth >= 0 &&
+                   !production_stage_prefix.empty() &&
+                   production_stage_prefix.back() == '_' &&
+                   !reference_stage_prefix.empty() &&
+                   reference_stage_prefix.back() == '_';
+        }
+
+        /** @return Exact production key for one semantic stage suffix. */
+        [[nodiscard]] std::string productionKey(
+            std::string_view semantic_stage) const
+        {
+            return production_stage_prefix + std::string(semantic_stage);
+        }
+
+        /** @return Exact Hugging Face key for one semantic stage suffix. */
+        [[nodiscard]] std::string referenceKey(
+            std::string_view semantic_stage) const
+        {
+            return reference_stage_prefix + std::string(semantic_stage);
+        }
     };
 
     /**
@@ -259,6 +305,261 @@ namespace llaminar2::test::parity
         int32_t serial_token = -1;
         int32_t grouped_token = -1;
     };
+
+    /**
+     * @brief Reference row whose first speculative token is serially correct.
+     *
+     * The row is selected from immutable Hugging Face evidence before the
+     * production request starts.  It lets one response-bounded transaction prove
+     * both its retained checkpoint bank and a visible accepted draft without
+     * launching a second inference lifecycle.
+     */
+    struct MTPParityAcceptedDraftReference
+    {
+        size_t reference_step = 0; ///< Decode-step identity of the main row.
+        int32_t base_token = -1; ///< Serial token emitted before the draft.
+        int32_t first_draft_token = -1; ///< Matching serial/HF draft token.
+
+        /** @return Whether both token identities are initialized. */
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return base_token >= 0 && first_draft_token >= 0;
+        }
+    };
+
+    /**
+     * @brief One ordinary decode row used to prove a serial token edge.
+     *
+     * Teacher forcing is a valid free-running serial oracle only while every
+     * forced token equals the predecessor row's production argmax.  Carrying
+     * both sides of that edge prevents a numerically compared but divergent
+     * teacher-forced trajectory from being reused by the grouped-MTP proof.
+     */
+    struct MTPParityCertifiedDecodeRow
+    {
+        size_t reference_step = 0; ///< Contiguous row identity, beginning at zero.
+        int32_t committed_token = -1; ///< Token actually forwarded by this row.
+        int32_t predicted_successor_token = -1; ///< Production argmax after it.
+    };
+
+    /** @brief Why ordinary decode could not certify a requested serial horizon. */
+    enum class MTPParitySerialCertificationFailure
+    {
+        None,
+        InvalidRequestedHorizon,
+        InvalidPrefillPrediction,
+        MissingDecodeRow,
+        NonContiguousDecodeRow,
+        DiscontinuousTokenEdge,
+        InvalidSuccessorPrediction,
+    };
+
+    /** @return Stable diagnostic spelling for one certification outcome. */
+    [[nodiscard]] constexpr std::string_view
+    mtpParitySerialCertificationFailureName(
+        MTPParitySerialCertificationFailure failure) noexcept
+    {
+        switch (failure)
+        {
+        case MTPParitySerialCertificationFailure::None:
+            return "none";
+        case MTPParitySerialCertificationFailure::InvalidRequestedHorizon:
+            return "invalid_requested_horizon";
+        case MTPParitySerialCertificationFailure::InvalidPrefillPrediction:
+            return "invalid_prefill_prediction";
+        case MTPParitySerialCertificationFailure::MissingDecodeRow:
+            return "missing_decode_row";
+        case MTPParitySerialCertificationFailure::NonContiguousDecodeRow:
+            return "non_contiguous_decode_row";
+        case MTPParitySerialCertificationFailure::DiscontinuousTokenEdge:
+            return "discontinuous_token_edge";
+        case MTPParitySerialCertificationFailure::InvalidSuccessorPrediction:
+            return "invalid_successor_prediction";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Typed result of deriving free-running serial tokens from decode.
+     */
+    struct MTPParitySerialTrajectoryCertification
+    {
+        std::vector<int32_t> tokens; ///< Exact certified output prefix.
+        MTPParitySerialCertificationFailure failure =
+            MTPParitySerialCertificationFailure::None;
+        size_t failure_row = std::numeric_limits<size_t>::max();
+        int32_t expected_token = -1;
+        int32_t observed_token = -1;
+
+        /** @return Whether the complete requested output horizon was proven. */
+        [[nodiscard]] bool complete(size_t required_output_count) const noexcept
+        {
+            return required_output_count > 0u &&
+                   failure == MTPParitySerialCertificationFailure::None &&
+                   tokens.size() == required_output_count;
+        }
+    };
+
+    /**
+     * @brief Certify that teacher-forced rows equal free-running serial decode.
+     *
+     * The prefill argmax is serial output zero. Decode row zero must consume
+     * that exact token, then its argmax becomes serial output one, and so on.
+     * This induction is byte-token exact; Hugging Face remains the independent
+     * tensor oracle but is not substituted for Llaminar's serial trajectory.
+     * A missing row is distinguishable from a broken edge so callers may run
+     * an explicitly longer oracle only when the compared corpus is too short.
+     *
+     * @param prefill_predicted_token Production argmax after prompt prefill.
+     * @param rows Ordered authenticated production decode rows.
+     * @param required_output_count Number of serial output tokens required.
+     * @return Certified prefix and an explicit terminal status.
+     */
+    [[nodiscard]] inline MTPParitySerialTrajectoryCertification
+    certifyMTPParitySerialTrajectory(
+        int32_t prefill_predicted_token,
+        std::span<const MTPParityCertifiedDecodeRow> rows,
+        size_t required_output_count)
+    {
+        MTPParitySerialTrajectoryCertification result;
+        if (required_output_count == 0u)
+        {
+            result.failure =
+                MTPParitySerialCertificationFailure::InvalidRequestedHorizon;
+            return result;
+        }
+        if (prefill_predicted_token < 0)
+        {
+            result.failure =
+                MTPParitySerialCertificationFailure::InvalidPrefillPrediction;
+            return result;
+        }
+
+        result.tokens.reserve(required_output_count);
+        result.tokens.push_back(prefill_predicted_token);
+        while (result.tokens.size() < required_output_count)
+        {
+            const size_t row_index = result.tokens.size() - 1u;
+            if (row_index >= rows.size())
+            {
+                result.failure =
+                    MTPParitySerialCertificationFailure::MissingDecodeRow;
+                result.failure_row = row_index;
+                return result;
+            }
+
+            const MTPParityCertifiedDecodeRow &row = rows[row_index];
+            if (row.reference_step != row_index)
+            {
+                result.failure =
+                    MTPParitySerialCertificationFailure::NonContiguousDecodeRow;
+                result.failure_row = row_index;
+                result.expected_token = static_cast<int32_t>(row_index);
+                result.observed_token = static_cast<int32_t>(row.reference_step);
+                return result;
+            }
+            if (row.committed_token != result.tokens.back())
+            {
+                result.failure =
+                    MTPParitySerialCertificationFailure::DiscontinuousTokenEdge;
+                result.failure_row = row_index;
+                result.expected_token = result.tokens.back();
+                result.observed_token = row.committed_token;
+                return result;
+            }
+            if (row.predicted_successor_token < 0)
+            {
+                result.failure = MTPParitySerialCertificationFailure::
+                    InvalidSuccessorPrediction;
+                result.failure_row = row_index;
+                return result;
+            }
+            result.tokens.push_back(row.predicted_successor_token);
+        }
+        return result;
+    }
+
+    /**
+     * @brief Execution and response geometry for one parity checkpoint transaction.
+     *
+     * GPU generation owns its response ledger on device. A two-token public
+     * budget admits one condition row plus one speculative output, while the
+     * device controller deliberately retains the complete selected depth-N
+     * graph geometry and clips only publication at the commit boundary. That
+     * is the smallest production request which executes one grouped verifier
+     * transaction and cannot advance into a second transaction.
+     *
+     * CPU generation has no resident controller to own that separation, so its
+     * public budget remains the complete condition-plus-drafts width.
+     */
+    struct MTPParityCheckpointTransactionPlan
+    {
+        int execution_draft_depth = 0; ///< Captured/selected predictor width.
+        int response_token_budget = 0; ///< Public decodeStep response limit.
+        bool device_commit_boundary = false; ///< Device clips publication only.
+
+        /** @return Whether the plan describes one legal speculative transaction. */
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return execution_draft_depth > 0 && response_token_budget > 1 &&
+                   (!device_commit_boundary || response_token_budget == 2);
+        }
+    };
+
+    /**
+     * @brief Plan one checkpoint transaction without changing graph geometry.
+     *
+     * @param device_controller_owned Whether a GPU resident controller owns
+     *        response/state publication.
+     * @param execution_draft_depth Positive selected MTP graph depth.
+     * @return A valid response/execution plan, or an invalid zero plan.
+     */
+    [[nodiscard]] constexpr MTPParityCheckpointTransactionPlan
+    makeMTPParityCheckpointTransactionPlan(
+        bool device_controller_owned,
+        int execution_draft_depth) noexcept
+    {
+        if (execution_draft_depth <= 0 ||
+            execution_draft_depth == std::numeric_limits<int>::max())
+        {
+            return {};
+        }
+        return {
+            .execution_draft_depth = execution_draft_depth,
+            .response_token_budget =
+                device_controller_owned ? 2 : execution_draft_depth + 1,
+            .device_commit_boundary = device_controller_owned,
+        };
+    }
+
+    /**
+     * @brief Find the earliest reference row with one provably accepted draft.
+     *
+     * @param serial_tokens Ordered reference decode tokens.
+     * @param first_draft_tokens MTP0 argmax at each aligned decode step.
+     * @return The first row where MTP0 predicts the following serial token.
+     */
+    [[nodiscard]] constexpr std::optional<MTPParityAcceptedDraftReference>
+    firstMTPParityAcceptedDraftReference(
+        std::span<const int32_t> serial_tokens,
+        std::span<const int32_t> first_draft_tokens) noexcept
+    {
+        if (serial_tokens.size() < 2u || first_draft_tokens.empty())
+            return std::nullopt;
+        const size_t candidate_count = std::min(
+            first_draft_tokens.size(), serial_tokens.size() - 1u);
+        for (size_t step = 0u; step < candidate_count; ++step)
+        {
+            if (first_draft_tokens[step] != serial_tokens[step + 1u])
+                continue;
+            return MTPParityAcceptedDraftReference{
+                .reference_step = step,
+                .base_token = serial_tokens[step],
+                .first_draft_token = serial_tokens[step + 1u],
+            };
+        }
+        return std::nullopt;
+    }
 
     /**
      * @brief Compare one grouped MTP response with a serial token prefix.

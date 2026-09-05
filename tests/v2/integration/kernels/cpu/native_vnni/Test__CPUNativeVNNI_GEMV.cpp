@@ -989,6 +989,142 @@ namespace
         return formats;
     }();
 
+    /**
+     * @test Prove the short-K GPU-aligned expert tree for every codebook.
+     *
+     * A Qwen MoE down projection with K=512 contains exactly sixteen Q8
+     * blocks, so every canonical device-ordered partition owns one physical
+     * block.  The economical two-row CPU implementation may elide partition
+     * bookkeeping in that geometry, but it must still retain every explicit
+     * binary32 multiply/add boundary.  GCC once contracted those boundaries
+     * into an FMA only after the AVX2 helper was inlined, making M=2 differ
+     * from two serial decode rows while broader stage tests happened to select
+     * another task geometry.
+     *
+     * One OpenMP worker deliberately makes the public layer-batched API choose
+     * its local ordered-tree implementation.  CTest registers the same source
+     * once for AVX2 and once for AVX-512; all supported source formats and MTP
+     * depths, including the depth-15 and dispatch-totality witnesses, compare
+     * every output byte against independent production M=1 calls.
+     */
+    TEST_F(
+        CPUNativeVNNIGemvTest,
+        GPUAlignedExpertOneBlockPartitionsAllFormatsRuntimeMMatchSerialDecode)
+    {
+        constexpr int N = 64;
+        constexpr int K = 512;
+        constexpr std::array<int, 4> runtime_rows = {2, 3, 15, 65};
+        constexpr auto policy =
+            CPUProjectionNumericalPolicy::GPUAlignedExpert;
+
+        ScopedOMPThreadCount single_worker(1);
+        const auto &formats = quantizedMoEVerifierFormats();
+        ASSERT_EQ(formats.size(), quantizedVerifierFormats().size())
+            << "The expert arithmetic regression must cover every canonical "
+               "quantized source format";
+
+        for (size_t format_index = 0;
+             format_index < formats.size();
+             ++format_index)
+        {
+            const auto &format = formats[format_index];
+            SCOPED_TRACE(format.label);
+            auto weights = format.create(
+                {static_cast<size_t>(N), static_cast<size_t>(K)},
+                static_cast<uint32_t>(0xA510u + format_index * 131u));
+            ASSERT_NE(weights, nullptr);
+
+            CPUNativeVNNIGemmKernel kernel(
+                weights.get(), 0, -1, policy);
+            ASSERT_TRUE(kernel.isValid());
+            const auto &packed = kernel.packedWeights();
+            ASSERT_EQ(
+                packed.numerical_policy,
+                CPUProjectionNumericalPolicy::GPUAlignedExpert);
+            ASSERT_TRUE(
+                MoEProjectionNumericalContract::
+                    oneNativeVNNIBlockPerOrderedPartition(K));
+
+            const int blocks_per_row = packed.blocks_per_row;
+            ASSERT_EQ(
+                blocks_per_row,
+                MoEProjectionNumericalContract::ordered_k_partitions);
+
+            for (int M : runtime_rows)
+            {
+                SCOPED_TRACE(std::string("M=") + std::to_string(M));
+                std::vector<float> input(
+                    static_cast<size_t>(M) * static_cast<size_t>(K));
+                for (size_t index = 0; index < input.size(); ++index)
+                {
+                    const int centered = static_cast<int>(
+                        (index * 37u + index / 11u +
+                         format_index * 17u) % 257u) - 128;
+                    input[index] =
+                        static_cast<float>(centered) * 0.006125f +
+                        static_cast<float>(
+                            static_cast<int>(index % 7u) - 3) *
+                            0.000091f;
+                }
+
+                std::vector<Q8_1Block> quantized(
+                    static_cast<size_t>(M) *
+                    static_cast<size_t>(blocks_per_row));
+                quantize_activations_to_q8_1(
+                    input.data(),
+                    quantized.data(),
+                    M,
+                    K,
+                    blocks_per_row,
+                    policy);
+
+                std::vector<float> grouped(
+                    static_cast<size_t>(M) * static_cast<size_t>(N),
+                    0.0f);
+                std::vector<float> serial(grouped.size(), 0.0f);
+                CPUNativeVNNIGemmKernel::BatchedPrequantizedProjectionDesc
+                    descriptor{
+                        .kernel = &kernel,
+                        .input_q8 = quantized.data(),
+                        .output = grouped.data(),
+                        .bias = nullptr,
+                        .rows = M,
+                        .n = N,
+                        .ldc = N,
+                        .verifier_schedule = VerifierRowsPolicy::Pairwise,
+                    };
+                ASSERT_TRUE(
+                    CPUNativeVNNIGemmKernel::
+                        multiply_batched_preq_decode_equivalent(
+                            &descriptor, 1, K));
+
+                for (int row = 0; row < M; ++row)
+                {
+                    gemv_native_vnni_preq(
+                        packed,
+                        quantized.data() +
+                            static_cast<size_t>(row) * blocks_per_row,
+                        serial.data() + static_cast<size_t>(row) * N,
+                        ISAPath::AUTO);
+                }
+                ASSERT_TRUE(std::any_of(
+                    serial.begin(),
+                    serial.end(),
+                    [](float value)
+                    {
+                        return std::isfinite(value) && value != 0.0f;
+                    })) << format.label << " produced a degenerate witness";
+                expectBitwiseEqualFloatRows(
+                    std::string(format.label) +
+                        " GPU-aligned one-block-partition grouped rows",
+                    grouped.data(),
+                    serial.data(),
+                    grouped.size(),
+                    N);
+            }
+        }
+    }
+
     TEST_F(CPUNativeVNNIGemvTest, MTP_FusedExpertDown_AllFormatsMatchSerialDecodeRows)
     {
         constexpr int N = 256;
@@ -1811,7 +1947,7 @@ namespace
     }
 
     /**
-     * @test Prove a replicated MTP head matches concatenated serial TP shards.
+     * @test Prove a replicated MTP head matches uneven serial TP shards.
      *
      * Mirrored terminal-head ownership removes the tiny logits allgather by
      * keeping the complete weight and output on every rank. That ownership
@@ -1819,14 +1955,16 @@ namespace
      * used by the ordinary vocabulary-sharded serial oracle. For every CPU
      * NativeVNNI codebook, this regression executes the real full-width M=1 and
      * grouped-verifier entry points inside an output-partition equivalence scope,
-     * then compares each output byte with two independently packed half-width
-     * kernels representing the serial TP ranks.
+     * then compares each output byte with three independently packed TP=3
+     * kernels. N=512 deliberately produces 171/171/170 columns, proving every
+     * codebook accepts a shorter final partition without changing arithmetic.
      */
     TEST_F(CPUNativeVNNIGemvTest,
-           MirroredMTPHeadAllFormatsMatchConcatenatedSerialTPShards)
+           MirroredMTPHeadAllFormatsMatchUnevenTP3SerialShards)
     {
         constexpr int N = 512;
-        constexpr int serial_partition_n = N / 2;
+        constexpr int serial_partition_n = 171;
+        constexpr int tail_partition_n = 170;
         constexpr int K = 256;
         constexpr std::array<int, 5> row_counts = {1, 2, 4, 8, 16};
         ScopedOMPThreadCount thread_scope(1);
@@ -1850,10 +1988,13 @@ namespace
             CPUNativeVNNIGemmKernel shard0_kernel(
                 weights.get(), 0, serial_partition_n);
             CPUNativeVNNIGemmKernel shard1_kernel(
-                weights.get(), serial_partition_n, N);
+                weights.get(), serial_partition_n, 2 * serial_partition_n);
+            CPUNativeVNNIGemmKernel shard2_kernel(
+                weights.get(), 2 * serial_partition_n, N);
             ASSERT_TRUE(mirrored_kernel.isValid()) << format.name;
             ASSERT_TRUE(shard0_kernel.isValid()) << format.name;
             ASSERT_TRUE(shard1_kernel.isValid()) << format.name;
+            ASSERT_TRUE(shard2_kernel.isValid()) << format.name;
 
             for (const int M : row_counts)
             {
@@ -1874,6 +2015,9 @@ namespace
                 FP32Tensor shard1_output(
                     {static_cast<size_t>(M),
                      static_cast<size_t>(serial_partition_n)});
+                FP32Tensor shard2_output(
+                    {static_cast<size_t>(M),
+                     static_cast<size_t>(tail_partition_n)});
 
                 {
                     auto partition_scope =
@@ -1912,6 +2056,7 @@ namespace
 
                 auto execute_shard = [&](CPUNativeVNNIGemmKernel &kernel,
                                          FP32Tensor &output,
+                                         int shard_width,
                                          const char *name)
                 {
                     if (M == 1)
@@ -1920,22 +2065,33 @@ namespace
                             input.get(),
                             &output,
                             M,
-                            serial_partition_n,
+                            shard_width,
                             K);
                     }
                     std::vector<ITensorGemm::TensorProjectionDesc> projection = {{
                         &kernel,
                         &output,
-                        serial_partition_n,
+                        shard_width,
                         nullptr,
                         name}};
                     return kernel.multiply_fused_verifier_rows_decode_equivalent(
                         input.get(), projection, M, K);
                 };
                 ASSERT_TRUE(execute_shard(
-                    shard0_kernel, shard0_output, "serial_tp_shard0"));
+                    shard0_kernel,
+                    shard0_output,
+                    serial_partition_n,
+                    "serial_tp_shard0"));
                 ASSERT_TRUE(execute_shard(
-                    shard1_kernel, shard1_output, "serial_tp_shard1"));
+                    shard1_kernel,
+                    shard1_output,
+                    serial_partition_n,
+                    "serial_tp_shard1"));
+                ASSERT_TRUE(execute_shard(
+                    shard2_kernel,
+                    shard2_output,
+                    tail_partition_n,
+                    "serial_tp_shard2"));
 
                 for (int row = 0; row < M; ++row)
                 {
@@ -1947,6 +2103,9 @@ namespace
                     const float *const shard1_row =
                         shard1_output.data() +
                         static_cast<size_t>(row) * serial_partition_n;
+                    const float *const shard2_row =
+                        shard2_output.data() +
+                        static_cast<size_t>(row) * tail_partition_n;
                     EXPECT_EQ(
                         std::memcmp(
                             mirrored_row,
@@ -1964,6 +2123,15 @@ namespace
                                 sizeof(float)),
                         0)
                         << format.name << " mirrored shard 1 differs at M="
+                        << M << " row=" << row;
+                    EXPECT_EQ(
+                        std::memcmp(
+                            mirrored_row + 2 * serial_partition_n,
+                            shard2_row,
+                            static_cast<size_t>(tail_partition_n) *
+                                sizeof(float)),
+                        0)
+                        << format.name << " mirrored tail shard differs at M="
                         << M << " row=" << row;
                 }
             }
@@ -3880,7 +4048,7 @@ namespace
     }
 
     /**
-     * @brief Prove dense movable floating experts use one CPU/GPU arithmetic tree.
+     * @brief Prove dense GPU-aligned floating experts use one CPU/GPU arithmetic tree.
      *
      * The historical floating MoE device tests used diagonal matrices, which
      * removed reduction-order ambiguity and therefore could not detect a CPU
@@ -3891,7 +4059,7 @@ namespace
      */
     TEST_F(
         CPUNativeVNNIGemvTest,
-        MovableFloatingExpertsAllFormatsMatchCanonicalDenseTree)
+        GPUAlignedFloatingExpertsAllFormatsMatchCanonicalDenseTree)
     {
         constexpr int M = 3;
         constexpr int DModel = 517;
@@ -3938,7 +4106,7 @@ namespace
             }
             default:
                 throw std::invalid_argument(
-                    "movable floating expert test received non-floating type");
+                    "GPU-aligned floating expert test received non-floating type");
             }
         };
 
@@ -4008,11 +4176,11 @@ namespace
 
             using Policy = gemm::FloatingPointGemmKernel::NumericalPolicy;
             gemm::FloatingPointGemmKernel gate_kernel(
-                gate_weight.get(), Policy::MovableExpert);
+                gate_weight.get(), Policy::GPUAlignedExpert);
             gemm::FloatingPointGemmKernel up_kernel(
-                up_weight.get(), Policy::MovableExpert);
+                up_weight.get(), Policy::GPUAlignedExpert);
             gemm::FloatingPointGemmKernel down_kernel(
-                down_weight.get(), Policy::MovableExpert);
+                down_weight.get(), Policy::GPUAlignedExpert);
             FP32Tensor observed_gate({static_cast<size_t>(M),
                                       static_cast<size_t>(Intermediate)});
             FP32Tensor observed_up({static_cast<size_t>(M),
@@ -4030,6 +4198,71 @@ namespace
                 M,
                 OutputWidth,
                 Intermediate));
+
+            /*
+             * Production sparse execution enters a projection bundle rather
+             * than calling each GEMM directly. Exercise both the ordinary M=1
+             * capable bundle and the grouped-verifier entry point: neither may
+             * discard the GPU-aligned expert engine's cross-tier numerical policy while
+             * selecting a faster CPU primitive.
+             */
+            FP32Tensor bundled_gate({static_cast<size_t>(M),
+                                     static_cast<size_t>(Intermediate)});
+            FP32Tensor bundled_up({static_cast<size_t>(M),
+                                   static_cast<size_t>(Intermediate)});
+            std::vector<ITensorGemm::TensorProjectionDesc>
+                bundled_projections{
+                    {&gate_kernel,
+                     &bundled_gate,
+                     Intermediate,
+                     nullptr,
+                     "gpu_aligned_gate"},
+                    {&up_kernel,
+                     &bundled_up,
+                     Intermediate,
+                     nullptr,
+                     "gpu_aligned_up"},
+                };
+            ASSERT_TRUE(gate_kernel.multiply_fused_tensor(
+                &input,
+                bundled_projections,
+                M,
+                DModel));
+
+            FP32Tensor verifier_gate({static_cast<size_t>(M),
+                                      static_cast<size_t>(Intermediate)});
+            FP32Tensor verifier_up({static_cast<size_t>(M),
+                                    static_cast<size_t>(Intermediate)});
+            std::vector<ITensorGemm::TensorProjectionDesc>
+                verifier_projections{
+                    {&gate_kernel,
+                     &verifier_gate,
+                     Intermediate,
+                     nullptr,
+                     "gpu_aligned_verifier_gate"},
+                    {&up_kernel,
+                     &verifier_up,
+                     Intermediate,
+                     nullptr,
+                     "gpu_aligned_verifier_up"},
+                };
+            ASSERT_TRUE(
+                gate_kernel.multiply_fused_verifier_rows_decode_equivalent(
+                    &input,
+                    verifier_projections,
+                    M,
+                    DModel));
+            FP32Tensor verifier_down({static_cast<size_t>(M),
+                                      static_cast<size_t>(OutputWidth)});
+            ASSERT_TRUE(
+                down_kernel.
+                    multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                        &verifier_gate,
+                        &verifier_up,
+                        &verifier_down,
+                        M,
+                        OutputWidth,
+                        Intermediate));
 
             std::vector<float> expected_gate(
                 static_cast<size_t>(M) * Intermediate);
@@ -4123,7 +4356,37 @@ namespace
                 0);
             EXPECT_EQ(
                 std::memcmp(
+                    bundled_gate.data(),
+                    expected_gate.data(),
+                    expected_gate.size() * sizeof(float)),
+                0);
+            EXPECT_EQ(
+                std::memcmp(
+                    bundled_up.data(),
+                    expected_up.data(),
+                    expected_up.size() * sizeof(float)),
+                0);
+            EXPECT_EQ(
+                std::memcmp(
+                    verifier_gate.data(),
+                    expected_gate.data(),
+                    expected_gate.size() * sizeof(float)),
+                0);
+            EXPECT_EQ(
+                std::memcmp(
+                    verifier_up.data(),
+                    expected_up.data(),
+                    expected_up.size() * sizeof(float)),
+                0);
+            EXPECT_EQ(
+                std::memcmp(
                     observed_down.data(),
+                    expected_down.data(),
+                    expected_down.size() * sizeof(float)),
+                0);
+            EXPECT_EQ(
+                std::memcmp(
+                    verifier_down.data(),
                     expected_down.data(),
                     expected_down.size() * sizeof(float)),
                 0);

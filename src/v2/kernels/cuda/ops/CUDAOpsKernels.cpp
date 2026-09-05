@@ -23,6 +23,7 @@
 #include "../../../utils/CUDAKernelProfiler.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include "../../common/EmbeddingWorkspaceContract.h"
 #include "../../common/PreparedEmbeddingWeights.h"
 #include <climits>
 #include "../../rope/RoPEDeviceParams.h"
@@ -2490,20 +2491,7 @@ namespace llaminar2
     {
         (void)n; // Unused for embedding
         (void)k; // Persistent embedding weights are not graph workspace
-
-        WorkspaceRequirements reqs;
-
-        // Buffer 1: Token IDs [max_seq_len × sizeof(int)]
-        // m is the maximum sequence length
-        size_t token_ids_bytes = static_cast<size_t>(m) * sizeof(int);
-        reqs.buffers.push_back({
-            EmbeddingWorkspaceBuffers::TOKEN_IDS,
-            token_ids_bytes,
-            256, // Alignment for CUDA
-            true // Required
-        });
-
-        return reqs;
+        return embedding_workspace::requirements({.graph_rows = m});
     }
 
     void CUDAEmbeddingKernelT::bindWorkspace(DeviceWorkspaceManager *workspace)

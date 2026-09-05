@@ -21,10 +21,14 @@ namespace llaminar2
         int finalizeAfterUnhandledException(AppContext &ctx, const char *mode_name, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
-            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
-            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
+            const bool is_authority =
+                ctx.runner &&
+                ctx.coordinatedRequestRole() ==
+                    CoordinatedRequestRole::Authority;
+            const bool notify_workers =
+                has_mpi && ctx.mpi_ctx->world_size() > 1 && is_authority;
 
-            if (is_root)
+            if (is_authority)
                 LOG_ERROR(mode_name << " failed with unhandled exception: " << detail);
 
             if (ctx.runner)
@@ -52,7 +56,10 @@ namespace llaminar2
         auto &tokenizer = ctx.tokenizer;
 
         const bool mpi_coordinated = mpi_ctx->world_size() > 1;
-        if (mpi_coordinated && mpi_ctx->rank() != 0)
+        const bool is_authority =
+            ctx.coordinatedRequestRole() ==
+            CoordinatedRequestRole::Authority;
+        if (mpi_coordinated && !is_authority)
         {
             LOG_DEBUG("Rank " << mpi_ctx->rank()
                              << " entering MPI worker loop for single-shot chat inference");
@@ -81,21 +88,15 @@ namespace llaminar2
 
         if (!tokenizer->hasChatTemplate())
         {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_ERROR("Chat mode requires a model with a chat template.");
-                LOG_ERROR("Use --chat-template to specify one (e.g., --chat-template chatml)");
-            }
+            LOG_ERROR("Chat mode requires a model with a chat template.");
+            LOG_ERROR("Use --chat-template to specify one (e.g., --chat-template chatml)");
             return shutdownAndFinalize(1);
         }
 
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_INFO("Running single-shot chat...");
-        }
+        LOG_INFO("Running single-shot chat...");
 
-        // Build conversation and encode with chat template on rank 0. Coordinated
-        // prefill broadcasts the tokens to worker ranks when MPI is enabled.
+        // The continuation authority owns chat encoding. Coordinated prefill
+        // broadcasts the resulting tokens to followers when MPI is enabled.
         std::vector<int32_t> token_ids;
         int token_count = 0;
 
@@ -133,10 +134,7 @@ namespace llaminar2
             return shutdownAndFinalize(1);
         }
 
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_DEBUG("Running prefill (" << token_count << " tokens)...");
-        }
+        LOG_DEBUG("Running prefill (" << token_count << " tokens)...");
 
         SamplingParams sampling_params;
         sampling_params.temperature = config.temperature;
@@ -148,10 +146,7 @@ namespace llaminar2
 
         if (!runner->prefill(token_ids))
         {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_ERROR("Chat prefill failed: " << runner->lastError());
-            }
+            LOG_ERROR("Chat prefill failed: " << runner->lastError());
             return shutdownAndFinalize(1);
         }
 
@@ -162,15 +157,8 @@ namespace llaminar2
             max_tokens = config.max_seq_len - token_count;
         }
 
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_INFO("Generating response (max " << max_tokens << " tokens)...");
-        }
-
-        if (mpi_ctx->rank() == 0)
-        {
-            console_output::printPromptAndResponseHeader(config.prompt);
-        }
+        LOG_INFO("Generating response (max " << max_tokens << " tokens)...");
+        console_output::printPromptAndResponseHeader(config.prompt);
 
         // Decode loop. MTP can return multiple accepted tokens in one step, so
         // keep the loop bounded by emitted tokens rather than decode calls.
@@ -184,10 +172,7 @@ namespace llaminar2
 
             if (!result.success())
             {
-                if (mpi_ctx->rank() == 0)
-                {
-                    LOG_ERROR("Decode step failed: " << result.error);
-                }
+                LOG_ERROR("Decode step failed: " << result.error);
                 return shutdownAndFinalize(1);
             }
 
@@ -205,7 +190,7 @@ namespace llaminar2
 
                 ++generated_tokens;
 
-                if (mpi_ctx->rank() == 0 && !is_stop)
+                if (!is_stop)
                 {
                     std::string token_text = tokenizer->decode_token(next_token);
                     std::cout << token_text << std::flush;
@@ -213,30 +198,21 @@ namespace llaminar2
 
                 if (is_stop)
                 {
-                    if (mpi_ctx->rank() == 0)
-                    {
-                        LOG_DEBUG("Stop token encountered (" << next_token << "), stopping generation");
-                    }
+                    LOG_DEBUG("Stop token encountered (" << next_token << "), stopping generation");
                     stop_generation = true;
                     break;
                 }
             }
         }
 
-        if (mpi_ctx->rank() == 0)
-        {
-            std::cout << "\n"
-                      << std::flush;
-        }
+        std::cout << "\n"
+                  << std::flush;
 
         // Flush accumulated GPU stage timeline for decode phase
         runner->flushStageTimeline();
 
-        if (mpi_ctx->rank() == 0)
-        {
-            std::cout << std::endl;
-            LOG_INFO("Chat generation complete.");
-        }
+        std::cout << std::endl;
+        LOG_INFO("Chat generation complete.");
 
         return shutdownAndFinalize(0);
     }

@@ -363,6 +363,8 @@ namespace llaminar2
         /** Complete retained main/MTP graph-family manifests in canonical order. */
         std::vector<MoEOverlayActivationGraphFamilyManifest>
             activation_graph_families;
+        /** Planner-certified mapping offsets and first-touch ownership. */
+        MoEOverlayNodeLocalActivationLayout activation_layout;
         /**
          * Exact process-local participant/device lanes embedded by graphs.
          *

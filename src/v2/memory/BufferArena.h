@@ -1,6 +1,6 @@
 /**
  * @file BufferArena.h
- * @brief Single source of truth for all activation buffer management
+ * @brief Single source of truth for device-local activation buffer management
  *
  * BufferArena owns all activation/scratch/workspace buffers and provides:
  *   - Typed registration with BufferId keys
@@ -40,15 +40,16 @@ namespace llaminar2
     /**
      * @brief Configuration for BufferArena allocation behavior.
      *
-     * Controls mapped memory for snapshot/debugging and factory binding.
+     * Activation tensors are always ordinary host/device tensors. GPU-visible
+     * host mappings belong to explicit TransferEngine control/data-plane
+     * regions; allowing a diagnostic flag to change activation placement would
+     * make graph capture identity and replay performance depend on the caller.
      */
     struct ArenaConfig
     {
         /// TensorFactory for NUMA-aware allocation (required for allocate())
         TensorFactory *factory = nullptr;
 
-        /// Use mapped memory for GPU activation buffers (snapshot/debugging)
-        bool use_mapped_memory = false;
     };
 
     /**
@@ -58,13 +59,9 @@ namespace llaminar2
     {
         size_t total_buffers = 0;
         size_t total_bytes = 0;
-        size_t mapped_buffers = 0;
-        size_t mapped_bytes = 0;
-
         void reset()
         {
             total_buffers = total_bytes = 0;
-            mapped_buffers = mapped_bytes = 0;
         }
     };
 

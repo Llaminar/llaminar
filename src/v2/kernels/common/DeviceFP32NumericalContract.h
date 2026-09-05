@@ -1,6 +1,6 @@
 /**
  * @file DeviceFP32NumericalContract.h
- * @brief Cross-backend explicit-rounding primitives for movable-expert arithmetic.
+ * @brief Cross-backend explicit-rounding primitives for GPU-aligned expert arithmetic.
  *
  * CUDA and HIP expose compatible round-to-nearest intrinsics, but the HIP
  * optimizer may still reassociate a completed result with its consumer. CPU

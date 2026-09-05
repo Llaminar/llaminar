@@ -542,6 +542,49 @@ TEST(Test__PrefixStateCacheLRU, EvictedBlockPersistsToDiskAndHydratesOnFind)
     cleanup();
 }
 
+/**
+ * A one-block RAM tier and one-block disk tier require a true swap: persisting
+ * the RAM victim logically evicts the record being promoted.  The verified
+ * archive ticket must retain the immutable append record without allocating a
+ * second full RAM block, then hydrate it after the victim owns disk capacity.
+ */
+TEST(Test__PrefixStateCacheLRU,
+     CapacityOneTiersSwapThroughVerifiedArchiveOffsets)
+{
+    const auto dir = tempDir();
+    const auto cleanup = [&]() { std::filesystem::remove_all(dir); };
+
+    constexpr size_t kBlockBytes = 32;
+    auto ram = std::make_shared<RamPrefixStorageBackend>(kBlockBytes * 2);
+    auto disk = makeDiskBackend(dir, kBlockBytes);
+    ASSERT_TRUE(disk->ready()) << disk->initializationError();
+    PrefixStateCache cache(kBlockBytes, ram, disk);
+
+    auto a = ram->allocate(keyFor(0), layoutBytes(kBlockBytes));
+    auto b = ram->allocate(keyFor(1), layoutBytes(kBlockBytes));
+    ASSERT_TRUE(a.valid());
+    ASSERT_TRUE(b.valid());
+    std::fill(a.kv_storage->begin(), a.kv_storage->end(), 0xa5);
+    const auto expected_a = *a.kv_storage;
+
+    ASSERT_TRUE(cache.insert(a));
+    ASSERT_TRUE(cache.insert(b));
+    ASSERT_TRUE(cache.isDiskResident(a.key));
+    ASSERT_TRUE(cache.isRamResident(b.key));
+
+    const auto promoted = cache.find(a.key);
+    ASSERT_TRUE(promoted.has_value());
+    ASSERT_NE(promoted->kv_storage, nullptr);
+    EXPECT_EQ(*promoted->kv_storage, expected_a);
+    EXPECT_TRUE(cache.isRamResident(a.key));
+    EXPECT_FALSE(cache.isDiskResident(a.key));
+    EXPECT_FALSE(cache.isRamResident(b.key));
+    EXPECT_TRUE(cache.isDiskResident(b.key));
+    EXPECT_EQ(cache.stats().disk_hydrations, 1u);
+    EXPECT_EQ(cache.stats().ram_to_disk_demotions, 2u);
+    cleanup();
+}
+
 TEST(Test__PrefixStateCacheLRU, RepeatedPromotionDemotionAndBottomTierEvictionAreExact)
 {
     const auto dir = tempDir();

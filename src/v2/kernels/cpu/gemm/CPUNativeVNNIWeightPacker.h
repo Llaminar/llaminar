@@ -48,6 +48,7 @@
 
 #include "CPUNativeVNNIDecode.h"
 #include "CPUNativeVNNIPreparedFootprint.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
 #include "kernels/cpu/rotation/ActivationRotation.h"
 #include "tensors/AlignedVector.h"
 #include "tensors/BlockStructures.h"
@@ -207,6 +208,14 @@ namespace llaminar2::cpu::native_vnni
 
         /// Physical prepared encoding consumed by serial and grouped kernels.
         CPUNativeVNNIEncoding encoding = CPUNativeVNNIEncoding::ExpandedInt8;
+
+        /**
+         * Arithmetic identity selected by the owner of this prepared matrix.
+         * ExpertOverlay matrices use the cross-backend reduction and activation
+         * contract; ordinary non-expert CPU matrices retain tuned native math.
+         */
+        CPUProjectionNumericalPolicy numerical_policy =
+            CPUProjectionNumericalPolicy::BackendNative;
 
         /// Bytes of pure group data per K-block (before metadata).
         /// 1024 for nibble-LUT (4 groups × 4 ZMMs × 64 bytes).

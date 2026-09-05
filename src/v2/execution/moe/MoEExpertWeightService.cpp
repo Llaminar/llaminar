@@ -73,6 +73,35 @@ namespace llaminar2
     namespace
     {
 
+        /**
+         * @brief Resolve the model context's sole admitted allocation authority.
+         *
+         * GPU expert preparation is a physical allocation boundary. A missing
+         * store or authority is therefore a lifecycle error, never permission
+         * to reconstruct a free-memory budget or allocate optimistically.
+         */
+        static std::shared_ptr<PhysicalMemoryAuthority>
+        requirePhysicalMemoryAuthority(
+            const MoEWeightContext &ctx,
+            const char *operation)
+        {
+            if (!ctx.prepared_store)
+            {
+                throw std::logic_error(
+                    std::string(operation) +
+                    " requires the model-owned PreparedWeightStore");
+            }
+            auto authority =
+                ctx.prepared_store->physicalMemoryAuthority();
+            if (!authority)
+            {
+                throw std::logic_error(
+                    std::string(operation) +
+                    " reached GPU allocation before physical-memory admission");
+            }
+            return authority;
+        }
+
         /// Query the NUMA node of a virtual address using move_pages(2).
         /// Returns -1 if NUMA info unavailable (non-Linux or unmapped page).
         static int queryNUMANode(const void *ptr)
@@ -1985,7 +2014,12 @@ namespace llaminar2
         };
         resolveExpertSlabRefs(ctx, /*create_if_missing=*/false);
 
-        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        auto orchestrator = std::make_shared<LoadOrchestrator>(
+            backend,
+            requirePhysicalMemoryAuthority(
+                ctx,
+                "GPU expert rebalance preparation"),
+            PhysicalMemoryOwner::RoutedExpertWeights);
         orchestrator->addDevice(gpu_ordinal);
 
         size_t max_raw_bytes = 0;
@@ -2486,7 +2520,12 @@ namespace llaminar2
 
         // Create one LoadOrchestrator for ALL expert weights (3 groups × local_count).
         // Single VRAM allocation, pipelined H2D + GPU repack.
-        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        auto orchestrator = std::make_shared<LoadOrchestrator>(
+            backend,
+            requirePhysicalMemoryAuthority(
+                ctx,
+                "GPU expert initial preparation"),
+            PhysicalMemoryOwner::RoutedExpertWeights);
         orchestrator->addDevice(gpu_ordinal);
 
         size_t max_raw_bytes = 0;
@@ -3417,6 +3456,10 @@ namespace llaminar2
         const int src_gpu_ordinal = gpuOrdinalFor(src_ctx.device_id);
         if (dst_gpu_ordinal < 0 || src_gpu_ordinal < 0)
             return false;
+        const auto memory_authority =
+            requirePhysicalMemoryAuthority(
+                dst_ctx,
+                "GPU-direct expert transfer-slot staging");
 
         struct WeightGroup
         {
@@ -3767,6 +3810,8 @@ namespace llaminar2
                     layer_idx,
                     capacity,
                     std::move(*specs),
+                    memory_authority,
+                    PhysicalMemoryOwner::RoutedExpertWeights,
                     /*transfer_capacity=*/0);
             }
             catch (const std::exception &ex)
@@ -3825,7 +3870,8 @@ namespace llaminar2
                         dst_ctx.device_id,
                         dst_gpu_ordinal,
                         capacity,
-                        *specs);
+                        *specs,
+                        memory_authority);
                     transfer_staging_pools->push_back(pool);
                     allocation_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                Clock::now() - pool_start)
@@ -4295,6 +4341,10 @@ namespace llaminar2
         const int src_gpu_ordinal = src_ctx.device_id.is_cuda()
                                         ? src_ctx.device_id.cuda_ordinal()
                                         : src_ctx.device_id.rocm_ordinal();
+        const auto memory_authority =
+            requirePhysicalMemoryAuthority(
+                dst_ctx,
+                "GPU-direct expert transfer");
         struct WeightGroup
         {
             const char *label;
@@ -4612,6 +4662,8 @@ namespace llaminar2
                     layer_idx,
                     capacity,
                     std::move(*specs),
+                    memory_authority,
+                    PhysicalMemoryOwner::RoutedExpertWeights,
                     GpuExpertSlotPool::recommendedTransferCapacity(
                         dst_ctx.num_experts,
                         experts_to_copy.size()));
@@ -4873,7 +4925,10 @@ namespace llaminar2
             if (!pooled_slot.has_value())
             {
                 const auto alloc_start = Clock::now();
-                expert_orchestrator = std::make_shared<LoadOrchestrator>(backend);
+                expert_orchestrator = std::make_shared<LoadOrchestrator>(
+                    backend,
+                    memory_authority,
+                    PhysicalMemoryOwner::RoutedExpertWeights);
                 expert_orchestrator->addDevice(dst_gpu_ordinal);
 
                 for (const auto &grp : groups)

@@ -101,6 +101,41 @@ namespace llaminar2::test::parity
         EXPECT_EQ(invalid.count, 0u);
     }
 
+    TEST(Test__MTPParitySnapshotContext,
+         ComparedCheckpointCarriesExactSidecarNamespaces)
+    {
+        const ComparedMTPParityCheckpoint checkpoint{
+            .reference_step = 0,
+            .model_layer = 48,
+            .identity = {
+                .role = MTPParityCheckpointRole::Primary,
+                .context = MTPParityCheckpointContext::
+                    DeviceTargetTokenLivePosition,
+                .reference_depth = 0,
+            },
+            .production_stage_prefix =
+                "MTP_DECODE_SIDECAR_DEVICE_TARGET_TOKEN_LIVE_POSITION_MTP0_",
+            .reference_stage_prefix = "decode_step0_MTP0_",
+        };
+
+        ASSERT_TRUE(checkpoint.valid());
+        EXPECT_EQ(
+            checkpoint.productionKey("MOE_ROUTING_INDICES"),
+            "MTP_DECODE_SIDECAR_DEVICE_TARGET_TOKEN_LIVE_POSITION_MTP0_"
+            "MOE_ROUTING_INDICES");
+        EXPECT_EQ(
+            checkpoint.referenceKey("MOE_ROUTE_CONTRIBUTIONS"),
+            "decode_step0_MTP0_MOE_ROUTE_CONTRIBUTIONS");
+        EXPECT_NE(
+            checkpoint.productionKey("MOE_ROUTING_INDICES"),
+            "layer48_MOE_ROUTING_INDICES")
+            << "A synthetic CSV layer is not a snapshot namespace authority";
+
+        auto malformed = checkpoint;
+        malformed.production_stage_prefix.pop_back();
+        EXPECT_FALSE(malformed.valid());
+    }
+
     TEST(Test__MTPParitySnapshotContext, BranchPrefixOwnsOnlyConsumedTokens)
     {
         constexpr std::array<int32_t, 3> consumed = {198, 760, 3841};
@@ -240,6 +275,134 @@ namespace llaminar2::test::parity
             << "A quantized Hugging Face near-tie must not replace the exact "
                "serial Llaminar oracle";
         EXPECT_EQ(comparison.compared_tokens, grouped.size());
+    }
+
+    TEST(Test__MTPParitySnapshotContext,
+         AcceptedDraftReferenceSelectsTheEarliestMatchingSerialEdge)
+    {
+        constexpr std::array<int32_t, 5> serial = {
+            13, 271, 760, 3841, 13477};
+        constexpr std::array<int32_t, 4> mtp0 = {
+            561, 760, 3841, 13477};
+        const auto selected =
+            firstMTPParityAcceptedDraftReference(serial, mtp0);
+        ASSERT_TRUE(selected.has_value());
+        EXPECT_EQ(selected->reference_step, 1u);
+        EXPECT_EQ(selected->base_token, 271);
+        EXPECT_EQ(selected->first_draft_token, 760);
+
+        constexpr std::array<int32_t, 2> rejected = {7, 8};
+        EXPECT_FALSE(
+            firstMTPParityAcceptedDraftReference(serial, rejected)
+                .has_value());
+    }
+
+    TEST(Test__MTPParitySnapshotContext,
+         TeacherForcedRowsCertifyAFreeRunningSerialTrajectoryByInduction)
+    {
+        constexpr std::array rows = {
+            MTPParityCertifiedDecodeRow{
+                .reference_step = 0u,
+                .committed_token = 13,
+                .predicted_successor_token = 271,
+            },
+            MTPParityCertifiedDecodeRow{
+                .reference_step = 1u,
+                .committed_token = 271,
+                .predicted_successor_token = 760,
+            },
+            MTPParityCertifiedDecodeRow{
+                .reference_step = 2u,
+                .committed_token = 760,
+                .predicted_successor_token = 3841,
+            },
+        };
+
+        const auto certification =
+            certifyMTPParitySerialTrajectory(13, rows, 4u);
+        ASSERT_TRUE(certification.complete(4u));
+        EXPECT_EQ(
+            certification.tokens,
+            (std::vector<int32_t>{13, 271, 760, 3841}));
+    }
+
+    TEST(Test__MTPParitySnapshotContext,
+         SerialCertificationFailsClosedAtTheFirstTeacherForcedDrift)
+    {
+        constexpr std::array rows = {
+            MTPParityCertifiedDecodeRow{
+                .reference_step = 0u,
+                .committed_token = 13,
+                .predicted_successor_token = 271,
+            },
+            MTPParityCertifiedDecodeRow{
+                .reference_step = 1u,
+                .committed_token = 71093,
+                .predicted_successor_token = 760,
+            },
+        };
+
+        const auto certification =
+            certifyMTPParitySerialTrajectory(13, rows, 3u);
+        EXPECT_FALSE(certification.complete(3u));
+        EXPECT_EQ(
+            certification.failure,
+            MTPParitySerialCertificationFailure::DiscontinuousTokenEdge);
+        EXPECT_EQ(certification.failure_row, 1u);
+        EXPECT_EQ(certification.expected_token, 271);
+        EXPECT_EQ(certification.observed_token, 71093);
+    }
+
+    TEST(Test__MTPParitySnapshotContext,
+         SerialCertificationDistinguishesShortEvidenceFromBrokenEvidence)
+    {
+        constexpr std::array rows = {
+            MTPParityCertifiedDecodeRow{
+                .reference_step = 0u,
+                .committed_token = 13,
+                .predicted_successor_token = 271,
+            },
+        };
+
+        const auto certification =
+            certifyMTPParitySerialTrajectory(13, rows, 3u);
+        EXPECT_FALSE(certification.complete(3u));
+        EXPECT_EQ(
+            certification.failure,
+            MTPParitySerialCertificationFailure::MissingDecodeRow);
+        EXPECT_EQ(certification.tokens, (std::vector<int32_t>{13, 271}));
+        EXPECT_EQ(certification.failure_row, 1u);
+    }
+
+    TEST(Test__MTPParitySnapshotContext,
+         DeviceCheckpointBudgetDoesNotNarrowCapturedDepth)
+    {
+        for (int depth = 1; depth <= 15; ++depth)
+        {
+            const auto plan = makeMTPParityCheckpointTransactionPlan(
+                /*device_controller_owned=*/true,
+                depth);
+            ASSERT_TRUE(plan.valid()) << "depth=" << depth;
+            EXPECT_EQ(plan.execution_draft_depth, depth);
+            EXPECT_EQ(plan.response_token_budget, 2);
+            EXPECT_TRUE(plan.device_commit_boundary);
+        }
+
+        const auto cpu_plan = makeMTPParityCheckpointTransactionPlan(
+            /*device_controller_owned=*/false,
+            /*execution_draft_depth=*/15);
+        ASSERT_TRUE(cpu_plan.valid());
+        EXPECT_EQ(cpu_plan.execution_draft_depth, 15);
+        EXPECT_EQ(cpu_plan.response_token_budget, 16);
+        EXPECT_FALSE(cpu_plan.device_commit_boundary);
+
+        EXPECT_FALSE(
+            makeMTPParityCheckpointTransactionPlan(true, 0).valid());
+        EXPECT_FALSE(
+            makeMTPParityCheckpointTransactionPlan(
+                false,
+                std::numeric_limits<int>::max())
+                .valid());
     }
 
     TEST(Test__MTPParitySnapshotContext, GroupedTokenMismatchReportsFirstEdge)

@@ -11,6 +11,8 @@
 #include "execution/moe/MoEOverlayEconomyCertificationController.h"
 #include "execution/moe/MoEOverlayEconomyEvidenceExchange.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
 
@@ -18,6 +20,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -30,6 +33,65 @@ namespace llaminar2::test
 {
     namespace
     {
+        /** @brief Enable only economy PerfStats and restore process state. */
+        class ScopedEconomyPerfStats final
+        {
+        public:
+            /** @brief Save the environment and enable the focused domain. */
+            ScopedEconomyPerfStats()
+                : old_summary_(environmentValue(
+                      "LLAMINAR_PERF_STATS_SUMMARY")),
+                  old_filter_(environmentValue(
+                      "LLAMINAR_PERF_STATS_FILTER"))
+            {
+                setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+                setenv(
+                    "LLAMINAR_PERF_STATS_FILTER",
+                    "moe_overlay_residency",
+                    1);
+                mutableDebugEnv().reload();
+                PerfStatsCollector::reset();
+            }
+
+            /** @brief Clear evidence and restore the caller's environment. */
+            ~ScopedEconomyPerfStats()
+            {
+                PerfStatsCollector::reset();
+                restore(
+                    "LLAMINAR_PERF_STATS_SUMMARY", old_summary_);
+                restore("LLAMINAR_PERF_STATS_FILTER", old_filter_);
+                mutableDebugEnv().reload();
+            }
+
+            ScopedEconomyPerfStats(const ScopedEconomyPerfStats &) = delete;
+            ScopedEconomyPerfStats &operator=(
+                const ScopedEconomyPerfStats &) = delete;
+
+        private:
+            /** @return Current environment value, preserving unset state. */
+            static std::optional<std::string> environmentValue(
+                const char *name)
+            {
+                const char *value = std::getenv(name);
+                return value ? std::optional<std::string>(value)
+                             : std::nullopt;
+            }
+
+            /** @brief Restore one exact saved environment value. */
+            static void restore(
+                const char *name,
+                const std::optional<std::string> &value)
+            {
+                if (value)
+                    setenv(name, value->c_str(), 1);
+                else
+                    unsetenv(name);
+            }
+
+            std::optional<std::string> old_summary_;
+            std::optional<std::string> old_filter_;
+        };
+
         /** @brief Shared proof that profile waves abort and never publish. */
         struct PhysicalObservations
         {
@@ -370,6 +432,22 @@ namespace llaminar2::test
             return row;
         }
 
+        /** @brief Build one MTP-only sidecar row with impossible phases empty. */
+        MoEOverlayParticipantLayerServiceTotals mtpSidecarServiceRow(
+            int participant,
+            int layer,
+            std::uint64_t bias)
+        {
+            auto row = serviceRow(participant, layer, bias);
+            for (const std::size_t phase : {std::size_t{0}, std::size_t{1}})
+            {
+                row.total_nanoseconds[phase] = 0;
+                row.activation_count[phase] = 0;
+                row.sample_count[phase] = 0;
+            }
+            return row;
+        }
+
         /** @brief Construct one projection contract for catalog tests. */
         MoEOverlayProjectionWeightManifest projectionManifest(
             ExpertTierWeightProjection role,
@@ -454,7 +532,11 @@ namespace llaminar2::test
             std::shared_ptr<MoEOverlayEconomyCalibrationController> controller;
 
             /** @brief Wire the real composite transport to a bounded journal. */
-            explicit ProfileFixture(int layer_count = 1)
+            explicit ProfileFixture(
+                int layer_count = 1,
+                std::shared_ptr<
+                    const MoEOverlaySealedMigrationMeasurements>
+                    presealed_measurements = nullptr)
             {
                 planner = std::make_shared<MoEOverlayEconomyCalibrationPlanner>(
                     MoEOverlayEconomyCalibrationPlanner::Config{
@@ -493,6 +575,8 @@ namespace llaminar2::test
                         .ledger = ledger,
                         .journal = journal,
                         .transport = transport,
+                        .presealed_measurements =
+                            std::move(presealed_measurements),
                         .perf_device = "device-free-profile",
                     });
             }
@@ -582,6 +666,82 @@ namespace llaminar2::test
     }
 
     TEST(
+        MoEOverlayEconomyCalibrationController,
+        ExactSealedProfileCompletesWithoutLaunchingPhysicalWaves)
+    {
+        ScopedEconomyPerfStats perf_stats;
+        ProfileFixture source;
+        pollToTerminal(*source.controller);
+        ASSERT_EQ(
+            source.controller->state(),
+            MoEOverlayEconomyCalibrationState::Complete);
+        const auto *sealed = source.controller->sealedMeasurements();
+        ASSERT_NE(sealed, nullptr);
+        auto retained = std::make_shared<
+            const MoEOverlaySealedMigrationMeasurements>(*sealed);
+
+        PerfStatsCollector::reset();
+        ProfileFixture reused(/*layer_count=*/1, retained);
+        EXPECT_EQ(
+            reused.controller->state(),
+            MoEOverlayEconomyCalibrationState::Complete);
+        EXPECT_TRUE(reused.controller->healthy());
+        EXPECT_EQ(reused.controller->sealedMeasurements()->identity,
+                  retained->identity);
+        const auto stats = reused.controller->stats();
+        EXPECT_EQ(stats.waves_started, 0u);
+        EXPECT_EQ(stats.waves_completed, 0u);
+        EXPECT_EQ(stats.accepted_pairs,
+                  reused.controller->expectedAcceptedPairs());
+        EXPECT_EQ(stats.reused_sealed_profiles, 1u);
+        EXPECT_EQ(reused.factory.observations->waves_prepared, 0u);
+
+        const auto evidence = PerfStatsCollector::snapshot(
+            {"moe_overlay_residency"});
+        const auto complete = std::find_if(
+            evidence.begin(), evidence.end(),
+            [](const PerfStatRecord &record)
+            {
+                return record.name ==
+                       "economy_transport_profile_complete";
+            });
+        ASSERT_NE(complete, evidence.end());
+        EXPECT_EQ(complete->value, 1.0);
+        EXPECT_EQ(complete->count, 1u);
+        EXPECT_EQ(complete->tags.at("origin"), "reused");
+        EXPECT_EQ(
+            complete->tags.at("measurement_identity"),
+            retained->identity);
+        EXPECT_EQ(complete->tags.at("coordinate_count"), "2");
+        EXPECT_EQ(complete->tags.at("waves"), "3");
+        EXPECT_EQ(complete->tags.at("elapsed_nanoseconds"), "0");
+        EXPECT_EQ(complete->tags.at("synthetic_inference"), "false");
+        EXPECT_EQ(complete->tags.at("publish_residency"), "false");
+    }
+
+    TEST(
+        MoEOverlayEconomyCalibrationController,
+        RejectsSealedProfileFromAnotherParticipantLayerTopology)
+    {
+        ProfileFixture source;
+        pollToTerminal(*source.controller);
+        const auto *sealed = source.controller->sealedMeasurements();
+        ASSERT_NE(sealed, nullptr);
+        auto incompatible = *sealed;
+        ASSERT_FALSE(incompatible.rows.empty());
+        ++incompatible.rows.front().layer;
+        ASSERT_TRUE(incompatible.valid());
+
+        EXPECT_THROW(
+            (void)ProfileFixture(
+                /*layer_count=*/1,
+                std::make_shared<
+                    const MoEOverlaySealedMigrationMeasurements>(
+                    std::move(incompatible))),
+            std::invalid_argument);
+    }
+
+    TEST(
         MoEOverlayEconomyEvidenceMerger,
         MigrationProfileCompletesComplementaryRanksAndRejectsIdentityDrift)
     {
@@ -643,7 +803,10 @@ namespace llaminar2::test
             {serviceRow(1, 0, 200), serviceRow(1, 1, 210)},
         };
         const auto merged = MoEOverlayEconomyEvidenceMerger::mergeService(
-            rank_rows, owner_map, 2);
+            rank_rows,
+            owner_map,
+            ExpertHistogramProductionTopology::uniform(
+                2, kAllExpertHistogramProductionSources));
         ASSERT_EQ(merged.size(), 4u);
 
         auto wrong_rank = rank_rows;
@@ -651,14 +814,61 @@ namespace llaminar2::test
         wrong_rank[1].pop_back();
         EXPECT_THROW(
             (void)MoEOverlayEconomyEvidenceMerger::mergeService(
-                wrong_rank, owner_map, 2),
+                wrong_rank,
+                owner_map,
+                ExpertHistogramProductionTopology::uniform(
+                    2, kAllExpertHistogramProductionSources)),
             std::invalid_argument);
 
         auto missing = rank_rows;
         missing[1].pop_back();
         EXPECT_THROW(
             (void)MoEOverlayEconomyEvidenceMerger::mergeService(
-                missing, owner_map, 2),
+                missing,
+                owner_map,
+                ExpertHistogramProductionTopology::uniform(
+                    2, kAllExpertHistogramProductionSources)),
+            std::invalid_argument);
+    }
+
+    TEST(
+        MoEOverlayEconomyEvidenceMerger,
+        UsesReachabilityRatherThanEconomyMaskAndRejectsImpossibleSidecarEvidence)
+    {
+        const auto owner_map = distributedOwnerMap();
+        const auto topology =
+            ExpertHistogramProductionTopology::forRetainedExecution(
+                /*retained_layer_count=*/3,
+                /*main_inference_layer_count=*/2,
+                ExpertHistogramServingRegime::PositiveDepthMTP);
+        const std::vector<std::vector<
+            MoEOverlayParticipantLayerServiceTotals>> rank_rows{
+            {
+                serviceRow(0, 0, 100),
+                serviceRow(0, 1, 110),
+                mtpSidecarServiceRow(0, 2, 120),
+            },
+            {
+                serviceRow(1, 0, 200),
+                serviceRow(1, 1, 210),
+                mtpSidecarServiceRow(1, 2, 220),
+            },
+        };
+
+        const auto merged = MoEOverlayEconomyEvidenceMerger::mergeService(
+            rank_rows, owner_map, topology);
+        ASSERT_EQ(merged.size(), 6u);
+        EXPECT_EQ(merged[0].sample_count[0], 3u)
+            << "Serial catch-up decode is reachable even when it is not economy-priced";
+
+        auto impossible = rank_rows;
+        auto &sidecar_decode = impossible[1][2];
+        sidecar_decode.total_nanoseconds[0] = 999;
+        sidecar_decode.activation_count[0] = 1;
+        sidecar_decode.sample_count[0] = 1;
+        EXPECT_THROW(
+            (void)MoEOverlayEconomyEvidenceMerger::mergeService(
+                impossible, owner_map, topology),
             std::invalid_argument);
     }
 
@@ -674,6 +884,15 @@ namespace llaminar2::test
         MoEOverlayEconomyCalibrationLayerCatalog catalog(manifest);
         ASSERT_EQ(catalog.groups().size(), 2u);
         EXPECT_EQ(catalog.representativeLayers(), (std::vector<int>{0, 2}));
+        EXPECT_EQ(
+            catalog.serviceTelemetryLayers(),
+            (std::vector<int>{0, 1, 2}));
+        EXPECT_EQ(catalog.layerCount(), 3u);
+        EXPECT_TRUE(catalog.isRepresentativeLayer(0));
+        EXPECT_FALSE(catalog.isRepresentativeLayer(1));
+        EXPECT_TRUE(catalog.isRepresentativeLayer(2));
+        EXPECT_FALSE(catalog.isRepresentativeLayer(-1));
+        EXPECT_FALSE(catalog.isRepresentativeLayer(3));
 
         MoEOverlayEconomyCalibrationPlanner planner({
             .live_snapshot = snapshot(3),
@@ -703,8 +922,45 @@ namespace llaminar2::test
     }
 
     TEST(
+        MoEOverlayEconomyCalibrationController,
+        ServiceTelemetryUsesDeterministicSquareRootLayerStrata)
+    {
+        std::vector<MoEOverlayLayerWeightManifest> manifest;
+        manifest.reserve(17u);
+        for (int layer = 0; layer < 16; ++layer)
+        {
+            manifest.push_back(
+                layerManifest(layer, 96, native_vnni_formats::Q4_0));
+        }
+        manifest.push_back(
+            layerManifest(16, 128, native_vnni_formats::Q4_0));
+
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog(manifest);
+        ASSERT_EQ(catalog.groups().size(), 2u);
+        EXPECT_EQ(catalog.representativeLayers(), (std::vector<int>{0, 16}));
+        EXPECT_EQ(
+            catalog.groups()[0].service_telemetry_layers,
+            (std::vector<int>{2, 6, 10, 14}));
+        EXPECT_EQ(
+            catalog.groups()[1].service_telemetry_layers,
+            (std::vector<int>{16}));
+        EXPECT_EQ(
+            catalog.serviceTelemetryLayers(),
+            (std::vector<int>{2, 6, 10, 14, 16}));
+        for (int layer = 0; layer < 17; ++layer)
+        {
+            const bool expected =
+                layer == 2 || layer == 6 || layer == 10 || layer == 14 ||
+                layer == 16;
+            EXPECT_EQ(catalog.isServiceTelemetryLayer(layer), expected);
+        }
+        EXPECT_FALSE(catalog.isServiceTelemetryLayer(-1));
+        EXPECT_FALSE(catalog.isServiceTelemetryLayer(17));
+    }
+
+    TEST(
         MoEOverlayEconomyCertificationController,
-        ReadinessBlocksOnlyForTopologyProfileThenNaturalTrafficCertifies)
+        FixedMTPTopologyCertifiesWithoutImpossibleDecodeEvidence)
     {
         const auto initial = snapshot();
         DecodeExpertHistogramConfig histogram_config;
@@ -758,6 +1014,7 @@ namespace llaminar2::test
                 .required_coordinates = planner->requiredCoordinates(),
                 .warmup_samples_per_coordinate = 0,
                 .measured_samples_per_coordinate = 3,
+                .required_sources = {false, true, true},
                 .measurement_identity = catalog->identity(),
             });
         auto journal = std::make_shared<
@@ -813,6 +1070,11 @@ namespace llaminar2::test
                 .payoff_horizon_tokens = 8,
                 .minimum_residency_generations = 0,
             },
+            .production_topology =
+                ExpertHistogramProductionTopology::forRetainedExecution(
+                    /*retained_layer_count=*/1,
+                    /*main_inference_layer_count=*/1,
+                    ExpertHistogramServingRegime::PositiveDepthMTP),
             .perf_device = "certification-readiness-test",
         });
 
@@ -848,7 +1110,6 @@ namespace llaminar2::test
             const auto endpoint = registry->endpoint(participant);
             ASSERT_NE(endpoint, nullptr);
             for (const auto source : {
-                     ExpertHistogramSource::DecodeToken,
                      ExpertHistogramSource::PrefillChunk,
                      ExpertHistogramSource::GroupedVerifier})
             {

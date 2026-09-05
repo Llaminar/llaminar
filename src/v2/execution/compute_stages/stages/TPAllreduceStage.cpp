@@ -9,10 +9,12 @@
 #include "../../../collective/AllreducePrecisionPolicy.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../memory/StageBufferContract.h"
 #include "../../../execution/moe/MoEOverlayNodeLocalRouteExchange.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../kernels/common/TPRankOrderedReductionKernels.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
@@ -21,6 +23,7 @@
 #include "../../../utils/PerfStatsCollector.h"
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -60,9 +63,23 @@ namespace llaminar2
         return "unknown";
     }
 
+    const char *toString(TPAllreduceArithmeticPolicy policy) noexcept
+    {
+        switch (policy)
+        {
+        case TPAllreduceArithmeticPolicy::NativeCollective:
+            return "native-collective";
+        case TPAllreduceArithmeticPolicy::CanonicalRankOrder:
+            return "canonical-rank-order";
+        }
+        return "unknown";
+    }
+
     namespace
     {
         constexpr const char *kDefaultAllreducePrecision = "fp32";
+        constexpr const char *kCanonicalRankBankWorkspace =
+            "tp_allreduce_canonical_rank_banks";
 
         const char *allreduceRoleForStage(const std::string &stage_name)
         {
@@ -192,7 +209,7 @@ namespace llaminar2
             const std::string &source,
             bool grouped_with_anchor)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled("tp_allreduce_bom"))
                 return;
 
             const size_t degree = params.tp_ctx ? static_cast<size_t>(params.tp_ctx->degree()) : 0;
@@ -306,7 +323,8 @@ namespace llaminar2
             size_t effective_count,
             bool no_op)
         {
-            if (!PerfStatsCollector::isEnabled() || !params.tensor)
+            if (!PerfStatsCollector::isDomainEnabled("tp_allreduce_bom") ||
+                !params.tensor)
                 return;
 
             const size_t tensor_numel = params.tensor->numel();
@@ -333,6 +351,7 @@ namespace llaminar2
                 std::to_string(batchInvariantAllreduceDecisionElements(
                     effective_count, logical_row_elements)));
             common_tags.emplace("precision", params.precision.empty() ? "default" : params.precision);
+            common_tags.emplace("arithmetic_policy", toString(params.arithmetic_policy));
             common_tags.emplace("requested_transport_precision", requestedTransportPrecision(params));
             common_tags.emplace("transport_precision", effectiveTransportPrecision(params, effective_count));
             PerfStatsCollector::Tags byte_tags = common_tags;
@@ -507,6 +526,30 @@ namespace llaminar2
             }
         }
 
+        if (params_.arithmetic_policy ==
+            TPAllreduceArithmeticPolicy::CanonicalRankOrder)
+        {
+            auto *local_tp = dynamic_cast<ILocalTPContext *>(params_.tp_ctx);
+            if (!local_tp)
+            {
+                LOG_ERROR("TPAllreduceStage: canonical rank-order reduction requires LocalTP"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+                return false;
+            }
+            if (transport_precision != "fp32")
+            {
+                LOG_ERROR("TPAllreduceStage: canonical rank-order reduction requires FP32 transport"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                          << " transport_precision=" << transport_precision);
+                return false;
+            }
+            return executeCanonicalRankOrder(
+                local_tp,
+                effective_count,
+                stage_stream,
+                sidebands);
+        }
+
         // Use stage_name overload with count parameter.
         // CRITICAL: Pass actual count for decode (seq_len * hidden_dim, not buffer size).
         bool success;
@@ -602,7 +645,30 @@ namespace llaminar2
         (void)m;
         (void)n;
         (void)k;
-        return {};
+        WorkspaceRequirements requirements;
+        if (params_.arithmetic_policy !=
+                TPAllreduceArithmeticPolicy::CanonicalRankOrder ||
+            !params_.tp_ctx || !params_.tensor)
+        {
+            return requirements;
+        }
+
+        const size_t effective_count =
+            params_.count > 0 ? params_.count : params_.tensor->numel();
+        const size_t degree = static_cast<size_t>(params_.tp_ctx->degree());
+        if (effective_count == 0 || degree < 2 ||
+            effective_count >
+                std::numeric_limits<size_t>::max() / degree / sizeof(float))
+        {
+            return requirements;
+        }
+        requirements.buffers.push_back(
+            {kCanonicalRankBankWorkspace,
+             effective_count * degree * sizeof(float),
+             256u,
+             true,
+             WorkspaceExecutionRegime::CompactDecodeOnly});
+        return requirements;
     }
 
     void TPAllreduceStage::bindWorkspace(DeviceWorkspaceManager *workspace)
@@ -659,6 +725,9 @@ namespace llaminar2
             info.addScalarInt("backend", static_cast<int>(params_.tp_ctx->backend()));
             info.addScalarInt("tp_scope", static_cast<int>(params_.tp_ctx->scope()));
         }
+        info.addScalarInt(
+            "arithmetic_policy",
+            static_cast<int>(params_.arithmetic_policy));
 
         return info;
     }
@@ -678,6 +747,148 @@ namespace llaminar2
         // Update base class device
         // Note: IComputeStage doesn't expose setDevice() publicly, so device
         // is fixed at construction. For reuse, create a new stage.
+    }
+
+    bool TPAllreduceStage::executeCanonicalRankOrder(
+        ILocalTPContext *local_tp,
+        size_t effective_count,
+        void *stage_stream,
+        const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands)
+    {
+        if (!local_tp || !stage_stream || !params_.tensor ||
+            params_.sideband_device_index < 0 || !bound_workspace_)
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-order reduction has incomplete bindings"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " local_tp=" << (local_tp != nullptr)
+                      << " stream=" << stage_stream
+                      << " tensor=" << (params_.tensor != nullptr)
+                      << " participant=" << params_.sideband_device_index
+                      << " workspace=" << (bound_workspace_ != nullptr));
+            return false;
+        }
+        if (params_.tensor->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-order reduction currently owns FP32 tensors only"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " tensor_type=" << params_.tensor->dtype_name());
+            return false;
+        }
+
+        const int degree = local_tp->degree();
+        if (degree < 2 || params_.sideband_device_index >= degree ||
+            effective_count == 0 ||
+            effective_count >
+                std::numeric_limits<size_t>::max() /
+                    static_cast<size_t>(degree) / sizeof(float))
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-order reduction rejected geometry"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " count=" << effective_count
+                      << " degree=" << degree
+                      << " participant=" << params_.sideband_device_index);
+            return false;
+        }
+
+        auto *rank_banks = static_cast<float *>(
+            bound_workspace_->getBuffer(kCanonicalRankBankWorkspace));
+        const size_t required_bytes =
+            effective_count * static_cast<size_t>(degree) * sizeof(float);
+        if (!rank_banks ||
+            bound_workspace_->getBufferSize(kCanonicalRankBankWorkspace) <
+                required_bytes)
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-bank workspace is missing or undersized"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " required_bytes=" << required_bytes);
+            return false;
+        }
+
+        auto *tensor_data = static_cast<float *>(params_.tensor->gpu_data_ptr());
+        if (!tensor_data)
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-order reduction requires device-resident tensor data"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+            return false;
+        }
+
+        const std::string collective_name =
+            params_.stage_name + "_canonical_rank_banks";
+        if (!local_tp->allgatherRawOnStream(
+                tensor_data,
+                rank_banks,
+                effective_count,
+                CollectiveDataType::FLOAT32,
+                params_.sideband_device_index,
+                stage_stream,
+                collective_name))
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-bank allgather failed"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+            return false;
+        }
+
+        if (!sidebands.empty())
+        {
+            recordAllreduceSidebandBillOfMaterials(params_, sidebands, false);
+            if (!local_tp->collectiveSidebandOnStream(
+                    sidebands,
+                    params_.sideband_device_index,
+                    stage_stream,
+                    params_.stage_name + "_canonical_sidebands"))
+            {
+                LOG_ERROR("TPAllreduceStage: canonical rank-order sideband publication failed"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+                return false;
+            }
+        }
+
+        bool folded = false;
+        if (params_.device_id.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            folded = launchCUDATPRankOrderedSumFP32(
+                rank_banks,
+                tensor_data,
+                effective_count,
+                degree,
+                params_.device_id.toKernelDeviceIndex(),
+                stage_stream);
+#endif
+        }
+        else if (params_.device_id.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            folded = launchROCmTPRankOrderedSumFP32(
+                rank_banks,
+                tensor_data,
+                effective_count,
+                degree,
+                params_.device_id.toKernelDeviceIndex(),
+                stage_stream);
+#endif
+        }
+        if (!folded)
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-order device fold failed"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " device=" << params_.device_id.toString());
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "tp_allreduce",
+            "canonical_rank_order_reductions",
+            1.0,
+            "collective",
+            params_.device_id.toString(),
+            {{"stage", params_.stage_name.empty() ? "unnamed" : params_.stage_name},
+             {"degree", std::to_string(degree)},
+             {"elements", std::to_string(effective_count)},
+             {"transport", "native_allgather"},
+             {"arithmetic", "device_rank_order"},
+             {"capture_mode", isGraphCaptureActive() ? "graph_capture" : "direct"}});
+        return true;
     }
 
     // =========================================================================
@@ -1194,7 +1405,8 @@ namespace llaminar2
 
     void TPLocalRootedCollectiveStage::recordBillOfMaterials() const
     {
-        if (!PerfStatsCollector::isEnabled())
+        if (!PerfStatsCollector::isDomainEnabled(
+                "tp_rooted_collective_bom"))
             return;
 
         const size_t element_bytes =

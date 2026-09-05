@@ -18,6 +18,7 @@
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.h"
 #include "execution/moe/IMoEGroupedVerifierHistogramPublisher.h"
+#include "execution/moe/MoERuntimeTable.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
@@ -85,6 +86,15 @@ namespace
             return producer_stream != nullptr;
         }
 
+        bool transitionGroupedVerifierHistogramProducerCapture(
+            void *producer_stream,
+            RuntimeHistogramProducerCaptureTransition transition) override
+        {
+            transition_streams.push_back(producer_stream);
+            capture_transitions.push_back(transition);
+            return producer_stream != nullptr;
+        }
+
         bool enqueueCommittedGroupedVerifierHistograms(
             const int32_t *,
             const int32_t *,
@@ -98,6 +108,9 @@ namespace
         int prepare_calls = 0;
         void *prepared_stream = nullptr;
         void *publication_stream = nullptr;
+        std::vector<void *> transition_streams;
+        std::vector<RuntimeHistogramProducerCaptureTransition>
+            capture_transitions;
     };
 
     // =========================================================================
@@ -467,6 +480,30 @@ namespace
         bool supports_padded_real_length_;
     };
 
+    /**
+     * @brief Minimal short-convolution state owner for graph contract tests.
+     *
+     * The live-state allgather test never executes the kernel, but production
+     * capture must prove that both persistent GDN state owners are present.
+     */
+    class StubShortConvolution : public ITensorShortConvolution
+    {
+    public:
+        bool forward(
+            const float *,
+            const float *,
+            const float *,
+            float *,
+            float *,
+            int,
+            int,
+            int,
+            bool) override
+        {
+            return true;
+        }
+    };
+
     // =========================================================================
     // Minimal stub ITensorGemm for expert GEMM engine checks
     // =========================================================================
@@ -638,6 +675,31 @@ TEST(MTPSpeculativeStatePublicationGraphCapture,
         reinterpret_cast<void *>(uintptr_t{0x5A7200});
     EXPECT_FALSE(stage.prepareGraphLaunch(nullptr, foreign_stream));
     EXPECT_EQ(publisher.prepare_calls, 1);
+
+    auto *const context = reinterpret_cast<IDeviceContext *>(
+        uintptr_t{0x5A7300});
+    ASSERT_TRUE(stage.transitionGraphCaptureActivity(
+        context,
+        capture_stream,
+        GraphCaptureActivityTransition::Entering));
+    ASSERT_TRUE(stage.transitionGraphCaptureActivity(
+        context,
+        capture_stream,
+        GraphCaptureActivityTransition::Completed));
+    EXPECT_EQ(
+        publisher.capture_transitions,
+        (std::vector<RuntimeHistogramProducerCaptureTransition>{
+            RuntimeHistogramProducerCaptureTransition::Entering,
+            RuntimeHistogramProducerCaptureTransition::Completed}));
+    EXPECT_EQ(
+        publisher.transition_streams,
+        (std::vector<void *>{capture_stream, capture_stream}));
+
+    EXPECT_FALSE(stage.transitionGraphCaptureActivity(
+        context,
+        foreign_stream,
+        GraphCaptureActivityTransition::Entering));
+    EXPECT_EQ(publisher.capture_transitions.size(), 2u);
 }
 
 /**
@@ -3219,17 +3281,22 @@ TEST_F(GDNPrefillGraphCapture, LiveStateAllGatherCapturableRequiresRawAllgatherG
 #endif
     tp_ctx.setRawAllgatherGraphCaptureSupported(true);
 
+    StubShortConvolution conv_kernel;
     StubGDNKernel recurrence_kernel(true, 8);
     GDNLiveStateAllGatherStage::Params params;
     params.device_id = device;
     params.tp_ctx = &tp_ctx;
+    params.conv_kernel = &conv_kernel;
     params.recurrence_kernel = &recurrence_kernel;
     params.layer_idx = 0;
     params.tp_device_idx = 0;
-    params.local_conv_state_floats = 0;
-    params.full_conv_state_floats = 0;
-    params.local_recurrence_state_floats = 4;
-    params.full_recurrence_state_floats = 8;
+    params.geometry = {
+        .global_key_heads = 2,
+        .global_value_heads = 2,
+        .key_width = 2,
+        .value_width = 2,
+        .conv_history_length = 1,
+    };
     params.stage_name = "gdn_live_state_allgather";
 
     GDNLiveStateAllGatherStage supported(params);

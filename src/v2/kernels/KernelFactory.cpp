@@ -8,6 +8,7 @@
 #include "../backends/BackendManager.h"
 #include "../backends/GPUDeviceContextPool.h"
 #include "../planning/KVCacheMemoryEstimator.h"
+#include "../planning/PhysicalMemoryAuthority.h"
 #include "cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "cpu/gemm/CPUPackedWeights.h"
 #include "PackedWeightsSerialization.h"
@@ -3411,8 +3412,16 @@ namespace llaminar
                 if (quantized && resolved_kind == GemmPreparationKind::CPU_PACKED)
                     (void)ensurePackedWeightsInTensorCache(tensor);
 
-                // Create the GEMM kernel bound to this tensor
-                auto kernel = createPreparedKernelForDevice(tensor, target_device);
+                // ExpertOverlay may move this logical matrix between CPU and
+                // GPU after any residency epoch. Bind the cross-backend
+                // arithmetic policy at preparation rather than inferring it
+                // later from whichever device happens to own the bytes.
+                auto kernel = std::make_unique<
+                    llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
+                    tensor,
+                    0,
+                    -1,
+                    llaminar2::CPUProjectionNumericalPolicy::GPUAlignedExpert);
                 if (!kernel)
                 {
                     LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Failed to create kernel for expert view");
@@ -3453,7 +3462,7 @@ namespace llaminar
                     return std::make_shared<llaminar2::gemm::FloatingPointGemmKernel>(
                         std::shared_ptr<const llaminar2::TensorBase>(std::move(tensor)),
                         llaminar2::gemm::FloatingPointGemmKernel::NumericalPolicy::
-                            MovableExpert);
+                            GPUAlignedExpert);
                 }
 
                 // Packed CPU kernels own their final representation. GPU expert
@@ -3516,7 +3525,8 @@ namespace llaminar
                  * hasInterleavedData() remains the authoritative CPU gate.
                  */
                 auto kernel = std::make_shared<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
-                    cpu_pw->takePacked());
+                    cpu_pw->takePacked(),
+                    llaminar2::CPUProjectionNumericalPolicy::GPUAlignedExpert);
                 if (!kernel->isValid())
                 {
                     LOG_ERROR("[KernelFactory::createExpertGemmFromPackedWeights] "
@@ -3567,8 +3577,10 @@ namespace llaminar
                 auto weights = std::make_shared<llaminar2::PreparedEmbeddingWeights>();
                 weights->blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
                 weights->vocab_size = shard_rows;
-                weights->byte_size = shard_rows * weights->blocks_per_row *
-                                     sizeof(llaminar2::EmbedQ8Block);
+                weights->byte_size =
+                    llaminar2::PreparedEmbeddingWeights::allocationBytes(
+                        shard_rows,
+                        d_model);
                 weights->vocab_offset = vocab_offset;
                 weights->total_vocab = effective_total;
                 weights->d_model = d_model;
@@ -3957,7 +3969,10 @@ namespace llaminar
             size_t KVCacheConfig::estimateBytes() const
             {
                 int effective_kv_heads = (local_n_kv_heads > 0) ? local_n_kv_heads : n_kv_heads;
-                if (effective_kv_heads <= 0 || num_layers <= 0 || head_dim <= 0)
+                const int effective_layers =
+                    hybrid_config ? hybrid_config->countKVLayers()
+                                  : num_layers;
+                if (effective_kv_heads <= 0 || effective_layers <= 0 || head_dim <= 0)
                     return 0;
 
                 std::string prec_str;
@@ -3992,7 +4007,7 @@ namespace llaminar
                 }
 
                 return ::llaminar2::KVCacheMemoryEstimator::estimate(
-                    num_layers, batch_size, max_seq_len,
+                    effective_layers, batch_size, max_seq_len,
                     effective_kv_heads, head_dim, prec_str, device);
             }
 
@@ -4002,18 +4017,66 @@ namespace llaminar
 
             std::unique_ptr<llaminar2::IKVCache> KernelFactory::createKVCache(const KVCacheConfig &config)
             {
-                // If hybrid config is provided, create a hybrid cache
-                if (config.is_hybrid())
+                std::shared_ptr<void> physical_memory_lease;
+                std::shared_ptr<void> recurrent_live_memory_lease;
+                if (config.physical_memory_authority)
                 {
-                    return createHybridKVCache(config);
+                    const size_t physical_bytes = config.estimateBytes();
+                    if (physical_bytes > 0)
+                    {
+                        auto typed_lease =
+                            config.physical_memory_authority->claimNewAllocation(
+                                config.device,
+                                llaminar2::PhysicalMemoryOwner::KVCache,
+                                physical_bytes);
+                        physical_memory_lease =
+                            std::make_shared<llaminar2::PhysicalMemoryAllocationLease>(
+                                std::move(typed_lease));
+                    }
+
+                    /*
+                     * CPU GDN vectors are a second physical owner beside the
+                     * compressed full-attention KV slab. Claim them before the
+                     * concrete constructor so allocation unwind cannot leave
+                     * the canonical ledger stale. GPU GDN arenas claim their
+                     * exact packed allocations internally.
+                     */
+                    if (config.device.is_cpu() && config.hybrid_config &&
+                        config.hybrid_config->countGDNLayers() > 0)
+                    {
+                        const size_t recurrent_bytes =
+                            config.hybrid_config->gdnStateGeometry()
+                                .localPayloadBytes(
+                                    config.hybrid_config->countGDNLayers());
+                        if (recurrent_bytes > 0)
+                        {
+                            auto typed_lease =
+                                config.physical_memory_authority
+                                    ->claimNewAllocation(
+                                        config.device,
+                                        llaminar2::PhysicalMemoryOwner::RecurrentLiveState,
+                                        recurrent_bytes);
+                            recurrent_live_memory_lease =
+                                std::make_shared<llaminar2::PhysicalMemoryAllocationLease>(
+                                    std::move(typed_lease));
+                        }
+                    }
                 }
 
-                if (config.device.is_cpu())
+                auto create_concrete = [&]() -> std::unique_ptr<llaminar2::IKVCache>
                 {
-                    return createCPUKVCache(config);
-                }
-                else if (config.device.is_cuda())
-                {
+                    // If hybrid config is provided, create a hybrid cache.
+                    if (config.is_hybrid())
+                    {
+                        return createHybridKVCache(config);
+                    }
+
+                    if (config.device.is_cpu())
+                    {
+                        return createCPUKVCache(config);
+                    }
+                    else if (config.device.is_cuda())
+                    {
 #ifdef HAVE_CUDA
                     // TQ precision uses a separate non-template class
                     if (config.precision == llaminar2::ActivationPrecision::Q8_1 ||
@@ -4041,9 +4104,9 @@ namespace llaminar
                     LOG_ERROR("[KernelFactory] CUDA KVCache requested but HAVE_CUDA not defined");
                     throw std::runtime_error("KernelFactory::createKVCache: CUDA support not compiled in");
 #endif
-                }
-                else if (config.device.is_rocm())
-                {
+                    }
+                    else if (config.device.is_rocm())
+                    {
 #ifdef HAVE_ROCM
                     // TQ precision uses a separate non-template class
                     if (config.precision == llaminar2::ActivationPrecision::Q8_1 ||
@@ -4071,12 +4134,38 @@ namespace llaminar
                     LOG_ERROR("[KernelFactory] ROCm KVCache requested but HAVE_ROCM not defined");
                     throw std::runtime_error("KernelFactory::createKVCache: ROCm support not compiled in");
 #endif
-                }
-                else
+                    }
+                    else
+                    {
+                        LOG_ERROR("[KernelFactory] Unsupported device type for KVCache: " << config.device.to_string());
+                        throw std::runtime_error("KernelFactory::createKVCache: Unsupported device type");
+                    }
+                };
+
+                auto cache = create_concrete();
+                if (!cache)
                 {
-                    LOG_ERROR("[KernelFactory] Unsupported device type for KVCache: " << config.device.to_string());
-                    throw std::runtime_error("KernelFactory::createKVCache: Unsupported device type");
+                    throw std::runtime_error(
+                        "KernelFactory::createKVCache: backend returned a null cache");
                 }
+                if (physical_memory_lease)
+                {
+                    cache->bindPhysicalMemoryLease(
+                        std::move(physical_memory_lease));
+                }
+                if (recurrent_live_memory_lease)
+                {
+                    auto *hybrid =
+                        dynamic_cast<llaminar2::IHybridKVCache *>(cache.get());
+                    if (!hybrid)
+                    {
+                        throw std::logic_error(
+                            "KernelFactory recurrent-state claim requires a hybrid cache");
+                    }
+                    hybrid->bindRecurrentLiveMemoryLease(
+                        std::move(recurrent_live_memory_lease));
+                }
+                return cache;
             }
 
             std::unique_ptr<llaminar2::ICPUKVCache> KernelFactory::createCPUKVCache(const KVCacheConfig &config)
@@ -4472,25 +4561,29 @@ namespace llaminar
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP32>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
                                 config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
-                                config.head_dim, cuda_device);
+                                config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::FP16:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP16>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
                                 config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
-                                config.head_dim, cuda_device);
+                                config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::BF16:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheBF16>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
                                 config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
-                                config.head_dim, cuda_device);
+                                config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::Q8_1:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheQ8_1>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
                                 config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
-                                config.head_dim, cuda_device);
+                                config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         default:
                             throw std::runtime_error("KernelFactory::createHybridKVCache: Unsupported CUDA precision");
@@ -4503,22 +4596,26 @@ namespace llaminar
                         case llaminar2::ActivationPrecision::FP32:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP32>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
-                                config.n_kv_heads, config.head_dim, cuda_device);
+                                config.n_kv_heads, config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::FP16:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP16>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
-                                config.n_kv_heads, config.head_dim, cuda_device);
+                                config.n_kv_heads, config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::BF16:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheBF16>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
-                                config.n_kv_heads, config.head_dim, cuda_device);
+                                config.n_kv_heads, config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::Q8_1:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheQ8_1>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
-                                config.n_kv_heads, config.head_dim, cuda_device);
+                                config.n_kv_heads, config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         default:
                             throw std::runtime_error("KernelFactory::createHybridKVCache: Unsupported CUDA precision");
@@ -4544,13 +4641,15 @@ namespace llaminar
                         cache = llaminar2::createShardedROCmHybridRingKVCache(
                             hc, config.precision, config.num_layers, config.batch_size,
                             config.max_seq_len, config.n_kv_heads, config.local_n_kv_heads,
-                            config.kv_head_start, config.head_dim, rocm_device);
+                            config.kv_head_start, config.head_dim, rocm_device,
+                            config.physical_memory_authority);
                     }
                     else
                     {
                         cache = llaminar2::createROCmHybridRingKVCache(
                             hc, config.precision, config.num_layers, config.batch_size,
-                            config.max_seq_len, config.n_kv_heads, config.head_dim, rocm_device);
+                            config.max_seq_len, config.n_kv_heads, config.head_dim,
+                            rocm_device, config.physical_memory_authority);
                     }
                 }
 #endif // HAVE_ROCM

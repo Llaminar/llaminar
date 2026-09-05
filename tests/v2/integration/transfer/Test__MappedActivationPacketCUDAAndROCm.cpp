@@ -2893,6 +2893,8 @@ namespace
             resources.root_stream));
 
         const std::array<DeviceId, 1> endpoints{continuation_device};
+        auto metadata_arena =
+            TransferEngine::instance().createMappedHostArena(endpoints);
         auto contribution_region =
             TransferEngine::instance().allocateMappedHostRegion(
                 payload_bytes, endpoints);
@@ -2906,7 +2908,8 @@ namespace
             d_model,
             continuation_device,
             workspace_generation,
-            contribution_region);
+            contribution_region,
+            metadata_arena);
         ASSERT_TRUE(storage.hasValidBoundIdentity());
 
         std::unique_ptr<IMoEKernel> kernel;
@@ -2944,6 +2947,28 @@ namespace
         EXPECT_FALSE(storage.payloadReady());
         EXPECT_TRUE(storage.arm(first_residency_epoch - 1u))
             << "dropping an unpublished lease must restore quiescent ownership";
+
+        /*
+         * A failed CPU service must release the already-submitted GPU parent
+         * without manufacturing route rows. The same captured consumer owns the
+         * abort acknowledgement, after which the ordinary success sequence can
+         * reuse this storage immediately.
+         */
+        ASSERT_TRUE(storage.publishAbort());
+        EXPECT_FALSE(storage.payloadReady());
+        ASSERT_TRUE(kernel->consumeMoEOverlayCanonicalRouteTicket(
+            MoEKernelLaunchContext{.stream = resources.root_stream},
+            ticket));
+        ASSERT_TRUE(resources.root_backend->recordEvent(
+            resources.root_terminal,
+            continuation_device.ordinal,
+            resources.root_stream));
+        ASSERT_TRUE(awaitEvent(
+            resources.root_backend,
+            resources.root_terminal,
+            std::chrono::seconds(5),
+            continuation_device.ordinal));
+        EXPECT_FALSE(storage.payloadReady());
 
         std::vector<float> actual(element_count, 0.0f);
         std::vector<float> expected(element_count, 0.0f);
@@ -2992,6 +3017,7 @@ namespace
             ASSERT_TRUE(publication.publish(route_capacity))
                 << "replay=" << replay;
             ASSERT_TRUE(storage.payloadReadyFor(residency_epoch));
+            ASSERT_TRUE(storage.publicationSucceededFor(residency_epoch));
             EXPECT_FALSE(publication.publish(route_capacity))
                 << "publication requires one fresh arm transition";
             EXPECT_FALSE(storage.arm(residency_epoch + 1u))
@@ -3011,6 +3037,13 @@ namespace
                 continuation_device.ordinal));
             EXPECT_FALSE(storage.payloadReady())
                 << "GPU did not acknowledge replay=" << replay;
+            EXPECT_TRUE(storage.publicationSucceededFor(residency_epoch))
+                << "the CPU protocol terminal must accept an exact publication "
+                   "even when the concurrent GPU parent acknowledged it first; "
+                   "replay="
+                << replay;
+            EXPECT_FALSE(
+                storage.publicationSucceededFor(residency_epoch + 1u));
 
             ASSERT_TRUE(resources.root_backend->deviceToHost(
                 actual.data(),

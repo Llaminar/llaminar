@@ -12,6 +12,8 @@
  * 2. Collective-marked segmented mode remains functional.
  * 3. Graph-stable snapshot slots preserve point-in-time outputs when a later
  *    stage overwrites the producer's arena storage.
+ * 4. A retained GPU parent can wait on a concurrently serviced canonical CPU
+ *    route ticket without serial child launches or a host stream fence.
  */
 
 #include <gtest/gtest.h>
@@ -28,13 +30,17 @@
 #include <cstdlib>
 
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphCaptureController.h"
 #include "execution/compute_stages/ComputeStages.h"
+#include "execution/moe/MoEOverlayRetainedParentComposer.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "backends/BackendManager.h"
+#include "backends/GPUGraphMemoryContract.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
 #include "backends/IWorkerGPUContext.h"
 #include "tensors/Tensors.h"
+#include "transfer/TransferEngine.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -215,6 +221,353 @@ namespace
         std::shared_ptr<MoEOverlayDispatchTicketStorage> storage_;
         std::array<int, 4> observed_rows_{};
         size_t call_count_ = 0;
+        bool complete_ = false;
+    };
+
+    /**
+     * @brief CPU producer for one reusable mapped canonical-route ticket.
+     *
+     * The stage intentionally has no arena bindings: every byte it owns lives
+     * in the setup-bound ticket and contribution mapping. This is the exact
+     * self-contained contract required for servicing the stage after a GPU
+     * retained parent has already started. Publication is the only ordering
+     * edge observed by the captured consumer.
+     */
+    class CanonicalTicketPublishManualStage final : public IComputeStage
+    {
+    public:
+        /**
+         * @brief Bind one immutable ticket and its deterministic test payload.
+         * @param storage Model-lifetime mapped ticket storage.
+         * @param route_capacity Number of route rows published per execution.
+         * @param d_model Width of each FP32 route row.
+         */
+        CanonicalTicketPublishManualStage(
+            std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage> storage,
+            std::size_t route_capacity,
+            int d_model)
+            : IComputeStage(DeviceId::cpu()),
+              storage_(std::move(storage)),
+              route_capacity_(route_capacity),
+              d_model_(d_model)
+        {
+        }
+
+        /**
+         * @brief Fill and release-publish the next mapped ticket generation.
+         * @return True after the complete compact payload becomes visible.
+         */
+        bool execute(IDeviceContext *ctx) override
+        {
+            complete_ = false;
+            if (!ctx || !storage_ ||
+                !storage_->hasValidBoundIdentity() || route_capacity_ == 0u ||
+                d_model_ <= 0)
+            {
+                return false;
+            }
+
+            const std::uint64_t residency_epoch = 101u + call_count_;
+            auto publication = storage_->arm(residency_epoch);
+            if (!publication)
+                return false;
+
+            auto *const original_slots = storage_->originalRouteSlotsHost();
+            auto *const compact_slots = storage_->compactRouteSlotsHost();
+            float *const rows = storage_->contributionRowsHost();
+            if (!original_slots || !compact_slots || !rows)
+                return false;
+
+            /* Reverse the compact layout so the device materializer must use
+             * both identity arrays instead of succeeding as a bulk copy. */
+            const float base = 1000.0f * static_cast<float>(call_count_ + 1u);
+            for (std::size_t entry = 0u; entry < route_capacity_; ++entry)
+            {
+                const std::size_t compact = route_capacity_ - 1u - entry;
+                original_slots[entry] = static_cast<std::int32_t>(entry);
+                compact_slots[entry] = static_cast<std::int32_t>(compact);
+                for (int column = 0; column < d_model_; ++column)
+                {
+                    rows[compact * static_cast<std::size_t>(d_model_) +
+                         static_cast<std::size_t>(column)] =
+                        base + 100.0f * static_cast<float>(entry) +
+                        static_cast<float>(column);
+                }
+            }
+            if (!publication.publish(route_capacity_))
+                return false;
+
+            ++call_count_;
+            complete_ = true;
+            return true;
+        }
+
+        /** @return Stable stage identity for graph diagnostics. */
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::MOE_LOCAL_EXPERT;
+        }
+        /** @return Human-readable stage name. */
+        std::string name() const override
+        {
+            return "canonical_ticket_publish_manual";
+        }
+        /**
+         * @return True for the executor fixture's shared context.
+         *
+         * Production supplies a participant-specific CPU context through its
+         * node executor callback. This lower-level integration invokes the
+         * self-contained host ticket stage through the graph's shared context;
+         * the stage deliberately performs no backend operation through it.
+         */
+        bool supportsBackend(ComputeBackendType) const override
+        {
+            return true;
+        }
+        /** @return False because mapped host service is outside GPU capture. */
+        bool isGraphCapturable() const override { return false; }
+        /** @return True because this stage is an explicit host ticket unit. */
+        bool isManualGraphBoundary() const override { return true; }
+        /** @return Whether the current invocation published its payload. */
+        bool manualGraphBoundaryComplete() const override { return complete_; }
+        /** @return Pre-armed service that overlaps retained-parent submission. */
+        ManualGraphBoundaryScheduling
+        manualGraphBoundaryScheduling() const noexcept override
+        {
+            return ManualGraphBoundaryScheduling::ConcurrentTicketService;
+        }
+        /** @return This stage owns the publication that releases GPU ingress. */
+        ConcurrentManualFailureRole
+        concurrentManualFailureRole() const noexcept override
+        {
+            return ConcurrentManualFailureRole::DeviceIngressPublisher;
+        }
+        /** @brief Publish an authenticated abort to drain a waiting parent. */
+        bool publishConcurrentManualFailure() noexcept override
+        {
+            return storage_ && storage_->publishAbort();
+        }
+        /** @return Ticket geometry is independent of padded logical length. */
+        bool supportsPaddedPrefillGraphCapturePreflight() const override
+        {
+            return true;
+        }
+        /** @return Ticket geometry preserves the live-length contract. */
+        bool supportsPaddedPrefillRealLengthContract() const override
+        {
+            return true;
+        }
+        /** @return No ordinary tensor coherence is owned by this stage. */
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+        /** @return No arena storage is required. */
+        StageBufferRequirements getBufferRequirements() const override
+        {
+            return {};
+        }
+        /** @return Empty arena contract; all storage is mapped-ticket owned. */
+        StageBufferContract bufferContract() const override
+        {
+            return StageBufferContract::build();
+        }
+        /** @return No tensor dump is needed for this protocol fixture. */
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+        /** @return Number of successful ticket publications. */
+        std::size_t callCount() const noexcept { return call_count_; }
+
+    private:
+        std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage> storage_;
+        std::size_t route_capacity_ = 0u;
+        int d_model_ = 0;
+        std::uint64_t call_count_ = 0u;
+        bool complete_ = false;
+    };
+
+    /**
+     * @brief Concurrent CPU bridge from one captured dispatch ticket to one
+     * captured canonical-route return ticket.
+     *
+     * This fixture is deliberately the smallest complete production-shaped
+     * heterogeneous boundary. The retained GPU parent first copies router and
+     * hidden-state bytes into @p dispatch_storage and system-release publishes
+     * them. This CPU service acquires that edge, constructs the canonical
+     * sparse return, and release-publishes @p return_storage so the already
+     * running parent can resume in its captured consumer.
+     */
+    class DispatchToCanonicalTicketManualStage final : public IComputeStage
+    {
+    public:
+        /**
+         * @brief Bind both immutable ticket lifetimes used by the bridge.
+         * @param dispatch_storage Captured GPU-to-CPU dispatch ticket.
+         * @param return_storage CPU-to-GPU canonical return ticket.
+         * @param route_capacity Number of canonical route rows per replay.
+         * @param d_model Width of every returned route row.
+         */
+        DispatchToCanonicalTicketManualStage(
+            std::shared_ptr<MoEOverlayDispatchTicketStorage> dispatch_storage,
+            std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage>
+                return_storage,
+            std::size_t route_capacity,
+            int d_model)
+            : IComputeStage(DeviceId::cpu()),
+              dispatch_storage_(std::move(dispatch_storage)),
+              return_storage_(std::move(return_storage)),
+              route_capacity_(route_capacity),
+              d_model_(d_model)
+        {
+        }
+
+        /**
+         * @brief Acquire the captured dispatch and publish one sparse return.
+         * @return True only after both publication edges complete in order.
+         */
+        bool execute(IDeviceContext *ctx) override
+        {
+            complete_ = false;
+            if (!ctx || !dispatch_storage_ || !return_storage_ ||
+                !dispatch_storage_->hasValidBoundIdentity() ||
+                !return_storage_->hasValidBoundIdentity() ||
+                route_capacity_ == 0u || d_model_ <= 0)
+            {
+                return false;
+            }
+
+            std::string publication_error;
+            if (!dispatch_storage_->awaitCapturedPublication(
+                    &publication_error))
+            {
+                return false;
+            }
+            const auto &dispatch = dispatch_storage_->ticket();
+            if (!dispatch.isValid() ||
+                dispatch.header->logical_row_count <= 0 ||
+                dispatch.header->d_model != d_model_)
+            {
+                return false;
+            }
+
+            const std::uint64_t residency_epoch = 301u + call_count_;
+            auto publication = return_storage_->arm(residency_epoch);
+            if (!publication)
+                return false;
+
+            auto *const original_slots =
+                return_storage_->originalRouteSlotsHost();
+            auto *const compact_slots =
+                return_storage_->compactRouteSlotsHost();
+            float *const rows = return_storage_->contributionRowsHost();
+            if (!original_slots || !compact_slots || !rows)
+                return false;
+
+            /* Preserve the first dispatch value as a replay-freshness oracle.
+             * Every route receives a deterministic offset so the captured
+             * consumer must materialize the complete mapped sparse payload. */
+            const float dispatch_value = dispatch.hidden_rows_fp32[0];
+            for (std::size_t route = 0u; route < route_capacity_; ++route)
+            {
+                original_slots[route] = static_cast<std::int32_t>(route);
+                compact_slots[route] = static_cast<std::int32_t>(route);
+                for (int column = 0; column < d_model_; ++column)
+                {
+                    rows[route * static_cast<std::size_t>(d_model_) +
+                         static_cast<std::size_t>(column)] =
+                        dispatch_value + 100.0f * static_cast<float>(route) +
+                        static_cast<float>(column);
+                }
+            }
+            if (!publication.publish(route_capacity_))
+                return false;
+
+            if (call_count_ < observed_dispatch_values_.size())
+                observed_dispatch_values_[call_count_] = dispatch_value;
+            ++call_count_;
+            complete_ = true;
+            return true;
+        }
+
+        /** @return Stable stage identity for graph diagnostics. */
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::MOE_EXPERT_DISPATCH;
+        }
+        /** @return Human-readable stage name. */
+        std::string name() const override
+        {
+            return "dispatch_to_canonical_ticket_manual";
+        }
+        /** @return True for the fixture's shared participant context. */
+        bool supportsBackend(ComputeBackendType) const override { return true; }
+        /** @return False because this service executes on the host. */
+        bool isGraphCapturable() const override { return false; }
+        /** @return True because this is the explicit heterogeneous cutpoint. */
+        bool isManualGraphBoundary() const override { return true; }
+        /** @return Whether this invocation published its return ticket. */
+        bool manualGraphBoundaryComplete() const override { return complete_; }
+        /** @return Service must be armed before retained-parent submission. */
+        ManualGraphBoundaryScheduling
+        manualGraphBoundaryScheduling() const noexcept override
+        {
+            return ManualGraphBoundaryScheduling::ConcurrentTicketService;
+        }
+        /** @return This service publishes the edge that releases GPU ingress. */
+        ConcurrentManualFailureRole
+        concurrentManualFailureRole() const noexcept override
+        {
+            return ConcurrentManualFailureRole::DeviceIngressPublisher;
+        }
+        /** @brief Release a captured consumer if dispatch servicing fails. */
+        bool publishConcurrentManualFailure() noexcept override
+        {
+            return return_storage_ && return_storage_->publishAbort();
+        }
+        /** @return Fixed ticket geometry supports padded capture. */
+        bool supportsPaddedPrefillGraphCapturePreflight() const override
+        {
+            return true;
+        }
+        /** @return Live rows are carried in the immutable ticket ABI. */
+        bool supportsPaddedPrefillRealLengthContract() const override
+        {
+            return true;
+        }
+        /** @return Both ticket stores own coherence explicitly. */
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+        /** @return No BufferArena storage belongs to this host service. */
+        StageBufferRequirements getBufferRequirements() const override
+        {
+            return {};
+        }
+        /** @return Empty arena contract permits concurrent ticket service. */
+        StageBufferContract bufferContract() const override
+        {
+            return StageBufferContract::build();
+        }
+        /** @return No tensor dump is required for this protocol fixture. */
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+        /** @return Number of complete dispatch-to-return transactions. */
+        std::size_t callCount() const noexcept { return call_count_; }
+        /** @return Dispatch value acquired during one completed transaction. */
+        float observedDispatchValue(std::size_t call) const noexcept
+        {
+            return call < observed_dispatch_values_.size()
+                       ? observed_dispatch_values_[call]
+                       : 0.0f;
+        }
+
+    private:
+        std::shared_ptr<MoEOverlayDispatchTicketStorage> dispatch_storage_;
+        std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage>
+            return_storage_;
+        std::size_t route_capacity_ = 0u;
+        int d_model_ = 0;
+        std::array<float, 4> observed_dispatch_values_{};
+        std::size_t call_count_ = 0u;
         bool complete_ = false;
     };
 } // namespace
@@ -418,6 +771,72 @@ protected:
         graph.addNode("stage1_norm", ComputeStageFactory::createRMSNorm(norm_params), device);
         graph.addNode("stage2_overwrite", ComputeStageFactory::createResidualAdd(overwrite_params), device);
         graph.addDependency("stage2_overwrite", "stage1_norm");
+        return graph;
+    }
+
+    /**
+     * @brief Build a production-scale checkpoint chain over three live tensors.
+     *
+     * The 122B parity graph exposes roughly fifteen hundred tensor-backed stage
+     * outputs per participant. Alternating two activation buffers reproduces
+     * the production arena-reuse hazard without allocating one tensor per
+     * stage: every ResidualAdd updates the next buffer and its snapshot must
+     * preserve that exact intermediate value before a later stage overwrites
+     * the same address.
+     *
+     * @param stage_count Positive number of captured checkpoint producers.
+     * @param element_count Elements in each checkpoint payload.
+     * @param final_output Receives the tensor written by the last stage.
+     * @return A dependency-ordered graph with @p stage_count snapshot outputs.
+     */
+    ComputeGraph buildProductionScaleSnapshotChain(
+        size_t stage_count,
+        size_t element_count,
+        FP32Tensor *&final_output)
+    {
+        EXPECT_GT(stage_count, 0u);
+        EXPECT_GT(element_count, 0u);
+
+        const DeviceId device = device_ctx_->deviceId();
+        auto *first = createArenaFP32Tensor(
+            BufferId::HIDDEN_STATE, {1u, element_count});
+        auto *second = createArenaFP32Tensor(
+            BufferId::NORMALIZED, {1u, element_count});
+        auto *residual = createArenaFP32Tensor(
+            BufferId::RESIDUAL, {1u, element_count});
+        std::fill_n(first->mutable_data(), element_count, 1.0F);
+        std::fill_n(second->mutable_data(), element_count, 0.0F);
+        std::fill_n(residual->mutable_data(), element_count, 0.25F);
+
+        ComputeGraph graph;
+        std::string predecessor;
+        for (size_t stage = 0; stage < stage_count; ++stage)
+        {
+            const bool even = (stage % 2u) == 0u;
+            ResidualAddStage::Params params;
+            params.device_id = device;
+            params.input = even ? first : second;
+            params.residual = residual;
+            params.output = even ? second : first;
+            params.num_elements = element_count;
+            params.input_buffer_id =
+                even ? BufferId::HIDDEN_STATE : BufferId::NORMALIZED;
+            params.residual_buffer_id = BufferId::RESIDUAL;
+            params.output_buffer_id =
+                even ? BufferId::NORMALIZED : BufferId::HIDDEN_STATE;
+
+            const std::string stage_name =
+                "production_snapshot_stage_" + std::to_string(stage);
+            graph.addNode(
+                stage_name,
+                ComputeStageFactory::createResidualAdd(params),
+                device);
+            if (!predecessor.empty())
+                graph.addDependency(stage_name, predecessor);
+            predecessor = stage_name;
+        }
+
+        final_output = (stage_count % 2u) == 0u ? first : second;
         return graph;
     }
 
@@ -717,13 +1136,17 @@ TEST_F(CachedGraphReplayExecutionTest,
 
     auto ticket_storage =
         std::make_shared<MoEOverlayDispatchTicketStorage>();
+    const std::array<DeviceId, 1> ticket_devices{device};
+    auto ticket_arena =
+        TransferEngine::instance().createMappedHostArena(ticket_devices);
     ticket_storage->bindFixedCapacity(
         layer,
         bucket_rows,
         top_k,
         d_model,
         device,
-        /*workspace_generation=*/29);
+        /*workspace_generation=*/29,
+        ticket_arena);
     const auto *const ticket_header = ticket_storage->ticket().header;
     const auto *const ticket_hidden =
         ticket_storage->ticket().hidden_rows_fp32;
@@ -1016,6 +1439,675 @@ TEST_F(CachedGraphReplayExecutionTest,
     EXPECT_EQ(setup_cache.successful_submission_count, 0u);
 }
 
+/**
+ * @brief Prove a retained parent replays its captured GPU-to-CPU dispatch edge.
+ *
+ * This combines the two halves certified separately by the segmented dispatch
+ * test and the canonical-return retained-parent test. It is the minimal shape
+ * of one production heterogeneous ExpertOverlay layer: captured D2H dispatch,
+ * concurrent CPU service, and captured mapped-ticket return consumption. A
+ * second transaction changes the source bytes while retaining every graph and
+ * ticket address. Forty-eight consecutive boundaries produce the same 97-unit
+ * retained-parent shape as the Qwen 3.5 122B authority graph. The depth-15
+ * grouped-decode row capacity, router fanout, and hidden width also reproduce
+ * its mapped-ticket byte pressure, while one shared canonical-return region
+ * matches the production serial CPU arena. This catches setup-time mapped-page
+ * translation storms without loading model weights or inventing per-layer
+ * registrations that production does not own.
+ */
+TEST_F(CachedGraphReplayExecutionTest,
+       RetainedParentReplaysCapturedDispatchPublicationAcrossReset)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+    ScopedPerfStats perf_stats;
+
+    constexpr int layer_count = 48;
+    constexpr int bucket_rows = 16;
+    constexpr int top_k = 8;
+    constexpr int d_model = 7168;
+    constexpr std::size_t route_capacity =
+        static_cast<std::size_t>(bucket_rows * top_k);
+    constexpr std::size_t contribution_elements =
+        route_capacity * static_cast<std::size_t>(d_model);
+    constexpr std::size_t contribution_bytes =
+        contribution_elements * sizeof(float);
+    const DeviceId device = device_ctx_->deviceId();
+
+    auto *hidden = createArenaFP32Tensor(
+        BufferId::NORMALIZED,
+        {bucket_rows, d_model});
+    auto *routing_indices = createArenaFP32Tensor(
+        BufferId::MOE_EXPERT_INDICES,
+        {bucket_rows, top_k});
+    auto *routing_weights = createArenaFP32Tensor(
+        BufferId::MOE_EXPERT_WEIGHTS,
+        {bucket_rows, top_k});
+    auto *canonical_output = createArenaFP32Tensor(
+        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS,
+        {route_capacity, static_cast<std::size_t>(d_model)});
+
+    const auto fill_dispatch = [&](float base)
+    {
+        for (int column = 0; column < d_model; ++column)
+            hidden->mutable_data()[column] = base + column;
+        routing_indices->mutable_data()[0] = 0.0f;
+        routing_indices->mutable_data()[1] = 1.0f;
+        routing_weights->mutable_data()[0] = 0.25f;
+        routing_weights->mutable_data()[1] = 0.75f;
+    };
+    fill_dispatch(11.0f);
+    std::fill_n(
+        canonical_output->mutable_data(),
+        contribution_elements,
+        -1.0f);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+
+    const std::array<DeviceId, 1> mapped_devices{device};
+    auto ticket_arena =
+        TransferEngine::instance().createMappedHostArena(mapped_devices);
+    auto cpu_canonical_arena =
+        std::make_shared<MoELocalExpertSerialBufferArena>(
+            MoELocalExpertSerialBufferArena::Config{
+                .device_id = DeviceId::cpu(),
+                .row_capacity = bucket_rows,
+                .row_capacity_buckets = {bucket_rows},
+                .d_model = d_model,
+                .routing_top_k = top_k,
+                .cpu_canonical_route_storage =
+                    MoELocalExpertSerialBufferArena::
+                        CPUCanonicalRouteStoragePolicy::RetainSerialMaximum,
+                .cpu_canonical_route_gpu_consumer = device,
+                .debug_name =
+                    "integration.production_mapped_cpu_canonical_routes",
+            });
+    auto contribution_region =
+        cpu_canonical_arena->mappedCPUCanonicalRoutes(device);
+    ASSERT_NE(contribution_region, nullptr);
+    ASSERT_NE(cpu_canonical_arena->cpuCanonicalRoutes(), nullptr);
+    EXPECT_FALSE(cpu_canonical_arena->cpuCanonicalRoutes()->isMapped());
+    EXPECT_EQ(
+        cpu_canonical_arena->cpuCanonicalRoutes()->home_device(),
+        DeviceId::cpu());
+    EXPECT_NE(
+        cpu_canonical_arena->cpuCanonicalRoutes()->mutable_data(),
+        contribution_region->mutableHostData());
+    EXPECT_TRUE(contribution_region->contains(0u, contribution_bytes));
+    ComputeGraph graph;
+    std::vector<std::shared_ptr<MoEOverlayDispatchTicketStorage>>
+        dispatch_storages;
+    std::vector<std::shared_ptr<
+        MoEOverlayCanonicalRouteReturnTicketStorage>> return_storages;
+    std::vector<DispatchToCanonicalTicketManualStage *> manual_probes;
+    dispatch_storages.reserve(layer_count);
+    return_storages.reserve(layer_count);
+    manual_probes.reserve(layer_count);
+
+    std::string prior_consume;
+    for (int layer = 0; layer < layer_count; ++layer)
+    {
+        auto dispatch_storage =
+            std::make_shared<MoEOverlayDispatchTicketStorage>();
+        dispatch_storage->bindFixedCapacity(
+            layer,
+            bucket_rows,
+            top_k,
+            d_model,
+            device,
+            /*workspace_generation=*/41u,
+            ticket_arena);
+        auto return_storage = std::make_shared<
+            MoEOverlayCanonicalRouteReturnTicketStorage>();
+        return_storage->bindFixedCapacity(
+            layer,
+            route_capacity,
+            d_model,
+            device,
+            /*workspace_generation=*/41u,
+            contribution_region,
+            ticket_arena);
+
+        MoEOverlayTicketPublishStage::Params publish_params;
+        publish_params.device_id = device;
+        publish_params.hidden = hidden;
+        publish_params.routing_indices = routing_indices;
+        publish_params.routing_weights = routing_weights;
+        publish_params.hidden_buffer_id = BufferId::NORMALIZED;
+        publish_params.routing_indices_buffer_id =
+            BufferId::MOE_EXPERT_INDICES;
+        publish_params.routing_weights_buffer_id =
+            BufferId::MOE_EXPERT_WEIGHTS;
+        publish_params.layer_idx = layer;
+        publish_params.bucket_rows = bucket_rows;
+        publish_params.top_k = top_k;
+        publish_params.d_model = d_model;
+        publish_params.ticket_storage = dispatch_storage;
+
+        auto manual_stage = std::make_unique<
+            DispatchToCanonicalTicketManualStage>(
+                dispatch_storage,
+                return_storage,
+                route_capacity,
+                d_model);
+        manual_probes.push_back(manual_stage.get());
+
+        MoEOverlayTicketConsumeStage::Params consume_params;
+        consume_params.device_id = device;
+        consume_params.output = canonical_output;
+        consume_params.output_buffer_id =
+            BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+        consume_params.layer_idx = layer;
+        consume_params.bucket_rows = bucket_rows;
+        consume_params.top_k = top_k;
+        consume_params.d_model = d_model;
+        consume_params.canonical_route_ticket_storage = return_storage;
+
+        const std::string publish_name =
+            "gpu_dispatch_publish_" + std::to_string(layer);
+        const std::string manual_name =
+            "cpu_dispatch_service_" + std::to_string(layer);
+        const std::string consume_name =
+            "gpu_return_consume_" + std::to_string(layer);
+        graph.addNode(
+            publish_name,
+            ComputeStageFactory::createMoEOverlayTicketPublish(
+                publish_params),
+            device);
+        graph.addNode(
+            manual_name,
+            std::move(manual_stage),
+            DeviceId::cpu());
+        graph.addNode(
+            consume_name,
+            ComputeStageFactory::createMoEOverlayTicketConsume(
+                consume_params),
+            device);
+        if (!prior_consume.empty())
+            graph.addDependency(publish_name, prior_consume);
+        graph.addDependency(manual_name, publish_name);
+        graph.addDependency(consume_name, manual_name);
+        graph.setHeterogeneousTicketUnitContract(
+            publish_name,
+            GraphHeterogeneousTicketUnitContract{
+                .identity =
+                    "captured_dispatch_before_cpu_service_" +
+                    std::to_string(layer),
+                .disposition = GraphHeterogeneousTicketUnitDisposition::
+                    BeforeManualBoundary,
+            });
+        prior_consume = consume_name;
+        dispatch_storages.push_back(std::move(dispatch_storage));
+        return_storages.push_back(std::move(return_storage));
+    }
+
+    ASSERT_FALSE(prior_consume.empty());
+    graph.setTerminalNode(prior_consume);
+    graph.setHeterogeneousTicketUnitContract(
+        prior_consume,
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "captured_return_after_cpu_service",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    GraphExecutorConfig exec_config;
+    exec_config.enable_validation = false;
+    DeviceGraphExecutor executor(exec_config);
+    graph_arena_.bindExecutor(executor);
+    DeviceGraphExecutor::GraphSegmentCache segment_cache;
+    void *const dispatch_stream = gpu_ctx_->defaultStream();
+    ASSERT_NE(dispatch_stream, nullptr);
+
+    const auto retained_plan = makeMoEOverlayRetainedParentPlan(graph);
+    ASSERT_TRUE(retained_plan.has_value());
+    ASSERT_TRUE(retained_plan->valid());
+    EXPECT_EQ(
+        retained_plan->replay_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            RequireRetainedParentWithConcurrentTicketService);
+    const auto execute = [&](DeviceGraphExecutor::GraphInitialSubmissionPolicy
+                                 initial_submission)
+    {
+        return executor.executeWithCachedGraphReplay(
+            graph,
+            device_ctx_.get(),
+            segment_cache,
+            dispatch_stream,
+            gpu_ctx_,
+            /*collective_nodes=*/nullptr,
+            /*collectives_graph_capturable=*/false,
+            /*force_recapture=*/false,
+            /*defer_final_sync=*/true,
+            /*capture_boundary=*/{},
+            retained_plan->replay_policy,
+            /*launch_dependency=*/{},
+            /*event_published_outputs=*/{},
+            retained_plan->composer,
+            initial_submission);
+    };
+    const auto expect_transaction = [&](std::size_t call, float base)
+    {
+        ASSERT_TRUE(gpu_ctx_->synchronizeStreamChecked(
+            segment_cache.capture_stream));
+        for (std::size_t layer = 0u; layer < manual_probes.size(); ++layer)
+        {
+            ASSERT_NE(manual_probes[layer], nullptr);
+            ASSERT_EQ(manual_probes[layer]->callCount(), call + 1u)
+                << "layer=" << layer;
+            EXPECT_FLOAT_EQ(
+                manual_probes[layer]->observedDispatchValue(call), base)
+                << "layer=" << layer;
+        }
+        ASSERT_TRUE(canonical_output->ensureOnHost(
+            segment_cache.capture_stream));
+        for (std::size_t route = 0u; route < route_capacity; ++route)
+        {
+            for (int column = 0; column < d_model; ++column)
+            {
+                EXPECT_FLOAT_EQ(
+                    canonical_output->data()[
+                        route * static_cast<std::size_t>(d_model) +
+                        static_cast<std::size_t>(column)],
+                    base + 100.0f * static_cast<float>(route) +
+                        static_cast<float>(column));
+            }
+        }
+        for (std::size_t layer = 0u; layer < return_storages.size(); ++layer)
+        {
+            EXPECT_FALSE(return_storages[layer]->payloadReady())
+                << "layer=" << layer;
+        }
+    };
+
+    ASSERT_TRUE(execute(
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+            MaterializeWithoutLaunch));
+    const auto mapped_arena_snapshot = ticket_arena->snapshot();
+    EXPECT_EQ(mapped_arena_snapshot.slice_count, 48u * 3u);
+    EXPECT_GE(
+        mapped_arena_snapshot.allocated_bytes,
+        48u * static_cast<std::size_t>(bucket_rows) *
+            static_cast<std::size_t>(d_model) * sizeof(float) * 2u);
+    EXPECT_LT(mapped_arena_snapshot.backing_region_count, 16u);
+    double backend_owned_mappings = 0.0;
+    double external_registrations = 0.0;
+    for (const auto &record : PerfStatsCollector::snapshot(
+             {"moe_overlay_activation_epoch"}))
+    {
+        if (record.name == "mapped_backend_allocations")
+        {
+            backend_owned_mappings += record.value;
+            EXPECT_EQ(
+                record.tags.at("mapping"),
+                "backend_owned_mapped_host_pages");
+        }
+        else if (record.name == "mapped_backend_registrations")
+        {
+            external_registrations += record.value;
+        }
+    }
+    EXPECT_GT(backend_owned_mappings, 0.0);
+    EXPECT_EQ(external_registrations, 0.0)
+        << "an exact-device retained ticket must not register anonymous pages";
+    ASSERT_NE(segment_cache.retained_parent_capture, nullptr);
+    EXPECT_TRUE(segment_cache.retained_parent_capture->hasExecutable());
+    ASSERT_EQ(segment_cache.segments.size(), 50u);
+    std::size_t captured_compilation_units = 0u;
+    std::size_t captured_stages = 0u;
+    std::size_t service_programs = 0u;
+    for (const auto &segment : segment_cache.segments)
+    {
+        if (segment.capturable)
+        {
+            ++captured_compilation_units;
+            captured_stages += segment.stage_names.size();
+        }
+        else
+        {
+            ++service_programs;
+            EXPECT_EQ(segment.stage_names.size(), 48u)
+                << "all CPU work must share one ordered concurrent service program";
+        }
+    }
+    EXPECT_EQ(captured_compilation_units, 49u)
+        << "typed ticket frontiers should bound native graph compilation";
+    EXPECT_EQ(captured_stages, 48u * 2u)
+        << "every publish/consume stage must enter the retained parent";
+    EXPECT_EQ(service_programs, 1u);
+    EXPECT_FALSE(segment_cache.segments.back().capturable);
+    EXPECT_EQ(segment_cache.segments.back().stage_names.size(), 48u)
+        << "all CPU work must share one ordered concurrent service program";
+    for (std::size_t layer = 0u; layer < manual_probes.size(); ++layer)
+    {
+        ASSERT_NE(manual_probes[layer], nullptr);
+        EXPECT_EQ(manual_probes[layer]->callCount(), 0u)
+            << "layer=" << layer;
+    }
+
+    graph.reset();
+    ASSERT_TRUE(execute(
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+            CaptureInstantiateAndLaunch));
+    expect_transaction(/*call=*/0u, /*base=*/11.0f);
+
+    fill_dispatch(29.0f);
+    ASSERT_TRUE(hidden->ensureOnDevice(
+        device, segment_cache.capture_stream));
+    ASSERT_TRUE(routing_indices->ensureOnDevice(
+        device, segment_cache.capture_stream));
+    ASSERT_TRUE(routing_weights->ensureOnDevice(
+        device, segment_cache.capture_stream));
+    graph.reset();
+    ASSERT_TRUE(execute(
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+            CaptureInstantiateAndLaunch));
+    expect_transaction(/*call=*/1u, /*base=*/29.0f);
+}
+
+/**
+ * @brief Prove one real GPU parent overlaps a canonical CPU ticket service.
+ *
+ * Setup records bounded graph-only compilation units around two CPU ticket
+ * boundaries and composes them into one native executable. At request time the
+ * persistent CPU service is armed before the parent submission call. Each
+ * canonical consumer waits in device code while its matching CPU stage
+ * release-publishes the mapped route payload. Two boundaries catch submission-
+ * queue circular waits that a tiny one-boundary parent can hide; replaying with
+ * different payloads proves that neither graph execution nor ticket contents
+ * were frozen in setup.
+ */
+TEST_F(CachedGraphReplayExecutionTest,
+       RetainedParentOverlapsCanonicalCPUTicketService)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+    ScopedPerfStats perf_stats;
+
+    constexpr std::array<int, 2> layers{7, 8};
+    constexpr int bucket_rows = 1;
+    constexpr int top_k = 2;
+    constexpr int d_model = 8;
+    constexpr std::size_t route_capacity =
+        static_cast<std::size_t>(bucket_rows * top_k);
+    constexpr std::size_t payload_elements =
+        route_capacity * static_cast<std::size_t>(d_model);
+    constexpr std::size_t payload_bytes = payload_elements * sizeof(float);
+    const DeviceId device = device_ctx_->deviceId();
+
+    auto *prefix_input = createArenaFP32Tensor(
+        BufferId::HIDDEN_STATE, {1u, static_cast<std::size_t>(d_model)});
+    auto *prefix_residual = createArenaFP32Tensor(
+        BufferId::RESIDUAL, {1u, static_cast<std::size_t>(d_model)});
+    auto *prefix_output = createArenaFP32Tensor(
+        BufferId::ATTN_OUTPUT, {1u, static_cast<std::size_t>(d_model)});
+    auto *canonical_output = createArenaFP32Tensor(
+        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS,
+        {route_capacity, static_cast<std::size_t>(d_model)});
+    for (int column = 0; column < d_model; ++column)
+    {
+        prefix_input->mutable_data()[column] =
+            1.0f + static_cast<float>(column);
+        prefix_residual->mutable_data()[column] = 0.5f;
+    }
+    std::fill_n(canonical_output->mutable_data(), payload_elements, -1.0f);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+
+    const std::array<DeviceId, 1> mapped_devices{device};
+    auto ticket_arena =
+        TransferEngine::instance().createMappedHostArena(mapped_devices);
+    auto first_contribution_region =
+        TransferEngine::instance().allocateMappedHostRegion(
+            payload_bytes, mapped_devices);
+    auto second_contribution_region =
+        TransferEngine::instance().allocateMappedHostRegion(
+            payload_bytes, mapped_devices);
+    ASSERT_NE(first_contribution_region, nullptr);
+    ASSERT_NE(second_contribution_region, nullptr);
+    ASSERT_TRUE(first_contribution_region->isBound());
+    ASSERT_TRUE(second_contribution_region->isBound());
+
+    auto first_ticket_storage = std::make_shared<
+        MoEOverlayCanonicalRouteReturnTicketStorage>();
+    auto second_ticket_storage = std::make_shared<
+        MoEOverlayCanonicalRouteReturnTicketStorage>();
+    first_ticket_storage->bindFixedCapacity(
+        layers[0],
+        route_capacity,
+        d_model,
+        device,
+        /*workspace_generation=*/37u,
+        first_contribution_region,
+        ticket_arena);
+    second_ticket_storage->bindFixedCapacity(
+        layers[1],
+        route_capacity,
+        d_model,
+        device,
+        /*workspace_generation=*/37u,
+        second_contribution_region,
+        ticket_arena);
+    ASSERT_TRUE(first_ticket_storage->hasValidBoundIdentity());
+    ASSERT_TRUE(second_ticket_storage->hasValidBoundIdentity());
+
+    ResidualAddStage::Params prefix_params;
+    prefix_params.device_id = device;
+    prefix_params.input = prefix_input;
+    prefix_params.residual = prefix_residual;
+    prefix_params.output = prefix_output;
+    prefix_params.num_elements = static_cast<std::size_t>(d_model);
+    prefix_params.input_buffer_id = BufferId::HIDDEN_STATE;
+    prefix_params.residual_buffer_id = BufferId::RESIDUAL;
+    prefix_params.output_buffer_id = BufferId::ATTN_OUTPUT;
+
+    auto first_manual_stage = std::make_unique<
+        CanonicalTicketPublishManualStage>(
+            first_ticket_storage, route_capacity, d_model);
+    auto second_manual_stage = std::make_unique<
+        CanonicalTicketPublishManualStage>(
+            second_ticket_storage, route_capacity, d_model);
+    CanonicalTicketPublishManualStage *const first_manual_probe =
+        first_manual_stage.get();
+    CanonicalTicketPublishManualStage *const second_manual_probe =
+        second_manual_stage.get();
+
+    const auto make_consume_params = [&](
+                                         int layer,
+                                         const std::shared_ptr<
+                                             MoEOverlayCanonicalRouteReturnTicketStorage>
+                                             &storage)
+    {
+        MoEOverlayTicketConsumeStage::Params params;
+        params.device_id = device;
+        params.output = canonical_output;
+        params.output_buffer_id =
+            BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+        params.layer_idx = layer;
+        params.bucket_rows = bucket_rows;
+        params.top_k = top_k;
+        params.d_model = d_model;
+        params.canonical_route_ticket_storage = storage;
+        return params;
+    };
+
+    ComputeGraph graph;
+    graph.addNode(
+        "gpu_prefix",
+        ComputeStageFactory::createResidualAdd(prefix_params),
+        device);
+    graph.addNode(
+        "cpu_canonical_ticket_service_0",
+        std::move(first_manual_stage),
+        DeviceId::cpu());
+    graph.addNode(
+        "gpu_canonical_ticket_consume_0",
+        ComputeStageFactory::createMoEOverlayTicketConsume(
+            make_consume_params(layers[0], first_ticket_storage)),
+        device);
+    graph.addNode(
+        "gpu_between_tickets",
+        ComputeStageFactory::createResidualAdd(prefix_params),
+        device);
+    graph.addNode(
+        "cpu_canonical_ticket_service_1",
+        std::move(second_manual_stage),
+        DeviceId::cpu());
+    graph.addNode(
+        "gpu_canonical_ticket_consume_1",
+        ComputeStageFactory::createMoEOverlayTicketConsume(
+            make_consume_params(layers[1], second_ticket_storage)),
+        device);
+    graph.addDependency("cpu_canonical_ticket_service_0", "gpu_prefix");
+    graph.addDependency(
+        "gpu_canonical_ticket_consume_0",
+        "cpu_canonical_ticket_service_0");
+    graph.addDependency(
+        "gpu_between_tickets", "gpu_canonical_ticket_consume_0");
+    graph.addDependency(
+        "cpu_canonical_ticket_service_1", "gpu_between_tickets");
+    graph.addDependency(
+        "gpu_canonical_ticket_consume_1",
+        "cpu_canonical_ticket_service_1");
+    graph.setHeterogeneousTicketUnitContract(
+        "gpu_prefix",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "prefix_before_cpu_ticket",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                BeforeManualBoundary,
+        });
+    graph.setHeterogeneousTicketUnitContract(
+        "gpu_between_tickets",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "between_cpu_tickets",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                BeforeManualBoundary,
+        });
+    graph.setTerminalNode("gpu_canonical_ticket_consume_1");
+    graph.setHeterogeneousTicketUnitContract(
+        "gpu_canonical_ticket_consume_1",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "canonical_ticket_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    GraphExecutorConfig exec_config;
+    exec_config.enable_validation = false;
+    DeviceGraphExecutor executor(exec_config);
+    graph_arena_.bindExecutor(executor);
+    DeviceGraphExecutor::GraphSegmentCache segment_cache;
+    void *const dispatch_stream = gpu_ctx_->defaultStream();
+    ASSERT_NE(dispatch_stream, nullptr);
+
+    const auto retained_plan = makeMoEOverlayRetainedParentPlan(graph);
+    ASSERT_TRUE(retained_plan.has_value());
+    ASSERT_TRUE(retained_plan->valid());
+    EXPECT_EQ(
+        retained_plan->replay_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            RequireRetainedParentWithConcurrentTicketService);
+    const auto production_composer = retained_plan->composer;
+    std::size_t composer_calls = 0u;
+    const DeviceGraphExecutor::RetainedParentCompositionHook composer =
+        [&](IGPUGraphCapture &destination,
+            const ComputeGraph &source_graph,
+            std::span<const DeviceGraphExecutor::GraphSegmentCache::
+                                RetainedCaptureUnitTemplateView> units)
+    {
+        ++composer_calls;
+        return production_composer(destination, source_graph, units);
+    };
+    const auto execute = [&](DeviceGraphExecutor::GraphInitialSubmissionPolicy
+                                 initial_submission)
+    {
+        return executor.executeWithCachedGraphReplay(
+            graph,
+            device_ctx_.get(),
+            segment_cache,
+            dispatch_stream,
+            gpu_ctx_,
+            /*collective_nodes=*/nullptr,
+            /*collectives_graph_capturable=*/false,
+            /*force_recapture=*/false,
+            /*defer_final_sync=*/true,
+            /*capture_boundary=*/{},
+            retained_plan->replay_policy,
+            /*launch_dependency=*/{},
+            /*event_published_outputs=*/{},
+            composer,
+            initial_submission);
+    };
+    const auto expect_payload = [&](float base)
+    {
+        /* Deferred replay deliberately proves the executor inserted no host
+         * fence between parent submission and CPU ticket service. The test
+         * joins only here, at the external observation boundary. */
+        ASSERT_TRUE(gpu_ctx_->synchronizeStreamChecked(
+            segment_cache.capture_stream));
+        ASSERT_TRUE(canonical_output->ensureOnHost(
+            segment_cache.capture_stream));
+        for (std::size_t route = 0u; route < route_capacity; ++route)
+        {
+            for (int column = 0; column < d_model; ++column)
+            {
+                EXPECT_FLOAT_EQ(
+                    canonical_output->data()[
+                        route * static_cast<std::size_t>(d_model) +
+                        static_cast<std::size_t>(column)],
+                    base + 100.0f * static_cast<float>(route) +
+                        static_cast<float>(column));
+            }
+        }
+    };
+
+    ASSERT_TRUE(execute(
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+            MaterializeWithoutLaunch));
+    ASSERT_NE(segment_cache.retained_parent_capture, nullptr);
+    EXPECT_TRUE(segment_cache.retained_parent_capture->hasExecutable());
+    EXPECT_STREQ(
+        DeviceGraphCaptureController::replayModeName(segment_cache),
+        "retained_parent");
+    EXPECT_EQ(first_manual_probe->callCount(), 0u);
+    EXPECT_EQ(second_manual_probe->callCount(), 0u);
+    EXPECT_EQ(composer_calls, 1u);
+    ASSERT_EQ(
+        segment_cache.retained_composed_parent_replay
+            .concurrent_ticket_service_segment_indices,
+        (std::vector<std::size_t>{3u}));
+    EXPECT_EQ(
+        segment_cache.retained_composed_parent_replay.child_unit_count,
+        3u);
+
+    graph.reset();
+    ASSERT_TRUE(execute(
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+            CaptureInstantiateAndLaunch));
+    ASSERT_EQ(first_manual_probe->callCount(), 1u);
+    ASSERT_EQ(second_manual_probe->callCount(), 1u);
+    expect_payload(1000.0f);
+    EXPECT_FALSE(first_ticket_storage->payloadReady());
+    EXPECT_FALSE(second_ticket_storage->payloadReady());
+
+    graph.reset();
+    ASSERT_TRUE(execute(
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+            CaptureInstantiateAndLaunch));
+    ASSERT_EQ(first_manual_probe->callCount(), 2u);
+    ASSERT_EQ(second_manual_probe->callCount(), 2u);
+    EXPECT_EQ(composer_calls, 1u);
+    expect_payload(2000.0f);
+    EXPECT_FALSE(first_ticket_storage->payloadReady());
+    EXPECT_FALSE(second_ticket_storage->payloadReady());
+}
+
 TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamForRecapture)
 {
     SKIP_IF_NO_GPU();
@@ -1112,12 +2204,27 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
     ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
     ASSERT_NE(segment_cache.capture_stream, nullptr);
+    ASSERT_TRUE(segment_cache.snapshot_manifest.storageBound());
+    ASSERT_NE(segment_cache.snapshot_manifest.storage_arena, nullptr);
+    EXPECT_FALSE(segment_cache.snapshot_manifest.storage_arena->isMapped());
+    EXPECT_EQ(segment_cache.snapshot_manifest.storage_allocation_count, 1u)
+        << "A cached graph must bind one device arena, not one allocation per checkpoint";
+    EXPECT_EQ(segment_cache.snapshot_manifest.bound_slot_count, 2u);
+    void *const snapshot_arena_pointer =
+        segment_cache.snapshot_manifest.storage_arena->gpu_data_ptr();
+    ASSERT_NE(snapshot_arena_pointer, nullptr);
     snapshots.clear();
+    const uint64_t downloads_before_first_publication =
+        segment_cache.snapshot_manifest.bulk_download_count;
     ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
         graph,
         segment_cache.capture_stream,
         "snapshot-overwrite-first-use",
         &segment_cache.snapshot_manifest));
+    EXPECT_EQ(
+        segment_cache.snapshot_manifest.bulk_download_count,
+        downloads_before_first_publication + 1u)
+        << "All captured checkpoint slots must share one bulk D2H acquisition";
     assertSnapshotDelta(snapshots, "stage1_norm", "stage2_overwrite", 10.0f);
     const auto warmup_snapshots = snapshots;
     assertTensorFiniteAndNonZero(
@@ -1225,6 +2332,11 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
     graph.reset();
     ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
+    EXPECT_EQ(segment_cache.snapshot_manifest.storage_allocation_count, 1u);
+    EXPECT_EQ(
+        segment_cache.snapshot_manifest.storage_arena->gpu_data_ptr(),
+        snapshot_arena_pointer)
+        << "Steady replay must retain the exact captured snapshot arena address";
     snapshots.clear();
     ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
         graph,
@@ -1240,6 +2352,10 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
     graph.reset();
     ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
+    EXPECT_EQ(segment_cache.snapshot_manifest.storage_allocation_count, 1u);
+    EXPECT_EQ(
+        segment_cache.snapshot_manifest.storage_arena->gpu_data_ptr(),
+        snapshot_arena_pointer);
     snapshots.clear();
     ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
         graph,
@@ -1248,4 +2364,119 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
         &segment_cache.snapshot_manifest));
     assertSnapshotDelta(snapshots, "stage1_norm", "stage2_overwrite", 10.0f);
     assertSnapshotsDiffer(capture_snapshots, snapshots, "stage1_norm");
+}
+
+/**
+ * @test Production-scale checkpoint capture remains VRAM-local and publishes
+ *       through one whole-arena D2H acquisition.
+ *
+ * The Qwen 3.5 122B parity graph presents about 1,525 selected outputs on its
+ * busiest participant. Historically, recording those outputs into mapped host
+ * pages flooded the ROCm interrupt ring and left the next RCCL graph capture
+ * taking seconds per enqueue. This model-free certificate retains the same
+ * checkpoint count and a roughly 100 MiB arena on both GPU backends. It proves
+ * that every stage-boundary value survives buffer reuse while the manifest
+ * performs exactly one host transfer per publication.
+ */
+TEST_F(CachedGraphReplayExecutionTest,
+       ProductionScaleSnapshotsUseOneDeviceArenaBulkDownload)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+
+    constexpr size_t kCheckpointCount = 1525u;
+    constexpr size_t kElementsPerCheckpoint = 16u * 1024u;
+    constexpr size_t kExpectedArenaBytes =
+        kCheckpointCount * kElementsPerCheckpoint * sizeof(float);
+
+    FP32Tensor *final_output = nullptr;
+    auto graph = buildProductionScaleSnapshotChain(
+        kCheckpointCount,
+        kElementsPerCheckpoint,
+        final_output);
+    ASSERT_NE(final_output, nullptr);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+
+    bool validate_publication = false;
+    size_t callback_index = 0u;
+    float previous_value = 0.0F;
+    GraphExecutorConfig exec_config;
+    exec_config.enable_validation = false;
+    exec_config.snapshot_callback =
+        [&](const std::string &stage_name, const StageDumpInfo &dump_info)
+        {
+            if (!validate_publication)
+                return;
+
+            ASSERT_EQ(dump_info.outputs.size(), 1u);
+            const auto &output = dump_info.outputs.front();
+            ASSERT_NE(output.data, nullptr);
+            ASSERT_STREQ(output.dtype, "FP32");
+            ASSERT_EQ(
+                output.rows * output.cols,
+                kElementsPerCheckpoint);
+            EXPECT_EQ(
+                stage_name,
+                "production_snapshot_stage_" +
+                    std::to_string(callback_index));
+
+            const auto *values = static_cast<const float *>(output.data);
+            EXPECT_FLOAT_EQ(values[0], values[kElementsPerCheckpoint / 2u]);
+            EXPECT_FLOAT_EQ(values[0], values[kElementsPerCheckpoint - 1u]);
+            if (callback_index > 0u)
+                EXPECT_FLOAT_EQ(values[0], previous_value + 0.25F);
+            previous_value = values[0];
+            ++callback_index;
+        };
+
+    DeviceGraphExecutor executor(exec_config);
+    graph_arena_.bindExecutor(executor);
+    DeviceGraphExecutor::GraphSegmentCache segment_cache;
+    void *const dispatch_stream = gpu_ctx_->defaultStream();
+    ASSERT_NE(dispatch_stream, nullptr);
+
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        device_ctx_.get(),
+        segment_cache,
+        dispatch_stream,
+        gpu_ctx_,
+        nullptr));
+    ASSERT_EQ(segment_cache.segments.size(), 1u);
+    ASSERT_NE(segment_cache.segments.front().capture, nullptr);
+    EXPECT_EQ(
+        segment_cache.segments.front().capture->nodeCount(),
+        kCheckpointCount * 2u)
+        << "Each checkpoint owns one producer kernel and one arena copy";
+    EXPECT_LE(
+        segment_cache.segments.front().capture->residentMemoryBytes(),
+        GPUGraphMemoryContract::reservationBytesPerExecutable(
+            device_ctx_->deviceId()))
+        << "The production-shape native executable must fit the same "
+           "driver-memory extent charged by capacity admission";
+    ASSERT_TRUE(segment_cache.snapshot_manifest.storageBound());
+    ASSERT_NE(segment_cache.snapshot_manifest.storage_arena, nullptr);
+    EXPECT_FALSE(segment_cache.snapshot_manifest.storage_arena->isMapped());
+    EXPECT_EQ(segment_cache.snapshot_manifest.storage_allocation_count, 1u);
+    EXPECT_EQ(
+        segment_cache.snapshot_manifest.bound_slot_count,
+        kCheckpointCount);
+    EXPECT_EQ(
+        segment_cache.snapshot_manifest.storage_required_bytes,
+        kExpectedArenaBytes);
+
+    const uint64_t downloads_before =
+        segment_cache.snapshot_manifest.bulk_download_count;
+    validate_publication = true;
+    ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
+        graph,
+        segment_cache.capture_stream,
+        "production-scale-snapshot-bulk-download",
+        &segment_cache.snapshot_manifest));
+    EXPECT_EQ(callback_index, kCheckpointCount);
+    EXPECT_EQ(
+        segment_cache.snapshot_manifest.bulk_download_count,
+        downloads_before + 1u)
+        << "Checkpoint count must not multiply host transfers";
 }

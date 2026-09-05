@@ -17,10 +17,13 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
+#include <cstring>
 #include <memory>
-#include <vector>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <string>
 #include <cmath>
 
@@ -33,6 +36,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "backends/IGPUGraphCapture.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 // Tensors and utilities
 #include "tensors/Tensors.h"
@@ -874,4 +878,382 @@ TEST_F(GPUGraphCaptureExecutionTest, OutputMatchesFastDecode)
         EXPECT_NEAR(graph_output[i], fast_decode_output[i], 1e-5f)
             << "Graph capture output differs from fast decode at index " << i;
     }
+}
+
+/**
+ * @brief One VRAM arena retains every graph-captured diagnostic checkpoint.
+ *
+ * A parity graph may publish hundreds of stage outputs. Captured writes to
+ * mapped host memory multiply PCIe packets and completion traffic; on ROCm a
+ * production-sized manifest can overflow the interrupt ring and degrade later
+ * RCCL capture. This regression proves that descriptor preparation performs one
+ * exact device allocation, reuses it without pointer drift, and that one bulk
+ * download still publishes byte-exact stage values.
+ */
+TEST_F(GPUGraphCaptureExecutionTest,
+       SnapshotManifestUsesOneArenaAndPublishesCapturedBytes)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(capture_, nullptr);
+
+    constexpr size_t seq_len = 4;
+    constexpr size_t d_model = 64;
+    constexpr size_t element_count = seq_len * d_model;
+    FP32Tensor *norm_input = nullptr;
+    FP32Tensor *residual = nullptr;
+    FP32Tensor *result = nullptr;
+    auto graph = buildNormResidualGraph(
+        seq_len, d_model, norm_input, residual, result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+
+    std::unordered_map<std::string, std::vector<float>> captured_outputs;
+    GraphExecutorConfig config;
+    config.snapshot_callback =
+        [&](const std::string &stage_name, const StageDumpInfo &dump_info)
+        {
+            ASSERT_FALSE(dump_info.outputs.empty());
+            const auto &output = dump_info.outputs.front();
+            ASSERT_NE(output.data, nullptr);
+            ASSERT_STREQ(output.dtype, "FP32");
+            const auto *values = static_cast<const float *>(output.data);
+            captured_outputs[stage_name] = std::vector<float>(
+                values, values + output.rows * output.cols);
+        };
+
+    DeviceGraphExecutor executor(config);
+    executor.setArena(&arena_);
+    void *const stream = capture_->executionStream();
+    ASSERT_NE(stream, nullptr);
+
+    DeviceGraphExecutor::GraphSnapshotManifest layout_manifest;
+    ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+        graph,
+        device_ctx_.get(),
+        stream,
+        "snapshot_arena_layout_regression",
+        &layout_manifest));
+    ASSERT_TRUE(layout_manifest.storageBound());
+    ASSERT_NE(layout_manifest.storage_arena, nullptr);
+    EXPECT_FALSE(layout_manifest.storage_arena->isMapped());
+    EXPECT_EQ(layout_manifest.storage_allocation_count, 1u);
+    EXPECT_EQ(layout_manifest.bound_slot_count, 2u);
+    EXPECT_GE(
+        layout_manifest.storage_capacity_bytes,
+        layout_manifest.storage_required_bytes);
+
+    std::vector<std::pair<size_t, size_t>> ranges;
+    for (const auto &[stage_name, stage_copies] :
+         layout_manifest.stage_copies)
+    {
+        SCOPED_TRACE(stage_name);
+        ASSERT_EQ(stage_copies.outputs.size(), 1u);
+        const auto &copy = stage_copies.outputs.front();
+        ASSERT_GT(copy.byte_size, 0u);
+        ASSERT_GE(copy.storage_bytes, copy.byte_size);
+        ASSERT_LE(
+            copy.storage_offset_bytes + copy.storage_bytes,
+            layout_manifest.storage_capacity_bytes);
+        ranges.emplace_back(
+            copy.storage_offset_bytes,
+            copy.storage_offset_bytes + copy.storage_bytes);
+    }
+    ASSERT_EQ(ranges.size(), 2u);
+    std::sort(ranges.begin(), ranges.end());
+    EXPECT_LE(ranges[0].second, ranges[1].first)
+        << "Distinct checkpoints must own disjoint arena subranges";
+
+    void *const original_arena_pointer =
+        layout_manifest.storage_arena->gpu_data_ptr();
+    ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+        graph,
+        device_ctx_.get(),
+        stream,
+        "snapshot_arena_identity_reuse",
+        &layout_manifest));
+    EXPECT_EQ(layout_manifest.storage_allocation_count, 1u);
+    EXPECT_EQ(
+        layout_manifest.storage_arena->gpu_data_ptr(),
+        original_arena_pointer)
+        << "An unchanged capture identity must reuse its device arena";
+
+    /*
+     * The direct capture API owns the executor's transient manifest. Prepare
+     * that manifest before beginCapture(), then publish it through the same
+     * post-launch callback path used by cached production graphs.
+     */
+    ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+        graph,
+        device_ctx_.get(),
+        stream,
+        "snapshot_arena_capture_regression"));
+    ASSERT_TRUE(executeCapturedGraph(graph, executor, result));
+    expectExecutableGraph();
+    ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
+        graph,
+        stream,
+        "snapshot_arena_capture_regression"));
+
+    ASSERT_EQ(captured_outputs.size(), 2u);
+    ASSERT_EQ(captured_outputs["rmsnorm"].size(), element_count);
+    ASSERT_EQ(captured_outputs["residual_add"].size(), element_count);
+
+    const float *const final_values = result->data();
+    EXPECT_EQ(
+        std::memcmp(
+            captured_outputs["residual_add"].data(),
+            final_values,
+            element_count * sizeof(float)),
+        0)
+        << "The final captured checkpoint must be byte-identical to its graph output";
+}
+
+/**
+ * @brief Production snapshot allocation is bounded by one admitted GPU owner.
+ *
+ * This is intentionally exercised by both backend-specialized binaries. The
+ * executor must claim the arena before calling CUDA/HIP allocation, publish
+ * the exact materialized byte count, and fail closed when production mode has
+ * no authority instead of discovering exhaustion in the backend allocator.
+ */
+TEST_F(GPUGraphCaptureExecutionTest,
+       SnapshotManifestMaterializesThroughPhysicalMemoryAuthority)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(capture_, nullptr);
+
+    constexpr size_t seq_len = 4;
+    constexpr size_t d_model = 64;
+    FP32Tensor *norm_input = nullptr;
+    FP32Tensor *residual = nullptr;
+    FP32Tensor *result = nullptr;
+    auto graph = buildNormResidualGraph(
+        seq_len, d_model, norm_input, residual, result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+
+    constexpr size_t kSnapshotEnvelopeBytes = 1024u * 1024u;
+    const DeviceId device = LINKED_GPU_DEVICE_ID();
+    PhysicalMemoryPlanBuilder plan_builder;
+    plan_builder.add(
+        PhysicalMemoryResource{
+            .world_rank = 0,
+            .device = device,
+            .total_bytes = 2u * kSnapshotEnvelopeBytes,
+            .admission_available_bytes = 2u * kSnapshotEnvelopeBytes,
+        },
+        PhysicalMemoryOwner::GraphSnapshotArena,
+        kSnapshotEnvelopeBytes);
+    const auto admission = std::make_shared<
+        const PhysicalMemoryPlanAdmissionCertificate>(
+        plan_builder.build());
+    PhysicalMemoryAuthority authority(admission, 0);
+    auto reservation = std::make_shared<PhysicalMemoryOwnerReservation>(
+        authority.reserveNewAllocations(
+            device,
+            PhysicalMemoryOwner::GraphSnapshotArena,
+            kSnapshotEnvelopeBytes));
+
+    GraphExecutorConfig config;
+    config.snapshot_callback =
+        [](const std::string &, const StageDumpInfo &) {};
+    config.require_snapshot_memory_authority = true;
+    DeviceGraphExecutor executor(config);
+    executor.setArena(&arena_);
+    executor.setGraphSnapshotMemoryReservation(reservation);
+
+    DeviceGraphExecutor::GraphSnapshotManifest manifest;
+    void *const stream = capture_->executionStream();
+    ASSERT_NE(stream, nullptr);
+    ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+        graph,
+        device_ctx_.get(),
+        stream,
+        "snapshot_physical_authority_regression",
+        &manifest));
+    ASSERT_NE(manifest.storage_arena, nullptr);
+    ASSERT_NE(manifest.storage_allocation_lease, nullptr);
+    EXPECT_TRUE(manifest.storage_allocation_lease->valid());
+    EXPECT_EQ(
+        manifest.storage_allocation_lease->bytes(),
+        manifest.storage_capacity_bytes);
+    EXPECT_EQ(
+        authority.claimedBytes(
+            device,
+            PhysicalMemoryOwner::GraphSnapshotArena,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        manifest.storage_capacity_bytes);
+    EXPECT_EQ(
+        reservation->remainingBytes(),
+        kSnapshotEnvelopeBytes - manifest.storage_capacity_bytes);
+
+    DeviceGraphExecutor missing_authority_executor(config);
+    missing_authority_executor.setArena(&arena_);
+    DeviceGraphExecutor::GraphSnapshotManifest rejected_manifest;
+    EXPECT_FALSE(missing_authority_executor.prepareSnapshotsForGraphCapture(
+        graph,
+        device_ctx_.get(),
+        stream,
+        "snapshot_missing_physical_authority_regression",
+        &rejected_manifest));
+    EXPECT_EQ(rejected_manifest.storage_arena, nullptr);
+    EXPECT_EQ(rejected_manifest.storage_allocation_lease, nullptr);
+}
+
+/**
+ * @brief Mutually exclusive graph roles reuse only their typed device pool.
+ *
+ * Production serving setup retains several prefill buckets and two verifier
+ * outcome graphs. Capturing each checkpoint manifest into an independent VRAM
+ * tensor needlessly multiplies diagnostic storage. This regression proves that
+ * a largest-first alternative family aliases one stable address, a concurrent
+ * MTP role remains disjoint, and an undersized frozen pool fails instead of
+ * reallocating behind an already captured pointer.
+ */
+TEST_F(GPUGraphCaptureExecutionTest,
+       SnapshotAlternativeArenasReuseFrozenTypedCapacity)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(capture_, nullptr);
+
+    FP32Tensor *large_input = nullptr;
+    FP32Tensor *large_residual = nullptr;
+    FP32Tensor *large_result = nullptr;
+    auto large_graph = buildNormResidualGraph(
+        /*seq_len=*/8,
+        /*d_model=*/64,
+        large_input,
+        large_residual,
+        large_result);
+
+    FP32Tensor *small_input = nullptr;
+    FP32Tensor *small_residual = nullptr;
+    FP32Tensor *small_result = nullptr;
+    auto small_graph = buildNormResidualGraph(
+        /*seq_len=*/4,
+        /*d_model=*/64,
+        small_input,
+        small_residual,
+        small_result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+
+    GraphExecutorConfig config;
+    config.snapshot_callback =
+        [](const std::string &, const StageDumpInfo &) {};
+    DeviceGraphExecutor executor(config);
+    executor.setArena(&arena_);
+    void *const stream = capture_->executionStream();
+    ASSERT_NE(stream, nullptr);
+
+    using ReuseClass =
+        DeviceGraphExecutor::GraphSnapshotArenaReuseClass;
+    using ReusePolicy =
+        DeviceGraphExecutor::GraphSnapshotArenaReusePolicy;
+    const ReusePolicy prefill_policy{
+        .reuse_class =
+            ReuseClass::PrefillOrMTPVerifierAlternative,
+        .configuration_identity = UINT64_C(91),
+    };
+
+    DeviceGraphExecutor::GraphSnapshotManifest large_manifest;
+    large_manifest.bindStorageReusePolicy(prefill_policy);
+    ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+        large_graph,
+        device_ctx_.get(),
+        stream,
+        "largest_prefill_alternative",
+        &large_manifest));
+    ASSERT_NE(large_manifest.storage_arena, nullptr);
+    EXPECT_EQ(large_manifest.storage_allocation_count, 1u);
+    void *const shared_prefill_address =
+        large_manifest.storage_arena->gpu_data_ptr();
+    const size_t shared_prefill_capacity =
+        large_manifest.storage_capacity_bytes;
+
+    DeviceGraphExecutor::GraphSnapshotManifest small_manifest;
+    small_manifest.bindStorageReusePolicy(prefill_policy);
+    ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+        small_graph,
+        device_ctx_.get(),
+        stream,
+        "smaller_prefill_alternative",
+        &small_manifest));
+    ASSERT_NE(small_manifest.storage_arena, nullptr);
+    EXPECT_EQ(small_manifest.storage_allocation_count, 0u)
+        << "The second alternative must bind, not allocate";
+    EXPECT_EQ(
+        small_manifest.storage_arena->gpu_data_ptr(),
+        shared_prefill_address);
+    EXPECT_EQ(
+        small_manifest.storage_capacity_bytes,
+        shared_prefill_capacity);
+    EXPECT_LT(
+        small_manifest.storage_required_bytes,
+        small_manifest.storage_capacity_bytes);
+
+    DeviceGraphExecutor::GraphSnapshotManifest verifier_manifest;
+    verifier_manifest.bindStorageReusePolicy(ReusePolicy{
+        .reuse_class =
+            ReuseClass::PrefillOrMTPVerifierAlternative,
+        .configuration_identity = UINT64_C(91),
+    });
+    ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+        small_graph,
+        device_ctx_.get(),
+        stream,
+        "grouped_verifier_after_published_prefill",
+        &verifier_manifest));
+    ASSERT_NE(verifier_manifest.storage_arena, nullptr);
+    EXPECT_EQ(verifier_manifest.storage_allocation_count, 0u);
+    EXPECT_EQ(
+        verifier_manifest.storage_arena->gpu_data_ptr(),
+        shared_prefill_address)
+        << "Prefill publication precedes grouped verification, so their wide "
+           "checkpoint graphs must reuse one frozen lane";
+
+    DeviceGraphExecutor::GraphSnapshotManifest condition_manifest;
+    condition_manifest.bindStorageReusePolicy(ReusePolicy{
+        .reuse_class = ReuseClass::MTPConditionAlternative,
+        .configuration_identity = UINT64_C(91),
+    });
+    ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+        small_graph,
+        device_ctx_.get(),
+        stream,
+        "concurrent_mtp_condition_role",
+        &condition_manifest));
+    ASSERT_NE(condition_manifest.storage_arena, nullptr);
+    EXPECT_NE(
+        condition_manifest.storage_arena->gpu_data_ptr(),
+        shared_prefill_address)
+        << "MTP condition and verifier snapshots may coexist and cannot alias";
+
+    DeviceGraphExecutor undersized_executor(config);
+    undersized_executor.setArena(&arena_);
+    const ReusePolicy undersized_policy{
+        .reuse_class =
+            ReuseClass::PrefillOrMTPVerifierAlternative,
+        .configuration_identity = UINT64_C(92),
+    };
+    DeviceGraphExecutor::GraphSnapshotManifest undersized_manifest;
+    undersized_manifest.bindStorageReusePolicy(undersized_policy);
+    ASSERT_TRUE(undersized_executor.prepareSnapshotsForGraphCapture(
+        small_graph,
+        device_ctx_.get(),
+        stream,
+        "undersized_verifier_pool",
+        &undersized_manifest));
+    const void *const frozen_address =
+        undersized_manifest.storage_arena->gpu_data_ptr();
+
+    DeviceGraphExecutor::GraphSnapshotManifest oversized_manifest;
+    oversized_manifest.bindStorageReusePolicy(undersized_policy);
+    EXPECT_FALSE(undersized_executor.prepareSnapshotsForGraphCapture(
+        large_graph,
+        device_ctx_.get(),
+        stream,
+        "illegal_verifier_pool_growth",
+        &oversized_manifest));
+    EXPECT_EQ(
+        undersized_manifest.storage_arena->gpu_data_ptr(),
+        frozen_address)
+        << "Rejecting a larger alternative must preserve every captured address";
 }

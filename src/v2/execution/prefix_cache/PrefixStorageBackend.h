@@ -129,6 +129,32 @@ namespace llaminar2
         bool has_terminal_logits = false;
         bool has_model_runtime_state = false;
 
+        /**
+         * Rank-local RAM accounting owners for this handle's physical bytes.
+         *
+         * The payload lease covers the serialized sections allocated by the
+         * RAM backend. The runtime-state lease covers optional model-specific
+         * host bytes attached after graph-owned state serialization. They are
+         * intentionally distinct: a device-hot replica retains only the
+         * runtime-state vector, whereas its serialized payload has moved to
+         * VRAM. These members precede the physical storage owners so reverse
+         * member destruction frees every allocation before returning its bytes
+         * to the canonical memory ledger.
+         */
+        std::shared_ptr<void> ram_payload_memory_lease;
+        std::shared_ptr<void> ram_runtime_state_memory_lease;
+
+        /**
+         * Canonical memory claim for a transient MTP rollback payload slot.
+         *
+         * Durable prefix records use the RAM/device-tier leases above. Live
+         * checkpoints borrow a preallocated recurrent/terminal payload slot
+         * instead, and retain this token beside that slot's shared storage so
+         * runner teardown cannot return its bytes to the topology ledger while
+         * an asynchronous snapshot still owns them.
+         */
+        std::shared_ptr<void> recurrent_checkpoint_memory_lease;
+
         std::shared_ptr<std::vector<uint8_t>> kv_storage;
         std::shared_ptr<std::vector<uint8_t>> hybrid_storage;
         std::shared_ptr<std::vector<uint8_t>> mtp_storage;

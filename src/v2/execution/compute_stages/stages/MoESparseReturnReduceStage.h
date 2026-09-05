@@ -122,6 +122,22 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return false; }
         bool isManualGraphBoundary() const override { return true; }
+        /**
+         * @brief Admit overlap only for the mapped canonical-ticket terminal.
+         *
+         * Dense return scattering and portable collectives require host launch
+         * sequencing. The canonical role merely validates the publication
+         * already produced by its colocated CPU expert stage.
+         */
+        ManualGraphBoundaryScheduling
+        manualGraphBoundaryScheduling() const noexcept override
+        {
+            return params_.canonical_route_ticket_storage &&
+                           params_.inbound_consumer_role ==
+                               InboundConsumerRole::CanonicalRouteTicketCompletion
+                       ? ManualGraphBoundaryScheduling::ConcurrentTicketService
+                       : ManualGraphBoundaryScheduling::BetweenExecutableLaunches;
+        }
         bool supportsPaddedPrefillGraphCapturePreflight() const override
         {
             return true;
@@ -155,7 +171,8 @@ namespace llaminar2
             }
             return !params_.canonical_route_ticket_storage ||
                    (params_.outbound_rows &&
-                    params_.canonical_route_ticket_storage->payloadReadyFor(
+                    params_.canonical_route_ticket_storage
+                        ->publicationSucceededFor(
                         params_.outbound_rows->residency_epoch));
         }
         bool allowsZeroOutput() const override { return true; }

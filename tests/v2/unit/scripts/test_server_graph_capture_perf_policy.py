@@ -27,6 +27,9 @@ from flash_attention_perf_policy import (  # noqa: E402
     validate_flash_attention_plan_policy,
 )
 from gpu_host_transfer_perf_policy import (  # noqa: E402
+    DEVICE_GENERATION_DISPATCH_TICKET_ABI_VERSION,
+    DEVICE_GENERATION_DISPATCH_TICKET_BYTES,
+    DEVICE_GENERATION_DISPATCH_TICKET_WORD_COUNT,
     validate_gpu_host_transfer_policy,
 )
 from llep_verifier_perf_policy import (  # noqa: E402
@@ -60,6 +63,18 @@ def counter(
     if device is not None:
         record["device"] = device
     return record
+
+
+def device_generation_ticket_tags() -> dict[str, str]:
+    """Build the reviewed cross-language immutable-ticket ABI tags."""
+
+    return {
+        "bytes": str(DEVICE_GENERATION_DISPATCH_TICKET_BYTES),
+        "abi_version": str(DEVICE_GENERATION_DISPATCH_TICKET_ABI_VERSION),
+        "word_count": str(DEVICE_GENERATION_DISPATCH_TICKET_WORD_COUNT),
+        "authority": "immutable_scheduler_snapshot",
+        "state_payload": "false",
+    }
 
 
 class TestServerGraphCapturePerfPolicy(unittest.TestCase):
@@ -399,11 +414,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     "device_generation_dispatch_ticket_d2h_submissions",
                     domain="mtp",
                     device="ROCm:0",
-                    tags={
-                        "bytes": "48",
-                        "authority": "immutable_scheduler_snapshot",
-                        "state_payload": "false",
-                    },
+                    tags=device_generation_ticket_tags(),
                 )
             ]
         )
@@ -411,6 +422,31 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         self.assertEqual(
             result.scheduler_dispatch_operations,
             ("device_generation_dispatch_ticket_d2h_submissions",),
+        )
+
+    def test_device_generation_ticket_policy_matches_cpp_typed_abi(self) -> None:
+        """The Python gate must track the sole C++ ticket ABI declaration."""
+
+        source = (
+            REPO_ROOT / "src/v2/kernels/common/SamplingMath.h"
+        ).read_text(encoding="utf-8")
+        version = re.search(r"kABIVersion\s*=\s*(\d+)u;", source)
+        word_count = re.search(r"kWordCount\s*=\s*(\d+)u;", source)
+        self.assertIsNotNone(version)
+        self.assertIsNotNone(word_count)
+        assert version is not None
+        assert word_count is not None
+        self.assertEqual(
+            DEVICE_GENERATION_DISPATCH_TICKET_ABI_VERSION,
+            int(version.group(1)),
+        )
+        self.assertEqual(
+            DEVICE_GENERATION_DISPATCH_TICKET_WORD_COUNT,
+            int(word_count.group(1)),
+        )
+        self.assertEqual(
+            DEVICE_GENERATION_DISPATCH_TICKET_BYTES,
+            DEVICE_GENERATION_DISPATCH_TICKET_WORD_COUNT * 4,
         )
 
     def test_gpu_host_transfer_policy_accepts_authenticated_rocm_moe_ticket(
@@ -481,11 +517,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
     ) -> None:
         """Backend, ABI size, and no-state authority tags are fail-closed."""
 
-        canonical_tags = {
-            "bytes": "48",
-            "authority": "immutable_scheduler_snapshot",
-            "state_payload": "false",
-        }
+        canonical_tags = device_generation_ticket_tags()
         invalid_records = {
             "cuda": counter(
                 "device_generation_dispatch_ticket_d2h_submissions",
@@ -498,6 +530,18 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 domain="mtp",
                 device="ROCm:0",
                 tags=canonical_tags | {"bytes": "64"},
+            ),
+            "stale_abi_version": counter(
+                "device_generation_dispatch_ticket_d2h_submissions",
+                domain="mtp",
+                device="ROCm:0",
+                tags=canonical_tags | {"abi_version": "1"},
+            ),
+            "stale_word_count": counter(
+                "device_generation_dispatch_ticket_d2h_submissions",
+                domain="mtp",
+                device="ROCm:0",
+                tags=canonical_tags | {"word_count": "12"},
             ),
             "state_payload": counter(
                 "device_generation_dispatch_ticket_d2h_submissions",
@@ -558,7 +602,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 tags={
                     "backend": "CUDA",
                     "depth_policy": "dynamic",
-                    "execution": "native_device_controlled_switch_while",
+                    "execution": "native_device_controlled_selector_while",
                     "minimum_draft_depth": "1",
                     "maximum_draft_depth": "15",
                     "draft_depth": "15",
@@ -571,7 +615,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 domain="mtp",
                 device=device,
                 tags={
-                    "execution": "single_async_native_switch_while_launch",
+                    "execution": "single_async_native_selector_while_launch",
                     "minimum_draft_depth": "1",
                     "maximum_draft_depth": "15",
                 },
@@ -784,11 +828,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 value=3,
                 domain="mtp",
                 device=device,
-                tags={
-                    "bytes": "48",
-                    "authority": "immutable_scheduler_snapshot",
-                    "state_payload": "false",
-                },
+                tags=device_generation_ticket_tags(),
             ),
             counter(
                 "device_generation_dispatch_tickets_observed",

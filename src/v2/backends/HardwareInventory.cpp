@@ -12,6 +12,7 @@
 #include "HardwareInventory.h"
 #include "GPUEnumeration.h"
 #include "HostMemoryCapacity.h"
+#include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 
 #include <algorithm>
@@ -202,27 +203,36 @@ namespace llaminar2
     HardwareInventory HardwareInventory::detect()
     {
         HardwareInventory hw;
+        const auto &startup = debugEnv().backend_startup;
 
         // --- CPU sockets ---
         hw.cpu_sockets = detect_cpu_sockets();
 
         // --- GPU devices ---
 #ifdef HAVE_CUDA
-        hw.cuda_devices = cuda_enumeration::enumerate_cuda_devices();
-        // Populate NUMA info for each CUDA device
-        for (auto &dev : hw.cuda_devices)
-            dev.numa_node = cuda_enumeration::get_cuda_device_numa_node(dev.device_id);
-        if (hw.cuda_devices.size() >= 2)
-            hw.cuda_p2p = cuda_enumeration::query_p2p_matrix(hw.cuda_devices);
+        if (startup.cudaEnabled())
+        {
+            hw.cuda_devices = cuda_enumeration::enumerate_cuda_devices();
+            // NUMA and P2P queries also enter the CUDA runtime, so they remain
+            // inside the same authoritative discovery-policy branch.
+            for (auto &dev : hw.cuda_devices)
+                dev.numa_node = cuda_enumeration::get_cuda_device_numa_node(dev.device_id);
+            if (hw.cuda_devices.size() >= 2)
+                hw.cuda_p2p = cuda_enumeration::query_p2p_matrix(hw.cuda_devices);
+        }
 #endif
 
 #ifdef HAVE_ROCM
-        hw.rocm_devices = rocm_enumeration::enumerate_rocm_devices();
-        // Populate NUMA info for each ROCm device
-        for (auto &dev : hw.rocm_devices)
-            dev.numa_node = rocm_enumeration::get_rocm_device_numa_node(dev.device_id);
-        if (hw.rocm_devices.size() >= 2)
-            hw.rocm_p2p = rocm_enumeration::query_p2p_matrix(hw.rocm_devices);
+        if (startup.rocmEnabled())
+        {
+            hw.rocm_devices = rocm_enumeration::enumerate_rocm_devices();
+            // NUMA and P2P queries can open KFD/runtime state and therefore
+            // must never escape the ROCm discovery-policy branch.
+            for (auto &dev : hw.rocm_devices)
+                dev.numa_node = rocm_enumeration::get_rocm_device_numa_node(dev.device_id);
+            if (hw.rocm_devices.size() >= 2)
+                hw.rocm_p2p = rocm_enumeration::query_p2p_matrix(hw.rocm_devices);
+        }
 #endif
 
         return hw;

@@ -126,11 +126,10 @@ namespace llaminar2
             output_partition_scope;
         if (params_.serial_equivalent_partition_width > 0)
         {
-            if (params_.serial_equivalent_partition_width > params_.vocab_size ||
-                (params_.vocab_size % params_.serial_equivalent_partition_width) != 0)
+            if (params_.serial_equivalent_partition_width > params_.vocab_size)
             {
                 throw std::logic_error(
-                    "[LMHeadStage] Replicated LM-head width must be an exact multiple of its serial partition width");
+                    "[LMHeadStage] Replicated LM-head serial partition width exceeds its physical vocabulary width");
             }
             output_partition_scope =
                 lm_gemm->beginOutputPartitionEquivalenceScope(

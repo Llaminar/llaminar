@@ -9,6 +9,7 @@
 
 #include "DeviceGraphCaptureController.h"
 #include "GraphCaptureGuard.h"
+#include "GraphCaptureStageActivity.h"
 
 #include "../coherence/CoherencePolicy.h"
 #include "../../../tensors/TensorClasses.h"
@@ -19,10 +20,13 @@
 #include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -41,6 +45,270 @@ namespace llaminar2
             Segmented,
             FullGraph
         };
+
+        /**
+         * @brief Typed host-side phases of one native graph materialization.
+         *
+         * These phases are diagnostic subdivisions of the single capture
+         * lifecycle transition. They never authorize capture, replay, or
+         * serving admission; the graph cache remains the sole lifecycle owner.
+         */
+        enum class CaptureMaterializationPhase : std::size_t
+        {
+            ArenaPrebind = 0,
+            LaunchPreparation,
+            SnapshotManifest,
+            InputCoherence,
+            NativeRecord,
+            NativeFinalize,
+            Count,
+        };
+
+        /** @return Stable PerfStats name for one materialization phase. */
+        constexpr const char *captureMaterializationPhaseName(
+            CaptureMaterializationPhase phase) noexcept
+        {
+            switch (phase)
+            {
+            case CaptureMaterializationPhase::ArenaPrebind:
+                return "arena_prebind";
+            case CaptureMaterializationPhase::LaunchPreparation:
+                return "launch_preparation";
+            case CaptureMaterializationPhase::SnapshotManifest:
+                return "snapshot_manifest";
+            case CaptureMaterializationPhase::InputCoherence:
+                return "input_coherence";
+            case CaptureMaterializationPhase::NativeRecord:
+                return "native_record";
+            case CaptureMaterializationPhase::NativeFinalize:
+                return "native_finalize";
+            case CaptureMaterializationPhase::Count:
+                break;
+            }
+            return "invalid";
+        }
+
+        /** @brief Bounded aggregate for repeated segment-local phase samples. */
+        struct CaptureMaterializationAggregate
+        {
+            std::uint64_t total_ns = 0u; ///< Sum across every segment sample.
+            std::uint64_t max_ns = 0u;   ///< Slowest individual segment sample.
+            std::size_t samples = 0u;    ///< Number of observations accumulated.
+
+            /** @brief Add one measured duration without changing lifecycle state. */
+            void observe(std::uint64_t elapsed_ns) noexcept
+            {
+                total_ns += elapsed_ns;
+                max_ns = std::max(max_ns, elapsed_ns);
+                ++samples;
+            }
+        };
+
+        /**
+         * @brief Host cost of recording one declarative stage into a native graph.
+         *
+         * Stream capture normally makes a kernel launch a microsecond-scale host
+         * operation. A library or collective is allowed to perform setup while
+         * recording, however, and an accidental rendezvous there can make graph
+         * materialization take seconds. These observations are setup-only and
+         * bounded to one entry per declarative stage; they never time graph
+         * replay or introduce a device synchronization.
+         */
+        struct CaptureStageRecordObservation
+        {
+            std::string stage_name;       ///< Stable declarative graph node name.
+            std::string stage_type;       ///< Stable declarative stage category.
+            std::uint64_t execute_ns = 0; ///< Canonical stage-recording host cost.
+            std::uint64_t snapshot_ns = 0; ///< Diagnostic-copy recording host cost.
+
+            /** @return Complete host recording cost attributed to this stage. */
+            [[nodiscard]] std::uint64_t totalNs() const noexcept
+            {
+                return execute_ns + snapshot_ns;
+            }
+        };
+
+        /**
+         * @brief Graph-wide recording cost accumulated for one stage category.
+         *
+         * Per-segment slow-stage reports expose first-use outliers, while this
+         * aggregate exposes a small cost repeated across every transformer
+         * block. Keeping only totals, a maximum, and a sample count bounds the
+         * setup diagnostic independently of model depth.
+         */
+        struct CaptureStageRecordAggregate
+        {
+            std::uint64_t execute_ns = 0u;  ///< Sum of canonical record calls.
+            std::uint64_t snapshot_ns = 0u; ///< Sum of diagnostic-copy calls.
+            std::uint64_t max_ns = 0u;      ///< Slowest complete stage sample.
+            std::size_t samples = 0u;       ///< Number of declarative stages.
+
+            /** @brief Accumulate one already-measured declarative stage. */
+            void observe(const CaptureStageRecordObservation &observation) noexcept
+            {
+                execute_ns += observation.execute_ns;
+                snapshot_ns += observation.snapshot_ns;
+                max_ns = std::max(max_ns, observation.totalNs());
+                ++samples;
+            }
+
+            /** @return Complete recording cost across this stage category. */
+            [[nodiscard]] std::uint64_t totalNs() const noexcept
+            {
+                return execute_ns + snapshot_ns;
+            }
+        };
+
+        /**
+         * @brief Report a bounded attribution when native recording is pathological.
+         *
+         * A normal graph does not emit this diagnostic. Once recording exceeds
+         * one second, the slowest stages and unattributed begin/end bookkeeping
+         * are logged so a production graph can be reduced without flooding the
+         * log with every layer. Host clocks only surround already-setup capture
+         * work and therefore cannot alter device ordering.
+         */
+        void logSlowCaptureStageAttribution(
+            DeviceId device,
+            const std::string &context,
+            std::span<const CaptureStageRecordObservation> observations,
+            std::uint64_t begin_ns,
+            std::uint64_t close_ns,
+            std::uint64_t native_record_ns)
+        {
+            constexpr std::uint64_t kSlowCaptureNs = 1'000'000'000ull;
+            constexpr std::size_t kMaximumReportedStages = 12u;
+            if (native_record_ns < kSlowCaptureNs)
+                return;
+
+            std::vector<std::size_t> order(observations.size());
+            for (std::size_t index = 0u; index < order.size(); ++index)
+                order[index] = index;
+            const std::size_t reported =
+                std::min(kMaximumReportedStages, order.size());
+            std::partial_sort(
+                order.begin(),
+                order.begin() + static_cast<std::ptrdiff_t>(reported),
+                order.end(),
+                [&](std::size_t lhs, std::size_t rhs)
+                {
+                    return observations[lhs].totalNs() >
+                           observations[rhs].totalNs();
+                });
+
+            std::uint64_t stage_total_ns = 0u;
+            for (const auto &observation : observations)
+                stage_total_ns += observation.totalNs();
+
+            std::ostringstream slowest;
+            for (std::size_t rank = 0u; rank < reported; ++rank)
+            {
+                const auto &observation = observations[order[rank]];
+                if (rank != 0u)
+                    slowest << ';';
+                slowest << observation.stage_name
+                        << "{execute_ms="
+                        << static_cast<double>(observation.execute_ns) / 1.0e6
+                        << ",snapshot_ms="
+                        << static_cast<double>(observation.snapshot_ns) / 1.0e6
+                        << '}';
+            }
+
+            const std::uint64_t accounted_ns =
+                std::min(native_record_ns, begin_ns + close_ns + stage_total_ns);
+            LOG_INFO(
+                "[GraphCaptureStageAttribution] slow native recording"
+                << " device=" << device.toString()
+                << " context=" << context
+                << " native_record_ms="
+                << static_cast<double>(native_record_ns) / 1.0e6
+                << " capture_begin_ms="
+                << static_cast<double>(begin_ns) / 1.0e6
+                << " capture_close_ms="
+                << static_cast<double>(close_ns) / 1.0e6
+                << " stage_total_ms="
+                << static_cast<double>(stage_total_ns) / 1.0e6
+                << " unattributed_ms="
+                << static_cast<double>(native_record_ns - accounted_ns) / 1.0e6
+                << " stages=" << observations.size()
+                << " slowest=" << slowest.str());
+        }
+
+        /**
+         * @brief Emit one bounded graph-wide attribution after materialization.
+         *
+         * This is deliberately a setup-only host-clock diagnostic. It neither
+         * synchronizes a device nor claims execution authority; its purpose is
+         * to distinguish one expensive first-use call from a modest library or
+         * collective registration cost repeated at every layer.
+         */
+        void logCaptureStageTypeAggregate(
+            DeviceId device,
+            const std::string &context,
+            const std::map<std::string, CaptureStageRecordAggregate> &aggregates)
+        {
+            constexpr std::size_t kMaximumReportedTypes = 12u;
+            if (aggregates.empty())
+                return;
+
+            std::vector<std::reference_wrapper<const std::pair<
+                const std::string,
+                CaptureStageRecordAggregate>>>
+                order;
+            order.reserve(aggregates.size());
+            for (const auto &entry : aggregates)
+                order.emplace_back(std::cref(entry));
+
+            const std::size_t reported =
+                std::min(kMaximumReportedTypes, order.size());
+            std::partial_sort(
+                order.begin(),
+                order.begin() + static_cast<std::ptrdiff_t>(reported),
+                order.end(),
+                [](const auto &lhs, const auto &rhs)
+                {
+                    return lhs.get().second.totalNs() >
+                           rhs.get().second.totalNs();
+                });
+
+            std::uint64_t stage_total_ns = 0u;
+            std::size_t stage_samples = 0u;
+            for (const auto &[stage_type, aggregate] : aggregates)
+            {
+                (void)stage_type;
+                stage_total_ns += aggregate.totalNs();
+                stage_samples += aggregate.samples;
+            }
+
+            std::ostringstream categories;
+            for (std::size_t rank = 0u; rank < reported; ++rank)
+            {
+                const auto &[stage_type, aggregate] = order[rank].get();
+                if (rank != 0u)
+                    categories << ';';
+                categories
+                    << stage_type
+                    << "{total_ms="
+                    << static_cast<double>(aggregate.totalNs()) / 1.0e6
+                    << ",execute_ms="
+                    << static_cast<double>(aggregate.execute_ns) / 1.0e6
+                    << ",snapshot_ms="
+                    << static_cast<double>(aggregate.snapshot_ns) / 1.0e6
+                    << ",max_ms="
+                    << static_cast<double>(aggregate.max_ns) / 1.0e6
+                    << ",samples=" << aggregate.samples << '}';
+            }
+
+            LOG_INFO(
+                "[GraphCaptureStageTypeAggregate] complete"
+                << " device=" << device.toString()
+                << " context=" << context
+                << " stage_total_ms="
+                << static_cast<double>(stage_total_ns) / 1.0e6
+                << " stage_samples=" << stage_samples
+                << " stage_types=" << aggregates.size()
+                << " slowest_types=" << categories.str());
+        }
 
         const char *graphExecutableLaunchPhaseName(
             DeviceGraphExecutor::GraphExecutableLaunchPhase phase)
@@ -290,6 +558,25 @@ namespace llaminar2
             return captureModeForPlan(cache.segments.size(), capturable_segments, manual_segments);
         }
 
+        /**
+         * @return Observable replay topology for one sealed or planned cache.
+         *
+         * A retained parent may be assembled from several capture-plan units,
+         * including a mapped host ticket service, but submits exactly one GPU
+         * executable. Reporting it as segmented would make PerfStats claim the
+         * serial child-replay path ran when it did not.
+         */
+        const char *replayTopologyTag(
+            const DeviceGraphExecutor::GraphSegmentCache &cache) noexcept
+        {
+            if (DeviceGraphExecutor::isRetainedParentPlanPolicy(
+                    cache.graph_replay_plan_policy))
+            {
+                return "retained_parent";
+            }
+            return captureModeTag(captureModeForCache(cache));
+        }
+
         const char *segmentTypeName(const DeviceGraphExecutor::GraphSegment &segment)
         {
             return segment.capturable ? "capturable" : "manual";
@@ -307,6 +594,421 @@ namespace llaminar2
             }
             out << ']';
             return out.str();
+        }
+
+        /** @brief Participant role in one heterogeneous ticket segment plan. */
+        enum class HeterogeneousTicketSegmentRole : std::uint8_t
+        {
+            Authority, ///< Owns one manual service after each typed cutpoint.
+            Follower, ///< Owns only captured units aligned to those cutpoints.
+        };
+
+        /** @brief Ticket-unit markers physically contained by one plan segment. */
+        struct HeterogeneousTicketSegmentMarkers
+        {
+            std::size_t before_manual = 0u; ///< BeforeManualBoundary contracts.
+            std::size_t terminal = 0u; ///< TransactionTerminal contracts.
+        };
+
+        /** @brief Authority that proves one replay transaction has completed. */
+        enum class ReplayTerminalFenceAuthority : std::uint8_t
+        {
+            HostObserver, ///< The caller must observe the capture-stream fence.
+            CaptureStreamEvent, ///< A dependent consumer may await the exact stream event.
+        };
+
+        /** @brief Resolved terminal-fence contract for one replay invocation. */
+        struct ReplayTerminalFencePlan
+        {
+            ReplayTerminalFenceAuthority authority =
+                ReplayTerminalFenceAuthority::HostObserver; ///< Sole completion authority.
+
+            /** @return Whether replay may return after publishing device ordering. */
+            [[nodiscard]] bool defersHostObservation() const noexcept
+            {
+                return authority ==
+                       ReplayTerminalFenceAuthority::CaptureStreamEvent;
+            }
+        };
+
+        /** @return Stable diagnostic name for a heterogeneous ticket role. */
+        constexpr const char *heterogeneousTicketSegmentRoleName(
+            HeterogeneousTicketSegmentRole role) noexcept
+        {
+            switch (role)
+            {
+            case HeterogeneousTicketSegmentRole::Authority:
+                return "authority";
+            case HeterogeneousTicketSegmentRole::Follower:
+                return "follower";
+            }
+            return "invalid";
+        }
+
+        /**
+         * @brief Validate typed ticket ordering without assuming child count.
+         *
+         * Scalar packet frontiers may deliberately split a producer or
+         * consumer unit into additional native children before retained-parent
+         * composition. The ticket lifecycle is therefore defined by marker
+         * adjacency, not by `captured == boundaries + 1` arithmetic. Every
+         * authority marker must be followed immediately by its one manual
+         * service and another captured unit. A follower has the same ordered
+         * marker cutpoints but no manual segment. Both roles terminate exactly
+         * once in the final captured unit.
+         */
+        void validateHeterogeneousTicketSegmentLifecycle(
+            const ComputeGraph &graph,
+            std::span<const DeviceGraphExecutor::GraphSegment> segments,
+            HeterogeneousTicketSegmentRole role,
+            std::size_t declared_before_manual,
+            std::size_t declared_terminal)
+        {
+            std::vector<HeterogeneousTicketSegmentMarkers> markers(
+                segments.size());
+            std::size_t observed_before_manual = 0u;
+            std::size_t observed_terminal = 0u;
+            std::size_t observed_manual_segments = 0u;
+            std::size_t observed_captured_segments = 0u;
+
+            const auto fail = [&](const std::string &reason)
+            {
+                std::ostringstream diagnostic;
+                diagnostic
+                    << "Invalid heterogeneous ticket "
+                    << heterogeneousTicketSegmentRoleName(role)
+                    << " segment lifecycle: " << reason
+                    << "; segments=" << segments.size()
+                    << " captured=" << observed_captured_segments
+                    << " manual=" << observed_manual_segments
+                    << " declared_boundaries=" << declared_before_manual
+                    << " observed_boundaries=" << observed_before_manual
+                    << " declared_terminal=" << declared_terminal
+                    << " observed_terminal=" << observed_terminal;
+                const std::size_t diagnostic_segments =
+                    std::min<std::size_t>(segments.size(), 8u);
+                for (std::size_t index = 0u;
+                     index < diagnostic_segments;
+                     ++index)
+                {
+                    const auto &segment = segments[index];
+                    diagnostic << " segment[" << index << "]={"
+                               << (segment.capturable ? "captured" : "manual")
+                               << ",before=" << markers[index].before_manual
+                               << ",terminal=" << markers[index].terminal
+                               << ",identity="
+                               << (segment.capture_wave_identity.empty()
+                                       ? "<implicit>"
+                                       : segment.capture_wave_identity)
+                               << ",first="
+                               << (segment.stage_names.empty()
+                                       ? "<empty>"
+                                       : segment.stage_names.front())
+                               << ",last="
+                               << (segment.stage_names.empty()
+                                       ? "<empty>"
+                                       : segment.stage_names.back())
+                               << '}';
+                }
+                throw std::runtime_error(diagnostic.str());
+            };
+
+            if (segments.empty())
+                fail("the plan is empty");
+
+            for (std::size_t segment_index = 0u;
+                 segment_index < segments.size();
+                 ++segment_index)
+            {
+                const auto &segment = segments[segment_index];
+                if (segment.stage_names.empty())
+                    fail("a plan segment has no stages");
+                if (segment.capturable)
+                    ++observed_captured_segments;
+                else
+                    ++observed_manual_segments;
+
+                for (const std::string &stage_name : segment.stage_names)
+                {
+                    const ComputeNode *const node = graph.getNode(stage_name);
+                    if (!node || !node->stage)
+                    {
+                        fail("a segment names unresolved stage '" +
+                             stage_name + "'");
+                    }
+                    if (!node->heterogeneous_ticket_unit_contract)
+                        continue;
+                    if (!segment.capturable)
+                    {
+                        fail("ticket-unit marker '" + stage_name +
+                             "' is attached to manual work");
+                    }
+                    switch (node->heterogeneous_ticket_unit_contract
+                                ->disposition)
+                    {
+                    case GraphHeterogeneousTicketUnitDisposition::
+                        BeforeManualBoundary:
+                        ++markers[segment_index].before_manual;
+                        ++observed_before_manual;
+                        break;
+                    case GraphHeterogeneousTicketUnitDisposition::
+                        TransactionTerminal:
+                        ++markers[segment_index].terminal;
+                        ++observed_terminal;
+                        break;
+                    }
+                }
+                if (markers[segment_index].before_manual > 1u ||
+                    markers[segment_index].terminal > 1u ||
+                    (markers[segment_index].before_manual != 0u &&
+                     markers[segment_index].terminal != 0u))
+                {
+                    fail("one captured segment contains conflicting ticket-unit markers");
+                }
+            }
+
+            if (!segments.front().capturable ||
+                !segments.back().capturable)
+            {
+                fail("the transaction must begin and end with captured device work");
+            }
+            if (declared_before_manual == 0u ||
+                observed_before_manual != declared_before_manual)
+            {
+                fail("the planned cutpoints do not match the declared ticket boundaries");
+            }
+            if (declared_terminal != 1u || observed_terminal != 1u ||
+                markers.back().terminal != 1u)
+            {
+                fail("the final captured unit is not the sole transaction terminal");
+            }
+
+            for (std::size_t index = 0u; index < segments.size(); ++index)
+            {
+                const bool closes_ticket =
+                    markers[index].before_manual == 1u;
+                if (role == HeterogeneousTicketSegmentRole::Authority)
+                {
+                    if (closes_ticket)
+                    {
+                        if (index + 2u >= segments.size() ||
+                            segments[index + 1u].capturable ||
+                            !segments[index + 2u].capturable)
+                        {
+                            fail("an authority cutpoint is not followed by one manual service and captured ingress");
+                        }
+                    }
+                    if (!segments[index].capturable)
+                    {
+                        if (index == 0u ||
+                            markers[index - 1u].before_manual != 1u)
+                        {
+                            fail("manual service has no immediately preceding authenticated cutpoint");
+                        }
+                    }
+                }
+                else
+                {
+                    if (!segments[index].capturable)
+                    {
+                        fail("a follower contains participant-local manual work");
+                    }
+                    if (closes_ticket &&
+                        (index + 1u >= segments.size() ||
+                         !segments[index + 1u].capturable))
+                    {
+                        fail("a follower cutpoint has no following captured unit");
+                    }
+                }
+            }
+
+            if (role == HeterogeneousTicketSegmentRole::Authority &&
+                observed_manual_segments != observed_before_manual)
+            {
+                fail("authority manual-service count does not match its authenticated cutpoints");
+            }
+        }
+
+        /**
+         * @brief Resolve the sole completion authority for a replay transaction.
+         *
+         * A fully captured graph can publish its capture-stream event when its
+         * collectives are native graph nodes. A typed heterogeneous ticket
+         * transaction has a different, equally exact proof: capture planning
+         * validates that it ends in one captured terminal unit, while every
+         * intervening manual collective publishes its completion back to the
+         * capture stream. Consequently that terminal stream event covers the
+         * whole captured/manual/captured DAG and a host wait would merely add
+         * scheduler latency before the event-aware consumer is enqueued.
+         *
+         * Ordinary segmented graphs retain a host observer. Their topology has
+         * no graph-owned terminal contract proving that a downstream caller is
+         * allowed to consume an asynchronously published transaction.
+         *
+         * @param graph Declarative graph whose envelope owns replay semantics.
+         * @param cache Materialized replay plan on the exact capture stream.
+         * @param has_collective_nodes Whether the source graph has collectives.
+         * @param collectives_graph_capturable Whether those collectives are in
+         *        native graph executables.
+         * @param defer_requested Whether the caller accepts event completion.
+         * @return Typed authority that must complete this replay invocation.
+         * @throws std::logic_error when a typed heterogeneous plan has lost its
+         *         required captured terminal or exact replay policy.
+         */
+        ReplayTerminalFencePlan resolveReplayTerminalFencePlan(
+            const ComputeGraph &graph,
+            const DeviceGraphExecutor::GraphSegmentCache &cache,
+            bool has_collective_nodes,
+            bool collectives_graph_capturable,
+            bool defer_requested)
+        {
+            if (!defer_requested)
+                return {};
+
+            const bool every_unit_captured = std::all_of(
+                cache.segments.begin(),
+                cache.segments.end(),
+                [](const DeviceGraphExecutor::GraphSegment &segment)
+                {
+                    return segment.capturable;
+                });
+            const bool complete_native_dag =
+                every_unit_captured &&
+                (!has_collective_nodes || collectives_graph_capturable);
+            if (complete_native_dag)
+            {
+                return {
+                    .authority =
+                        ReplayTerminalFenceAuthority::CaptureStreamEvent};
+            }
+
+            if (!requiresHeterogeneousTicketSegmentation(
+                    graph.nativeCaptureEnvelope()))
+            {
+                return {};
+            }
+
+            if (cache.graph_replay_plan_policy !=
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::
+                        AllowHeterogeneousBoundarySegmentation ||
+                cache.segments.empty() ||
+                !cache.segments.front().capturable ||
+                !cache.segments.back().capturable)
+            {
+                throw std::logic_error(
+                    "A typed heterogeneous replay lost its captured/manual/"
+                    "captured terminal-fence contract");
+            }
+
+            const std::string terminal_name = graph.terminalNode();
+            const auto &terminal_segment = cache.segments.back();
+            if (terminal_name.empty() ||
+                terminal_segment.stage_names.empty() ||
+                terminal_segment.stage_names.back() != terminal_name)
+            {
+                throw std::logic_error(
+                    "A typed heterogeneous replay does not end at its declared "
+                    "graph terminal");
+            }
+
+            const ComputeNode *const terminal = graph.getNode(terminal_name);
+            if (!terminal || !terminal->heterogeneous_ticket_unit_contract ||
+                terminal->heterogeneous_ticket_unit_contract->disposition !=
+                    GraphHeterogeneousTicketUnitDisposition::
+                        TransactionTerminal ||
+                !terminal_segment.capture ||
+                !terminal_segment.capture->hasExecutable() ||
+                terminal_segment.capture->executionStream() !=
+                    cache.capture_stream)
+            {
+                throw std::logic_error(
+                    "A typed heterogeneous replay terminal is not one exact "
+                    "captured executable on the cache stream");
+            }
+
+            return {
+                .authority =
+                    ReplayTerminalFenceAuthority::CaptureStreamEvent};
+        }
+
+        /**
+         * @brief Lower an authenticated ticket lifecycle to bounded compilation
+         *        units and one concurrent CPU service program.
+         *
+         * The declarative graph alternates GPU packet work and CPU ticket work so
+         * dependency validation can prove every cutpoint. Runtime execution does
+         * not alternate graph launches: every captured unit below is imported by
+         * the retained-parent composer and only that one parent executable may be
+         * submitted. The units are deliberately kept bounded during native graph
+         * recording, however. RCCL capture registration becomes substantially
+         * more expensive when hundreds of preceding compute and collective nodes
+         * already inhabit the same HIP capture, while importing several graph-only
+         * children into one parent has no request-time launch cost.
+         *
+         * Manual stages are the other concurrent program. The persistent CPU
+         * worker services them in declarative order while device packet waits keep
+         * their original positions in the retained parent. Consequently compile
+         * sharding changes neither the typed ticket protocol nor runtime ownership.
+         *
+         * @param segments Validated alternating semantic segments to consume.
+         * @param include_manual_service Whether this endpoint owns CPU service.
+         * @return Ordered captured compilation units followed, when owned, by one
+         *         CPU service program.
+         */
+        std::vector<DeviceGraphExecutor::GraphSegment>
+        lowerHeterogeneousTicketCompilationPlan(
+            std::vector<DeviceGraphExecutor::GraphSegment> segments,
+            bool include_manual_service)
+        {
+            DeviceGraphExecutor::GraphSegment service_program;
+            service_program.capturable = false;
+
+            std::vector<DeviceGraphExecutor::GraphSegment> programs;
+            programs.reserve(segments.size() +
+                             (include_manual_service ? 1u : 0u));
+
+            for (auto &segment : segments)
+            {
+                if (!segment.passive_capture_waves_after.empty())
+                {
+                    throw std::runtime_error(
+                        "A heterogeneous ticket compilation unit cannot contain passive capture waves");
+                }
+
+                if (segment.capturable)
+                {
+                    /*
+                     * Preserve the typed ticket/layer frontier and its capture
+                     * identity. This is a graph-only compiler shard: it is never
+                     * exposed as an independently launchable runtime program.
+                     */
+                    programs.push_back(std::move(segment));
+                    continue;
+                }
+
+                service_program.stage_names.insert(
+                    service_program.stage_names.end(),
+                    std::make_move_iterator(segment.stage_names.begin()),
+                    std::make_move_iterator(segment.stage_names.end()));
+            }
+
+            if (programs.empty())
+            {
+                throw std::runtime_error(
+                    "A heterogeneous ticket compilation plan has no capturable device work");
+            }
+            if (include_manual_service !=
+                !service_program.stage_names.empty())
+            {
+                throw std::runtime_error(
+                    include_manual_service
+                        ? "A heterogeneous ticket authority has no CPU service program"
+                        : "A heterogeneous ticket follower unexpectedly owns CPU service work");
+            }
+
+            if (include_manual_service)
+                programs.push_back(std::move(service_program));
+            return programs;
         }
 
         /**
@@ -1053,7 +1755,7 @@ namespace llaminar2
     const char *DeviceGraphCaptureController::replayModeName(
         const DeviceGraphExecutor::GraphSegmentCache &segment_cache)
     {
-        return captureModeTag(captureModeForCache(segment_cache));
+        return replayTopologyTag(segment_cache);
     }
 
     bool DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(
@@ -1211,6 +1913,15 @@ namespace llaminar2
             ownsHeterogeneousTicketBoundary(native_capture_envelope);
         const bool heterogeneous_ticket_follower =
             followsHeterogeneousTicketBoundary(native_capture_envelope);
+        const bool retained_parent_composition =
+            DeviceGraphExecutor::isRetainedParentPlanPolicy(plan_policy);
+        const bool concurrent_ticket_service =
+            DeviceGraphExecutor::hasConcurrentTicketService(plan_policy);
+        const bool retained_heterogeneous_authority =
+            heterogeneous_ticket_authority && concurrent_ticket_service;
+        const bool retained_heterogeneous_follower =
+            heterogeneous_ticket_follower && retained_parent_composition &&
+            !concurrent_ticket_service;
         if (device_owned_timeline_transaction &&
             plan_policy !=
                 DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph)
@@ -1221,10 +1932,12 @@ namespace llaminar2
         if (heterogeneous_ticket_transaction &&
             plan_policy !=
                 DeviceGraphExecutor::GraphReplayPlanPolicy::
-                    AllowHeterogeneousBoundarySegmentation)
+                    AllowHeterogeneousBoundarySegmentation &&
+            !retained_heterogeneous_authority &&
+            !retained_heterogeneous_follower)
         {
             throw std::logic_error(
-                "A heterogeneous ticket transaction requires the explicit heterogeneous segmentation policy");
+                "A heterogeneous ticket transaction requires explicit boundary segmentation, an authority parent with concurrent ticket service, or a graph-only follower parent");
         }
         const auto &segmented_collective_capture_allow =
             debugEnv().execution.gpu_graph_collective_segmented_capture_allow;
@@ -1544,6 +2257,12 @@ namespace llaminar2
         }
 
         const int max_stages = debugEnv().execution.gpu_graph_max_stages;
+        if (max_stages > 0 && heterogeneous_ticket_transaction &&
+            retained_parent_composition)
+        {
+            throw std::runtime_error(
+                "gpu_graph_max_stages cannot override typed retained heterogeneous ticket compilation units");
+        }
         if (max_stages > 0)
         {
             std::vector<DeviceGraphExecutor::GraphSegment> split_segments;
@@ -1586,9 +2305,42 @@ namespace llaminar2
             segment_cache.segments = std::move(split_segments);
         }
 
-        if (plan_policy ==
-            DeviceGraphExecutor::GraphReplayPlanPolicy::
-                RequireRetainedParentComposition)
+        /*
+         * First prove the declarative captured/manual/captured lifecycle. Only
+         * then lower it to bounded graph-only compiler shards and, on the
+         * authority, one ordered CPU ticket service. The retained-parent
+         * composer imports every captured shard into one executable, while the
+         * mapped publication/wait kernels preserve every original cutpoint.
+         */
+        if (heterogeneous_ticket_authority)
+        {
+            validateHeterogeneousTicketSegmentLifecycle(
+                graph,
+                segment_cache.segments,
+                HeterogeneousTicketSegmentRole::Authority,
+                heterogeneous_ticket_unit_boundaries,
+                heterogeneous_ticket_terminal_units);
+        }
+
+        if (heterogeneous_ticket_follower)
+        {
+            validateHeterogeneousTicketSegmentLifecycle(
+                graph,
+                segment_cache.segments,
+                HeterogeneousTicketSegmentRole::Follower,
+                heterogeneous_ticket_unit_boundaries,
+                heterogeneous_ticket_terminal_units);
+        }
+
+        if (heterogeneous_ticket_transaction &&
+            retained_parent_composition)
+        {
+            segment_cache.segments = lowerHeterogeneousTicketCompilationPlan(
+                std::move(segment_cache.segments),
+                heterogeneous_ticket_authority);
+        }
+
+        if (retained_parent_composition)
         {
             /*
              * Child captures share stable arena storage but do not execute
@@ -1608,8 +2360,47 @@ namespace llaminar2
             {
                 if (!segment.capturable)
                 {
-                    throw std::runtime_error(
-                        "Retained parent composition forbids manual replay units");
+                    if (!concurrent_ticket_service)
+                    {
+                        throw std::runtime_error(
+                            "Retained parent composition forbids manual replay units");
+                    }
+
+                    size_t device_ingress_publishers = 0u;
+                    for (const std::string &stage_name : segment.stage_names)
+                    {
+                        const ComputeNode *const node = graph.getNode(stage_name);
+                        if (!node || !node->stage)
+                        {
+                            throw std::runtime_error(
+                                "Concurrent ticket-service planning cannot resolve stage '" +
+                                stage_name + "'");
+                        }
+                        const StageBufferContract contract =
+                            node->stage->bufferContract();
+                        if (!node->stage->isManualGraphBoundary() ||
+                            node->stage->manualGraphBoundaryScheduling() !=
+                                ManualGraphBoundaryScheduling::
+                                    ConcurrentTicketService ||
+                            !contract.allArenaReads().empty() ||
+                            !contract.allWrites().empty())
+                        {
+                            throw std::runtime_error(
+                                "Concurrent ticket-service stage '" + stage_name +
+                                "' lacks a self-contained mapped-ticket boundary contract");
+                        }
+                        if (node->stage->concurrentManualFailureRole() ==
+                            ConcurrentManualFailureRole::DeviceIngressPublisher)
+                        {
+                            ++device_ingress_publishers;
+                        }
+                    }
+                    if (device_ingress_publishers == 0u)
+                    {
+                        throw std::runtime_error(
+                            "Concurrent ticket-service manual unit has no authenticated device-ingress publisher for failure drainage");
+                    }
+                    continue;
                 }
 
                 std::unordered_set<BufferId> segment_parent_inputs;
@@ -1752,81 +2543,6 @@ namespace llaminar2
             throw std::runtime_error(diagnostic.str());
         }
 
-        if (heterogeneous_ticket_authority &&
-            (capturable_segments !=
-                 heterogeneous_ticket_unit_boundaries + 1u ||
-             manual_segments !=
-                 heterogeneous_ticket_unit_boundaries ||
-             heterogeneous_ticket_terminal_units != 1u ||
-             manual_segments == 0u ||
-             segment_cache.segments.empty() ||
-             !segment_cache.segments.front().capturable ||
-             !segment_cache.segments.back().capturable))
-        {
-            std::ostringstream diagnostic;
-            diagnostic
-                << "Heterogeneous ticket authority must lower to captured "
-                   "producer/consumer units separated by authenticated manual "
-                   "ticket boundaries"
-                << ": capturable_segments=" << capturable_segments
-                << " manual_segments=" << manual_segments
-                << " unit_boundaries="
-                << heterogeneous_ticket_unit_boundaries
-                << " terminal_units="
-                << heterogeneous_ticket_terminal_units;
-            const size_t diagnostic_segments =
-                std::min<size_t>(segment_cache.segments.size(), 8u);
-            for (size_t segment_index = 0u;
-                 segment_index < diagnostic_segments;
-                 ++segment_index)
-            {
-                const auto &segment =
-                    segment_cache.segments[segment_index];
-                diagnostic << " segment[" << segment_index << "]={"
-                           << (segment.capturable ? "captured" : "manual")
-                           << ",identity="
-                           << (segment.capture_wave_identity.empty()
-                                   ? "<implicit>"
-                                   : segment.capture_wave_identity)
-                           << ",first="
-                           << (segment.stage_names.empty()
-                                   ? "<empty>"
-                                   : segment.stage_names.front())
-                           << ",last="
-                           << (segment.stage_names.empty()
-                                   ? "<empty>"
-                                   : segment.stage_names.back())
-                           << '}';
-            }
-            throw std::runtime_error(diagnostic.str());
-        }
-
-        if (heterogeneous_ticket_follower)
-        {
-            if (heterogeneous_ticket_unit_boundaries == 0u ||
-                capturable_segments !=
-                    heterogeneous_ticket_unit_boundaries + 1u ||
-                manual_segments != 0u ||
-                heterogeneous_ticket_terminal_units != 1u ||
-                segment_cache.segments.empty() ||
-                !segment_cache.segments.front().capturable ||
-                !segment_cache.segments.back().capturable)
-            {
-                std::ostringstream diagnostic;
-                diagnostic
-                    << "Heterogeneous ticket follower must contain only "
-                       "captured device units separated by typed "
-                       "authority-aligned cutpoints"
-                    << ": capturable_segments=" << capturable_segments
-                    << " manual_segments=" << manual_segments
-                    << " unit_boundaries="
-                    << heterogeneous_ticket_unit_boundaries
-                    << " terminal_units="
-                    << heterogeneous_ticket_terminal_units;
-                throw std::runtime_error(diagnostic.str());
-            }
-        }
-
         if (heterogeneous_ticket_transaction)
         {
             PerfStatsCollector::addCounter(
@@ -1852,23 +2568,31 @@ namespace llaminar2
                       : "follower"}});
         }
 
-        if (plan_policy ==
-            DeviceGraphExecutor::GraphReplayPlanPolicy::
-                RequireRetainedParentComposition)
+        if (retained_parent_composition)
         {
-            if (manual_segments != 0u || capturable_segments == 0u)
+            if (capturable_segments == 0u ||
+                (!concurrent_ticket_service && manual_segments != 0u))
             {
                 throw std::runtime_error(
                     "Retained parent composition requires one or more native child graphs and forbids manual replay units");
             }
+            if (concurrent_ticket_service &&
+                !heterogeneous_ticket_authority)
+            {
+                throw std::runtime_error(
+                    "Concurrent ticket service is legal only for a typed heterogeneous ticket authority");
+            }
             for (const auto &segment : segment_cache.segments)
             {
+                if (!segment.capturable)
+                    continue;
                 for (const std::string &stage_name : segment.stage_names)
                 {
                     const ComputeNode *const node = graph.getNode(stage_name);
                     if (!node || !node->stage ||
-                        node->stage->graphLaunchPreparationPolicy() ==
-                            GraphLaunchPreparationPolicy::CaptureAndReplay)
+                        (!concurrent_ticket_service &&
+                         node->stage->graphLaunchPreparationPolicy() ==
+                             GraphLaunchPreparationPolicy::CaptureAndReplay))
                     {
                         throw std::runtime_error(
                             "Retained parent composition requires immutable replay metadata for stage '" +
@@ -2046,10 +2770,9 @@ namespace llaminar2
                         AllowHeterogeneousBoundarySegmentation &&
                 undeclared_manual_boundaries.empty();
             const bool retained_parent_composition_admitted =
-                plan_policy ==
-                    DeviceGraphExecutor::GraphReplayPlanPolicy::
-                        RequireRetainedParentComposition &&
-                manual_segments == 0u;
+                retained_parent_composition &&
+                (manual_segments == 0u || concurrent_ticket_service) &&
+                undeclared_manual_boundaries.empty();
 
             if (!heterogeneous_boundary_segmentation_admitted &&
                 !retained_parent_composition_admitted)
@@ -2067,13 +2790,11 @@ namespace llaminar2
                         << "; the execution topology did not admit a "
                            "heterogeneous manual boundary";
                 }
-                else if (plan_policy ==
-                         DeviceGraphExecutor::GraphReplayPlanPolicy::
-                             RequireRetainedParentComposition)
+                else if (retained_parent_composition)
                 {
-                    detail
-                        << "; retained parent composition admits native child "
-                           "graphs only and cannot contain a manual unit";
+                    detail << (concurrent_ticket_service
+                                   ? "; retained parent concurrent service admits only mapped-ticket manual units with an authenticated abort publisher"
+                                   : "; retained parent composition admits native child graphs only and cannot contain a manual unit");
                 }
                 if (!undeclared_manual_boundaries.empty())
                 {
@@ -2235,9 +2956,6 @@ namespace llaminar2
             return false;
         }
 
-        const bool trace_replay = debugEnv().execution.gpu_graph_trace_replay;
-        const auto &device_id = ctx->deviceId();
-
         bool manual_had_collective = false;
         for (const auto &stage_name : segment.stage_names)
         {
@@ -2283,13 +3001,6 @@ namespace llaminar2
                 // reads and deadlocks.
                 void *compute_stream = gpu_ctx->defaultStream();
 
-                if (trace_replay)
-                {
-                    LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                               << " COLLECTIVE enter: " << stage_name
-                                               << " insertStreamDependency(compute←capture)");
-                }
-
                 if (capture_stream)
                 {
                     // GPU-side: compute_stream waits for capture_stream.
@@ -2305,12 +3016,6 @@ namespace llaminar2
                                   << stage_name);
                         return false;
                     }
-                }
-
-                if (trace_replay)
-                {
-                    LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                               << " COLLECTIVE execute: " << stage_name);
                 }
 
                 node->stage->setGPUStream(compute_stream);
@@ -2337,11 +3042,6 @@ namespace llaminar2
                     }
                 }
 
-                if (trace_replay)
-                {
-                    LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                               << " COLLECTIVE done: " << stage_name);
-                }
             }
             else
             {
@@ -2603,6 +3303,14 @@ namespace llaminar2
             "segment_recapture_" + std::to_string(segment_index));
         if (!dependency_ledger)
             return false;
+        std::vector<IComputeStage *> capture_stages;
+        capture_stages.reserve(segment.stage_names.size());
+        for (const auto &stage_name : segment.stage_names)
+        {
+            ComputeNode *node = graph.getNode(stage_name);
+            capture_stages.push_back(
+                node && node->stage ? node->stage.get() : nullptr);
+        }
         {
             if (capture_boundary_cb)
             {
@@ -2622,14 +3330,29 @@ namespace llaminar2
                 }
             }
 
+            ScopedGraphCaptureStageActivity stage_capture_activity(
+                capture_stages,
+                ctx,
+                capture_stream,
+                "segment recapture index=" +
+                    std::to_string(segment_index));
             ScopedBackendGraphCapture capture_transaction(
                 *gpu_ctx,
                 *segment.capture,
                 "segment recapture index=" +
                     std::to_string(segment_index),
                 dependency_ledger.get());
+            if (!stage_capture_activity.begin())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Re-capture stage activity admission failed, seg "
+                    << segment_index);
+                return false;
+            }
             if (!capture_transaction.begin())
             {
+                (void)stage_capture_activity.finish(
+                    GraphCaptureActivityTransition::Aborted);
                 LOG_ERROR("[DeviceGraphCaptureController] Re-capture beginCapture failed, seg " << segment_index);
                 return false;
             }
@@ -2672,6 +3395,15 @@ namespace llaminar2
             }
 
             capture_transaction.finish();
+            if (!stage_capture_activity.finish(
+                    exec_ok
+                        ? GraphCaptureActivityTransition::Completed
+                        : GraphCaptureActivityTransition::Aborted))
+            {
+                if (exec_ok)
+                    failed_stage_name = "<stage_capture_activity>";
+                exec_ok = false;
+            }
         }
 
         /*
@@ -3301,6 +4033,16 @@ namespace llaminar2
             initial_submission ==
             DeviceGraphExecutor::GraphInitialSubmissionPolicy::
                 MaterializeWithoutLaunch;
+        std::vector<size_t> concurrent_service_segments;
+        if (DeviceGraphExecutor::hasConcurrentTicketService(
+                segment_cache.graph_replay_plan_policy))
+        {
+            for (size_t index = 0u; index < segment_cache.segments.size(); ++index)
+            {
+                if (!segment_cache.segments[index].capturable)
+                    concurrent_service_segments.push_back(index);
+            }
+        }
         if (materialize_without_launch)
         {
             /*
@@ -3310,7 +4052,10 @@ namespace llaminar2
              * cache only after the executable is fully instantiated.
              */
             for (auto &segment : segment_cache.segments)
-                cacheCapturedSegmentArenaWrites(graph, segment);
+            {
+                if (segment.capturable)
+                    cacheCapturedSegmentArenaWrites(graph, segment);
+            }
             segment_cache.retained_parent_capture = std::move(parent);
             PerfStatsCollector::addCounter(
                 "forward_graph",
@@ -3339,10 +4084,18 @@ namespace llaminar2
         {
             return false;
         }
-        if (!parent->launch())
+        const bool parent_submission_ok =
+            concurrent_service_segments.empty()
+                ? parent->launch()
+                : hooks.submit_parent_with_concurrent_ticket_service &&
+                      hooks.submit_parent_with_concurrent_ticket_service(
+                          *parent,
+                          concurrent_service_segments,
+                          current_step);
+        if (!parent_submission_ok)
         {
             LOG_ERROR(
-                "[DeviceGraphCaptureController] Retained parent transaction-zero launch failed");
+                "[DeviceGraphCaptureController] Retained parent transaction-zero submission failed");
             return false;
         }
 
@@ -3353,7 +4106,10 @@ namespace llaminar2
          * backend. This is host-side authority bookkeeping, not child replay.
          */
         for (auto &segment : segment_cache.segments)
-            hooks.post_launch(segment, segment_cache.capture_stream);
+        {
+            if (segment.capturable)
+                hooks.post_launch(segment, segment_cache.capture_stream);
+        }
 
         PerfStatsCollector::addCounter(
             "forward_graph",
@@ -3486,6 +4242,129 @@ namespace llaminar2
         }
 
         segment.last_executed_step = current_step;
+        return true;
+    }
+
+    bool DeviceGraphCaptureController::executeConcurrentTicketService(
+            ComputeGraph &graph,
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            IDeviceContext *ctx,
+            IWorkerGPUContext *gpu_ctx,
+            uint64_t current_step,
+            std::span<const size_t> segment_indices,
+            const std::function<bool(ComputeNode &)> &execute_node_cb)
+    {
+        if (!ctx || !gpu_ctx || !segment_cache.capture_stream ||
+            !DeviceGraphExecutor::hasConcurrentTicketService(
+                segment_cache.graph_replay_plan_policy))
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Concurrent ticket service has incomplete context or the wrong replay policy");
+            return false;
+        }
+
+        const auto fatal_abort_failure = [](const std::string &detail) noexcept
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Fatal retained-parent ticket-service abort-publication failure: "
+                << detail);
+            std::terminate();
+        };
+
+        const auto publish_abort = [&]() noexcept
+        {
+            bool found_publisher = false;
+            for (const size_t segment_index : segment_indices)
+            {
+                if (segment_index >= segment_cache.segments.size())
+                {
+                    fatal_abort_failure(
+                        "sealed manual segment index is outside the graph plan");
+                }
+                const auto &segment = segment_cache.segments[segment_index];
+                for (const std::string &stage_name : segment.stage_names)
+                {
+                    ComputeNode *const node = graph.getNode(stage_name);
+                    if (!node || !node->stage)
+                    {
+                        fatal_abort_failure(
+                            "cannot resolve abort publisher stage '" +
+                            stage_name + "'");
+                    }
+                    if (node->stage->concurrentManualFailureRole() !=
+                        ConcurrentManualFailureRole::DeviceIngressPublisher)
+                    {
+                        continue;
+                    }
+                    found_publisher = true;
+                    if (!node->stage->publishConcurrentManualFailure())
+                    {
+                        fatal_abort_failure(
+                            "device-ingress publisher rejected abort for stage '" +
+                            stage_name + "'");
+                    }
+                }
+            }
+            if (!found_publisher)
+            {
+                fatal_abort_failure(
+                    "failed transaction has no device-ingress publisher");
+            }
+        };
+
+        for (const size_t segment_index : segment_indices)
+        {
+            if (segment_index >= segment_cache.segments.size())
+            {
+                fatal_abort_failure(
+                    "sealed manual segment index is outside the graph plan");
+            }
+            auto &segment = segment_cache.segments[segment_index];
+            if (segment.capturable)
+            {
+                fatal_abort_failure(
+                    "sealed concurrent-service index names a captured unit");
+            }
+
+            bool service_ok = false;
+            try
+            {
+                service_ok = executeManualReplaySegment(
+                    graph,
+                    segment,
+                    ctx,
+                    gpu_ctx,
+                    segment_cache.capture_stream,
+                    /*has_collective_nodes=*/false,
+                    /*needs_segment_sync=*/false,
+                    current_step,
+                    execute_node_cb,
+                    /*record_snapshot_copies_cb=*/{});
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Concurrent ticket service threw while executing segment "
+                    << segment_index << ": " << error.what());
+            }
+            catch (...)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Concurrent ticket service threw a non-standard exception while executing segment "
+                    << segment_index);
+            }
+            if (!service_ok)
+            {
+                /*
+                 * Release every captured device wait before returning failure.
+                 * The parent-submission owner joins this worker and only then
+                 * performs the exceptional stream fence, so backend submission
+                 * and stream retirement can never race across host threads.
+                 */
+                publish_abort();
+                return false;
+            }
+        }
         return true;
     }
 
@@ -3746,13 +4625,60 @@ namespace llaminar2
         const bool full_graph_capture =
             captureModeForCache(segment_cache) == GraphReplayCaptureMode::FullGraph;
         const bool retained_parent_composition =
-            segment_cache.graph_replay_plan_policy ==
-            DeviceGraphExecutor::GraphReplayPlanPolicy::
-                RequireRetainedParentComposition;
+            DeviceGraphExecutor::isRetainedParentPlanPolicy(
+                segment_cache.graph_replay_plan_policy);
+        const bool concurrent_ticket_service =
+            DeviceGraphExecutor::hasConcurrentTicketService(
+                segment_cache.graph_replay_plan_policy);
         const bool materialize_without_launch =
             initial_submission ==
             DeviceGraphExecutor::GraphInitialSubmissionPolicy::
                 MaterializeWithoutLaunch;
+        std::array<
+            CaptureMaterializationAggregate,
+            static_cast<std::size_t>(
+                CaptureMaterializationPhase::Count)>
+            materialization_timings{};
+        std::map<std::string, CaptureStageRecordAggregate>
+            stage_record_aggregates;
+        const auto record_materialization_timing = [&] (
+            CaptureMaterializationPhase phase,
+            PerfStatsCollector::Clock::time_point begin,
+            const DeviceGraphExecutor::GraphSegment *segment,
+            size_t segment_index)
+        {
+            const auto measured_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    PerfStatsCollector::Clock::now() - begin)
+                    .count();
+            const auto elapsed_ns = static_cast<std::uint64_t>(
+                std::max<std::int64_t>(0, measured_ns));
+            const size_t stage_count =
+                segment ? segment->stage_names.size() : 0u;
+            const size_t node_count =
+                segment && segment->capture
+                    ? segment->capture->nodeCount()
+                    : 0u;
+            const char *const phase_name =
+                captureMaterializationPhaseName(phase);
+            materialization_timings[static_cast<std::size_t>(phase)]
+                .observe(elapsed_ns);
+            PerfStatsCollector::recordTimingNs(
+                "forward_graph",
+                std::string("capture_materialization_") + phase_name,
+                elapsed_ns,
+                materialize_without_launch ? "setup" : "capture",
+                ctx->deviceId().toString(),
+                {{"capture_mode", replayTopologyTag(segment_cache)},
+                 {"context", segment_cache.perf_context},
+                 {"initial_submission",
+                  materialize_without_launch
+                      ? "materialize_without_launch"
+                      : "instantiate_and_launch"},
+                 {"segment_index", std::to_string(segment_index)},
+                 {"stages", std::to_string(stage_count)},
+                 {"nodes", std::to_string(node_count)}});
+        };
 
         if (retained_parent_composition !=
             static_cast<bool>(hooks.retained_parent_composer))
@@ -3762,7 +4688,7 @@ namespace llaminar2
             result.reset_cache = true;
             return result;
         }
-        if (retained_parent_composition &&
+        if (retained_parent_composition && !concurrent_ticket_service &&
             std::any_of(
                 segment_cache.segments.begin(),
                 segment_cache.segments.end(),
@@ -3841,6 +4767,7 @@ namespace llaminar2
             result.reset_cache = true;
             return result;
         }
+        const auto prebind_begin = PerfStatsCollector::Clock::now();
         for (const auto &seg : segment_cache.segments)
         {
             if (seg.capturable && !hooks.prebind_storage(seg))
@@ -3855,6 +4782,11 @@ namespace llaminar2
                 return result;
             }
         }
+        record_materialization_timing(
+            CaptureMaterializationPhase::ArenaPrebind,
+            prebind_begin,
+            /*segment=*/nullptr,
+            /*segment_index=*/0u);
 
         /*
          * Launch preparation owns immutable topology setup and must complete for
@@ -3863,6 +4795,8 @@ namespace llaminar2
          * descriptor tables, pointer arrays, and transfer events. Only after
          * preparation may the stricter capture-readiness predicates be trusted.
          */
+        const auto launch_preparation_begin =
+            PerfStatsCollector::Clock::now();
         for (const auto &seg : segment_cache.segments)
         {
             if (!seg.capturable)
@@ -3884,6 +4818,11 @@ namespace llaminar2
                 return result;
             }
         }
+        record_materialization_timing(
+            CaptureMaterializationPhase::LaunchPreparation,
+            launch_preparation_begin,
+            /*segment=*/nullptr,
+            /*segment_index=*/0u);
 
         for (const auto &seg : segment_cache.segments)
         {
@@ -3925,38 +4864,33 @@ namespace llaminar2
             }
         }
 
+        /*
+         * Snapshot destinations form one graph-owned allocation, so descriptor
+         * discovery is a graph-wide setup phase rather than per-segment work.
+         * Every stage has now frozen its persistent launch metadata and output
+         * pointers. Bind the complete arena once before the first beginCapture();
+         * no later segment may allocate or extend snapshot storage.
+         */
+        const auto snapshot_manifest_begin =
+            PerfStatsCollector::Clock::now();
+        if (hooks.prepare_snapshot_manifest &&
+            !hooks.prepare_snapshot_manifest())
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Complete snapshot manifest preparation failed before native graph capture");
+            result.reset_cache = true;
+            result.success = false;
+            return result;
+        }
+        record_materialization_timing(
+            CaptureMaterializationPhase::SnapshotManifest,
+            snapshot_manifest_begin,
+            /*segment=*/nullptr,
+            /*segment_index=*/0u);
+
         for (size_t segment_index = 0; segment_index < segment_cache.segments.size(); ++segment_index)
         {
             auto &seg = segment_cache.segments[segment_index];
-            if (debugEnv().execution.gpu_graph_trace_replay)
-            {
-                /* Capture-time stalls precede replay and therefore cannot be
-                 * localized by the replay trace below.  Emit the same compact
-                 * unit identity here so a retained device wait can be tied to
-                 * the exact declarative frontier without dumping every stage
-                 * or perturbing normal execution. */
-                LOG_DEBUG(
-                    "[CaptureTrace] "
-                    << ctx->deviceId().toString()
-                    << " step=" << current_step
-                    << " seg=" << segment_index << "/"
-                    << segment_cache.segments.size()
-                    << " [" << (seg.capturable ? "GRAPH" : "MANUAL")
-                    << "] stages=" << seg.stage_names.size()
-                    << " first="
-                    << (seg.stage_names.empty()
-                            ? std::string("<empty>")
-                            : seg.stage_names.front())
-                    << " last="
-                    << (seg.stage_names.empty()
-                            ? std::string("<empty>")
-                            : seg.stage_names.back())
-                    << " identity="
-                    << (seg.capture_wave_identity.empty()
-                            ? std::string("<implicit>")
-                            : seg.capture_wave_identity)
-                    << " stage_list=" << describeSegmentStages(seg));
-            }
             if (seg.capturable)
             {
                 // Capturable path: prepared stream -> begin capture -> record
@@ -3981,6 +4915,8 @@ namespace llaminar2
                     result.success = false;
                     return result;
                 }
+                const auto input_coherence_begin =
+                    PerfStatsCollector::Clock::now();
                 if (!hooks.cohere_inputs(seg))
                 {
                     LOG_ERROR("[DeviceGraphCaptureController] Native graph capture input preflight failed for segment starting at "
@@ -3991,32 +4927,11 @@ namespace llaminar2
                     result.success = false;
                     return result;
                 }
-
-                /*
-                 * Snapshot copy nodes need their per-stage output descriptors and
-                 * destination storage allocated before stream capture begins.
-                 * Preparation is descriptor-only: it must not copy payload bytes,
-                 * enqueue stream work, or publish a producer event. The exact
-                 * point-in-time D2D copy is recorded only after its producing
-                 * stage executes inside the graph transaction.
-                 */
-                if (hooks.prepare_snapshot_copies)
-                {
-                    for (const auto &stage_name : seg.stage_names)
-                    {
-                        auto *node = graph.getNode(stage_name);
-                        if (!node || !node->stage)
-                            continue;
-                        if (!hooks.prepare_snapshot_copies(*node, capture_stream))
-                        {
-                            LOG_ERROR("[DeviceGraphCaptureController] Snapshot descriptor preparation failed before cached graph capture: "
-                                      << stage_name);
-                            result.reset_cache = true;
-                            result.success = false;
-                            return result;
-                        }
-                    }
-                }
+                record_materialization_timing(
+                    CaptureMaterializationPhase::InputCoherence,
+                    input_coherence_begin,
+                    &seg,
+                    segment_index);
 
                 /*
                  * Launch preparation and native capture share one exact stream.
@@ -4047,6 +4962,9 @@ namespace llaminar2
                         return result;
                     }
                 }
+
+                const auto native_record_begin =
+                    PerfStatsCollector::Clock::now();
 
                 seg.capture = gpu_ctx->createGraphCapture(capture_stream);
                 if (!seg.capture)
@@ -4080,9 +4998,29 @@ namespace llaminar2
                     return result;
                 }
 
+                std::vector<IComputeStage *> capture_stages;
+                capture_stages.reserve(seg.stage_names.size());
+                for (const auto &stage_name : seg.stage_names)
+                {
+                    ComputeNode *node = graph.getNode(stage_name);
+                    capture_stages.push_back(
+                        node && node->stage ? node->stage.get() : nullptr);
+                }
+
                 bool exec_ok = true;
                 std::string failed_stage_name;
+                std::vector<CaptureStageRecordObservation>
+                    stage_record_observations;
+                stage_record_observations.reserve(seg.stage_names.size());
+                std::uint64_t capture_begin_ns = 0u;
+                std::uint64_t capture_close_ns = 0u;
                 {
+                    ScopedGraphCaptureStageActivity stage_capture_activity(
+                        capture_stages,
+                        ctx,
+                        capture_stream,
+                        "capture phase segment=" +
+                            std::to_string(segment_index));
                     ScopedBackendGraphCapture capture_transaction(
                         *gpu_ctx,
                         *seg.capture,
@@ -4090,12 +5028,32 @@ namespace llaminar2
                             std::to_string(segment_index) +
                             " stages=" + describeSegmentStages(seg),
                         dependency_ledger.get());
+                    if (!stage_capture_activity.begin())
+                    {
+                        LOG_ERROR(
+                            "[DeviceGraphCaptureController] Stage capture "
+                            "activity admission failed for segment");
+                        result.reset_cache = true;
+                        result.success = false;
+                        return result;
+                    }
+                    const auto capture_begin_call =
+                        PerfStatsCollector::Clock::now();
                     if (!capture_transaction.begin())
                     {
+                        (void)stage_capture_activity.finish(
+                            GraphCaptureActivityTransition::Aborted);
                         LOG_ERROR("[DeviceGraphCaptureController] beginCapture failed for segment");
                         result.reset_cache = true;
                         return result;
                     }
+                    capture_begin_ns = static_cast<std::uint64_t>(
+                        std::max<std::int64_t>(
+                            0,
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                PerfStatsCollector::Clock::now() -
+                                capture_begin_call)
+                                .count()));
 
                     ScopedCapturedAuxiliaryBranch auxiliary_branch(
                         hooks.auxiliary_branch,
@@ -4116,15 +5074,58 @@ namespace llaminar2
                         if (!exec_ok)
                             break;
                         auto *node = graph.getNode(stage_name);
-                        if (!node || !node->stage || !hooks.execute_node(*node))
+                        CaptureStageRecordObservation observation{
+                            .stage_name = stage_name,
+                            .stage_type =
+                                node && node->stage
+                                    ? computeStageTypeName(node->stage->type())
+                                    : "invalid",
+                        };
+                        const auto stage_record_begin =
+                            PerfStatsCollector::Clock::now();
+                        const bool stage_recorded =
+                            node && node->stage && hooks.execute_node(*node);
+                        observation.execute_ns = static_cast<std::uint64_t>(
+                            std::max<std::int64_t>(
+                                0,
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    PerfStatsCollector::Clock::now() -
+                                    stage_record_begin)
+                                    .count()));
+                        if (!stage_recorded)
                         {
                             LOG_ERROR("[DeviceGraphCaptureController] Stage failed during cached graph capture: " << stage_name);
+                            stage_record_aggregates[observation.stage_type]
+                                .observe(observation);
+                            stage_record_observations.push_back(
+                                std::move(observation));
                             exec_ok = false;
                             failed_stage_name = stage_name;
                             break;
                         }
-                        if (hooks.record_snapshot_copies &&
-                            !hooks.record_snapshot_copies(*node, capture_stream))
+                        bool snapshots_recorded = true;
+                        if (hooks.record_snapshot_copies)
+                        {
+                            const auto snapshot_record_begin =
+                                PerfStatsCollector::Clock::now();
+                            snapshots_recorded =
+                                hooks.record_snapshot_copies(
+                                    *node, capture_stream);
+                            observation.snapshot_ns =
+                                static_cast<std::uint64_t>(
+                                    std::max<std::int64_t>(
+                                        0,
+                                        std::chrono::duration_cast<
+                                            std::chrono::nanoseconds>(
+                                            PerfStatsCollector::Clock::now() -
+                                            snapshot_record_begin)
+                                            .count()));
+                        }
+                        stage_record_aggregates[observation.stage_type]
+                            .observe(observation);
+                        stage_record_observations.push_back(
+                            std::move(observation));
+                        if (!snapshots_recorded)
                         {
                             LOG_ERROR("[DeviceGraphCaptureController] Snapshot copy failed during cached graph capture: "
                                       << stage_name);
@@ -4150,8 +5151,48 @@ namespace llaminar2
                         }
                     }
 
+                    const auto capture_close_call =
+                        PerfStatsCollector::Clock::now();
                     capture_transaction.finish();
+                    if (!stage_capture_activity.finish(
+                            exec_ok
+                                ? GraphCaptureActivityTransition::Completed
+                                : GraphCaptureActivityTransition::Aborted))
+                    {
+                        if (exec_ok)
+                        {
+                            failed_stage_name =
+                                "<stage_capture_activity>";
+                        }
+                        exec_ok = false;
+                    }
+                    capture_close_ns = static_cast<std::uint64_t>(
+                        std::max<std::int64_t>(
+                            0,
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                PerfStatsCollector::Clock::now() -
+                                capture_close_call)
+                                .count()));
                 }
+                const auto native_record_ns = static_cast<std::uint64_t>(
+                    std::max<std::int64_t>(
+                        0,
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            PerfStatsCollector::Clock::now() -
+                            native_record_begin)
+                            .count()));
+                logSlowCaptureStageAttribution(
+                    ctx->deviceId(),
+                    segment_cache.perf_context,
+                    stage_record_observations,
+                    capture_begin_ns,
+                    capture_close_ns,
+                    native_record_ns);
+                record_materialization_timing(
+                    CaptureMaterializationPhase::NativeRecord,
+                    native_record_begin,
+                    &seg,
+                    segment_index);
 
                 /*
                  * A begin-only barrier is insufficient: participants can take
@@ -4203,6 +5244,8 @@ namespace llaminar2
                                      InstantiateWithoutLaunch
                                : CapturedUnitFinalization::
                                      InstantiateAndLaunch);
+                const auto native_finalize_begin =
+                    PerfStatsCollector::Clock::now();
                 const bool capture_finalize_ok = finalizeCapturePhaseCapturableSegment(
                     graph,
                     seg,
@@ -4224,6 +5267,11 @@ namespace llaminar2
                     result.reset_cache = true;
                     return result;
                 }
+                record_materialization_timing(
+                    CaptureMaterializationPhase::NativeFinalize,
+                    native_finalize_begin,
+                    &seg,
+                    segment_index);
                 /*
                  * Ordinary segmented execution launches its unit before joining
                  * following passive waves. Parent composition deliberately does
@@ -4255,7 +5303,8 @@ namespace llaminar2
                  * arithmetic before request admission. The first ordinary replay
                  * executes this unit in its declared position.
                 */
-                if (!materialize_without_launch)
+                if (!materialize_without_launch &&
+                    !retained_parent_composition)
                 {
                     const bool manual_capture_ok =
                         executeCapturePhaseManualSegment(
@@ -4303,6 +5352,111 @@ namespace llaminar2
             result.reset_cache = true;
             return result;
         }
+
+        const auto milliseconds = [](
+            std::uint64_t nanoseconds) noexcept
+        {
+            return static_cast<double>(nanoseconds) / 1.0e6;
+        };
+        const auto &prebind = materialization_timings[
+            static_cast<std::size_t>(
+                CaptureMaterializationPhase::ArenaPrebind)];
+        const auto &launch_preparation = materialization_timings[
+            static_cast<std::size_t>(
+                CaptureMaterializationPhase::LaunchPreparation)];
+        const auto &snapshot_manifest = materialization_timings[
+            static_cast<std::size_t>(
+                CaptureMaterializationPhase::SnapshotManifest)];
+        const auto &input_coherence = materialization_timings[
+            static_cast<std::size_t>(
+                CaptureMaterializationPhase::InputCoherence)];
+        const auto &native_record = materialization_timings[
+            static_cast<std::size_t>(
+                CaptureMaterializationPhase::NativeRecord)];
+        const auto &native_finalize = materialization_timings[
+            static_cast<std::size_t>(
+                CaptureMaterializationPhase::NativeFinalize)];
+        const std::size_t capture_compilation_units =
+            static_cast<std::size_t>(std::count_if(
+                segment_cache.segments.begin(),
+                segment_cache.segments.end(),
+                [](const DeviceGraphExecutor::GraphSegment &segment)
+                {
+                    return segment.capturable;
+                }));
+        const std::size_t service_programs =
+            segment_cache.segments.size() - capture_compilation_units;
+        std::size_t captured_stage_objects = 0u;
+        std::size_t service_stage_objects = 0u;
+        std::size_t captured_native_nodes = 0u;
+        for (const auto &segment : segment_cache.segments)
+        {
+            if (segment.capturable)
+            {
+                captured_stage_objects += segment.stage_names.size();
+                if (segment.capture)
+                    captured_native_nodes += segment.capture->nodeCount();
+            }
+            else
+            {
+                service_stage_objects += segment.stage_names.size();
+            }
+        }
+        /*
+         * A retained parent imports every graph-only child but exposes one
+         * executable to inference. Keep that distinct from compilation-unit
+         * count so setup diagnostics never imply serial runtime replay.
+         */
+        const std::size_t runtime_native_executables =
+            retained_parent_composition ? 1u : capture_compilation_units;
+        const std::size_t runtime_native_nodes =
+            retained_parent_composition &&
+                    segment_cache.retained_parent_capture
+                ? segment_cache.retained_parent_capture->nodeCount()
+                : captured_native_nodes;
+        logCaptureStageTypeAggregate(
+            ctx->deviceId(),
+            segment_cache.perf_context,
+            stage_record_aggregates);
+        LOG_INFO(
+            "[GraphCaptureMaterialization] complete"
+            << " device=" << ctx->deviceId().toString()
+            << " context=" << segment_cache.perf_context
+            << " capture_mode="
+            << replayTopologyTag(segment_cache)
+            << " initial_submission="
+            << (materialize_without_launch
+                    ? "materialize_without_launch"
+                    : "instantiate_and_launch")
+            << " capture_compilation_units="
+            << capture_compilation_units
+            << " service_programs=" << service_programs
+            << " captured_stage_objects=" << captured_stage_objects
+            << " service_stage_objects=" << service_stage_objects
+            << " captured_native_nodes=" << captured_native_nodes
+            << " runtime_native_executables="
+            << runtime_native_executables
+            << " runtime_native_nodes=" << runtime_native_nodes
+            << " prebind_ms=" << milliseconds(prebind.total_ns)
+            << " launch_preparation_ms="
+            << milliseconds(launch_preparation.total_ns)
+            << " snapshot_manifest_ms="
+            << milliseconds(snapshot_manifest.total_ns)
+            << " input_coherence_ms="
+            << milliseconds(input_coherence.total_ns)
+            << " input_coherence_max_ms="
+            << milliseconds(input_coherence.max_ns)
+            << " input_coherence_samples=" << input_coherence.samples
+            << " native_record_ms="
+            << milliseconds(native_record.total_ns)
+            << " native_record_max_ms="
+            << milliseconds(native_record.max_ns)
+            << " native_record_samples=" << native_record.samples
+            << " native_finalize_ms="
+            << milliseconds(native_finalize.total_ns)
+            << " native_finalize_max_ms="
+            << milliseconds(native_finalize.max_ns)
+            << " native_finalize_samples=" << native_finalize.samples);
 
         result.success = true;
         return result;
@@ -4385,29 +5539,22 @@ namespace llaminar2
         // the sole mode that needs intermediate host visibility for comparison.
         const bool needs_segment_sync = verify_mode;
 
-        const bool captured_collectives_can_defer_final_sync =
-            has_collective_nodes &&
-            collectives_graph_capturable;
-        const bool collective_sync_requires_eager_wait =
-            has_collective_nodes && !captured_collectives_can_defer_final_sync;
+        const ReplayTerminalFencePlan terminal_fence_plan =
+            resolveReplayTerminalFencePlan(
+                graph,
+                segment_cache,
+                has_collective_nodes,
+                collectives_graph_capturable,
+                defer_final_sync);
         const bool can_defer_final_sync =
-            defer_final_sync &&
-            !collective_sync_requires_eager_wait &&
-            std::all_of(segment_cache.segments.begin(),
-                        segment_cache.segments.end(),
-                        [](const DeviceGraphExecutor::GraphSegment &segment)
-                        {
-                            return segment.capturable;
-                        });
-        const bool trace_replay = exec_cfg.gpu_graph_trace_replay;
+            terminal_fence_plan.defersHostObservation();
         const bool forward_graph_stats_enabled =
             PerfStatsCollector::isDomainEnabled("forward_graph");
         const auto &device_id = ctx->deviceId();
         const std::string device_name =
-            forward_graph_stats_enabled || trace_replay
+            forward_graph_stats_enabled
                 ? device_id.toString()
                 : std::string{};
-        const int total_segments = static_cast<int>(segment_cache.segments.size());
         std::optional<PerfStatsCollector::ScopedTimer> replay_timer;
         if (forward_graph_stats_enabled)
         {
@@ -4453,18 +5600,6 @@ namespace llaminar2
                     segment_cache.perf_context,
                     &segment_cache.replay_workload);
             }
-            if (trace_replay)
-            {
-                const char *seg_display_type = seg.capturable ? "GRAPH" : "MANUAL";
-                const auto &first_name = seg.stage_names.empty() ? std::string("<empty>") : seg.stage_names.front();
-                LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                           << " step=" << current_step
-                                           << " seg=" << seg_idx << "/" << total_segments
-                                           << " [" << seg_display_type << "]"
-                                           << " stages=" << seg.stage_names.size()
-                                           << " first=" << first_name);
-            }
-
             if (forward_graph_stats_enabled)
             {
                 PerfStatsCollector::addCounter(
@@ -4638,13 +5773,6 @@ namespace llaminar2
                 return result;
             }
 
-            if (trace_replay)
-            {
-                LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                           << " step=" << current_step
-                                           << " seg=" << seg_idx << "/" << total_segments << " DONE");
-            }
-
             seg_idx++;
         }
 
@@ -4656,13 +5784,6 @@ namespace llaminar2
             return result;
         }
 
-        if (trace_replay)
-        {
-            LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                       << " step=" << current_step
-                                       << " ALL " << total_segments
-                                       << " segments done, entering final capture-event ownership fence");
-        }
         // A caller may explicitly defer this fence when it immediately enqueues
         // a dependent GPU operation. Every manual collective publishes an event
         // back to capture_stream, so one capture-stream completion event covers
@@ -4735,12 +5856,6 @@ namespace llaminar2
                 "[DeviceGraphCaptureController] Capture-stream ownership fence "
                 "completed but a replay GPU timing event remained pending");
             return result;
-        }
-        if (trace_replay)
-        {
-            LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                       << " step=" << current_step
-                                       << " final capture-event ownership fence complete");
         }
         result.success = true;
         return result;

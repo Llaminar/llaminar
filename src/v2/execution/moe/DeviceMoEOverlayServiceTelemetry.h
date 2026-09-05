@@ -47,10 +47,11 @@ namespace llaminar2
     /**
      * @brief Translate an authenticated inference graph role to service phase.
      *
-     * MTP draft execution belongs to a learned sidecar rather than the main
-     * model's decode/prefill economy planes, so it intentionally returns Auto.
-     * A caller with live sidecar telemetry must provide a separate typed
-     * accounting policy instead of attributing draft cost to main-model work.
+     * The third service plane means routed work inside an MTP transaction. On
+     * ordinary model layers that is grouped-verifier execution; on retained
+     * predictor layers it is draft execution. The per-layer production
+     * topology keeps those costs distinct without adding an ambiguous global
+     * "decode" alias or asking histogram deltas to infer graph identity.
      */
     [[nodiscard]] LLAMINAR_MOE_SERVICE_HD constexpr
     MoEOverlayServicePhaseHint
@@ -64,8 +65,8 @@ namespace llaminar2
         case MoEOverlayInferenceGraphRole::MainDecode:
             return MoEOverlayServicePhaseHint::Decode;
         case MoEOverlayInferenceGraphRole::MTPGroupedVerifier:
-            return MoEOverlayServicePhaseHint::GroupedVerifier;
         case MoEOverlayInferenceGraphRole::MTPDraft:
+            return MoEOverlayServicePhaseHint::GroupedVerifier;
         case MoEOverlayInferenceGraphRole::None:
             return MoEOverlayServicePhaseHint::Auto;
         }

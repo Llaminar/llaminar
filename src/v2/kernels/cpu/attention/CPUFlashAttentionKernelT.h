@@ -43,6 +43,7 @@
 
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/config/RuntimeConfig.h"
+#include "../../attention/AttentionWorkspaceContract.h"
 #include "../../../tensors/FP16Utils.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../tensors/TensorKernels.h"
@@ -87,16 +88,6 @@ class AVX2Q16DotParityTest;
 
 namespace llaminar2
 {
-    namespace cpu::AttentionWorkspaceBuffers
-    {
-        /** Persistent FP32 numerator summaries for CPU K/V-context attention. */
-        inline constexpr const char *PARTIAL_OUTPUT = "attn_partial_output";
-        /** Persistent per-summary online-softmax maxima. */
-        inline constexpr const char *PARTIAL_M = "attn_partial_m";
-        /** Persistent per-summary online-softmax denominators. */
-        inline constexpr const char *PARTIAL_L = "attn_partial_l";
-    } // namespace cpu::AttentionWorkspaceBuffers
-
     namespace detail
     {
         /**
@@ -425,63 +416,12 @@ namespace llaminar2
             int n = 0,
             int k = 0) const override
         {
-            const std::size_t rows = static_cast<std::size_t>(std::max(1, m));
-            const std::size_t heads = static_cast<std::size_t>(std::max(1, n));
-            const std::size_t head_dim = static_cast<std::size_t>(std::max(1, k));
-            const std::size_t workers =
-                static_cast<std::size_t>(std::max(1, omp_get_max_threads()));
-            const std::size_t producer_slots =
-                std::max<std::size_t>(1, (workers + heads - 1) / heads);
-            const std::size_t slots_per_row = producer_slots + 1;
-
-            const auto checked_product = [](std::size_t lhs,
-                                            std::size_t rhs,
-                                            const char *description)
-            {
-                if (lhs != 0 && rhs > std::numeric_limits<std::size_t>::max() / lhs)
-                {
-                    throw std::overflow_error(
-                        std::string("CPU FA2 workspace overflow for ") +
-                        description);
-                }
-                return lhs * rhs;
-            };
-
-            const std::size_t partial_slots = checked_product(
-                checked_product(rows, heads, "rows x heads"),
-                slots_per_row,
-                "rows x heads x merged/producer slots");
-            const std::size_t padded_head_dim = (head_dim + 15U) & ~15U;
-            const std::size_t partial_output_elements = checked_product(
-                partial_slots,
-                padded_head_dim,
-                "partial slots x padded head dimension");
-            const std::size_t partial_output_bytes = checked_product(
-                partial_output_elements,
-                sizeof(float),
-                "partial output bytes");
-            const std::size_t partial_meta_bytes = checked_product(
-                partial_slots,
-                sizeof(float),
-                "partial metadata bytes");
-
-            WorkspaceRequirements requirements;
-            requirements.buffers.push_back({
-                cpu::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
-                partial_output_bytes,
-                64,
-                true});
-            requirements.buffers.push_back({
-                cpu::AttentionWorkspaceBuffers::PARTIAL_M,
-                partial_meta_bytes,
-                64,
-                true});
-            requirements.buffers.push_back({
-                cpu::AttentionWorkspaceBuffers::PARTIAL_L,
-                partial_meta_bytes,
-                64,
-                true});
-            return requirements;
+            return attention_workspace::cpuParallelRequirements({
+                .compact_query_rows = std::max(1, m),
+                .local_query_heads = std::max(1, n),
+                .head_dim = std::max(1, k),
+                .worker_count = std::max(1, omp_get_max_threads()),
+            });
         }
 
         /**
@@ -499,29 +439,29 @@ namespace llaminar2
             CPUKernelBase::bindWorkspace(workspace);
             partial_output_ = workspace
                                   ? static_cast<float *>(workspace->getBuffer(
-                                        cpu::AttentionWorkspaceBuffers::PARTIAL_OUTPUT))
+                                        attention_workspace::kPartialOutput))
                                   : nullptr;
             partial_m_ = workspace
                              ? static_cast<float *>(workspace->getBuffer(
-                                   cpu::AttentionWorkspaceBuffers::PARTIAL_M))
+                                   attention_workspace::kPartialM))
                              : nullptr;
             partial_l_ = workspace
                              ? static_cast<float *>(workspace->getBuffer(
-                                   cpu::AttentionWorkspaceBuffers::PARTIAL_L))
+                                   attention_workspace::kPartialL))
                              : nullptr;
             partial_output_capacity_ = workspace
                                            ? workspace->getBufferSize(
-                                                 cpu::AttentionWorkspaceBuffers::PARTIAL_OUTPUT) /
+                                                 attention_workspace::kPartialOutput) /
                                                  sizeof(float)
                                            : 0;
             partial_m_capacity_ = workspace
                                       ? workspace->getBufferSize(
-                                            cpu::AttentionWorkspaceBuffers::PARTIAL_M) /
+                                            attention_workspace::kPartialM) /
                                             sizeof(float)
                                       : 0;
             partial_l_capacity_ = workspace
                                       ? workspace->getBufferSize(
-                                            cpu::AttentionWorkspaceBuffers::PARTIAL_L) /
+                                            attention_workspace::kPartialL) /
                                             sizeof(float)
                                       : 0;
         }

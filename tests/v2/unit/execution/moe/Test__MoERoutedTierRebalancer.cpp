@@ -236,6 +236,13 @@ namespace llaminar2::test
         {
             MoERoutedTierServiceProfile profile;
             profile.identity = "unit-certified-phase-profile-v1";
+            profile.production_topology =
+                ExpertHistogramProductionTopology::uniform(
+                    kLayers,
+                    ExpertHistogramProductionSourceMask{
+                        true,
+                        true,
+                        true});
             for (int tier_index = 0;
                  tier_index < static_cast<int>(plan.routed_tiers.size());
                  ++tier_index)
@@ -521,6 +528,52 @@ namespace llaminar2::test
         EXPECT_EQ(
             phase.rebalance_diagnostics.phase_service_profile_identity,
             profile.identity);
+    }
+
+    /**
+     * @brief Exceptional fixed-MTP serial demand is legal but not economic.
+     *
+     * The retained main-model serial graph can run for terminal catch-up, so
+     * its histogram column may be non-zero. A positive-depth MTP service
+     * profile deliberately prices only recurring prefill and grouped verifier
+     * work. The placement planner must ignore the catch-up demand rather than
+     * rejecting it as unreachable or inventing a zero-cost preference.
+     */
+    TEST(
+        Test__MoERoutedTierRebalancer,
+        FixedMTPSerialCatchupDemandDoesNotSteerPlacement)
+    {
+        auto plan = allGpuPlan();
+        std::vector<std::vector<uint64_t>> decode(
+            kLayers, std::vector<uint64_t>(kExperts, 0));
+        std::vector<std::vector<uint64_t>> prefill = decode;
+        std::vector<std::vector<uint64_t>> verifier = decode;
+        decode[0][7] = 10'000;
+        prefill[0] = {100, 90, 80, 70, 0, 0, 0, 0};
+        auto histogram = makePhaseHistogram(decode, prefill, verifier);
+
+        auto profile = serviceProfile(
+            plan,
+            /* preferred decode/prefill/verifier ns */ {0, 1, 1},
+            /* less-preferred decode/prefill/verifier ns */ {0, 100, 100});
+        profile.production_topology = ExpertHistogramProductionTopology(
+            std::vector<ExpertHistogramProductionSourceMask>(
+                kLayers, {true, true, true}),
+            std::vector<ExpertHistogramProductionSourceMask>(
+                kLayers, {false, true, true}));
+
+        MoERoutedExpertPlacementPlannerOptions options;
+        options.decode_histogram = histogram.get();
+        options.phase_service_profile = &profile;
+        const auto result = MoERoutedExpertPlacementPlanner::plan(
+            plan, metadata(), options);
+
+        const auto &placement =
+            result.planned_plan.placements[0].routed_expert_tier;
+        EXPECT_EQ(placement[7], 1)
+            << "exceptional serial catch-up demand must not steer fixed-MTP economics";
+        for (int expert = 0; expert < 4; ++expert)
+            EXPECT_EQ(placement[static_cast<std::size_t>(expert)], 0);
     }
 
     TEST(

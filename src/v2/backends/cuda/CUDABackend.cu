@@ -1415,17 +1415,7 @@ namespace llaminar2
             }
         }
 
-        int previous_device = -1;
-        cudaError_t error = cudaGetDevice(&previous_device);
-        if (error != cudaSuccess || previous_device < 0)
-        {
-            result.diagnostic =
-                "cudaGetDevice failed before runtime reset: " +
-                std::string(cudaGetErrorString(error));
-            (void)cudaGetLastError();
-            return result;
-        }
-        error = cudaSetDevice(device_id);
+        cudaError_t error = cudaSetDevice(device_id);
         if (error != cudaSuccess)
         {
             result.diagnostic =
@@ -1444,8 +1434,6 @@ namespace llaminar2
                 "cudaMemGetInfo failed before runtime reset: " +
                 std::string(cudaGetErrorString(error));
             (void)cudaGetLastError();
-            if (previous_device != device_id)
-                (void)cudaSetDevice(previous_device);
             return result;
         }
 
@@ -1453,8 +1441,6 @@ namespace llaminar2
         {
             result.diagnostic =
                 "CUDA tensor-validator generation could not retire";
-            if (previous_device != device_id)
-                (void)cudaSetDevice(previous_device);
             return result;
         }
 
@@ -1466,8 +1452,6 @@ namespace llaminar2
                                 std::to_string(device_id) + ": " +
                                 cudaGetErrorString(error);
             (void)cudaGetLastError();
-            if (previous_device != device_id)
-                (void)cudaSetDevice(previous_device);
             return result;
         }
 
@@ -1491,44 +1475,53 @@ namespace llaminar2
         {
             std::lock_guard<std::mutex> generation_lock(
                 runtime_generation_mutex_);
-            result.active_generation = result.retired_generation + 1u;
+            result.successor_generation = result.retired_generation + 1u;
             runtime_generations_[static_cast<size_t>(device_id)] =
-                result.active_generation;
+                result.successor_generation;
         }
 
-        error = cudaSetDevice(device_id);
-        if (error == cudaSuccess)
+        /*
+         * Do not call cudaSetDevice(), cudaMemGetInfo(), or restore the former
+         * current device after reset. Each of those runtime operations can
+         * initialize a primary context and retain hundreds of MiB that the
+         * next model's admission snapshot cannot use. The driver state query
+         * below is observational: it neither retains nor materializes the
+         * successor primary context.
+         */
+        CUdevice driver_device{};
+        CUresult driver_error = cuDeviceGet(&driver_device, device_id);
+        unsigned int primary_context_flags = 0u;
+        int primary_context_active = 1;
+        if (driver_error == CUDA_SUCCESS)
         {
-            error = cudaMemGetInfo(
-                &result.driver_free_bytes_after, &total_bytes);
+            driver_error = cuDevicePrimaryCtxGetState(
+                driver_device,
+                &primary_context_flags,
+                &primary_context_active);
         }
-        if (error != cudaSuccess)
+        if (driver_error != CUDA_SUCCESS)
+        {
+            const char *driver_diagnostic = nullptr;
+            (void)cuGetErrorString(driver_error, &driver_diagnostic);
+            result.diagnostic =
+                "CUDA driver could not certify dormant successor context for CUDA:" +
+                std::to_string(device_id) + ": " +
+                (driver_diagnostic ? driver_diagnostic :
+                                     "unknown CUDA driver error");
+            return result;
+        }
+        if (primary_context_active != 0)
         {
             result.diagnostic =
-                "CUDA runtime could not materialize the fresh generation: " +
-                std::string(cudaGetErrorString(error));
-            (void)cudaGetLastError();
-            if (previous_device != device_id &&
-                cudaSetDevice(previous_device) != cudaSuccess)
-            {
-                (void)cudaGetLastError();
-                std::terminate();
-            }
+                "cudaDeviceReset left CUDA:" + std::to_string(device_id) +
+                " primary context active";
             return result;
         }
 
-        if (previous_device != device_id &&
-            cudaSetDevice(previous_device) != cudaSuccess)
-        {
-            (void)cudaGetLastError();
-            LOG_ERROR(
-                "[CUDABackend] Failed to restore CUDA device "
-                << previous_device << " after retiring CUDA:" << device_id);
-            std::terminate();
-        }
-
+        result.post_reset_state = DeviceRuntimePostResetState::Quiescent;
         result.success = true;
-        result.diagnostic = "CUDA runtime generation retired";
+        result.diagnostic =
+            "CUDA runtime generation retired with quiescent successor";
         return result;
     }
 
@@ -1722,7 +1715,8 @@ namespace llaminar2
     bool CUDABackend::registerExternalMappedHostMemory(
         void *ptr,
         size_t bytes,
-        int registration_device_id)
+        int registration_device_id,
+        MappedHostRegistrationScope scope)
     {
         std::lock_guard<std::mutex> lifecycle_lock(
             cudaRuntimeResourceLifecycleMutex());
@@ -1734,14 +1728,16 @@ namespace llaminar2
                       << registration_device_id);
             return false;
         }
-        const cudaError_t error = cudaHostRegister(
-            ptr,
-            bytes,
-            cudaHostRegisterMapped | cudaHostRegisterPortable);
+        const unsigned int flags = cudaHostRegisterMapped |
+                                   (scope == MappedHostRegistrationScope::BackendPortable
+                                        ? cudaHostRegisterPortable
+                                        : 0u);
+        const cudaError_t error = cudaHostRegister(ptr, bytes, flags);
         if (error != cudaSuccess)
         {
-            LOG_ERROR("[CUDABackend::registerExternalMappedHostMemory] cudaHostRegister(mapped|portable) failed for "
-                      << bytes << " bytes: " << cudaGetErrorString(error));
+            LOG_ERROR("[CUDABackend::registerExternalMappedHostMemory] cudaHostRegister failed for "
+                      << bytes << " bytes scope=" << to_string(scope)
+                      << ": " << cudaGetErrorString(error));
             (void)cudaGetLastError();
             return false;
         }

@@ -368,17 +368,17 @@ namespace llaminar2
                 {"mtp_concat", {"mtp_kv_prefill_rows", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat and bucket-wide shifted-prefill scratch"},
                 {"mtp_projected", {"mtp_kv_prefill_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden and bucket-wide shifted-prefill scratch"},
                 {"mtp_hidden", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP final hidden"},
-                {"mtp_q_raw", {"mtp_kv_prefill_rows", "fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output including bucket-wide shifted prefill"},
-                {"mtp_q_gate", {"mtp_kv_prefill_rows", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA sigmoid gate including bucket-wide shifted prefill"},
-                {"mtp_q", {"mtp_kv_prefill_rows", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection including bucket-wide shifted prefill"},
-                {"mtp_k", {"mtp_kv_prefill_rows", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection including bucket-wide shifted prefill"},
-                {"mtp_v", {"mtp_kv_prefill_rows", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection including bucket-wide shifted prefill"},
+                {"mtp_q_raw", {"mtp_kv_prefill_rows", "mtp_fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output including bucket-wide shifted prefill"},
+                {"mtp_q_gate", {"mtp_kv_prefill_rows", "mtp_q_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA sigmoid gate including bucket-wide shifted prefill"},
+                {"mtp_q", {"mtp_kv_prefill_rows", "mtp_q_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection including bucket-wide shifted prefill"},
+                {"mtp_k", {"mtp_kv_prefill_rows", "mtp_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection including bucket-wide shifted prefill"},
+                {"mtp_v", {"mtp_kv_prefill_rows", "mtp_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection including bucket-wide shifted prefill"},
                 {"mtp_k_full_prefill", {"mtp_kv_prefill_rows", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full key rows for phase-split and shifted-prefill KV handoff"},
                 {"mtp_v_full_prefill", {"mtp_kv_prefill_rows", "kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP full value rows for phase-split and shifted-prefill KV handoff"},
-                {"mtp_attn_output", {"mtp_target_query_rows", "attn_output_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention/GDN output"},
+                {"mtp_attn_output", {"mtp_target_query_rows", "mtp_attn_output_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention/GDN output"},
                 {"mtp_attn_proj", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention projection"},
-                {"mtp_gate", {"mtp_target_query_rows", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
-                {"mtp_up", {"mtp_target_query_rows", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
+                {"mtp_gate", {"mtp_target_query_rows", "mtp_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
+                {"mtp_up", {"mtp_target_query_rows", "mtp_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
                 {"mtp_ffn_output", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
                 {"mtp_logits", {"mtp_target_query_rows", "mtp_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Participant MTP logits: explicit vocabulary shard or mirrored full vocabulary at any TP scope"},
                 {"mtp_logits_gathered", {"mtp_global_gather_rows", "mtp_global_gather_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Full-vocabulary explicit-sharded GlobalTP MTP rows; conditionally 1x1 when no gather is owned"},
@@ -504,13 +504,20 @@ namespace llaminar2
                 SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
             config["GDN_CONV1D_OUTPUT"] =
                 SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
-            config["GDN_RECURRENCE"] = SnapshotShardingMode::COLUMN_PARALLEL;
-            config["GDN_DELTA_RULE_OUTPUT"] = SnapshotShardingMode::COLUMN_PARALLEL;
-            config["GATED_RMSNORM"] = SnapshotShardingMode::COLUMN_PARALLEL;
-            config["GDN_NORM_GATE_OUTPUT"] = SnapshotShardingMode::COLUMN_PARALLEL;
-            config["GDN_Z_PROJECTION"] = SnapshotShardingMode::COLUMN_PARALLEL;
-            config["GDN_ALPHA"] = SnapshotShardingMode::COLUMN_PARALLEL;
-            config["GDN_BETA"] = SnapshotShardingMode::COLUMN_PARALLEL;
+            config["GDN_RECURRENCE"] =
+                SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+            config["GDN_DELTA_RULE_OUTPUT"] =
+                SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+            config["GATED_RMSNORM"] =
+                SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+            config["GDN_NORM_GATE_OUTPUT"] =
+                SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+            config["GDN_Z_PROJECTION"] =
+                SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+            config["GDN_ALPHA"] =
+                SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+            config["GDN_BETA"] =
+                SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
             config["GDN_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
             config["ATTENTION_OUTPUT_GATE"] = SnapshotShardingMode::REPLICATED;
             config["FA_GATE"] = SnapshotShardingMode::COLUMN_PARALLEL;

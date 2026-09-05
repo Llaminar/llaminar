@@ -38,8 +38,7 @@ namespace llaminar2
 
     MoEOverlayEconomyCalibrationController::
         MoEOverlayEconomyCalibrationController(Config config)
-        : config_(std::move(config)),
-          profiling_started_at_(std::chrono::steady_clock::now())
+        : config_(std::move(config))
     {
         if (!config_.planner || !config_.ledger || !config_.journal ||
             !config_.transport)
@@ -110,6 +109,58 @@ namespace llaminar2
             static_cast<std::uint64_t>(jobs_.size()) * observations;
         local_rows_.reserve(2);
 
+        if (config_.presealed_measurements)
+        {
+            if (!config_.presealed_measurements->valid())
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay reused transfer profile is malformed");
+            }
+            std::vector<MoEOverlayMigrationMeasurementCoordinate>
+                reused_coordinates;
+            reused_coordinates.reserve(
+                config_.presealed_measurements->rows.size());
+            for (const auto &row : config_.presealed_measurements->rows)
+            {
+                reused_coordinates.push_back({
+                    .source_participant = row.source_participant,
+                    .destination_participant = row.destination_participant,
+                    .layer = row.layer,
+                });
+            }
+            std::sort(
+                reused_coordinates.begin(), reused_coordinates.end());
+            if (reused_coordinates != coordinates)
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay reused transfer profile does not exactly match the current participant/layer topology");
+            }
+
+            sealed_ = *config_.presealed_measurements;
+            accepted_pairs_.store(
+                expected_profile_waves_, std::memory_order_relaxed);
+            reused_sealed_profiles_.store(1u, std::memory_order_relaxed);
+            state_.store(
+                MoEOverlayEconomyCalibrationState::Complete,
+                std::memory_order_release);
+            recordProfileCounter(
+                config_.perf_device,
+                "economy_transport_profile_complete",
+                1.0,
+                {{"origin", "reused"},
+                 {"measurement_identity", sealed_->identity},
+                 {"coordinate_count",
+                  std::to_string(reused_coordinates.size())},
+                 {"waves", std::to_string(expected_profile_waves_)},
+                 {"elapsed_nanoseconds", "0"}});
+            LOG_INFO(
+                "[ExpertOverlay][Economy] Reused exact sealed transport profile coordinates="
+                << reused_coordinates.size()
+                << " expected_waves=" << expected_profile_waves_
+                << " synthetic_inference=false");
+            return;
+        }
+
         recordProfileCounter(
             config_.perf_device,
             "economy_transport_profile_expected_waves",
@@ -146,6 +197,11 @@ namespace llaminar2
         }
         try
         {
+            if (!profiling_started_at_)
+            {
+                profiling_started_at_ =
+                    std::chrono::steady_clock::now();
+            }
             if (stop_requested_.load(std::memory_order_acquire))
             {
                 progressStop();
@@ -473,8 +529,13 @@ namespace llaminar2
                 "ExpertOverlay transfer profiler exhausted its finite jobs before the ledger became ready");
         }
         sealed_ = config_.ledger->seal();
+        if (!profiling_started_at_)
+        {
+            throw std::logic_error(
+                "ExpertOverlay transfer profile completed before its first physical poll");
+        }
         const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - profiling_started_at_)
+            std::chrono::steady_clock::now() - *profiling_started_at_)
                                  .count();
         state_.store(
             MoEOverlayEconomyCalibrationState::Complete,
@@ -483,8 +544,12 @@ namespace llaminar2
             config_.perf_device,
             "economy_transport_profile_complete",
             1.0,
-            {{"elapsed_nanoseconds", std::to_string(std::max<int64_t>(1, elapsed))},
-             {"waves", std::to_string(expected_profile_waves_)}});
+            {{"origin", "measured"},
+             {"measurement_identity", sealed_->identity},
+             {"coordinate_count", std::to_string(sealed_->rows.size())},
+             {"waves", std::to_string(expected_profile_waves_)},
+             {"elapsed_nanoseconds",
+              std::to_string(std::max<int64_t>(1, elapsed))}});
         LOG_INFO(
             "[ExpertOverlay][Economy] Transport profile complete waves="
             << expected_profile_waves_ << " elapsed_ms="
@@ -581,6 +646,8 @@ namespace llaminar2
             .evidence_exchanges_completed =
                 evidence_exchanges_completed_.load(std::memory_order_relaxed),
             .accepted_pairs = accepted_pairs_.load(std::memory_order_relaxed),
+            .reused_sealed_profiles =
+                reused_sealed_profiles_.load(std::memory_order_relaxed),
             .fatal_failures = fatal_failures_.load(std::memory_order_relaxed),
         };
     }

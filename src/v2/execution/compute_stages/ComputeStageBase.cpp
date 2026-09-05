@@ -224,8 +224,6 @@ namespace llaminar2
             return "SHORT_CONV1D";
         case ComputeStageType::GDN_RECURRENCE:
             return "GDN_RECURRENCE";
-        case ComputeStageType::GDN_LIVE_STATE_LOCALIZE:
-            return "GDN_LIVE_STATE_LOCALIZE";
         case ComputeStageType::GDN_LIVE_STATE_ALLGATHER:
             return "GDN_LIVE_STATE_ALLGATHER";
         case ComputeStageType::PREFILL_CHUNK_MATERIALIZATION:

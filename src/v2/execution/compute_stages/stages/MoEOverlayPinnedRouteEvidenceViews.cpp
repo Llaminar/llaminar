@@ -25,7 +25,8 @@ namespace llaminar2
                     std::numeric_limits<std::uint32_t>::max()) ||
             !params.domain_route_assignment.validFor(
                 static_cast<std::uint32_t>(route_slots)) ||
-            !params.runtime_route_weights ||
+            !params.runtime_route_weights.validFor(
+                params.physical_rows, params.top_k) ||
             !params.overlay_route_placement.valid())
         {
             throw std::invalid_argument(
@@ -49,7 +50,7 @@ namespace llaminar2
                 params.device);
         runtime_route_weights_device_view_ =
             std::make_unique<GpuTensorView>(
-                const_cast<float *>(params.runtime_route_weights),
+                const_cast<float *>(params.runtime_route_weights.weights),
                 static_cast<std::size_t>(physical_rows_),
                 static_cast<std::size_t>(top_k_),
                 TensorType::FP32,

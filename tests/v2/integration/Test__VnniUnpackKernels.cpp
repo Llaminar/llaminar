@@ -905,7 +905,8 @@ TEST_P(VnniUnpackTest, BoundedBufferedMmapPipelineMatchesAcrossLaneReuse) {
     TemporaryMappedSourceFile mapped(GetParam(), file_bytes);
     ASSERT_NE(mapped.region(), nullptr);
 
-    LoadOrchestrator orchestrator(backend_);
+    LoadOrchestrator orchestrator(
+        backend_, kTestOnlyUnadmittedGPUAllocation);
     orchestrator.addDevice(device_id_);
     for (int job_index = 0; job_index < kJobCount; ++job_index) {
         orchestrator.planWeight(
@@ -1019,7 +1020,8 @@ TEST_P(
     ASSERT_EQ(tensor->size_bytes(), static_cast<size_t>(N) * sizeof(Q6_KBlock));
     ASSERT_GT(tensor->size_bytes(), kOddSlotCapacity);
 
-    LoadOrchestrator orchestrator(backend_);
+    LoadOrchestrator orchestrator(
+        backend_, kTestOnlyUnadmittedGPUAllocation);
     orchestrator.addDevice(device_id_);
     orchestrator.planWeight(
         device_id_, "odd_stride_q6_k", N, K,

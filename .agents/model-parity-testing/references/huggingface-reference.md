@@ -5,7 +5,7 @@
 The Python project under `python/reference/` is the independent numerical
 oracle for model parity. It runs on CPU in FP32, reconstructs the Hugging Face
 model from the exact production GGUF, publishes NumPy checkpoint tensors, and
-writes authenticated metadata last. Native tests consume those immutable
+writes complete identity metadata last. Native tests consume those immutable
 snapshots; Python is not part of the production inference path.
 
 Use the current implementation as authority. `python/reference/README.md` can
@@ -30,7 +30,8 @@ lag code, so verify flags and schemas in the relevant generator and
   Hugging Face construction, weight transforms, hooks, and snapshot rules.
 - `generate_*_pipeline_snapshots.py`: command-line entrypoints used by C++
   fixtures to generate prefill and incremental-decode packs.
-- `snapshot_metadata.py`: identity hashing, schema validation, and atomic
+- `snapshot_metadata.py`: lightweight model descriptors, small-input identity
+  hashing, schema validation, and atomic
   `metadata.txt` publication.
 - `tests/` and loader tests: device-free regression coverage for metadata,
   parsing, dequantization, and reference behavior.
@@ -52,7 +53,7 @@ lag code, so verify flags and schemas in the relevant generator and
    step; MTP sidecars carry depth/sidecar identity required by the schema.
 7. Flush snapshot files, then atomically publish `metadata.txt` with fsync and
    rename. Metadata is the commit record; a directory without valid metadata is
-   not an authenticated pack.
+   not a complete pack.
 
 `Qwen35MoEReferenceModel` is especially important for sparse parity. It builds
 the eager Hugging Face `Qwen3_5MoeForCausalLM`, performs the GGUF-to-HF expert
@@ -66,7 +67,7 @@ sidecar stages rather than treating the final accepted token as sufficient.
 The current metadata identity records a supported schema and binds:
 
 - engine `pytorch`, device `cpu`, and dtype `float32`;
-- SHA-256 of the exact GGUF bytes;
+- the declared GGUF filename and byte length for newly generated packs;
 - SHA-256 of the exact UTF-8 prompt bytes;
 - the nonempty token sequence and its canonical SHA-256;
 - requested decode depth and generated decode-token identity;
@@ -74,11 +75,14 @@ The current metadata identity records a supported schema and binds:
 - architecture-specific sidecar schema, including Qwen3.6 MoE MTP schema 5
   where applicable.
 
-The C++ fixture streams the GGUF digest and caches it only by canonical path,
-file size, and modification time within the process. Rank zero alone regenerates
-a stale pack, and all ranks wait for the result. Never accept pathname equality,
-file age alone, an empty token list, too few decode steps, or metadata written
-before the tensors.
+Campaign registration binds the model and reference directory as one typed
+case. Staging binds every split shard to stable source and immutable tmpfs
+destination identities, and newly generated metadata adds a filename/size
+diagnostic. The C++ fixture never rereads the GGUF just to hash it: full
+checkpoint comparisons prove weight-content equivalence and make a wrong model
+fail mathematically. Rank zero alone regenerates an incomplete pack, and all
+ranks wait for the result. Never accept an empty token list, too few decode
+steps, or metadata written before the tensors.
 
 ## Generator invocation
 
@@ -96,7 +100,7 @@ python3 python/reference/generate_qwen35_moe_pipeline_snapshots.py \
 The generator also exposes focused modes such as `--metadata-only`,
 `--decode-snapshots-only`, and `--mtp-sidecar-snapshots`; read its current
 `argparse` definition before use. Focused modes are diagnostic or additive and
-must still leave a complete authenticated pack for production parity.
+must still leave a complete pack for production parity.
 
 CTest commonly constrains OpenMP for native execution. The regeneration wrapper
 unsets inherited `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,

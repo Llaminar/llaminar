@@ -61,7 +61,8 @@ namespace llaminar2
              * serial graph that projects one vocabulary shard per participant.
              * Zero means that output ownership and serial arithmetic width are
              * identical. A positive value activates the backend's explicit
-             * output-partition equivalence contract.
+             * output-partition equivalence contract. The full vocabulary need
+             * not divide by this width: the final typed shard may be shorter.
              */
             int serial_equivalent_partition_width = 0;
             int effective_last_row_idx = -1;           ///< Dynamic last real token row for padded prefill replay.

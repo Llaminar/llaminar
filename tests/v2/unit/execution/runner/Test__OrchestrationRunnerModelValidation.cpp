@@ -1,6 +1,6 @@
 /**
  * @file Test__OrchestrationRunnerModelValidation.cpp
- * @brief Unit tests for OrchestrationRunner model file validation.
+ * @brief Unit tests for OrchestrationRunner model and retirement lifecycles.
  *
  * Verifies that buildExecutionPlan() (called from initialize()) hard-fails
  * when the model file does not exist or is not valid GGUF, instead of silently
@@ -12,8 +12,12 @@
 #include <filesystem>
 
 #include "execution/runner/OrchestrationRunner.h"
+#include "execution/runner/ModelContextRetirement.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include "execution/local_execution/device/ReusableExecutionWorkspace.h"
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
 #include "config/OrchestrationConfig.h"
+#include "loaders/ModelContext.h"
 
 using namespace llaminar2;
 
@@ -224,6 +228,81 @@ namespace
         const auto sealed = authority.sealedDeviceMemoryRetention(&error);
         ASSERT_TRUE(sealed.has_value()) << error;
         EXPECT_TRUE(sealed->empty());
+    }
+
+    TEST(Test__ModelContextRetirement,
+         RejectsAnIncompleteContractBeforeChangingOwnership)
+    {
+        ModelContextReuseContract contract;
+        contract.reuse_authority =
+            std::make_shared<ModelContextReuseAuthority>();
+
+        EXPECT_THROW(
+            (void)retireExclusiveModelContextReuseContract(contract),
+            std::invalid_argument);
+        EXPECT_NE(contract.reuse_authority, nullptr)
+            << "Validation failure must leave the caller's lifecycle authority intact";
+        EXPECT_EQ(
+            contract.reuse_authority->state(),
+            ModelContextReuseAuthority::State::RunnerExclusive);
+    }
+
+    TEST(Test__ModelContextRetirement,
+         RetiresACompleteCpuOnlyContractWithoutInventingAGpuTransaction)
+    {
+        auto reuse_authority =
+            std::make_shared<ModelContextReuseAuthority>();
+        std::string error;
+        ASSERT_TRUE(reuse_authority->beginSealing(&error)) << error;
+        ASSERT_TRUE(reuse_authority->publishReusable({}, &error)) << error;
+
+        ModelContextReuseContract contract;
+        contract.context = ModelContext::createForTesting(
+            "cpu-only-retirement.gguf");
+        contract.reuse_authority = std::move(reuse_authority);
+        contract.reusable_execution_workspaces =
+            std::make_shared<ReusableExecutionWorkspaceRegistry>();
+        PhysicalMemoryPlanBuilder memory_plan;
+        memory_plan.add(
+            PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = DeviceId::cpu(),
+                .total_bytes = 1024u,
+                .admission_available_bytes = 1024u,
+            },
+            PhysicalMemoryOwner::ModelSourcePayload,
+            1u);
+        const auto memory_admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(
+            memory_plan.build());
+        contract.physical_memory_authority =
+            std::make_shared<PhysicalMemoryAuthority>(
+                memory_admission, 0);
+
+        const ModelContextRetirementReceipt receipt =
+            retireExclusiveModelContextReuseContract(contract);
+
+        EXPECT_EQ(receipt.retiredDeviceCount(), 0u);
+        EXPECT_EQ(contract.context, nullptr);
+        EXPECT_EQ(contract.reuse_authority, nullptr);
+        EXPECT_EQ(contract.reusable_execution_workspaces, nullptr);
+        EXPECT_EQ(contract.physical_memory_authority, nullptr);
+    }
+
+    TEST(Test__ModelContextRetirement,
+         TypedCpuOnlyPlanNeverEntersTheGpuBatchAPI)
+    {
+        PendingExclusiveModelRetirement pending =
+            PendingExclusiveModelRetirement::begin({});
+        EXPECT_EQ(
+            pending.kind(),
+            PendingExclusiveModelRetirement::Kind::HostOnly);
+        EXPECT_EQ(pending.pendingDeviceCount(), 0u);
+
+        const ModelContextRetirementReceipt receipt = pending.complete();
+        EXPECT_EQ(receipt.retiredDeviceCount(), 0u);
+        EXPECT_THROW((void)pending.complete(), std::logic_error)
+            << "The typed ownership boundary must be consumed exactly once";
     }
 
 } // namespace

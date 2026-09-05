@@ -322,7 +322,8 @@ namespace llaminar2
 {
     namespace rocm
     {
-        constexpr int MAX_FLASH_DECODE_SPLITS = 32;
+        constexpr int MAX_FLASH_DECODE_SPLITS =
+            attention_workspace::kMaximumDecodeSplits;
         constexpr int MIN_KV_ROWS_PER_SPLIT = 16;
         constexpr int TARGET_RESIDENT_BLOCKS_PER_CU = 7;
         /*
@@ -415,7 +416,7 @@ namespace llaminar2
             int device_idx,
             const char *kv_storage)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled("gpu_graph_inventory"))
                 return;
 
             PerfStatsCollector::addCounter(
@@ -2481,51 +2482,41 @@ namespace llaminar2
         WorkspaceRequirements ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::getWorkspaceRequirements(
             int m, int n, int k) const
         {
-            WorkspaceRequirements reqs;
-
-            // Default parameters for Flash Decoding workspace sizing
-            // Conservative estimates for maximum expected configuration
             const int batch_size = (m > 0) ? m : 1;
             const int n_heads = (n > 0) ? n : 128;     // Max expected heads
             const int head_dim = (k > 0) ? k : 128;    // Max expected head dim
-            const int num_splits = MAX_FLASH_DECODE_SPLITS;
-            const int max_kv_len = 4096;               // decode workspace bound
-
-            // Conservative conversion buffer sizing for mixed-precision KV
-            // Assume n_kv_heads <= n_heads and allocate with n_heads for safety.
-            size_t kv_convert_bytes = static_cast<size_t>(batch_size) *
-                                      static_cast<size_t>(max_kv_len) *
-                                      static_cast<size_t>(n_heads) *
-                                      static_cast<size_t>(head_dim) *
-                                      sizeof(float);
-
-            // partial_output: [batch × n_heads × num_splits × head_dim] FP32
-            size_t partial_output_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
-
-            // partial_m: [batch × n_heads × num_splits] FP32 (max scores per split)
-            size_t partial_m_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
-
-            // partial_l: [batch × n_heads × num_splits] FP32 (logsumexp per split)
-            size_t partial_l_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
-
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_OUTPUT, partial_output_bytes, 256, true});
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::DEVICE_PARAMS,
-                                    sizeof(attention::AttentionDeviceParams) *
-                                        static_cast<size_t>(MAX_SMALL_DECODE_ROWS),
-                                    256,
-                                    true});
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::K_TMP_FP32, kv_convert_bytes, 256, true});
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::V_TMP_FP32, kv_convert_bytes, 256, true});
+            constexpr int max_kv_len = 4096;
+            const attention_workspace::Geometry geometry{
+                .compact_query_rows = batch_size,
+                .request_count = batch_size,
+                .local_query_heads = n_heads,
+                // AttentionComputeStage supplies the exact GQA width before
+                // publishing the serial-family arena.
+                .local_kv_heads = n_heads,
+                .head_dim = head_dim,
+                .context_rows = max_kv_len,
+                .decode_splits = MAX_FLASH_DECODE_SPLITS,
+                .include_device_params = true,
+                .include_fp32_kv_conversion = true,
+            };
+            WorkspaceRequirements reqs =
+                attention_workspace::requirements(geometry);
+            const auto *partial_output =
+                reqs.find(AttentionWorkspaceBuffers::PARTIAL_OUTPUT);
+            const auto *partial_m =
+                reqs.find(AttentionWorkspaceBuffers::PARTIAL_M);
+            const auto *partial_l =
+                reqs.find(AttentionWorkspaceBuffers::PARTIAL_L);
+            const size_t kv_convert_bytes =
+                attention_workspace::fp32KVConversionBufferBytes(geometry);
 
             LOG_TRACE("[ROCmFlashAttentionKernelT<FP32>::getWorkspaceRequirements] "
                       << "batch=" << batch_size << " n_heads=" << n_heads << " head_dim=" << head_dim
-                      << " num_splits=" << num_splits
+                      << " num_splits=" << MAX_FLASH_DECODE_SPLITS
                       << " max_kv_len=" << max_kv_len
-                      << " => partial_output=" << (partial_output_bytes / 1024) << "KB"
-                      << ", partial_m=" << partial_m_bytes << "B"
-                      << ", partial_l=" << partial_l_bytes << "B"
+                      << " => partial_output=" << (partial_output->size_bytes / 1024) << "KB"
+                      << ", partial_m=" << partial_m->size_bytes << "B"
+                      << ", partial_l=" << partial_l->size_bytes << "B"
                       << ", kv_convert(each)=" << (kv_convert_bytes / (1024 * 1024)) << "MB");
 
             return reqs;
@@ -2876,24 +2867,25 @@ namespace llaminar2
         WorkspaceRequirements ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::getWorkspaceRequirements(
             int m, int n, int k) const
         {
-            WorkspaceRequirements reqs;
-
             const int batch_size = (m > 0) ? m : 1;
             const int n_heads = (n > 0) ? n : 128;
             const int head_dim = (k > 0) ? k : 128;
-            const int num_splits = MAX_FLASH_DECODE_SPLITS;
-
-            // FP16 uses FP32 workspace for numerical stability
-            size_t partial_output_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
-            size_t partial_m_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
-            size_t partial_l_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
-
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_OUTPUT, partial_output_bytes, 256, true});
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
+            WorkspaceRequirements reqs = attention_workspace::requirements({
+                .compact_query_rows = batch_size,
+                .request_count = batch_size,
+                .local_query_heads = n_heads,
+                .local_kv_heads = n_heads,
+                .head_dim = head_dim,
+                .context_rows = 4096,
+                .decode_splits = MAX_FLASH_DECODE_SPLITS,
+                .include_device_params = false,
+                .include_fp32_kv_conversion = false,
+            });
+            const auto *partial_output =
+                reqs.find(AttentionWorkspaceBuffers::PARTIAL_OUTPUT);
 
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP16>::getWorkspaceRequirements] "
-                      << "partial_output=" << (partial_output_bytes / 1024) << "KB");
+                      << "partial_output=" << (partial_output->size_bytes / 1024) << "KB");
 
             return reqs;
         }
@@ -3233,24 +3225,25 @@ namespace llaminar2
         WorkspaceRequirements ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::getWorkspaceRequirements(
             int m, int n, int k) const
         {
-            WorkspaceRequirements reqs;
-
             const int batch_size = (m > 0) ? m : 1;
             const int n_heads = (n > 0) ? n : 128;
             const int head_dim = (k > 0) ? k : 128;
-            const int num_splits = MAX_FLASH_DECODE_SPLITS;
-
-            // BF16 on MI50 falls back to FP32, so workspace is FP32
-            size_t partial_output_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
-            size_t partial_m_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
-            size_t partial_l_bytes = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
-
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_OUTPUT, partial_output_bytes, 256, true});
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
-            reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
+            WorkspaceRequirements reqs = attention_workspace::requirements({
+                .compact_query_rows = batch_size,
+                .request_count = batch_size,
+                .local_query_heads = n_heads,
+                .local_kv_heads = n_heads,
+                .head_dim = head_dim,
+                .context_rows = 4096,
+                .decode_splits = MAX_FLASH_DECODE_SPLITS,
+                .include_device_params = false,
+                .include_fp32_kv_conversion = false,
+            });
+            const auto *partial_output =
+                reqs.find(AttentionWorkspaceBuffers::PARTIAL_OUTPUT);
 
             LOG_DEBUG("[ROCmFlashAttentionKernelT<BF16>::getWorkspaceRequirements] "
-                      << "partial_output=" << (partial_output_bytes / 1024) << "KB");
+                      << "partial_output=" << (partial_output->size_bytes / 1024) << "KB");
 
             return reqs;
         }

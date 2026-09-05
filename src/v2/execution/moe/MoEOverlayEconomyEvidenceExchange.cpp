@@ -256,16 +256,18 @@ namespace llaminar2
         const std::vector<std::vector<
             MoEOverlayParticipantLayerServiceTotals>> &rank_rows,
         const MoEExpertOwnerMap &owner_map,
-        int num_layers,
-        ExpertHistogramProductionSourceMask active_sources)
+        const ExpertHistogramProductionTopology &production_topology)
     {
-        if (rank_rows.empty() || num_layers <= 0 ||
-            owner_map.participants().empty() ||
-            !validExpertHistogramProductionSourceMask(active_sources))
+        if (rank_rows.empty() || owner_map.participants().empty() ||
+            !production_topology.valid() ||
+            production_topology.layerCount() >
+                static_cast<std::size_t>(std::numeric_limits<int>::max()))
         {
             throw std::invalid_argument(
                 "ExpertOverlay service merge requires rank, participant, and layer geometry");
         }
+        const int num_layers =
+            static_cast<int>(production_topology.layerCount());
 
         using Coordinate = std::pair<int, int>;
         std::map<Coordinate, MoEOverlayParticipantLayerServiceTotals> merged;
@@ -273,29 +275,33 @@ namespace llaminar2
         {
             for (const auto &row : rank_rows[rank])
             {
-                bool invalid_phase_evidence = false;
-                for (std::size_t phase = 0;
-                     phase < kExpertHistogramProductionSourceCount;
-                     ++phase)
-                {
-                    invalid_phase_evidence = invalid_phase_evidence ||
-                        (!active_sources[phase] &&
-                         row.sample_count[phase] != 0);
-                }
                 const auto *participant =
                     owner_map.participantForId(row.participant_id);
                 if (!row.valid() || !participant ||
                     !participant->world_rank_known ||
                     participant->world_rank != static_cast<int>(rank) ||
-                    row.layer < 0 || row.layer >= num_layers ||
-                    invalid_phase_evidence ||
-                    !merged.emplace(
-                               Coordinate{row.participant_id, row.layer},
-                               row)
+                    row.layer < 0 || row.layer >= num_layers)
+                {
+                    throw std::invalid_argument(
+                        "ExpertOverlay service ranks supplied a malformed, out-of-range, or wrongly owned row");
+                }
+                for (std::size_t phase = 0;
+                     phase < kExpertHistogramProductionSourceCount;
+                     ++phase)
+                {
+                    if (!production_topology.reachable(row.layer, phase) &&
+                        row.sample_count[phase] != 0)
+                    {
+                        throw std::invalid_argument(
+                            "ExpertOverlay service ranks supplied evidence for an unreachable layer/phase coordinate");
+                    }
+                }
+                if (!merged.emplace(
+                            Coordinate{row.participant_id, row.layer}, row)
                          .second)
                 {
                     throw std::invalid_argument(
-                        "ExpertOverlay service ranks supplied malformed, disabled-phase, duplicate, or wrongly owned rows");
+                        "ExpertOverlay service ranks supplied a duplicate participant/layer row");
                 }
             }
         }

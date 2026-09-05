@@ -1,6 +1,6 @@
 /**
  * @file FloatingExpertNumericalContract.h
- * @brief Host implementation of the movable floating-expert reduction tree.
+ * @brief Host implementation of the GPU-aligned floating-expert reduction tree.
  *
  * ExpertOverlay may promote or demote an FP16, BF16, or FP32 expert between a
  * CPU tier and a GPU tier while a request is alive. Placement must not select
@@ -52,7 +52,7 @@ namespace llaminar2::floating_expert_numerical_contract
     }
 
     /**
-     * @brief Compute up to four dot products with the movable-expert tree.
+     * @brief Compute up to four dot products with the GPU-aligned expert tree.
      *
      * `lhs(row,k)` supplies one activation and `rhs(k)` supplies the shared
      * weight element. K is visited in increasing order, but each term updates

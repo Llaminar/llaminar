@@ -60,6 +60,10 @@ def ctest_document(*names: str) -> str:
                             "value": campaigns.REGISTERED_TIMEOUT_SECONDS,
                         },
                         {"name": "REQUIRED_FILES", "value": [model_path]},
+                        {
+                            "name": "WORKING_DIRECTORY",
+                            "value": "/workspaces/llaminar",
+                        },
                     ],
                     "command": [
                         "fake_gtest",
@@ -99,6 +103,29 @@ def preflight_ctest_document(*names: str) -> str:
     )
 
 
+def unit_ctest_document(*names: str) -> str:
+    """Build a complete model-free Unit registration document."""
+
+    return json.dumps(
+        {
+            "tests": [
+                {
+                    "name": name,
+                    "properties": [
+                        {
+                            "name": "LABELS",
+                            "value": ["V2", campaigns.PRODUCTION_PARITY_UNIT_LABEL],
+                        },
+                        {"name": "TIMEOUT", "value": 30.0},
+                    ],
+                    "command": ["fake_unit_test"],
+                }
+                for name in names
+            ]
+        }
+    )
+
+
 class ProductionParityCampaignTest(unittest.TestCase):
     @staticmethod
     def write_canonical_artifacts(directory: Path) -> None:
@@ -112,6 +139,77 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     "value" for _ in next(campaigns.csv.reader([header]))
                 ) + "\n"
             (directory / filename).write_text(payload, encoding="utf-8")
+
+    def test_prefix_restore_schema_requires_cross_epoch_gdn_evidence(self) -> None:
+        """Keep the validator synchronized with typed GDN state comparison."""
+
+        columns = next(
+            campaigns.csv.reader(
+                [campaigns.REQUIRED_CSV_HEADERS["prefix_restore.csv"]]
+            )
+        )
+
+        self.assertEqual(
+            columns[
+                columns.index("main_kv_numerically_passed") + 1 :
+                columns.index("terminal_hidden_policy")
+            ],
+            [
+                "gdn_state_policy",
+                "gdn_numerically_compared",
+                "gdn_numerical_payloads",
+                "gdn_numerical_elements",
+                "gdn_minimum_cosine",
+                "gdn_maximum_relative_l2",
+                "gdn_maximum_abs",
+                "gdn_numerically_passed",
+            ],
+        )
+
+    @mock.patch.object(campaigns.subprocess, "run")
+    def test_complete_unit_inventory_is_discovered_from_ctest(
+        self,
+        run: mock.Mock,
+    ) -> None:
+        run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=unit_ctest_document(
+                "V2_Unit_PhysicalMemoryAuthority",
+                "V2_Unit_MemoryPlanner",
+            ),
+            stderr="",
+        )
+
+        discovered = campaigns.discover_production_parity_unit_tests(
+            Path("build")
+        )
+
+        self.assertEqual(
+            discovered,
+            (
+                "V2_Unit_MemoryPlanner",
+                "V2_Unit_PhysicalMemoryAuthority",
+            ),
+        )
+        command = run.call_args.args[0]
+        self.assertIn("--show-only=json-v1", command)
+
+    @mock.patch.object(campaigns.subprocess, "run")
+    def test_unit_inventory_rejects_model_fixture_dependency(
+        self,
+        run: mock.Mock,
+    ) -> None:
+        document = json.loads(unit_ctest_document("V2_Unit_Invalid"))
+        document["tests"][0]["properties"].append(
+            {"name": "FIXTURES_REQUIRED", "value": ["V2_Models"]}
+        )
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(document), stderr=""
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires a fixture"):
+            campaigns.discover_production_parity_unit_tests(Path("build"))
 
     @mock.patch.object(campaigns.subprocess, "run")
     def test_preflight_inventory_is_discovered_from_model_free_integration_label(
@@ -170,8 +268,14 @@ class ProductionParityCampaignTest(unittest.TestCase):
         "discover_production_parity_preflight_tests",
         return_value=("V2_Integration_ParityCellLifecycle_MPI1",),
     )
+    @mock.patch.object(
+        campaigns,
+        "discover_production_parity_unit_tests",
+        return_value=("V2_Unit_PhysicalMemoryAuthority",),
+    )
     def test_preflight_executes_the_ctest_label_before_campaign_admission(
         self,
+        discover_units: mock.Mock,
         discover: mock.Mock,
         run_process: mock.Mock,
     ) -> None:
@@ -182,16 +286,105 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertEqual(return_code, 0)
         self.assertEqual(
             tests,
-            ("V2_Integration_ParityCellLifecycle_MPI1",),
+            (
+                "V2_Unit_PhysicalMemoryAuthority",
+                "V2_Integration_ParityCellLifecycle_MPI1",
+            ),
         )
+        discover_units.assert_called_once_with(Path("build"))
         discover.assert_called_once_with(Path("build"))
-        command = run_process.call_args.args[0]
-        self.assertIn("--parallel", command)
-        self.assertIn("--no-tests=error", command)
+        self.assertEqual(run_process.call_count, 3)
+        build_command = run_process.call_args_list[0].args[0]
+        unit_command = run_process.call_args_list[1].args[0]
+        command = run_process.call_args_list[2].args[0]
+        self.assertIn(campaigns.PRODUCTION_PARITY_UNIT_BUILD_TARGET, build_command)
+        self.assertIn("--parallel", unit_command)
+        self.assertIn("--no-tests=error", unit_command)
+        self.assertIn(f"^{campaigns.PRODUCTION_PARITY_UNIT_PREFIX}", unit_command)
         self.assertIn(
             f"^{campaigns.PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
             command,
         )
+
+    @mock.patch.object(
+        campaigns,
+        "discover_production_parity_preflight_tests",
+        return_value=("V2_Integration_ParityCellLifecycle_MPI1",),
+    )
+    @mock.patch.object(
+        campaigns,
+        "discover_production_parity_unit_tests",
+        return_value=("V2_Unit_PhysicalMemoryAuthority",),
+    )
+    def test_individual_preflight_receipt_requires_unchanged_build_identity(
+        self,
+        discover_units: mock.Mock,
+        discover: mock.Mock,
+    ) -> None:
+        """Amortize preflight without allowing an unchecked skip switch."""
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            root = Path(raw_directory)
+            build = root / "build"
+            build.mkdir()
+            boundaries = (
+                build / ".ninja_log",
+                build / "build.ninja",
+                build / "CTestTestfile.cmake",
+            )
+            for boundary in boundaries:
+                boundary.write_text("build identity\n", encoding="utf-8")
+                os.utime(boundary, ns=(1_000_000_000, 1_000_000_000))
+
+            report = root / "individual.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "schema_version": (
+                            campaigns.INDIVIDUAL_PROGRESS_REPORT_SCHEMA_VERSION
+                        ),
+                        "mode": "sequential_unseen_exact_cells",
+                        "certification_eligible": False,
+                        "preflight_return_code": 0,
+                        "preflight_test_count": 2,
+                        "preflight_tests": [
+                            "V2_Unit_PhysicalMemoryAuthority",
+                            "V2_Integration_ParityCellLifecycle_MPI1",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(report, ns=(2_000_000_000, 2_000_000_000))
+
+            return_code, elapsed, tests = (
+                campaigns.reuse_unchanged_production_parity_preflight(
+                    build,
+                    report,
+                )
+            )
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(elapsed, 0.0)
+            self.assertEqual(
+                tests,
+                (
+                    "V2_Unit_PhysicalMemoryAuthority",
+                    "V2_Integration_ParityCellLifecycle_MPI1",
+                ),
+            )
+            discover_units.assert_called_once_with(build.resolve())
+            discover.assert_called_once_with(build.resolve())
+
+            os.utime(
+                boundaries[0],
+                ns=(3_000_000_000, 3_000_000_000),
+            )
+            with self.assertRaisesRegex(ValueError, "build or CTest"):
+                campaigns.reuse_unchanged_production_parity_preflight(
+                    build,
+                    report,
+                )
 
     def test_main_orders_preflight_before_model_fixture_and_staging(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -424,6 +617,307 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertNotRegex("x" + cell.name, regex)
         self.assertNotIn("?:", regex)
 
+    def test_individual_command_narrows_only_registered_exact_filter(self) -> None:
+        cases = (
+            "MatrixSuite.ProductionParity/Ordinal",
+            "MatrixSuite.ProductionParity/Random",
+        )
+        cell = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=cases,
+            command=(
+                "/usr/bin/mpirun",
+                "-np",
+                "2",
+                "fake_gtest",
+                "--flag=retained",
+                "--gtest_filter=" + ":".join(cases),
+            ),
+            environment=("OMP_NUM_THREADS=28",),
+            working_directory="/workspaces/llaminar",
+        )
+
+        exact = campaigns._exact_registered_command(cell, cases[1])
+
+        self.assertEqual(exact[:-1], cell.command[:-1])
+        self.assertEqual(exact[-1], f"--gtest_filter={cases[1]}")
+        self.assertEqual(
+            campaigns._single_exact_cell(cell, cases[1]).gtest_cases,
+            (cases[1],),
+        )
+
+    def test_individual_command_rejects_unregistered_or_ambiguous_filter(self) -> None:
+        case = "MatrixSuite.ProductionParity/Ordinal"
+        missing_filter = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=(case,),
+            command=("fake_gtest",),
+        )
+        duplicate_filter = campaigns.CampaignCell(
+            missing_filter.name,
+            missing_filter.group,
+            gtest_cases=(case,),
+            command=(
+                "fake_gtest",
+                f"--gtest_filter={case}",
+                f"--gtest_filter={case}",
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            campaigns._exact_registered_command(missing_filter, case)
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            campaigns._exact_registered_command(duplicate_filter, case)
+        with self.assertRaisesRegex(ValueError, "is not registered"):
+            campaigns._exact_registered_command(missing_filter, case + "X")
+
+    @mock.patch.object(campaigns, "validate_campaign_artifacts")
+    @mock.patch.object(campaigns, "_run_process", return_value=0)
+    def test_individual_cell_uses_registered_process_contract(
+        self,
+        run_process: mock.Mock,
+        validate: mock.Mock,
+    ) -> None:
+        case = "MatrixSuite.ProductionParity/Ordinal_KVFP16_MTPOff"
+        cell = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=(case,),
+            command=("fake_gtest", f"--gtest_filter={case}"),
+            environment=("OMP_NUM_THREADS=28", "MODE=registered"),
+            working_directory="/workspaces/llaminar",
+        )
+        artifact_directory = "/artifacts/cell"
+        validate.return_value = (
+            len(campaigns.REQUIRED_CSV_HEADERS),
+            (artifact_directory,),
+            (),
+        )
+
+        result = campaigns.run_individual_cell(
+            cell,
+            case,
+            600.0,
+            environment_overrides={"MODE": "override", "EXTRA": "1"},
+            artifact_results_root=Path("/artifacts"),
+        )
+
+        self.assertEqual(result.return_code, 0)
+        self.assertEqual(result.gtest_cases, (case,))
+        self.assertEqual(
+            run_process.call_args.args[0],
+            ["fake_gtest", f"--gtest_filter={case}"],
+        )
+        self.assertEqual(
+            run_process.call_args.kwargs["working_directory"],
+            Path("/workspaces/llaminar"),
+        )
+        self.assertEqual(
+            run_process.call_args.kwargs["environment_overrides"],
+            {"OMP_NUM_THREADS": "28", "MODE": "override", "EXTRA": "1"},
+        )
+
+    @mock.patch.object(campaigns, "_current_git_short_hash", return_value="abc123")
+    def test_green_ledger_requires_exit_zero_and_fresh_artifact_contract(
+        self,
+        _revision: mock.Mock,
+    ) -> None:
+        cases = (
+            "MatrixSuite.ProductionParity/Ordinal_KVFP16_MTPOff",
+            "MatrixSuite.ProductionParity/Random_KVFP16_MTPOff",
+        )
+        cell = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=cases,
+            command=("fake_gtest", "--gtest_filter=" + ":".join(cases)),
+            environment=("MODE=production",),
+            working_directory="/workspaces/llaminar",
+        )
+        expected_count = len(campaigns.REQUIRED_CSV_HEADERS)
+        green = campaigns.CampaignResult(
+            campaign=cell.name,
+            test_type=cell.test_type,
+            backends="CPU",
+            precision_set="ALL",
+            precision_types=("FP16",),
+            gtest_cases=(cases[0],),
+            elapsed_seconds=1.0,
+            target_seconds=4500.0,
+            return_code=0,
+            target_met=True,
+            outcome="completed",
+            artifact_contract_passed=True,
+            validated_artifact_file_count=expected_count,
+            artifact_directories=("/fresh/ordinal",),
+        )
+        failed_but_complete = campaigns.CampaignResult(
+            **{
+                **green.__dict__,
+                "gtest_cases": (cases[1],),
+                "return_code": 8,
+                "artifact_directories": ("/fresh/random",),
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            path = Path(raw_directory) / "green-ledger.json"
+            ledger = campaigns.record_individual_green(path, cell, green)
+            self.assertEqual(ledger.green_cases, frozenset((cases[0],)))
+            self.assertEqual(
+                campaigns.unseen_individual_cells((cell,), ledger),
+                ((cell, cases[1]),),
+            )
+            with self.assertRaisesRegex(ValueError, "refusing to record"):
+                campaigns.record_individual_green(
+                    path,
+                    cell,
+                    failed_but_complete,
+                )
+            reloaded = campaigns.load_individual_green_ledger(path)
+
+        self.assertEqual(reloaded.green_cases, frozenset((cases[0],)))
+        self.assertFalse(reloaded.certification_eligible)
+
+    def test_green_ledger_rejects_changed_registered_execution_contract(self) -> None:
+        case = "MatrixSuite.ProductionParity/Ordinal_KVFP16_MTPOff"
+        original = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=(case,),
+            command=("fake_gtest", f"--gtest_filter={case}"),
+            environment=("MODE=old",),
+            working_directory="/workspaces/llaminar",
+        )
+        entry = campaigns.IndividualGreenEvidence(
+            gtest_case=case,
+            campaign=original.name,
+            git_revision="abc123",
+            passed_wall_time_ns=1,
+            elapsed_seconds=1.0,
+            validated_artifact_file_count=len(campaigns.REQUIRED_CSV_HEADERS),
+            artifact_directory="/artifacts/cell",
+            execution_contract_sha256=(
+                campaigns._exact_execution_contract_sha256(original, case)
+            ),
+        )
+        ledger = campaigns.IndividualGreenLedger(
+            schema_version=campaigns.INDIVIDUAL_GREEN_LEDGER_SCHEMA_VERSION,
+            certification_eligible=False,
+            entries=(entry,),
+        )
+        changed = campaigns.CampaignCell(
+            original.name,
+            original.group,
+            gtest_cases=(case,),
+            command=original.command,
+            environment=("MODE=new",),
+            working_directory=original.working_directory,
+        )
+
+        with self.assertRaisesRegex(ValueError, "execution contract changed"):
+            campaigns.validate_green_ledger_selection((changed,), ledger)
+
+    @mock.patch.object(campaigns, "_current_git_short_hash", return_value="abc123")
+    def test_report_seed_imports_only_green_aggregate_and_declared_fail_fast_prefix(
+        self,
+        _revision: mock.Mock,
+    ) -> None:
+        prefix = "FailSuite.ProductionParity/Prefix_KVFP16_MTPOff"
+        first_red = "FailSuite.ProductionParity/Red_KVFP16_MTPOff"
+        unrun = "FailSuite.ProductionParity/Unrun_KVFP16_MTPOff"
+        failed = campaigns.CampaignCell(
+            "Failed_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=(prefix, first_red, unrun),
+            command=(
+                "fake_gtest",
+                "--gtest_filter=" + ":".join((prefix, first_red, unrun)),
+            ),
+            environment=("GTEST_FAIL_FAST=1",),
+            working_directory="/workspaces/llaminar",
+        )
+        aggregate_green = "GreenSuite.ProductionParity/Only_KVFP16_MTPOff"
+        green = campaigns.CampaignCell(
+            "Green_ProductionCampaign_CUDA_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CUDA", "ALL"),
+            gtest_cases=(aggregate_green,),
+            command=(
+                "fake_gtest",
+                f"--gtest_filter={aggregate_green}",
+            ),
+            environment=("GTEST_FAIL_FAST=1",),
+            working_directory="/workspaces/llaminar",
+        )
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            root = Path(raw_directory)
+            artifacts = root / "artifacts"
+            for case in (prefix, first_red, aggregate_green):
+                self.write_canonical_artifacts(
+                    artifacts / campaigns._gtest_artifact_directory_name(case)
+                )
+            report = root / "report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 12,
+                        "artifact_root": str(artifacts),
+                        "campaigns": [
+                            {
+                                "campaign": failed.name,
+                                "gtest_cases": list(failed.gtest_cases),
+                                "return_code": 8,
+                                "outcome": "completed",
+                                "artifact_contract_passed": False,
+                                "validated_artifact_file_count": 0,
+                                "artifact_errors": ["first red"],
+                            },
+                            {
+                                "campaign": green.name,
+                                "gtest_cases": list(green.gtest_cases),
+                                "return_code": 0,
+                                "outcome": "completed",
+                                "artifact_contract_passed": True,
+                                "validated_artifact_file_count": len(
+                                    campaigns.REQUIRED_CSV_HEADERS
+                                ),
+                                "artifact_errors": [],
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger_path = root / "ledger.json"
+
+            ledger = campaigns.seed_individual_green_ledger_from_campaign_report(
+                report,
+                (failed, green),
+                ledger_path,
+                declared_first_reds=((failed.name, first_red),),
+            )
+
+        self.assertEqual(
+            ledger.green_cases,
+            frozenset((prefix, aggregate_green)),
+        )
+        provenance = {
+            entry.gtest_case: entry.provenance for entry in ledger.entries
+        }
+        self.assertEqual(
+            provenance[prefix],
+            "aggregate_gtest_fail_fast_prefix_before_declared_first_red",
+        )
+        self.assertEqual(
+            provenance[aggregate_green],
+            "aggregate_exit_zero_and_fresh_artifact_contract",
+        )
+        self.assertNotIn(first_red, ledger.green_cases)
+        self.assertNotIn(unrun, ledger.green_cases)
+
     def test_exact_cell_watch_kills_stuck_process_group_and_names_cell(self) -> None:
         """A silent generated cell must fail in its own bounded lifetime."""
 
@@ -435,7 +929,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 f"p=Path({str(progress)!r}); p.parent.mkdir(parents=True); "
                 "p.write_text('started'); time.sleep(30)"
             )
-            evidence = campaigns.ProcessTimeoutEvidence()
+            evidence = campaigns.ProcessTerminationEvidence()
             started = campaigns.time.monotonic()
 
             return_code = campaigns._run_process(
@@ -446,19 +940,19 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     progress_files=((case, progress),),
                     not_before_wall_time_ns=campaigns.time.time_ns(),
                 ),
-                timeout_evidence=evidence,
+                termination_evidence=evidence,
             )
 
         self.assertEqual(return_code, 124)
         self.assertLess(campaigns.time.monotonic() - started, 2.0)
         self.assertEqual(
             evidence.kind,
-            campaigns.ProcessTimeoutKind.EXACT_CELL,
+            campaigns.ProcessTerminationKind.EXACT_CELL_TIMEOUT,
         )
         self.assertEqual(evidence.exact_gtest_case, case)
 
     def test_exact_cell_watch_renews_deadline_only_on_next_cell(self) -> None:
-        """Sequential cells may exceed one cell budget in aggregate."""
+        """Sequential cells may exceed both setup and one-cell budgets."""
 
         with tempfile.TemporaryDirectory() as raw_directory:
             first = Path(raw_directory) / "first" / "test_log.txt"
@@ -471,12 +965,12 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 "b.parent.mkdir(parents=True); b.write_text('started'); "
                 "time.sleep(0.3)"
             )
-            evidence = campaigns.ProcessTimeoutEvidence()
+            evidence = campaigns.ProcessTerminationEvidence()
             started = campaigns.time.monotonic()
 
             return_code = campaigns._run_process(
                 [sys.executable, "-c", script],
-                5.0,
+                0.2,
                 exact_cell_watch=campaigns.ExactCellTimeoutWatch(
                     timeout_seconds=0.5,
                     progress_files=(
@@ -485,12 +979,98 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     ),
                     not_before_wall_time_ns=campaigns.time.time_ns(),
                 ),
-                timeout_evidence=evidence,
+                termination_evidence=evidence,
             )
 
         self.assertEqual(return_code, 0)
         self.assertGreater(campaigns.time.monotonic() - started, 0.5)
-        self.assertEqual(evidence.kind, campaigns.ProcessTimeoutKind.NONE)
+        self.assertEqual(
+            evidence.kind,
+            campaigns.ProcessTerminationKind.NONE,
+        )
+
+    def test_campaign_cancellation_terminates_the_active_process_group(
+        self,
+    ) -> None:
+        """A sibling red must stop both CTest and its MPI-style children."""
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            child_ready = directory / "child-ready"
+            child_terminated = directory / "child-terminated"
+            parent_ready = directory / "parent-ready"
+            child_script = f"""
+import signal
+import time
+from pathlib import Path
+
+ready = Path({str(child_ready)!r})
+terminated = Path({str(child_terminated)!r})
+
+def stop(_signum, _frame):
+    terminated.write_text("terminated")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+ready.write_text("ready")
+while True:
+    time.sleep(1)
+"""
+            parent_script = f"""
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+child_ready = Path({str(child_ready)!r})
+subprocess.Popen([sys.executable, "-c", {child_script!r}])
+deadline = time.monotonic() + 5.0
+while not child_ready.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+Path({str(parent_ready)!r}).write_text("ready")
+time.sleep(30)
+"""
+            cancellation = campaigns.CampaignCancellation()
+            evidence = campaigns.ProcessTerminationEvidence()
+
+            def cancel_active_group() -> None:
+                deadline = campaigns.time.monotonic() + 5.0
+                while (
+                    not parent_ready.exists()
+                    and campaigns.time.monotonic() < deadline
+                ):
+                    campaigns.time.sleep(0.01)
+                cancellation.request_after_failure("first-red-campaign")
+
+            publisher = campaigns.threading.Thread(target=cancel_active_group)
+            publisher.start()
+            started = campaigns.time.monotonic()
+            return_code = campaigns._run_process(
+                [sys.executable, "-c", parent_script],
+                10.0,
+                cancellation=cancellation,
+                termination_evidence=evidence,
+            )
+            publisher.join(timeout=1.0)
+
+            terminated_deadline = campaigns.time.monotonic() + 1.0
+            while (
+                not child_terminated.exists()
+                and campaigns.time.monotonic() < terminated_deadline
+            ):
+                campaigns.time.sleep(0.01)
+
+            self.assertTrue(parent_ready.exists())
+            self.assertTrue(child_ready.exists())
+            self.assertTrue(child_terminated.exists())
+
+        self.assertEqual(return_code, 130)
+        self.assertLess(campaigns.time.monotonic() - started, 2.0)
+        self.assertEqual(
+            evidence.kind,
+            campaigns.ProcessTerminationKind.CAMPAIGN_CANCELLED,
+        )
+        self.assertEqual(evidence.cancelling_campaign, "first-red-campaign")
 
     @mock.patch.object(campaigns, "_run_process")
     def test_campaign_receives_only_the_completion_timeout_remaining(
@@ -503,9 +1083,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         )
         run_process.return_value = 0
 
-        environment = {
-            "LLAMINAR_PRODUCTION_PARITY_DIGEST_CACHE": "/tmp/digest-proof"
-        }
+        environment = {"LLAMINAR_TEST_ENVIRONMENT_PASSTHROUGH": "proof"}
         result = campaigns.run_campaign(
             Path("build"),
             cell,
@@ -540,8 +1118,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
         )
         self.assertIsNone(run_process.call_args.kwargs["exact_cell_watch"])
         self.assertIsInstance(
-            run_process.call_args.kwargs["timeout_evidence"],
-            campaigns.ProcessTimeoutEvidence,
+            run_process.call_args.kwargs["termination_evidence"],
+            campaigns.ProcessTerminationEvidence,
         )
         self.assertEqual(
             result.exact_cell_timeout_seconds,
@@ -614,6 +1192,10 @@ class ProductionParityCampaignTest(unittest.TestCase):
             columns = next(
                 campaigns.csv.reader([campaigns.MTP_TRANSACTIONS_HEADER])
             )
+            self.assertIn("acceptance_witness_executed", columns)
+            self.assertIn(
+                "acceptance_witness_accepted_token_delta", columns
+            )
             self.assertIn("dynamic_policy_witness_executed", columns)
             self.assertIn(
                 "dynamic_policy_witness_serial_oracle_tokens", columns
@@ -679,9 +1261,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
         )
 
         def expire_cell(*_args: object, **kwargs: object) -> int:
-            evidence = kwargs["timeout_evidence"]
-            assert isinstance(evidence, campaigns.ProcessTimeoutEvidence)
-            evidence.kind = campaigns.ProcessTimeoutKind.EXACT_CELL
+            evidence = kwargs["termination_evidence"]
+            assert isinstance(evidence, campaigns.ProcessTerminationEvidence)
+            evidence.kind = campaigns.ProcessTerminationKind.EXACT_CELL_TIMEOUT
             evidence.exact_gtest_case = case
             return 124
 
@@ -764,6 +1346,108 @@ class ProductionParityCampaignTest(unittest.TestCase):
             ["CPU", "ROCm"],
         )
 
+    def test_scheduler_prioritizes_unseen_then_partial_then_complete(
+        self,
+    ) -> None:
+        complete_cases = (
+            "CompleteSuite.ProductionParity/Ordinal",
+            "CompleteSuite.ProductionParity/Random",
+        )
+        partial_cases = (
+            "PartialSuite.ProductionParity/Ordinal",
+            "PartialSuite.ProductionParity/Random",
+        )
+        unseen_cases = (
+            "UnseenSuite.ProductionParity/Ordinal",
+            "UnseenSuite.ProductionParity/Random",
+        )
+        complete = campaigns.CampaignCell(
+            "a_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=complete_cases,
+        )
+        partial = campaigns.CampaignCell(
+            "b_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=partial_cases,
+        )
+        unseen = campaigns.CampaignCell(
+            "c_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+            gtest_cases=unseen_cases,
+        )
+        selected = [complete, partial, unseen]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for gtest_case in (*complete_cases, partial_cases[0]):
+                self.write_canonical_artifacts(
+                    root
+                    / campaigns._gtest_artifact_directory_name(gtest_case)
+                )
+
+            evidence = campaigns.inspect_prior_artifact_evidence(
+                selected,
+                (root,),
+            )
+            ordered = campaigns.scheduling_order(
+                selected,
+                prior_evidence=evidence,
+            )
+
+        self.assertEqual(ordered, [unseen, partial, complete])
+        self.assertEqual(
+            campaigns.scheduling_order(selected),
+            [complete, partial, unseen],
+        )
+        self.assertEqual(len(evidence.observed_gtest_cases), 3)
+        self.assertEqual(
+            evidence.coverage_for(unseen).kind,
+            campaigns.PriorEvidenceCoverageKind.UNSEEN,
+        )
+        self.assertEqual(
+            evidence.coverage_for(partial).kind,
+            campaigns.PriorEvidenceCoverageKind.PARTIAL,
+        )
+        self.assertEqual(
+            evidence.coverage_for(complete).kind,
+            campaigns.PriorEvidenceCoverageKind.COMPLETE,
+        )
+        self.assertEqual(
+            campaigns.prior_evidence_campaign_counts(selected, evidence),
+            {
+                campaigns.PriorEvidenceCoverageKind.UNSEEN: 1,
+                campaigns.PriorEvidenceCoverageKind.PARTIAL: 1,
+                campaigns.PriorEvidenceCoverageKind.COMPLETE: 1,
+            },
+        )
+        self.assertEqual(
+            {
+                (cell.name, cell.gtest_cases)
+                for cell in ordered
+            },
+            {
+                (cell.name, cell.gtest_cases)
+                for cell in selected
+            },
+        )
+
+    def test_prior_artifact_roots_are_repeatable_explicit_directories(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            arguments = campaigns.parse_args(
+                [
+                    "--prioritize-unseen-from-artifact-root",
+                    str(root),
+                    "--prioritize-unseen-from-artifact-root",
+                    str(root),
+                ]
+            )
+
+        self.assertEqual(arguments.prior_artifact_roots, (root,))
+
     @mock.patch.object(campaigns, "run_campaign")
     def test_matrix_admits_remaining_campaigns_after_target_is_missed(
         self, run_campaign: mock.Mock
@@ -779,9 +1463,10 @@ class ProductionParityCampaignTest(unittest.TestCase):
         def completed_result(
             _build_dir: Path,
             cell: campaigns.CampaignCell,
-            _completion_timeout_seconds: float,
+            _completion_timeout_seconds: float | None,
             **_kwargs: object,
         ) -> campaigns.CampaignResult:
+            self.assertIsNone(_completion_timeout_seconds)
             return campaigns.CampaignResult(
                 campaign=cell.name,
                 test_type=cell.test_type,
@@ -802,14 +1487,107 @@ class ProductionParityCampaignTest(unittest.TestCase):
             Path("build"),
             cells,
             target_seconds=1.0,
-            completion_timeout_seconds=30.0,
-            global_started_at=campaigns.time.monotonic() - 2.0,
+            global_started_at=campaigns.time.monotonic() - 31.0,
         )
 
         self.assertEqual(run_campaign.call_count, 2)
         self.assertEqual([result.campaign for result in results], [c.name for c in cells])
         self.assertTrue(all(result.return_code == 0 for result in results))
         self.assertTrue(all(not result.target_met for result in results))
+
+    @mock.patch.object(campaigns, "run_campaign")
+    def test_matrix_first_failure_cancels_sibling_and_stops_admission(
+        self,
+        run_campaign: mock.Mock,
+    ) -> None:
+        """Only the initially admitted disjoint set may run after one red."""
+
+        first = campaigns.CampaignCell(
+            "a_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+        )
+        pending = campaigns.CampaignCell(
+            "b_ProductionCampaign_CPU_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CPU", "ALL"),
+        )
+        sibling = campaigns.CampaignCell(
+            "c_ProductionCampaign_CUDA_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CUDA", "ALL"),
+        )
+        sibling_started = campaigns.threading.Event()
+        called: list[str] = []
+
+        def result_for(
+            _build_dir: Path,
+            cell: campaigns.CampaignCell,
+            _completion_timeout_seconds: float,
+            **kwargs: object,
+        ) -> campaigns.CampaignResult:
+            called.append(cell.name)
+            cancellation = kwargs["cancellation"]
+            assert isinstance(cancellation, campaigns.CampaignCancellation)
+            if cell == first:
+                self.assertTrue(sibling_started.wait(timeout=1.0))
+                return_code = 17
+                outcome = "completed"
+                cancelled_by = ""
+            elif cell == sibling:
+                sibling_started.set()
+                deadline = campaigns.time.monotonic() + 1.0
+                while (
+                    not cancellation.requested
+                    and campaigns.time.monotonic() < deadline
+                ):
+                    campaigns.time.sleep(0.01)
+                self.assertTrue(cancellation.requested)
+                return_code = 130
+                outcome = "cancelled_after_campaign_failure"
+                cancelled_by = cancellation.failing_campaign
+            else:  # pragma: no cover - admission is the invariant under test
+                self.fail("pending campaign was admitted after the first red")
+
+            return campaigns.CampaignResult(
+                campaign=cell.name,
+                test_type=cell.test_type,
+                backends=cell.group.backends,
+                precision_set=cell.group.kv_precision,
+                precision_types=cell.precision_types,
+                gtest_cases=cell.gtest_cases,
+                elapsed_seconds=0.1,
+                target_seconds=30.0,
+                return_code=return_code,
+                target_met=True,
+                cancelled_by_campaign=cancelled_by,
+                outcome=outcome,
+                artifact_contract_passed=(return_code == 0),
+            )
+
+        run_campaign.side_effect = result_for
+        results, _ = campaigns.run_campaign_matrix(
+            Path("build"),
+            [first, pending, sibling],
+            target_seconds=30.0,
+        )
+
+        by_campaign = {result.campaign: result for result in results}
+        self.assertCountEqual(called, [first.name, sibling.name])
+        self.assertEqual(by_campaign[first.name].return_code, 17)
+        self.assertEqual(
+            by_campaign[pending.name].outcome,
+            "not_started_after_campaign_failure",
+        )
+        self.assertEqual(
+            by_campaign[sibling.name].outcome,
+            "cancelled_after_campaign_failure",
+        )
+        self.assertEqual(
+            by_campaign[pending.name].cancelled_by_campaign,
+            first.name,
+        )
+        self.assertEqual(
+            by_campaign[sibling.name].cancelled_by_campaign,
+            first.name,
+        )
 
     def test_ctest_exact_regex_selects_one_real_registered_test(self) -> None:
         """The emitted expression must be understood by CTest, not just Python."""
@@ -1350,7 +2128,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertEqual(selected, (part_one.resolve(), part_two.resolve()))
 
     @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
-    def test_ramdisk_staging_records_source_digest_and_publishes_read_only_models(
+    def test_ramdisk_staging_records_exact_bytes_and_publishes_read_only_models(
         self, filesystem_type: mock.Mock
     ) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
@@ -1376,8 +2154,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
             self.assertEqual(len(evidence), 1)
             self.assertEqual(evidence[0].size_bytes, len(payload))
             self.assertEqual(
-                evidence[0].sha256,
-                campaigns.hashlib.sha256(payload).hexdigest(),
+                evidence[0].source_identity,
+                campaigns._source_identity(source.stat()),
             )
             filesystem_type.assert_called_once_with(staging)
 
@@ -1401,11 +2179,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 campaigns,
                 "_stage_one_model",
                 wraps=campaigns._stage_one_model,
-            ) as stage_one, mock.patch.object(
-                campaigns,
-                "_hash_file",
-                wraps=campaigns._hash_file,
-            ) as hash_file:
+            ) as stage_one:
                 first, _ = campaigns.stage_models_in_ramdisk(
                     [cell],
                     staging,
@@ -1420,15 +2194,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 )
 
             self.assertEqual(stage_one.call_count, 1)
-            self.assertEqual(
-                hash_file.call_count,
-                0,
-                "staging must leave the one destination SHA pass to the "
-                "reference-pack authentication gate",
-            )
             self.assertEqual(first[0].cache_status, "copied")
             self.assertEqual(second[0].cache_status, "reused")
-            self.assertEqual(second[0].sha256, first[0].sha256)
+            self.assertEqual(second[0].source_identity, first[0].source_identity)
             self.assertEqual((staging / source.name).read_bytes(), payload)
             manifest = json.loads(
                 (staging.parent / "model-cache-manifest.json").read_text(
@@ -1443,6 +2211,67 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 manifest["models"][source.name]["cached_identity"],
                 list(campaigns._source_identity((staging / source.name).stat())),
             )
+            self.assertNotIn("sha256", manifest["models"][source.name])
+
+    @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
+    def test_schema_one_cache_migrates_without_rereading_model_payload(
+        self, _: mock.Mock
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            source = directory / "model.gguf"
+            source.write_bytes(b"persistent-real-weights")
+            staging = directory / "cache" / "models"
+            staging.mkdir(parents=True)
+            destination = staging / source.name
+            destination.write_bytes(source.read_bytes())
+            destination.chmod(0o400)
+            manifest_path = staging.parent / "model-cache-manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "models": {
+                            source.name: {
+                                "source_path": str(source),
+                                "source_identity": list(
+                                    campaigns._source_identity(source.stat())
+                                ),
+                                "cached_identity": list(
+                                    campaigns._source_identity(destination.stat())
+                                ),
+                                "size_bytes": source.stat().st_size,
+                                "sha256": "legacy-content-digest",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cell = campaigns.CampaignCell(
+                "cell_ProductionCampaign_CPU_ALL_PRECISIONS",
+                campaigns.CampaignGroup("CPU", "ALL"),
+                model_files=(str(source),),
+            )
+
+            with mock.patch.object(
+                campaigns, "_stage_one_model", wraps=campaigns._stage_one_model
+            ) as stage_one:
+                evidence, _ = campaigns.stage_models_in_ramdisk(
+                    [cell],
+                    staging,
+                    campaigns.time.monotonic() + 30.0,
+                    persistent=True,
+                )
+
+            self.assertEqual(stage_one.call_count, 0)
+            self.assertEqual(evidence[0].cache_status, "reused")
+            migrated = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                migrated["schema_version"],
+                campaigns.PERSISTENT_MODEL_CACHE_SCHEMA_VERSION,
+            )
+            self.assertNotIn("sha256", migrated["models"][source.name])
 
     @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
     def test_persistent_ramdisk_cache_refreshes_changed_source_atomically(
@@ -1507,7 +2336,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     )
 
     @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
-    def test_persistent_workspace_seals_models_while_digests_remain_writable(
+    def test_persistent_workspace_seals_all_cache_owned_paths(
         self, _: mock.Mock
     ) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
@@ -1520,7 +2349,6 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     campaigns.time.monotonic() + 30.0,
                 ) as workspace:
                     workspace.models.mkdir()
-                    workspace.digests.mkdir()
                     published_model = workspace.models / "model.gguf"
                     published_model.write_bytes(b"published-model")
 
@@ -1528,20 +2356,12 @@ class ProductionParityCampaignTest(unittest.TestCase):
 
                     self.assertEqual(workspace.root.stat().st_mode & 0o777, 0o500)
                     self.assertEqual(workspace.models.stat().st_mode & 0o777, 0o500)
-                    self.assertEqual(workspace.digests.stat().st_mode & 0o777, 0o700)
                     if os.geteuid() != 0:
                         with self.assertRaises(PermissionError):
                             published_model.unlink()
-                    digest = workspace.digests / "model.sha256"
-                    digest.write_text("authenticated", encoding="utf-8")
-                    self.assertEqual(
-                        digest.read_text(encoding="utf-8"),
-                        "authenticated",
-                    )
 
                 self.assertEqual(root.stat().st_mode & 0o777, 0o500)
                 self.assertEqual((root / "models").stat().st_mode & 0o777, 0o500)
-                self.assertEqual((root / "digests").stat().st_mode & 0o777, 0o500)
                 if os.geteuid() != 0:
                     with self.assertRaises(PermissionError):
                         published_model.unlink()
@@ -1634,6 +2454,33 @@ class ProductionParityCampaignTest(unittest.TestCase):
             args.persistent_model_cache_dir,
             Path("/dev/shm/llaminar-parity-cache"),
         )
+
+    def test_individual_cell_admission_limit_is_explicit_and_positive(
+        self,
+    ) -> None:
+        args = campaigns.parse_args(
+            [
+                "--run-unseen-cells-individually",
+                "--green-ledger",
+                "green.json",
+                "--max-unseen-cells",
+                "1",
+            ]
+        )
+
+        self.assertEqual(args.max_unseen_cells, 1)
+        with self.assertRaises(SystemExit):
+            campaigns.parse_args(["--max-unseen-cells", "1"])
+        with self.assertRaises(SystemExit):
+            campaigns.parse_args(
+                [
+                    "--run-unseen-cells-individually",
+                    "--green-ledger",
+                    "green.json",
+                    "--max-unseen-cells",
+                    "0",
+                ]
+            )
 
     @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
     def test_persistent_workspace_rejects_session_ipc_tmpfs(

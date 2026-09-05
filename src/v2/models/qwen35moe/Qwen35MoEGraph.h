@@ -14,6 +14,7 @@
 #include "../../execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "../../execution/moe/MoERuntimeTable.h"
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -26,11 +27,64 @@ namespace llaminar2
     class DeviceMoERebalanceTransferState;
     class ILocalTPContext;
     class IMoERuntimeTable;
+    class MappedHostTransferArena;
     class MoELocalExpertSerialBufferArena;
     class MoEExpertOwnerMap;
     class MoEOverlayCollectiveWorkspace;
     class MoEOverlayMPIRankBatchTransport;
     struct PrefixFingerprintMaterial;
+
+    /**
+     * @brief Semantic workload that may contribute production decode demand.
+     *
+     * Ordinary prefill and MTP sidecars are deliberately non-producers. A
+     * grouped main-model verifier is decode-equivalent work even though its
+     * physical row count is greater than one; classifying it as prefill would
+     * quarantine every accepted MTP route from Dynamic maintenance.
+     */
+    enum class MoERuntimeHistogramWorkload : std::uint8_t
+    {
+        NonDecode,
+        SerialDecode,
+        GroupedMainVerifier,
+    };
+
+    /**
+     * @brief Typed authority decision for host runtime-histogram registration.
+     */
+    enum class MoERuntimeHistogramProducerRole : std::uint8_t
+    {
+        NotProducer,
+        ProductionDecode,
+    };
+
+    /**
+     * @brief Resolve whether one graph workload feeds the host demand window.
+     *
+     * @param workload Semantic graph workload, independent of physical M.
+     * @param host_maintenance_collects Whether host-authoritative Observe or
+     *        Dynamic maintenance owns the histogram. Device-resident
+     *        maintenance never registers a host drain.
+     * @return ProductionDecode for serial decode and accepted grouped-verifier
+     *         rows when host collection is active; NotProducer otherwise.
+     */
+    [[nodiscard]] constexpr MoERuntimeHistogramProducerRole
+    selectMoERuntimeHistogramProducerRole(
+        MoERuntimeHistogramWorkload workload,
+        bool host_maintenance_collects) noexcept
+    {
+        if (!host_maintenance_collects)
+            return MoERuntimeHistogramProducerRole::NotProducer;
+        switch (workload)
+        {
+        case MoERuntimeHistogramWorkload::SerialDecode:
+        case MoERuntimeHistogramWorkload::GroupedMainVerifier:
+            return MoERuntimeHistogramProducerRole::ProductionDecode;
+        case MoERuntimeHistogramWorkload::NonDecode:
+        default:
+            return MoERuntimeHistogramProducerRole::NotProducer;
+        }
+    }
 
     /**
      * @brief Qwen 3.5 MoE graph builder
@@ -196,6 +250,7 @@ namespace llaminar2
         std::string maybeAddEmbeddingDiagnosticCheckpoints(
             ComputeGraph &graph,
             TensorBase *source,
+            BufferId source_buffer_id,
             const std::string &dependency,
             int total_tokens,
             DeviceId device) override;
@@ -212,6 +267,7 @@ namespace llaminar2
             ComputeGraph &graph,
             const std::string &boundary,
             TensorBase *source,
+            BufferId source_buffer_id,
             const std::string &dependency,
             int total_tokens,
             DeviceId device,
@@ -257,6 +313,7 @@ namespace llaminar2
             ComputeGraph &graph,
             const std::string &boundary,
             const ITensor *source,
+            BufferId source_buffer_id,
             const std::string &dependency,
             int layer_idx,
             int total_tokens,
@@ -356,7 +413,8 @@ namespace llaminar2
             const MoERuntimeTableIdentity &identity,
             int prefill_token_capacity = 0,
             int num_layers_override = -1,
-            bool register_decode_histogram = true,
+            MoERuntimeHistogramProducerRole histogram_producer_role =
+                MoERuntimeHistogramProducerRole::NotProducer,
             bool bind_overlay_epoch = false);
 
         /**
@@ -371,6 +429,8 @@ namespace llaminar2
          * @param device Exact local owner of the expert GEMM work.
          * @param participant Stable overlay participant identity.
          * @param required_row_capacity Compact input rows required by this graph.
+         * @param cpu_canonical_route_gpu_consumer Exact continuation GPU when
+         *        CPU canonical rows must be graph-visible mapped storage.
          * @return Model-lifetime immutable-address tensor owner.
          * @throws std::logic_error when a later graph asks for capacity outside
          *         the immutable graph-family plan.
@@ -379,7 +439,9 @@ namespace llaminar2
         localExpertSerialBufferArenaForParticipant(
             DeviceId device,
             int participant,
-            size_t required_row_capacity);
+            size_t required_row_capacity,
+            std::optional<DeviceId> cpu_canonical_route_gpu_consumer =
+                std::nullopt);
         /**
          * @brief Return one serial-family host packet arena for a participant.
          *
@@ -440,10 +502,26 @@ namespace llaminar2
         void registerRuntimeTableHistogramSyncIfNeeded(
             const std::string &key,
             IMoERuntimeTable *table,
-            bool register_decode_histogram);
+            MoERuntimeHistogramProducerRole histogram_producer_role);
 
     private:
+        /**
+         * @brief Return model-lifetime mapped ticket storage for one GPU.
+         *
+         * All serialized transformer, prefill, verifier, and MTP graph roles on
+         * the endpoint suballocate this same non-relocating arena. The method
+         * freezes exact endpoint identity and prevents per-layer native host
+         * registration from becoming part of graph construction.
+         */
+        std::shared_ptr<MappedHostTransferArena>
+        mappedOverlayTicketArenaForDevice(DeviceId device);
+
         std::unordered_map<std::string, std::unique_ptr<MoERuntimeTable>> moe_runtime_tables_;
+        /** One geometrically registered mapped ticket arena per exact GPU. */
+        std::unordered_map<
+            std::string,
+            std::shared_ptr<MappedHostTransferArena>>
+            moe_mapped_ticket_arenas_;
         /**
          * @brief One request-epoch RCU arena per serial GPU graph family.
          *

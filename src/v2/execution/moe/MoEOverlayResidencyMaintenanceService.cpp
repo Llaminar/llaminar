@@ -9,7 +9,9 @@
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 
+#include <algorithm>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -29,6 +31,29 @@ namespace llaminar2
                        MoEOverlayResidencyApplyStatus::PublicationFailed ||
                    status ==
                        MoEOverlayResidencyApplyStatus::RetirementFailed;
+        }
+
+        /** @brief Add to a monotonic counter without allowing wraparound. */
+        void saturatingAtomicAdd(
+            std::atomic<std::uint64_t> &counter,
+            std::uint64_t increment) noexcept
+        {
+            std::uint64_t observed = counter.load(std::memory_order_relaxed);
+            while (observed != std::numeric_limits<std::uint64_t>::max())
+            {
+                const std::uint64_t available =
+                    std::numeric_limits<std::uint64_t>::max() - observed;
+                const std::uint64_t desired =
+                    observed + std::min(increment, available);
+                if (counter.compare_exchange_weak(
+                        observed,
+                        desired,
+                        std::memory_order_release,
+                        std::memory_order_relaxed))
+                {
+                    return;
+                }
+            }
         }
     } // namespace
 
@@ -155,6 +180,25 @@ namespace llaminar2
         wake_cv_.notify_one();
     }
 
+    void MoEOverlayResidencyMaintenanceService::notifyInferenceProgress(
+        MoEOverlayInferenceProgress progress) noexcept
+    {
+        if (!progress.valid())
+            return;
+
+        /* This counter schedules a future exact device-bank drain; it never
+         * substitutes for the selected-expert rows owned by that bank. Traffic
+         * completing before request-boundary demand activation belongs to the
+         * certification quarantine and must not schedule a live-bank probe. */
+        if (config_.authority->optimizationDemandActive())
+        {
+            saturatingAtomicAdd(
+                inference_progress_tokens_,
+                progress.completed_logical_tokens);
+        }
+        notifyMaintenanceProgress();
+    }
+
     void MoEOverlayResidencyMaintenanceService::stopAndDrain(
         MoEOverlayMaintenanceDrainScope scope)
     {
@@ -277,6 +321,15 @@ namespace llaminar2
             .poll_iterations =
                 poll_iterations_.load(std::memory_order_relaxed),
             .notifications = notifications_.load(std::memory_order_relaxed),
+            .inference_progress_tokens =
+                inference_progress_tokens_.load(
+                    std::memory_order_relaxed),
+            .histogram_runtime_probes =
+                histogram_runtime_probes_.load(
+                    std::memory_order_relaxed),
+            .histogram_runtime_reconciliations =
+                histogram_runtime_reconciliations_.load(
+                    std::memory_order_relaxed),
             .economy_certification_polls =
                 economy_certification_polls_.load(
                     std::memory_order_relaxed),
@@ -456,6 +509,96 @@ namespace llaminar2
         state_.store(
             MoEOverlayMaintenanceState::Waiting,
             std::memory_order_release);
+    }
+
+    MoEOverlayHistogramWindowResult
+    MoEOverlayResidencyMaintenanceService::
+        progressAuthoritativeHistogramWindow()
+    {
+        const std::uint64_t observed_notification =
+            notifications_.load(std::memory_order_acquire);
+        const std::uint64_t observed_inference_tokens =
+            inference_progress_tokens_.load(std::memory_order_acquire);
+        const MoEOptimizationDemandWindow demand =
+            config_.authority->optimizationDemandWindow();
+
+        const std::uint64_t unprobed_tokens =
+            observed_inference_tokens >=
+                    reconciled_inference_progress_tokens_
+                ? observed_inference_tokens -
+                      reconciled_inference_progress_tokens_
+                : std::numeric_limits<std::uint64_t>::max();
+        const std::uint64_t remaining_rows =
+            demand.remainingRoutedRows();
+        const bool host_window_full =
+            demand.valid() && remaining_rows == 0u;
+        const bool cadence_requests_probe =
+            demand.valid() && remaining_rows > 0u &&
+            unprobed_tokens >= remaining_rows;
+        const bool reconcile_runtime_sources =
+            histogram_runtime_probe_active_ || host_window_full ||
+            cadence_requests_probe;
+
+        if (reconcile_runtime_sources &&
+            !histogram_runtime_probe_active_)
+        {
+            /* Pair both watermarks with the exact device bank admitted by this
+             * poll. Inference may advance either counter while its event/DMA
+             * is pending; that later progress must remain visible afterward. */
+            histogram_runtime_probe_active_ = true;
+            active_histogram_probe_tokens_ = observed_inference_tokens;
+            active_histogram_probe_notification_ = observed_notification;
+            histogram_runtime_probes_.fetch_add(
+                1u, std::memory_order_relaxed);
+            recordPerfCounter("maintenance_histogram_runtime_probes");
+        }
+
+        const auto result = config_.authority->progressHistogramWindow(
+            cadence_requests_probe || histogram_runtime_probe_active_
+                ? MoEOverlayHistogramEvidenceScope::RuntimeSources
+                : MoEOverlayHistogramEvidenceScope::HostResident);
+        if (result.progress ==
+            MoEOverlayHistogramWindowProgress::Pending)
+        {
+            return result;
+        }
+
+        std::uint64_t reconciled_notification = observed_notification;
+        if (histogram_runtime_probe_active_)
+        {
+            reconciled_inference_progress_tokens_ =
+                active_histogram_probe_tokens_;
+            reconciled_notification =
+                active_histogram_probe_notification_;
+            histogram_runtime_probe_active_ = false;
+            active_histogram_probe_tokens_ = 0u;
+            active_histogram_probe_notification_ = 0u;
+        }
+        else if (result.progress ==
+                 MoEOverlayHistogramWindowProgress::Ready)
+        {
+            /* A fully host-resident bank already accounts for every inference
+             * completion observed before this poll. Consuming that cadence
+             * avoids an unnecessary empty runtime-source probe afterward. */
+            reconciled_inference_progress_tokens_ =
+                observed_inference_tokens;
+        }
+
+        if (result.progress ==
+            MoEOverlayHistogramWindowProgress::Reconciled)
+        {
+            histogram_runtime_reconciliations_.fetch_add(
+                1u, std::memory_order_relaxed);
+            recordPerfCounter(
+                "maintenance_histogram_runtime_reconciliations");
+            publishReconciledWaitingState(reconciled_notification);
+        }
+        else if (result.progress ==
+                 MoEOverlayHistogramWindowProgress::Waiting)
+        {
+            publishReconciledWaitingState(reconciled_notification);
+        }
+        return result;
     }
 
     void MoEOverlayResidencyMaintenanceService::run(
@@ -710,14 +853,34 @@ namespace llaminar2
         if (!allow_new_proposal)
         {
             /*
-             * Only the histogram coordinator can own an irrevocable send at
-             * this point. Peers stopping after the coordinated root has
-             * drained hold at most a passive preposted receive, which their
-             * publisher cancels during runner teardown.
+             * The coordinator can own an irrevocable proposal send. A peer can
+             * also own the acknowledgement of a proposal that it already
+             * authenticated: `retainDistributedProposal()` deliberately keeps
+             * that transaction in PublishingProposal until the acknowledgement
+             * reaches Ready. The topology drain's second barrier proves that no
+             * new coordinator proposal can begin, but the peer may observe its
+             * stop token before it gets one final poll of that already-posted
+             * acknowledgement. Continue exactly those two irrevocable edges.
+             *
+             * An Empty peer retains only its preposted next-generation receive.
+             * That receive is not a transaction and must remain passive here;
+             * the proposal publisher cancels it after the maintenance worker
+             * has stopped. Distinguishing the retained transaction state from
+             * `proposal_exchange_active_` prevents both the former deadlock and
+             * an invented wait for a proposal that the stopped coordinator can
+             * no longer publish.
              */
-            if (config_.proposal_publisher &&
+            const bool coordinator_publication_in_flight =
+                config_.proposal_publisher &&
                 config_.proposal_publisher->isCoordinator() &&
-                proposal_exchange_active_)
+                proposal_exchange_active_;
+            const bool peer_acknowledgement_in_flight =
+                config_.proposal_publisher &&
+                !config_.proposal_publisher->isCoordinator() &&
+                retained_transaction_state_ ==
+                    MoEOverlayRetainedTransactionState::PublishingProposal;
+            if (coordinator_publication_in_flight ||
+                peer_acknowledgement_in_flight)
             {
                 progressDistributedProposal();
             }
@@ -734,15 +897,16 @@ namespace llaminar2
         std::shared_ptr<const DecodeExpertHistogramWindow> local_window;
         if (dynamic)
         {
-            const std::uint64_t observed_progress_generation =
-                notifications_.load(std::memory_order_acquire);
             const auto window_result =
-                config_.authority->progressHistogramWindow();
+                progressAuthoritativeHistogramWindow();
             if (window_result.progress ==
                 MoEOverlayHistogramWindowProgress::Waiting)
             {
-                publishReconciledWaitingState(
-                    observed_progress_generation);
+                return;
+            }
+            if (window_result.progress ==
+                MoEOverlayHistogramWindowProgress::Reconciled)
+            {
                 return;
             }
             if (window_result.progress ==
@@ -799,15 +963,16 @@ namespace llaminar2
         auto &publisher = *config_.proposal_publisher;
         if (publisher.isCoordinator() && !proposal_exchange_active_)
         {
-            const std::uint64_t observed_progress_generation =
-                notifications_.load(std::memory_order_acquire);
             const auto window_result =
-                config_.authority->progressHistogramWindow();
+                progressAuthoritativeHistogramWindow();
             if (window_result.progress ==
                 MoEOverlayHistogramWindowProgress::Waiting)
             {
-                publishReconciledWaitingState(
-                    observed_progress_generation);
+                return;
+            }
+            if (window_result.progress ==
+                MoEOverlayHistogramWindowProgress::Reconciled)
+            {
                 return;
             }
             if (window_result.progress ==
@@ -1167,6 +1332,11 @@ namespace llaminar2
         case MoEOverlayResidencyApplyStatus::Preparing:
             state_.store(
                 MoEOverlayMaintenanceState::Preparing,
+                std::memory_order_release);
+            return;
+        case MoEOverlayResidencyApplyStatus::AwaitingGraphSequenceBoundary:
+            state_.store(
+                MoEOverlayMaintenanceState::AwaitingGraphSequenceBoundary,
                 std::memory_order_release);
             return;
         case MoEOverlayResidencyApplyStatus::Publishing:

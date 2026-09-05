@@ -202,7 +202,7 @@ namespace llaminar2
     struct MoEOverlayInferenceTransactionTicket
     {
         static constexpr std::uint32_t kMagic = 0x54494F4Du; // "MOIT"
-        static constexpr std::uint32_t kABIVersion = 3u;
+        static constexpr std::uint32_t kABIVersion = 4u;
 
         std::uint32_t magic = kMagic;
         std::uint32_t abi_version = kABIVersion;
@@ -225,6 +225,16 @@ namespace llaminar2
          * exact endpoint-local ticket against this monotonic floor.
          */
         std::uint64_t placement_epoch = 0;
+        /**
+         * Cumulative logical decode tokens retired before this ticket.
+         *
+         * The continuation device authenticates this frontier in its narrow
+         * HIP scheduling ticket. The host coordinator then sidebands the same
+         * immutable value on the already-required rank-follower ticket. Remote
+         * ranks may derive one positive cadence delta from it, but it never
+         * carries response contents or grants host ownership of generation.
+         */
+        std::uint64_t retired_decode_progress_tokens = 0;
         std::uint64_t topology_fingerprint_low = 0;
         std::uint64_t topology_fingerprint_high = 0;
         std::int32_t source_world_rank = -1;
@@ -279,7 +289,7 @@ namespace llaminar2
 
     static_assert(
         std::is_trivially_copyable_v<MoEOverlayInferenceTransactionTicket>);
-    static_assert(sizeof(MoEOverlayInferenceTransactionTicket) == 136u);
+    static_assert(sizeof(MoEOverlayInferenceTransactionTicket) == 144u);
 
     /**
      * @brief Build and validate one retained-graph execution ticket.
@@ -302,7 +312,8 @@ namespace llaminar2
         int draft_depth = -1,
         int sidecar_depth = -1,
         const MoEOverlayInferenceWorkloadIdentity &
-            prefill_schedule_workload = {});
+            prefill_schedule_workload = {},
+        std::uint64_t retired_decode_progress_tokens = 0u);
 
     /**
      * @brief Build a successful or fatal terminal ticket for one command.
@@ -318,7 +329,8 @@ namespace llaminar2
         std::uint64_t transaction_ordinal,
         std::uint64_t placement_epoch,
         MoEOverlayInferenceTransactionAction action,
-        int error_code = 0);
+        int error_code = 0,
+        std::uint64_t retired_decode_progress_tokens = 0u);
 
     /** @brief Lifecycle of one fixed transaction ring slot. */
     enum class MoEOverlayInferenceTransactionSlotState : std::uint8_t

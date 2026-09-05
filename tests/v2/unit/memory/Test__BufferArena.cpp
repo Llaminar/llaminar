@@ -12,6 +12,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
 #include <limits>
 #include "memory/BufferArena.h"
 #include "memory/BufferId.h"
@@ -1200,43 +1201,51 @@ TEST(Test__BufferArena, AllocateWithFactoryCreatesFP32)
     EXPECT_EQ(t2->cols(), 128u);
 }
 
-TEST(Test__BufferArena, MappedModeKeepsGpuScratchBuffersDeviceLocal)
+TEST(Test__BufferArena, GpuActivationAndPublicationBuffersRemainDeviceLocal)
 {
     MPIContext mpi_ctx(0, 1);
     TensorFactory factory(mpi_ctx);
-    factory.setUseMappedMemoryForGPU(true);
 
     ArenaConfig config;
     config.factory = &factory;
-    config.use_mapped_memory = true;
 
     BufferArena arena(config);
     ASSERT_TRUE(arena.registerBuffer(BufferId::GDN_ALPHA, 256, 16, "FP32", DeviceId::rocm(0)));
     ASSERT_TRUE(arena.registerBuffer(BufferId::GDN_BETA, 256, 16, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::LOGITS, 16, 4096, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::LOGITS_LOCAL, 16, 2048, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::ALL_POSITION_LOGITS, 16, 4096, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::ALL_POSITION_LOGITS_LOCAL, 16, 2048, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::PREFIX_TERMINAL_LOGITS, 1, 4096, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::STOCHASTIC_PROCESSED_LOGITS, 1, 4096, "FP32", DeviceId::rocm(0)));
     ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_LOGITS, 16, 4096, "FP32", DeviceId::rocm(0)));
     ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_LOGITS_GATHERED, 16, 8192, "FP32", DeviceId::rocm(0)));
 
     ASSERT_TRUE(arena.allocate());
 
-    auto *alpha = dynamic_cast<TensorBase *>(arena.getTensor(BufferId::GDN_ALPHA));
-    auto *beta = dynamic_cast<TensorBase *>(arena.getTensor(BufferId::GDN_BETA));
-    auto *mtp_logits = dynamic_cast<TensorBase *>(arena.getTensor(BufferId::MTP_LOGITS));
-    auto *mtp_logits_gathered =
-        dynamic_cast<TensorBase *>(arena.getTensor(BufferId::MTP_LOGITS_GATHERED));
-    ASSERT_NE(alpha, nullptr);
-    ASSERT_NE(beta, nullptr);
-    ASSERT_NE(mtp_logits, nullptr);
-    ASSERT_NE(mtp_logits_gathered, nullptr);
-    EXPECT_FALSE(alpha->isMapped());
-    EXPECT_FALSE(beta->isMapped());
-    EXPECT_FALSE(mtp_logits->isMapped())
-        << "GPU MTP logits are graph output scratch, never host-visible publication";
-    EXPECT_FALSE(mtp_logits_gathered->isMapped())
-        << "Gathered GPU MTP logits must remain device-owned until explicit result surfacing";
-    EXPECT_EQ(alpha->home_device(), DeviceId::rocm(0));
-    EXPECT_EQ(beta->home_device(), DeviceId::rocm(0));
-    EXPECT_EQ(mtp_logits->home_device(), DeviceId::rocm(0));
-    EXPECT_EQ(mtp_logits_gathered->home_device(), DeviceId::rocm(0));
+    const std::array<BufferId, 10> graph_buffers{
+        BufferId::GDN_ALPHA,
+        BufferId::GDN_BETA,
+        BufferId::LOGITS,
+        BufferId::LOGITS_LOCAL,
+        BufferId::ALL_POSITION_LOGITS,
+        BufferId::ALL_POSITION_LOGITS_LOCAL,
+        BufferId::PREFIX_TERMINAL_LOGITS,
+        BufferId::STOCHASTIC_PROCESSED_LOGITS,
+        BufferId::MTP_LOGITS,
+        BufferId::MTP_LOGITS_GATHERED,
+    };
+    for (const BufferId id : graph_buffers)
+    {
+        auto *tensor = dynamic_cast<TensorBase *>(arena.getTensor(id));
+        ASSERT_NE(tensor, nullptr) << bufferIdName(id);
+        EXPECT_FALSE(tensor->isMapped())
+            << bufferIdName(id)
+            << " is graph activation/publication storage; host-visible mappings "
+               "must be explicit TransferEngine regions";
+        EXPECT_EQ(tensor->home_device(), DeviceId::rocm(0))
+            << bufferIdName(id);
+    }
 }
 
 TEST(Test__BufferArena, AllocateWithFactoryCreatesBF16)

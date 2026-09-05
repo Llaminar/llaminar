@@ -805,6 +805,23 @@ TEST(Test__MoEOverlayCollectiveWorkspace, DispatchTicketRejectsInvalidLogicalPre
 }
 
 TEST(Test__MoEOverlayCollectiveWorkspace,
+     GPUDispatchTicketRejectsPerTicketMappedRegistration)
+{
+    MoEOverlayDispatchTicketStorage storage;
+    EXPECT_THROW(
+        storage.bindFixedCapacity(
+            /*layer_idx=*/2,
+            /*bucket_rows=*/8,
+            /*top_k=*/2,
+            /*d_model=*/4,
+            DeviceId::cuda(0),
+            /*workspace_generation=*/9,
+            /*mapped_arena=*/nullptr),
+        std::invalid_argument);
+    EXPECT_FALSE(storage.isBound());
+}
+
+TEST(Test__MoEOverlayCollectiveWorkspace,
      TransportedHiddenRowsPublishCanonicalRouterQ8Bytes)
 {
     /*

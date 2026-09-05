@@ -94,12 +94,38 @@ namespace llaminar2
             const void *position_ids_device = nullptr,
             const int32_t *sequence_lengths_device = nullptr) override;
 
+        /**
+         * @brief Build one MTP graph from an explicitly materialized weight view.
+         *
+         * This legacy tensor overload assumes @p weights already represent the
+         * graph's declared sidecar layout. Production frozen-weight callers use
+         * the typed binding overload below so replicated predictors cannot be
+         * handed a primary-model TP shard.
+         */
         ComputeGraph buildMTPGraph(
             int depth_idx,
             const MTPDepthWeights &weights,
             const MTPForwardInput &input,
             MTPForwardOutput &output);
 
+        /**
+         * @brief Build one MTP graph from the canonical typed sidecar binding.
+         *
+         * Tensor-parallel predictors consume @p bindings directly. A declared
+         * replicated-per-participant predictor instead resolves the matching
+         * depth from the auxiliary full-width binding set installed on the
+         * builder. This single selection boundary serves retained live
+         * sidecars and graph-integrated shifted-prefill cache publication.
+         *
+         * @param depth_idx Logical MTP predictor depth being built.
+         * @param bindings Caller-visible primary weight binding; used directly
+         *        only when the sidecar policy is tensor parallel.
+         * @param input Typed sidecar input and shifted-state ownership.
+         * @param output Persistent graph output bindings.
+         * @return Complete participant-local MTP transaction graph.
+         * @throws std::runtime_error when a replicated policy has no unique
+         *         full-width binding for @p depth_idx.
+         */
         ComputeGraph buildMTPGraph(
             int depth_idx,
             const MTPDepthWeightBindings &bindings,
@@ -122,21 +148,6 @@ namespace llaminar2
                     MTPShiftedRowPublicationPolicy::ReuseSidecarRow,
             };
         }
-
-            /**
-             * @brief Resolve the global GDN value-head offset for a local TP shard.
-             *
-             * GDN value heads can have a different count from FA/Q attention heads,
-             * so recurrence state indexing must follow the actual value-projection
-             * shard rather than GraphConfig::head_start when slice metadata exists.
-             */
-            static int resolveGDNGlobalVHeadOffset(
-                const WeightBinding *value_projection_binding,
-                int d_v,
-                int n_v_heads,
-                int n_v_heads_full,
-                const GraphConfig &config,
-                const IMPIContext *mpi_ctx);
 
     protected:
         /**
@@ -190,6 +201,7 @@ namespace llaminar2
          * @param graph GDN subgraph being assembled.
          * @param boundary Stable backend-neutral boundary name.
          * @param source Tensor whose final real row is retained.
+         * @param source_buffer_id Arena slot that owns @p source.
          * @param dependency Producer that must complete before row selection.
          * @param layer_idx Global transformer layer index.
          * @param total_tokens Flattened captured graph row count.
@@ -203,6 +215,7 @@ namespace llaminar2
             ComputeGraph &graph,
             const std::string &boundary,
             const ITensor *source,
+            BufferId source_buffer_id,
             const std::string &dependency,
             int layer_idx,
             int total_tokens,

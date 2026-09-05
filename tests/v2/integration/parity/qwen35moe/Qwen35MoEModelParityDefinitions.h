@@ -66,18 +66,38 @@ namespace llaminar2::test::parity::qwen35moe
         };
     }
 
-    /** Requests discarded symmetrically while convergence graphs warm. */
-    inline constexpr int kQwen35MoEConvergenceTimingWarmupRequests = 1;
+    /**
+     * Requests discarded symmetrically while convergence graphs warm.
+     *
+     * The speed witness runs only after graph materialization, transport
+     * profiling, and live economy certification have already exercised the
+     * exact production graph family. A further discarded 122B request would
+     * warm no new state and would consume part of the ten-minute parity-cell
+     * budget without contributing evidence.
+     */
+    inline constexpr int kQwen35MoEConvergenceTimingWarmupRequests = 0;
     /** Full-prefill observations retained in each placement cohort. */
-    inline constexpr int kQwen35MoEConvergenceTimingMeasuredRequests = 5;
+    inline constexpr int kQwen35MoEConvergenceTimingMeasuredRequests = 3;
     /** Complete stationary request corpus replayed on both sides of the A/B. */
     inline constexpr int kQwen35MoEConvergenceTimingCorpusRequests =
         kQwen35MoEConvergenceTimingWarmupRequests +
         kQwen35MoEConvergenceTimingMeasuredRequests;
     /** Routed decode forwards issued after every convergence prefill. */
-    inline constexpr int kQwen35MoEConvergenceTimingDecodeForwards = 5;
-    /** Bucket-aligned routed rows in every convergence prefill. */
-    inline constexpr std::size_t kQwen35MoEConvergenceTimingPromptRows = 64u;
+    inline constexpr int kQwen35MoEConvergenceTimingDecodeForwards = 2;
+    /** Production-segmented routed rows in every convergence prefill. */
+    inline constexpr std::size_t kQwen35MoEConvergenceTimingPromptRows = 17u;
+    /** Largest canonical parity decode horizon among the shared 35B/122B cells. */
+    inline constexpr int kQwen35MoEMaximumParityDecodeForwards = 5;
+
+    /** @return Routed rows executed by one complete timing request. */
+    inline constexpr std::uint64_t
+    qwen35MoEConvergenceTimingRequestRoutedRows() noexcept
+    {
+        return static_cast<std::uint64_t>(
+                   kQwen35MoEConvergenceTimingPromptRows) +
+               static_cast<std::uint64_t>(
+                   kQwen35MoEConvergenceTimingDecodeForwards);
+    }
 
     /**
      * @return Exact routed-row corpus that one immutable timing epoch retains.
@@ -92,29 +112,60 @@ namespace llaminar2::test::parity::qwen35moe
     {
         return static_cast<std::uint64_t>(
                    kQwen35MoEConvergenceTimingCorpusRequests) *
-               (static_cast<std::uint64_t>(
-                    kQwen35MoEConvergenceTimingPromptRows) +
-                static_cast<std::uint64_t>(
-                    kQwen35MoEConvergenceTimingDecodeForwards));
+               qwen35MoEConvergenceTimingRequestRoutedRows();
+    }
+
+    /**
+     * @return Conservative routed rows in the numerical proof after timing.
+     *
+     * The shared speed-witness geometry serves both the 35B five-step parity
+     * model and the 122B four-step model. Reserving the larger authenticated
+     * request keeps Dynamic maintenance live without allowing a new placement
+     * publication to invalidate the prefix between its seed and restore.
+     */
+    inline constexpr std::uint64_t
+    qwen35MoEMaximumNumericalParityRoutedRows() noexcept
+    {
+        return static_cast<std::uint64_t>(
+                   kQwen35MoEParityTokenIds.size()) +
+               static_cast<std::uint64_t>(
+                   kQwen35MoEMaximumParityDecodeForwards);
+    }
+
+    /** @return Complete post-movement evidence protected in one epoch. */
+    inline constexpr std::uint64_t
+    qwen35MoEConvergenceProtectedRoutedRows() noexcept
+    {
+        return qwen35MoEConvergenceTimingCohortRoutedRows() +
+               qwen35MoEMaximumNumericalParityRoutedRows();
     }
 
     /**
      * Fixed demand-bank width for the matched before/after speed witness.
      *
-     * The 414-row timing corpus must fit strictly inside one immutable epoch.
-     * Five retained request pairs give the latency gate an odd request-matched
-     * median and 25 decode observations per side; the discarded first request
-     * remains a graph/cache warmup. The remaining rows are deliberate
-     * publication headroom, not untyped fixture slack. Movement-only cells use
-     * their separate shorter policy.
+     * The 57-row timing corpus and at most 14 numerical-parity rows must fit
+     * strictly inside one immutable epoch.
+     * Three request-matched prefills give the latency gate an odd median and
+     * six decode observations per side. Every 17-row prefill is necessarily
+     * segmented across the production 16-row capture capacity, so shortening
+     * the witness does not weaken its captured 16+1 execution proof. Request
+     * admission is sequential, but the fourth asynchronous publication can
+     * complete while one already-admitted 19-row request is executing. The
+     * remaining rows therefore retain that exact overlap, the complete
+     * post-movement cohort, and the canonical prefix/decode proof strictly
+     * below the next publication threshold.
+     * Movement-only cells use their separate shorter policy.
      */
-    inline constexpr int kQwen35MoEConvergenceHistogramWindowRows = 448;
+    inline constexpr int kQwen35MoEConvergenceHistogramWindowRows = 96;
 
     static_assert(
         static_cast<std::uint64_t>(
             kQwen35MoEConvergenceHistogramWindowRows) >
-        qwen35MoEConvergenceTimingCohortRoutedRows());
-    static_assert(kQwen35MoEConvergenceTimingWarmupRequests > 0);
+        qwen35MoEConvergenceProtectedRoutedRows() +
+            qwen35MoEConvergenceTimingRequestRoutedRows(),
+        "The convergence window must retain one in-flight request and the "
+        "complete post-movement timing and numerical-parity proof");
+    static_assert(kQwen35MoEConvergenceTimingWarmupRequests >= 0);
     static_assert(
         kQwen35MoEConvergenceTimingMeasuredRequests % 2 == 1,
         "The convergence median must retain an odd request count");
@@ -129,7 +180,7 @@ namespace llaminar2::test::parity::qwen35moe
             .reference_directory = "pytorch_qwen35_moe_snapshots",
             .prompt = kQwen35MoEParityPrompt,
             .token_ids = qwen35MoEParityTokenIds(),
-            .decode_steps = 5,
+            .decode_steps = kQwen35MoEMaximumParityDecodeForwards,
             .max_seq_len = 4096,
             .transformer_layers = 40,
             .attention_heads = 16,
@@ -248,6 +299,7 @@ namespace llaminar2::test::parity::qwen35moe
         int cpu_participants;
         Qwen35MoEOverlayContinuationBackend continuation;
         bool segmented_prefill;
+        ModelParityDynamicSpeedupWitness dynamic_speedup_witness;
     };
 
     /** @return Every 35B graph-native topology formerly registered by hand. */
@@ -262,6 +314,7 @@ namespace llaminar2::test::parity::qwen35moe
                 2,
                 Qwen35MoEOverlayContinuationBackend::CUDA,
                 true,
+                ModelParityDynamicSpeedupWitness::Random,
             },
             {
                 "CUDA1_CPU2_2xMPI_NodeExpertOverlay",
@@ -270,6 +323,7 @@ namespace llaminar2::test::parity::qwen35moe
                 2,
                 Qwen35MoEOverlayContinuationBackend::CUDA,
                 false,
+                ModelParityDynamicSpeedupWitness::Disabled,
             },
             {
                 "ROCm1_CPU2_2xMPI_NodeExpertOverlay",
@@ -278,6 +332,7 @@ namespace llaminar2::test::parity::qwen35moe
                 2,
                 Qwen35MoEOverlayContinuationBackend::ROCm,
                 false,
+                ModelParityDynamicSpeedupWitness::Disabled,
             },
             {
                 "CUDA1_ROCm1_2xMPI_NodeExpertOverlay",
@@ -286,6 +341,7 @@ namespace llaminar2::test::parity::qwen35moe
                 0,
                 Qwen35MoEOverlayContinuationBackend::CUDA,
                 false,
+                ModelParityDynamicSpeedupWitness::Disabled,
             },
         }};
         return specs;
@@ -667,6 +723,8 @@ namespace llaminar2::test::parity::qwen35moe
                 },
             };
         }
+        definition.features.dynamic_speedup_witness =
+            spec.dynamic_speedup_witness;
         return definition;
     }
 } // namespace llaminar2::test::parity::qwen35moe

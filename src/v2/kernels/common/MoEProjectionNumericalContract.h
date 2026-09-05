@@ -1,6 +1,6 @@
 /**
  * @file MoEProjectionNumericalContract.h
- * @brief Backend-neutral arithmetic constants for movable MoE projections.
+ * @brief Backend-neutral arithmetic constants for every MoE projection.
  *
  * ExpertOverlay may execute one expert on CUDA in one residency epoch and on
  * ROCm in the next.  Placement must not silently select a different numerical
@@ -17,6 +17,24 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Select arithmetic for the reusable CPU projection implementation.
+     *
+     * This policy distinguishes projection semantics, never expert placement.
+     * Ordinary non-expert CPU projections may retain their backend-native
+     * reduction schedule. Every CPU expert projection, whether static or
+     * dynamically placed, must use @ref GPUAlignedExpert so that CPU, CUDA,
+     * and ROCm execute one immutable numerical program.
+     *
+     * Production expert callers do not choose this policy: typed expert
+     * preparation APIs bind @ref GPUAlignedExpert unconditionally.
+     */
+    enum class CPUProjectionNumericalPolicy : std::uint8_t
+    {
+        BackendNative = 0,   ///< Ordinary non-expert CPU projection arithmetic.
+        GPUAlignedExpert = 1 ///< Canonical CPU/CUDA/ROCm expert arithmetic.
+    };
+
     /**
      * @brief Immutable numerical policy shared by heterogeneous MoE kernels.
      *
@@ -39,7 +57,7 @@ namespace llaminar2
         static constexpr int ordered_k_partitions = 16;
 
         /**
-         * Number of ordered FP32 lanes in every movable floating projection.
+         * Number of ordered FP32 lanes in every GPU-aligned expert projection.
          *
          * A CPU tier emulates these logical lanes; CUDA and ROCm map one lane
          * to one thread. The value is arithmetic identity rather than launch
@@ -50,7 +68,7 @@ namespace llaminar2
         /**
          * @brief Report whether a source policy has a certified heterogeneous tree.
          *
-         * Every source format accepted by the movable-expert registry uses the
+         * Every source format accepted by the expert registry uses the
          * same sixteen-partition tree. The physical decoder remains selected by
          * codebook, but placement cannot also select a backend-trained reduction
          * parenthesization. Reserved codebook ids remain rejected so a newly
@@ -93,6 +111,29 @@ namespace llaminar2
             return blocks < ordered_k_partitions
                        ? blocks
                        : ordered_k_partitions;
+        }
+
+        /**
+         * @brief Report whether every ordered partition contains one Q8 block.
+         *
+         * In this geometry, forming each partition from positive zero and then
+         * folding partitions in order is byte-identical to the ordinary
+         * GPU-aligned running accumulator: both execute `+0 + contribution[0]`
+         * followed by increasing block contributions. Kernels may therefore
+         * omit partition-loop bookkeeping without changing arithmetic.
+         *
+         * @param reduction_width Number of source values reduced by the row.
+         * @return True only for a valid width whose partition count equals its
+         *         NativeVNNI block count.
+         */
+        static constexpr bool oneNativeVNNIBlockPerOrderedPartition(
+            int reduction_width) noexcept
+        {
+            const int partitions =
+                orderedKPartitionsForWidth(reduction_width);
+            return partitions > 0 &&
+                   partitions ==
+                       reduction_width / native_vnni_values_per_block;
         }
     };
 }

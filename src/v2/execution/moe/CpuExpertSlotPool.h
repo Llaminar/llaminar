@@ -7,13 +7,15 @@
  * gate/up/down GEMM objects created before inference begins. A lease is
  * identified by `(expert, epoch)`, allowing an old and candidate epoch to
  * retain the same logical expert concurrently until RCU ticket retirement
- * releases the old engine aliases.
+ * releases the old engine aliases. Exact-geometry layers may share one pool;
+ * each lease is therefore identified by `(layer, expert, epoch)`.
  */
 
 #pragma once
 
 #include "ExpertWeightFormat.h"
 #include "ExpertTierWeightStream.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,7 +31,7 @@ namespace llaminar2
     class ITensorGemm;
 
     /**
-     * @brief Preallocated CPU execution slots owned by one layer/participant.
+     * @brief Preallocated CPU execution slots owned by one participant/geometry.
      *
      * Slot buffers are never resized after construction. The physical transfer
      * writes every byte before `MoEOverlayPreparedProjectionOperation` publishes
@@ -114,6 +116,7 @@ namespace llaminar2
         struct Lease
         {
             int slot_index = -1;
+            int layer_idx = -1;
             int expert_id = -1;
             std::uint64_t residency_epoch = 0;
             /** Shared control block that returns the slot after all aliases die. */
@@ -139,7 +142,18 @@ namespace llaminar2
          * @throws std::invalid_argument for invalid geometry/format/topology.
          * @throws std::runtime_error when strict NUMA binding cannot be installed.
          */
-        static std::shared_ptr<CpuExpertSlotPool> create(Config config);
+        static std::shared_ptr<CpuExpertSlotPool> create(
+            Config config,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+            PhysicalMemoryOwner owner);
+
+        /**
+         * @brief Materialize an explicitly unadmitted pool for isolated tests.
+         *
+         * Naming the bypass keeps test fixtures concise without allowing a
+         * production caller to omit aggregate CPU admission accidentally.
+         */
+        static std::shared_ptr<CpuExpertSlotPool> createForTest(Config config);
 
         /**
          * @brief Reserve one inactive slot for an exact candidate epoch.
@@ -148,6 +162,25 @@ namespace llaminar2
          * @return Complete writable triplet, or no value on capacity pressure.
          */
         [[nodiscard]] std::optional<Lease> acquire(
+            int expert_id,
+            std::uint64_t residency_epoch);
+
+        /**
+         * @brief Reserve one slot for a layer sharing this exact geometry.
+         *
+         * CPU expert engines are projection-geometry objects; no arithmetic
+         * state is specific to a transformer-layer number. Including the
+         * logical layer in the lease identity therefore permits a bounded
+         * geometry arena to recycle physical bytes across layers without
+         * allowing equal expert ids from two layers to alias.
+         *
+         * @param layer_idx Logical transformer layer receiving the expert.
+         * @param expert_id Logical expert identity within that layer.
+         * @param residency_epoch Positive candidate RCU epoch.
+         * @return Complete writable triplet, or no value on pressure/duplicate.
+         */
+        [[nodiscard]] std::optional<Lease> acquireForLayer(
+            int layer_idx,
             int expert_id,
             std::uint64_t residency_epoch);
 
@@ -160,9 +193,15 @@ namespace llaminar2
         /** @return Immediately reservable inactive slots. */
         [[nodiscard]] std::size_t availableSlots() const noexcept;
 
+        /** @return Exact physical RAM retained by every projection allocation. */
+        [[nodiscard]] std::size_t allocationBytes() const noexcept
+        {
+            return allocation_bytes_;
+        }
+
         /**
-         * @brief Find the slot for one exact expert/epoch identity.
-         * @return Slot index when that RCU version remains retained.
+         * @brief Find a setup-layer slot for one exact expert/epoch identity.
+         * @return Slot index when that setup-layer RCU version remains retained.
          */
         [[nodiscard]] std::optional<int> slotFor(
             int expert_id,
@@ -174,7 +213,7 @@ namespace llaminar2
             return config_.participant_id;
         }
 
-        /** @return Transformer layer owning these projection geometries. */
+        /** @return Setup layer whose geometry defines this reusable pool. */
         [[nodiscard]] int layerIndex() const noexcept
         {
             return config_.layer_idx;
@@ -191,16 +230,31 @@ namespace llaminar2
         struct Slot;
 
         /** @brief Take already materialized slots after complete validation. */
-        CpuExpertSlotPool(Config config, std::vector<Slot> slots);
+        CpuExpertSlotPool(
+            Config config,
+            std::vector<Slot> slots,
+            std::optional<PhysicalMemoryAllocationLease> memory_lease,
+            std::size_t allocation_bytes);
+
+        /** @brief Shared checked implementation for production and test creation. */
+        static std::shared_ptr<CpuExpertSlotPool> createImpl(
+            Config config,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+            PhysicalMemoryOwner owner,
+            bool admitted);
 
         /** @brief Return a slot only for the exact generation that acquired it. */
         void release(
             int slot_index,
+            int layer_idx,
             int expert_id,
             std::uint64_t residency_epoch) noexcept;
 
         Config config_;
+        /** Claim remains live until every owned projection has been destroyed. */
+        std::optional<PhysicalMemoryAllocationLease> memory_lease_;
         std::vector<Slot> slots_;
+        std::size_t allocation_bytes_ = 0u;
         mutable std::mutex mutex_;
     };
 

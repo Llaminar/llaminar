@@ -580,7 +580,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
     std::vector<Q4_0Block> host_blocks(total_blocks);
     fill_q4_0_blocks(host_blocks.data(), total_blocks);
 
-    LoadOrchestrator orch(backend_);
+    LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
     orch.planWeight(0, "chunked_q4_0", N, K, 16, false, false, raw_bytes);
     orch.allocate(/*pinned_slot_size=*/16 * raw_bytes_per_row,
@@ -621,7 +621,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_K_RowChunkedWeightMatchesUnchunkedLayout)
     std::vector<Q4_KBlock> host_blocks(static_cast<size_t>(N) * superblocks_per_row);
     fill_q4k_blocks(host_blocks.data(), static_cast<int>(host_blocks.size()));
 
-    LoadOrchestrator orch(backend_);
+    LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
     orch.planWeight(0, "chunked_q4_k", N, K, 16, true, false, raw_bytes);
     orch.allocate(/*pinned_slot_size=*/raw_bytes_per_superblock_column,
@@ -668,7 +668,7 @@ TEST(Test__DeviceLoadPipelineCUDA, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
     std::vector<Q4_0Block> host_blocks(total_blocks);
     fill_q4_0_blocks(host_blocks.data(), total_blocks);
 
-    LoadOrchestrator orch(backend);
+    LoadOrchestrator orch(backend, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
     orch.planWeight(0, "cuda_chunked_q4_0", N, K, 16, false, false, raw_bytes);
     orch.allocate(raw_bytes_per_block_column, 2);
@@ -974,7 +974,7 @@ TEST_F(Test__DeviceLoadPipeline, LoadOrchestratorEndToEnd)
     fill_q4k_blocks(q4k_data.data(), total_sb);
 
     // Setup orchestrator
-    LoadOrchestrator orch(backend_);
+    LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
 
     orch.planWeight(0, "w_q4_0", N, K, 16, false, false, raw_bytes);

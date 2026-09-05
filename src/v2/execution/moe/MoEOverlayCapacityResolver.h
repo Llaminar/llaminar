@@ -20,10 +20,13 @@
 #include "MoEOverlayPhysicalResidencyFabric.h"
 #include "MoERoutedExpertPlacementPlan.h"
 #include "backends/DeviceId.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
@@ -59,13 +62,85 @@ namespace llaminar2
      * common budget. `usable_budget_bytes` is already the minimum of discovered
      * allocatable memory and any explicit user limit.
      */
-    struct MoEOverlayPhysicalMemoryBudget
+    class MoEOverlayPhysicalMemoryBudget final
     {
-        std::string resource_id;
-        DeviceId device = DeviceId::invalid();
-        std::size_t usable_budget_bytes = 0;
-        std::size_t fixed_bytes = 0;
-        std::size_t transfer_staging_bytes = 0;
+    public:
+        /** @brief Bind one logical join identity to a certified physical BOM. */
+        MoEOverlayPhysicalMemoryBudget(
+            std::string resource_id,
+            PhysicalMemoryAdmissionCertificate certificate)
+            : resource_id_(std::move(resource_id)),
+              certificate_(std::move(certificate))
+        {
+            if (resource_id_.empty())
+                throw std::invalid_argument(
+                    "ExpertOverlay physical memory identity cannot be empty");
+        }
+
+        /** @return Stable logical identity used by tier participants. */
+        [[nodiscard]] const std::string &resourceId() const noexcept
+        {
+            return resource_id_;
+        }
+
+        /** @return Physical CPU/CUDA/ROCm allocator. */
+        [[nodiscard]] DeviceId device() const noexcept
+        {
+            return certificate_.bom().resource().device;
+        }
+
+        /** @return Certified fixed/staging allocation authority. */
+        [[nodiscard]] const PhysicalMemoryAdmissionCertificate &certificate()
+            const noexcept
+        {
+            return certificate_;
+        }
+
+        /** @return Sampled allocatable capacity for this resource. */
+        [[nodiscard]] std::size_t usableBudgetBytes() const noexcept
+        {
+            return certificate_.bom().resource()
+                .admission_available_bytes;
+        }
+
+        /** @return Base non-staging incremental allocation bytes. */
+        [[nodiscard]] std::size_t fixedBytes() const noexcept
+        {
+            const auto &bom = certificate_.bom();
+            return bom.incrementalBytes() - transferStagingBytes();
+        }
+
+        /** @return Complete typed staging charge in this base certificate. */
+        [[nodiscard]] std::size_t transferStagingBytes() const noexcept
+        {
+            const auto &bom = certificate_.bom();
+            return bom.bytes(PhysicalMemoryOwner::WeightLoadStaging) +
+                   bom.bytes(
+                       PhysicalMemoryOwner::ActivationTransportStaging) +
+                   bom.bytes(PhysicalMemoryOwner::ExpertMigrationStaging);
+        }
+
+        /** @return Same owner charges certified against a new availability. */
+        [[nodiscard]] MoEOverlayPhysicalMemoryBudget withAvailableBytes(
+            std::size_t available_bytes) const
+        {
+            const auto &source = certificate_.bom();
+            PhysicalMemoryBOMBuilder builder(
+                PhysicalMemoryResource{
+                    .world_rank = source.resource().world_rank,
+                    .device = source.resource().device,
+                    .total_bytes = source.resource().total_bytes,
+                    .admission_available_bytes = available_bytes,
+                },
+                source);
+            return MoEOverlayPhysicalMemoryBudget(
+                resource_id_,
+                PhysicalMemoryAdmissionCertificate(builder.build()));
+        }
+
+    private:
+        std::string resource_id_;
+        PhysicalMemoryAdmissionCertificate certificate_;
     };
 
     /** @brief One logical participant's binding to a physical memory authority. */
@@ -73,8 +148,10 @@ namespace llaminar2
     {
         int participant_id = -1;
         std::string resource_id;
-        /** Zero is valid for an immutable/static plan with no migration fabric. */
+        /** Per-layer arrival bound; zero disables the migration arena. */
         std::size_t shadow_slots_per_layer = 1;
+        /** Global concurrently live arrivals across all exact geometries. */
+        std::size_t maximum_concurrent_shadow_slots = 1;
     };
 
     /**
@@ -156,19 +233,117 @@ namespace llaminar2
     };
 
     /** @brief Auditable memory BOM for one unique physical resource. */
-    struct MoEOverlayResolvedPhysicalMemory
+    class MoEOverlayResolvedPhysicalMemory final
     {
-        std::string resource_id;
-        DeviceId device = DeviceId::invalid();
-        std::size_t usable_budget_bytes = 0;
-        std::size_t fixed_bytes = 0;
-        std::size_t transfer_staging_bytes = 0;
-        std::size_t shadow_bytes = 0;
-        std::size_t live_expert_bytes = 0;
-        std::size_t used_bytes = 0;
-        std::size_t remaining_bytes = 0;
+    public:
+        /** @brief Publish the final certified BOM and its copy geometry. */
+        MoEOverlayResolvedPhysicalMemory(
+            std::string resource_id,
+            std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>
+                authority,
+            PhysicalMemoryAllocatorIdentity identity,
+            std::vector<int> live_copies_per_layer,
+            std::vector<int> shadow_arrival_capacity_per_layer)
+            : resource_id_(std::move(resource_id)),
+              authority_(std::move(authority)),
+              identity_(identity),
+              live_copies_per_layer(std::move(live_copies_per_layer)),
+              shadow_arrival_capacity_per_layer(
+                  std::move(shadow_arrival_capacity_per_layer))
+        {
+            if (resource_id_.empty() || !authority_ ||
+                !authority_->plan().find(identity_))
+            {
+                throw std::invalid_argument(
+                    "Resolved ExpertOverlay memory requires a non-empty identity and shared admitted resource");
+            }
+        }
+
+        /** @return Logical join identity used by participant plans. */
+        [[nodiscard]] const std::string &resourceId() const noexcept
+        {
+            return resource_id_;
+        }
+
+        /** @return CPU/CUDA/ROCm allocator owning this plan. */
+        [[nodiscard]] DeviceId device() const noexcept
+        {
+            return identity_.device;
+        }
+
+        /** @return Canonical resource BOM owned by the aggregate authority. */
+        [[nodiscard]] const PhysicalMemoryBOM &bom() const noexcept
+        {
+            return *authority_->plan().find(identity_);
+        }
+
+        /** @return Sole topology-wide admission authority behind this view. */
+        [[nodiscard]] const std::shared_ptr<
+            const PhysicalMemoryPlanAdmissionCertificate> &authority()
+            const noexcept
+        {
+            return authority_;
+        }
+
+        /** @return Complete bytes across all physical owner categories. */
+        [[nodiscard]] std::size_t usedBytes() const noexcept
+        {
+            return bom().incrementalBytes();
+        }
+
+        /** @return Unassigned bytes after all fixed and expert owners. */
+        [[nodiscard]] std::size_t remainingBytes() const noexcept
+        {
+            return bom().remainingBytes();
+        }
+
+        /** @return Sampled allocatable bytes for the final resource. */
+        [[nodiscard]] std::size_t usableBudgetBytes() const noexcept
+        {
+            return bom().resource()
+                .admission_available_bytes;
+        }
+
+        /** @return Final inactive expert-bank bytes. */
+        [[nodiscard]] std::size_t shadowBytes() const
+        {
+            return bom().bytes(
+                PhysicalMemoryOwner::ExpertShadowSlots);
+        }
+
+        /** @return Final live prepared routed-expert bytes. */
+        [[nodiscard]] std::size_t liveExpertBytes() const
+        {
+            return bom().bytes(
+                PhysicalMemoryOwner::RoutedExpertWeights);
+        }
+
+        /** @return Weight-load, activation, and migration staging bytes. */
+        [[nodiscard]] std::size_t transferStagingBytes() const
+        {
+            const auto &memory = bom();
+            return memory.bytes(PhysicalMemoryOwner::WeightLoadStaging) +
+                   memory.bytes(
+                       PhysicalMemoryOwner::ActivationTransportStaging) +
+                   memory.bytes(PhysicalMemoryOwner::ExpertMigrationStaging);
+        }
+
+        /** @return Incremental non-expert, non-staging base bytes. */
+        [[nodiscard]] std::size_t fixedBytes() const
+        {
+            return usedBytes() - transferStagingBytes() - shadowBytes() -
+                   liveExpertBytes();
+        }
+
         std::vector<int> live_copies_per_layer;
-        std::vector<int> shadow_copies_per_layer;
+        /** Logical arrival bound; physical shared-arena bytes live in the BOM. */
+        std::vector<int> shadow_arrival_capacity_per_layer;
+
+    private:
+        std::string resource_id_;
+        std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>
+            authority_;
+        PhysicalMemoryAllocatorIdentity identity_;
     };
 
     /** @brief Immutable capacity result consumed by placement and admission. */
@@ -177,6 +352,9 @@ namespace llaminar2
         int num_experts = 0;
         std::vector<MoEOverlayPreparedExpertFootprint> layer_footprints;
         std::vector<MoEOverlayResolvedTierCapacity> tiers;
+        /** One immutable admission proof for every CPU/GPU allocator. */
+        std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>
+            physical_memory_admission;
         std::vector<MoEOverlayResolvedPhysicalMemory> physical_resources;
 
         /** @return Resolved tier entry for an external stable tier index. */

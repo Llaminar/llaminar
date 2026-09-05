@@ -196,6 +196,49 @@ namespace llaminar2
         if (config_.lane_name.empty())
             throw std::invalid_argument(
                 "GPU host-relay lane requires a stable non-empty name");
+        const auto valid_staging = [&](const auto &regions, DeviceId device)
+        {
+            return std::all_of(
+                regions.begin(),
+                regions.end(),
+                [&](const auto &region)
+                {
+                    return region && region->isBound() &&
+                           region->devices().size() == 1u &&
+                           region->hasDevice(device) &&
+                           region->contains(
+                               0u, config_.staging_capacity_bytes);
+                });
+        };
+        if (!valid_staging(
+                config_.source_mapped_staging,
+                config_.source_device) ||
+            !valid_staging(
+                config_.destination_mapped_staging,
+                config_.destination_device))
+        {
+            throw std::invalid_argument(
+                "GPU host-relay lane requires four complete exact-device mapped staging slices");
+        }
+        const std::array<const void *, 4> host_addresses{
+            config_.source_mapped_staging[0]->mutableHostData(),
+            config_.source_mapped_staging[1]->mutableHostData(),
+            config_.destination_mapped_staging[0]->mutableHostData(),
+            config_.destination_mapped_staging[1]->mutableHostData(),
+        };
+        bool staging_aliases = false;
+        for (std::size_t lhs = 0u; lhs < host_addresses.size(); ++lhs)
+        {
+            for (std::size_t rhs = lhs + 1u;
+                 rhs < host_addresses.size(); ++rhs)
+            {
+                staging_aliases = staging_aliases ||
+                                  host_addresses[lhs] == host_addresses[rhs];
+            }
+        }
+        if (staging_aliases)
+            throw std::invalid_argument(
+                "GPU host-relay lane staging slices must be pairwise disjoint");
         if (!config_.source_progress_epoch ||
             !config_.destination_progress_epoch ||
             config_.source_progress_epoch->device() != config_.source_device ||
@@ -270,27 +313,20 @@ namespace llaminar2
         try
         {
             /*
-             * Each staging allocation is mapped only into the GPU that touches
-             * it. The setup thread first-touches both host regions; a bounded
-             * CPU memcpy is the sole portable CUDA/HIP ownership bridge.
+             * Each slice is mapped only into the GPU that touches it. The
+             * fabric already first-touched one pool-wide slab per endpoint; a
+             * bounded CPU memcpy remains the sole portable CUDA/HIP ownership
+             * bridge. Materialization must not call a native allocator here:
+             * doing so would scale KFD/CUDA mapping work with logical edges.
              */
-            TransferEngine transfer_engine;
-            const std::array<DeviceId, 1> source_devices{
-                config_.source_device};
-            const std::array<DeviceId, 1> destination_devices{
-                config_.destination_device};
             for (std::size_t slot_index = 0u;
                  slot_index < slots_.size(); ++slot_index)
             {
                 Slot &slot = slots_[slot_index];
                 slot.source_mapped =
-                    transfer_engine.allocateMappedHostRegion(
-                        config_.staging_capacity_bytes,
-                        source_devices);
+                    config_.source_mapped_staging[slot_index];
                 slot.destination_mapped =
-                    transfer_engine.allocateMappedHostRegion(
-                        config_.staging_capacity_bytes,
-                        destination_devices);
+                    config_.destination_mapped_staging[slot_index];
                 slot.source_progress =
                     config_.source_progress_epoch->reserveSlot(
                         MappedTransferDirection::DeviceToHost,

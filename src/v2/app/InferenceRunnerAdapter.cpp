@@ -191,10 +191,10 @@ namespace llaminar2
             orch_runner_->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
     }
 
-    bool InferenceRunnerAdapter::waitForLastForwardCompletionForBenchmark()
+    bool InferenceRunnerAdapter::waitForLastInferenceCompletionForBenchmark()
     {
         return orch_runner_ &&
-               orch_runner_->waitForLastForwardCompletionForBenchmark();
+               orch_runner_->waitForLastInferenceCompletionForBenchmark();
     }
 
     InferenceReadiness

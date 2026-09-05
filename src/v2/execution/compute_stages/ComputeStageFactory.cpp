@@ -432,12 +432,6 @@ namespace llaminar2
         return std::make_unique<GDNRecurrenceStage>(params);
     }
 
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createGDNLiveStateLocalize(
-        const GDNLiveStateLocalizeStage::Params &params)
-    {
-        return std::make_unique<GDNLiveStateLocalizeStage>(params);
-    }
-
     std::unique_ptr<IComputeStage> ComputeStageFactory::createGDNLiveStateAllGather(
         const GDNLiveStateAllGatherStage::Params &params)
     {

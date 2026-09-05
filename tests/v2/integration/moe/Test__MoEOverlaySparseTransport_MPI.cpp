@@ -787,7 +787,8 @@ namespace llaminar2::test
                                 int logical_rows,
                                 int physical_rows,
                                 int draft_depth = -1,
-                                int sidecar_depth = -1)
+                                int sidecar_depth = -1,
+                                std::uint64_t retired_decode_tokens = 0u)
         {
             const std::uint64_t ticket_ordinal = ordinal++;
             expected.push_back(makeMoEOverlayInferenceExecutionTicket(
@@ -801,22 +802,38 @@ namespace llaminar2::test
                 logical_rows,
                 physical_rows,
                 draft_depth,
-                sidecar_depth));
+                sidecar_depth,
+                /*prefill_schedule_workload=*/{},
+                retired_decode_tokens));
         };
 
         /* One bucketed prefill and serial decode precede depth-2/depth-3 cycles. */
         append(MoEOverlayInferenceGraphRole::MainPrefill, 4, 4);
         append(MoEOverlayInferenceGraphRole::MainDecode, 1, 1);
-        append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 2, 0);
-        append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 2, 1);
-        append(MoEOverlayInferenceGraphRole::MTPGroupedVerifier, 3, 4, 2);
-        append(MoEOverlayInferenceGraphRole::MainDecode, 1, 1);
-        append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 3, 0);
-        append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 3, 1);
-        append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 3, 2);
-        append(MoEOverlayInferenceGraphRole::MTPGroupedVerifier, 4, 4, 3);
+        append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 2, 0, 1u);
+        append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 2, 1, 1u);
+        append(
+            MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
+            3,
+            4,
+            2,
+            -1,
+            1u);
+        append(MoEOverlayInferenceGraphRole::MainDecode, 1, 1, -1, -1, 4u);
+        append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 3, 0, 5u);
+        append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 3, 1, 5u);
+        append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 3, 2, 5u);
+        append(
+            MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
+            4,
+            4,
+            3,
+            -1,
+            5u);
         RecordingTransactionExecutor executor;
         std::uint64_t retired_prefill_tokens = 0u;
+        std::uint64_t retired_decode_tokens = 0u;
+        std::uint64_t retired_decode_notifications = 0u;
         if (rank_ == 0)
         {
             MoEOverlayInferenceTransactionPublisher publisher({
@@ -845,17 +862,19 @@ namespace llaminar2::test
                         ticket.physical_rows_per_request,
                     .draft_depth = ticket.draft_depth,
                     .sidecar_depth = ticket.sidecar_depth,
+                    .retired_decode_progress_tokens =
+                        ticket.retired_decode_progress_tokens,
                 });
                 ASSERT_TRUE(published.ok) << published.error;
                 EXPECT_EQ(published.ticket, ticket);
                 if (index == 0u)
                 {
-                    EXPECT_FALSE(publisher.complete(17, &error))
+                    EXPECT_FALSE(publisher.complete(17, 0u, &error))
                         << "Complete must not overtake a live data-plane return";
                 }
                 ASSERT_TRUE(publisher.retire(published, &error)) << error;
             }
-            ASSERT_TRUE(publisher.complete(17, &error)) << error;
+            ASSERT_TRUE(publisher.complete(17, 9u, &error)) << error;
             EXPECT_EQ(publisher.state(),
                       MoEOverlayInferenceProtocolState::Complete);
         }
@@ -879,6 +898,16 @@ namespace llaminar2::test
                     retired_prefill_tokens += completed_tokens;
                     return true;
                 },
+                .retired_decode_progress_sink =
+                    [&retired_decode_tokens,
+                     &retired_decode_notifications](
+                        std::uint64_t completed_tokens,
+                        std::string *)
+                {
+                    retired_decode_tokens += completed_tokens;
+                    ++retired_decode_notifications;
+                    return true;
+                },
             });
             const auto result = follower.runOneCommand();
             ASSERT_TRUE(result.ok) << result.error;
@@ -887,6 +916,10 @@ namespace llaminar2::test
             EXPECT_EQ(executor.tickets, expected);
             EXPECT_EQ(retired_prefill_tokens, 8u)
                 << "The follower must sideband request_count times real rows";
+            EXPECT_EQ(retired_decode_tokens, 9u);
+            EXPECT_EQ(retired_decode_notifications, 4u)
+                << "Repeated graph tickets in one sequence must not duplicate progress";
+            EXPECT_EQ(result.retired_decode_progress_tokens, 9u);
             EXPECT_EQ(follower.state(),
                       MoEOverlayInferenceProtocolState::Complete);
         }

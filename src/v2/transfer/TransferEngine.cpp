@@ -13,10 +13,12 @@
 #include "transfer/TransferEngine.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -27,6 +29,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
 #include "backends/IGPUGraphCapture.h"
+#include "backends/IWorkerGPUContext.h"
 #include "collective/BackendRouter.h"
 #include "collective/ICollectiveBackend.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -281,200 +284,295 @@ namespace llaminar2
     TransferEngine::completeExclusiveModelRetirement(
         ExclusiveModelRetirementTicket &&ticket) const
     {
-        if (!ticket.valid_)
+        std::vector<ExclusiveModelRetirementTicket> tickets;
+        tickets.reserve(1u);
+        tickets.push_back(std::move(ticket));
+        auto receipts = completeExclusiveModelRetirements(
+            std::move(tickets));
+        if (receipts.size() != 1u)
         {
             throw std::logic_error(
-                "Exclusive model-retirement ticket was moved or already consumed");
+                "Single-device model retirement produced an invalid receipt cardinality");
         }
+        return std::move(receipts.front());
+    }
 
-        const DeviceId device = ticket.retention_.device;
-        const size_t expected_retired_bytes =
-            ticket.retention_.totalBytes();
-        ticket.valid_ = false;
-
-        IBackend *const backend = resolveBackend(device);
-        if (!backend)
+    std::vector<DeviceMemoryReclamationReceipt>
+    TransferEngine::completeExclusiveModelRetirements(
+        std::vector<ExclusiveModelRetirementTicket> &&tickets) const
+    {
+        if (tickets.empty())
         {
-            throw std::runtime_error(
-                "Exclusive model retirement has no backend for " +
-                device.toString());
+            throw std::invalid_argument(
+                "Exclusive model-retirement batch requires at least one ticket");
         }
+
+        struct PendingRetirement final
+        {
+            ExclusiveModelRetirementTicket *ticket = nullptr;
+            DeviceId device = DeviceId::invalid();
+            IBackend *backend = nullptr;
+        };
+
+        std::set<DeviceId> devices;
+        std::vector<PendingRetirement> pending;
+        pending.reserve(tickets.size());
+        for (auto &ticket : tickets)
+        {
+            if (!ticket.valid_)
+            {
+                throw std::logic_error(
+                    "Exclusive model-retirement batch contains a moved or already consumed ticket");
+            }
+            const DeviceId device = ticket.retention_.device;
+            if (!devices.insert(device).second)
+            {
+                throw std::invalid_argument(
+                    "Exclusive model-retirement batch contains duplicate device " +
+                    device.toString());
+            }
+            IBackend *const backend = resolveBackend(device);
+            if (!backend)
+            {
+                throw std::runtime_error(
+                    "Exclusive model retirement has no backend for " +
+                    device.toString());
+            }
+            pending.push_back(PendingRetirement{
+                .ticket = &ticket,
+                .device = device,
+                .backend = backend,
+            });
+        }
+
+        /* Completion is an irrevocable topology transition. Consume every
+         * obligation together before destroying a collective or worker owner;
+         * a partially reset model cannot safely retry the remaining tickets. */
+        for (auto &retirement : pending)
+            retirement.ticket->valid_ = false;
 
         /* Collective libraries own native streams, events, communicators, and
-         * internal allocations that are intentionally outside IBackend's
-         * tensor-allocation registry. Retire that process authority first;
-         * resetting HIP/CUDA underneath a pooled coordinator leaves stale
-         * handles whose later destructor enters an invalid primary context. */
-        const CollectiveRuntimeRetirementReceipt collective_retirement =
-            GlobalBackendRouter::retireForExclusiveDeviceRuntimeReset(
-                device);
-        if (!collective_retirement.complete())
+         * internal allocations outside IBackend's tensor ledger. Retire the
+         * complete participant set before touching any primary context so a
+         * peer communicator cannot retain another device's generation. */
+        for (const auto &retirement : pending)
         {
-            std::ostringstream error;
-            error
-                << "Exclusive runtime-generation retirement found live "
-                   "collective ownership for "
-                << device.toString()
-                << " state="
-                << static_cast<int>(collective_retirement.state)
-                << " active_owners="
-                << collective_retirement.active_owners
-                << ": "
-                << (collective_retirement.diagnostic.empty()
-                        ? "collective authority returned an incomplete receipt"
-                        : collective_retirement.diagnostic);
-            throw std::runtime_error(error.str());
+            const CollectiveRuntimeRetirementReceipt collective_retirement =
+                GlobalBackendRouter::retireForExclusiveDeviceRuntimeReset(
+                    retirement.device);
+            if (!collective_retirement.complete())
+            {
+                std::ostringstream error;
+                error
+                    << "Exclusive runtime-generation retirement found live "
+                       "collective ownership for "
+                    << retirement.device.toString()
+                    << " state="
+                    << static_cast<int>(collective_retirement.state)
+                    << " active_owners="
+                    << collective_retirement.active_owners
+                    << ": "
+                    << (collective_retirement.diagnostic.empty()
+                            ? "collective authority returned an incomplete receipt"
+                            : collective_retirement.diagnostic);
+                throw std::runtime_error(error.str());
+            }
         }
 
-        /*
-         * All graph/model owners named by the ticket are gone. Keep context
-         * acquisition excluded from worker destruction through native runtime
-         * reset: HIP direct-dispatch handlers retain graph-touched slabs beyond
-         * hipFree and stream destruction, and only generation retirement ends
-         * that hidden ownership. CUDA implements the same lifecycle contract
-         * so sequential JIT model loading has backend-symmetric semantics.
-         */
-        auto context_retirement =
-            GPUDeviceContextPool::instance()
-                .beginExclusiveGenerationRetirement(device);
-        const GPUDeviceContextGenerationRetirementReceipt context_receipt =
-            context_retirement.receipt();
-        const DeviceRuntimeGenerationRetirementRequest runtime_request(
-            device.gpu_ordinal());
-        const DeviceRuntimeGenerationRetirementResult runtime_receipt =
-            backend->retireExclusiveDeviceRuntimeGeneration(runtime_request);
-        if (!runtime_receipt.supported || !runtime_receipt.success ||
-            !runtime_receipt.reset_invoked ||
-            runtime_receipt.retired_generation == 0u ||
-            runtime_receipt.active_generation !=
-                runtime_receipt.retired_generation + 1u ||
-            runtime_receipt.tracked_device_allocations != 0u ||
-            runtime_receipt.tracked_device_allocation_bytes != 0u ||
-            runtime_receipt.tracked_host_registrations != 0u)
+        /* Hold every acquisition-exclusion scope simultaneously. Destroying
+         * all worker streams, BLAS handles, events, and peer mappings before
+         * the first cudaDeviceReset/hipDeviceReset is the critical batch edge:
+         * sequential context destruction lets an unretired peer keep hundreds
+         * of MiB of driver state alive across the reset. */
+        std::vector<ExclusiveGPUDeviceGenerationRetirement>
+            context_retirements;
+        std::vector<GPUDeviceContextGenerationRetirementReceipt>
+            context_receipts;
+        context_retirements.reserve(pending.size());
+        context_receipts.reserve(pending.size());
+        for (const auto &retirement : pending)
         {
-            std::ostringstream error;
-            error
-                << "Exclusive runtime-generation retirement failed for "
-                << device.toString()
-                << " backend=" << backend->backendName()
-                << " reset_invoked="
-                << (runtime_receipt.reset_invoked ? "true" : "false")
-                << " retired_generation="
-                << runtime_receipt.retired_generation
-                << " active_generation="
-                << runtime_receipt.active_generation
-                << " tracked_device_allocations="
-                << runtime_receipt.tracked_device_allocations
-                << " tracked_device_allocation_bytes="
-                << runtime_receipt.tracked_device_allocation_bytes
-                << " tracked_host_registrations="
-                << runtime_receipt.tracked_host_registrations
-                << ": "
-                << (runtime_receipt.diagnostic.empty()
-                        ? "backend returned an incomplete runtime-reset receipt"
-                        : runtime_receipt.diagnostic);
-            throw std::runtime_error(error.str());
+            context_retirements.push_back(
+                GPUDeviceContextPool::instance()
+                    .beginExclusiveGenerationRetirement(
+                        retirement.device));
+            context_receipts.push_back(
+                context_retirements.back().receipt());
         }
 
-        /* Native generation reset already destroys graph and default-pool
-         * caches. Build the exclusive receipt directly instead of creating a
-         * fresh generation only to trim it again. */
-        DeviceMemoryReclamationReceipt receipt{
-            .device = device,
-            .intent =
-                DeviceMemoryReclamationIntent::ExclusiveModelRetirement,
-            .expected_retired_bytes = expected_retired_bytes,
-            .driver_free_bytes_before_owner_release =
-                ticket.driver_free_bytes_before_owner_release_,
-            .canonical_allocations_before_owner_release =
-                ticket.canonical_allocations_before_owner_release_,
-            .canonical_allocation_bytes_before_owner_release =
-                ticket.canonical_allocation_bytes_before_owner_release_,
-            .canonical_allocations_before_runtime_reset =
-                runtime_receipt.tracked_device_allocations,
-            .canonical_allocation_bytes_before_runtime_reset =
-                runtime_receipt.tracked_device_allocation_bytes,
-            .driver_free_bytes_before =
-                runtime_receipt.driver_free_bytes_before,
-            .driver_free_bytes_after =
-                runtime_receipt.driver_free_bytes_after,
-        };
-        if (receipt.releasedCanonicalBytes() <
-            receipt.expected_retired_bytes)
+        std::vector<DeviceRuntimeGenerationRetirementResult>
+            runtime_receipts;
+        runtime_receipts.reserve(pending.size());
+        for (const auto &retirement : pending)
         {
-            std::ostringstream error;
-            error
-                << "Exclusive model-retirement canonical allocation proof "
-                   "is incomplete for "
-                << receipt.device.toString()
-                << ": released_canonical_bytes="
-                << receipt.releasedCanonicalBytes()
-                << " expected_retired_bytes="
-                << receipt.expected_retired_bytes
-                << " canonical_allocations_before_owner_release="
-                << receipt.canonical_allocations_before_owner_release
-                << " canonical_allocation_bytes_before_owner_release="
+            const DeviceRuntimeGenerationRetirementRequest runtime_request(
+                retirement.device.gpu_ordinal());
+            runtime_receipts.push_back(
+                retirement.backend
+                    ->retireExclusiveDeviceRuntimeGeneration(
+                        runtime_request));
+            const auto &runtime_receipt = runtime_receipts.back();
+            if (!runtime_receipt.supported || !runtime_receipt.success ||
+                !runtime_receipt.reset_invoked ||
+                runtime_receipt.retired_generation == 0u ||
+                runtime_receipt.successor_generation !=
+                    runtime_receipt.retired_generation + 1u ||
+                runtime_receipt.post_reset_state !=
+                    DeviceRuntimePostResetState::Quiescent ||
+                runtime_receipt.tracked_device_allocations != 0u ||
+                runtime_receipt.tracked_device_allocation_bytes != 0u ||
+                runtime_receipt.tracked_host_registrations != 0u)
+            {
+                std::ostringstream error;
+                error
+                    << "Exclusive runtime-generation retirement failed for "
+                    << retirement.device.toString()
+                    << " backend=" << retirement.backend->backendName()
+                    << " reset_invoked="
+                    << (runtime_receipt.reset_invoked ? "true" : "false")
+                    << " retired_generation="
+                    << runtime_receipt.retired_generation
+                    << " successor_generation="
+                    << runtime_receipt.successor_generation
+                    << " post_reset_state="
+                    << to_string(runtime_receipt.post_reset_state)
+                    << " tracked_device_allocations="
+                    << runtime_receipt.tracked_device_allocations
+                    << " tracked_device_allocation_bytes="
+                    << runtime_receipt.tracked_device_allocation_bytes
+                    << " tracked_host_registrations="
+                    << runtime_receipt.tracked_host_registrations
+                    << ": "
+                    << (runtime_receipt.diagnostic.empty()
+                            ? "backend returned an incomplete runtime-reset receipt"
+                            : runtime_receipt.diagnostic);
+                throw std::runtime_error(error.str());
+            }
+        }
+
+        std::vector<DeviceMemoryReclamationReceipt> receipts;
+        receipts.reserve(pending.size());
+        for (size_t index = 0u; index < pending.size(); ++index)
+        {
+            const auto &retirement = pending[index];
+            const auto &ticket = *retirement.ticket;
+            const auto &context_receipt = context_receipts[index];
+            const auto &runtime_receipt = runtime_receipts[index];
+            const DeviceId device = retirement.device;
+            const size_t expected_retired_bytes =
+                ticket.retention_.totalBytes();
+
+            /* Native generation reset already destroys graph and default-pool
+             * caches. Build the exclusive receipt directly instead of creating
+             * a fresh generation only to trim it again. */
+            DeviceMemoryReclamationReceipt receipt{
+                .device = device,
+                .intent =
+                    DeviceMemoryReclamationIntent::ExclusiveModelRetirement,
+                .expected_retired_bytes = expected_retired_bytes,
+                .driver_free_bytes_before_owner_release =
+                    ticket.driver_free_bytes_before_owner_release_,
+                .canonical_allocations_before_owner_release =
+                    ticket.canonical_allocations_before_owner_release_,
+                .canonical_allocation_bytes_before_owner_release =
+                    ticket.canonical_allocation_bytes_before_owner_release_,
+                .canonical_allocations_before_runtime_reset =
+                    runtime_receipt.tracked_device_allocations,
+                .canonical_allocation_bytes_before_runtime_reset =
+                    runtime_receipt.tracked_device_allocation_bytes,
+                .driver_free_bytes_before =
+                    runtime_receipt.driver_free_bytes_before,
+            };
+            if (receipt.releasedCanonicalBytes() <
+                receipt.expected_retired_bytes)
+            {
+                std::ostringstream error;
+                error
+                    << "Exclusive model-retirement canonical allocation proof "
+                       "is incomplete for "
+                    << receipt.device.toString()
+                    << ": released_canonical_bytes="
+                    << receipt.releasedCanonicalBytes()
+                    << " expected_retired_bytes="
+                    << receipt.expected_retired_bytes
+                    << " canonical_allocations_before_owner_release="
+                    << receipt.canonical_allocations_before_owner_release
+                    << " canonical_allocation_bytes_before_owner_release="
+                    << receipt.canonical_allocation_bytes_before_owner_release
+                    << " canonical_allocations_before_runtime_reset="
+                    << receipt.canonical_allocations_before_runtime_reset
+                    << " canonical_allocation_bytes_before_runtime_reset="
+                    << receipt.canonical_allocation_bytes_before_runtime_reset;
+                throw std::runtime_error(error.str());
+            }
+            receipt.retired_context_generation =
+                context_receipt.retired_generation;
+            receipt.runtime_reset_invoked = runtime_receipt.reset_invoked;
+            receipt.retired_runtime_generation =
+                runtime_receipt.retired_generation;
+            receipt.successor_runtime_generation =
+                runtime_receipt.successor_generation;
+            receipt.runtime_post_reset_state =
+                runtime_receipt.post_reset_state;
+            receipt.runtime_driver_free_bytes_before =
+                runtime_receipt.driver_free_bytes_before;
+            PerfStatsCollector::addCounter(
+                "device_memory",
+                "retired_context_generations",
+                context_receipt.retiredLiveContext() ? 1.0 : 0.0,
+                "model_lifecycle",
+                device.toString(),
+                {{"generation",
+                  std::to_string(context_receipt.retired_generation)}});
+            PerfStatsCollector::addCounter(
+                "device_memory",
+                "retired_runtime_generations",
+                1.0,
+                "model_lifecycle",
+                device.toString(),
+                {{"retired_generation",
+                  std::to_string(runtime_receipt.retired_generation)},
+                 {"successor_generation",
+                  std::to_string(runtime_receipt.successor_generation)},
+                 {"post_reset_state",
+                  to_string(runtime_receipt.post_reset_state)},
+                 {"driver_free_before_bytes",
+                  std::to_string(runtime_receipt.driver_free_bytes_before)},
+                 {"released_canonical_bytes",
+                  std::to_string(receipt.releasedCanonicalBytes())},
+                 {"expected_retired_bytes",
+                  std::to_string(receipt.expected_retired_bytes)}});
+            LOG_INFO(
+                "[DeviceRuntimeGeneration] device="
+                << device.toString()
+                << " backend=" << retirement.backend->backendName()
+                << " context_generation="
+                << context_receipt.retired_generation
+                << " runtime_generation="
+                << runtime_receipt.retired_generation << "->"
+                << runtime_receipt.successor_generation
+                << " post_reset_state="
+                << to_string(runtime_receipt.post_reset_state)
+                << " canonical_allocation_bytes="
                 << receipt.canonical_allocation_bytes_before_owner_release
-                << " canonical_allocations_before_runtime_reset="
-                << receipt.canonical_allocations_before_runtime_reset
-                << " canonical_allocation_bytes_before_runtime_reset="
-                << receipt.canonical_allocation_bytes_before_runtime_reset;
-            throw std::runtime_error(error.str());
+                << "->"
+                << receipt.canonical_allocation_bytes_before_runtime_reset
+                << " driver_free_before_reset="
+                << runtime_receipt.driver_free_bytes_before);
+            receipts.push_back(std::move(receipt));
         }
-        receipt.retired_context_generation =
-            context_receipt.retired_generation;
-        receipt.runtime_reset_invoked = runtime_receipt.reset_invoked;
-        receipt.retired_runtime_generation =
-            runtime_receipt.retired_generation;
-        receipt.active_runtime_generation =
-            runtime_receipt.active_generation;
-        receipt.runtime_driver_free_bytes_before =
-            runtime_receipt.driver_free_bytes_before;
-        receipt.runtime_driver_free_bytes_after =
-            runtime_receipt.driver_free_bytes_after;
+
         PerfStatsCollector::addCounter(
             "device_memory",
-            "retired_context_generations",
-            context_receipt.retiredLiveContext() ? 1.0 : 0.0,
-            "model_lifecycle",
-            device.toString(),
-            {{"generation",
-              std::to_string(context_receipt.retired_generation)}});
-        PerfStatsCollector::addCounter(
-            "device_memory",
-            "retired_runtime_generations",
+            "retired_runtime_generation_batches",
             1.0,
             "model_lifecycle",
-            device.toString(),
-            {{"retired_generation",
-              std::to_string(runtime_receipt.retired_generation)},
-             {"active_generation",
-              std::to_string(runtime_receipt.active_generation)},
-             {"driver_free_before_bytes",
-              std::to_string(runtime_receipt.driver_free_bytes_before)},
-             {"driver_free_after_bytes",
-              std::to_string(runtime_receipt.driver_free_bytes_after)},
-             {"released_canonical_bytes",
-              std::to_string(receipt.releasedCanonicalBytes())},
-             {"expected_retired_bytes",
-              std::to_string(receipt.expected_retired_bytes)}});
+            "process",
+            {{"participants", std::to_string(receipts.size())}});
         LOG_INFO(
-            "[DeviceRuntimeGeneration] device="
-            << device.toString()
-            << " backend=" << backend->backendName()
-            << " context_generation="
-            << context_receipt.retired_generation
-            << " runtime_generation="
-            << runtime_receipt.retired_generation << "->"
-            << runtime_receipt.active_generation
-            << " canonical_allocation_bytes="
-            << receipt.canonical_allocation_bytes_before_owner_release
-            << "->"
-            << receipt.canonical_allocation_bytes_before_runtime_reset
-            << " driver_free="
-            << runtime_receipt.driver_free_bytes_before << "->"
-            << runtime_receipt.driver_free_bytes_after);
-        return receipt;
+            "[DeviceRuntimeGenerationBatch] participants="
+            << receipts.size() << " state=complete");
+        return receipts;
     }
 
     DeviceMemoryReclamationReceipt TransferEngine::reclaimDeviceMemory(
@@ -791,6 +889,77 @@ namespace llaminar2
             static_cast<unsigned char *>(allocation_) + offset);
     }
 
+    PersistentTransferStagingSlice::PersistentTransferStagingSlice(
+        std::shared_ptr<PinnedHostTransferBuffer> pinned,
+        std::shared_ptr<DeviceTransferBuffer> device_storage,
+        size_t offset,
+        size_t bytes,
+        DeviceId device) noexcept
+        : pinned_(std::move(pinned)),
+          device_storage_(std::move(device_storage)),
+          offset_(offset),
+          bytes_(bytes),
+          device_(device)
+    {
+    }
+
+    bool PersistentTransferStagingSlice::valid() const noexcept
+    {
+        return pinned_ && device_storage_ && pinned_->isBound() &&
+               device_storage_->isBound() && device_.is_gpu() && bytes_ > 0u &&
+               pinned_->registrationDevice() == device_ &&
+               device_storage_->device() == device_ &&
+               pinned_->contains(offset_, bytes_) &&
+               device_storage_->contains(offset_, bytes_);
+    }
+
+    void *PersistentTransferStagingSlice::mutablePinnedData() const
+    {
+        if (!valid())
+        {
+            throw std::logic_error(
+                "Persistent transfer staging slice has no valid pinned region");
+        }
+        return pinned_->mutableData(offset_);
+    }
+
+    void *PersistentTransferStagingSlice::mutableDeviceData() const
+    {
+        if (!valid())
+        {
+            throw std::logic_error(
+                "Persistent transfer staging slice has no valid device region");
+        }
+        return device_storage_->mutableDeviceData(offset_);
+    }
+
+    PersistentTransferExecutionLane::PersistentTransferExecutionLane(
+        std::shared_ptr<void> pool_lifetime,
+        void *stream,
+        DeviceId device,
+        size_t lane_index) noexcept
+        : pool_lifetime_(std::move(pool_lifetime)),
+          stream_(stream),
+          device_(device),
+          lane_index_(lane_index)
+    {
+    }
+
+    bool PersistentTransferExecutionLane::valid() const noexcept
+    {
+        return pool_lifetime_ && stream_ && device_.is_gpu();
+    }
+
+    void *PersistentTransferExecutionLane::stream() const
+    {
+        if (!valid())
+        {
+            throw std::logic_error(
+                "Persistent transfer execution lane is incomplete");
+        }
+        return stream_;
+    }
+
     const void *DeviceTransferBuffer::deviceData(size_t offset) const
     {
         if (!isBound() || !contains(offset, 0u))
@@ -806,14 +975,16 @@ namespace llaminar2
         void *allocation,
         size_t bytes,
         std::span<const DeviceId> devices,
-        std::shared_ptr<void> lifetime)
+        std::shared_ptr<void> lifetime,
+        BackingKind backing_kind)
         : allocation_(allocation),
           bytes_(bytes),
           devices_(devices.begin(), devices.end()),
-          external_lifetime_(std::move(lifetime))
+          lifetime_(std::move(lifetime)),
+          backing_kind_(backing_kind)
     {
         if (!allocation_ || bytes_ == 0u || devices_.empty() ||
-            !external_lifetime_)
+            !lifetime_)
         {
             throw std::invalid_argument(
                 "MappedHostTransferRegion requires stable pages, positive bytes, endpoints, and a retained lifetime");
@@ -841,23 +1012,32 @@ namespace llaminar2
     {
         /*
          * The enclosing graph family proves stream quiescence before releasing
-         * this owner. Unregister each runtime while the external mmap lifetime
-         * is still held; unmapping first would leave a driver registration
-         * pointing at invalid virtual memory.
+         * this owner. External pages must be unregistered while their lifetime
+         * is still held; backend-owned pages are freed by the lifetime deleter;
+         * slices merely release their parent. Keeping those cases explicit
+         * makes it impossible to unregister a native mapped allocation.
          */
-        for (auto registration = registrations_.rbegin();
-             registration != registrations_.rend(); ++registration)
+        if (backing_kind_ == BackingKind::ExternalRegistration)
         {
-            if (registration->backend &&
-                !registration->backend->unregisterExternalMappedHostMemory(
-                    allocation_, registration->registration_ordinal))
+            for (auto registration = registrations_.rbegin();
+                 registration != registrations_.rend(); ++registration)
             {
-                LOG_ERROR(
-                    "MappedHostTransferRegion could not unregister external pages for backend family "
-                    << static_cast<int>(registration->type)
-                    << " registration_device="
-                    << registration->registration_ordinal);
+                if (registration->backend &&
+                    !registration->backend->unregisterExternalMappedHostMemory(
+                        allocation_, registration->registration_ordinal))
+                {
+                    LOG_ERROR(
+                        "MappedHostTransferRegion could not unregister external pages for backend family "
+                        << static_cast<int>(registration->type)
+                        << " registration_device="
+                        << registration->registration_ordinal);
+                }
             }
+        }
+        else if (!registrations_.empty())
+        {
+            LOG_ERROR(
+                "MappedHostTransferRegion non-external backing unexpectedly owns backend registrations");
         }
         bound_ = false;
         aliases_.clear();
@@ -865,12 +1045,12 @@ namespace llaminar2
         allocation_ = nullptr;
         bytes_ = 0u;
         devices_.clear();
-        external_lifetime_.reset();
+        lifetime_.reset();
     }
 
     bool MappedHostTransferRegion::isBound() const noexcept
     {
-        return bound_ && allocation_ && external_lifetime_ &&
+        return bound_ && allocation_ && lifetime_ &&
                aliases_.size() == devices_.size();
     }
 
@@ -933,6 +1113,198 @@ namespace llaminar2
                 return alias.device == device;
             });
         return found == aliases_.end() ? nullptr : found->backend;
+    }
+
+    MappedHostTransferArena::MappedHostTransferArena(
+        IBackend *(*backend_resolver)(DeviceId),
+        std::span<const DeviceId> devices)
+        : backend_resolver_(backend_resolver),
+          devices_(devices.begin(), devices.end())
+    {
+        if (devices_.empty() ||
+            std::any_of(
+                devices_.begin(),
+                devices_.end(),
+                [](DeviceId device) { return !device.is_gpu(); }))
+        {
+            throw std::invalid_argument(
+                "MappedHostTransferArena requires a non-empty local GPU endpoint set");
+        }
+        std::sort(devices_.begin(), devices_.end());
+        if (std::adjacent_find(devices_.begin(), devices_.end()) !=
+            devices_.end())
+        {
+            throw std::invalid_argument(
+                "MappedHostTransferArena contains a duplicate GPU endpoint");
+        }
+    }
+
+    std::shared_ptr<MappedHostTransferRegion>
+    MappedHostTransferArena::allocate(size_t bytes, size_t alignment)
+    {
+        if (bytes == 0u || alignment == 0u)
+        {
+            throw std::invalid_argument(
+                "MappedHostTransferArena allocation requires positive bytes and alignment");
+        }
+        if (isGraphCaptureActive())
+        {
+            throw std::logic_error(
+                "MappedHostTransferArena cannot grow or suballocate during GPU graph capture");
+        }
+
+        const auto aligned_offset =
+            [alignment](const MappedHostTransferRegion &region,
+                        size_t cursor) -> size_t
+        {
+            const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(
+                region.mutableHostData());
+            if (cursor >
+                std::numeric_limits<std::uintptr_t>::max() - base)
+            {
+                throw std::overflow_error(
+                    "MappedHostTransferArena address arithmetic overflow");
+            }
+            const std::uintptr_t address = base + cursor;
+            const size_t remainder = static_cast<size_t>(address % alignment);
+            const size_t padding = remainder == 0u ? 0u : alignment - remainder;
+            if (cursor > std::numeric_limits<size_t>::max() - padding)
+            {
+                throw std::overflow_error(
+                    "MappedHostTransferArena alignment arithmetic overflow");
+            }
+            return cursor + padding;
+        };
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        TransferEngine transfer(backend_resolver_);
+
+        const auto allocate_from =
+            [&](BackingRegion &backing)
+                -> std::shared_ptr<MappedHostTransferRegion>
+        {
+            if (!backing.region || !backing.region->isBound())
+            {
+                throw std::logic_error(
+                    "MappedHostTransferArena contains an unbound backing region");
+            }
+            const size_t offset =
+                aligned_offset(*backing.region, backing.used_bytes);
+            if (!backing.region->contains(offset, bytes))
+                return nullptr;
+
+            auto slice = transfer.sliceMappedHostRegion(
+                backing.region, offset, bytes);
+            const auto host_address = reinterpret_cast<std::uintptr_t>(
+                slice->mutableHostData());
+            if (host_address % alignment != 0u)
+            {
+                throw std::logic_error(
+                    "MappedHostTransferArena produced a misaligned host slice");
+            }
+            for (const DeviceId device : devices_)
+            {
+                const auto device_address =
+                    reinterpret_cast<std::uintptr_t>(
+                        slice->deviceAlias(device));
+                if (device_address % alignment != 0u)
+                {
+                    throw std::logic_error(
+                        "MappedHostTransferArena backend alias does not preserve requested alignment for " +
+                        device.toString());
+                }
+            }
+
+            const size_t padding = offset - backing.used_bytes;
+            backing.used_bytes = offset + bytes;
+            if (allocated_bytes_ >
+                    std::numeric_limits<size_t>::max() - bytes ||
+                alignment_padding_bytes_ >
+                    std::numeric_limits<size_t>::max() - padding)
+            {
+                throw std::overflow_error(
+                    "MappedHostTransferArena allocation accounting overflow");
+            }
+            allocated_bytes_ += bytes;
+            alignment_padding_bytes_ += padding;
+            ++slice_count_;
+            return slice;
+        };
+
+        /* Search newest-first so the current growth slab absorbs adjacent
+         * ticket payloads while older captured addresses remain untouched. */
+        for (auto backing = backing_regions_.rbegin();
+             backing != backing_regions_.rend(); ++backing)
+        {
+            if (auto slice = allocate_from(*backing))
+                return slice;
+        }
+
+        if (bytes > std::numeric_limits<size_t>::max() - (alignment - 1u))
+        {
+            throw std::overflow_error(
+                "MappedHostTransferArena backing capacity overflow");
+        }
+        const size_t minimum_backing_bytes = bytes + alignment - 1u;
+        const size_t requested_backing_bytes =
+            std::max(minimum_backing_bytes, committed_bytes_);
+        auto region = transfer.allocateMappedHostRegion(
+            requested_backing_bytes, devices_);
+        if (!region || !region->isBound())
+        {
+            throw std::runtime_error(
+                "MappedHostTransferArena could not bind a backing region");
+        }
+        if (committed_bytes_ >
+            std::numeric_limits<size_t>::max() - region->sizeBytes())
+        {
+            throw std::overflow_error(
+                "MappedHostTransferArena committed capacity overflow");
+        }
+        committed_bytes_ += region->sizeBytes();
+        backing_regions_.push_back({
+            .region = std::move(region),
+            .used_bytes = 0u,
+        });
+
+        PerfStatsCollector::addCounter(
+            "moe_overlay_activation_epoch",
+            "mapped_arena_backing_regions",
+            1.0,
+            "setup",
+            "heterogeneous",
+            {{"growth", "geometric"},
+             {"registration_cardinality", "logarithmic"}});
+        PerfStatsCollector::addCounter(
+            "moe_overlay_activation_epoch",
+            "mapped_arena_committed_bytes",
+            static_cast<double>(
+                backing_regions_.back().region->sizeBytes()),
+            "setup",
+            "heterogeneous",
+            {{"growth", "geometric"},
+             {"registration_cardinality", "logarithmic"}});
+
+        auto slice = allocate_from(backing_regions_.back());
+        if (!slice)
+        {
+            throw std::logic_error(
+                "MappedHostTransferArena newly committed backing cannot satisfy its triggering allocation");
+        }
+        return slice;
+    }
+
+    MappedHostTransferArena::Snapshot
+    MappedHostTransferArena::snapshot() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {
+            .committed_bytes = committed_bytes_,
+            .allocated_bytes = allocated_bytes_,
+            .alignment_padding_bytes = alignment_padding_bytes_,
+            .backing_region_count = backing_regions_.size(),
+            .slice_count = slice_count_,
+        };
     }
 
     std::shared_ptr<PinnedHostTransferBuffer>
@@ -1002,6 +1374,105 @@ namespace llaminar2
         return buffer;
     }
 
+    std::vector<PersistentTransferStagingSlice>
+    TransferEngine::allocatePersistentTransferStagingSlices(
+        size_t bytes_per_slice,
+        size_t slice_count,
+        DeviceId device) const
+    {
+        if (bytes_per_slice == 0u || slice_count == 0u || !device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "Persistent transfer staging requires positive geometry and an exact GPU");
+        }
+        if (slice_count >
+            std::numeric_limits<size_t>::max() / bytes_per_slice)
+        {
+            throw std::overflow_error(
+                "Persistent transfer staging slab byte size overflowed");
+        }
+        const size_t total_bytes = bytes_per_slice * slice_count;
+        auto pinned = allocatePinnedHostBuffer(total_bytes, device);
+        auto device_storage = allocateDeviceTransferBuffer(total_bytes, device);
+
+        std::vector<PersistentTransferStagingSlice> slices;
+        slices.reserve(slice_count);
+        for (size_t index = 0u; index < slice_count; ++index)
+        {
+            slices.push_back(PersistentTransferStagingSlice(
+                pinned,
+                device_storage,
+                index * bytes_per_slice,
+                bytes_per_slice,
+                device));
+        }
+        return slices;
+    }
+
+    std::vector<PersistentTransferExecutionLane>
+    TransferEngine::allocatePersistentTransferExecutionLanes(
+        size_t lane_count,
+        DeviceId device,
+        const std::string &pool_name) const
+    {
+        if (lane_count == 0u || !device.is_gpu() || pool_name.empty())
+        {
+            throw std::invalid_argument(
+                "Persistent transfer execution lanes require positive geometry, an exact GPU, and a stable pool name");
+        }
+
+        auto streams = std::make_shared<std::vector<void *>>(
+            lane_count, nullptr);
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        size_t created_count = 0u;
+        context.submitAndWait(
+            [&]
+            {
+                for (size_t index = 0u; index < lane_count; ++index)
+                {
+                    bool created = false;
+                    (*streams)[index] = context.getOrCreateAuxiliaryStream(
+                        "persistent_transfer_execution:" + pool_name + ":" +
+                            device.toString() + ":lane:" +
+                            std::to_string(index),
+                        GPUAuxiliaryStreamSchedulingClass::
+                            BackgroundMaintenance,
+                        &created);
+                    if (!(*streams)[index])
+                    {
+                        throw std::runtime_error(
+                            "Persistent transfer execution pool could not materialize lane " +
+                            std::to_string(index) + " on " +
+                            device.toString());
+                    }
+                    created_count += created ? 1u : 0u;
+                }
+            });
+
+        std::vector<PersistentTransferExecutionLane> lanes;
+        lanes.reserve(lane_count);
+        const std::shared_ptr<void> pool_lifetime = streams;
+        for (size_t index = 0u; index < lane_count; ++index)
+        {
+            lanes.push_back(PersistentTransferExecutionLane(
+                pool_lifetime,
+                (*streams)[index],
+                device,
+                index));
+        }
+        PerfStatsCollector::addCounter(
+            "transfer",
+            "persistent_execution_stream_pools_materialized",
+            1.0,
+            "model_setup",
+            device.toString(),
+            {{"pool", pool_name},
+             {"lane_count", std::to_string(lane_count)},
+             {"new_stream_count", std::to_string(created_count)},
+             {"stream_class", "background_maintenance"}});
+        return lanes;
+    }
+
     std::shared_ptr<PinnedHostTransferBuffer>
     TransferEngine::registerExternalPinnedHostBuffer(
         void *allocation,
@@ -1037,7 +1508,11 @@ namespace llaminar2
     {
         auto region = std::shared_ptr<MappedHostTransferRegion>(
             new MappedHostTransferRegion(
-                allocation, bytes, devices, std::move(lifetime)));
+                allocation,
+                bytes,
+                devices,
+                std::move(lifetime),
+                MappedHostTransferRegion::BackingKind::ExternalRegistration));
 
         for (const DeviceId device : region->devices_)
         {
@@ -1072,8 +1547,21 @@ namespace llaminar2
                 });
             if (registration == region->registrations_.end())
             {
+                const size_t family_endpoint_count =
+                    static_cast<size_t>(std::count_if(
+                        region->devices_.begin(),
+                        region->devices_.end(),
+                        [&](DeviceId endpoint)
+                        { return endpoint.type == device.type; }));
+                const MappedHostRegistrationScope scope =
+                    family_endpoint_count == 1u
+                        ? MappedHostRegistrationScope::DeviceLocal
+                        : MappedHostRegistrationScope::BackendPortable;
                 if (!backend->registerExternalMappedHostMemory(
-                        allocation, bytes, device.gpu_ordinal()))
+                        allocation,
+                        bytes,
+                        device.gpu_ordinal(),
+                        scope))
                 {
                     throw std::runtime_error(
                         "TransferEngine could not register mapped external pages for " +
@@ -1083,6 +1571,7 @@ namespace llaminar2
                     .type = device.type,
                     .backend = backend,
                     .registration_ordinal = device.gpu_ordinal(),
+                    .scope = scope,
                 });
             }
             else if (registration->backend != backend)
@@ -1114,7 +1603,7 @@ namespace llaminar2
         {
             const PerfStatsCollector::Tags tags{
                 {"scope", "node_local"},
-                {"mapping", "portable_external_host_pages"},
+                {"mapping", "typed_external_host_pages"},
                 {"blocking", "false"},
             };
             PerfStatsCollector::addCounter(
@@ -1138,8 +1627,89 @@ namespace llaminar2
                 "setup",
                 "heterogeneous",
                 tags);
+            PerfStatsCollector::addCounter(
+                "moe_overlay_activation_epoch",
+                "mapped_region_bytes",
+                static_cast<double>(bytes),
+                "setup",
+                "heterogeneous",
+                tags);
+            for (const auto &registration : region->registrations_)
+            {
+                const PerfStatsCollector::Tags registration_tags{
+                    {"scope", "node_local"},
+                    {"registration_scope", to_string(registration.scope)},
+                    {"backend", registration.type == DeviceType::CUDA
+                                    ? "cuda"
+                                    : "rocm"},
+                    {"blocking", "false"},
+                };
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_activation_epoch",
+                    "mapped_backend_registrations",
+                    1.0,
+                    "setup",
+                    "heterogeneous",
+                    registration_tags);
+            }
         }
         return region;
+    }
+
+    std::shared_ptr<MappedHostTransferRegion>
+    TransferEngine::sliceMappedHostRegion(
+        std::shared_ptr<MappedHostTransferRegion> parent,
+        size_t offset,
+        size_t bytes) const
+    {
+        if (!parent || !parent->isBound() || bytes == 0u ||
+            !parent->contains(offset, bytes))
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped-host slice requires a bound parent and positive in-range geometry");
+        }
+
+        void *const host_start = parent->mutableHostData(offset);
+        std::shared_ptr<void> parent_lifetime = parent;
+        auto slice = std::shared_ptr<MappedHostTransferRegion>(
+            new MappedHostTransferRegion(
+                host_start,
+                bytes,
+                parent->devices_,
+                std::move(parent_lifetime),
+                MappedHostTransferRegion::BackingKind::ParentSlice));
+        slice->aliases_.reserve(parent->aliases_.size());
+        for (const auto &alias : parent->aliases_)
+        {
+            slice->aliases_.push_back({
+                .device = alias.device,
+                .address = static_cast<void *>(
+                    static_cast<unsigned char *>(alias.address) + offset),
+                .backend = alias.backend,
+            });
+        }
+        /* A slice owns no native registration. Its external lifetime retains
+         * the parent, whose destructor unregisters only after the final child
+         * and arena owner disappear. */
+        slice->bound_ = true;
+
+        PerfStatsCollector::addCounter(
+            "moe_overlay_activation_epoch",
+            "mapped_arena_slices",
+            1.0,
+            "setup",
+            "heterogeneous",
+            {{"mapping", "parent_subregion"},
+             {"native_registration", "false"}});
+        PerfStatsCollector::addCounter(
+            "moe_overlay_activation_epoch",
+            "mapped_arena_slice_bytes",
+            static_cast<double>(bytes),
+            "setup",
+            "heterogeneous",
+            {{"mapping", "parent_subregion"},
+             {"native_registration", "false"}});
+        return slice;
     }
 
     std::shared_ptr<MappedHostTransferRegion>
@@ -1170,6 +1740,115 @@ namespace llaminar2
         }
         const size_t mapping_bytes =
             ((bytes + page_size - 1u) / page_size) * page_size;
+
+        if (devices.size() == 1u)
+        {
+            const DeviceId device = devices.front();
+            IBackend *const backend = resolveBackend(device);
+            if (!backend)
+            {
+                throw std::runtime_error(
+                    "TransferEngine mapped-host allocation has no backend for " +
+                    device.toString());
+            }
+
+            /*
+             * A native mapped allocation is not merely a convenience wrapper.
+             * On Vega20, registering an already-faulted anonymous range emits
+             * an ATS invalidation interrupt for roughly every host page. Four
+             * participants materializing retained graph tickets concurrently
+             * can therefore overrun the fixed 4 KiB IH2 retry ring. KFD-owned
+             * hipHostMallocMapped pages establish the same zero-copy alias
+             * without that interrupt storm; cudaHostAllocMapped gives CUDA the
+             * symmetric ownership contract. The backend call is setup-only and
+             * serialized by its runtime-lifecycle authority.
+             */
+            void *device_alias = nullptr;
+            void *const allocation = backend->allocateMapped(
+                mapping_bytes, device.gpu_ordinal(), &device_alias);
+            if (!allocation || !device_alias)
+            {
+                if (allocation)
+                    backend->freeMapped(allocation, device.gpu_ordinal());
+                throw std::runtime_error(
+                    "TransferEngine backend-owned mapped allocation failed for " +
+                    device.toString());
+            }
+            auto lifetime = std::shared_ptr<void>(
+                allocation,
+                [backend, ordinal = device.gpu_ordinal()](void *address)
+                {
+                    backend->freeMapped(address, ordinal);
+                });
+
+            /* The calling setup thread owns NUMA placement. Touch the complete
+             * allocation once before capture so neither CPU service nor a GPU
+             * mapped write encounters a first-use host fault. */
+            std::memset(allocation, 0, mapping_bytes);
+            auto region = std::shared_ptr<MappedHostTransferRegion>(
+                new MappedHostTransferRegion(
+                    allocation,
+                    mapping_bytes,
+                    devices,
+                    std::move(lifetime),
+                    MappedHostTransferRegion::BackingKind::BackendAllocation));
+            region->aliases_.push_back({
+                .device = device,
+                .address = device_alias,
+                .backend = backend,
+            });
+            region->bound_ = true;
+
+            if (PerfStatsCollector::isDomainEnabled(
+                    "moe_overlay_activation_epoch"))
+            {
+                const PerfStatsCollector::Tags tags{
+                    {"scope", "node_local"},
+                    {"mapping", "backend_owned_mapped_host_pages"},
+                    {"backend", device.type == DeviceType::CUDA
+                                    ? "cuda"
+                                    : "rocm"},
+                    {"blocking", "false"},
+                };
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_activation_epoch",
+                    "mapped_regions_allocated",
+                    1.0,
+                    "setup",
+                    "heterogeneous",
+                    tags);
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_activation_epoch",
+                    "mapped_endpoint_aliases",
+                    1.0,
+                    "setup",
+                    "heterogeneous",
+                    tags);
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_activation_epoch",
+                    "mapped_backend_families",
+                    1.0,
+                    "setup",
+                    "heterogeneous",
+                    tags);
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_activation_epoch",
+                    "mapped_backend_allocations",
+                    1.0,
+                    "setup",
+                    "heterogeneous",
+                    tags);
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_activation_epoch",
+                    "mapped_region_bytes",
+                    static_cast<double>(mapping_bytes),
+                    "setup",
+                    "heterogeneous",
+                    tags);
+            }
+            return region;
+        }
+
         void *const mapping = ::mmap(
             nullptr,
             mapping_bytes,
@@ -1200,6 +1879,83 @@ namespace llaminar2
             mapping_bytes,
             devices,
             std::move(lifetime));
+    }
+
+    std::vector<std::shared_ptr<MappedHostTransferRegion>>
+    TransferEngine::allocateMappedHostTransferSlices(
+        size_t bytes_per_slice,
+        size_t slice_count,
+        DeviceId device) const
+    {
+        if (bytes_per_slice == 0u || slice_count == 0u || !device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "Mapped host transfer slices require positive geometry and an exact GPU");
+        }
+        const long page_size_value = ::sysconf(_SC_PAGESIZE);
+        if (page_size_value <= 0)
+        {
+            throw std::runtime_error(
+                "Mapped host transfer slices could not resolve the host page size");
+        }
+        const size_t page_size = static_cast<size_t>(page_size_value);
+        if (bytes_per_slice >
+            std::numeric_limits<size_t>::max() - (page_size - 1u))
+        {
+            throw std::overflow_error(
+                "Mapped host transfer slice alignment overflowed");
+        }
+        const size_t stride =
+            ((bytes_per_slice + page_size - 1u) / page_size) * page_size;
+        if (slice_count > std::numeric_limits<size_t>::max() / stride)
+        {
+            throw std::overflow_error(
+                "Mapped host transfer slab byte size overflowed");
+        }
+        const size_t total_bytes = stride * slice_count;
+        const std::array<DeviceId, 1> endpoints{device};
+        auto slab = allocateMappedHostRegion(total_bytes, endpoints);
+        if (!slab || !slab->isBound() || !slab->hasDevice(device))
+        {
+            throw std::runtime_error(
+                "Mapped host transfer slab did not bind its exact GPU endpoint");
+        }
+
+        std::vector<std::shared_ptr<MappedHostTransferRegion>> slices;
+        slices.reserve(slice_count);
+        for (size_t index = 0u; index < slice_count; ++index)
+        {
+            auto slice = sliceMappedHostRegion(
+                slab, index * stride, bytes_per_slice);
+            if (!slice || !slice->isBound() ||
+                !slice->hasDevice(device) ||
+                slice->sizeBytes() != bytes_per_slice)
+            {
+                throw std::logic_error(
+                    "Mapped host transfer slab produced an incomplete slice");
+            }
+            slices.push_back(std::move(slice));
+        }
+
+        PerfStatsCollector::addCounter(
+            "transfer",
+            "mapped_host_transfer_pools_materialized",
+            1.0,
+            "model_setup",
+            device.toString(),
+            {{"slice_count", std::to_string(slice_count)},
+             {"slice_bytes", std::to_string(bytes_per_slice)},
+             {"slab_bytes", std::to_string(total_bytes)},
+             {"native_allocation_count", "1"}});
+        return slices;
+    }
+
+    std::shared_ptr<MappedHostTransferArena>
+    TransferEngine::createMappedHostArena(
+        std::span<const DeviceId> devices) const
+    {
+        return std::shared_ptr<MappedHostTransferArena>(
+            new MappedHostTransferArena(resolve_, devices));
     }
 
     void *TransferEngine::resolveMappedTimelineKernelSignal64(
@@ -2014,7 +2770,12 @@ namespace llaminar2
                 .value = value,
             });
         }
-        if (!destination.buildOrderedTimelineTransaction(lowered))
+        const GPUOrderedTimelineInstrumentation instrumentation =
+            PerfStatsCollector::gpuStageEventTimingEnabled()
+                ? GPUOrderedTimelineInstrumentation::PerStepEvents
+                : GPUOrderedTimelineInstrumentation::Disabled;
+        if (!destination.buildOrderedTimelineTransaction(
+                lowered, instrumentation))
         {
             throw std::runtime_error(
                 "TransferEngine could not lower mapped timeline transaction for " +

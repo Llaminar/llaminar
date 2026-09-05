@@ -29,6 +29,7 @@ namespace llaminar2
     struct GGUFModel;
     class MoEOverlayMPIRemoteProjectionTransport;
     class MappedTransferProgressEpoch;
+    class PhysicalMemoryAuthority;
     struct MoEOverlayDevicePhysicalMovementBatch;
     struct MoEOverlayResidencyExecutionFingerprint;
 
@@ -95,7 +96,10 @@ namespace llaminar2
     /** @brief Process-local evidence for the materialized residency fabric. */
     struct MoEOverlayPhysicalResidencyFabricStats
     {
+        /** Logical participant/layer bindings into shared slot arenas. */
         std::uint64_t endpoint_layer_pools = 0;
+        /** Physically distinct participant/exact-geometry slot arenas. */
+        std::uint64_t endpoint_geometry_pools = 0;
         /** Loader-owned live slots enrolled for bounded post-retire reuse. */
         std::uint64_t adopted_initial_slots = 0;
         /** Bootstrap assignments actually returned after an old ticket barrier. */
@@ -156,6 +160,15 @@ namespace llaminar2
     {
         /** Published logical epoch whose owner map was physically canonicalized. */
         std::uint64_t source_epoch = 0;
+        /**
+         * Exact prepared-placement authority represented by @ref local_banks.
+         *
+         * Device-owned RCU deliberately does not advance a host residency
+         * snapshot.  Carrying the canonical map in the seal keeps registry
+         * rebinding self-contained instead of asking teardown to consult a
+         * stale secondary authority and compare unrelated epoch numbers.
+         */
+        MoEExpertOwnerMap canonical_owner_map;
         /** Complete immutable banks for every process-local participant. */
         std::vector<MoEOverlayParticipantResidencyBank> local_banks;
         /** Residents already occupying an adopted loader-era allocation. */
@@ -163,8 +176,26 @@ namespace llaminar2
         /** Residents copied asynchronously out of a temporary shadow allocation. */
         std::size_t compacted_shadow_experts = 0;
 
-        /** @return Whether this value names a positive epoch and complete banks. */
+        /**
+         * @return Whether the epoch, owner map, and every local bank form one
+         *         complete immutable registry-rebind authority.
+         */
         [[nodiscard]] bool valid() const noexcept;
+    };
+
+    /**
+     * @brief Sole physical-inventory source used by terminal context sealing.
+     *
+     * Host-owned RCU publishes every participant bank and seals from that
+     * registry. Device-owned RCU deliberately keeps no host bank mirror, so it
+     * seals from the quiescent physical slot ledger instead. Selecting this at
+     * fabric construction makes an authority mismatch unrepresentable at
+     * teardown.
+     */
+    enum class MoEOverlayPhysicalInventoryAuthority
+    {
+        ParticipantRegistry, ///< Host-published participant banks are current.
+        DeviceSlotLedger,    ///< Device runtime plus physical ledger are current.
     };
 
     /**
@@ -203,10 +234,15 @@ namespace llaminar2
         /** @brief Immutable model-lifetime materialization policy. */
         struct Config
         {
+            /** Sole rank-bound authority for every local pool and staging lane. */
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority;
             /** Complete process-local initial-bank registry. */
             std::shared_ptr<MoEOverlayParticipantResidencyRegistry> registry;
             /** Exact epoch and owner map installed in @ref registry. */
             std::shared_ptr<const MoEOverlayResidencySnapshot> initial_snapshot;
+            /** Typed source of the terminal durable physical inventory. */
+            MoEOverlayPhysicalInventoryAuthority inventory_authority =
+                MoEOverlayPhysicalInventoryAuthority::ParticipantRegistry;
             /**
              * Optional globally-published layer manifest.
              *
@@ -226,9 +262,10 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayMPIRemoteProjectionTransport>
                 remote_projection_transport;
             /**
-             * Maximum incoming experts retained per participant/layer wave.
-             * A proposal requiring more is a configuration error, not transient
-             * backpressure, because runtime allocation is forbidden.
+             * Maximum logical arrivals targeting one participant/layer wave.
+             * Exact-geometry layers share a physical RCU slot arena bounded by
+             * @ref maximum_concurrent_cycles; this value remains the per-layer
+             * scheduling guard and does not imply one permanent pool per layer.
              */
             std::size_t shadow_slots_per_endpoint_layer = 1;
             /** Bounded CPU-format or GPU host-relay staging bytes per lane. */
@@ -237,10 +274,17 @@ namespace llaminar2
              * Maximum closed migration cycles admitted in one wave.
              *
              * The fabric combines this with logical-participant multiplicity
-             * per physical device and pre-materializes the resulting lane
-             * pools. It must equal the residency authority's scheduling cap.
+             * and exact prepared-weight geometry to pre-materialize shared
+             * slot arenas and lane pools. It must equal the residency
+             * authority's scheduling cap.
              */
             std::size_t maximum_concurrent_cycles = 1;
+            /**
+             * Maximum setup-owned background streams per participant copy.
+             * Must be positive and no larger than the concurrent-cycle cap;
+             * independently event-tracked operations share them round-robin.
+             */
+            std::size_t maximum_execution_streams = 1;
             /**
              * Collect exact device/host timing evidence on local transfer lanes.
              * Dynamic production enables this for economy certification;

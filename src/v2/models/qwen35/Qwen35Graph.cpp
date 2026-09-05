@@ -23,6 +23,7 @@
 #include "../../utils/Logger.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -115,54 +116,6 @@ namespace llaminar2
                       << "fp32_layers=" << schema.tp_allreduce_fp32_layer_count
                       << " default=" << schema.tp_allreduce_default_precision);
         }
-    }
-
-    int Qwen35Graph::resolveGDNGlobalVHeadOffset(
-        const WeightBinding *value_projection_binding,
-        int d_v,
-        int n_v_heads,
-        int n_v_heads_full,
-        const GraphConfig &config,
-        const IMPIContext *mpi_ctx)
-    {
-        if (n_v_heads >= n_v_heads_full || d_v <= 0)
-            return 0;
-
-        if (value_projection_binding)
-        {
-            const auto &slice = value_projection_binding->slice;
-            if (slice.row_count > 0 && slice.row_start % static_cast<size_t>(d_v) == 0)
-            {
-                return static_cast<int>(slice.row_start / static_cast<size_t>(d_v));
-            }
-        }
-
-        if (config.tp_config)
-        {
-            const auto *assignment = config.getAssignment();
-            const int total_heads = config.n_heads;
-            if (assignment && total_heads > 0)
-            {
-                return static_cast<int>(
-                    static_cast<int64_t>(n_v_heads_full) * assignment->head_start / total_heads);
-            }
-        }
-
-        if (mpi_ctx && mpi_ctx->world_size() > 1)
-            return mpi_ctx->rank() * n_v_heads;
-
-        if (config.tp_ctx && config.tp_ctx->degree() > 1)
-        {
-            /*
-             * GraphConfig is participant-local: tp_device_idx was bound by
-             * the runner factory for this exact graph instance.  Do not ask a
-             * shared LocalTPContext for mutable "current device" state while
-             * RankOrchestrator builds participant graphs concurrently.
-             */
-            return config.tp_device_idx * n_v_heads;
-        }
-
-        return 0;
     }
 
     // =========================================================================
@@ -284,23 +237,12 @@ namespace llaminar2
             return false;
         }
         const int degree = local_tp->degree();
-
         const int n_k_heads_full = config_.gdn.group_count > 0
                                        ? config_.gdn.group_count
                                        : config_.n_heads;
         const int n_v_heads_full = config_.gdn.time_step_rank > 0
                                        ? config_.gdn.time_step_rank
                                        : n_k_heads_full;
-        if (config_.local_n_heads <= 0 ||
-            config_.n_heads <= 0 ||
-            config_.local_n_heads >= config_.n_heads ||
-            config_.n_heads % degree != 0 ||
-            config_.local_n_heads != config_.n_heads / degree ||
-            n_v_heads_full % degree != 0)
-        {
-            return false;
-        }
-
         if (n_v_heads_full <= 0 ||
             n_k_heads_full <= 0 ||
             config_.gdn.state_size <= 0 ||
@@ -309,7 +251,19 @@ namespace llaminar2
             return false;
         }
 
-        return true;
+        const GDNLinkedLiveStateGeometry geometry{
+            .global_key_heads = n_k_heads_full,
+            .global_value_heads = n_v_heads_full,
+            .key_width = config_.gdn.state_size,
+            .value_width = config_.gdn.state_size,
+            .conv_history_length = config_.gdn.conv_kernel_size - 1,
+        };
+        return geometry.resolve(
+                   GDNLinkedLiveStateKind::ConvHistory,
+                   degree).has_value() &&
+               geometry.resolve(
+                   GDNLinkedLiveStateKind::Recurrence,
+                   degree).has_value();
     }
 
     // =========================================================================
@@ -332,40 +286,20 @@ namespace llaminar2
                                        : n_k_heads_full;
         int n_k_heads_local = n_k_heads_full;
         int n_v_heads_local = n_v_heads_full;
-        const bool gdn_modular_repeat = (n_v_heads_full > n_k_heads_full);
         const int resolver_local_n_heads = config.local_n_heads > 0
                                                ? config.local_n_heads
                                                : config_.local_n_heads;
         if (config_.qkv_column_parallel && resolver_local_n_heads > 0 && config_.n_heads > 0)
         {
-            if (config_.default_device.is_cpu())
-            {
-                const GDNHeadAssignment assignment =
-                    GDNHeadAssignment::fromPartition(
-                        n_k_heads_full,
-                        n_v_heads_full,
-                        config_.head_start,
-                        resolver_local_n_heads,
-                        config_.n_heads);
-                n_k_heads_local = assignment.localKeyHeads();
-                n_v_heads_local = assignment.localValueHeads();
-            }
-            else
-            {
-                // GPU phase-split state handoff currently consumes contiguous
-                // V shards and therefore retains its established Q/K layout.
-                n_v_heads_local =
-                    n_v_heads_full * resolver_local_n_heads / config_.n_heads;
-                if (n_v_heads_local <= 0)
-                    n_v_heads_local = 1;
-                if (!gdn_modular_repeat)
-                {
-                    n_k_heads_local =
-                        n_k_heads_full * resolver_local_n_heads / config_.n_heads;
-                    if (n_k_heads_local <= 0)
-                        n_k_heads_local = 1;
-                }
-            }
+            const GDNHeadAssignment assignment =
+                GDNHeadAssignment::fromPartition(
+                    n_k_heads_full,
+                    n_v_heads_full,
+                    config_.head_start,
+                    resolver_local_n_heads,
+                    config_.n_heads);
+            n_k_heads_local = assignment.localKeyHeads();
+            n_v_heads_local = assignment.localValueHeads();
         }
         const int d_k = config_.gdn.state_size;
         const int key_dim = n_k_heads_local * d_k;
@@ -387,6 +321,15 @@ namespace llaminar2
         config.custom_formulas["fa_q_full_dim"] =
             static_cast<size_t>(local_n_heads_fa * config_.head_dim * 2);
 
+        /*
+         * MTP can retain a complete participant-local predictor while the main
+         * forward graph stays tensor parallel. QwenGraphBase publishes that
+         * typed sidecar width independently of local_qkv_dim; derive the two
+         * Qwen3.5-only FA capacities from the same authority.
+         */
+        const size_t mtp_q_dim = config.custom_formulas.at("mtp_q_dim");
+        config.custom_formulas["mtp_fa_q_full_dim"] = 2 * mtp_q_dim;
+
         // attn_output must be wide enough for BOTH FA (local_qkv_dim) and GDN (gdn_inner_size).
         // GDN layers write n_v_heads * d_v elements per row; FA layers write local_n_heads * head_dim.
         // GatedRMSNorm and GEMV stride are derived from this buffer's column count,
@@ -394,6 +337,10 @@ namespace llaminar2
         const size_t local_qkv_dim = static_cast<size_t>(config.local_n_heads * config.head_dim);
         config.custom_formulas["attn_output_dim"] =
             std::max(local_qkv_dim, static_cast<size_t>(gdn_inner));
+        config.custom_formulas["mtp_attn_output_dim"] =
+            std::max(
+                mtp_q_dim,
+                config.custom_formulas["attn_output_dim"]);
 
         // Add GDN buffer name → BufferId mappings
         config.buffer_name_to_id["gdn_qkv"] = BufferId::GDN_QKV;
@@ -430,7 +377,59 @@ namespace llaminar2
         const MTPForwardInput &input,
         MTPForwardOutput &output)
     {
-        return buildMTPGraph(depth_idx, toLegacyMTPDepthWeights(bindings), input, output);
+        const MTPDepthWeightBindings *effective_bindings = &bindings;
+        if (config_.mtpUsesReplicatedDenseSidecarBinding())
+        {
+            /*
+             * Both retained live sidecars and the graph-integrated shifted
+             * prefill transaction enter through this typed overload.  Their
+             * caller may be building the primary TP graph and therefore pass
+             * that graph's compact MTP binding.  A replicated predictor must
+             * never reinterpret that shard as a full K/V or dense matrix: it
+             * selects the auxiliary full binding here, before any legacy
+             * tensor view or prepared-reference lookup is formed.
+             *
+             * Selecting by declared depth rather than vector position keeps
+             * dynamic-depth reuse explicit and rejects an incomplete frozen
+             * auxiliary weight set at graph construction.
+             */
+            const auto &replicated_depths =
+                decode_replicated_dense_weight_bindings_.mtp.depths;
+            const auto match = std::find_if(
+                replicated_depths.begin(),
+                replicated_depths.end(),
+                [depth_idx](const MTPDepthWeightBindings &candidate)
+                {
+                    return candidate.depth_index == depth_idx;
+                });
+            if (match == replicated_depths.end())
+            {
+                throw std::runtime_error(
+                    "[Qwen35Graph] Replicated MTP sidecar depth " +
+                    std::to_string(depth_idx) +
+                    " has no auxiliary full-width weight binding");
+            }
+            if (std::find_if(
+                    std::next(match),
+                    replicated_depths.end(),
+                    [depth_idx](const MTPDepthWeightBindings &candidate)
+                    {
+                        return candidate.depth_index == depth_idx;
+                    }) != replicated_depths.end())
+            {
+                throw std::runtime_error(
+                    "[Qwen35Graph] Replicated MTP sidecar depth " +
+                    std::to_string(depth_idx) +
+                    " has duplicate auxiliary weight bindings");
+            }
+            effective_bindings = &*match;
+        }
+
+        return buildMTPGraph(
+            depth_idx,
+            toLegacyMTPDepthWeights(*effective_bindings),
+            input,
+            output);
     }
 
     ComputeGraph Qwen35Graph::buildMTPGraph(
@@ -464,14 +463,18 @@ namespace llaminar2
         const int total_tokens = input.batch_size * input.seq_len;
 
         /*
-         * MTP sidecars verify decode rows.  When LocalTP uses a replicated
-         * dense-decode view, every reused attention/FFN sub-builder must resolve
-         * prepared refs from that same view; otherwise a stage can pair a
-         * replicated tensor pointer with a TP-local prepared GEMM engine.  The
-         * selected MTPDepthWeights already come from selectMTPDecodeWeightSet();
-         * this scope keeps the binding/ref lookups aligned with those tensors.
+         * MTP sidecars verify decode rows. When LocalTP uses either replicated
+         * decode weights or the narrower replicated-predictor policy, every
+         * reused attention/FFN sub-builder must resolve prepared refs from that
+         * same view; otherwise a stage can pair a replicated tensor pointer
+         * with a TP-local prepared GEMM engine. The selected MTPDepthWeights
+         * already come from selectMTPDecodeWeightSet(); this scope keeps the
+         * binding/ref lookups and collective topology aligned with those tensors.
          */
-        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+        DecodeReplicatedDenseScope decode_dense_scope(
+            *this,
+            total_tokens,
+            config_.mtpUsesReplicatedDenseSidecarBinding());
 
         const bool kv_cache_only = input.kv_cache_only;
         MTPKVCacheOnlyScope kv_cache_only_scope(*this, kv_cache_only);
@@ -945,6 +948,7 @@ namespace llaminar2
         ComputeGraph &graph,
         const std::string &boundary,
         const ITensor *source,
+        BufferId source_buffer_id,
         const std::string &dependency,
         int layer_idx,
         int total_tokens,
@@ -955,6 +959,7 @@ namespace llaminar2
         (void)graph;
         (void)boundary;
         (void)source;
+        (void)source_buffer_id;
         (void)layer_idx;
         (void)total_tokens;
         (void)feature_dim;
@@ -1127,24 +1132,38 @@ namespace llaminar2
                                        : n_v_heads_full * d_v;
         const int full_qkv_dim = 2 * full_key_dim + full_value_dim;
         const int conv_history_len = std::max(0, config_.gdn.conv_kernel_size - 1);
-        const bool modular_conv_state =
-            n_v_heads_full > n_k_heads_full &&
-            n_k_heads == n_k_heads_full &&
-            n_v_heads < n_v_heads_full;
         const int local_conv_state_floats = qkv_dim * conv_history_len;
         const int full_conv_state_floats = full_qkv_dim * conv_history_len;
         const int local_recurrence_state_floats = n_v_heads * d_k * d_v;
         const int full_recurrence_state_floats = n_v_heads_full * d_k * d_v;
+        const GDNLinkedLiveStateGeometry linked_state_geometry{
+            .global_key_heads = n_k_heads_full,
+            .global_value_heads = n_v_heads_full,
+            .key_width = d_k,
+            .value_width = d_v,
+            .conv_history_length = conv_history_len,
+        };
+        const int live_state_degree =
+            config_.tp_ctx && config_.tp_ctx->isLocal()
+                ? static_cast<ILocalTPContext *>(config_.tp_ctx)->degree()
+                : 0;
+        const auto linked_conv_shape = linked_state_geometry.resolve(
+            GDNLinkedLiveStateKind::ConvHistory,
+            live_state_degree);
+        const auto linked_recurrence_shape = linked_state_geometry.resolve(
+            GDNLinkedLiveStateKind::Recurrence,
+            live_state_degree);
+        const bool gdn_state_is_linked_local =
+            linked_conv_shape && linked_recurrence_shape &&
+            local_conv_state_floats == linked_conv_shape->local_state_floats &&
+            local_recurrence_state_floats ==
+                linked_recurrence_shape->local_state_floats;
         const bool gdn_state_already_full =
             local_conv_state_floats == full_conv_state_floats &&
             local_recurrence_state_floats == full_recurrence_state_floats;
         const bool gdn_live_state_handoff_candidate =
-            total_tokens > 1 && live_state_allgather_available;
-        const bool needs_gdn_live_state_localize =
-            gdn_live_state_handoff_candidate &&
-            verifier_state_capture_supported &&
-            keep_gdn_state_tp_local &&
-            !gdn_state_already_full;
+            total_tokens > 1 && live_state_allgather_available &&
+            (gdn_state_is_linked_local || gdn_state_already_full);
 
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm
@@ -1152,6 +1171,18 @@ namespace llaminar2
         // GDN layers don't check HybridQ16 (always use fused when not first layer)
         addPreAttentionNorm(graph, prefix, buffers, gdn_layer->attn_norm,
                             total_tokens, layer_idx, device, /*check_hybrid_q16=*/false);
+        const std::string gdn_attention_norm_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_attention_norm",
+                buffers.normalized,
+                BufferId::NORMALIZED,
+                prefix + "attn_norm",
+                layer_idx,
+                total_tokens,
+                d_model,
+                device,
+                sequence_lengths_device);
 
         // =====================================================================
         // Stage 2: GDN 4-way Projection
@@ -1194,12 +1225,13 @@ namespace llaminar2
         graph.addNode(prefix + "gdn_proj",
                       ComputeStageFactory::createGDNProjection(proj_params),
                       device);
-        graph.addDependency(prefix + "gdn_proj", prefix + "attn_norm");
+        graph.addDependency(prefix + "gdn_proj", gdn_attention_norm_ready);
         std::string gdn_projection_ready =
             maybeAddGDNDiagnosticCheckpoint(
                 graph,
                 "gdn_projection",
                 buffers.get(BufferId::GDN_QKV),
+                BufferId::GDN_QKV,
                 prefix + "gdn_proj",
                 layer_idx,
                 total_tokens,
@@ -1223,6 +1255,7 @@ namespace llaminar2
                 graph,
                 "gdn_z",
                 buffers.get(BufferId::GDN_Z),
+                BufferId::GDN_Z,
                 gdn_projection_ready,
                 layer_idx,
                 total_tokens,
@@ -1234,6 +1267,7 @@ namespace llaminar2
                 graph,
                 "gdn_alpha",
                 buffers.get(BufferId::GDN_ALPHA),
+                BufferId::GDN_ALPHA,
                 gdn_projection_ready,
                 layer_idx,
                 total_tokens,
@@ -1245,49 +1279,13 @@ namespace llaminar2
                 graph,
                 "gdn_beta",
                 buffers.get(BufferId::GDN_BETA),
+                BufferId::GDN_BETA,
                 gdn_projection_ready,
                 layer_idx,
                 total_tokens,
                 n_v_heads,
                 device,
                 sequence_lengths_device);
-
-        std::string gdn_state_localize_node;
-        if (needs_gdn_live_state_localize)
-        {
-            GDNLiveStateLocalizeStage::Params state_localize_params;
-            state_localize_params.device_id = device;
-            state_localize_params.tp_ctx = static_cast<ILocalTPContext *>(config_.tp_ctx);
-            state_localize_params.conv_kernel = gdn_state->conv_kernel.get();
-            state_localize_params.recurrence_kernel = gdn_state->rec_kernel.get();
-            state_localize_params.layer_idx = layer_idx;
-            state_localize_params.tp_device_idx = config_.tp_device_idx;
-            state_localize_params.local_conv_state_floats = local_conv_state_floats;
-            state_localize_params.full_conv_state_floats = full_conv_state_floats;
-            state_localize_params.modular_conv_state = modular_conv_state;
-            if (modular_conv_state)
-            {
-                state_localize_params.conv_history_len = conv_history_len;
-                state_localize_params.conv_qk_channels = 2 * full_key_dim;
-                state_localize_params.conv_local_v_channels = value_dim;
-                state_localize_params.conv_full_v_channels = full_value_dim;
-            }
-            state_localize_params.local_recurrence_state_floats = local_recurrence_state_floats;
-            state_localize_params.full_recurrence_state_floats = full_recurrence_state_floats;
-            state_localize_params.stage_name = prefix + "gdn_live_state_localize";
-
-            /*
-             * The localize stage has no arena inputs, but tying it to attn_norm
-             * keeps the graph connected and lets the projection run in parallel.
-             * short_conv depends on both this handoff and gdn_proj, so it cannot
-             * consume stale TP-local state from a previous verifier capture.
-             */
-            gdn_state_localize_node = prefix + "gdn_live_state_localize";
-            graph.addNode(gdn_state_localize_node,
-                          ComputeStageFactory::createGDNLiveStateLocalize(state_localize_params),
-                          device);
-            graph.addDependency(gdn_state_localize_node, prefix + "attn_norm");
-        }
 
         // =====================================================================
         // Stage 3: Short Conv1d + SiLU on QKV
@@ -1325,13 +1323,12 @@ namespace llaminar2
                       ComputeStageFactory::createShortConv1d(conv_params),
                       device);
         graph.addDependency(prefix + "short_conv", gdn_projection_ready);
-        if (!gdn_state_localize_node.empty())
-            graph.addDependency(prefix + "short_conv", gdn_state_localize_node);
         const std::string short_conv_ready =
             maybeAddGDNDiagnosticCheckpoint(
                 graph,
                 "short_conv",
                 buffers.get(BufferId::GDN_RECURRENCE_IN),
+                BufferId::GDN_RECURRENCE_IN,
                 prefix + "short_conv",
                 layer_idx,
                 total_tokens,
@@ -1375,32 +1372,11 @@ namespace llaminar2
         rec_params.verifier_state_capture_rows = verifier_state_capture_rows;
         rec_params.speculative_state_slot_rows = verifier_state_capture_rows;
 
-        // GPU TP retains contiguous V shards, so global_v_head_offset tells
-        // recurrence which global V heads select from its Q/K source:
-        //   k_idx = (v_local + offset) % n_k_heads_local
-        //
-        // This is required in ALL TP modes where V is sharded:
-        //   - Selection   (n_k > n_v_local):  K sharded alongside V
-        //   - Identity    (n_k == n_v_local, K replicated at full count)
-        //   - Expansion   (n_k < n_v_local):  K replicated, modular GQA repeat
-        //                                     (e.g. 27B TP=2: n_k=16, n_v_local=24)
-        //
-        // V is sharded whenever n_v_heads < n_v_heads_full. Previously the
-        // expansion case was missed, leaving rank>0 with offset=0 and reading
-        // the wrong K-heads for its V-head slice.
-        // CPU TP instead packs all modulo-linked V spans beside the local Q/K
-        // shard. In that canonical local order, local_v % local_k is already
-        // exact and no global offset belongs in the recurrence contract.
-        if (!device.is_cpu() && n_v_heads < n_v_heads_full)
-        {
-            rec_params.global_v_head_offset = resolveGDNGlobalVHeadOffset(
-                layer_bindings.attn_gate,
-                d_v,
-                n_v_heads,
-                n_v_heads_full,
-                config_,
-                mpi_ctx_.get());
-        }
+        /* Every backend packs V repeats beside the local Q/K interval in
+         * dependency-closed order. The recurrence's local modular relation is
+         * therefore exact with offset zero; a global offset would select a
+         * different local key and corrupt every non-zero participant. */
+        rec_params.global_v_head_offset = 0;
 
         rec_params.output_buffer_id = BufferId::ATTN_OUTPUT;
         rec_params.qkv_buffer_id = BufferId::GDN_RECURRENCE_IN;
@@ -1425,18 +1401,7 @@ namespace llaminar2
             state_gather_params.recurrence_kernel = gdn_state->rec_kernel.get();
             state_gather_params.layer_idx = layer_idx;
             state_gather_params.tp_device_idx = config_.tp_device_idx;
-            state_gather_params.local_conv_state_floats = local_conv_state_floats;
-            state_gather_params.full_conv_state_floats = full_conv_state_floats;
-            state_gather_params.modular_conv_state = modular_conv_state;
-            if (modular_conv_state)
-            {
-                state_gather_params.conv_history_len = conv_history_len;
-                state_gather_params.conv_qk_channels = 2 * full_key_dim;
-                state_gather_params.conv_local_v_channels = value_dim;
-                state_gather_params.conv_full_v_channels = full_value_dim;
-            }
-            state_gather_params.local_recurrence_state_floats = local_recurrence_state_floats;
-            state_gather_params.full_recurrence_state_floats = full_recurrence_state_floats;
+            state_gather_params.geometry = linked_state_geometry;
             state_gather_params.stage_name = prefix + "gdn_live_state_allgather";
 
             if (!gdn_state_already_full)
@@ -1476,6 +1441,7 @@ namespace llaminar2
                 graph,
                 "gdn_preprocessed_qkv",
                 buffers.get(BufferId::GDN_RECURRENCE_IN),
+                BufferId::GDN_RECURRENCE_IN,
                 gdn_state_ready_node,
                 layer_idx,
                 total_tokens,
@@ -1487,6 +1453,7 @@ namespace llaminar2
                 graph,
                 "gdn_preprocessed_alpha",
                 buffers.get(BufferId::GDN_ALPHA),
+                BufferId::GDN_ALPHA,
                 gdn_state_ready_node,
                 layer_idx,
                 total_tokens,
@@ -1498,6 +1465,7 @@ namespace llaminar2
                 graph,
                 "gdn_preprocessed_beta",
                 buffers.get(BufferId::GDN_BETA),
+                BufferId::GDN_BETA,
                 gdn_state_ready_node,
                 layer_idx,
                 total_tokens,
@@ -1510,6 +1478,7 @@ namespace llaminar2
                 graph,
                 "gdn_recurrence",
                 buffers.attn_output,
+                BufferId::ATTN_OUTPUT,
                 gdn_state_ready_node,
                 layer_idx,
                 total_tokens,
@@ -1546,6 +1515,7 @@ namespace llaminar2
                 graph,
                 "gdn_gated_norm",
                 buffers.attn_output,
+                BufferId::ATTN_OUTPUT,
                 prefix + "gated_norm",
                 layer_idx,
                 total_tokens,
@@ -1554,18 +1524,36 @@ namespace llaminar2
                 sequence_lengths_device);
 
         // =====================================================================
-        // Stage 6: Output Projection (Wo GEMM) + optional TP AllReduce
+        // Stage 6: Local output projection, observation, then TP reconstruction
         // =====================================================================
-        std::string terminal_node = addWoProjectionAndAllreduce(
+        const std::string local_projection_node = addWoProjection(
             graph, prefix, buffers, gdn_layer->ssm_out, layer_bindings.ssm_out,
-            total_tokens, layer_idx, device,
+            total_tokens, device,
             gated_norm_ready,
-            "gdn_out_proj", "gdn_wo_allreduce");
+            "gdn_out_proj");
+        const std::string local_projection_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_local_output_projection",
+                buffers.attn_proj,
+                BufferId::ATTN_PROJ,
+                local_projection_node,
+                layer_idx,
+                total_tokens,
+                config_.d_model,
+                device,
+                sequence_lengths_device);
+        std::string terminal_node = addWoAllreduce(
+            graph, prefix, buffers, gdn_layer->ssm_out,
+            total_tokens, layer_idx, device,
+            local_projection_ready,
+            "gdn_wo_allreduce");
         terminal_node =
             maybeAddGDNDiagnosticCheckpoint(
                 graph,
                 "gdn_output_projection",
                 buffers.attn_proj,
+                BufferId::ATTN_PROJ,
                 terminal_node,
                 layer_idx,
                 total_tokens,
@@ -1914,12 +1902,15 @@ namespace llaminar2
         }
 
         // =================================================================
-        // Stage 5: Wo projection + optional TP allreduce
+        // Stage 5: publish the local Wo partial, then reconstruct TP output.
         // =================================================================
-        std::string terminal = addWoProjectionAndAllreduce(
+        const std::string wo_projection = addWoProjection(
             graph, prefix, buffers, layer.wo, wo_binding,
-            total_tokens, layer_idx, device,
+            total_tokens, device,
             prefix + "attn_output_gate");
+        std::string terminal = addWoAllreduce(
+            graph, prefix, buffers, layer.wo,
+            total_tokens, layer_idx, device, wo_projection);
 
         graph.setTerminalNode(terminal);
 

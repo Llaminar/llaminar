@@ -51,6 +51,20 @@ namespace llaminar2
         std::function<bool(std::uint64_t completed_tokens,
                            std::string *error)>;
 
+    /**
+     * @brief Non-blocking sink for device-authenticated decode progress.
+     *
+     * Hosted HIP generation publishes a cumulative committed-token count in
+     * its immutable scheduler ticket.  The transaction coordinator converts
+     * consecutive snapshots into an exactly-once positive delta only after
+     * the matching sparse graph sequence retires.  Production binds this sink
+     * to host-authoritative background residency maintenance; it must not run
+     * policy, perform MPI, allocate, or wait.
+     */
+    using MoEOverlayRetiredDecodeProgressSink =
+        std::function<bool(std::uint64_t completed_tokens,
+                           std::string *error)>;
+
     /** @brief Exact terminal owned by one continuation graph participant. */
     enum class MoEOverlayInferenceCompletionBoundaryKind : std::uint8_t
     {
@@ -217,6 +231,13 @@ namespace llaminar2
          * interval without owning tokens or recreating root scheduling policy.
          */
         MoEOverlayInferenceWorkloadIdentity prefill_schedule_workload{};
+        /**
+         * Coordinator-owned cumulative decode frontier for follower cadence.
+         * Ordinary graph callers leave this zero; the rank-wide transaction
+         * coordinator overwrites it from the authenticated hosted ticket before
+         * comparing symmetric descriptors or publishing remote work.
+         */
+        std::uint64_t retired_decode_progress_tokens = 0u;
 
         bool operator==(
             const MoEOverlayInferenceExecutionDescriptor &) const = default;
@@ -260,6 +281,7 @@ namespace llaminar2
         /** @brief Publish the successful terminal ticket. */
         virtual bool complete(
             std::uint64_t placement_epoch,
+            std::uint64_t retired_decode_progress_tokens,
             std::string *error = nullptr) = 0;
         /** @brief Publish a fatal terminal ticket. */
         virtual bool abort(
@@ -308,6 +330,7 @@ namespace llaminar2
         /** @brief Publish the successful terminal after every handle retired. */
         bool complete(
             std::uint64_t placement_epoch,
+            std::uint64_t retired_decode_progress_tokens,
             std::string *error = nullptr) override;
 
         /** @brief Publish a process-fatal terminal for the active command. */
@@ -342,6 +365,7 @@ namespace llaminar2
         bool publishTerminal(
             MoEOverlayInferenceTransactionAction action,
             std::uint64_t placement_epoch,
+            std::uint64_t retired_decode_progress_tokens,
             int error_code,
             std::string *error);
 
@@ -531,6 +555,9 @@ namespace llaminar2
             /** Optional process-local device-controller wake sideband. */
             MoEOverlayRetiredPrefillProgressSink
                 retired_prefill_progress_sink;
+            /** Optional host-maintenance wake for retired hosted MTP sequences. */
+            MoEOverlayRetiredDecodeProgressSink
+                retired_decode_progress_sink;
             /**
              * Host RCU authority whose current epoch is pinned per sequence.
              * Device-resident homogeneous controllers leave this empty because
@@ -728,6 +755,8 @@ namespace llaminar2
          * @param transaction_id Positive monotonically increasing ticket id.
          * @param next_draft_depth Controller-selected next depth, or nullopt
          *        when the ticket closes the outer generation command.
+         * @param committed_output_tokens Cumulative logical response count in
+         *        the same authenticated ticket.
          * @param error Optional stable lifecycle diagnostic.
          * @return True when this exact transition was applied or had already
          *         been applied by a symmetric participant.
@@ -735,6 +764,7 @@ namespace llaminar2
         bool advanceHostedGraphSequence(
             std::uint64_t transaction_id,
             std::optional<int> next_draft_depth,
+            std::uint64_t committed_output_tokens,
             std::string *error = nullptr);
 
         /** @brief Retire all graph slots and publish Complete to every target. */
@@ -957,6 +987,8 @@ namespace llaminar2
         std::uint64_t last_hosted_sequence_transition_id_ = 0;
         /** Decision paired with @ref last_hosted_sequence_transition_id_. */
         std::optional<int> last_hosted_sequence_next_draft_depth_;
+        /** Cumulative token count paired with the last hosted transition. */
+        std::uint64_t last_hosted_sequence_committed_output_tokens_ = 0u;
         ExecutionSequencePlan execution_sequence_{};
         std::uint64_t next_group_id_ = 1;
         std::uint64_t next_sequence_id_ = 1;
@@ -1064,6 +1096,8 @@ namespace llaminar2
         bool aborted = false; ///< True when root published an Abort terminal.
         int error_code = 0; ///< Positive root error code for an abort.
         std::size_t executed_transactions = 0; ///< Retained graphs completed.
+        /** Cumulative device-authenticated decode progress on Complete. */
+        std::uint64_t retired_decode_progress_tokens = 0u;
         std::string error; ///< Protocol, transport, or executor diagnostic.
     };
 
@@ -1090,6 +1124,9 @@ namespace llaminar2
             /** Optional process-local device-controller wake sideband. */
             MoEOverlayRetiredPrefillProgressSink
                 retired_prefill_progress_sink;
+            /** Optional hosted-maintenance wake from the source frontier. */
+            MoEOverlayRetiredDecodeProgressSink
+                retired_decode_progress_sink;
         };
 
         /**
@@ -1123,6 +1160,8 @@ namespace llaminar2
             interference_probe_;
         MoEOverlayRetiredPrefillProgressSink
             retired_prefill_progress_sink_;
+        MoEOverlayRetiredDecodeProgressSink
+            retired_decode_progress_sink_;
     };
 
 } // namespace llaminar2

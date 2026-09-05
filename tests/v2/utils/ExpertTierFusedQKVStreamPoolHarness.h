@@ -342,8 +342,19 @@ namespace llaminar2::test
 
             ExpertTierWeightTransferLane lane({
                 .device = device,
-                .staging_capacity_bytes = migration_layout.chunkBytes(
-                    migration_layout.maximum_units_per_chunk),
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   migration_layout.chunkBytes(
+                                       migration_layout.maximum_units_per_chunk),
+                                   1u,
+                                   device)
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     device,
+                                     lane_prefix + ":" + phase.name)
+                                 .front(),
                 .lane_name = lane_prefix + ":" + phase.name,
                 .perf_device = device.to_string(),
             });

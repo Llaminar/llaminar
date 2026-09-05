@@ -285,22 +285,6 @@ namespace llaminar2
         }
     }
 
-    static bool shouldUseMappedMemoryForBuffer(BufferId id)
-    {
-        switch (id)
-        {
-        case BufferId::LOGITS:
-        case BufferId::LOGITS_LOCAL:
-        case BufferId::ALL_POSITION_LOGITS:
-        case BufferId::ALL_POSITION_LOGITS_LOCAL:
-        case BufferId::PREFIX_TERMINAL_LOGITS:
-        case BufferId::STOCHASTIC_PROCESSED_LOGITS:
-            return true;
-        default:
-            return false;
-        }
-    }
-
     /// Map buffer name string (from BufferDescriptor/BufferNames) to BufferId.
     /// Returns BufferId::_COUNT if no mapping exists.
     BufferId BufferArena::bufferNameToId(const std::string &name)
@@ -472,42 +456,13 @@ namespace llaminar2
         std::vector<size_t> shape{b.rows, b.cols};
         const std::string dtype = b.dtype ? std::string(b.dtype) : "FP32";
         const bool is_fp32 = dtype == "FP32";
-        const bool mapped_requested =
-            config_.use_mapped_memory && b.home_device.is_gpu() && is_fp32;
-        const bool mapped_allowed =
-            mapped_requested && shouldUseMappedMemoryForBuffer(id);
 
         // ── Factory-based allocation (NUMA-aware, dtype-aware) ──────────
         if (config_.factory)
         {
-            // Mapped memory is only safe for host-visible publication buffers.
-            // Scratch activations must stay in device memory so graph-captured
-            // GPU paths do not smuggle in mapped-output copies.
-            if (mapped_allowed)
-            {
-                auto mapped = FP32Tensor::createMapped(shape, b.home_device);
-                if (mapped && mapped->isMapped())
-                {
-                    LOG_DEBUG("[BufferArena] Created mapped FP32 tensor for '"
-                              << bufferIdName(id) << "' on " << b.home_device.toString());
-                    return mapped;
-                }
-                throw std::runtime_error(
-                    "[BufferArena] Required mapped allocation failed for '" +
-                    std::string(bufferIdName(id)) + "' on " +
-                    b.home_device.toString());
-            }
-
             // Dispatch by dtype string
             if (is_fp32)
             {
-                if (mapped_requested && !mapped_allowed)
-                {
-                    LOG_TRACE("[BufferArena] Keeping GPU FP32 scratch buffer '"
-                              << bufferIdName(id) << "' in device memory on "
-                              << b.home_device.toString());
-                    return std::make_shared<FP32Tensor>(shape, b.home_device);
-                }
                 return config_.factory->createFP32(shape, b.home_device);
             }
             else if (dtype == "FP16")
@@ -535,10 +490,6 @@ namespace llaminar2
                 LOG_DEBUG("[BufferArena] Unknown dtype '" << dtype
                                                           << "' for " << bufferIdName(id)
                                                           << ", defaulting to FP32");
-                if (mapped_requested && !mapped_allowed)
-                {
-                    return std::make_shared<FP32Tensor>(shape, b.home_device);
-                }
                 return config_.factory->createFP32(shape, b.home_device);
             }
         }
@@ -578,6 +529,15 @@ namespace llaminar2
                 LOG_ERROR("[BufferArena] Failed to allocate buffer '"
                           << bufferIdName(bid) << "'");
                 return false;
+            }
+            if (b.home_device.is_gpu() && tensor->isMapped())
+            {
+                throw std::logic_error(
+                    "BufferArena: owned GPU graph buffer '" +
+                    std::string(bufferIdName(bid)) +
+                    "' resolved to mapped host storage; graph activations must "
+                    "remain device-local and mapped transport pages must be "
+                    "declared through TransferEngine");
             }
 
             size_t bytes = tensor->size_bytes();

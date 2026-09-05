@@ -24,6 +24,7 @@ namespace llaminar2
 {
     class IBackend;
     class LoadOrchestrator;
+    class PhysicalMemoryAuthority;
 
     class GpuExpertTransferStagingPool
         : public std::enable_shared_from_this<GpuExpertTransferStagingPool>
@@ -41,6 +42,15 @@ namespace llaminar2
         };
 
         static std::shared_ptr<GpuExpertTransferStagingPool> create(
+            IBackend *backend,
+            DeviceId device,
+            int device_ordinal,
+            int capacity,
+            std::vector<ProjectionSpec> specs,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority);
+
+        /** @brief Named unadmitted construction boundary for isolated tests. */
+        static std::shared_ptr<GpuExpertTransferStagingPool> createForTest(
             IBackend *backend,
             DeviceId device,
             int device_ordinal,
@@ -65,6 +75,16 @@ namespace llaminar2
             int capacity,
             std::vector<ProjectionSpec> specs,
             std::shared_ptr<LoadOrchestrator> orchestrator);
+
+        /** @brief Shared implementation for admitted and explicit test setup. */
+        static std::shared_ptr<GpuExpertTransferStagingPool> createImpl(
+            IBackend *backend,
+            DeviceId device,
+            int device_ordinal,
+            int capacity,
+            std::vector<ProjectionSpec> specs,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+            bool explicit_test_allocation);
 
         static std::string slotName(int slot_index, const std::string &label);
         void releaseSlot(int slot_index, int expert_id);

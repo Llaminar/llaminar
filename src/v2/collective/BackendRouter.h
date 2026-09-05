@@ -354,6 +354,18 @@ namespace llaminar2
         CollectiveBackendType selectBackendType(const DeviceGroup &group) const;
         std::string makeGroupKey(const DeviceGroup &group) const;
 
+        /**
+         * @brief Resolve this process's rank-local participant inventory.
+         *
+         * Full cluster inventories are indexed by MPI rank. Participant-scoped
+         * LocalTP inventories contain one record whose `rank` field names its
+         * owner. Supporting both shapes keeps backend pre-initialization tied
+         * to declared participants rather than array position or discovery.
+         *
+         * @return Local rank inventory, or nullptr when none was supplied.
+         */
+        [[nodiscard]] const RankInventory *localRankInventory() const noexcept;
+
         // Pre-initialize GPU backends to avoid CUDA/HIP context corruption
         void preInitializeNCCLBackend();
         void preInitializeRCCLBackend();

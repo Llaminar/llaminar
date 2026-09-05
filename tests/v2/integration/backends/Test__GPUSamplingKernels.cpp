@@ -2706,9 +2706,9 @@ namespace
      * predicate word, the identical executable must run the tail exactly once.
      * This is the focused contract used to omit non-due Dynamic maintenance and
      * its collective without host scheduling or graph recapture. Running the
-     * same contract through one-shot, WHILE, and SWITCH/WHILE composition also
-     * proves sparse maintenance and fixed/dynamic MTP share one fragment-
-     * execution policy.
+     * same contract through one-shot and WHILE composition proves sparse
+     * maintenance and fixed MTP share one fragment-execution policy. Dynamic
+     * selector gating has its own depth-total integration proof below.
      */
     TEST_P(
         GPUSamplingTest,
@@ -2719,8 +2719,6 @@ namespace
 
         constexpr int healthy_index = 0;
         constexpr int complete_index = 1;
-        constexpr int selector_index = 2;
-        constexpr int error_index = 3;
         constexpr int control_stride = 4;
         constexpr int trace_sentinel = -1;
         constexpr int trace_publication = 7331;
@@ -2860,39 +2858,6 @@ namespace
                     .complete_index = complete_index,
                 }));
             ASSERT_TRUE(parent->instantiate());
-            run_case(condition_clear, trace_sentinel);
-            run_case(condition_set, trace_publication);
-
-            const std::array<DeviceControlledLoopBranch, 1> branches = {{
-                {
-                    .ordered_fragments = fragments,
-                },
-            }};
-            ASSERT_TRUE(parent->supportsDeviceControlledSwitchWhileLoop());
-            ASSERT_TRUE(parent->buildDeviceControlledSwitchWhileLoop(
-                branches,
-                DeviceControlledLoopPredicate{
-                    .control_rows_device =
-                        static_cast<const int *>(d_control),
-                    .control_stride = control_stride,
-                    .request_count = 1,
-                    .healthy_index = healthy_index,
-                    .complete_index = complete_index,
-                },
-                DeviceControlledLoopSwitch{
-                    .control_rows_device = static_cast<int *>(d_control),
-                    .control_stride = control_stride,
-                    .request_count = 1,
-                    .healthy_index = healthy_index,
-                    .complete_index = complete_index,
-                    .selector_index = selector_index,
-                    .error_index = error_index,
-                    .minimum_selector = 0,
-                    .maximum_selector = 0,
-                    .invalid_selector_error = 9101,
-                }));
-            ASSERT_TRUE(parent->instantiate());
-
             run_case(condition_clear, trace_sentinel);
             run_case(condition_set, trace_publication);
 
@@ -3529,97 +3494,84 @@ namespace
     }
 
     /**
-     * @brief Prove CUDA selects complete WHILE transactions from device state.
+     * @brief Prove one compact CUDA parent executes every legal MTP depth.
      *
-     * Branch one writes the first trace word and publishes selector two through
-     * a captured D2D copy. Branch two writes the second trace word and publishes
-     * request completion. One parent launch must therefore execute both bodies
-     * in order without a host selector read. A malformed selector is then
-     * required to invalidate the controller and execute neither branch.
+     * The parent owns one unconditional depth-one fragment, fourteen monotonic
+     * selector-gated fragments, and one shared completion tail. Replaying the
+     * same executable for selectors one through fifteen must write exactly that
+     * prefix and the common tail. Out-of-range selectors must poison the
+     * controller before either region executes.
      */
     TEST_P(
         GPUSamplingTest,
-        DeviceControlledSwitchWhileSelectsTransactionsAndFailsInvalidDepth)
+        DeviceControlledSelectorWhileCoversDepthFifteenAndFailsInvalidDepth)
     {
         if (GetParam() != "CUDA")
-            GTEST_SKIP() << "CUDA SWITCH/WHILE coverage is backend-specific";
+        {
+            GTEST_SKIP()
+                << "CUDA native selector/WHILE coverage is backend-specific";
+        }
 
         constexpr int healthy_index = 0;
         constexpr int complete_index = 1;
         constexpr int selector_index = 2;
         constexpr int error_index = 3;
         constexpr int control_stride = 4;
+        constexpr int minimum_selector = 1;
+        constexpr int maximum_selector = 15;
+        constexpr int trace_word_count = maximum_selector + 1;
         constexpr int invalid_selector_error = 7719;
+        constexpr int trace_sentinel = -1;
+        constexpr int common_tail_value = 9001;
 
         void *d_control = backend_->allocate(
             control_stride * sizeof(int), device_id_);
-        void *d_trace = backend_->allocate(2 * sizeof(int), device_id_);
-        void *d_trace_one = backend_->allocate(sizeof(int), device_id_);
-        void *d_trace_two = backend_->allocate(sizeof(int), device_id_);
-        void *d_selector_two = backend_->allocate(sizeof(int), device_id_);
+        void *d_trace = backend_->allocate(
+            trace_word_count * sizeof(int), device_id_);
+        void *d_slot_values = backend_->allocate(
+            maximum_selector * sizeof(int), device_id_);
+        void *d_common_tail_value =
+            backend_->allocate(sizeof(int), device_id_);
         void *d_complete = backend_->allocate(sizeof(int), device_id_);
-        const std::array<void *, 6> allocations = {
+        const std::array<void *, 5> allocations = {
             d_control,
             d_trace,
-            d_trace_one,
-            d_trace_two,
-            d_selector_two,
+            d_slot_values,
+            d_common_tail_value,
             d_complete};
         for (void *allocation : allocations)
             ASSERT_NE(allocation, nullptr);
 
-        const int trace_one = 101;
-        const int trace_two = 202;
-        const int selector_two = 2;
+        std::array<int, maximum_selector> slot_values{};
+        for (int slot = 0; slot < maximum_selector; ++slot)
+            slot_values[static_cast<size_t>(slot)] = 100 + slot;
+        const std::array<int, trace_word_count> empty_trace = [=]
+        {
+            std::array<int, trace_word_count> values{};
+            values.fill(trace_sentinel);
+            return values;
+        }();
         const int complete = 1;
-        const std::array<int, control_stride> initial_control = {
-            1,
-            0,
-            1,
-            0};
-        const std::array<int, 2> empty_trace = {-1, -1};
 
-        std::array<int, control_stride> actual_control{};
-        std::array<int, 2> actual_trace{};
         auto &cuda_context =
             GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
         cuda_context.submitAndWait([&]()
         {
             void *const parent_stream = cuda_context.defaultStream();
-            void *const branch_one_stream = cuda_context.createStream();
-            void *const branch_two_stream = cuda_context.createStream();
+            void *const fragment_stream = cuda_context.createStream();
             ASSERT_NE(parent_stream, nullptr);
-            ASSERT_NE(branch_one_stream, nullptr);
-            ASSERT_NE(branch_two_stream, nullptr);
+            ASSERT_NE(fragment_stream, nullptr);
 
             ASSERT_TRUE(copyHostToDevice(
-                d_control,
-                initial_control.data(),
-                sizeof(initial_control),
+                d_slot_values,
+                slot_values.data(),
+                sizeof(slot_values),
                 device_id_,
                 parent_stream));
             ASSERT_TRUE(copyHostToDevice(
-                d_trace,
-                empty_trace.data(),
-                sizeof(empty_trace),
-                device_id_,
-                parent_stream));
-            ASSERT_TRUE(copyHostToDevice(
-                d_trace_one,
-                &trace_one,
-                sizeof(trace_one),
-                device_id_,
-                parent_stream));
-            ASSERT_TRUE(copyHostToDevice(
-                d_trace_two,
-                &trace_two,
-                sizeof(trace_two),
-                device_id_,
-                parent_stream));
-            ASSERT_TRUE(copyHostToDevice(
-                d_selector_two,
-                &selector_two,
-                sizeof(selector_two),
+                d_common_tail_value,
+                &common_tail_value,
+                sizeof(common_tail_value),
                 device_id_,
                 parent_stream));
             ASSERT_TRUE(copyHostToDevice(
@@ -3630,64 +3582,68 @@ namespace
                 parent_stream));
             ASSERT_TRUE(backend_->synchronizeStream(parent_stream, device_id_));
 
-            auto branch_one =
-                cuda_context.createGraphCapture(branch_one_stream);
-            ASSERT_NE(branch_one, nullptr);
-            ASSERT_TRUE(branch_one->beginCapture());
-            ASSERT_TRUE(backend_->deviceCopyAsync(
-                d_trace,
-                d_trace_one,
-                sizeof(int),
-                device_id_,
-                branch_one_stream));
-            ASSERT_TRUE(backend_->deviceCopyAsync(
-                static_cast<int *>(d_control) + selector_index,
-                d_selector_two,
-                sizeof(int),
-                device_id_,
-                branch_one_stream));
-            ASSERT_TRUE(branch_one->endCapture());
-            ASSERT_GT(branch_one->nodeCount(), 0u);
+            std::vector<std::unique_ptr<IGPUGraphCapture>> slot_captures;
+            slot_captures.reserve(maximum_selector);
+            std::vector<DeviceControlledLoopFragment> fragments;
+            fragments.reserve(maximum_selector + 1);
+            for (int slot = 0; slot < maximum_selector; ++slot)
+            {
+                auto capture =
+                    cuda_context.createGraphCapture(fragment_stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->deviceCopyAsync(
+                    static_cast<int *>(d_trace) + slot,
+                    static_cast<int *>(d_slot_values) + slot,
+                    sizeof(int),
+                    device_id_,
+                    fragment_stream));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_GT(capture->nodeCount(), 0u);
+                slot_captures.push_back(std::move(capture));
+                fragments.push_back(DeviceControlledLoopFragment{
+                    .name = slot == 0
+                        ? "minimum-depth prefix"
+                        : "selector-gated draft prefix",
+                    .capture = slot_captures.back().get(),
+                    .execution = slot == 0
+                        ? DeviceControlledLoopFragmentExecution::Always
+                        : DeviceControlledLoopFragmentExecution::
+                              IfDeviceSelectorAtLeast,
+                    .condition_word_device = nullptr,
+                    .minimum_selector = slot == 0 ? -1 : slot + 1,
+                });
+            }
 
-            auto branch_two =
-                cuda_context.createGraphCapture(branch_two_stream);
-            ASSERT_NE(branch_two, nullptr);
-            ASSERT_TRUE(branch_two->beginCapture());
+            auto common_tail =
+                cuda_context.createGraphCapture(fragment_stream);
+            ASSERT_NE(common_tail, nullptr);
+            ASSERT_TRUE(common_tail->beginCapture());
             ASSERT_TRUE(backend_->deviceCopyAsync(
-                static_cast<int *>(d_trace) + 1,
-                d_trace_two,
+                static_cast<int *>(d_trace) + maximum_selector,
+                d_common_tail_value,
                 sizeof(int),
                 device_id_,
-                branch_two_stream));
+                fragment_stream));
             ASSERT_TRUE(backend_->deviceCopyAsync(
                 static_cast<int *>(d_control) + complete_index,
                 d_complete,
                 sizeof(int),
                 device_id_,
-                branch_two_stream));
-            ASSERT_TRUE(branch_two->endCapture());
-            ASSERT_GT(branch_two->nodeCount(), 0u);
-
-            const std::array<DeviceControlledLoopFragment, 1>
-                branch_one_fragments = {{
-                    {.name = "selector one", .capture = branch_one.get()},
-                }};
-            const std::array<DeviceControlledLoopFragment, 1>
-                branch_two_fragments = {{
-                    {.name = "selector two", .capture = branch_two.get()},
-                }};
-            const std::array<DeviceControlledLoopBranch, 3> branches = {
-                DeviceControlledLoopBranch{},
-                DeviceControlledLoopBranch{
-                    .ordered_fragments = branch_one_fragments},
-                DeviceControlledLoopBranch{
-                    .ordered_fragments = branch_two_fragments}};
+                fragment_stream));
+            ASSERT_TRUE(common_tail->endCapture());
+            ASSERT_GT(common_tail->nodeCount(), 0u);
+            fragments.push_back(DeviceControlledLoopFragment{
+                .name = "shared transaction tail",
+                .capture = common_tail.get(),
+            });
 
             auto parent = cuda_context.createGraphCapture(parent_stream);
             ASSERT_NE(parent, nullptr);
-            ASSERT_TRUE(parent->supportsDeviceControlledSwitchWhileLoop());
-            ASSERT_TRUE(parent->buildDeviceControlledSwitchWhileLoop(
-                branches,
+            ASSERT_TRUE(
+                parent->supportsDeviceControlledSelectorWhileLoop());
+            ASSERT_TRUE(parent->buildDeviceControlledSelectorWhileLoop(
+                fragments,
                 DeviceControlledLoopPredicate{
                     .control_rows_device =
                         static_cast<const int *>(d_control),
@@ -3695,7 +3651,7 @@ namespace
                     .request_count = 1,
                     .healthy_index = healthy_index,
                     .complete_index = complete_index},
-                DeviceControlledLoopSwitch{
+                DeviceControlledLoopSelector{
                     .control_rows_device = static_cast<int *>(d_control),
                     .control_stride = control_stride,
                     .request_count = 1,
@@ -3703,75 +3659,137 @@ namespace
                     .complete_index = complete_index,
                     .selector_index = selector_index,
                     .error_index = error_index,
-                    .minimum_selector = 1,
-                    .maximum_selector = 2,
+                    .minimum_selector = minimum_selector,
+                    .maximum_selector = maximum_selector,
                     .invalid_selector_error = invalid_selector_error}));
             ASSERT_TRUE(parent->instantiate());
-            ASSERT_TRUE(parent->launch());
-            ASSERT_TRUE(parent->launch())
-                << "A terminal controller must execute zero later iterations";
-            ASSERT_TRUE(copyDeviceToHost(
-                actual_trace.data(),
-                d_trace,
-                sizeof(actual_trace),
-                device_id_,
-                parent_stream));
-            ASSERT_TRUE(copyDeviceToHost(
-                actual_control.data(),
-                d_control,
-                sizeof(actual_control),
-                device_id_,
-                parent_stream));
-            ASSERT_TRUE(backend_->synchronizeStream(parent_stream, device_id_));
 
-            EXPECT_EQ(actual_trace, (std::array<int, 2>{101, 202}));
-            EXPECT_EQ(actual_control[healthy_index], 1);
-            EXPECT_EQ(actual_control[complete_index], 1);
-            EXPECT_EQ(actual_control[selector_index], 2);
-            EXPECT_EQ(actual_control[error_index], 0);
+            auto run_legal_depth = [&](int depth)
+            {
+                const std::array<int, control_stride> initial_control = {
+                    1,
+                    0,
+                    depth,
+                    0};
+                std::array<int, trace_word_count> actual_trace{};
+                std::array<int, control_stride> actual_control{};
+                ASSERT_TRUE(copyHostToDevice(
+                    d_control,
+                    initial_control.data(),
+                    sizeof(initial_control),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_trace,
+                    empty_trace.data(),
+                    sizeof(empty_trace),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(parent->launch());
+                ASSERT_TRUE(copyDeviceToHost(
+                    actual_trace.data(),
+                    d_trace,
+                    sizeof(actual_trace),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(copyDeviceToHost(
+                    actual_control.data(),
+                    d_control,
+                    sizeof(actual_control),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(
+                    backend_->synchronizeStream(parent_stream, device_id_));
 
-            const std::array<int, control_stride> invalid_control = {
-                1,
-                0,
-                3,
-                0};
-            ASSERT_TRUE(copyHostToDevice(
-                d_control,
-                invalid_control.data(),
-                sizeof(invalid_control),
-                device_id_,
-                parent_stream));
-            ASSERT_TRUE(copyHostToDevice(
-                d_trace,
-                empty_trace.data(),
-                sizeof(empty_trace),
-                device_id_,
-                parent_stream));
-            ASSERT_TRUE(parent->launch());
-            ASSERT_TRUE(copyDeviceToHost(
-                actual_trace.data(),
-                d_trace,
-                sizeof(actual_trace),
-                device_id_,
-                parent_stream));
-            ASSERT_TRUE(copyDeviceToHost(
-                actual_control.data(),
-                d_control,
-                sizeof(actual_control),
-                device_id_,
-                parent_stream));
-            ASSERT_TRUE(backend_->synchronizeStream(parent_stream, device_id_));
+                for (int slot = 0; slot < maximum_selector; ++slot)
+                {
+                    EXPECT_EQ(
+                        actual_trace[static_cast<size_t>(slot)],
+                        slot < depth
+                            ? slot_values[static_cast<size_t>(slot)]
+                            : trace_sentinel)
+                        << "selector=" << depth << " slot=" << slot;
+                }
+                EXPECT_EQ(
+                    actual_trace[maximum_selector],
+                    common_tail_value);
+                EXPECT_EQ(actual_control[healthy_index], 1);
+                EXPECT_EQ(actual_control[complete_index], 1);
+                EXPECT_EQ(actual_control[selector_index], depth);
+                EXPECT_EQ(actual_control[error_index], 0);
 
-            EXPECT_EQ(actual_trace, empty_trace);
-            EXPECT_EQ(actual_control[healthy_index], 0);
-            EXPECT_EQ(actual_control[complete_index], 1);
-            EXPECT_EQ(actual_control[error_index], invalid_selector_error);
+                ASSERT_TRUE(parent->launch())
+                    << "A terminal controller must replay zero iterations";
+                std::array<int, trace_word_count> terminal_replay_trace{};
+                ASSERT_TRUE(copyDeviceToHost(
+                    terminal_replay_trace.data(),
+                    d_trace,
+                    sizeof(terminal_replay_trace),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(
+                    backend_->synchronizeStream(parent_stream, device_id_));
+                EXPECT_EQ(terminal_replay_trace, actual_trace);
+            };
+
+            for (int depth = minimum_selector;
+                 depth <= maximum_selector;
+                 ++depth)
+            {
+                run_legal_depth(depth);
+            }
+
+            auto run_invalid_depth = [&](int depth)
+            {
+                const std::array<int, control_stride> initial_control = {
+                    1,
+                    0,
+                    depth,
+                    0};
+                std::array<int, trace_word_count> actual_trace{};
+                std::array<int, control_stride> actual_control{};
+                ASSERT_TRUE(copyHostToDevice(
+                    d_control,
+                    initial_control.data(),
+                    sizeof(initial_control),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_trace,
+                    empty_trace.data(),
+                    sizeof(empty_trace),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(parent->launch());
+                ASSERT_TRUE(copyDeviceToHost(
+                    actual_trace.data(),
+                    d_trace,
+                    sizeof(actual_trace),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(copyDeviceToHost(
+                    actual_control.data(),
+                    d_control,
+                    sizeof(actual_control),
+                    device_id_,
+                    parent_stream));
+                ASSERT_TRUE(
+                    backend_->synchronizeStream(parent_stream, device_id_));
+
+                EXPECT_EQ(actual_trace, empty_trace);
+                EXPECT_EQ(actual_control[healthy_index], 0);
+                EXPECT_EQ(actual_control[complete_index], 1);
+                EXPECT_EQ(
+                    actual_control[error_index],
+                    invalid_selector_error);
+            };
+            run_invalid_depth(minimum_selector - 1);
+            run_invalid_depth(maximum_selector + 1);
 
             parent.reset();
-            branch_two.reset();
-            branch_one.reset();
-            cuda_context.destroyStream(branch_two_stream);
-            cuda_context.destroyStream(branch_one_stream);
+            common_tail.reset();
+            slot_captures.clear();
+            cuda_context.destroyStream(fragment_stream);
         });
 
         for (void *allocation : allocations)
@@ -18122,6 +18140,7 @@ namespace
         ASSERT_TRUE(publication->instantiate());
 
         control[kDeviceGenerationControlTransactionCount] = 9;
+        control[kDeviceGenerationControlResponseTokenCount] = 23;
         control[kDeviceGenerationControlCurrentDraftDepth] = 15;
         control[kDeviceGenerationControlActiveVerifierRowCount] = 16;
         const uint32_t maintenance_due = 1;
@@ -18153,6 +18172,7 @@ namespace
             workspace_generation));
         EXPECT_EQ(observed.transaction_count, 9);
         EXPECT_EQ(observed.next_draft_depth, 15);
+        EXPECT_EQ(observed.committed_output_tokens, 23);
         EXPECT_EQ(observed.maintenance_due, 1);
         EXPECT_EQ(observed.healthy, 1);
         EXPECT_EQ(

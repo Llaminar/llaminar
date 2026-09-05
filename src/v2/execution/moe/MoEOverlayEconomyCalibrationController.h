@@ -58,6 +58,8 @@ namespace llaminar2
         std::uint64_t evidence_exchanges_started = 0;
         std::uint64_t evidence_exchanges_completed = 0;
         std::uint64_t accepted_pairs = 0;
+        /** Exact sealed physical corpus imported without launching new waves. */
+        std::uint64_t reused_sealed_profiles = 0;
         std::uint64_t fatal_failures = 0;
 
         /* Zero-only legacy fields remain during diagnostic-reader migration. */
@@ -96,6 +98,13 @@ namespace llaminar2
             /** Optional all-rank merger for distributed partial timings. */
             std::shared_ptr<IMoEOverlayEconomyEvidenceExchange>
                 evidence_exchange;
+            /**
+             * Optional immutable physical profile from an exact prepared-model
+             * reuse contract. Malformed or topology-incompatible evidence is
+             * fatal; the controller never falls back to fresh profiling.
+             */
+            std::shared_ptr<const MoEOverlaySealedMigrationMeasurements>
+                presealed_measurements;
             std::string perf_device;
         };
 
@@ -224,7 +233,9 @@ namespace llaminar2
         bool evidence_exchange_active_ = false;
         std::string failure_after_cleanup_;
         std::optional<MoEOverlaySealedMigrationMeasurements> sealed_;
-        const std::chrono::steady_clock::time_point profiling_started_at_;
+        /** First physical-wave poll; construction may precede graph capture. */
+        std::optional<std::chrono::steady_clock::time_point>
+            profiling_started_at_;
 
         std::atomic<std::uint64_t> polls_{0};
         std::atomic<std::uint64_t> wave_start_attempts_{0};
@@ -235,6 +246,7 @@ namespace llaminar2
         std::atomic<std::uint64_t> evidence_exchanges_started_{0};
         std::atomic<std::uint64_t> evidence_exchanges_completed_{0};
         std::atomic<std::uint64_t> accepted_pairs_{0};
+        std::atomic<std::uint64_t> reused_sealed_profiles_{0};
         std::atomic<std::uint64_t> fatal_failures_{0};
         std::uint64_t expected_profile_waves_ = 0u;
     };

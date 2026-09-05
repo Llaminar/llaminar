@@ -217,5 +217,32 @@ namespace llaminar2
             IGPUGraphCapture &destination,
             const ComputeGraph &graph,
             std::span<const MoEOverlayRetainedCaptureUnit> units);
+
+        /**
+         * @brief Retain ordered children whose timeline edges are stage-owned.
+         *
+         * Scalar and multi-row packet stages capture their complete mapped
+         * timeline or multi-stream fork/join DAG inside ordinary child units.
+         * Likewise, a same-domain sibling may contain only authority-aligned
+         * collective cutpoints and no packet stage of its own. In every case
+         * the parent adds exact child-to-child dependencies but must not
+         * manufacture a second mapped wait or publication.
+         *
+         * Every non-manual, non-passive graph node must occur exactly once in
+         * @p units and all such nodes must belong to one GPU. Packet stages are
+         * deliberately accepted here because their exact timeline nodes are
+         * already part of their captured child.
+         *
+         * @param destination Empty native parent on the participant GPU.
+         * @param graph Exact declarative heterogeneous endpoint graph.
+         * @param units Active native units in graph execution order.
+         * @throws std::invalid_argument for missing, reordered, or mixed-device
+         *         units.
+         * @throws std::runtime_error when native graph lowering fails.
+         */
+        static void buildStageOwnedTransactionFromCapturedUnits(
+            IGPUGraphCapture &destination,
+            const ComputeGraph &graph,
+            std::span<const MoEOverlayRetainedCaptureUnit> units);
     };
 } // namespace llaminar2

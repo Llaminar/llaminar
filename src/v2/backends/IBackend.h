@@ -87,6 +87,35 @@ namespace llaminar2
     };
 
     /**
+     * @brief Exact device-address-space reach required by one mapped host region.
+     *
+     * Device-local registration updates only the named GPU's address space.
+     * Backend-portable registration is reserved for a region whose immutable
+     * endpoint set contains two or more devices from the same backend family.
+     * Keeping this policy typed prevents a one-device activation ticket from
+     * needlessly modifying every local GPU page table.
+     */
+    enum class MappedHostRegistrationScope : std::uint8_t
+    {
+        DeviceLocal = 0, ///< Only the registration device consumes the pages.
+        BackendPortable, ///< Multiple devices in one backend consume the pages.
+    };
+
+    /** @return Stable diagnostic spelling for mapped registration reach. */
+    [[nodiscard]] constexpr const char *to_string(
+        MappedHostRegistrationScope scope) noexcept
+    {
+        switch (scope)
+        {
+        case MappedHostRegistrationScope::DeviceLocal:
+            return "device_local";
+        case MappedHostRegistrationScope::BackendPortable:
+            return "backend_portable";
+        }
+        return "unknown";
+    }
+
+    /**
      * @brief Unforgeable authority to retire one exclusive GPU runtime generation.
      *
      * Only TransferEngine can construct this request, after consuming an
@@ -118,13 +147,48 @@ namespace llaminar2
     };
 
     /**
+     * @brief Certified native-runtime state after an exclusive device reset.
+     *
+     * The successor generation exists as a host-side cache identity before
+     * model execution materializes runtime state for it. Keeping that state
+     * explicit prevents a diagnostic memory query from silently rehydrating
+     * the runtime generation that model retirement was required to release.
+     * CUDA can additionally prove that its primary context is inactive. AMD
+     * HIP deliberately keeps a process primary-context object active, so its
+     * equivalent proof is a successful native reset followed by no
+     * materializing runtime operation.
+     */
+    enum class DeviceRuntimePostResetState : std::uint8_t
+    {
+        Unverified = 0, ///< No backend proof of the post-reset native state.
+        Quiescent, ///< Reset successor has not been rehydrated for execution.
+    };
+
+    /** @return Stable diagnostic spelling for a post-reset runtime state. */
+    [[nodiscard]] constexpr const char *to_string(
+        DeviceRuntimePostResetState state) noexcept
+    {
+        switch (state)
+        {
+        case DeviceRuntimePostResetState::Unverified:
+            return "unverified";
+        case DeviceRuntimePostResetState::Quiescent:
+            return "quiescent";
+        }
+        return "unknown";
+    }
+
+    /**
      * @brief Backend proof for one completed CUDA/HIP runtime reset generation.
      *
      * A successful result means the backend proved that no tracked device
      * allocation or host registration remained, invalidated its own cached
      * runtime handles, reset the named device context, and published a new
-     * monotonically increasing generation. Driver free-memory observations
-     * bracket the reset and are evidence, not admission authority.
+     * monotonically increasing successor generation. The successor must remain
+     * quiescent: querying driver free memory after reset through the runtime
+     * can rehydrate it and defeat reclamation. Driver free memory is
+     * therefore observed only before reset; the next legitimate model
+     * admission observes capacity while activating the successor generation.
      */
     struct DeviceRuntimeGenerationRetirementResult
     {
@@ -132,9 +196,10 @@ namespace llaminar2
         bool success = false; ///< Every precondition, reset, and publication passed.
         bool reset_invoked = false; ///< Native cuda/hip device reset was called.
         std::uint64_t retired_generation = 0u; ///< Generation invalidated by reset.
-        std::uint64_t active_generation = 0u; ///< Fresh generation after reset.
+        std::uint64_t successor_generation = 0u; ///< Published quiescent generation.
+        DeviceRuntimePostResetState post_reset_state =
+            DeviceRuntimePostResetState::Unverified; ///< Native successor state.
         size_t driver_free_bytes_before = 0u; ///< Driver free bytes before reset.
-        size_t driver_free_bytes_after = 0u; ///< Driver free bytes after reset.
         size_t tracked_device_allocations = 0u; ///< Live allocations at preflight.
         size_t tracked_device_allocation_bytes = 0u; ///< Live bytes at preflight.
         size_t tracked_host_registrations = 0u; ///< Live registrations at preflight.
@@ -720,7 +785,8 @@ namespace llaminar2
          * the only authority able to construct @p request. Implementations must
          * reject the operation while any backend-tracked allocation or host
          * registration remains, clear every backend-owned cached runtime handle,
-         * and publish a fresh generation only after the native reset succeeds.
+         * publish a quiescent successor generation only after the native reset
+         * succeeds, and certify without reactivating that native context.
          *
          * CPU and test backends inherit an unsupported result unless they model
          * this lifecycle explicitly.
@@ -827,27 +893,32 @@ namespace llaminar2
         }
 
         /**
-         * @brief Register caller-owned pages for direct access by every local device.
+         * @brief Register caller-owned pages with exact typed device reach.
          *
          * This is distinct from ordinary DMA pinning: the registration must be
-         * portable across contexts owned by this backend and must expose a
          * device-visible alias through @ref externalMappedHostDevicePointer.
-         * The call is setup-only and must not allocate or copy payload bytes.
+         * Device-local scope must not update unrelated device page tables;
+         * backend-portable scope is valid only when the caller has declared
+         * multiple consumers in this backend family. The call is setup-only
+         * and must not allocate or copy payload bytes.
          *
          * @param ptr Stable page-aligned or runtime-acceptable host address.
          * @param bytes Positive immutable region size.
          * @param registration_device_id One valid local device used to establish
-         *        the backend registration context; it does not limit later aliases.
-         * @return True only when the complete region was registered as mapped/portable.
+         *        the backend registration context.
+         * @param scope Exact address-space reach required by the declared endpoints.
+         * @return True only when the complete region was registered with that reach.
          */
         virtual bool registerExternalMappedHostMemory(
             void *ptr,
             size_t bytes,
-            int registration_device_id)
+            int registration_device_id,
+            MappedHostRegistrationScope scope)
         {
             (void)ptr;
             (void)bytes;
             (void)registration_device_id;
+            (void)scope;
             return false;
         }
 

@@ -39,6 +39,8 @@
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../memory/BufferArena.h" // Phase 2: contract-based coherence
+#include "../../../planning/PhysicalMemoryAuthority.h"
+#include "../../../utils/Assertions.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -56,6 +58,7 @@ namespace llaminar2
     // Forward declarations
     class TensorBase;
     class FP32Tensor;
+    class RetainedParentTicketServiceWorker;
 
     /**
      * @brief Policy controlling what happens during stage execution.
@@ -81,6 +84,23 @@ namespace llaminar2
             SetupAddressesOnly,  ///< Record immutable addresses; no live bytes or writes exist yet.
         };
 
+        /**
+         * @brief Sole owner of point-in-time diagnostic snapshot recording.
+         *
+         * Ordinary eager and monolithic capture paths let the stage executor
+         * record their snapshot copy. Segmented capture/replay instead delegates
+         * that operation to `DeviceGraphCaptureController`, which records the
+         * copy only after it has completed the exact manual/captured stream edge.
+         * Keeping this authority typed prevents both owners from recording the
+         * same copy and prevents an eager stage call from reaching for the
+         * executor's unrelated transient manifest.
+         */
+        enum class SnapshotRecordingAuthority : uint8_t
+        {
+            StageExecutor = 0,      ///< `runStage()` records the snapshot copy.
+            GraphCaptureController, ///< The graph controller records it after the stage.
+        };
+
         bool coherence = true;            ///< Arena contract-based input/output coherence
         bool weight_coherence = true;     ///< Upload weights to device
         bool mark_dirty = true;           ///< Publish outputs after real execution; setup-only recording disables it.
@@ -94,6 +114,8 @@ namespace llaminar2
         bool preserve_gpu_streams = false; ///< Keep caller-assigned streams instead of rebinding normal passes to the worker stream
         GraphRecordingAuthority graph_recording_authority =
             GraphRecordingAuthority::RuntimeExecution; ///< Setup capture may bind pointers without publishing payload authority.
+        SnapshotRecordingAuthority snapshot_recording_authority =
+            SnapshotRecordingAuthority::StageExecutor; ///< Exactly one layer records each diagnostic copy.
 
         /// Full execution — coherence, validation, profiling, everything.
         static StageRunPolicy full()
@@ -226,7 +248,8 @@ namespace llaminar2
              * native graph. Capture rejects any descriptor drift.
              */
             bool descriptor_finalized = false;
-            std::unique_ptr<FP32Tensor> storage;
+            /** Byte offset of this immutable slot inside the graph-owned arena. */
+            size_t storage_offset_bytes = 0;
         };
 
         /** @brief Snapshot slots owned by one stage in one forward graph. */
@@ -236,14 +259,94 @@ namespace llaminar2
         };
 
         /**
+         * @brief Proven non-concurrency class for diagnostic snapshot storage.
+         *
+         * A retained serving family owns several alternative native graphs. The
+         * alternatives in one class never have overlapping unread checkpoint
+         * lifetimes, so their captured D2D nodes may safely target one stable
+         * device allocation even when the graphs belong to the same request.
+         * Classes that can coexist with unread values in an MTP parent remain
+         * distinct. `Dedicated` is the conservative default for graphs without
+         * a typed serving-family proof.
+         */
+        enum class GraphSnapshotArenaReuseClass : uint8_t
+        {
+            Dedicated = 0, ///< This manifest owns an exclusive arena.
+            /**
+             * Prefill and grouped-verifier graphs use the same wide checkpoint
+             * lane. Prefill publication completes before device generation can
+             * begin, so neither graph can retain unread bytes while the other
+             * executes. Greedy/stochastic verifier outcomes are alternatives
+             * within that same generation phase.
+             */
+            PrefillOrMTPVerifierAlternative,
+            /** Live and restored-prefix condition graphs alternate. */
+            MTPConditionAlternative,
+        };
+
+        /**
+         * @brief Complete identity for one shared diagnostic arena namespace.
+         *
+         * The configuration identity separates graph families captured under
+         * different checkpoint selections. Reusing an allocation across those
+         * selections would let a later, larger manifest invalidate addresses
+         * embedded in an older executable.
+         */
+        struct GraphSnapshotArenaReusePolicy
+        {
+            GraphSnapshotArenaReuseClass reuse_class =
+                GraphSnapshotArenaReuseClass::Dedicated;
+            uint64_t configuration_identity = 0;
+
+            /** @return Whether this policy is internally complete. */
+            [[nodiscard]] constexpr bool valid() const noexcept
+            {
+                return reuse_class ==
+                           GraphSnapshotArenaReuseClass::Dedicated
+                           ? configuration_identity == 0
+                           : configuration_identity != 0;
+            }
+
+            /** @return Whether multiple mutually exclusive manifests may bind it. */
+            [[nodiscard]] constexpr bool shared() const noexcept
+            {
+                return reuse_class !=
+                       GraphSnapshotArenaReuseClass::Dedicated;
+            }
+
+            friend constexpr bool operator==(
+                const GraphSnapshotArenaReusePolicy &,
+                const GraphSnapshotArenaReusePolicy &) = default;
+        };
+
+        /**
          * @brief Complete GPU snapshot manifest owned by one forward graph.
          *
          * Stage names are unique only inside a ComputeGraph; they are not
          * process-wide identities. ForwardGraphCache stores this object beside
-         * the executable whose captured D2D nodes write these slots.
+         * the executable whose captured D2D nodes write these slots. Captured
+         * producers write only to ordinary device memory. After replay, one
+         * bulk D2H acquisition populates the tensor's host mirror before any
+         * per-stage callback reads a subrange. This deliberately avoids issuing
+         * hundreds of PCIe-mapped writes from one native graph.
          */
         struct GraphSnapshotManifest
         {
+            /**
+             * @brief Typed lifecycle for graph-owned diagnostic storage.
+             *
+             * Descriptor discovery and storage binding are deliberately separate
+             * setup phases. Native capture may consume only `StorageBound`; it can
+             * never allocate a missing destination or infer that a partially
+             * collected manifest is usable.
+             */
+            enum class StorageState : uint8_t
+            {
+                Empty = 0,             ///< No descriptor or storage identity exists.
+                CollectingDescriptors, ///< Stable stage descriptors are being frozen.
+                StorageBound,          ///< Every slot has one stable arena offset.
+            };
+
             std::unordered_map<std::string, GraphSnapshotStageCopies> stage_copies;
             std::unordered_set<std::string> outputless_stages;
             /**
@@ -254,11 +357,153 @@ namespace llaminar2
              */
             std::unordered_set<std::string> filtered_stages;
 
+            /**
+             * One ordinary tensor containing every selected output in this graph.
+             *
+             * Its GPU allocation is the immutable destination embedded in the
+             * captured graph. Its host allocation is the bulk-download mirror
+             * consumed by diagnostics. It must never be mapped host memory:
+             * stage-local graph writes stay VRAM-local so a large parity
+             * manifest cannot flood a backend's host-memory completion path.
+             */
+            /** Ledger claim destroyed only after @ref storage_arena is freed. */
+            std::shared_ptr<PhysicalMemorySuballocationLease>
+                storage_allocation_lease;
+            std::shared_ptr<FP32Tensor> storage_arena;
+            DeviceId storage_device = DeviceId::invalid();
+            size_t storage_capacity_bytes = 0;
+            size_t storage_required_bytes = 0;
+            size_t bound_slot_count = 0;
+            uint64_t storage_allocation_count = 0;
+            /** Successful whole-arena D2H acquisitions over this allocation. */
+            uint64_t bulk_download_count = 0;
+            StorageState storage_state = StorageState::Empty;
+            GraphSnapshotArenaReusePolicy storage_reuse_policy;
+
+            /**
+             * @brief Bind the typed reuse proof before descriptor preparation.
+             *
+             * Repeating the same policy is idempotent. A policy may change only
+             * after captured-copy topology has been retired; otherwise native
+             * executables would retain addresses from one arena namespace while
+             * the manifest advertised another.
+             */
+            void bindStorageReusePolicy(
+                GraphSnapshotArenaReusePolicy policy)
+            {
+                LLAMINAR_ASSERT(
+                    policy.valid(),
+                    "Graph snapshot arena reuse policy is incomplete");
+                LLAMINAR_ASSERT(
+                    !ownsCapturedCopyTopology() ||
+                        storage_reuse_policy == policy,
+                    "A live captured snapshot topology cannot change arena reuse policy");
+                storage_reuse_policy = policy;
+            }
+
+            /**
+             * @brief Begin a complete descriptor pass while retaining reusable storage.
+             *
+             * A graph preparation pass reconstructs the exact selected descriptor
+             * set in execution order. The already allocated arena remains eligible
+             * for reuse only if final binding proves the same device and sufficient
+             * capacity.
+             */
+            void beginDescriptorCollection()
+            {
+                stage_copies.clear();
+                outputless_stages.clear();
+                filtered_stages.clear();
+                storage_required_bytes = 0;
+                bound_slot_count = 0;
+                storage_state = StorageState::CollectingDescriptors;
+            }
+
+            /** @return Whether native capture may consume every selected slot. */
+            [[nodiscard]] bool storageBound() const noexcept
+            {
+                return storage_state == StorageState::StorageBound;
+            }
+
+            /**
+             * @brief Test whether this manifest owns native snapshot-copy topology.
+             *
+             * Filtered and outputless stage classifications are host metadata;
+             * they add no node or pointer to the executable. Any selected stage,
+             * device arena, or bound byte range instead belongs to a concrete
+             * captured D2D topology and cannot be replaced while that executable
+             * remains live.
+             *
+             * @return True when native graph identity includes snapshot storage.
+             */
+            [[nodiscard]] bool ownsCapturedCopyTopology() const noexcept
+            {
+                return !stage_copies.empty() || storage_arena ||
+                       storage_device.is_valid() ||
+                       storage_capacity_bytes != 0 ||
+                       storage_required_bytes != 0 ||
+                       bound_slot_count != 0;
+            }
+
+            /**
+             * @brief Freeze a graph-local selection containing no D2D copies.
+             *
+             * An already captured lean executable can acquire diagnostic
+             * publication policy without changing its native topology when the
+             * filter selects none of this graph's tensor-backed GPU outputs.
+             * This transition publishes the complete negative selection so
+             * replay never re-enters live stage state after launch.
+             *
+             * @param filtered Stages rejected by the complete-stage filter.
+             * @param outputless Selected stages with no selected GPU tensor output.
+             */
+            void bindNoCopySelection(
+                std::unordered_set<std::string> filtered,
+                std::unordered_set<std::string> outputless)
+            {
+                LLAMINAR_ASSERT(
+                    !ownsCapturedCopyTopology(),
+                    "A live captured snapshot topology cannot be rebound as a no-copy manifest");
+                clear();
+                filtered_stages = std::move(filtered);
+                outputless_stages = std::move(outputless);
+                storage_state = StorageState::StorageBound;
+            }
+
+            /** @return Whether the manifest owns no descriptor or storage identity. */
+            [[nodiscard]] bool empty() const noexcept
+            {
+                return storage_state == StorageState::Empty &&
+                       stage_copies.empty() && outputless_stages.empty() &&
+                       filtered_stages.empty() && !storage_arena &&
+                       !storage_allocation_lease &&
+                       storage_capacity_bytes == 0 &&
+                       storage_required_bytes == 0 && bound_slot_count == 0 &&
+                       storage_allocation_count == 0 && bulk_download_count == 0;
+            }
+
+            /**
+             * @brief Retire captured storage while preserving cache reuse policy.
+             *
+             * A cache reset destroys executable topology but retains the typed
+             * role assigned from its ForwardGraphSignature. The next descriptor
+             * pass may therefore rebind the same immutable shared arena without
+             * reconstructing policy from mutable graph state.
+             */
             void clear()
             {
                 stage_copies.clear();
                 outputless_stages.clear();
                 filtered_stages.clear();
+                storage_arena.reset();
+                storage_allocation_lease.reset();
+                storage_device = DeviceId::invalid();
+                storage_capacity_bytes = 0;
+                storage_required_bytes = 0;
+                bound_slot_count = 0;
+                storage_allocation_count = 0;
+                bulk_download_count = 0;
+                storage_state = StorageState::Empty;
             }
         };
 
@@ -296,8 +541,8 @@ namespace llaminar2
         // Non-copyable, movable
         DeviceGraphExecutor(const DeviceGraphExecutor &) = delete;
         DeviceGraphExecutor &operator=(const DeviceGraphExecutor &) = delete;
-        DeviceGraphExecutor(DeviceGraphExecutor &&) = default;
-        DeviceGraphExecutor &operator=(DeviceGraphExecutor &&) = default;
+        DeviceGraphExecutor(DeviceGraphExecutor &&) noexcept;
+        DeviceGraphExecutor &operator=(DeviceGraphExecutor &&) noexcept;
 
         // =========================================================================
         // Configuration (IGraphExecutor interface)
@@ -340,6 +585,28 @@ namespace llaminar2
         {
             config_.snapshot_stage_filter = std::move(filter);
             advanceSnapshotConfigurationEpoch();
+        }
+
+        /**
+         * @brief Publish a caller-owned semantic identity for snapshot topology.
+         *
+         * The ordinary callback/filter setters conservatively advance a monotonic
+         * epoch because arbitrary callers cannot prove semantic equivalence.
+         * DeviceGraphOrchestrator owns a stronger contract: it normalizes the
+         * selected key set and assigns the same non-zero identity whenever that
+         * exact topology is selected again. This lets a lean serving executable
+         * and a pre-materialized diagnostic executable coexist and be selected
+         * without recapture.
+         *
+         * @param identity Non-zero identity for the complete callback/filter
+         *        topology. Identity one is reserved for snapshots disabled.
+         */
+        void setSnapshotConfigurationIdentity(uint64_t identity)
+        {
+            LLAMINAR_ASSERT(
+                identity != 0,
+                "Snapshot graph topology requires a non-zero identity");
+            snapshot_configuration_epoch_ = identity;
         }
         /**
          * @brief Current graph identity epoch for diagnostic snapshot nodes.
@@ -721,17 +988,29 @@ namespace llaminar2
             const std::vector<int> *host_request_seq_lens = nullptr);
 
         /**
-         * @brief Pre-register graph-stable snapshot buffers before GPU graph capture.
+         * @brief Freeze all graph snapshot descriptors and bind one device arena.
          *
          * Captured parity diagnostics record device-to-device snapshot copies as
          * graph nodes immediately after producing stages execute. The destination
-         * buffers and per-stage output descriptors must therefore exist before
+         * arena and per-stage output descriptors must therefore exist before
          * beginCapture(); discovering either while capture is active is a hard
-         * graph-capture contract violation.
+         * graph-capture contract violation. One exact VRAM arena is sized from
+         * the complete descriptor pass. Every captured checkpoint remains a
+         * device-local D2D write; one post-replay D2H acquisition populates its
+         * host mirror for diagnostic callbacks.
          *
          * This method performs no payload copies and does not execute graph
          * stages. Callers must pass the explicit graph stream that will be used
          * for capture.
+         *
+         * @param graph Complete participant-local graph whose selected outputs
+         *        define the immutable snapshot layout.
+         * @param ctx Exact GPU context that owns the capture transaction.
+         * @param producer_stream Non-null stream used by the future graph.
+         * @param context Optional diagnostic identity for a fatal setup error.
+         * @param snapshot_manifest Optional graph-cache-owned manifest; the
+         *        executor-owned transient manifest is used when omitted.
+         * @return True once every selected output owns a stable in-bounds slot.
          */
         bool prepareSnapshotsForGraphCapture(
             ComputeGraph &graph,
@@ -1002,13 +1281,41 @@ namespace llaminar2
          * between those children and produces the sole executable that may launch.
          * This is the contract used by node-local heterogeneous sparse collectives;
          * it never authorizes a host walk over the child units.
+         *
+         * @ref RequireRetainedParentWithConcurrentTicketService retains the
+         * same one-executable GPU ownership while admitting only typed CPU
+         * ticket-service units. The parent is submitted once; those CPU units
+         * run on one setup-created persistent host worker and release captured
+         * mapped waits. The worker is armed before native parent submission so
+         * a backend may apply submission-queue backpressure without circularly
+         * withholding the CPU service it needs. These units are not additional
+         * graph launches and may not own arena data.
          */
         enum class GraphReplayPlanPolicy
         {
             RequireFullGraph,
             AllowHeterogeneousBoundarySegmentation,
             RequireRetainedParentComposition,
+            RequireRetainedParentWithConcurrentTicketService,
         };
+
+        /** @return Whether @p policy materializes one topology-composed parent. */
+        [[nodiscard]] static constexpr bool isRetainedParentPlanPolicy(
+            GraphReplayPlanPolicy policy) noexcept
+        {
+            return policy ==
+                       GraphReplayPlanPolicy::RequireRetainedParentComposition ||
+                   policy == GraphReplayPlanPolicy::
+                                 RequireRetainedParentWithConcurrentTicketService;
+        }
+
+        /** @return Whether @p policy admits typed CPU service after parent launch. */
+        [[nodiscard]] static constexpr bool
+        hasConcurrentTicketService(GraphReplayPlanPolicy policy) noexcept
+        {
+            return policy == GraphReplayPlanPolicy::
+                                 RequireRetainedParentWithConcurrentTicketService;
+        }
 
         /**
          * @brief First-use submission contract for a newly materialized graph.
@@ -1136,6 +1443,9 @@ namespace llaminar2
                 std::vector<IComputeStage *> stages; ///< Stable source stages in execution order.
                 std::vector<uint64_t> stage_variant_signatures; ///< Immutable launch variants.
                 std::vector<GraphSegment::ArenaWriteBinding> arena_writes; ///< Complete deduplicated publication set.
+                /** Manual segments serviced after the sole parent submission. */
+                std::vector<size_t>
+                    concurrent_ticket_service_segment_indices;
 
                 /** @return true when identity, child count, and stage vectors agree. */
                 [[nodiscard]] bool valid() const noexcept
@@ -1156,6 +1466,7 @@ namespace llaminar2
                     stages.clear();
                     stage_variant_signatures.clear();
                     arena_writes.clear();
+                    concurrent_ticket_service_segment_indices.clear();
                 }
             };
 
@@ -1337,7 +1648,72 @@ namespace llaminar2
             uint64_t successful_submission_count = 0; ///< Lifetime inference transactions submitted through captured executables.
             uint64_t capture_variant_signature = 0;   ///< Stage-reported launch-topology variant for this cache
             uint64_t variant_recapture_count = 0;     ///< Resets caused by launch-topology variant changes
-            uint64_t snapshot_configuration_epoch = 0; ///< Executor snapshot topology represented by this cache
+            uint64_t snapshot_configuration_epoch = 0; ///< Effective snapshot topology represented by this cache.
+
+            /**
+             * @brief Complete graph-local snapshot selection cache identity.
+             *
+             * These three values form one atomic logical fact: the effective
+             * native topology produced by evaluating one executor policy against
+             * one declarative graph generation. Keeping them typed prevents a
+             * move/reset path from retaining only part of the selection proof.
+             */
+            struct SnapshotSelectionIdentity
+            {
+                /** Canonical executable topology containing no snapshot copies. */
+                static constexpr uint64_t kNoCapturedCopiesIdentity = 1u;
+
+                /** Executor-wide semantic snapshot policy that was evaluated. */
+                uint64_t source_configuration_identity = 0;
+                /** Declarative graph generation evaluated under that policy. */
+                uint64_t graph_topology_generation = 0;
+                /** Resulting graph-local native executable topology. */
+                uint64_t effective_configuration_identity =
+                    kNoCapturedCopiesIdentity;
+
+                /**
+                 * @brief Test whether this fact covers an exact policy and graph.
+                 * @param source_identity Current executor policy identity.
+                 * @param topology_generation Current graph topology generation.
+                 * @return True only for the complete matching selection fact.
+                 */
+                [[nodiscard]] bool matches(
+                    uint64_t source_identity,
+                    uint64_t topology_generation) const noexcept
+                {
+                    return source_configuration_identity == source_identity &&
+                           graph_topology_generation == topology_generation;
+                }
+
+                /**
+                 * @brief Publish one complete non-zero selection fact.
+                 * @param source_identity Executor policy identity.
+                 * @param topology_generation Graph topology generation.
+                 * @param effective_identity Resulting executable identity.
+                 */
+                void publish(
+                    uint64_t source_identity,
+                    uint64_t topology_generation,
+                    uint64_t effective_identity)
+                {
+                    LLAMINAR_ASSERT(
+                        source_identity != 0 && topology_generation != 0 &&
+                            effective_identity != 0,
+                        "Snapshot selection identity requires three non-zero components");
+                    source_configuration_identity = source_identity;
+                    graph_topology_generation = topology_generation;
+                    effective_configuration_identity = effective_identity;
+                }
+
+                /** @brief Forget the evaluation and restore the lean default. */
+                void clear() noexcept
+                {
+                    source_configuration_identity = 0;
+                    graph_topology_generation = 0;
+                    effective_configuration_identity =
+                        kNoCapturedCopiesIdentity;
+                }
+            } snapshot_selection_identity;
             std::string perf_context;                 ///< Optional structured stats tag for the replay caller
             ReplayWorkloadGeometry replay_workload;   ///< Exact cache-key geometry for deferred replay metrics
             void *capture_stream = nullptr;           ///< Exact non-null stream for capture/replay
@@ -1386,6 +1762,8 @@ namespace llaminar2
                   capture_variant_signature(other.capture_variant_signature),
                   variant_recapture_count(other.variant_recapture_count),
                   snapshot_configuration_epoch(other.snapshot_configuration_epoch),
+                  snapshot_selection_identity(
+                      other.snapshot_selection_identity),
                   perf_context(std::move(other.perf_context)),
                   replay_workload(other.replay_workload),
                   capture_stream(other.capture_stream),
@@ -1432,6 +1810,7 @@ namespace llaminar2
                     ExecutableSubmissionState::Empty;
                 other.variant_recapture_count = 0;
                 other.snapshot_configuration_epoch = 0;
+                other.snapshot_selection_identity.clear();
                 other.replay_gpu_timing_slots.clear();
                 other.replay_gpu_timing_device_name.clear();
                 other.replay_gpu_timing_busy_samples = 0;
@@ -1462,6 +1841,8 @@ namespace llaminar2
                     capture_variant_signature = other.capture_variant_signature;
                     variant_recapture_count = other.variant_recapture_count;
                     snapshot_configuration_epoch = other.snapshot_configuration_epoch;
+                    snapshot_selection_identity =
+                        other.snapshot_selection_identity;
                     perf_context = std::move(other.perf_context);
                     replay_workload = other.replay_workload;
                     capture_stream = other.capture_stream;
@@ -1508,6 +1889,7 @@ namespace llaminar2
                         ExecutableSubmissionState::Empty;
                     other.variant_recapture_count = 0;
                     other.snapshot_configuration_epoch = 0;
+                    other.snapshot_selection_identity.clear();
                     other.replay_gpu_timing_slots.clear();
                     other.replay_gpu_timing_device_name.clear();
                     other.replay_gpu_timing_busy_samples = 0;
@@ -1573,7 +1955,7 @@ namespace llaminar2
              * rejects adoption so the caller must use the ordinary fenced reset
              * before destroying backend resources.
              *
-             * @param epoch Non-zero executor-owned snapshot topology generation.
+             * @param epoch Non-zero effective snapshot topology identity.
              * @return true when the identity was adopted without touching the
              *         stream; false when retirement is required.
              */
@@ -1584,10 +1966,7 @@ namespace llaminar2
                     epoch != 0 && !initialized && !needs_capture &&
                     executable_submission_state ==
                         ExecutableSubmissionState::Empty &&
-                    segments.empty() &&
-                    snapshot_manifest.stage_copies.empty() &&
-                    snapshot_manifest.outputless_stages.empty() &&
-                    snapshot_manifest.filtered_stages.empty() &&
+                    segments.empty() && snapshot_manifest.empty() &&
                     decode_step == 0 && capture_variant_signature == 0 &&
                     replay_gpu_timing_slots.empty() &&
                     !retained_parent_capture &&
@@ -1706,6 +2085,7 @@ namespace llaminar2
                     ExecutableSubmissionState::Empty;
                 decode_step = 0;
                 capture_variant_signature = 0;
+                snapshot_selection_identity.clear();
                 terminal_fence_published_generation = 0;
                 terminal_fence_observed_generation = 0;
                 graph_replay_plan_policy =
@@ -1956,9 +2336,10 @@ namespace llaminar2
          *        host/device boundary after this replay. The executor records
          *        one exact capture-stream event for each named owner; all other
          *        graph-internal writes retain flags-only publication.
-         * @param retained_parent_composer Required only by @ref
-         *        RequireRetainedParentComposition. It lowers graph-only children
-         *        into the one executable owned and launched by this cache.
+         * @param retained_parent_composer Required by both retained-parent
+         *        policies. It lowers graph-only children into the one executable
+         *        owned and launched by this cache; the concurrent-service policy
+         *        additionally runs its certified manual ticket program.
          * @param initial_submission Selects atomic transaction-zero submission or
          *        setup-only materialization. Setup records and instantiates every
          *        native unit, including an optional retained parent, but neither
@@ -2079,6 +2460,39 @@ namespace llaminar2
             GraphCaptureRecordPurpose purpose,
             const char *context);
 
+        /**
+         * @brief Submit one retained parent while an independent CPU service runs.
+         *
+         * The persistent service worker is armed before the native graph call.
+         * This ordering is required because a large HIP graph can begin its
+         * mapped waits and apply command-queue backpressure before
+         * `hipGraphLaunch()` returns. The CPU worker consumes those tickets in
+         * parallel, so backend submission can continue without a circular wait.
+         *
+         * @param parent Sole instantiated retained executable for the transaction.
+         * @param graph Declarative graph owning every manual service stage.
+         * @param segment_cache Cache owning the stream and frozen manual indices.
+         * @param ctx Exact participant execution context.
+         * @param gpu_ctx Exact non-null GPU worker context.
+         * @param current_step Cache-local transaction generation.
+         * @param segment_indices Manual ticket units in graph order.
+         * @return True only when parent submission and every CPU service succeed.
+         */
+        bool submitRetainedParentWithConcurrentTicketService(
+            IGPUGraphCapture &parent,
+            ComputeGraph &graph,
+            GraphSegmentCache &segment_cache,
+            IDeviceContext *ctx,
+            IWorkerGPUContext *gpu_ctx,
+            uint64_t current_step,
+            std::span<const size_t> segment_indices);
+
+        /**
+         * @brief Create the ticket worker before a retained transaction can launch.
+         * @return True when the persistent worker exists and is idle.
+         */
+        bool prepareRetainedParentTicketServiceWorker();
+
         GraphExecutorConfig config_;
         GraphExecutorStats stats_;
         ICollectiveContext *collective_ctx_ = nullptr; ///< Optional collective context (not owned)
@@ -2086,7 +2500,10 @@ namespace llaminar2
         StageTimeline stage_timeline_;                 ///< GPU event-based per-stage timeline profiler
         bool stage_timeline_info_populated_ = false;   ///< True after first setStageInfo pass (names never change)
         bool weights_session_cohered_ = false;         ///< True after first forward completes weight coherence for all nodes
-        uint64_t snapshot_configuration_epoch_ = 1;   ///< Monotonic snapshot graph-topology identity
+        uint64_t snapshot_configuration_epoch_ = 1;   ///< Current semantic snapshot graph-topology identity.
+        /** Setup-created worker that lets CPU tickets progress during GPU submission. */
+        std::unique_ptr<RetainedParentTicketServiceWorker>
+            retained_parent_ticket_service_worker_;
 
         /**
          * @brief Allocate one stage's arena bindings without changing authority.
@@ -2222,6 +2639,51 @@ namespace llaminar2
                                                 void *producer_stream,
                                                 bool record_device_copy,
                                                 GraphSnapshotManifest &snapshot_manifest);
+
+        /**
+         * @brief Bind one exact device arena after descriptor collection.
+         *
+         * Slots are laid out in declarative graph execution order and output
+         * order. Existing storage is retained only when its device and capacity
+         * still satisfy the complete manifest, preserving capture pointer
+         * identity without relying on unordered-container iteration.
+         *
+         * @param graph Graph that owns the descriptor execution order.
+         * @param fallback_device Participant-local GPU selected by the executor.
+         * @param setup_stream Exact non-null setup stream for allocation identity.
+         * @param snapshot_manifest Manifest in `CollectingDescriptors` state.
+         * @return True after every slot owns a stable in-bounds arena offset.
+         */
+        bool bindGraphSnapshotArena(
+            ComputeGraph &graph,
+            DeviceId fallback_device,
+            void *setup_stream,
+            GraphSnapshotManifest &snapshot_manifest);
+
+        /**
+         * @brief Select whether a stage publisher owns arena acquisition.
+         *
+         * Eager diagnostics publish one producer at a time and therefore acquire
+         * the arena in the stage call. Captured graph publication acquires the
+         * complete arena once after launch, then walks every stage without
+         * recording redundant completion events or waits.
+         */
+        enum class GraphSnapshotPublicationMode : uint8_t
+        {
+            PublishAndAcquireArena = 0,
+            ArenaAlreadyAcquired,
+        };
+
+        /**
+         * @brief Bulk-download the complete device arena after its producer.
+         *
+         * @param producer_stream Exact stream that wrote every live arena slot.
+         * @param snapshot_manifest Bound graph-owned arena and descriptors.
+         * @return True once one D2H transfer has populated the host mirror.
+         */
+        bool acquireGraphSnapshotArenaOnHost(
+            void *producer_stream,
+            GraphSnapshotManifest &snapshot_manifest);
         /**
          * @brief Evaluate the configured filter against one concrete publication.
          *
@@ -2233,14 +2695,41 @@ namespace llaminar2
                                         const StageDumpInfo &dump_info) const;
 
         /**
-         * @brief Prepare immutable graph-stable snapshot descriptors/storage.
+         * @brief Resolve the snapshot topology that one concrete graph requires.
+         *
+         * Snapshot policy is configured once on the executor, but only selected
+         * tensor-backed GPU outputs add native D2D nodes to a particular graph.
+         * Already initialized graphs have completed launch preparation, so their
+         * immutable dump descriptors can be evaluated once per policy/topology
+         * identity. A pristine graph remains conservative because a stage may not
+         * expose its final descriptor until launch preparation inside capture.
+         *
+         * @param graph Declarative graph whose native executable is being chosen.
+         * @param segment_cache Cache owning the graph-local evaluation result.
+         * @return Non-zero effective identity; one denotes no captured copies.
+         */
+        uint64_t resolveGraphSnapshotConfigurationIdentity(
+            ComputeGraph &graph,
+            GraphSegmentCache &segment_cache);
+
+        /**
+         * @brief Freeze one stage's immutable graph-stable snapshot descriptors.
          *
          * GPU graph capture cannot discover or allocate snapshot outputs while
          * capture is active. The stage must therefore expose its stable output
          * descriptor after launch preparation and before model arithmetic.
-         * This method allocates the graph-owned destination and freezes the
-         * exact source descriptor without copying payload bytes. The captured
-         * point-in-time copy is recorded only after the producer executes.
+         * This method freezes the exact source descriptor without allocating or
+         * copying payload bytes. After the complete descriptor pass,
+         * @ref bindGraphSnapshotArena assigns every output a disjoint range in
+         * one graph-owned allocation. The point-in-time copy is recorded only
+         * after the producer executes.
+         *
+         * @param node Producer whose selected outputs are being described.
+         * @param target_device Participant-local GPU owning those outputs.
+         * @param producer_stream Exact future capture stream; used only to
+         *        validate lifecycle identity during descriptor preparation.
+         * @param snapshot_manifest Manifest in `CollectingDescriptors` state.
+         * @return True when the stage descriptor is complete and allocation-free.
          */
         bool prepareGraphSnapshotCopies(ComputeNode &node,
                                         DeviceId target_device,
@@ -2255,9 +2744,10 @@ namespace llaminar2
          * live stage outputs after the full graph finishes is incorrect when the
          * arena reuses an activation slot later in the graph. This helper records
          * a device-to-device copy immediately after the producing stage into
-         * a unique device-visible mapped-host slot. Graph replay therefore
+         * a unique range in one graph-owned VRAM arena. Graph replay therefore
          * preserves the stage-boundary value without re-entering eager
-         * execution or reserving a second activation graph in device memory.
+         * execution. One post-graph bulk D2H copy publishes every slot to the
+         * diagnostic host mirror.
          */
         bool captureGraphSnapshotCopies(ComputeNode &node,
                                         DeviceId target_device,
@@ -2267,17 +2757,18 @@ namespace llaminar2
         /**
          * @brief Publish one GPU stage from its immutable graph snapshot slots.
          *
-         * Graph replay updates a mapped slot through its device-visible pointer
-         * without executing stage C++. This method records a real post-launch
-         * completion event, waits only for that publication point, builds a
-         * callback descriptor solely from the frozen slot manifest, and invokes
-         * the configured snapshot callback over the host-visible mapping.
+         * Graph replay updates a VRAM slot without executing stage C++. This
+         * method consumes the one already-acquired host mirror, builds a callback
+         * descriptor solely from the frozen slot manifest, and invokes the
+         * configured snapshot callback over the corresponding host subrange.
          * It deliberately never calls getDumpInfo() on the live stage.
          */
         bool publishGraphSnapshotCopies(const std::string &stage_name,
                                         void *producer_stream,
                                         GraphSnapshotManifest &snapshot_manifest,
-                                        const GraphSnapshotLogicalRows *logical_rows);
+                                        const GraphSnapshotLogicalRows *logical_rows,
+                                        GraphSnapshotPublicationMode publication_mode =
+                                            GraphSnapshotPublicationMode::PublishAndAcquireArena);
 
         // =====================================================================
         // Legacy internal helpers (now delegate to runStages/runStage)
@@ -2317,6 +2808,77 @@ namespace llaminar2
          * explicitly. This transient state is never a cached executable owner.
          */
         GraphSnapshotManifest transient_snapshot_manifest_;
+
+        /** @brief Key for one executor-local non-concurrent snapshot arena. */
+        struct GraphSnapshotSharedArenaKey
+        {
+            DeviceId device = DeviceId::invalid();
+            GraphSnapshotArenaReuseClass reuse_class =
+                GraphSnapshotArenaReuseClass::Dedicated;
+            uint64_t configuration_identity = 0;
+
+            friend bool operator==(
+                const GraphSnapshotSharedArenaKey &,
+                const GraphSnapshotSharedArenaKey &) = default;
+        };
+
+        /** @brief Hash the complete shared-arena identity. */
+        struct GraphSnapshotSharedArenaKeyHash
+        {
+            size_t operator()(
+                const GraphSnapshotSharedArenaKey &key) const noexcept
+            {
+                size_t hash = std::hash<DeviceId>{}(key.device);
+                hash ^= std::hash<uint8_t>{}(
+                            static_cast<uint8_t>(key.reuse_class)) +
+                        0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+                hash ^= std::hash<uint64_t>{}(
+                            key.configuration_identity) +
+                        0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+                return hash;
+            }
+        };
+
+        /**
+         * @brief Tensor and ledger token for one shared immutable GPU address.
+         *
+         * Declaration order is intentional: reverse destruction frees the
+         * tensor before returning its exact bytes to the physical ledger.
+         */
+        struct GraphSnapshotSharedArena
+        {
+            std::shared_ptr<PhysicalMemorySuballocationLease>
+                allocation_lease;
+            std::shared_ptr<FP32Tensor> tensor;
+        };
+
+        /**
+         * Stable arenas retained after individual cache invalidation because an
+         * older executable in the same diagnostic configuration may still
+         * embed the address. The executor tears them down only after all graph
+         * caches that can reference them have been retired.
+         */
+        std::unordered_map<
+            GraphSnapshotSharedArenaKey,
+            GraphSnapshotSharedArena,
+            GraphSnapshotSharedArenaKeyHash>
+            graph_snapshot_shared_arenas_;
+
+        /** Complete capacity committed before any snapshot graph is built. */
+        std::shared_ptr<PhysicalMemoryOwnerReservation>
+            graph_snapshot_memory_reservation_;
+
+    public:
+        /**
+         * @brief Install the sole allocation authority for snapshot arenas.
+         * @param reservation Model-lifetime capacity reservation, or null only
+         *        for an isolated test executor.
+         * @throws std::logic_error after any snapshot allocation exists.
+         */
+        void setGraphSnapshotMemoryReservation(
+            std::shared_ptr<PhysicalMemoryOwnerReservation> reservation);
+
+    private:
 
         float *getTemporaryBuffer(size_t elements);
     };

@@ -34,6 +34,7 @@
 #include "kernels/IKVCache.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCache.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/SIMDHelpers.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
@@ -140,7 +141,39 @@ namespace
     {
         std::unique_ptr<llaminar2::IKVCache> owner;
         llaminar2::IHybridKVCache *hybrid = nullptr;
+        std::shared_ptr<llaminar2::PhysicalMemoryAuthority> memory_authority;
     };
+
+    /** @brief Admit complete ROCm hybrid-cache capacity for direct cache tests. */
+    std::shared_ptr<llaminar2::PhysicalMemoryAuthority>
+    makeRecurrentStateAuthority()
+    {
+        constexpr size_t kTestCapacity = 64u * 1024u * 1024u;
+        llaminar2::PhysicalMemoryPlanBuilder builder;
+        builder.add(
+            llaminar2::PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = llaminar2::DeviceId::rocm(0),
+                .total_bytes = 1024u * 1024u * 1024u,
+                .admission_available_bytes = 1024u * 1024u * 1024u,
+            },
+            llaminar2::PhysicalMemoryOwner::RecurrentLiveState,
+            kTestCapacity);
+        builder.add(
+            llaminar2::PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = llaminar2::DeviceId::rocm(0),
+                .total_bytes = 1024u * 1024u * 1024u,
+                .admission_available_bytes = 1024u * 1024u * 1024u,
+            },
+            llaminar2::PhysicalMemoryOwner::KVCache,
+            kTestCapacity);
+        auto admission = std::make_shared<
+            const llaminar2::PhysicalMemoryPlanAdmissionCertificate>(
+            builder.build());
+        return std::make_shared<llaminar2::PhysicalMemoryAuthority>(
+            std::move(admission), 0);
+    }
 
     /// @brief Builds a compact but production-valid Qwen3.5-style GDN/FA/GDN layer map.
     llaminar2::HybridKVCacheConfig makeHybridConfig()
@@ -199,6 +232,8 @@ namespace
     /// @brief Creates a ROCm hybrid cache through KernelFactory so GDN kernels are initialized.
     HybridCacheHandle createHybridCache(const llaminar2::HybridKVCacheConfig &hybrid_config)
     {
+        auto accounted_hybrid = hybrid_config;
+        auto memory_authority = makeRecurrentStateAuthority();
         llaminar::v2::kernels::KVCacheConfig config;
         config.precision = llaminar2::ActivationPrecision::FP32;
         config.device = llaminar2::DeviceId::rocm(0);
@@ -207,9 +242,11 @@ namespace
         config.max_seq_len = 8;
         config.n_kv_heads = 1;
         config.head_dim = 2;
-        config.hybrid_config = &hybrid_config;
+        config.hybrid_config = &accounted_hybrid;
+        config.physical_memory_authority = memory_authority;
 
         HybridCacheHandle handle;
+        handle.memory_authority = std::move(memory_authority);
         handle.owner = KernelFactory::createKVCache(config);
         handle.hybrid = dynamic_cast<llaminar2::IHybridKVCache *>(handle.owner.get());
         if (!handle.hybrid)
@@ -233,6 +270,8 @@ namespace
         int n_kv_heads,
         int head_dim)
     {
+        auto accounted_hybrid = hybrid_config;
+        auto memory_authority = makeRecurrentStateAuthority();
         llaminar::v2::kernels::KVCacheConfig config;
         config.precision = precision;
         config.device = llaminar2::DeviceId::rocm(0);
@@ -241,9 +280,11 @@ namespace
         config.max_seq_len = max_seq_len;
         config.n_kv_heads = n_kv_heads;
         config.head_dim = head_dim;
-        config.hybrid_config = &hybrid_config;
+        config.hybrid_config = &accounted_hybrid;
+        config.physical_memory_authority = memory_authority;
 
         HybridCacheHandle handle;
+        handle.memory_authority = std::move(memory_authority);
         handle.owner = KernelFactory::createKVCache(config);
         handle.hybrid = dynamic_cast<llaminar2::IHybridKVCache *>(handle.owner.get());
         if (!handle.hybrid)
@@ -653,6 +694,41 @@ namespace
 } // namespace
 
 #ifdef HAVE_ROCM
+
+TEST(Test__ROCmHybridKVCacheReset,
+     GDNStateArenaClaimsTheRecurrentOwnerUntilDeviceFree)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    const auto hybrid_config = makeHybridConfig();
+    const size_t expected_recurrent_bytes =
+        hybrid_config.gdnStateGeometry().deviceArenaBytes(
+            hybrid_config.countGDNLayers(),
+            /*request_capacity=*/1);
+    auto cache = createHybridCache(hybrid_config);
+    ASSERT_NE(cache.memory_authority, nullptr);
+    EXPECT_EQ(
+        cache.memory_authority->claimedBytes(
+            llaminar2::DeviceId::rocm(0),
+            llaminar2::PhysicalMemoryOwner::RecurrentLiveState,
+            llaminar2::PhysicalMemoryMaterializationKind::NewAllocation),
+        expected_recurrent_bytes);
+    EXPECT_EQ(
+        cache.memory_authority->claimedBytes(
+            llaminar2::DeviceId::rocm(0),
+            llaminar2::PhysicalMemoryOwner::ExecutionWorkspace,
+            llaminar2::PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
+
+    cache.owner.reset();
+    EXPECT_EQ(
+        cache.memory_authority->claimedBytes(
+            llaminar2::DeviceId::rocm(0),
+            llaminar2::PhysicalMemoryOwner::RecurrentLiveState,
+            llaminar2::PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
+}
 
 TEST(Test__ROCmHybridKVCacheReset, ClearPreservesCacheAndGDNKernelObjectsButMatchesFreshState)
 {

@@ -144,6 +144,17 @@ namespace llaminar2
          */
         double decode_after_prefill_tokens_per_sec = 0.0;
 
+        /**
+         * Exact tokens emitted by this measured production request.
+         *
+         * Repeated benchmarks previously retained tokens only for the final
+         * request.  That made an adaptive runtime failure impossible to align
+         * with the request/epoch that introduced it.  This is generic output
+         * evidence captured after inference; it neither controls nor probes an
+         * ExpertOverlay authority.
+         */
+        std::vector<int32_t> generated_token_ids;
+
         /** Completed movement epoch immediately before this request's prefill. */
         std::uint64_t moe_runtime_movement_epoch_start = 0;
         /** Completed movement epoch observed after this request's decode. */
@@ -161,6 +172,17 @@ namespace llaminar2
         std::uint64_t dynamic_demotions = 0;
         /** Equal-priority moves that rebalance participant skew. */
         std::uint64_t dynamic_same_priority_moves = 0;
+
+        /** MTP draft predictions attempted by this exact request. */
+        std::uint64_t mtp_draft_steps = 0;
+        /** MTP draft tokens accepted by this exact request. */
+        std::uint64_t mtp_accepted_tokens = 0;
+        /** MTP draft tokens rejected by this exact request. */
+        std::uint64_t mtp_rejected_tokens = 0;
+        /** Grouped verifier transactions submitted by this exact request. */
+        std::uint64_t mtp_verifier_runs = 0;
+        /** Physical target rows evaluated across those verifier transactions. */
+        std::uint64_t mtp_verifier_token_count = 0;
 
         /** Decode trajectory partitioned by the configured maintenance window. */
         std::vector<BenchmarkDecodeWindowResult> decode_windows;

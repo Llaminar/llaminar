@@ -523,7 +523,8 @@ namespace llaminar2::test
 
         bool reserveCollectiveResources(
             size_t bytes,
-            size_t /*fp16_scratch_elements*/) override
+            size_t /*fp16_scratch_elements*/,
+            const std::shared_ptr<PhysicalMemoryAuthority> & /*memory_authority*/) override
         {
             (void)bytes;
             return true; // Mock: Always succeed

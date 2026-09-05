@@ -24,6 +24,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <limits>
 #include <sstream>
@@ -50,8 +51,6 @@ namespace llaminar2
         constexpr uint64_t kRecordFooterBytes = 16;
         constexpr uint64_t kMaximumMetadataBytes = 1024ull * 1024ull;
         constexpr uint64_t kMaximumRecordBytes = 1ull << 40;
-        constexpr size_t kCopyBufferBytes = 8ull * 1024ull * 1024ull;
-
         constexpr std::array<const char *, 6> kSectionNames = {
             "kv",
             "hybrid",
@@ -416,15 +415,121 @@ namespace llaminar2
         }
     } // namespace
 
+    DiskPrefixStorageBackend::HydrationTicket::~HydrationTicket()
+    {
+        release();
+    }
+
+    DiskPrefixStorageBackend::HydrationTicket::HydrationTicket(
+        HydrationTicket &&other) noexcept
+        : backend_(std::move(other.backend_)),
+          handle_(std::move(other.handle_)),
+          archive_device_(other.archive_device_),
+          archive_inode_(other.archive_inode_),
+          sections_(other.sections_),
+          consumed_(other.consumed_)
+    {
+        other.archive_device_ = 0;
+        other.archive_inode_ = 0;
+        other.consumed_ = true;
+    }
+
+    DiskPrefixStorageBackend::HydrationTicket &
+    DiskPrefixStorageBackend::HydrationTicket::operator=(
+        HydrationTicket &&other) noexcept
+    {
+        if (this == &other)
+            return *this;
+        release();
+        backend_ = std::move(other.backend_);
+        handle_ = std::move(other.handle_);
+        archive_device_ = other.archive_device_;
+        archive_inode_ = other.archive_inode_;
+        sections_ = other.sections_;
+        consumed_ = other.consumed_;
+        other.archive_device_ = 0;
+        other.archive_inode_ = 0;
+        other.consumed_ = true;
+        return *this;
+    }
+
+    DiskPrefixStorageBackend::HydrationTicket::HydrationTicket(
+        std::shared_ptr<DiskPrefixStorageBackend> backend,
+        PrefixBlockHandle handle,
+        uint64_t archive_device,
+        uint64_t archive_inode,
+        std::array<SectionSnapshot, 6> sections)
+        : backend_(std::move(backend)),
+          handle_(std::move(handle)),
+          archive_device_(archive_device),
+          archive_inode_(archive_inode),
+          sections_(std::move(sections))
+    {
+    }
+
+    bool DiskPrefixStorageBackend::HydrationTicket::valid() const noexcept
+    {
+        return backend_ && handle_.valid() && !consumed_;
+    }
+
+    size_t DiskPrefixStorageBackend::HydrationTicket::totalBytes() const noexcept
+    {
+        return handle_.total_bytes;
+    }
+
+    const PrefixBlockHandle &
+    DiskPrefixStorageBackend::HydrationTicket::diskHandle() const noexcept
+    {
+        return handle_;
+    }
+
+    void DiskPrefixStorageBackend::HydrationTicket::release() noexcept
+    {
+        if (!backend_)
+            return;
+        backend_->releaseHydrationTicket();
+        backend_.reset();
+        consumed_ = true;
+    }
+
     DiskPrefixStorageBackend::DiskPrefixStorageBackend(
         std::filesystem::path archive_path,
         size_t budget_bytes,
         std::string model_artifact_identity)
+        : DiskPrefixStorageBackend(
+              std::move(archive_path),
+              budget_bytes,
+              std::move(model_artifact_identity),
+              nullptr)
+    {
+    }
+
+    DiskPrefixStorageBackend::DiskPrefixStorageBackend(
+        std::filesystem::path archive_path,
+        size_t budget_bytes,
+        std::string model_artifact_identity,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
         : archive_path_(std::move(archive_path)),
           lock_path_(archive_path_.string() + ".lock"),
           budget_bytes_(budget_bytes),
-          model_artifact_identity_(std::move(model_artifact_identity))
+          model_artifact_identity_(std::move(model_artifact_identity)),
+          memory_authority_(std::move(memory_authority))
     {
+        /*
+         * Claim before allocating.  Direct construction deliberately has no
+         * live production topology and remains available only to focused unit
+         * tests; openShared() hard-requires and retains the canonical ledger.
+         */
+        if (memory_authority_)
+        {
+            archive_scratch_memory_lease_ =
+                memory_authority_->claimNewAllocation(
+                    DeviceId::cpu(),
+                    PhysicalMemoryOwner::PrefixArchiveStaging,
+                    PrefixArchiveIOGeometry::scratchBytes());
+        }
+        archive_scratch_.resize(PrefixArchiveIOGeometry::scratchBytes());
+
         std::string error;
         ready_ = initialize(&error);
         initialization_error_ = std::move(error);
@@ -434,6 +539,7 @@ namespace llaminar2
         const std::filesystem::path &archive_path,
         size_t budget_bytes,
         const std::string &model_artifact_identity,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
         std::string *error)
     {
         static std::mutex registry_mutex;
@@ -445,6 +551,13 @@ namespace llaminar2
             (path_error ? archive_path.lexically_normal() : absolute.lexically_normal()).string();
 
         std::lock_guard<std::mutex> lock(registry_mutex);
+        if (!memory_authority ||
+            !memory_authority->contains(DeviceId::cpu()))
+        {
+            if (error)
+                *error = "shared prefix archive requires the rank-local CPU memory authority";
+            return nullptr;
+        }
         if (auto existing = registry[key].lock())
         {
             if (existing->budgetBytes() != budget_bytes)
@@ -453,13 +566,30 @@ namespace llaminar2
                     *error = "archive already opened with a different disk budget";
                 return nullptr;
             }
+            if (existing->memory_authority_.get() != memory_authority.get())
+            {
+                if (error)
+                    *error = "archive already belongs to a different physical-memory authority";
+                return nullptr;
+            }
             return existing;
         }
 
-        auto backend = std::make_shared<DiskPrefixStorageBackend>(
-            archive_path,
-            budget_bytes,
-            model_artifact_identity);
+        std::shared_ptr<DiskPrefixStorageBackend> backend;
+        try
+        {
+            backend.reset(new DiskPrefixStorageBackend(
+                archive_path,
+                budget_bytes,
+                model_artifact_identity,
+                std::move(memory_authority)));
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+            return nullptr;
+        }
         if (!backend->ready())
         {
             if (error)
@@ -1137,6 +1267,8 @@ namespace llaminar2
         record.handle.terminal_hidden_storage.reset();
         record.handle.terminal_logits_storage.reset();
         record.handle.model_runtime_state_storage.reset();
+        record.handle.ram_payload_memory_lease.reset();
+        record.handle.ram_runtime_state_memory_lease.reset();
         record.handle.payload_readiness.reset();
         record.handle.pinned_kv_storage.reset();
         record.handle.pinned_hybrid_storage.reset();
@@ -1209,7 +1341,12 @@ namespace llaminar2
         PrefixBlockHandle *ram_handle,
         std::string *error)
     {
-        RamPrefixStorageBackend ram(layout.totalBytes());
+        /*
+         * This convenience path is only a unit-test oracle.  Production owns
+         * a bounded, admitted RamPrefixStorageBackend and calls the typed
+         * direct-hydration transaction after beginVerifiedHydration().
+         */
+        RamPrefixStorageBackend ram(std::numeric_limits<size_t>::max());
         return readBlockIntoRamBackend(
             key,
             layout,
@@ -1218,10 +1355,218 @@ namespace llaminar2
             error);
     }
 
+    std::optional<DiskPrefixStorageBackend::HydrationTicket>
+    DiskPrefixStorageBackend::beginVerifiedHydration(
+        const PrefixCacheKey &key,
+        const PrefixPayloadLayout &layout,
+        std::string *error)
+    {
+        std::lock_guard<std::mutex> process_lock(mutex_);
+        if (!ready_)
+        {
+            if (error)
+                *error = initialization_error_;
+            return std::nullopt;
+        }
+        AdvisoryLock file_lock(lock_path_);
+        if (!file_lock.locked())
+        {
+            if (error)
+                *error = errnoMessage("failed to lock prefix archive");
+            return std::nullopt;
+        }
+        FileDescriptor archive(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
+        if (!archive || !refreshIndexLocked(archive.get(), error))
+            return std::nullopt;
+
+        const auto record_it = records_.find(key);
+        if (record_it == records_.end() ||
+            !fullLayoutMatch(record_it->second.handle.layout, layout))
+        {
+            if (error)
+                *error = "prefix archive record not found or layout mismatch";
+            return std::nullopt;
+        }
+        if (!verifyRecordPayloadLocked(
+                archive.get(), record_it->second, error))
+        {
+            return std::nullopt;
+        }
+
+        std::shared_ptr<DiskPrefixStorageBackend> self = weak_from_this().lock();
+        if (!self)
+        {
+            if (error)
+                *error = "verified hydration requires a shared archive lifetime";
+            return std::nullopt;
+        }
+
+        /*
+         * Match ordinary read semantics by making the requested payload most
+         * recent before RAM pressure writes a victim.  The physical snapshot
+         * below still makes a capacity-one RAM/disk swap correct if that write
+         * must evict this logical record anyway.
+         */
+        if (!appendTouchLocked(archive.get(), key, error))
+            return std::nullopt;
+
+        const RecordIndex &touched_record = records_.at(key);
+        std::array<HydrationTicket::SectionSnapshot, kSectionCount> sections{};
+        for (size_t index = 0; index < sections.size(); ++index)
+        {
+            sections[index] = {
+                .offset = touched_record.sections[index].offset,
+                .bytes = touched_record.sections[index].bytes,
+                .checksum = touched_record.sections[index].checksum,
+            };
+        }
+        ++active_hydration_tickets_;
+        return HydrationTicket(
+            std::move(self),
+            touched_record.handle,
+            archive_device_,
+            archive_inode_,
+            std::move(sections));
+    }
+
+    bool DiskPrefixStorageBackend::hydrateVerified(
+        HydrationTicket &ticket,
+        RamPrefixStorageBackend &ram_backend,
+        PrefixBlockHandle *ram_handle,
+        std::string *error)
+    {
+        if (!ram_handle)
+        {
+            if (error)
+                *error = "RAM hydration output is null";
+            return false;
+        }
+
+        std::lock_guard<std::mutex> process_lock(mutex_);
+        if (!ticket.valid() || ticket.backend_.get() != this)
+        {
+            if (error)
+                *error = "verified hydration ticket is invalid, foreign, or consumed";
+            return false;
+        }
+        ticket.consumed_ = true;
+
+        AdvisoryLock file_lock(lock_path_);
+        if (!file_lock.locked())
+        {
+            if (error)
+                *error = errnoMessage("failed to lock prefix archive");
+            return false;
+        }
+        FileDescriptor archive(::open(archive_path_.c_str(), O_RDWR | O_CLOEXEC));
+        struct stat archive_state
+        {
+        };
+        if (!archive || ::fstat(archive.get(), &archive_state) != 0 ||
+            static_cast<uint64_t>(archive_state.st_dev) != ticket.archive_device_ ||
+            static_cast<uint64_t>(archive_state.st_ino) != ticket.archive_inode_)
+        {
+            if (error)
+                *error = "prefix archive changed after hydration verification";
+            return false;
+        }
+
+        const PrefixBlockHandle &verified = ticket.handle_;
+        PrefixBlockHandle out =
+            ram_backend.allocate(verified.key, verified.layout);
+        if (!out.valid())
+        {
+            if (error)
+                *error = "failed to allocate RAM hydration handle";
+            return false;
+        }
+
+        const size_t runtime_bytes =
+            static_cast<size_t>(ticket.sections_[5].bytes);
+        if (runtime_bytes > 0)
+        {
+            auto runtime_state =
+                std::make_shared<std::vector<uint8_t>>(runtime_bytes);
+            if (!ram_backend.attachModelRuntimeState(
+                    &out, std::move(runtime_state)))
+            {
+                ram_backend.release(out);
+                if (error)
+                    *error = "failed to allocate accounted RAM runtime-state payload";
+                return false;
+            }
+        }
+        out.has_hybrid_state = verified.has_hybrid_state;
+        out.has_terminal_hidden = verified.has_terminal_hidden;
+        out.has_terminal_logits = verified.has_terminal_logits;
+        if (out.total_bytes != verified.total_bytes ||
+            out.has_model_runtime_state != verified.has_model_runtime_state)
+        {
+            ram_backend.release(out);
+            if (error)
+                *error = "prefix archive runtime-state accounting mismatch";
+            return false;
+        }
+
+        const std::array<std::pair<void *, size_t>, 6> destinations = {{
+            {out.kv_payload, out.kvBytes()},
+            {out.hybrid_payload, out.hybridBytes()},
+            {out.mtp_payload, out.layout.mtpKVBytes()},
+            {out.terminal_hidden, out.terminalHiddenBytes()},
+            {out.terminal_logits, out.terminalLogitsBytes()},
+            {runtime_bytes > 0
+                 ? out.model_runtime_state_storage->data()
+                 : nullptr,
+             runtime_bytes},
+        }};
+        for (size_t index = 0; index < destinations.size(); ++index)
+        {
+            const auto &[destination, destination_bytes] = destinations[index];
+            const auto &section = ticket.sections_[index];
+            if (section.bytes != destination_bytes ||
+                (destination_bytes > 0 &&
+                 (!destination ||
+                  !preadAll(
+                      archive.get(),
+                      destination,
+                      destination_bytes,
+                      section.offset) ||
+                  checksumBytes(destination, destination_bytes) !=
+                      section.checksum)))
+            {
+                ram_backend.release(out);
+                if (error)
+                    *error = std::string("prefix payload checksum or size mismatch in ") +
+                             kSectionNames[index];
+                return false;
+            }
+        }
+
+        /*
+         * Refresh the logical index after any intervening demotion.  Touch only
+         * when the verified record remains resident on disk; an evicted record
+         * now has RAM as its sole payload authority.
+         */
+        if (!refreshIndexLocked(archive.get(), error))
+        {
+            ram_backend.release(out);
+            return false;
+        }
+        if (records_.find(verified.key) != records_.end() &&
+            !appendTouchLocked(archive.get(), verified.key, error))
+        {
+            ram_backend.release(out);
+            return false;
+        }
+
+        *ram_handle = std::move(out);
+        return true;
+    }
+
     bool DiskPrefixStorageBackend::readBlockIntoRamBackend(
         const PrefixCacheKey &key,
         const PrefixPayloadLayout &layout,
-        IPrefixStorageBackend &ram_backend,
+        RamPrefixStorageBackend &ram_backend,
         PrefixBlockHandle *ram_handle,
         std::string *error)
     {
@@ -1272,14 +1617,29 @@ namespace llaminar2
             static_cast<size_t>(record.sections[5].bytes);
         if (runtime_bytes > 0)
         {
-            out.model_runtime_state_storage =
+            auto runtime_state =
                 std::make_shared<std::vector<uint8_t>>(runtime_bytes);
+            if (!ram_backend.attachModelRuntimeState(
+                    &out, std::move(runtime_state)))
+            {
+                ram_backend.release(out);
+                if (error)
+                    *error = "failed to allocate accounted RAM runtime-state payload";
+                return false;
+            }
         }
-        out.total_bytes = record.handle.total_bytes;
         out.has_hybrid_state = record.handle.has_hybrid_state;
         out.has_terminal_hidden = record.handle.has_terminal_hidden;
         out.has_terminal_logits = record.handle.has_terminal_logits;
-        out.has_model_runtime_state = record.handle.has_model_runtime_state;
+        if (out.total_bytes != record.handle.total_bytes ||
+            out.has_model_runtime_state !=
+                record.handle.has_model_runtime_state)
+        {
+            ram_backend.release(out);
+            if (error)
+                *error = "prefix archive runtime-state accounting mismatch";
+            return false;
+        }
 
         const std::array<std::pair<void *, size_t>, 6> destinations = {{
             {out.kv_payload, out.kvBytes()},
@@ -1327,6 +1687,55 @@ namespace llaminar2
         }
         *ram_handle = std::move(out);
         return compactIfNeededLocked(archive.get(), error);
+    }
+
+    bool DiskPrefixStorageBackend::verifyRecordPayloadLocked(
+        int archive_fd,
+        const RecordIndex &record,
+        std::string *error)
+    {
+        if (archive_scratch_.empty())
+        {
+            if (error)
+                *error = "prefix archive I/O scratch is unavailable";
+            return false;
+        }
+
+        for (size_t index = 0; index < record.sections.size(); ++index)
+        {
+            const SectionIndex &section = record.sections[index];
+            uint64_t remaining = section.bytes;
+            uint64_t source_offset = section.offset;
+            uint64_t checksum = hashPrefixBytes("", 0);
+            while (remaining > 0)
+            {
+                const size_t chunk = static_cast<size_t>(
+                    std::min<uint64_t>(remaining, archive_scratch_.size()));
+                if (!preadAll(
+                        archive_fd,
+                        archive_scratch_.data(),
+                        chunk,
+                        source_offset))
+                {
+                    if (error)
+                        *error = std::string("failed to stream prefix payload section ") +
+                                 kSectionNames[index];
+                    return false;
+                }
+                checksum = hashPrefixBytes(
+                    archive_scratch_.data(), chunk, checksum);
+                source_offset += chunk;
+                remaining -= chunk;
+            }
+            if (checksum != section.checksum)
+            {
+                if (error)
+                    *error = std::string("prefix payload checksum mismatch in ") +
+                             kSectionNames[index];
+                return false;
+            }
+        }
+        return true;
     }
 
     std::vector<PrefixBlockHandle> DiskPrefixStorageBackend::compatibleEntries(
@@ -1379,6 +1788,15 @@ namespace llaminar2
         int archive_fd,
         std::string *error)
     {
+        /*
+         * A verified ticket may refer to a put record that was logically
+         * evicted during a RAM/disk swap.  Append-only mutation preserves its
+         * bytes; compaction is the sole operation that could invalidate those
+         * immutable offsets, so defer it until every in-process ticket retires.
+         */
+        if (active_hydration_tickets_ != 0u)
+            return true;
+
         const uint64_t physical_bytes = fileSize(archive_fd);
         const uint64_t threshold = std::max<uint64_t>(
             64ull * 1024ull * 1024ull,
@@ -1392,6 +1810,14 @@ namespace llaminar2
             return true;
         }
         return rewriteArchiveLocked(archive_fd, error);
+    }
+
+    void DiskPrefixStorageBackend::releaseHydrationTicket() noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (active_hydration_tickets_ == 0u)
+            std::terminate();
+        --active_hydration_tickets_;
     }
 
     bool DiskPrefixStorageBackend::rewriteArchiveLocked(
@@ -1436,7 +1862,6 @@ namespace llaminar2
                 return lhs->sequence < rhs->sequence;
             });
 
-        std::vector<uint8_t> copy_buffer(kCopyBufferBytes);
         for (const RecordIndex *record : ordered)
         {
             uint64_t remaining = record->record_bytes;
@@ -1444,13 +1869,13 @@ namespace llaminar2
             while (remaining > 0)
             {
                 const size_t chunk = static_cast<size_t>(
-                    std::min<uint64_t>(remaining, copy_buffer.size()));
+                    std::min<uint64_t>(remaining, archive_scratch_.size()));
                 if (!preadAll(
                         source_fd,
-                        copy_buffer.data(),
+                        archive_scratch_.data(),
                         chunk,
                         source_offset) ||
-                    !writeAll(destination.get(), copy_buffer.data(), chunk))
+                    !writeAll(destination.get(), archive_scratch_.data(), chunk))
                 {
                     if (error)
                         *error = "failed to copy active prefix record during compaction";

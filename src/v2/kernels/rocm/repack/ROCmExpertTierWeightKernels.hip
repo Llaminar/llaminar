@@ -615,6 +615,47 @@ namespace llaminar2
         }
 
         /**
+         * @brief Build the canonical Q16 multiplier for an IQ2 grid half.
+         * @param factor Published source scale for this sixteen-value half.
+         * @param inverse_scale Reciprocal of the destination Q8 scale.
+         * @return Positive Q16 multiplier rounded before integer application.
+         *
+         * The CPU AVX-512 representation rounds this multiplier once and then
+         * truncates integer products. Naming that boundary keeps ROCm demotion
+         * byte-identical without replacing the parallel preparation kernel.
+         */
+        __device__ __forceinline__ std::int32_t tierIQ2Q16RatioROCm(
+            float factor,
+            float inverse_scale)
+        {
+            const float scaled = __fmul_rn(
+                __fmul_rn(factor, inverse_scale), 65536.0f);
+            return static_cast<std::int32_t>(__fadd_rn(scaled, 0.5f));
+        }
+
+        /**
+         * @brief Apply one canonical Q16 IQ2 transcode while retaining sign.
+         * @param signed_grid_value Signed integer decoded from an IQ2 grid.
+         * @param ratio Positive Q16 multiplier for the value's source half.
+         * @return Signed Q8 payload byte in an integer container.
+         *
+         * Sign application follows the unsigned multiply/shift so this is the
+         * scalar-lane equivalent of AVX-512 `mullo`, `srli`, then masked negate.
+         */
+        __device__ __forceinline__ int applyTierIQ2Q16RatioROCm(
+            int signed_grid_value,
+            std::int32_t ratio)
+        {
+            const std::uint32_t magnitude = static_cast<std::uint32_t>(
+                signed_grid_value < 0 ? -signed_grid_value : signed_grid_value);
+            const std::uint32_t prepared =
+                (magnitude * static_cast<std::uint32_t>(ratio)) >> 16;
+            return signed_grid_value < 0
+                       ? -static_cast<int>(prepared)
+                       : static_cast<int>(prepared);
+        }
+
+        /**
          * @brief Decode and transcode one source-format block per logical row.
          * @tparam Codebook One of 6, 7, 9 through 17, or raw-INT8 19.
          * @param payload Production-packed source payload array.
@@ -755,10 +796,77 @@ namespace llaminar2
                     }
                 }
             }
+            else if constexpr (Codebook == 13 || Codebook == 15)
+            {
+                // IQ2_S and IQ2_XXS share the CPU AVX-512 Q16 contract:
+                // round the two half-block ratios, truncate integer products,
+                // and only then apply signs. Each work item still owns one
+                // column, so the exactness fix introduces no serial lane.
+                int maximum_grid_low = 0;
+                int maximum_grid_high = 0;
+                for (int value = 0; value < 32; ++value)
+                {
+                    const int signed_grid =
+                        decodedTierGroupValueROCm(decoded_groups, value);
+                    const int magnitude =
+                        signed_grid < 0 ? -signed_grid : signed_grid;
+                    if (value < 16)
+                        maximum_grid_low =
+                            magnitude > maximum_grid_low
+                                ? magnitude
+                                : maximum_grid_low;
+                    else
+                        maximum_grid_high =
+                            magnitude > maximum_grid_high
+                                ? magnitude
+                                : maximum_grid_high;
+                }
+
+                const float factor_low = primary;
+                const float factor_high =
+                    Codebook == 13 ? secondary : primary;
+                const float maximum_low = __fmul_rn(
+                    factor_low, static_cast<float>(maximum_grid_low));
+                const float maximum_high = __fmul_rn(
+                    factor_high, static_cast<float>(maximum_grid_high));
+                const float maximum_absolute =
+                    fmaxf(maximum_low, maximum_high);
+                output_minimum = 0.0f;
+                if (maximum_absolute < 1.0e-6f)
+                {
+                    output_scale = 0.0f;
+                    for (int value = 0; value < 32; ++value)
+                    {
+                        unit[interleavedValueOffsetROCm(
+                            local_column, value)] = 0u;
+                    }
+                }
+                else
+                {
+                    output_scale = fminf(
+                        tierDivideROCm(maximum_absolute, 127.0f),
+                        65504.0f);
+                    const float inverse_scale =
+                        tierDivideROCm(1.0f, output_scale);
+                    const std::int32_t ratio_low =
+                        tierIQ2Q16RatioROCm(factor_low, inverse_scale);
+                    const std::int32_t ratio_high =
+                        tierIQ2Q16RatioROCm(factor_high, inverse_scale);
+                    for (int value = 0; value < 32; ++value)
+                    {
+                        const int quantized = applyTierIQ2Q16RatioROCm(
+                            decodedTierGroupValueROCm(decoded_groups, value),
+                            value < 16 ? ratio_low : ratio_high);
+                        unit[interleavedValueOffsetROCm(
+                            local_column, value)] =
+                            static_cast<std::uint8_t>(
+                                static_cast<std::int8_t>(quantized));
+                    }
+                }
+            }
             else if constexpr (
-                Codebook == 11 || Codebook == 12 || Codebook == 13 ||
-                Codebook == 14 || Codebook == 15 || Codebook == 16 ||
-                Codebook == 17)
+                Codebook == 11 || Codebook == 12 || Codebook == 14 ||
+                Codebook == 16 || Codebook == 17)
             {
                 // IQ formats become normalized Q8_0 CPU blocks. Derive absmax
                 // from represented values, then quantize with one shared scale.

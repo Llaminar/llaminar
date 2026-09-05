@@ -14,9 +14,11 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../../utils/VramBillOfMaterials.h"
+#include "../../../planning/PhysicalMemoryAuthority.h"
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -48,6 +50,54 @@ namespace llaminar2
 
     }
 
+    WorkspaceAllocator::WorkspaceAllocator(
+        std::shared_ptr<PhysicalMemoryAuthority>
+            physical_memory_authority)
+    {
+        installPhysicalMemoryAuthority(
+            std::move(physical_memory_authority));
+    }
+
+    void WorkspaceAllocator::installPhysicalMemoryAuthority(
+        std::shared_ptr<PhysicalMemoryAuthority>
+            physical_memory_authority)
+    {
+        if (!physical_memory_authority)
+        {
+            throw std::invalid_argument(
+                "WorkspaceAllocator requires a non-null physical-memory authority");
+        }
+        if (physical_memory_authority_ &&
+            physical_memory_authority_.get() !=
+                physical_memory_authority.get())
+        {
+            throw std::logic_error(
+                "WorkspaceAllocator cannot replace a live physical-memory authority");
+        }
+        if (!physical_memory_authority_ &&
+            !device_workspaces_.empty())
+        {
+            throw std::logic_error(
+                "WorkspaceAllocator cannot bind physical accounting after backend allocation");
+        }
+        physical_memory_authority_ =
+            std::move(physical_memory_authority);
+    }
+
+    std::unique_ptr<DeviceWorkspaceManager>
+    WorkspaceAllocator::createDeviceWorkspaceManager(
+        DeviceId device,
+        size_t budget_bytes) const
+    {
+        if (physical_memory_authority_)
+        {
+            return std::make_unique<DeviceWorkspaceManager>(
+                device, budget_bytes, physical_memory_authority_);
+        }
+        return std::make_unique<DeviceWorkspaceManager>(
+            device, budget_bytes);
+    }
+
     // =========================================================================
     // Memory Query
     // =========================================================================
@@ -58,6 +108,14 @@ namespace llaminar2
         {
             LOG_WARN("[WorkspaceAllocator] Cannot query memory for invalid device");
             return 0;
+        }
+
+        if (physical_memory_authority_)
+        {
+            return physical_memory_authority_
+                ->remainingAdmittedNewAllocationBytes(
+                    device,
+                    PhysicalMemoryOwner::ExecutionWorkspace);
         }
 
         IBackend *backend = getBackendFor(device);
@@ -79,6 +137,14 @@ namespace llaminar2
         {
             LOG_DEBUG("[WorkspaceAllocator] No memory available for " << device.toString());
             return 0;
+        }
+
+        if (physical_memory_authority_)
+        {
+            // The MemoryPlanner owner line is already the complete typed
+            // workspace envelope. Applying another free-memory fraction or
+            // max-budget clamp here would create a second accounting policy.
+            return available;
         }
 
         float fraction = device.is_cpu() ? config.cpu_fraction : config.gpu_fraction;
@@ -1062,6 +1128,37 @@ namespace llaminar2
                     return false;
                 }
                 needed = serial_family_plan.total_bytes;
+
+                /*
+                 * Keep the exact interval layout behind the opt-in VRAM BOM.
+                 * Admission estimators and the runtime graph planner execute at
+                 * different lifecycle points; when they disagree, a name,
+                 * extent, regime, or content lifetime is the actionable unit.
+                 * Emitting that typed layout here avoids widening fatal logs or
+                 * asking a junior developer to infer aliasing from one total.
+                 */
+                for (const auto &placement :
+                     serial_family_plan.placements)
+                {
+                    logVramBomLine(
+                        "workspace_serial_family_placement",
+                        "device=" + device.toString() +
+                            " name=" + placement.descriptor.name +
+                            " offset_bytes=" +
+                            std::to_string(placement.offset) +
+                            " size_bytes=" +
+                            std::to_string(
+                                placement.descriptor.size_bytes) +
+                            " alignment=" +
+                            std::to_string(
+                                placement.descriptor.alignment) +
+                            " regime=" +
+                            std::to_string(static_cast<unsigned>(
+                                placement.descriptor.regime)) +
+                            " content_lifetime=" +
+                            std::to_string(static_cast<unsigned>(
+                                placement.descriptor.content_lifetime)));
+                }
             }
             if (hints.graph_family_policy ==
                 WorkspaceGraphFamilyPolicy::
@@ -1146,7 +1243,7 @@ namespace llaminar2
             else
             {
                 new_manager =
-                    std::make_unique<DeviceWorkspaceManager>(device, budget);
+                    createDeviceWorkspaceManager(device, budget);
                 manager = new_manager.get();
             }
             logVramBomLine(
@@ -1292,7 +1389,7 @@ namespace llaminar2
                                                      << combined.buffers.size() << " buffers, "
                                                      << combined.total_bytes_with_alignment() << " bytes needed");
 
-            auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
+            auto manager = createDeviceWorkspaceManager(device, budget);
             logVramBomLine(
                 "workspace_plan",
                 "phase=legacy_allocate device=" + device.toString() +

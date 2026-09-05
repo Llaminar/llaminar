@@ -2501,8 +2501,18 @@ namespace llaminar2::moe_activation_packet_device
 #endif
             } while (true);
             const auto control = snapshotPeerPublished(launch.control);
+            const auto publication_status =
+                static_cast<MoEOverlayCanonicalRouteTicketStatus>(
+                    control.publication_status);
+            const bool success_payload =
+                publication_status ==
+                MoEOverlayCanonicalRouteTicketStatus::Success;
+            const bool abort_payload =
+                publication_status ==
+                MoEOverlayCanonicalRouteTicketStatus::Aborted;
             block_ticket_valid =
-                control.valid() && control.publicationPending() &&
+                success_payload && control.valid() &&
+                        control.publicationPending() &&
                         control.residency_epoch != 0u &&
                         control.route_capacity ==
                             static_cast<std::int32_t>(
@@ -2511,7 +2521,15 @@ namespace llaminar2::moe_activation_packet_device
                         control.live_entry_count <= launch.route_capacity
                     ? 1u
                     : 0u;
-            block_live_entries = control.live_entry_count;
+            /* An authenticated abort deliberately materializes zero rows. The
+             * following acknowledgement kernel still advances the sequence,
+             * allowing every later wait in a failed retained parent to drain. */
+            block_live_entries =
+                abort_payload && control.valid() &&
+                        control.publicationPending() &&
+                        control.live_entry_count == 0u
+                    ? 0u
+                    : control.live_entry_count;
         }
         __syncthreads();
         if (block_ticket_valid == 0u)
@@ -2572,12 +2590,25 @@ namespace llaminar2::moe_activation_packet_device
         if (blockIdx.x != 0u || threadIdx.x != 0u)
             return;
         const auto control = snapshotPeerPublished(launch.control);
+        const auto publication_status =
+            static_cast<MoEOverlayCanonicalRouteTicketStatus>(
+                control.publication_status);
+        const bool success_payload =
+            publication_status ==
+            MoEOverlayCanonicalRouteTicketStatus::Success;
+        const bool abort_payload =
+            publication_status ==
+            MoEOverlayCanonicalRouteTicketStatus::Aborted;
         if (!control.valid() || !control.publicationPending() ||
-            control.residency_epoch == 0u ||
             control.route_capacity !=
                 static_cast<std::int32_t>(launch.route_capacity) ||
             control.d_model != launch.d_model ||
-            control.live_entry_count > launch.route_capacity)
+            control.live_entry_count > launch.route_capacity ||
+            (success_payload && control.residency_epoch == 0u) ||
+            (abort_payload &&
+             (control.residency_epoch != 0u ||
+              control.live_entry_count != 0u)) ||
+            (!success_payload && !abort_payload))
         {
             return;
         }

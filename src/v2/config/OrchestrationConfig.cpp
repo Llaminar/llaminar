@@ -611,6 +611,27 @@ namespace llaminar2
             return errors;
 
         auto &plan = *plan_ptr;
+
+        /*
+         * Integer priority already defines a total preference order. Derive
+         * final coverage from its least-preferred member so configuration
+         * cannot carry a second, contradictory fallback ordering. Duplicate
+         * priorities remain invalid and are diagnosed by plan validation;
+         * selecting either duplicate here does not make that input admissible.
+         */
+        if (!plan.routed_tiers.empty())
+        {
+            auto coverage = std::max_element(
+                plan.routed_tiers.begin(),
+                plan.routed_tiers.end(),
+                [](const RoutedExpertTier &lhs, const RoutedExpertTier &rhs)
+                {
+                    return lhs.priority < rhs.priority;
+                });
+            for (auto &tier : plan.routed_tiers)
+                tier.fallback = (&tier == &*coverage);
+        }
+
         std::vector<ExecutionDomainDefinition> inventory;
         std::unordered_map<std::string, size_t> index_by_name;
 
@@ -1103,6 +1124,17 @@ namespace llaminar2
             errors.push_back(
                 "MoE migration transfer slots must be > 0");
         }
+        if (moe_rebalance.resolvedMigrationExecutionStreams() == 0)
+        {
+            errors.push_back(
+                "MoE migration execution streams must be > 0");
+        }
+        if (moe_rebalance.resolvedMigrationExecutionStreams() >
+            moe_rebalance.migration_transfer_slots)
+        {
+            errors.push_back(
+                "MoE migration execution streams cannot exceed transfer slots");
+        }
         if (moe_rebalance.resolvedMigrationCyclesPerWave() == 0)
         {
             errors.push_back(
@@ -1393,6 +1425,8 @@ namespace llaminar2
             << moe_rebalance.migration_payoff_horizon_tokens << "\n";
         oss << "    migration_transfer_slots: "
             << moe_rebalance.migration_transfer_slots << "\n";
+        oss << "    migration_execution_streams: "
+            << moe_rebalance.resolvedMigrationExecutionStreams() << "\n";
         oss << "    migration_cycles_per_wave: "
             << moe_rebalance.resolvedMigrationCyclesPerWave() << "\n";
         oss << "    routed_prefill_assignment_window_tokens: "

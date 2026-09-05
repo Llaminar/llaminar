@@ -12,6 +12,7 @@
 #include "MoEOverlayPhysicalResidencyFabric.h"
 
 #include "CpuExpertSlotPool.h"
+#include "ExpertPreparedMemoryGeometry.h"
 #include "ExpertTierGpuBlobTransferLane.h"
 #include "ExpertTierGpuPeerTransferLane.h"
 #include "ExpertTierWeightTransferLane.h"
@@ -25,6 +26,7 @@
 #include "backends/ComputeBackend.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "memory/NUMAAllocator.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "utils/PerfStatsCollector.h"
 
 #ifdef HAVE_CUDA
@@ -44,6 +46,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -84,18 +87,72 @@ namespace llaminar2
 
     bool MoEOverlayReusableContextSeal::valid() const noexcept
     {
-        if (source_epoch == 0 || local_banks.empty())
+        if (source_epoch == 0 || canonical_owner_map.owners().empty() ||
+            canonical_owner_map.participants().empty() || local_banks.empty())
             return false;
-        return std::all_of(
-            local_banks.begin(),
-            local_banks.end(),
-            [this](const MoEOverlayParticipantResidencyBank &bank)
+
+        try
+        {
+            for (std::size_t bank_index = 0;
+                 bank_index < local_banks.size();
+                 ++bank_index)
             {
-                return bank.epoch == source_epoch &&
-                       bank.participant_id >= 0 &&
-                       (bank.device.is_cpu() || bank.device.is_gpu()) &&
-                       !bank.layers.empty();
-            });
+                const auto &bank = local_banks[bank_index];
+                const auto *participant =
+                    canonical_owner_map.participantForId(bank.participant_id);
+                if (!participant || bank.epoch != source_epoch ||
+                    bank.device != participant->device || bank.layers.empty() ||
+                    bank.layers.front().resident_mask.empty() ||
+                    !bank.valid(
+                        bank.participant_id,
+                        participant->device,
+                        static_cast<int>(bank.layers.size()),
+                        static_cast<int>(
+                            bank.layers.front().resident_mask.size())))
+                {
+                    return false;
+                }
+                for (std::size_t previous = 0;
+                     previous < bank_index;
+                     ++previous)
+                {
+                    if (local_banks[previous].participant_id ==
+                        bank.participant_id)
+                    {
+                        return false;
+                    }
+                }
+
+                for (std::size_t layer = 0;
+                     layer < bank.layers.size();
+                     ++layer)
+                {
+                    const auto &resident_mask =
+                        bank.layers[layer].resident_mask;
+                    for (std::size_t expert = 0;
+                         expert < resident_mask.size();
+                         ++expert)
+                    {
+                        const auto *owner = canonical_owner_map.ownerFor(
+                            static_cast<int>(layer),
+                            static_cast<int>(expert));
+                        if (!owner ||
+                            resident_mask[expert] !=
+                                (owner->owner_participant ==
+                                 bank.participant_id))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        catch (...)
+        {
+            /* Validation is a failure predicate at an noexcept lifecycle edge. */
+            return false;
+        }
     }
 
     std::vector<MoEOverlayLayerWeightManifest>
@@ -2173,15 +2230,11 @@ namespace llaminar2
             bool aborted_ = false;
         };
 
-        /** @brief Source-independent geometry/provenance expected per layer role. */
-        struct ProjectionSignature
-        {
-            int N = 0;
-            int K = 0;
-            ExpertWeightFormat format;
+        /** Source-independent exact projection identity shared with admission. */
+        using ProjectionSignature = ExpertPreparedProjectionIdentity;
 
-            bool operator==(const ProjectionSignature &) const = default;
-        };
+        /** Gate/up/down identity shared by admission and physical arenas. */
+        using ExpertGeometryKey = ExpertPreparedTripletGeometryKey;
 
         /**
          * @brief Recyclable view over loader-owned initial expert allocations.
@@ -2213,32 +2266,39 @@ namespace llaminar2
             /** @brief One initially occupied physical expert allocation. */
             struct InitialSlot
             {
+                int layer_idx = -1;
                 int expert_id = -1;
                 std::uint64_t residency_epoch = 0;
                 std::vector<Projection> projections;
             };
 
             /**
-             * @brief Validate and adopt every resident allocation in one layer.
+             * @brief Validate and adopt every resident allocation in one geometry.
              * @param device Exact endpoint device.
              * @param participant_id Logical endpoint identity.
-             * @param layer_idx Transformer layer identity.
+             * @param layer_indices Sorted layers sharing the projection geometry.
              * @param initial_slots Loader-owned resident triplets.
              * @param perf_device Stable topology label for evidence.
              */
             AdoptedInitialExpertSlotRecycler(
                 DeviceId device,
                 int participant_id,
-                int layer_idx,
+                std::vector<int> layer_indices,
                 std::vector<InitialSlot> initial_slots,
                 std::string perf_device)
                 : device_(device),
                   participant_id_(participant_id),
-                  layer_idx_(layer_idx),
+                  layer_indices_(std::move(layer_indices)),
                   perf_device_(std::move(perf_device))
             {
                 if ((!device_.is_cpu() && !device_.is_gpu()) ||
-                    participant_id_ < 0 || layer_idx_ < 0)
+                    participant_id_ < 0 || layer_indices_.empty() ||
+                    !std::is_sorted(
+                        layer_indices_.begin(), layer_indices_.end()) ||
+                    std::adjacent_find(
+                        layer_indices_.begin(), layer_indices_.end()) !=
+                        layer_indices_.end() ||
+                    layer_indices_.front() < 0)
                 {
                     throw std::invalid_argument(
                         "ExpertOverlay adopted-slot arena has invalid endpoint identity");
@@ -2247,7 +2307,11 @@ namespace llaminar2
                 slots_.reserve(initial_slots.size());
                 for (auto &initial : initial_slots)
                 {
-                    if (initial.expert_id < 0 ||
+                    if (!std::binary_search(
+                            layer_indices_.begin(),
+                            layer_indices_.end(),
+                            initial.layer_idx) ||
+                        initial.expert_id < 0 ||
                         initial.residency_epoch == 0 ||
                         initial.projections.size() != kProjections.size())
                     {
@@ -2279,10 +2343,12 @@ namespace llaminar2
                     }
                     slots_.push_back({
                         .projections = std::move(initial.projections),
+                        .layer_idx = initial.layer_idx,
                         .expert_id = initial.expert_id,
                         .residency_epoch = initial.residency_epoch,
                         .bootstrap_assignment = true,
                     });
+                    ++initial_capacity_by_layer_[initial.layer_idx];
                 }
             }
 
@@ -2291,18 +2357,20 @@ namespace llaminar2
              * @return Complete aliasing lease, or no value when none is free.
              */
             [[nodiscard]] std::optional<CpuExpertSlotPool::Lease> acquireCpu(
+                int layer_idx,
                 int expert_id,
                 std::uint64_t residency_epoch)
             {
                 if (!device_.is_cpu())
                     return std::nullopt;
                 const auto assignment = acquireAssignment(
-                    expert_id, residency_epoch);
+                    layer_idx, expert_id, residency_epoch);
                 if (!assignment)
                     return std::nullopt;
 
                 CpuExpertSlotPool::Lease lease;
                 lease.slot_index = assignment->slot_index;
+                lease.layer_idx = layer_idx;
                 lease.expert_id = expert_id;
                 lease.residency_epoch = residency_epoch;
                 lease.lifetime = assignment->lifetime;
@@ -2321,7 +2389,8 @@ namespace llaminar2
                         .engine = std::move(engine),
                     });
                 }
-                recordAcquisition(assignment->slot_index, residency_epoch);
+                recordAcquisition(
+                    layer_idx, assignment->slot_index, residency_epoch);
                 return lease;
             }
 
@@ -2330,17 +2399,21 @@ namespace llaminar2
              * @return Stable descriptor storage plus assignment lease, or no value.
              */
             [[nodiscard]] std::optional<GpuExpertSlotPool::AcquiredSlot>
-            acquireGpu(int expert_id, std::uint64_t residency_epoch)
+            acquireGpu(
+                int layer_idx,
+                int expert_id,
+                std::uint64_t residency_epoch)
             {
                 if (!device_.is_gpu())
                     return std::nullopt;
                 const auto assignment = acquireAssignment(
-                    expert_id, residency_epoch);
+                    layer_idx, expert_id, residency_epoch);
                 if (!assignment)
                     return std::nullopt;
 
                 GpuExpertSlotPool::AcquiredSlot lease;
                 lease.slot_index = assignment->slot_index;
+                lease.layer_idx = layer_idx;
                 lease.expert_id = expert_id;
                 lease.residency_epoch = residency_epoch;
                 lease.lifetime = assignment->lifetime;
@@ -2349,7 +2422,8 @@ namespace llaminar2
                 lease.projections.reserve(slot.projections.size());
                 for (const auto &projection : slot.projections)
                     lease.projections.push_back(*projection.gpu_destination);
-                recordAcquisition(assignment->slot_index, residency_epoch);
+                recordAcquisition(
+                    layer_idx, assignment->slot_index, residency_epoch);
                 return lease;
             }
 
@@ -2369,6 +2443,16 @@ namespace llaminar2
                 return slots_.size();
             }
 
+            /** @return Loader-owned allocations originating in one layer. */
+            [[nodiscard]] std::size_t initialCapacityForLayer(
+                int layer_idx) const noexcept
+            {
+                const auto found = initial_capacity_by_layer_.find(layer_idx);
+                return found == initial_capacity_by_layer_.end()
+                    ? 0u
+                    : found->second;
+            }
+
             /**
              * @brief Test whether one resident already occupies this exact arena.
              * @param expert_id Logical expert expected in the current bank.
@@ -2379,14 +2463,19 @@ namespace llaminar2
              * while still retaining unused minima arrays, so format comparison
              * alone cannot decide whether the old shadow arena may be destroyed.
              */
-            [[nodiscard]] bool ownsAssignment(int expert_id) const noexcept
+            [[nodiscard]] bool ownsAssignment(
+                int layer_idx,
+                int expert_id) const noexcept
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 return std::count_if(
                            slots_.begin(),
                            slots_.end(),
-                           [expert_id](const Slot &slot)
-                           { return slot.expert_id == expert_id; }) == 1;
+                           [layer_idx, expert_id](const Slot &slot)
+                           {
+                               return slot.layer_idx == layer_idx &&
+                                   slot.expert_id == expert_id;
+                           }) == 1;
             }
 
             /**
@@ -2400,6 +2489,7 @@ namespace llaminar2
              * destruction of their final bank/operation alias performs release.
              */
             bool retireBootstrapAssignment(
+                int layer_idx,
                 int expert_id,
                 std::uint64_t retired_bank_epoch) noexcept
             {
@@ -2410,7 +2500,8 @@ namespace llaminar2
                     for (std::size_t index = 0; index < slots_.size(); ++index)
                     {
                         auto &slot = slots_[index];
-                        if (slot.expert_id != expert_id ||
+                        if (slot.layer_idx != layer_idx ||
+                            slot.expert_id != expert_id ||
                             !slot.bootstrap_assignment ||
                             slot.residency_epoch > retired_bank_epoch)
                         {
@@ -2428,6 +2519,7 @@ namespace llaminar2
                          * impossible future assignment from being reclaimed.
                          */
                         assignment_epoch = slot.residency_epoch;
+                        slot.layer_idx = -1;
                         slot.expert_id = -1;
                         slot.residency_epoch = 0;
                         slot.bootstrap_assignment = false;
@@ -2439,6 +2531,7 @@ namespace llaminar2
                     return false;
                 recordRelease(
                     "bootstrap_slot_retired",
+                    layer_idx,
                     released_slot,
                     assignment_epoch);
                 return true;
@@ -2449,6 +2542,8 @@ namespace llaminar2
             struct Slot
             {
                 std::vector<Projection> projections;
+                /** Current logical layer, or -1 while this storage is free. */
+                int layer_idx = -1;
                 int expert_id = -1;
                 std::uint64_t residency_epoch = 0;
                 bool bootstrap_assignment = false;
@@ -2469,6 +2564,7 @@ namespace llaminar2
                  */
                 std::shared_ptr<AdoptedInitialExpertSlotRecycler> pool;
                 int slot_index = -1;
+                int layer_idx = -1;
                 int expert_id = -1;
                 std::uint64_t residency_epoch = 0;
             };
@@ -2482,10 +2578,15 @@ namespace llaminar2
 
             /** @brief Atomically reserve one free slot and create its lease token. */
             [[nodiscard]] std::optional<Assignment> acquireAssignment(
+                int layer_idx,
                 int expert_id,
                 std::uint64_t residency_epoch)
             {
-                if (expert_id < 0 || residency_epoch == 0)
+                if (!std::binary_search(
+                        layer_indices_.begin(),
+                        layer_indices_.end(),
+                        layer_idx) ||
+                    expert_id < 0 || residency_epoch == 0)
                     return std::nullopt;
 
                 int selected = -1;
@@ -2502,6 +2603,7 @@ namespace llaminar2
                     if (selected < 0)
                         return std::nullopt;
                     auto &slot = slots_[static_cast<std::size_t>(selected)];
+                    slot.layer_idx = layer_idx;
                     slot.expert_id = expert_id;
                     slot.residency_epoch = residency_epoch;
                     slot.bootstrap_assignment = false;
@@ -2511,6 +2613,7 @@ namespace llaminar2
                     new LeaseToken{
                         .pool = shared_from_this(),
                         .slot_index = selected,
+                        .layer_idx = layer_idx,
                         .expert_id = expert_id,
                         .residency_epoch = residency_epoch,
                     },
@@ -2522,6 +2625,7 @@ namespace llaminar2
                             {
                                 lease->pool->releaseLease(
                                     lease->slot_index,
+                                    lease->layer_idx,
                                     lease->expert_id,
                                     lease->residency_epoch);
                             }
@@ -2537,6 +2641,7 @@ namespace llaminar2
             /** @brief Release only the exact lease-managed assignment. */
             void releaseLease(
                 int slot_index,
+                int layer_idx,
                 int expert_id,
                 std::uint64_t residency_epoch) noexcept
             {
@@ -2550,11 +2655,13 @@ namespace llaminar2
                     }
                     auto &slot = slots_[static_cast<std::size_t>(slot_index)];
                     if (slot.bootstrap_assignment ||
+                        slot.layer_idx != layer_idx ||
                         slot.expert_id != expert_id ||
                         slot.residency_epoch != residency_epoch)
                     {
                         return;
                     }
+                    slot.layer_idx = -1;
                     slot.expert_id = -1;
                     slot.residency_epoch = 0;
                     released = true;
@@ -2562,12 +2669,14 @@ namespace llaminar2
                 if (released)
                     recordRelease(
                         "adopted_slot_lease_released",
+                        layer_idx,
                         slot_index,
                         residency_epoch);
             }
 
             /** @brief Emit one acquisition proof outside the pool mutex. */
             void recordAcquisition(
+                int layer_idx,
                 int slot_index,
                 std::uint64_t residency_epoch) const
             {
@@ -2578,7 +2687,7 @@ namespace llaminar2
                     "maintenance",
                     perf_device_,
                     {{"participant", std::to_string(participant_id_)},
-                     {"layer", std::to_string(layer_idx_)},
+                     {"layer", std::to_string(layer_idx)},
                      {"slot", std::to_string(slot_index)},
                      {"epoch", std::to_string(residency_epoch)},
                      {"device", device_.to_string()}});
@@ -2587,6 +2696,7 @@ namespace llaminar2
             /** @brief Emit one exact retirement/release proof. */
             void recordRelease(
                 const char *counter,
+                int layer_idx,
                 int slot_index,
                 std::uint64_t residency_epoch) const noexcept
             {
@@ -2597,7 +2707,7 @@ namespace llaminar2
                     "maintenance",
                     perf_device_,
                     {{"participant", std::to_string(participant_id_)},
-                     {"layer", std::to_string(layer_idx_)},
+                     {"layer", std::to_string(layer_idx)},
                      {"slot", std::to_string(slot_index)},
                      {"epoch", std::to_string(residency_epoch)},
                      {"device", device_.to_string()}});
@@ -2605,24 +2715,35 @@ namespace llaminar2
 
             DeviceId device_ = DeviceId::invalid();
             int participant_id_ = -1;
-            int layer_idx_ = -1;
+            std::vector<int> layer_indices_;
+            std::map<int, std::size_t> initial_capacity_by_layer_;
             std::string perf_device_;
             std::vector<Slot> slots_;
             mutable std::mutex mutex_;
         };
 
-        /** @brief CPU or GPU inactive slots for one local endpoint/layer. */
-        struct EndpointLayerPool
+        /** @brief One participant's recyclable arena for an exact geometry. */
+        struct EndpointGeometryPool
         {
             DeviceId device = DeviceId::invalid();
-            /** Guaranteed inactive overlap capacity charged in the BOM. */
-            std::size_t capacity = 0;
-            /** Initial live allocations that rotate into free slots on retire. */
+            int participant_id = -1;
+            std::vector<int> layer_indices;
+            /** Globally bounded inactive overlap capacity charged in the BOM. */
+            std::size_t shadow_capacity = 0;
+            /** Loader allocations shared by every compatible layer after retire. */
             std::shared_ptr<AdoptedInitialExpertSlotRecycler> adopted_slots;
             std::variant<
                 std::shared_ptr<CpuExpertSlotPool>,
                 std::shared_ptr<GpuExpertSlotPool>>
                 pool;
+        };
+
+        /** @brief Layer binding into one exact-geometry destination arena. */
+        struct EndpointLayerPool
+        {
+            std::shared_ptr<EndpointGeometryPool> geometry_pool;
+            /** Maximum simultaneous arrivals for this one logical layer. */
+            std::size_t layer_arrival_capacity = 0;
         };
 
         /** @brief Complete local destination reservation for one migration. */
@@ -3033,6 +3154,7 @@ namespace llaminar2
         std::vector<AdoptedInitialExpertSlotRecycler::InitialSlot>
         makeAdoptedInitialSlots(
             const MoEOverlayParticipantLayerBank &layer,
+            int layer_idx,
             DeviceId device,
             std::uint64_t epoch)
         {
@@ -3044,6 +3166,7 @@ namespace llaminar2
                     continue;
 
                 AdoptedInitialExpertSlotRecycler::InitialSlot slot;
+                slot.layer_idx = layer_idx;
                 slot.expert_id = static_cast<int>(expert);
                 slot.residency_epoch = epoch;
                 slot.projections.reserve(kProjections.size());
@@ -3346,6 +3469,7 @@ namespace llaminar2
         std::string reusable_seal_failure;
 
         std::atomic<std::uint64_t> endpoint_layer_pools{0};
+        std::atomic<std::uint64_t> endpoint_geometry_pools{0};
         std::atomic<std::uint64_t> adopted_initial_slots{0};
         std::atomic<std::uint64_t> adopted_initial_slots_recycled{0};
         std::atomic<std::uint64_t> cpu_shadow_slots{0};
@@ -3537,9 +3661,13 @@ namespace llaminar2
                     });
 
             /*
-             * Pass two allocates every endpoint/layer, including a completely
-             * empty cold tier.  Shadow capacity is a runtime wave bound, not a
-             * function of current occupancy, so it must remain exact.
+             * Pass two groups layers by their exact gate/up/down allocation
+             * contract. A closed migration cycle can visit one participant
+             * only once, so layers with identical geometry share the bounded
+             * inactive arena instead of each retaining an allocation that can
+             * never be used concurrently. Loader-owned slots join that same
+             * arena: after publication, the departed source from any compatible
+             * layer replaces the inactive slot consumed by the arrival.
              */
             for (const int participant_id : local_ids)
             {
@@ -3561,31 +3689,72 @@ namespace llaminar2
                         "ExpertOverlay shadow-slot capacity exceeds the model expert count");
                 }
 
-                for (int layer_idx = 0;
-                     layer_idx < endpoint->numLayers();
+                std::map<ExpertGeometryKey, std::vector<int>>
+                    layers_by_geometry;
+                for (int layer_idx = 0; layer_idx < endpoint->numLayers();
                      ++layer_idx)
                 {
                     const auto signatures = requireLayerSignatures(
                         model_signatures, layer_idx);
-                    const auto &initial_layer =
-                        bank_found->second->layers[
-                            static_cast<std::size_t>(layer_idx)];
-                    const std::size_t capacity =
+                    layers_by_geometry[ExpertGeometryKey{signatures}]
+                        .push_back(layer_idx);
+                }
+
+                for (const auto &[geometry, layer_indices] :
+                     layers_by_geometry)
+                {
+                    if (layer_indices.empty() ||
+                        layer_indices.size() >
+                            std::numeric_limits<std::size_t>::max() /
+                                config.shadow_slots_per_endpoint_layer)
+                    {
+                        throw std::overflow_error(
+                            "ExpertOverlay shared shadow-slot capacity overflows size_t");
+                    }
+                    const std::size_t geometry_layer_capacity =
+                        layer_indices.size() *
                         config.shadow_slots_per_endpoint_layer;
-                    EndpointLayerPool destination;
-                    destination.device = endpoint->device();
-                    destination.capacity = capacity;
-                    auto adopted_initial_slots = makeAdoptedInitialSlots(
-                        initial_layer,
-                        endpoint->device(),
-                        config.initial_snapshot->epoch);
+                    const std::size_t capacity = std::min(
+                        config.maximum_concurrent_cycles,
+                        geometry_layer_capacity);
+                    if (capacity == 0 ||
+                        capacity > static_cast<std::size_t>(
+                            std::numeric_limits<int>::max()))
+                    {
+                        throw std::invalid_argument(
+                            "ExpertOverlay shared shadow-slot arena has invalid capacity");
+                    }
+
+                    std::vector<
+                        AdoptedInitialExpertSlotRecycler::InitialSlot>
+                        adopted_initial_slots;
+                    for (const int layer_idx : layer_indices)
+                    {
+                        const auto &initial_layer =
+                            bank_found->second->layers[
+                                static_cast<std::size_t>(layer_idx)];
+                        auto layer_slots = makeAdoptedInitialSlots(
+                            initial_layer,
+                            layer_idx,
+                            endpoint->device(),
+                            config.initial_snapshot->epoch);
+                        adopted_initial_slots.insert(
+                            adopted_initial_slots.end(),
+                            std::make_move_iterator(layer_slots.begin()),
+                            std::make_move_iterator(layer_slots.end()));
+                    }
                     const std::size_t adopted_count =
                         adopted_initial_slots.size();
-                    destination.adopted_slots = std::make_shared<
+                    auto destination = std::make_shared<EndpointGeometryPool>();
+                    destination->device = endpoint->device();
+                    destination->participant_id = participant_id;
+                    destination->layer_indices = layer_indices;
+                    destination->shadow_capacity = capacity;
+                    destination->adopted_slots = std::make_shared<
                         AdoptedInitialExpertSlotRecycler>(
                         endpoint->device(),
                         participant_id,
-                        layer_idx,
+                        layer_indices,
                         std::move(adopted_initial_slots),
                         config.perf_device);
                     impl.adopted_initial_slots.fetch_add(
@@ -3597,7 +3766,8 @@ namespace llaminar2
                         for (const auto projection : kProjections)
                         {
                             const auto &signature =
-                                signatures[projectionIndex(projection)];
+                                geometry.projections[
+                                    projectionIndex(projection)];
                             specs.push_back({
                                 .projection = projection,
                                 .N = signature.N,
@@ -3611,15 +3781,18 @@ namespace llaminar2
                                 ? CpuExpertSlotPool::MemoryPlacement::boundNode(
                                       participant->address.numa_node)
                                 : CpuExpertSlotPool::MemoryPlacement::aggregateDomain();
-                        auto pool = CpuExpertSlotPool::create({
-                            .participant_id = participant_id,
-                            .layer_idx = layer_idx,
-                            .capacity = static_cast<int>(capacity),
-                            .projections = std::move(specs),
-                            .memory_placement = memory_placement,
-                            .perf_device = config.perf_device,
-                        });
-                        destination.pool = std::move(pool);
+                        auto pool = CpuExpertSlotPool::create(
+                            {
+                                .participant_id = participant_id,
+                                .layer_idx = layer_indices.front(),
+                                .capacity = static_cast<int>(capacity),
+                                .projections = std::move(specs),
+                                .memory_placement = memory_placement,
+                                .perf_device = config.perf_device,
+                            },
+                            config.memory_authority,
+                            PhysicalMemoryOwner::ExpertShadowSlots);
+                        destination->pool = std::move(pool);
                         impl.cpu_shadow_slots.fetch_add(
                             capacity, std::memory_order_relaxed);
                     }
@@ -3635,7 +3808,8 @@ namespace llaminar2
                         for (const auto projection : kProjections)
                         {
                             const auto &signature =
-                                signatures[projectionIndex(projection)];
+                                geometry.projections[
+                                    projectionIndex(projection)];
                             GpuExpertSlotPool::ProjectionSpec spec{
                                 .label = projectionName(projection),
                                 .N = signature.N,
@@ -3664,11 +3838,13 @@ namespace llaminar2
                             backend,
                             endpoint->device(),
                             endpoint->device().gpu_ordinal(),
-                            layer_idx,
+                            layer_indices.front(),
                             static_cast<int>(capacity),
                             std::move(specs),
+                            config.memory_authority,
+                            PhysicalMemoryOwner::ExpertShadowSlots,
                             /*transfer_capacity=*/0);
-                        destination.pool = std::move(pool);
+                        destination->pool = std::move(pool);
                         impl.gpu_shadow_slots.fetch_add(
                             capacity, std::memory_order_relaxed);
                     }
@@ -3678,14 +3854,25 @@ namespace llaminar2
                             "ExpertOverlay physical fabric encountered an unsupported participant device");
                     }
 
-                    const auto [_, inserted] = impl.endpoint_pools.emplace(
-                        EndpointLayerKey{participant_id, layer_idx},
-                        std::move(destination));
-                    if (!inserted)
-                        throw std::logic_error(
-                            "ExpertOverlay physical fabric created a duplicate endpoint pool");
-                    impl.endpoint_layer_pools.fetch_add(
+                    impl.endpoint_geometry_pools.fetch_add(
                         1, std::memory_order_relaxed);
+                    for (const int layer_idx : layer_indices)
+                    {
+                        const auto [_, inserted] = impl.endpoint_pools.emplace(
+                            EndpointLayerKey{participant_id, layer_idx},
+                            EndpointLayerPool{
+                                .geometry_pool = destination,
+                                .layer_arrival_capacity =
+                                    config.shadow_slots_per_endpoint_layer,
+                            });
+                        if (!inserted)
+                        {
+                            throw std::logic_error(
+                                "ExpertOverlay physical fabric created a duplicate endpoint/layer binding");
+                        }
+                        impl.endpoint_layer_pools.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
                 }
             }
         }
@@ -3764,6 +3951,64 @@ namespace llaminar2
                 }
                 return multiplicity * config.maximum_concurrent_cycles;
             };
+
+            const auto physicalStreamCount = [&](std::size_t multiplicity)
+            {
+                if (multiplicity == 0u ||
+                    config.maximum_execution_streams == 0u ||
+                    multiplicity >
+                        std::numeric_limits<std::size_t>::max() /
+                            config.maximum_execution_streams)
+                {
+                    throw std::overflow_error(
+                        "ExpertOverlay physical stream-pool geometry overflowed");
+                }
+                return multiplicity * config.maximum_execution_streams;
+            };
+
+            /*
+             * One physical participant can take part once in every admitted
+             * cycle. Gate/up/down projections and source/destination roles are
+             * separate logical operations, but multiplying HIP/CUDA streams by
+             * those roles does not create additional hardware queues. Bind all
+             * compatible operations to the same typed participant/cycle lane;
+             * their staging and completion events remain independent.
+             */
+            std::map<
+                DeviceId,
+                std::vector<PersistentTransferExecutionLane>>
+                execution_lanes;
+            for (const auto &[device, multiplicity] :
+                 participant_multiplicity)
+            {
+                if (!device.is_gpu())
+                    continue;
+                execution_lanes.emplace(
+                    device,
+                    TransferEngine::instance()
+                        .allocatePersistentTransferExecutionLanes(
+                            physicalStreamCount(multiplicity),
+                            device,
+                            "moe_overlay_physical_fabric"));
+            }
+            const auto executionLane = [&execution_lanes](
+                                           DeviceId device,
+                                           std::size_t lane_index)
+                -> const PersistentTransferExecutionLane &
+            {
+                const auto found = execution_lanes.find(device);
+                if (found == execution_lanes.end() ||
+                    found->second.empty())
+                {
+                    throw std::logic_error(
+                        "ExpertOverlay physical lane exceeded its typed GPU execution-stream pool");
+                }
+                /* Logical participant/cycle lanes keep independent storage and
+                 * terminal events. Only their background stream is shared, so
+                 * every operation can be enqueued in one maintenance pass
+                 * while finite GPU queues remain a separately tunable BOM. */
+                return found->second[lane_index % found->second.size()];
+            };
             std::size_t maximum_parallel_lanes = 0;
 
             /*
@@ -3837,6 +4082,7 @@ namespace llaminar2
                     .device = device,
                     .slot_capacity = slot_capacity,
                     .execution_lane_capacity = execution_lane_capacity,
+                    .execution_streams = execution_lanes.at(device),
                     .maximum_bytes = config.staging_capacity_bytes,
                     .name = "expert_overlay_physical_relay:" +
                             device.to_string(),
@@ -3845,6 +4091,47 @@ namespace llaminar2
                 impl.transfer_progress_epochs.emplace(
                     device, std::move(epoch));
             }
+
+            /*
+             * The progress-slot BOM is also the exact mapped-payload BOM: one
+             * source or destination region belongs to every retained command
+             * slot. Allocate one native mapped slab per physical GPU, then
+             * distribute immutable child regions as lanes are constructed.
+             * This keeps setup proportional to devices rather than directed
+             * edges, projections, cycle width, and double-buffer slots.
+             */
+            std::map<
+                DeviceId,
+                std::vector<std::shared_ptr<MappedHostTransferRegion>>>
+                mapped_relay_staging;
+            std::map<DeviceId, std::size_t> mapped_relay_staging_cursor;
+            for (const auto &[device, slot_capacity] : progress_slot_demand)
+            {
+                mapped_relay_staging.emplace(
+                    device,
+                    TransferEngine::instance()
+                        .allocateMappedHostTransferSlices(
+                            config.staging_capacity_bytes,
+                            slot_capacity,
+                            device));
+                mapped_relay_staging_cursor.emplace(device, 0u);
+            }
+            const auto takeMappedRelayStaging =
+                [&](DeviceId device)
+                -> std::shared_ptr<MappedHostTransferRegion>
+            {
+                const auto pool = mapped_relay_staging.find(device);
+                auto cursor = mapped_relay_staging_cursor.find(device);
+                if (pool == mapped_relay_staging.end() ||
+                    cursor == mapped_relay_staging_cursor.end() ||
+                    cursor->second >= pool->second.size())
+                {
+                    throw std::logic_error(
+                        "ExpertOverlay mapped relay staging exceeded its exact progress-slot BOM for " +
+                        device.toString());
+                }
+                return pool->second[cursor->second++];
+            };
 
             for (const auto &[source_device, source_multiplicity] :
                  participant_multiplicity)
@@ -3901,6 +4188,9 @@ namespace llaminar2
                                             .source_device = source_device,
                                             .destination_device =
                                                 destination_device,
+                                            .execution = executionLane(
+                                                destination_device,
+                                                lane_index),
                                             .lane_name =
                                                 name_prefix + "_lane_" +
                                                 std::to_string(lane_index),
@@ -3927,6 +4217,27 @@ namespace llaminar2
                                      lane_index < lane_count;
                                      ++lane_index)
                                 {
+                                    std::array<
+                                        std::shared_ptr<
+                                            MappedHostTransferRegion>,
+                                        2>
+                                        source_staging;
+                                    std::array<
+                                        std::shared_ptr<
+                                            MappedHostTransferRegion>,
+                                        2>
+                                        destination_staging;
+                                    for (std::size_t slot_index = 0u;
+                                         slot_index < source_staging.size();
+                                         ++slot_index)
+                                    {
+                                        source_staging[slot_index] =
+                                            takeMappedRelayStaging(
+                                                source_device);
+                                        destination_staging[slot_index] =
+                                            takeMappedRelayStaging(
+                                                destination_device);
+                                    }
                                     auto lane = std::make_shared<
                                         ExpertTierGpuBlobTransferLane>(
                                         ExpertTierGpuBlobTransferLane::Config{
@@ -3942,6 +4253,10 @@ namespace llaminar2
                                                           CrossBackend,
                                             .staging_capacity_bytes =
                                                 config.staging_capacity_bytes,
+                                            .source_mapped_staging =
+                                                std::move(source_staging),
+                                            .destination_mapped_staging =
+                                                std::move(destination_staging),
                                             .source_progress_epoch =
                                                 impl.transfer_progress_epochs.at(
                                                     source_device),
@@ -3987,6 +4302,21 @@ namespace llaminar2
                                                      : destination_device;
                             auto pool =
                                 std::make_shared<SharedWeightLanePool>();
+                            /*
+                             * Preserve one exclusive slice per physical lane,
+                             * while registering the complete pool as one host
+                             * slab and allocating it as one device slab. ROCm
+                             * host registration has substantial fixed and
+                             * growing per-allocation cost; exposing every 4 MiB
+                             * slice as a separate allocation made setup scale
+                             * quadratically with the public wave width.
+                             */
+                            const auto staging_slices =
+                                TransferEngine::instance()
+                                    .allocatePersistentTransferStagingSlices(
+                                        config.staging_capacity_bytes,
+                                        lane_count,
+                                        gpu);
                             for (std::size_t lane_index = 0;
                                  lane_index < lane_count;
                                  ++lane_index)
@@ -3995,8 +4325,10 @@ namespace llaminar2
                                     ExpertTierWeightTransferLane>(
                                     ExpertTierWeightTransferLane::Config{
                                         .device = gpu,
-                                        .staging_capacity_bytes =
-                                            config.staging_capacity_bytes,
+                                        .staging =
+                                            staging_slices[lane_index],
+                                        .execution = executionLane(
+                                            gpu, lane_index),
                                         .lane_name =
                                             name_prefix + "_lane_" +
                                             std::to_string(lane_index),
@@ -4014,6 +4346,19 @@ namespace llaminar2
                             impl.weight_lanes.emplace(key, std::move(pool));
                         }
                     }
+                }
+            }
+
+            for (const auto &[device, slices] : mapped_relay_staging)
+            {
+                const auto cursor =
+                    mapped_relay_staging_cursor.find(device);
+                if (cursor == mapped_relay_staging_cursor.end() ||
+                    cursor->second != slices.size())
+                {
+                    throw std::logic_error(
+                        "ExpertOverlay mapped relay staging did not consume its exact progress-slot BOM for " +
+                        device.toString());
                 }
             }
 
@@ -4135,6 +4480,15 @@ namespace llaminar2
                                 : "remote_destination";
                         auto &lanes = impl.remote_gpu_lanes[key];
                         lanes.reserve(lane_count);
+                        /* Cross-rank endpoints retain the same independently
+                         * writable lane geometry but share two pool-wide
+                         * TransferEngine allocation authorities. */
+                        const auto staging_slices =
+                            TransferEngine::instance()
+                                .allocatePersistentTransferStagingSlices(
+                                    config.staging_capacity_bytes,
+                                    lane_count,
+                                    device);
                         for (std::size_t lane_index = 0;
                              lane_index < lane_count;
                              ++lane_index)
@@ -4143,8 +4497,9 @@ namespace llaminar2
                                 MoEOverlayGpuRemoteProjectionLane>(
                                 MoEOverlayGpuRemoteProjectionLane::Config{
                                     .device = device,
-                                    .staging_capacity_bytes =
-                                        config.staging_capacity_bytes,
+                                    .staging = staging_slices[lane_index],
+                                    .execution = executionLane(
+                                        device, lane_index),
                                     .lane_name =
                                         device.to_string() + "_" + role_name +
                                         "_" + projectionName(projection) +
@@ -4184,24 +4539,31 @@ namespace llaminar2
 
         /** @brief Acquire one CPU or GPU slot without starting physical work. */
         ReservedDestination reserveDestination(
-            EndpointLayerPool &pool,
+            EndpointLayerPool &binding,
+            int layer_idx,
             int expert_id,
             std::uint64_t candidate_epoch)
         {
+            if (!binding.geometry_pool)
+            {
+                throw std::logic_error(
+                    "ExpertOverlay endpoint/layer binding lost its geometry arena");
+            }
+            auto &pool = *binding.geometry_pool;
             ReservedDestination reserved;
             if (pool.device.is_cpu())
             {
                 if (pool.adopted_slots)
                 {
                     reserved.cpu = pool.adopted_slots->acquireCpu(
-                        expert_id, candidate_epoch);
+                        layer_idx, expert_id, candidate_epoch);
                     if (reserved.cpu)
                         return reserved;
                 }
                 auto cpu_pool =
                     std::get<std::shared_ptr<CpuExpertSlotPool>>(pool.pool);
-                reserved.cpu = cpu_pool->acquire(
-                    expert_id, candidate_epoch);
+                reserved.cpu = cpu_pool->acquireForLayer(
+                    layer_idx, expert_id, candidate_epoch);
                 if (!reserved.cpu)
                     throw std::runtime_error(
                         "ExpertOverlay CPU shadow-slot preflight changed before reservation");
@@ -4211,14 +4573,14 @@ namespace llaminar2
                 if (pool.adopted_slots)
                 {
                     reserved.gpu = pool.adopted_slots->acquireGpu(
-                        expert_id, candidate_epoch);
+                        layer_idx, expert_id, candidate_epoch);
                     if (reserved.gpu)
                         return reserved;
                 }
                 auto gpu_pool =
                     std::get<std::shared_ptr<GpuExpertSlotPool>>(pool.pool);
-                reserved.gpu = gpu_pool->acquire(
-                    expert_id, candidate_epoch);
+                reserved.gpu = gpu_pool->acquireForLayer(
+                    layer_idx, expert_id, candidate_epoch);
                 if (!reserved.gpu)
                     throw std::runtime_error(
                         "ExpertOverlay GPU shadow-slot preflight changed before reservation");
@@ -4229,18 +4591,21 @@ namespace llaminar2
         /** @brief Return currently available slots through the typed pool. */
         std::size_t availableSlots(const EndpointLayerPool &pool)
         {
-            const std::size_t adopted = pool.adopted_slots
-                                            ? pool.adopted_slots
+            if (!pool.geometry_pool)
+                return 0;
+            const auto &geometry = *pool.geometry_pool;
+            const std::size_t adopted = geometry.adopted_slots
+                                            ? geometry.adopted_slots
                                                   ->availableSlots()
                                             : 0;
-            if (pool.device.is_cpu())
+            if (geometry.device.is_cpu())
             {
                 return adopted +
-                    std::get<std::shared_ptr<CpuExpertSlotPool>>(pool.pool)
+                    std::get<std::shared_ptr<CpuExpertSlotPool>>(geometry.pool)
                         ->availableSlots();
             }
             return adopted +
-                std::get<std::shared_ptr<GpuExpertSlotPool>>(pool.pool)
+                std::get<std::shared_ptr<GpuExpertSlotPool>>(geometry.pool)
                     ->availableSlots();
         }
     } // namespace
@@ -4248,11 +4613,12 @@ namespace llaminar2
     std::shared_ptr<MoEOverlayPhysicalResidencyFabric>
     MoEOverlayPhysicalResidencyFabric::create(Config config)
     {
-        if (!config.registry || !config.initial_snapshot ||
+        if (!config.memory_authority || !config.registry ||
+            !config.initial_snapshot ||
             !config.initial_snapshot->valid())
         {
             throw std::invalid_argument(
-                "ExpertOverlay physical fabric requires registry and valid initial snapshot");
+                "ExpertOverlay physical fabric requires the rank-bound memory authority, registry, and valid initial snapshot");
         }
         if (config.registry->initialEpoch() !=
                 config.initial_snapshot->epoch ||
@@ -4263,10 +4629,13 @@ namespace llaminar2
         }
         if (config.shadow_slots_per_endpoint_layer == 0 ||
             config.staging_capacity_bytes == 0 ||
-            config.maximum_concurrent_cycles == 0)
+            config.maximum_concurrent_cycles == 0 ||
+            config.maximum_execution_streams == 0 ||
+            config.maximum_execution_streams >
+                config.maximum_concurrent_cycles)
         {
             throw std::invalid_argument(
-                "ExpertOverlay physical fabric requires positive shadow, staging, and concurrent-cycle capacities");
+                "ExpertOverlay physical fabric requires positive shadow, staging, cycle, and execution-stream capacities, with streams no greater than cycles");
         }
         if (config.remote_projection_transport)
         {
@@ -4308,6 +4677,10 @@ namespace llaminar2
             config.perf_device,
             {{"endpoint_layer_pools",
               std::to_string(impl->endpoint_pools.size())},
+             {"endpoint_geometry_pools",
+              std::to_string(
+                  impl->endpoint_geometry_pools.load(
+                      std::memory_order_relaxed))},
              {"adopted_initial_slots",
               std::to_string(
                   impl->adopted_initial_slots.load(
@@ -4325,7 +4698,9 @@ namespace llaminar2
                   impl->maximum_parallel_cpu_copy_lanes.load(
                       std::memory_order_relaxed))},
              {"maximum_concurrent_cycles",
-              std::to_string(config.maximum_concurrent_cycles)}});
+              std::to_string(config.maximum_concurrent_cycles)},
+             {"maximum_execution_streams",
+              std::to_string(config.maximum_execution_streams)}});
         return std::shared_ptr<MoEOverlayPhysicalResidencyFabric>(
             new MoEOverlayPhysicalResidencyFabric(
                 std::move(config), std::move(impl)));
@@ -4374,8 +4749,10 @@ namespace llaminar2
         const std::vector<int> &local_destination_participants)
     {
         if (!batch.valid() || !batch.movesWeights() ||
-            batch.kind !=
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement)
+            (batch.kind !=
+                 MoEOverlayDeviceControllerTransactionKind::DynamicPlacement &&
+             batch.kind != MoEOverlayDeviceControllerTransactionKind::
+                               PreparedContextRestore))
         {
             impl_->waves_failed.fetch_add(1, std::memory_order_relaxed);
             return {
@@ -4658,6 +5035,14 @@ namespace llaminar2
          * cycle set before acquiring one slot.  Exceeding the model-time BOM is
          * fatal; an old ticket retaining a planned slot is ordinary deferral.
          */
+        struct GeometryShadowDemand
+        {
+            EndpointLayerPool *binding = nullptr;
+            std::size_t slot_count = 0;
+            int destination_participant = -1;
+        };
+        std::map<const EndpointGeometryPool *, GeometryShadowDemand>
+            demand_by_geometry;
         for (const auto &requirement : shadow_requirements)
         {
             if (!std::binary_search(
@@ -4679,16 +5064,55 @@ namespace llaminar2
             {
                 return fail(error.what());
             }
-            if (requirement.slot_count > pool->capacity)
+            if (!pool->geometry_pool ||
+                requirement.slot_count > pool->layer_arrival_capacity)
             {
                 return fail(
-                    "ExpertOverlay migration wave exceeds the preallocated shadow-slot BOM: participant=" +
+                    "ExpertOverlay migration wave exceeds the per-layer shadow arrival bound: participant=" +
                     std::to_string(requirement.destination_participant) +
                     " layer=" + std::to_string(requirement.layer_idx) +
                     " required=" + std::to_string(requirement.slot_count) +
-                    " capacity=" + std::to_string(pool->capacity));
+                    " capacity=" +
+                    std::to_string(pool->layer_arrival_capacity));
             }
-            const std::size_t available = availableSlots(*pool);
+            auto &geometry_demand = demand_by_geometry[
+                pool->geometry_pool.get()];
+            if (!geometry_demand.binding)
+            {
+                geometry_demand.binding = pool;
+                geometry_demand.destination_participant =
+                    requirement.destination_participant;
+            }
+            if (requirement.slot_count >
+                std::numeric_limits<std::size_t>::max() -
+                    geometry_demand.slot_count)
+            {
+                return fail(
+                    "ExpertOverlay geometry shadow demand overflows size_t");
+            }
+            geometry_demand.slot_count += requirement.slot_count;
+        }
+
+        for (const auto &[_, requirement] : demand_by_geometry)
+        {
+            if (!requirement.binding ||
+                !requirement.binding->geometry_pool)
+            {
+                return fail(
+                    "ExpertOverlay geometry shadow demand lost its typed arena binding");
+            }
+            const auto &geometry = *requirement.binding->geometry_pool;
+            if (requirement.slot_count > geometry.shadow_capacity)
+            {
+                return fail(
+                    "ExpertOverlay migration wave exceeds the shared exact-geometry shadow-slot BOM: participant=" +
+                    std::to_string(requirement.destination_participant) +
+                    " required=" + std::to_string(requirement.slot_count) +
+                    " capacity=" +
+                    std::to_string(geometry.shadow_capacity));
+            }
+            const std::size_t available = availableSlots(
+                *requirement.binding);
             if (requirement.slot_count > available)
             {
                 impl_->waves_deferred.fetch_add(
@@ -4698,10 +5122,10 @@ namespace llaminar2
                     "ExpertOverlay shadow slots are retained by an older epoch: "
                     "participant=" +
                     std::to_string(requirement.destination_participant) +
-                    " layer=" + std::to_string(requirement.layer_idx) +
                     " required=" + std::to_string(requirement.slot_count) +
                     " available=" + std::to_string(available) +
-                    " planned_capacity=" + std::to_string(pool->capacity) +
+                    " planned_capacity=" +
+                    std::to_string(geometry.shadow_capacity) +
                     " expected_epoch=" +
                     std::to_string(expected_epoch) +
                     " candidate_epoch=" +
@@ -4731,6 +5155,7 @@ namespace llaminar2
                     migration.layer_idx);
                 destinations[migration_index] = reserveDestination(
                     pool,
+                    migration.layer_idx,
                     migration.expert_id,
                     candidate_epoch);
             }
@@ -6069,13 +6494,17 @@ namespace llaminar2
                 migration.layer_idx,
             });
             if (found == impl_->endpoint_pools.end() ||
-                !found->second.adopted_slots)
+                !found->second.geometry_pool ||
+                !found->second.geometry_pool->adopted_slots)
             {
                 /* Local topology disappearing after publication is unrecoverable. */
                 std::terminate();
             }
-            if (found->second.adopted_slots->retireBootstrapAssignment(
-                    migration.expert_id, retired_epoch))
+            if (found->second.geometry_pool->adopted_slots
+                    ->retireBootstrapAssignment(
+                        migration.layer_idx,
+                        migration.expert_id,
+                        retired_epoch))
             {
                 ++recycled;
             }
@@ -6197,37 +6626,170 @@ namespace llaminar2
 
             MoEOverlayReusableContextSeal result;
             result.source_epoch = published_epoch;
+            result.canonical_owner_map =
+                config_.initial_snapshot->owner_map;
             const auto participant_ids =
                 config_.registry->localParticipantIds();
             result.local_banks.reserve(participant_ids.size());
 
             /*
-             * First take an immutable copy of every source bank and prove the
-             * complete logical placement before submitting a single byte copy.
-             * This preflight makes a partial physical seal impossible for an
+             * Materialize the exact terminal inventory from its typed owner.
+             * Host RCU keeps participant banks current. Device RCU intentionally
+             * does not: its controller owns selectors and its physical ledger
+             * owns engine lifetimes. Reading the registry in that mode would be
+             * an informal host mirror and, after movement, names the wrong
+             * epoch. Both authorities produce the same immutable bank value for
+             * the common capacity/compaction proof below.
+             */
+            if (config_.inventory_authority ==
+                MoEOverlayPhysicalInventoryAuthority::ParticipantRegistry)
+            {
+                for (const int participant_id : participant_ids)
+                {
+                    const auto endpoint =
+                        config_.registry->endpoint(participant_id);
+                    auto bank = endpoint
+                        ? endpoint->acquire(published_epoch)
+                        : MoEOverlayParticipantBankLease{};
+                    if (!endpoint || !bank ||
+                        !bank->valid(
+                            participant_id,
+                            endpoint->device(),
+                            endpoint->numLayers(),
+                            endpoint->numExperts()))
+                    {
+                        return fail(
+                            "ExpertOverlay reusable-context seal cannot acquire participant " +
+                            std::to_string(participant_id) + " at epoch " +
+                            std::to_string(published_epoch) +
+                            " from the host participant-bank authority");
+                    }
+                    result.local_banks.push_back(*bank);
+                }
+            }
+            else if (config_.inventory_authority ==
+                     MoEOverlayPhysicalInventoryAuthority::DeviceSlotLedger)
+            {
+                if (!impl_->device_slot_ledger)
+                {
+                    return fail(
+                        "ExpertOverlay reusable-context seal lost its device physical inventory authority");
+                }
+                std::string inventory_error;
+                const auto inventory = impl_->device_slot_ledger->snapshot(
+                    published_epoch, &inventory_error);
+                if (!inventory || !inventory->valid())
+                {
+                    return fail(
+                        inventory_error.empty()
+                            ? "ExpertOverlay reusable-context seal could not snapshot the device physical inventory"
+                            : std::move(inventory_error));
+                }
+
+                std::map<int, std::size_t> bank_index_by_participant;
+                for (const int participant_id : participant_ids)
+                {
+                    const auto endpoint =
+                        config_.registry->endpoint(participant_id);
+                    const auto *participant =
+                        config_.initial_snapshot->owner_map.participantForId(
+                            participant_id);
+                    if (!endpoint || !participant ||
+                        endpoint->device() != participant->device)
+                    {
+                        return fail(
+                            "ExpertOverlay device physical inventory cannot resolve local participant " +
+                            std::to_string(participant_id));
+                    }
+
+                    MoEOverlayParticipantResidencyBank bank{
+                        .epoch = published_epoch,
+                        .participant_id = participant_id,
+                        .device = endpoint->device(),
+                    };
+                    bank.layers.resize(
+                        static_cast<std::size_t>(endpoint->numLayers()));
+                    for (auto &layer : bank.layers)
+                    {
+                        layer.resident_mask.assign(
+                            static_cast<std::size_t>(endpoint->numExperts()),
+                            false);
+                        layer.experts.resize(
+                            static_cast<std::size_t>(endpoint->numExperts()));
+                    }
+                    bank_index_by_participant.emplace(
+                        participant_id, result.local_banks.size());
+                    result.local_banks.push_back(std::move(bank));
+                }
+
+                for (const auto &slot : inventory->slots)
+                {
+                    const auto bank_index = bank_index_by_participant.find(
+                        slot.key.participant_id);
+                    if (bank_index == bank_index_by_participant.end())
+                    {
+                        return fail(
+                            "ExpertOverlay device physical inventory contains a non-local participant slot");
+                    }
+                    auto &bank = result.local_banks.at(bank_index->second);
+                    if (slot.key.layer_idx < 0 ||
+                        slot.key.expert_id < 0 ||
+                        static_cast<std::size_t>(slot.key.layer_idx) >=
+                            bank.layers.size() ||
+                        static_cast<std::size_t>(slot.key.expert_id) >=
+                            bank.layers.at(
+                                static_cast<std::size_t>(slot.key.layer_idx))
+                                .experts.size())
+                    {
+                        return fail(
+                            "ExpertOverlay device physical inventory contains an out-of-range expert coordinate");
+                    }
+                    auto &layer = bank.layers.at(
+                        static_cast<std::size_t>(slot.key.layer_idx));
+                    if (layer.resident_mask.at(
+                            static_cast<std::size_t>(slot.key.expert_id)))
+                    {
+                        return fail(
+                            "ExpertOverlay device physical inventory contains a duplicate expert coordinate");
+                    }
+                    layer.setResidentExpert(
+                        slot.key.expert_id, slot.triplet);
+                }
+            }
+            else
+            {
+                return fail(
+                    "ExpertOverlay reusable-context seal has an unknown physical inventory authority");
+            }
+
+            /*
+             * Prove the complete prepared placement before submitting a single
+             * byte copy. This makes a partial physical seal impossible for an
              * owner-map or adopted-capacity defect.
              */
-            for (const int participant_id : participant_ids)
+            std::map<
+                const AdoptedInitialExpertSlotRecycler *,
+                std::pair<
+                    std::shared_ptr<AdoptedInitialExpertSlotRecycler>,
+                    std::size_t>>
+                compaction_demand_by_geometry;
+            for (auto &canonical : result.local_banks)
             {
+                const int participant_id = canonical.participant_id;
                 const auto endpoint = config_.registry->endpoint(participant_id);
                 const auto *participant =
                     config_.initial_snapshot->owner_map.participantForId(
                         participant_id);
-                auto bank = endpoint
-                    ? endpoint->acquire(published_epoch)
-                    : MoEOverlayParticipantBankLease{};
-                if (!endpoint || !participant || !bank ||
-                    !bank->valid(
+                if (!endpoint || !participant ||
+                    !canonical.valid(
                         participant_id,
                         endpoint->device(),
                         endpoint->numLayers(),
                         endpoint->numExperts()))
                 {
                     return fail(
-                        "ExpertOverlay reusable-context seal cannot acquire a complete local participant bank");
+                        "ExpertOverlay reusable-context seal materialized an incomplete local participant bank");
                 }
-
-                MoEOverlayParticipantResidencyBank canonical = *bank;
                 for (int layer_idx = 0;
                      layer_idx < endpoint->numLayers();
                      ++layer_idx)
@@ -6248,8 +6810,10 @@ namespace llaminar2
 
                     auto &pool = requireEndpointPool(
                         *impl_, participant_id, layer_idx);
-                    if (!pool.adopted_slots ||
-                        pool.adopted_slots->capacity() !=
+                    if (!pool.geometry_pool ||
+                        !pool.geometry_pool->adopted_slots ||
+                        pool.geometry_pool->adopted_slots
+                                ->initialCapacityForLayer(layer_idx) !=
                             residentCount(layer))
                     {
                         return fail(
@@ -6273,17 +6837,36 @@ namespace llaminar2
                             return fail(
                                 "ExpertOverlay reusable-context seal found an incomplete resident triplet");
                         }
-                        if (!pool.adopted_slots->ownsAssignment(expert_id))
+                        if (!pool.geometry_pool->adopted_slots
+                                 ->ownsAssignment(layer_idx, expert_id))
                             ++needs_compaction;
                     }
-                    if (pool.adopted_slots->availableSlots() <
-                        needs_compaction)
+                    auto &geometry_demand =
+                        compaction_demand_by_geometry[
+                            pool.geometry_pool->adopted_slots.get()];
+                    if (!geometry_demand.first)
+                    {
+                        geometry_demand.first =
+                            pool.geometry_pool->adopted_slots;
+                    }
+                    if (needs_compaction >
+                        std::numeric_limits<std::size_t>::max() -
+                            geometry_demand.second)
                     {
                         return fail(
-                            "ExpertOverlay reusable-context seal cannot fit every shadow resident into the prepared allocation arena");
+                            "ExpertOverlay reusable-context compaction demand overflows size_t");
                     }
+                    geometry_demand.second += needs_compaction;
                 }
-                result.local_banks.push_back(std::move(canonical));
+            }
+            for (const auto &[_, demand] : compaction_demand_by_geometry)
+            {
+                if (!demand.first ||
+                    demand.first->availableSlots() < demand.second)
+                {
+                    return fail(
+                        "ExpertOverlay reusable-context seal cannot fit every shadow resident into the shared prepared allocation arena");
+                }
             }
 
             const auto completion_deadline =
@@ -6419,6 +7002,12 @@ namespace llaminar2
                         static_cast<std::size_t>(layer_idx));
                     auto &pool = requireEndpointPool(
                         *impl_, bank.participant_id, layer_idx);
+                    if (!pool.geometry_pool ||
+                        !pool.geometry_pool->adopted_slots)
+                    {
+                        return fail(
+                            "ExpertOverlay reusable-context compaction lost its geometry arena");
+                    }
                     for (int expert_id = 0;
                          expert_id < endpoint->numExperts();
                          ++expert_id)
@@ -6428,7 +7017,8 @@ namespace llaminar2
                         {
                             continue;
                         }
-                        if (pool.adopted_slots->ownsAssignment(expert_id))
+                        if (pool.geometry_pool->adopted_slots
+                                ->ownsAssignment(layer_idx, expert_id))
                         {
                             ++result.retained_canonical_experts;
                             continue;
@@ -6444,8 +7034,10 @@ namespace llaminar2
                         if (bank.device.is_cpu())
                         {
                             auto destination =
-                                pool.adopted_slots->acquireCpu(
-                                    expert_id, published_epoch);
+                                pool.geometry_pool->adopted_slots->acquireCpu(
+                                    layer_idx,
+                                    expert_id,
+                                    published_epoch);
                             if (!destination)
                             {
                                 return fail(
@@ -6524,8 +7116,10 @@ namespace llaminar2
                         else
                         {
                             auto destination =
-                                pool.adopted_slots->acquireGpu(
-                                    expert_id, published_epoch);
+                                pool.geometry_pool->adopted_slots->acquireGpu(
+                                    layer_idx,
+                                    expert_id,
+                                    published_epoch);
                             if (!destination)
                             {
                                 return fail(
@@ -6708,6 +7302,9 @@ namespace llaminar2
         return {
             .endpoint_layer_pools =
                 impl_->endpoint_layer_pools.load(std::memory_order_relaxed),
+            .endpoint_geometry_pools =
+                impl_->endpoint_geometry_pools.load(
+                    std::memory_order_relaxed),
             .adopted_initial_slots =
                 impl_->adopted_initial_slots.load(
                     std::memory_order_relaxed),

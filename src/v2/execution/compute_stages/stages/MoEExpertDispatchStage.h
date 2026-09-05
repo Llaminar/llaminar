@@ -235,6 +235,20 @@ namespace llaminar2
         bool isGraphCapturable() const override { return false; }
         /** @return true because heterogeneous ExpertOverlay executes this host descriptor between captured device regions. */
         bool isManualGraphBoundary() const override { return true; }
+        /**
+         * @brief Admit overlap only when a captured GPU ticket owns every input.
+         *
+         * The stage's first operation acquire-waits on the publisher's mapped
+         * timeline. Direct tensor bindings instead require the preceding GPU
+         * executable to have completed before host execution begins.
+         */
+        ManualGraphBoundaryScheduling
+        manualGraphBoundaryScheduling() const noexcept override
+        {
+            return params_.ticket_storage
+                       ? ManualGraphBoundaryScheduling::ConcurrentTicketService
+                       : ManualGraphBoundaryScheduling::BetweenExecutableLaunches;
+        }
         bool supportsPaddedPrefillGraphCapturePreflight() const override
         {
             return params_.ticket_storage != nullptr;
@@ -280,6 +294,15 @@ namespace llaminar2
         MoEOverlayCollectiveRuntimeParams runtime_params_{};
         /** Persistent integer view of FP32 ticket expert ids; no execute allocation. */
         mutable std::vector<int> routing_evidence_expert_ids_;
+        /**
+         * @brief Invocation-exclusive histogram accumulator retained at setup.
+         *
+         * Dispatch stages execute independently, so each stage owns one dense
+         * expert-count table rather than sharing mutable scratch through the
+         * process-wide histogram. The merge clears and reuses this storage.
+         */
+        mutable std::vector<std::uint64_t>
+            routing_evidence_count_scratch_;
     };
 
 } // namespace llaminar2

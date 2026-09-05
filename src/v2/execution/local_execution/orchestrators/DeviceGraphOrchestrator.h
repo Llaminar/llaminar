@@ -52,11 +52,13 @@
 #include "../../../loaders/IWeightStreamer.h"          // For weight streaming (Option B)
 #include "../../../interfaces/IModelContext.h"         // For interface-based construction
 #include "../../../memory/BufferArena.h"               // Phase 2: unified buffer management
+#include "../../../planning/PhysicalMemoryBOM.h"       // Typed physical allocation owners
 #include "../../prefix_cache/PrefixCacheFingerprint.h"
 #include "../../prefix_cache/PrefixCacheStats.h"
 #include "../../prefix_cache/PrefixStorageBackend.h"   // PrefixBlockHandle restore-source ownership
 #include "../../mtp/MTPSpecDecodeMetadata.h"
 #include "../../mtp/MTPSidecarCaptureLayout.h"
+#include "../../mtp/MTPGraphOwnerPlan.h"
 #include "../../mtp/MTPVerifierPolicy.h"
 #include "../../mtp/HostedDeviceGenerationLifecycle.h"
 #include "../../../interfaces/IMPITopology.h"          // For interface-based construction
@@ -255,6 +257,8 @@ namespace llaminar2
     class RamPrefixStorageBackend;
     class DiskPrefixStorageBackend;
     class DeviceHotPrefixStorageBackend;
+    class PhysicalMemoryAuthority;
+    class PhysicalMemoryOwnerReservation;
     enum class PrefixDeviceHotLeaseResult;
     class ActivationRotation;
     enum class KVCacheLayoutMode : uint8_t;
@@ -347,34 +351,9 @@ namespace llaminar2
         }
     };
 
-    /**
-     * @brief Configuration for inference state initialization
-     *
-     * Controls how buffers are allocated during initializeInferenceState().
-     */
+    /** @brief Immutable capacities used to initialize inference state. */
     struct InferenceStateInitConfig
     {
-        /**
-         * @brief Use mapped memory for GPU tensor allocation
-         *
-         * When true and the target device is a GPU (CUDA or ROCm), FP32 activation
-         * buffers will be allocated using zero-copy mapped memory:
-         * - CUDA: cudaHostAllocMapped | cudaHostAllocWriteCombined
-         * - ROCm: hipHostMallocMapped | hipHostMallocWriteCombined
-         *
-         * This enables the host to read GPU tensor data without memcpy, which is
-         * essential for:
-         * - Snapshot capture mode (parity testing, debugging)
-         * - Any scenario where host needs frequent access to GPU tensors
-         *
-         * Tradeoffs:
-         * - Slightly slower GPU access (PCIe vs VRAM bandwidth)
-         * - But eliminates ~5-10 second sync delays for snapshot callbacks
-         *
-         * Default: false (use device memory for best GPU performance)
-         */
-        bool use_mapped_memory = false;
-
         /**
          * @brief Sequence length used for transient graph/activation buffers.
          *
@@ -778,6 +757,17 @@ namespace llaminar2
              */
             std::shared_ptr<ReusableExecutionWorkspaceRegistry>
                 reusable_execution_workspaces;
+
+            /**
+             * Rank-bound CPU/GPU memory authority admitted before graph setup.
+             *
+             * Production factories pass this explicitly from the model setup
+             * boundary. DeviceGraphOrchestrator must not rediscover it through
+             * a concrete weight-manager downcast because arenas, caches, and
+             * workspaces are peer allocation owners rather than weight details.
+             */
+            std::shared_ptr<PhysicalMemoryAuthority>
+                physical_memory_authority;
         };
 
         // =========================================================================
@@ -798,7 +788,28 @@ namespace llaminar2
         DeviceGraphOrchestrator(Dependencies deps);
 
         /**
-         * @brief Construct orchestrator with graph builder
+         * @brief Construct an injected orchestrator with isolated-test accounting.
+         *
+         * This is the dependency-rich counterpart to the legacy model-free test
+         * constructor. It is deliberately named and unavailable through a mode
+         * flag so production callers cannot accidentally waive physical-memory
+         * admission while unit fixtures can still inject mock model/context
+         * dependencies without creating real CPU or GPU allocations.
+         *
+         * @param deps Unit-owned dependency bundle.
+         * @return Isolated orchestrator that never masquerades as admitted
+         *         production state.
+         */
+        [[nodiscard]] static std::unique_ptr<DeviceGraphOrchestrator>
+        createForTest(Dependencies deps);
+
+        /**
+         * @brief Construct an isolated orchestrator for model-free unit tests.
+         *
+         * This legacy surface intentionally has no model context or physical-
+         * memory admission. Production factories must use Dependencies. Any
+         * allocation owner reached through this constructor is therefore an
+         * explicitly unaccounted test fixture rather than a runtime fallback.
          *
          * @param graph_builder Shared pointer to IGraphBuilder (graph definition)
          * @param mpi_ctx MPI context for distributed execution
@@ -1842,24 +1853,30 @@ namespace llaminar2
         }
 
         /**
-         * @brief Capture compact row digests after a mirrored MTP proposal fails.
+         * @brief Capture compact row digests at a completed mirrored-MTP boundary.
          *
-         * This error-path diagnostic samples the device-owned terminal-hidden
+         * This opt-in diagnostic samples the device-owned terminal-hidden
          * input, every semantically important sidecar boundary, live device
-         * positions, and resident proposal slots.  It is deliberately absent
-         * from the successful hot path: the caller invokes it only after two
-         * mirrored participants have already returned different draft tokens.
+         * positions, resident proposal slots, and the selected main-model
+         * checkpoint bank. It is deliberately absent from the ordinary hot
+         * path. Callers use it after a mirrored failure or after an explicit
+         * diagnostic completion boundary.
          *
          * Each tensor contributes its first logical row because production
-         * proposal sidecars execute one condition row.  The copy uses this
-         * runner's explicit GPU stream and leaves TensorBase coherence metadata
-         * untouched, so collecting diagnostics cannot make a stale host mirror
+         * proposal sidecars execute one condition row. The copy uses
+         * @p ordered_stream when the caller owns exact producer provenance;
+         * failure paths without such provenance use this runner's dedicated
+         * diagnostic stream. TensorBase coherence metadata remains untouched,
+         * so collecting diagnostics cannot make a stale host mirror
          * authoritative.
          *
+         * @param ordered_stream Exact non-null stream ordered after the
+         *        checkpoint producer, or nullptr only on an already-closed
+         *        failure boundary.
          * @return Ordered digest inventory suitable for participant comparison.
          */
         std::vector<MTPMirroredTensorDigest>
-        captureFailedMirroredMTPDigests();
+        captureMirroredMTPDigests(void *ordered_stream = nullptr);
 
         /**
          * @brief Mark the active compact request-prefill logits transaction.
@@ -2734,7 +2751,7 @@ namespace llaminar2
             return forward(tokens, seq_len, 1) != nullptr;
         }
 
-        bool waitForLastForwardCompletionForBenchmark() override;
+        bool waitForLastInferenceCompletionForBenchmark() override;
 
         bool forwardPrefill(const int *tokens, int seq_len) override;
 
@@ -2992,7 +3009,7 @@ namespace llaminar2
          * until HIP exposes equivalent conditional graph nodes; it is selected
          * before admission and is never entered after a native launch failure.
          *
-         * @param topology Fixed-depth WHILE or dynamic SWITCH-in-WHILE shape.
+         * @param topology Fixed-depth WHILE or dynamic selector-gated WHILE shape.
          * @return Explicit execution policy, or `Unsupported` for a fatal
          *         incomplete backend/capture configuration.
          */
@@ -4181,6 +4198,8 @@ namespace llaminar2
                         snapshot_capture_.captureStage(snapshot_context_ + "::" + name, dump);
                     snapshot_capture_.captureStage(name, dump);
                 });
+            executor_.setSnapshotConfigurationIdentity(
+                snapshotConfigurationIdentity());
         }
 
         /**
@@ -4213,13 +4232,17 @@ namespace llaminar2
             if (!snapshot_enabled_)
                 return;
             applySnapshotCaptureFilter();
+            executor_.setSnapshotConfigurationIdentity(
+                snapshotConfigurationIdentity());
         }
 
         /**
          * @brief Disable diagnostic snapshots and remove their captured graph nodes.
          *
-         * The first transition advances the executor topology epoch; repeating
-         * the disabled state is an idempotent request-local cleanup operation.
+         * Disabled snapshots have one stable semantic graph identity. Returning
+         * to that state selects the already-materialized lean executable rather
+         * than inventing a new cache generation; repeating the transition is a
+         * request-local cleanup operation only.
          */
         void disableSnapshotCapture() override
         {
@@ -4239,6 +4262,8 @@ namespace llaminar2
             prefill_chunk_snapshot_sequence_.clear();
             executor_.setSnapshotStageFilter(nullptr);
             executor_.setSnapshotCallback(nullptr);
+            executor_.setSnapshotConfigurationIdentity(
+                kSnapshotsDisabledConfigurationIdentity);
         }
 
         /**
@@ -4334,6 +4359,38 @@ namespace llaminar2
                 {
                     return snapshotStageMatchesFilter(stage_name, dump_info);
                 });
+        }
+
+        /**
+         * @brief Resolve a stable identity for the normalized snapshot key set.
+         *
+         * Callback objects are recreated when diagnostics are temporarily
+         * suspended, but callback address is not graph topology. The sorted key
+         * inventory is. Retaining one process-local identity per exact inventory
+         * lets the already-instantiated diagnostic executable be selected again
+         * without colliding with the lean serving executable or recapturing it.
+         *
+         * @return Non-zero identity distinct from the snapshots-disabled value.
+         */
+        uint64_t snapshotConfigurationIdentity()
+        {
+            std::vector<std::string> normalized(
+                snapshot_capture_filter_.begin(),
+                snapshot_capture_filter_.end());
+            std::sort(normalized.begin(), normalized.end());
+            const auto found =
+                snapshot_configuration_identities_.find(normalized);
+            if (found != snapshot_configuration_identities_.end())
+                return found->second;
+
+            LLAMINAR_ASSERT(
+                next_snapshot_configuration_identity_ != 0,
+                "Snapshot graph topology identity exhausted");
+            const uint64_t identity =
+                next_snapshot_configuration_identity_++;
+            snapshot_configuration_identities_.emplace(
+                std::move(normalized), identity);
+            return identity;
         }
 
         // =========================================================================
@@ -4674,8 +4731,10 @@ namespace llaminar2
          * generally available, while the graph declares whether its event DAG
          * is ordinary, one indivisible device-owned transaction, or an
          * explicitly ticket-segmented heterogeneous transaction. The capture
-         * controller applies that typed declaration here so initial capture and
-         * retained replay cannot derive different executable identities.
+         * controller applies that typed declaration here. ExpertOverlay packet
+         * graphs are then resolved through the shared retained-parent composer,
+         * so initial capture, hosted MTP replay, and ordinary forward replay
+         * cannot derive different executable or CPU-service authorities.
          *
          * @param graph Exact graph whose native envelope constrains replay.
          * @param has_collective_nodes Whether @p graph contains collectives.
@@ -5680,14 +5739,17 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
-         * @brief Enclose one topology-wide main forward in its device epoch lease.
+         * @brief Enclose one ordinary GPU main forward in its device epoch lease.
          *
          * Ordinary prefill and decode are complete production transactions, so
          * their reader acquire must be a graph root and their release must be
          * the sole terminal after every model, collective, and auxiliary-stream
-         * join.  Embedding both stages avoids launching a separate release graph
-         * beside a still-running captured MoE lane.  MTP parents already own an
-         * equivalent complete transaction and are deliberately excluded.
+         * join. This ownership is independent of whether placement decisions
+         * are host- or device-authoritative: the participant-local main graph is
+         * complete in either case. Embedding both stages avoids cross-stream
+         * boundary graphs beside a still-running captured MoE lane. MTP parents
+         * already own an equivalent complete transaction and are deliberately
+         * excluded.
          *
          * @param graph Fully built participant-local production graph.
          * @param input Typed role and mathematical phase for that graph.
@@ -6427,6 +6489,26 @@ namespace llaminar2
         /// Graph caching configuration
         GraphCacheConfig cache_config_;
 
+        /**
+         * Complete opaque-driver graph-pool capacity committed for this runner.
+         *
+         * CUDA/HIP do not expose allocation handles for individual graph-pool
+         * slabs, so they cannot receive ordinary per-pointer leases. This one
+         * model-lifetime reservation is the canonical materialization claim for
+         * every graph cache declared later in this class. Declaration order is
+         * intentional: graph owners are destroyed before this reservation.
+         */
+        std::shared_ptr<PhysicalMemoryOwnerReservation>
+            native_graph_memory_reservation_;
+
+        /**
+         * Complete graph-snapshot capacity committed before capture setup.
+         * Executor child leases retain its shared state until each concrete
+         * device tensor has been freed.
+         */
+        std::shared_ptr<PhysicalMemoryOwnerReservation>
+            graph_snapshot_memory_reservation_;
+
         /// Per-layer graph cache
         std::vector<LayerGraphCache> layer_graph_cache_;
 
@@ -6479,6 +6561,13 @@ namespace llaminar2
             size_t terminal_hidden_host_capacity_bytes = 0;
             size_t terminal_hidden_device_capacity_bytes = 0;
             DeviceId device = DeviceId::invalid();
+
+            /**
+             * Exact RecurrentCheckpointState claim for all payload allocations
+             * in this slot. It is copied into every borrowed handle so a slot's
+             * physical bytes and accounting authority have identical lifetime.
+             */
+            std::shared_ptr<void> physical_memory_lease;
             std::shared_ptr<std::vector<uint8_t>> hybrid_host_storage;
             std::shared_ptr<void> hybrid_device_storage;
             std::shared_ptr<std::vector<uint8_t>> terminal_hidden_host_storage;
@@ -6499,6 +6588,9 @@ namespace llaminar2
         {
             size_t capacity_bytes = 0;
             DeviceId device = DeviceId::invalid();
+
+            /** Exact SequenceMetadata claim retained beside the VRAM slot. */
+            std::shared_ptr<void> physical_memory_lease;
             std::shared_ptr<void> storage;
             std::shared_ptr<void> ready_event;
         };
@@ -6683,6 +6775,28 @@ namespace llaminar2
         void disablePrefixCacheForRunner(const std::string &reason);
         bool acquireLiveCheckpointStorage(PrefixBlockHandle &handle) const;
         bool ensureLiveCheckpointStorage(PrefixBlockHandle &handle) const;
+
+        /**
+         * @brief Claim one exact setup allocation from the rank-bound authority.
+         *
+         * Production callers fail when admission is absent or exhausted. The
+         * legacy graph-builder constructor has an explicit IsolatedTest mode
+         * whose device-free fixtures may allocate without a topology plan.
+         * The returned type-erased token owns a move-only ledger lease.
+         *
+         * @param device Physical allocator that will receive the allocation.
+         * @param owner Typed BOM line that admitted the bytes.
+         * @param bytes Exact backing bytes to allocate after this call.
+         * @param allocation_name Stable diagnostic label.
+         * @param lease Receives the lifetime token before allocation begins.
+         * @return true when allocation may proceed.
+         */
+        bool claimPhysicalAllocation(
+            DeviceId device,
+            PhysicalMemoryOwner owner,
+            size_t bytes,
+            const char *allocation_name,
+            std::shared_ptr<void> *lease) const;
         bool acquireLiveDeviceSequenceStateStorage(
             int cache_depth,
             int sequence_index,
@@ -7387,6 +7501,21 @@ namespace llaminar2
             DeviceLogitsSource source,
             const char *consumer_name) const;
 
+        /**
+         * @brief Resolve the exact scalar main row eligible for prefix archival.
+         *
+         * Prefix harvest runs after several physically different main-model
+         * producers.  Ordinary prefill writes the canonical logits arena,
+         * while a restored-prefix MTP bridge deliberately writes the
+         * preplanned all-position arena at row zero.  The current publication
+         * is the sole authority for that physical choice; inferring it again
+         * from configured TP policy can select an allocated but stale tensor.
+         *
+         * @return Current scalar main-model logits tensor, or nullptr when no
+         *         compatible producer has published in this request epoch.
+         */
+        [[nodiscard]] TensorBase *currentPrefixArchiveLogits() const noexcept;
+
         /** Resolve any sampling source while preserving main publication rules. */
         [[nodiscard]] TensorBase *resolveDeviceLogitsTensor(
             DeviceLogitsSource source,
@@ -7777,8 +7906,12 @@ namespace llaminar2
 
         static constexpr size_t
             kMTPVerifierPreparationControlPolicyCount =
+                MTPGraphOwnerPlan::kVerifierControlPolicyCount;
+        static_assert(
+            kMTPVerifierPreparationControlPolicyCount ==
                 static_cast<size_t>(
-                    MTPVerifierPreparationControlPolicy::Count);
+                    MTPVerifierPreparationControlPolicy::Count),
+            "MTP graph-owner plan and verifier policy enum must remain identical");
 
         /**
          * @brief Exact structural address of one verifier-preparation capture.
@@ -7888,6 +8021,7 @@ namespace llaminar2
             DeviceControlledLoopFragmentExecution execution =
                 DeviceControlledLoopFragmentExecution::Always;
             const uint32_t *condition_word_device = nullptr;
+            int minimum_selector = -1;
 
             /** @return Whether two plans embed the same immutable executable identity. */
             [[nodiscard]] bool hasSameExecutionIdentity(
@@ -7897,19 +8031,20 @@ namespace llaminar2
                        semantic_graph == other.semantic_graph &&
                        forward_signature == other.forward_signature &&
                        execution == other.execution &&
-                       condition_word_device == other.condition_word_device;
+                       condition_word_device == other.condition_word_device &&
+                       minimum_selector == other.minimum_selector;
             }
         };
 
         /**
          * @brief Persistent owner for one policy-complete device generation loop.
          *
-         * Fixed policy owns one immutable transaction body. Dynamic policy owns
-         * one complete retained branch per legal draft depth, selected from the
-         * resident controller's exact value. CUDA embeds those branches in a
-         * native SWITCH-in-WHILE parent. HIP captures an isolated ticket
-         * publisher and submits the selected retained branch on one explicit
-         * scheduler stream. Mutable generation state never leaves the device.
+         * Fixed policy owns one immutable transaction body. Native CUDA dynamic
+         * policy owns one maximum-width transaction whose monotonic draft prefix
+         * is gated by the resident selector and whose verifier/publication tail
+         * appears once. HIP captures an isolated ticket publisher and retains one
+         * semantic branch per legal depth on one explicit scheduler stream.
+         * Mutable generation state never leaves the device.
          *
          * The stream is allocated with runner workspace setup. The graph object
          * is retained across request boundaries and rebuilt from exact child
@@ -7951,7 +8086,7 @@ namespace llaminar2
             /** Maximum/capture draft width embedded in every verifier child. */
             int draft_depth = 0;
             int verifier_rows_per_request = 0;
-            /** Inclusive native SWITCH range; equal for a fixed body. */
+            /** Inclusive selector range; equal for a fixed body. */
             int minimum_draft_depth = 0;
             int maximum_draft_depth = 0;
             /** DeviceGenerationDepthPolicyMode encoded into this executable. */
@@ -7961,6 +8096,8 @@ namespace llaminar2
             size_t fragment_count = 0;
             /** Number of native conditional nodes embedded in the executable. */
             size_t native_conditional_fragment_count = 0;
+            /** Source fragments owned by monotonic selector-gated prefix groups. */
+            size_t native_selector_gated_fragment_count = 0;
             /** Number of retained semantic fragments selected by a device ticket. */
             size_t ticket_conditioned_fragment_count = 0;
             ExecutionKind execution_kind = ExecutionKind::Unmaterialized;
@@ -8002,6 +8139,7 @@ namespace llaminar2
                 sampling_mode.reset();
                 fragment_count = 0;
                 native_conditional_fragment_count = 0;
+                native_selector_gated_fragment_count = 0;
                 ticket_conditioned_fragment_count = 0;
                 branch_offsets.fill(0);
                 branch_fragment_counts.fill(0);
@@ -8139,7 +8277,11 @@ namespace llaminar2
         };
 
         MTPTerminalHiddenRowSelectGraphCache mtp_terminal_hidden_row_select_cache_;
-        /// CPU/direct-fixture arbitrary-row selector. Production GPU paths use one of the typed caches below.
+        /**
+         * CPU arbitrary-row selector and the single replaceable GPU nonzero-
+         * contiguous catch-up owner. Fixed row-zero, request, and device-indexed
+         * GPU shapes use the typed cache directories below.
+         */
         MTPTerminalHiddenRowsSelectGraphCache mtp_terminal_hidden_rows_select_cache_;
         /// One immutable row-zero suffix graph per MTP catchup width, materialized before request execution.
         std::vector<std::unique_ptr<MTPTerminalHiddenRowsSelectGraphCache>>
@@ -8221,17 +8363,6 @@ namespace llaminar2
          */
         std::vector<HostedDeviceGenerationFragment>
             mtp_device_generation_loop_hosted_fragment_scratch_;
-
-        /**
-         * @brief Allocation-free native SWITCH branch descriptors.
-         *
-         * Entry `d` names the complete transaction for resident draft depth `d`.
-         * Its span borrows the flattened fragment scratch above only during
-         * synchronous parent composition. Workspace setup sizes this inventory
-         * through the maximum supported depth so materialization never grows it.
-         */
-        std::vector<DeviceControlledLoopBranch>
-            mtp_device_generation_loop_branch_scratch_;
 
         /**
          * @brief Allocation-free identity scratch for verifier graph selection.
@@ -8574,6 +8705,13 @@ namespace llaminar2
         /// Snapshot capture engine (owns storage + routing logic)
         SnapshotCapture snapshot_capture_;
         std::unordered_set<std::string> snapshot_capture_filter_;
+        /** Stable semantic identities for diagnostic executable variants. */
+        std::map<std::vector<std::string>, uint64_t>
+            snapshot_configuration_identities_;
+        /** Identity one is the lean graph with no snapshot nodes. */
+        static constexpr uint64_t
+            kSnapshotsDisabledConfigurationIdentity = 1;
+        uint64_t next_snapshot_configuration_identity_ = 2;
 
         // =========================================================================
         // Graph Buffer Management Members (Phase 3 - moved from QwenStandardGraph)
@@ -8593,6 +8731,30 @@ namespace llaminar2
         /** Registry retained by the model-context reuse contract. */
         std::shared_ptr<ReusableExecutionWorkspaceRegistry>
             reusable_execution_workspaces_;
+
+        /** Rank-bound allocation authority shared by every local owner. */
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_;
+
+        /**
+         * @brief Typed boundary between production admission and unit fixtures.
+         *
+         * This prevents a missing production authority from silently selecting
+         * an unaccounted allocator while preserving device-free unit tests that
+         * deliberately construct no model topology.
+         */
+        enum class MemoryAuthorityMode : std::uint8_t
+        {
+            ProductionRequired = 0,
+            IsolatedTest,
+        };
+
+        MemoryAuthorityMode memory_authority_mode_ =
+            MemoryAuthorityMode::ProductionRequired;
+
+        /** Shared dependency constructor behind typed production/test edges. */
+        DeviceGraphOrchestrator(
+            Dependencies deps,
+            MemoryAuthorityMode memory_authority_mode);
 
         /// Workspace allocator owned either by the lease or this runner.
         std::shared_ptr<WorkspaceAllocator> workspace_allocator_;
@@ -8621,6 +8783,13 @@ namespace llaminar2
         ServingGraphFamilyLifecycle serving_graph_family_lifecycle_ =
             ServingGraphFamilyLifecycle::AwaitingMaterialization;
 
+        /** Frozen non-diagnostic identity shared by every serving variant. */
+        std::optional<ServingGraphFamilyMaterializationPlan>
+            serving_graph_family_plan_;
+        /** Snapshot topologies whose complete native executable family is resident. */
+        std::unordered_set<uint64_t>
+            materialized_serving_snapshot_identities_;
+
         /// Unified buffer arena — owns and tracks coherence for all activation buffers
         std::unique_ptr<BufferArena> arena_;
 
@@ -8633,6 +8802,8 @@ namespace llaminar2
 
         int stochastic_target_row_capacity_ = 0;
         int stochastic_draft_row_capacity_ = 0;
+        /** Canonical setup geometry shared with native graph-memory admission. */
+        MTPGraphOwnerPlan mtp_graph_owner_plan_{MTPRuntimeConfig{}};
         int stochastic_batch_output_request_capacity_ = 1; ///< Configured request count owned by grouped MTP transactions on every backend.
         int mtp_max_draft_depth_ = 1; ///< Largest configured fixed/dynamic draft depth owned by this runner.
         int mtp_max_verifier_rows_ = 2; ///< Per-request draft rows plus the terminal bonus row.
@@ -8754,6 +8925,17 @@ namespace llaminar2
         };
 
         DeviceGenerationStorage device_generation_storage_;
+        /**
+         * Exact request policy published with the active device controller.
+         *
+         * This is request-lifecycle metadata, not a host shadow of mutable
+         * controller state. The device remains authoritative for current depth
+         * and counters; the retained value only authenticates which captured
+         * fixed/dynamic graph family may consume that controller. It is born
+         * with admission and retired with the same event-ordered request edge.
+         */
+        std::optional<sampling_math::DeviceGenerationDepthPolicy>
+            active_device_generation_depth_policy_;
         void *stochastic_target_token_ids_dev_ = nullptr; ///< INT32 [target_rows, 256]
         void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [target_rows, 256]
         void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [draft_rows, 256]
@@ -10584,6 +10766,25 @@ namespace llaminar2
         bool materializeMTPTerminalHiddenPublicationGraphs();
 
         /**
+         * @brief Capture every request-independent MTP forward executable.
+         *
+         * The live condition graph and grouped verifier are ordinary model
+         * forwards with distinct immutable cache identities.  They must join
+         * the setup-owned serving family instead of being discovered by the
+         * first decode transaction.  This method binds only persistent arena,
+         * KV, and pipeline addresses and requests capture without launch; it
+         * never publishes an admitted request or executes model arithmetic.
+         *
+         * @param pipeline_hidden_input Stable previous-stage activation owner,
+         *        or null for an embedding/root stage.
+         * @param publication_stream Exact setup stream owning stable input data.
+         * @return true when every configured MTP forward identity is retained.
+         */
+        bool materializeMTPServingForwardExecutablesWithoutLaunch(
+            TensorBase *pipeline_hidden_input,
+            void *publication_stream);
+
+        /**
          * @brief Build one typed GPU rows-select graph against current bindings.
          *
          * @param cache Destination cache whose previous graph is replaced during setup.
@@ -10915,10 +11116,10 @@ namespace llaminar2
         /**
          * @brief Assemble the configured sampling policy into its backend executable.
          *
-         * Fixed/observe policy clones one producer-ordered transaction into a
-         * branch. Dynamic policy clones one complete transaction per legal
-         * depth. CUDA composes native conditional nodes; HIP retains those
-         * branches and instantiates an isolated dispatch-ticket publisher.
+         * Fixed/observe policy clones one producer-ordered transaction. Dynamic
+         * CUDA composes one selector-gated maximum-width transaction; HIP retains
+         * one complete semantic transaction per legal depth and instantiates an
+         * isolated dispatch-ticket publisher.
          * Every fragment must already be replay-ready at @p draft_depth capture
          * capacity and match the active request/workspace identity. This method
          * composes and instantiates only; it never launches generation or reads

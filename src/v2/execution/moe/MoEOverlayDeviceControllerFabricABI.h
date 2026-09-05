@@ -25,7 +25,7 @@ namespace llaminar2
 
     /** Version of every fixed-width fabric record in this header. */
     inline constexpr std::uint32_t kMoEOverlayDeviceControllerFabricVersion =
-        13u;
+        14u;
 
     /** Number of durable demand histories consumed by Dynamic placement. */
     inline constexpr std::uint32_t
@@ -220,6 +220,10 @@ namespace llaminar2
         std::uint64_t command_entries_offset = 0u;
         /** Immutable exact bytes in one complete packed expert, per layer. */
         std::uint64_t payload_bytes_per_layer_offset = 0u;
+        /** Immutable loader-prepared `[layer][expert]` owner participant ids. */
+        std::uint64_t initial_owner_participants_offset = 0u;
+        /** Exact number of 32-bit words in the initial owner table. */
+        std::uint64_t initial_owner_participants_words = 0u;
         /** Leader-owned `[phase][layer][expert]` accumulated routed demand. */
         std::uint64_t demand_history_offset = 0u;
         /** Exact number of 64-bit words in @ref demand_history_offset. */

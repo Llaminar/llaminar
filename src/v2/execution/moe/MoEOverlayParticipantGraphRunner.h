@@ -47,6 +47,7 @@ namespace llaminar2
     class MoEOverlayRankBatchTransportRegistry;
     class TensorBase;
     class WorkspaceAllocator;
+    class PhysicalMemoryOwnerReservation;
     struct MoERoutedExpertPlacementPlan;
 
     /**
@@ -499,6 +500,18 @@ namespace llaminar2
         std::vector<const MoEExpertOwnerParticipant *> local_participants_;
         std::shared_ptr<PreparedWeightStore> prepared_store_;
         std::unique_ptr<FrozenModelWeightSet> frozen_weights_;
+        /**
+         * @brief Canonical opaque graph-pool commitments for rank-local GPUs.
+         *
+         * One reservation per physical device covers every main/MTP row-shape
+         * graph declared later in this runner. Individual graph objects cannot
+         * own allocator leases because CUDA/HIP expose only shared driver-pool
+         * growth, not independently releasable allocation handles.
+         */
+        std::unordered_map<
+            DeviceId,
+            std::shared_ptr<PhysicalMemoryOwnerReservation>>
+            native_graph_memory_reservations_;
         std::unordered_map<DeviceId, std::unique_ptr<IDeviceContext>>
             owned_device_contexts_;
         std::unordered_map<DeviceId, IDeviceContext *> execution_contexts_;
@@ -535,6 +548,23 @@ namespace llaminar2
          */
         std::unordered_map<int, std::unique_ptr<ParticipantGpuRuntime>>
             participant_gpu_runtimes_;
+        /**
+         * @brief One physical serial workspace family for every local device.
+         *
+         * Main, prefill-shape, grouped-verifier, and learned MTP graphs are
+         * retained concurrently but the request protocol permits only one of
+         * them to execute on a device at a time.  Their workspace addresses
+         * must therefore come from this runner-owned allocator, not from a
+         * temporary allocator created by each graph builder invocation.  The
+         * latter would materialize the same admitted owner line repeatedly and
+         * exhaust the canonical physical-memory ledger during setup.
+         *
+         * This member precedes the cached graphs so reverse-order destruction
+         * retires every graph that embeds its pointers before releasing the
+         * backing allocation.
+         */
+        std::shared_ptr<WorkspaceAllocator>
+            serial_graph_family_workspace_allocator_;
         /** One exact graph-branch authority for each mapped relay GPU. */
         std::unordered_map<
             DeviceId,

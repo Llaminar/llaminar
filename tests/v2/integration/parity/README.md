@@ -36,13 +36,20 @@ Missing models, hardware, decode references, graph evidence, or snapshot
 publication are failures in a production campaign. Focused developer tests may
 still skip when their optional prerequisite is absent.
 
-## Model-free integration preflight
+## Model-free prerequisite gates
 
-Every aggregate campaign run begins with the registered
-`ProductionParityPreflight` CTest label. It runs before the model-download
-fixture and before GGUF staging, so a broken rank lifecycle, graph/event
-contract, or ExpertOverlay epoch cannot consume model-loading time or
-contaminate a later parity process.
+Every aggregate campaign run first builds the CMake-owned `v2_unit_gate` target
+and runs the complete `V2_Unit_*` CTest namespace. It then runs the registered
+`ProductionParityPreflight` CTest label. Both phases precede the model-download
+fixture and GGUF staging, so a broken device-free invariant, rank lifecycle,
+graph/event contract, or ExpertOverlay epoch cannot consume model-loading time
+or contaminate a later parity process.
+
+CTest naming and labels are the sole Unit inventory authority. The CMake helper
+collects each Unit executable into `v2_unit_gate`; Python/script-only Unit tests
+need no build dependency and still run in the CTest phase. Unit registration
+implicitly means model-free, and campaign discovery rejects any Unit entry with
+a model fixture or external-file dependency.
 
 `tests/v2/CMakeLists.txt` is the sole preflight inventory authority. The Python
 driver discovers the label and fails closed unless it is nonempty and every
@@ -53,8 +60,9 @@ member:
 - has a positive timeout no greater than 120 seconds; and
 - exercises production infrastructure without loading a real model.
 
-The gate covers established MPI/rank and orchestration lifecycle, CUDA/ROCm
-explicit-stream event ordering, native graph capture and retained replay,
+The Integration preflight covers established MPI/rank and orchestration
+lifecycle, CUDA/ROCm explicit-stream event ordering, native graph capture and
+retained replay,
 prefill graph buckets, heterogeneous captured-ticket dispatch, prepared
 ExpertOverlay weights, and asynchronous overlay epochs. When a campaign defect
 exposes a new model-free invariant, add a focused integration regression and
@@ -62,18 +70,22 @@ add that existing test registration to
 `V2_PRODUCTION_PARITY_PREFLIGHT_TESTS`. Do not add a second list to the
 campaign driver.
 
-Run it independently with:
+Run both phases independently with:
 
 ```bash
+cmake --build build_v2_integration --parallel --target v2_unit_gate
+ctest --test-dir build_v2_integration \
+  --output-on-failure --parallel --no-tests=error -R '^V2_Unit_'
 ctest --test-dir build_v2_integration \
   --output-on-failure --parallel --no-tests=error \
   -L '^ProductionParityPreflight$'
 ```
 
-A preflight failure prevents fixture setup, model staging, and all model parity
-children. Report schema 10 records its return code, elapsed time, discovered
-test count, and exact test names. Its elapsed time is included in the single
-75-minute aggregate target.
+A Unit build/test or Integration preflight failure prevents fixture setup,
+model staging, and all model parity children. The campaign report's preflight
+receipt records the combined return code, elapsed time, discovered test count,
+and exact Unit-plus-Integration test identities. Its elapsed time is included
+in the single 75-minute aggregate target.
 
 ## Reference-pack identity
 
@@ -82,7 +94,7 @@ campaign accepts an existing pack only when it binds all of the following:
 
 - supported snapshot schema;
 - PyTorch on CPU using FP32;
-- SHA-256 of the exact GGUF file used by the native runner;
+- the typed campaign's GGUF filename and byte-length descriptor when present;
 - SHA-256 of the exact UTF-8 prompt bytes;
 - nonempty tokenizer output and its SHA-256;
 - sufficient decode depth, decode tokens, and boundary snapshots.
@@ -92,18 +104,23 @@ into a private directory on `/dev/shm`. CTest's `REQUIRED_FILES` property is the
 machine-readable model declaration for each production campaign. The runner
 expands split GGUF siblings, resolves symlink aliases, rejects basename
 collisions, verifies that the entire corpus plus a reserve fits on tmpfs, and
-computes source SHA-256 while atomically publishing each read-only RAM copy.
-Full-write and byte-count checks, source mutation detection, read-only mode, and
-source/destination identity binding protect the transaction. Each production
-child then performs the single canonical destination SHA-256 check against its
-authenticated reference pack before inference; a shared identity-keyed digest
-cache coalesces that check across campaigns. Any missing declaration,
+atomically publishes each read-only RAM copy. Full-write and byte-count checks,
+source mutation detection, read-only mode, and source/destination identity
+binding protect the transaction. There is deliberately no whole-GGUF hash pass:
+the campaign's checkpoint comparisons are the mathematical proof that the
+loaded weights match the reference. Any missing declaration,
 non-memory filesystem, capacity shortfall, mutation during copy, reference
-digest mismatch, exact-cell timeout, or completion timeout is a hard failure.
+descriptor mismatch, exact-cell timeout, or setup completion timeout is a hard
+failure.
 Every generated GTest cell has a fixed 600-second progress deadline spanning
 its setup, inference, evidence publication, teardown, and transition to the
 next cell. The staging and authentication time are part of the same 75-minute
-target; by default the temporary corpus is removed when the run exits.
+target; by default the temporary corpus is removed when the run exits. Every
+registered aggregate also sets `GTEST_FAIL_FAST=1`. The first exact red ends
+that aggregate, becomes the driver's immutable first-failure identity, cancels
+already-running backend-disjoint sibling process groups, and prevents pending
+campaign admission. Cancelled and not-started campaigns remain distinct from
+the preserved first red in the JSON report.
 
 Runners with a different memory mount can pass
 `--model-ramdisk-root /path/to/tmpfs`. The directory must already reside on
@@ -116,8 +133,8 @@ while the devcontainer mount namespace remains alive:
 scripts/ci/setup_production_parity_tmpfs.sh
 ```
 
-For rapid local iteration, explicitly retain the authenticated corpus and digest
-records in a stable child directory:
+For rapid local iteration, explicitly retain the identity-bound corpus in a
+stable child directory:
 
 ```bash
 python3 scripts/ci/run_production_parity_campaigns.py \
@@ -126,22 +143,28 @@ python3 scripts/ci/run_production_parity_campaigns.py \
   --persistent-model-cache-dir cache
 ```
 
-The first invocation computes source SHA-256 during the copy, atomically
-publishes each read-only GGUF, and authenticates the published bytes once through
-the reference-pack gate. Later invocations reuse an entry only when its source
+If an unfiltered local sweep was interrupted, add one repeatable
+`--prioritize-unseen-from-artifact-root PATH` option for each preserved
+`production-campaign-artifacts/<run>` directory. The driver then schedules
+wholly unseen aggregates before partial aggregates and previously complete
+aggregates. Prior artifacts are ordering hints only: no selected exact cell is
+skipped, old evidence cannot satisfy the new report, and every new artifact is
+still subject to the complete freshness and canonical CSV contract.
+
+The first invocation atomically publishes each read-only GGUF while checking
+the exact copied byte count and source stability. Later invocations reuse an
+entry only when its source
 device, inode, size, nanosecond mtime, nanosecond ctime, and read-only cached-file
-identity are unchanged; the persistent digest cache binds the prior reference
-authentication to that exact destination identity. Changed entries are replaced
-atomically, while a changed cached identity is reauthenticated before inference.
+identity are unchanged. Changed entries are replaced atomically; a changed or
+incomplete cached identity is a miss rather than a reason to scan the payload.
 One exclusive cache lock spans staging and every child inference process, so a
 concurrent run cannot replace weights still in use. After acquiring that lock,
 the driver reclaims only unpublished copy/manifest transaction files left by an
 interrupted process or host reboot; published models and operator-owned files
 remain untouched. While idle, the driver removes owner-write permission from
-the cache root, model directory, and digest directory. During a campaign the
-root and published-model directory remain sealed while child processes append
-digest evidence. This makes an ordinary same-user sweep fail before it can
-unlink the manifest or GGUFs. The driver never deletes this directory.
+the cache root and model directory. During a campaign both remain sealed. This
+makes an ordinary same-user sweep fail before it can unlink the manifest or
+GGUFs. The driver never deletes this directory.
 
 "Persistent" means persistent for the lifetime of the same mounted memory
 filesystem. A host reboot, container replacement, or explicit unmount/remount
@@ -162,15 +185,13 @@ scripts/ci/setup_production_parity_tmpfs.sh --unmount
 Registered `ProductionCampaign_*` CTest entries are internal children used by
 the aggregate driver for discovery and backend scheduling. Running one directly
 with `ctest -R ...ProductionCampaign...` intentionally fails before model
-mapping because it has no authenticated tmpfs publication or cache lock. Use
+mapping because it has no identity-bound tmpfs publication or cache lock. Use
 the driver command above (with `--campaign` for a narrow child selection), or
 run a non-campaign focused GTest diagnostic explicitly.
 
-Every child process then re-authenticates the RAM copy against the reference
-pack. Those streaming digests are coalesced through a private run-scoped cache,
-or the explicitly selected persistent cache, keyed by canonical path, device,
-inode, size, nanosecond mtime, and nanosecond ctime. This prevents both repeated
-multi-gigabyte scans and stale pathname trust. Qwen2/Qwen3 use
+Every child validates the typed model mapping and inexpensive reference-pack
+descriptor, then lets full checkpoint parity prove the weight contents. No
+child rereads the model merely to hash it. Qwen2/Qwen3 use
 `python/reference/generate_qwen_pipeline_snapshots.py`; Qwen3.5, Qwen3.6, and
 their MoE variants use the architecture-specific generators under
 `python/reference/`.
@@ -183,12 +204,12 @@ publication lifecycle:
 
 ```mermaid
 flowchart LR
-    A[Validate authenticated pack] -->|usable| R[Read concurrently]
+    A[Validate reference pack] -->|usable| R[Read concurrently]
     A -->|missing or stale| L[Acquire node-local writer lease]
     L --> V[Validate again]
     V -->|peer published while waiting| R
     V -->|still missing| G[Run one CPU Hugging Face generator]
-    G --> P[Atomically publish and authenticate]
+    G --> P[Atomically publish complete metadata]
     P --> R
 ```
 
@@ -236,7 +257,7 @@ capture or replay. MTP uses a backend-specific generation proof:
 
 - CUDA requires one native conditional parent and complete `full_graph_*`
   capture/replay.
-- ROCm requires HIP's authenticated 48-byte immutable scheduler ticket and the
+- ROCm requires HIP's authenticated ABI-v2 52-byte immutable scheduler ticket and the
   retained captured transaction family it selects. The device controller owns
   every decision and mutable value; the host only submits the named branch.
   Consequently `forward_full_graph_*` proves each captured transaction while
@@ -336,8 +357,21 @@ weights and claim backend resources; it does not receive a fresh budget. Missing
 the target is a performance failure reported after the matrix completes, not a
 reason to stop admitting work or discard later correctness evidence.
 
-The driver first runs the model-free integration preflight, then stages the
-download fixture once, stages and authenticates the selected real weights into
+Every Dynamic cell still proves economically admitted physical movement and
+emits the full numerical/CSV evidence. The substantially longer matched
+before/after throughput cohort is a separate typed obligation:
+`ModelParityFeatureMatrix::dynamic_speedup_witness` selects an ordinal, random,
+both-owner, or disabled representative for an exact model/topology definition.
+The expander assigns that cohort only to the first activation/KV pair, ordinary
+prefill profile, and MTP-off cell. This keeps owner order, precision, prefill,
+and MTP as complete mathematical axes without repeating the same topology
+economy experiment in every cell. Inspect the model-owned definitions for the
+current representative set; fixtures must not infer it from test names or the
+presence of a CPU participant.
+
+The driver first builds and runs the complete model-free Unit suite and then
+runs the model-free integration preflight, before staging the
+download fixture once, stages the selected real weights into
 RAM once, overlaps only backend-disjoint work, runs every campaign even after
 the target is missed, and records the complete correctness result. Every exact
 matrix cell has a fixed 600-second watchdog.
@@ -346,12 +380,13 @@ renews the deadline, while expiry terminates the complete CTest/MPI process
 group and records `exact_cell_timeout` plus the exact GTest identity. This
 retains process-resident model/prepared-weight reuse without permitting a
 silent aggregate to occupy devices for hours. An independent 21,600-second
-completion ceiling bounds fixture staging and the complete run, not one cell or
-the economy requirement; configure it separately with
-`--completion-timeout-seconds`. C++ cells write timing evidence but do not
+completion ceiling bounds setup phases that cannot publish exact-cell progress;
+configure it separately with `--completion-timeout-seconds`. It is not a
+cumulative matrix deadline. Once inference begins, the ten-minute exact-cell
+watchdog is the sole timeout authority. C++ cells write timing evidence but do not
 assert the 75-minute target individually. `production-campaigns.json` records
 separate correctness and performance statuses, timeout evidence, staged byte
-count, source/destination digests, staging filesystem/time, and campaign
+count, source/destination identities, staging filesystem/time, and campaign
 coverage.
 
 List the configured coverage without loading a model:
@@ -433,10 +468,12 @@ Use a substantive file header and keep configurations declarative.
    `PRODUCTION_PERF_STATS_FILTER "forward_graph,<domain>"`.
 5. Build the target so its generated CTest include is refreshed, then run the
    campaign unit test and `--list` coverage audit.
-6. Add each new model-free infrastructure or production-path regression to the
-   CMake-owned `ProductionParityPreflight` inventory, run that gate, then stage
-   the real model files and run every affected backend campaign. A new defect
-   needs a focused regression in addition to the full campaign cell.
+6. Add each new device-free regression as a `V2_Unit_*` test; it joins the
+   prerequisite automatically. Add each model-free backend/integration
+   production-path regression to the CMake-owned
+   `ProductionParityPreflight` inventory. Run both gates, then stage the real
+   model files and run every affected backend campaign. A new defect needs a
+   focused regression in addition to the full campaign cell.
 
 Do not create separate `PrefillParity`, `DecodeParity`, and
 `SnapshotInfrastructure` model-loading tests for a new matrix. Their contracts

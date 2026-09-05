@@ -75,6 +75,15 @@ namespace llaminar2
             std::min(max_context_rows, max_segment_rows));
     }
 
+    int resolvePrefillScheduleRowCapacity(
+        int admitted_prefill_rows,
+        int configured_segment_rows) noexcept
+    {
+        if (admitted_prefill_rows <= 0 || configured_segment_rows <= 0)
+            return 0;
+        return std::min(admitted_prefill_rows, configured_segment_rows);
+    }
+
     std::vector<int> prefillGraphBucketsAtOrBelowCapacity(
         const std::vector<int> &buckets,
         int resident_graph_rows)

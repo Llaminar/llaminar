@@ -57,7 +57,6 @@
 
 // Qwen 3.5 FA stages
 #include "stages/QGateSplitStage.h"
-#include "stages/GDNLiveStateLocalizeStage.h"
 #include "stages/GDNLiveStateAllGatherStage.h"
 
 // MTP sidecar stages

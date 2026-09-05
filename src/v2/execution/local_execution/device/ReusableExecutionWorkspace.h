@@ -21,6 +21,7 @@
 #include "WorkspaceAllocator.h"
 
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
@@ -231,52 +232,38 @@ namespace llaminar2
         /**
          * @brief Acquire one structural workspace owner for a live runner.
          * @param key Exact device/PP/TP ownership identity.
+         * @param physical_memory_authority Exact authority shared with the
+         *        prepared model context.
          * @param error Optional lifecycle rejection diagnostic.
          * @return Exclusive lease, or null for invalid/concurrent ownership.
          */
         [[nodiscard]] std::unique_ptr<Lease> acquire(
             const ReusableExecutionWorkspaceKey &key,
+            std::shared_ptr<PhysicalMemoryAuthority>
+                physical_memory_authority,
             std::string *error = nullptr)
         {
-            if (error)
-                error->clear();
-            if (!key.valid())
+            if (!physical_memory_authority)
             {
                 if (error)
-                    *error = "reusable workspace key is invalid";
+                    *error = "reusable workspace has no physical-memory authority";
                 return nullptr;
             }
+            return acquireImpl(
+                key, std::move(physical_memory_authority), error);
+        }
 
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto [it, inserted] = slots_.try_emplace(key);
-            Slot &slot = it->second;
-            if (inserted)
-            {
-                slot.allocator = std::make_shared<WorkspaceAllocator>();
-                slot.state = SlotState::Leased;
-                slot.generation = 1u;
-            }
-            else
-            {
-                if (slot.state != SlotState::Reusable || !slot.allocator)
-                {
-                    if (error)
-                    {
-                        *error = slot.state == SlotState::Invalid
-                                     ? (slot.diagnostic.empty()
-                                            ? "reusable workspace slot is invalid"
-                                            : slot.diagnostic)
-                                     : "reusable workspace slot already has a live runner";
-                    }
-                    return nullptr;
-                }
-                slot.state = SlotState::Leased;
-                slot.diagnostic.clear();
-                ++slot.generation;
-            }
-
-            return std::unique_ptr<Lease>(new Lease(
-                weak_from_this(), key, slot.generation, slot.allocator));
+        /**
+         * @brief Acquire an allocation-free slot for unit lifecycle tests.
+         *
+         * This path deliberately supplies no backend-allocation authority and
+         * cannot acquire a slot that was ever bound for production.
+         */
+        [[nodiscard]] std::unique_ptr<Lease> acquireForTests(
+            const ReusableExecutionWorkspaceKey &key,
+            std::string *error = nullptr)
+        {
+            return acquireImpl(key, nullptr, error);
         }
 
         /**
@@ -330,6 +317,89 @@ namespace llaminar2
         }
 
     private:
+        /** @brief Shared implementation for production and device-free tests. */
+        [[nodiscard]] std::unique_ptr<Lease> acquireImpl(
+            const ReusableExecutionWorkspaceKey &key,
+            std::shared_ptr<PhysicalMemoryAuthority>
+                physical_memory_authority,
+            std::string *error)
+        {
+            if (error)
+                error->clear();
+            if (!key.valid())
+            {
+                if (error)
+                    *error = "reusable workspace key is invalid";
+                return nullptr;
+            }
+
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto [it, inserted] = slots_.try_emplace(key);
+            Slot &slot = it->second;
+            if (inserted)
+            {
+                try
+                {
+                    slot.allocator = physical_memory_authority
+                                         ? std::make_shared<WorkspaceAllocator>(
+                                               std::move(
+                                                   physical_memory_authority))
+                                         : std::make_shared<WorkspaceAllocator>();
+                }
+                catch (const std::exception &exception)
+                {
+                    slots_.erase(it);
+                    if (error)
+                        *error = exception.what();
+                    return nullptr;
+                }
+                slot.state = SlotState::Leased;
+                slot.generation = 1u;
+            }
+            else
+            {
+                if (slot.state != SlotState::Reusable || !slot.allocator)
+                {
+                    if (error)
+                    {
+                        *error = slot.state == SlotState::Invalid
+                                     ? (slot.diagnostic.empty()
+                                            ? "reusable workspace slot is invalid"
+                                            : slot.diagnostic)
+                                     : "reusable workspace slot already has a live runner";
+                    }
+                    return nullptr;
+                }
+                try
+                {
+                    if (physical_memory_authority)
+                    {
+                        slot.allocator->installPhysicalMemoryAuthority(
+                            std::move(physical_memory_authority));
+                    }
+                    else if (slot.allocator->physicalMemoryAuthority())
+                    {
+                        if (error)
+                        {
+                            *error = "test-only workspace acquisition cannot consume a production authority";
+                        }
+                        return nullptr;
+                    }
+                }
+                catch (const std::exception &exception)
+                {
+                    if (error)
+                        *error = exception.what();
+                    return nullptr;
+                }
+                slot.state = SlotState::Leased;
+                slot.diagnostic.clear();
+                ++slot.generation;
+            }
+
+            return std::unique_ptr<Lease>(new Lease(
+                weak_from_this(), key, slot.generation, slot.allocator));
+        }
         struct Slot
         {
             SlotState state = SlotState::Invalid;

@@ -144,6 +144,67 @@ namespace llaminar2
         return *this;
     }
 
+    ComputeGraph &ComputeGraph::moveHeterogeneousTicketTransactionTerminal(
+        const std::string &current_terminal,
+        const std::string &replacement_terminal)
+    {
+        const auto current = node_index_.find(current_terminal);
+        const auto replacement = node_index_.find(replacement_terminal);
+        if (current == node_index_.end())
+        {
+            throw std::out_of_range(
+                "Cannot move heterogeneous ticket terminal from missing graph node '" +
+                current_terminal + "'");
+        }
+        if (replacement == node_index_.end())
+        {
+            throw std::out_of_range(
+                "Cannot move heterogeneous ticket terminal to missing graph node '" +
+                replacement_terminal + "'");
+        }
+        if (!requiresHeterogeneousTicketSegmentation(
+                native_capture_envelope_))
+        {
+            throw std::logic_error(
+                "A heterogeneous ticket terminal can move only inside a heterogeneous ticket envelope");
+        }
+        if (terminalNode() != current_terminal)
+        {
+            throw std::logic_error(
+                "Heterogeneous ticket terminal move does not name the graph's current terminal");
+        }
+
+        auto &current_contract =
+            nodes_[current->second]->heterogeneous_ticket_unit_contract;
+        auto &replacement_contract =
+            nodes_[replacement->second]->heterogeneous_ticket_unit_contract;
+        if (!current_contract ||
+            current_contract->disposition !=
+                GraphHeterogeneousTicketUnitDisposition::TransactionTerminal)
+        {
+            throw std::logic_error(
+                "Current heterogeneous graph terminal does not own its transaction-terminal contract");
+        }
+        if (replacement_contract)
+        {
+            throw std::logic_error(
+                "Replacement heterogeneous graph terminal already owns a ticket-unit contract");
+        }
+
+        const std::vector<std::string> leaves = getLeafNodes();
+        if (leaves.size() != 1u || leaves.front() != replacement_terminal)
+        {
+            throw std::logic_error(
+                "Replacement heterogeneous graph terminal is not the sole dependency leaf");
+        }
+
+        replacement_contract = std::move(current_contract);
+        current_contract.reset();
+        terminal_node_ = replacement_terminal;
+        noteTopologyMutation();
+        return *this;
+    }
+
     ComputeGraph &ComputeGraph::setNativeCaptureEnvelope(
         GraphNativeCaptureEnvelope envelope)
     {

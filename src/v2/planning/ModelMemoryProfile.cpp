@@ -4,6 +4,7 @@
 #include <numeric>
 #include <cstring>
 #include <stdexcept>
+#include <string_view>
 
 /**
  * @file ModelMemoryProfile.cpp
@@ -103,6 +104,50 @@ namespace llaminar2
                 result *= static_cast<size_t>(d);
             }
             return result;
+        }
+
+        /** @brief Whether a tensor is one packed parent containing every routed expert. */
+        bool isRoutedExpertParent(std::string_view name)
+        {
+            return name.ends_with(".ffn_gate_exps.weight") ||
+                   name.ends_with(".ffn_up_exps.weight") ||
+                   name.ends_with(".ffn_down_exps.weight");
+        }
+
+        /**
+         * @brief Recover the K dimension of one logical matrix from GGUF axes.
+         *
+         * ModelLoader normalizes ordinary 2-D tensors to `[N, K]`. Routed
+         * expert parents retain GGUF's three-dimensional `[K, N, experts]`
+         * representation because loading slices the outer expert axis before
+         * preparing an individual matrix. Treating the final axis as K turns
+         * the expert count into a matrix dimension and grossly overprices
+         * split-K workspace.
+         *
+         * @param tensor Parsed tensor directory entry.
+         * @param expert_count Model-wide routed expert cardinality.
+         * @return Inner dimension of one logical matrix, or zero for a scalar.
+         * @throws std::invalid_argument when a routed parent has an invalid
+         *         rank, expert axis, or zero matrix geometry.
+         */
+        size_t logicalMatrixK(
+            const GGUFTensorInfo &tensor,
+            int expert_count)
+        {
+            if (tensor.dimensions.empty())
+                return 0u;
+            if (!isRoutedExpertParent(tensor.name))
+                return static_cast<size_t>(tensor.dimensions.back());
+
+            if (tensor.dimensions.size() != 3u || expert_count <= 0 ||
+                tensor.dimensions[0] == 0u || tensor.dimensions[1] == 0u ||
+                tensor.dimensions[2] != static_cast<uint64_t>(expert_count))
+            {
+                throw std::invalid_argument(
+                    "Routed expert tensor has invalid [K, N, experts] geometry: " +
+                    tensor.name);
+            }
+            return static_cast<size_t>(tensor.dimensions[0]);
         }
 
         int firstPositiveMetadataInt(
@@ -223,7 +268,7 @@ namespace llaminar2
             info.native_bytes = static_cast<size_t>(t.size_bytes);
             info.quant_type = ggufTypeToString(t.type);
             info.elements = computeElements(t.dimensions);
-            info.K = t.dimensions.empty() ? 0 : static_cast<size_t>(t.dimensions.back());
+            info.K = logicalMatrixK(t, profile.expert_count);
             info.layer_index = parseLayerIndex(t.name);
 
             profile.total_native_bytes += info.native_bytes;

@@ -17,9 +17,15 @@ broken, or uneconomical implementation.
    mirrors, eager execution, recapture, oversized timeouts, or capability
    advertisements to postpone a required production implementation. Finish the
    implementation or fail hard with a precise diagnostic.
-2. **Give every live value one authority.** GPU execution state is device-owned;
-   CPU execution state is host-owned. Do not maintain an informal host shadow
-   of device state or repair coherence by downloading and re-uploading values.
+2. **Give every live value and physical byte one authority.** GPU execution
+   state is device-owned; CPU execution state is host-owned. Do not maintain an
+   informal host shadow of device state or repair coherence by downloading and
+   re-uploading values. `PhysicalMemoryAuthority` is the sole canonical
+   admission, reservation, materialization, and release ledger for every CPU
+   and GPU allocation in Llaminar. Estimators may only contribute typed BOM
+   inputs to that authority; no subsystem may keep a parallel live ledger,
+   independently subtract capacity, apply an anonymous reserve, or make an
+   allocation decision from duplicated accounting arithmetic.
 3. **Make invalid states unrepresentable.** Put lifecycle, ownership, ordering,
    and policy in typed interfaces, enums, builders, and RAII scopes. Do not rely
    on comments, caller discipline, raw state transitions, or source scans when
@@ -378,9 +384,13 @@ ctest --test-dir build_v2_integration -N
 # Run the complete configured suite
 ctest --test-dir build_v2_integration --output-on-failure --parallel
 
-# Common families
+# Complete Unit gate: build its CMake-owned executable inventory, then run all
+# registered script and binary tests.
+cmake --build build_v2_integration --parallel --target v2_unit_gate
 ctest --test-dir build_v2_integration -R '^V2_Unit_' \
   --output-on-failure --parallel
+
+# Common integration family
 ctest --test-dir build_v2_integration -R '^V2_Integration_Parity_' \
   --output-on-failure --parallel
 
@@ -422,11 +432,13 @@ For model parity, use `.agents/model-parity-testing/SKILL.md`, then read
 production campaigns. The aggregate campaign system replaces the historical
 hand-picked PyTorch parity baseline: it keeps reference generation, live-path
 execution, every checkpoint comparison, CSV evidence, and the shared economy
-target in one registered matrix. Each non-list run first executes the
-CMake-owned, model-free `ProductionParityPreflight` integration label; add a
-focused regression there when a parity defect establishes a reusable lifecycle,
-graph, stream/event, collective, or movement invariant. Local reports and
-result directories are generated debris and must not be committed.
+target in one registered matrix. Each non-list run first builds and runs the
+complete CMake-owned `V2_Unit_*` suite, then executes the model-free
+`ProductionParityPreflight` integration label. Device-free regressions join the
+Unit phase automatically; add a focused Integration regression to preflight
+when a parity defect establishes a reusable backend lifecycle, graph,
+stream/event, collective, or movement invariant. Local reports and result
+directories are generated debris and must not be committed.
 
 For a debugger attached directly to `llaminar2`, pass
 `--no-mpi-bootstrap`; otherwise it may attach to the MPI wrapper. Record any

@@ -852,8 +852,8 @@ TEST(Test__WeightManagerPrepare, GpuGdnAlphaBetaProjectionBindingsArePreparedByS
     FrozenModelWeightSet frozen = manager.materialize(plan);
     const auto &alpha_binding = frozen.layer(0, "ssm_alpha.weight");
     const auto &beta_binding = frozen.layer(0, "ssm_beta.weight");
-    EXPECT_EQ(alpha_binding.identity.role, WeightRole::GDNProjection);
-    EXPECT_EQ(beta_binding.identity.role, WeightRole::GDNProjection);
+    EXPECT_EQ(alpha_binding.identity.role, WeightRole::GDNAlphaBetaProjection);
+    EXPECT_EQ(beta_binding.identity.role, WeightRole::GDNAlphaBetaProjection);
     ASSERT_FALSE(alpha_binding.prepared.has_value());
     ASSERT_FALSE(beta_binding.prepared.has_value());
 
@@ -865,6 +865,72 @@ TEST(Test__WeightManagerPrepare, GpuGdnAlphaBetaProjectionBindingsArePreparedByS
     ASSERT_TRUE(beta_prepared.has_value());
     EXPECT_EQ(alpha_prepared->binding_id, alpha_binding.binding_id);
     EXPECT_EQ(beta_prepared->binding_id, beta_binding.binding_id);
+}
+
+/**
+ * @brief A prepared FP32 override retains the TP slice identity of its source.
+ *
+ * The bulk GPU preparation pass registers a prepared handle before the frozen
+ * graph binding is materialized.  PreparedWeightStore can adopt that handle
+ * only when the derived FP32 tensor carries the same logical interval as the
+ * Q8 source.  Losing this metadata caused every alpha/beta projection to be
+ * allocated a second time in heterogeneous LocalTP startup.
+ */
+TEST(Test__WeightManagerMaterialize,
+     GdnAlphaBetaFP32OverridePreservesTensorParallelSliceIdentity)
+{
+    constexpr size_t kValueHeads = 16;
+    constexpr size_t kHidden = 256;
+    const std::string name = "blk.0.ssm_alpha.weight";
+
+    auto loader = MockModelLoaderBuilder()
+                      .addQ8_0RandomTensor(
+                          name, {kValueHeads / 2u, kHidden})
+                      .build();
+    WeightManager manager(*loader);
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::LocalTP;
+    strategy.model_id = ModelContextId{911};
+    strategy.tp_degree = 2;
+    strategy.devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
+
+    WeightPlan plan(strategy);
+    WeightRequirement requirement;
+    requirement.canonical_name = name;
+    requirement.target_device = DeviceId::cuda(0);
+    requirement.lookup_device = DeviceId::cuda(0);
+    requirement.tp_domain = 0;
+    requirement.tp_rank_or_device_index = 0;
+    requirement.slice.source_rows = kValueHeads;
+    requirement.slice.source_cols = kHidden;
+    requirement.slice.row_start = 0u;
+    requirement.slice.row_count = kValueHeads / 2u;
+    requirement.slice.col_start = 0u;
+    requirement.slice.col_count = kHidden;
+    requirement.slice.inner_is_presliced = true;
+    plan.add(requirement);
+
+    FrozenModelWeightSet frozen = manager.materialize(plan);
+    const auto &binding = frozen.layer(0, "ssm_alpha.weight");
+    ASSERT_NE(binding.tensor, nullptr);
+    EXPECT_EQ(binding.identity.role,
+              WeightRole::GDNAlphaBetaProjection);
+    EXPECT_EQ(binding.tensor->native_type(), TensorType::FP32);
+    EXPECT_EQ(binding.tensor->shape(),
+              (std::vector<size_t>{kValueHeads / 2u, kHidden}));
+
+    const auto metadata =
+        manager.weightMetadataRegistry()->metadata(binding.tensor);
+    ASSERT_TRUE(metadata.has_value());
+    EXPECT_EQ(metadata->slice.source_rows, binding.slice.source_rows);
+    EXPECT_EQ(metadata->slice.source_cols, binding.slice.source_cols);
+    EXPECT_EQ(metadata->slice.row_start, binding.slice.row_start);
+    EXPECT_EQ(metadata->slice.row_count, binding.slice.row_count);
+    EXPECT_EQ(metadata->slice.col_start, binding.slice.col_start);
+    EXPECT_EQ(metadata->slice.col_count, binding.slice.col_count);
+    EXPECT_EQ(metadata->slice.inner_is_presliced,
+              binding.slice.inner_is_presliced);
 }
 
 TEST(Test__WeightManagerMaterialize, FrozenBindingsRetainMaterializedTPSlices)
@@ -972,7 +1038,7 @@ TEST(Test__ModelWeightBindings, AdaptsFrozenBindingsToLegacyPointers)
         PreparedWeightKind::None,
         post_attn_norm.get());
     embedding_binding.identity.role = WeightRole::Embedding;
-    gdn_binding.identity.role = WeightRole::GDNProjection;
+    gdn_binding.identity.role = WeightRole::GDNAlphaBetaProjection;
     moe_binding.identity.role = WeightRole::MoEExpertGate;
     dt_bias_binding.identity.role = WeightRole::Bias;
     post_attn_norm_binding.identity.role = WeightRole::Norm;
@@ -993,7 +1059,7 @@ TEST(Test__ModelWeightBindings, AdaptsFrozenBindingsToLegacyPointers)
     ASSERT_NE(layer_bindings.ssm_dt_bias, nullptr);
     ASSERT_NE(layer_bindings.ffn_norm, nullptr);
     ASSERT_NE(layer_bindings.moe_gate_exps, nullptr);
-    EXPECT_EQ(layer_bindings.ssm_alpha->identity.role, WeightRole::GDNProjection);
+    EXPECT_EQ(layer_bindings.ssm_alpha->identity.role, WeightRole::GDNAlphaBetaProjection);
     EXPECT_EQ(layer_bindings.ssm_dt_bias->tensor, gdn_dt_bias.get());
     EXPECT_EQ(layer_bindings.ffn_norm->tensor, post_attn_norm.get());
     EXPECT_EQ(layer_bindings.moe_gate_exps->identity.role, WeightRole::MoEExpertGate);
@@ -1021,4 +1087,38 @@ TEST(Test__WeightManagerMaterialize, ThrowsForMissingRequiredWeight)
     plan.add(missing);
 
     EXPECT_THROW(manager.materialize(plan), std::runtime_error);
+}
+
+TEST(Test__WeightPlan, FrozenSetRetainsItsExactPhysicalMemoryOwner)
+{
+    InferenceStrategy strategy;
+    strategy.model_id = ModelContextId{90210};
+
+    WeightPlan additional(
+        strategy,
+        PhysicalMemoryOwner::AdditionalModelWeights);
+    EXPECT_EQ(
+        additional.physicalMemoryOwner(),
+        PhysicalMemoryOwner::AdditionalModelWeights);
+
+    ModelWeightSetBuilder builder(strategy);
+    FrozenModelWeightSet frozen(
+        strategy,
+        builder.freezeBindings(),
+        additional.physicalMemoryOwner());
+    EXPECT_EQ(
+        frozen.physicalMemoryOwner(),
+        PhysicalMemoryOwner::AdditionalModelWeights);
+
+    EXPECT_THROW(
+        WeightPlan(
+            strategy,
+            PhysicalMemoryOwner::ExecutionWorkspace),
+        std::invalid_argument);
+    EXPECT_THROW(
+        FrozenModelWeightSet(
+            strategy,
+            {},
+            PhysicalMemoryOwner::KVCache),
+        std::invalid_argument);
 }

@@ -79,6 +79,8 @@ namespace llaminar2
         std::optional<WeightSlot> getSlot(const std::string &name) const;
 
         size_t totalPlannedBytes() const;
+        /** @return Largest logical raw source transaction in the plan. */
+        size_t maximumPlannedStagingBytes() const;
         size_t numPlannedWeights() const;
         bool isAllocated() const;
         int deviceId() const;

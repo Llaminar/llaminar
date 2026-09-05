@@ -6,7 +6,7 @@ observe only a compact serial-visible token result or the terminal response
 ledger produced after a complete device-owned generation request. Prefix-cache
 movement is the sole data-plane exception because RAM and disk are intentional
 cache tiers rather than execution-state mirrors. ROCm additionally permits one
-strictly authenticated scheduler ticket per hosted transaction: 48 bytes for
+strictly authenticated scheduler ticket per hosted transaction: 52 bytes for
 dynamic MTP and 60 bytes for homogeneous device-side MoE rebalancing. HIP
 graphs do not provide conditional nodes, so the host submits the
 already-captured branch named by this immutable control-plane snapshot without
@@ -29,6 +29,15 @@ from typing import Any, Iterable, Mapping
 
 _UNATTRIBUTED_TRANSFER_AGGREGATES = frozenset({"d2h", "d2h_bytes"})
 
+# This is the single Python-side review point for the C++ wire ABI declared by
+# DeviceGenerationDispatchTicket. A unit architecture test compares these
+# values to SamplingMath.h so the two languages cannot drift silently again.
+DEVICE_GENERATION_DISPATCH_TICKET_ABI_VERSION = 2
+DEVICE_GENERATION_DISPATCH_TICKET_WORD_COUNT = 13
+DEVICE_GENERATION_DISPATCH_TICKET_BYTES = (
+    DEVICE_GENERATION_DISPATCH_TICKET_WORD_COUNT * 4
+)
+
 # These operations materialize the compact, authoritative response of one
 # decode/MTP transaction.  They never expose draft proposals, verifier rows,
 # recurrent state, or KV data to host execution.
@@ -50,12 +59,31 @@ _FINAL_RESPONSE_OPERATIONS = frozenset(
 )
 
 _ROCM_HOST_DISPATCH_OPERATIONS = {
-    "device_generation_dispatch_ticket_d2h_submissions": ("mtp", "48"),
+    "device_generation_dispatch_ticket_d2h_submissions": (
+        "mtp",
+        str(DEVICE_GENERATION_DISPATCH_TICKET_BYTES),
+    ),
     "device_moe_rebalance_dispatch_ticket_d2h_submissions": (
         "moe_rebalance",
         "60",
     ),
 }
+
+
+def device_generation_dispatch_ticket_abi_is_canonical(
+    tags: Mapping[str, Any],
+) -> bool:
+    """Authenticate the exact reviewed device-generation ticket wire ABI."""
+
+    normalized = {str(key): str(value) for key, value in tags.items()}
+    return (
+        normalized.get("bytes")
+        == str(DEVICE_GENERATION_DISPATCH_TICKET_BYTES)
+        and normalized.get("abi_version")
+        == str(DEVICE_GENERATION_DISPATCH_TICKET_ABI_VERSION)
+        and normalized.get("word_count")
+        == str(DEVICE_GENERATION_DISPATCH_TICKET_WORD_COUNT)
+    )
 
 
 @dataclass(frozen=True)
@@ -148,8 +176,14 @@ def _is_authenticated_rocm_scheduler_ticket(
         str(key): str(value)
         for key, value in (record.get("tags") or {}).items()
     }
+    abi_valid = tags.get("bytes") == expected_bytes
+    if str(record.get("name", "")) == (
+        "device_generation_dispatch_ticket_d2h_submissions"
+    ):
+        abi_valid = device_generation_dispatch_ticket_abi_is_canonical(tags)
+
     return (
-        tags.get("bytes") == expected_bytes
+        abi_valid
         and tags.get("authority") == "immutable_scheduler_snapshot"
         and tags.get("state_payload") == "false"
     )

@@ -21,6 +21,8 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <memory>
+#include <utility>
 #include <unistd.h>
 
 namespace llaminar2
@@ -55,12 +57,13 @@ namespace llaminar2
         CUDAHybridRingKVCache(
             const HybridKVCacheConfig &hybrid_config,
             int n_layers, int batch_size, int max_seq_len,
-            int n_kv_heads, int head_dim, int device_id = 0)
+            int n_kv_heads, int head_dim, int device_id,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
             : Base(hybrid_config.countKVLayers(), batch_size, max_seq_len,
                    n_kv_heads, head_dim, device_id),
               total_layers_(n_layers)
         {
-            initHybrid(hybrid_config);
+            initHybrid(hybrid_config, std::move(memory_authority));
         }
 
         /**
@@ -69,12 +72,13 @@ namespace llaminar2
         CUDAHybridRingKVCache(
             const HybridKVCacheConfig &hybrid_config,
             int n_layers, int batch_size, int max_seq_len,
-            int n_kv_heads, int head_dim, IWorkerGPUContext *ctx)
+            int n_kv_heads, int head_dim, IWorkerGPUContext *ctx,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
             : Base(hybrid_config.countKVLayers(), batch_size, max_seq_len,
                    n_kv_heads, head_dim, ctx),
               total_layers_(n_layers)
         {
-            initHybrid(hybrid_config);
+            initHybrid(hybrid_config, std::move(memory_authority));
         }
 
         /**
@@ -84,13 +88,14 @@ namespace llaminar2
             const HybridKVCacheConfig &hybrid_config,
             int n_layers, int batch_size, int max_seq_len,
             int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-            int head_dim, int device_id = 0)
+            int head_dim, int device_id,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
             : Base(hybrid_config.countKVLayers(), batch_size, max_seq_len,
                    n_kv_heads, local_n_kv_heads, kv_head_start,
                    head_dim, device_id),
               total_layers_(n_layers)
         {
-            initHybrid(hybrid_config);
+            initHybrid(hybrid_config, std::move(memory_authority));
         }
 
         /**
@@ -100,13 +105,14 @@ namespace llaminar2
             const HybridKVCacheConfig &hybrid_config,
             int n_layers, int batch_size, int max_seq_len,
             int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-            int head_dim, IWorkerGPUContext *ctx)
+            int head_dim, IWorkerGPUContext *ctx,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
             : Base(hybrid_config.countKVLayers(), batch_size, max_seq_len,
                    n_kv_heads, local_n_kv_heads, kv_head_start,
                    head_dim, ctx),
               total_layers_(n_layers)
         {
-            initHybrid(hybrid_config);
+            initHybrid(hybrid_config, std::move(memory_authority));
         }
 
         // =====================================================================
@@ -808,6 +814,7 @@ namespace llaminar2
         int total_layers_;
         int first_layer_index_ = 0;
         HybridLayerMap layer_map_;
+        HybridGDNStateGeometry gdn_state_geometry_;
         HybridGDNDeviceStateArena gdn_state_arena_;
         std::vector<HybridGDNLayerState> gdn_states_;
 
@@ -848,70 +855,11 @@ namespace llaminar2
             metadata.total_layers = total_layers_;
             metadata.gdn_layers = layer_map_.gdnLayerCount();
             metadata.host_bytes = 0;
-
-            for (int layer = 0; layer < total_layers_; ++layer)
-            {
-                const int gdn_idx = layer_map_.toGDNIndex(layer);
-                if (gdn_idx < 0)
-                    continue;
-                const auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
-                if (state.conv_kernel)
-                {
-                    metadata.device_bytes += localConvStateBytes(state);
-                    if (state.full_conv_state_size != state.local_conv_state_size)
-                        metadata.device_bytes += fullConvStateBytes(state);
-                }
-                if (state.rec_kernel)
-                {
-                    metadata.device_bytes += localRecurrenceStateBytes(state);
-                    if (state.full_recurrence_state_size !=
-                        state.local_recurrence_state_size)
-                    {
-                        metadata.device_bytes += fullRecurrenceStateBytes(state);
-                    }
-                }
-            }
+            metadata.device_bytes =
+                gdn_state_geometry_.deviceSerializedPayloadBytes(
+                    metadata.gdn_layers);
             metadata.has_device_kernel_state = metadata.device_bytes > 0;
             return metadata;
-        }
-
-        /// @brief Returns the participant-local short-convolution bank size.
-        static size_t localConvStateBytes(const HybridGDNLayerState &state)
-        {
-            return static_cast<size_t>(state.local_conv_state_size) * sizeof(float);
-        }
-
-        /// @brief Returns the participant-local recurrence bank size.
-        static size_t localRecurrenceStateBytes(const HybridGDNLayerState &state)
-        {
-            return static_cast<size_t>(state.local_recurrence_state_size) * sizeof(float);
-        }
-
-        /**
-         * @brief Returns the serialized full-bank conv-state byte count.
-         *
-         * Both local and full banks are allocated before graph capture. Prefix
-         * payloads therefore serialize each distinct bank in deterministic
-         * shape order instead of relying on an out-of-band host mirror.
-         */
-        static size_t fullConvStateBytes(const HybridGDNLayerState &state)
-        {
-            if (state.full_conv_state_size > 0)
-                return static_cast<size_t>(state.full_conv_state_size) * sizeof(float);
-            return state.conv_kernel ? state.conv_kernel->largestStateBytes() : 0;
-        }
-
-        /**
-         * @brief Returns the serialized full-bank recurrence-state byte count.
-         *
-         * See @ref fullConvStateBytes for why this is deliberately independent
-         * of currently allocated GPU banks.
-         */
-        static size_t fullRecurrenceStateBytes(const HybridGDNLayerState &state)
-        {
-            if (state.full_recurrence_state_size > 0)
-                return static_cast<size_t>(state.full_recurrence_state_size) * sizeof(float);
-            return state.rec_kernel ? state.rec_kernel->largestStateBytes() : 0;
         }
 
         bool exportHybridStatePayload(
@@ -1096,7 +1044,14 @@ namespace llaminar2
             return true;
         }
 
-        void initHybrid(const HybridKVCacheConfig &config)
+        /**
+         * @brief Materialize GDN banks from canonical geometry and authority.
+         * @param config Immutable hybrid model/participant geometry.
+         * @param memory_authority Sole ledger for the GPU allocation.
+         */
+        void initHybrid(
+            const HybridKVCacheConfig &config,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
         {
             first_layer_index_ = config.first_layer_index;
             layer_map_.build(config.layer_types);
@@ -1105,68 +1060,32 @@ namespace llaminar2
             if (n_gdn <= 0)
                 return;
 
-            // Compute GDN dimensions (same logic as Qwen35Graph::ensureGDNStates)
-            const int n_k_heads_full = config.gdn_group_count > 0
-                                           ? config.gdn_group_count
-                                           : config.n_heads;
-            const int n_v_heads_full = config.gdn_time_step_rank > 0
-                                           ? config.gdn_time_step_rank
-                                           : n_k_heads_full;
-
-            int n_k_heads = n_k_heads_full;
-            int n_v_heads = n_v_heads_full;
-            const bool gdn_modular_repeat = (n_v_heads_full > n_k_heads_full);
-
-            if (config.local_n_heads > 0 && config.n_heads > 0 &&
-                config.local_n_heads < config.n_heads)
-            {
-                n_v_heads = n_v_heads_full * config.local_n_heads / config.n_heads;
-                if (n_v_heads <= 0)
-                    n_v_heads = 1;
-                if (!gdn_modular_repeat)
-                {
-                    n_k_heads = n_k_heads_full * config.local_n_heads / config.n_heads;
-                    if (n_k_heads <= 0)
-                        n_k_heads = 1;
-                }
-            }
-
-            const int d_v = config.gdn_state_size;
-            const int d_k = d_v;
-            const int full_key_dim = n_k_heads_full * d_k;
-            const int full_value_dim = config.gdn_inner_size > 0
-                                           ? config.gdn_inner_size
-                                           : n_v_heads_full * d_v;
-            const int full_qkv_dim = 2 * full_key_dim + full_value_dim;
-            const int full_recurrence_state_size = n_v_heads_full * d_k * d_v;
-            const int full_conv_state_size =
-                config.gdn_conv_kernel_size > 1
-                    ? full_qkv_dim * (config.gdn_conv_kernel_size - 1)
-                    : 0;
-            const int key_dim = n_k_heads * d_k;
-            const int value_dim = config.gdn_inner_size > 0
-                                      ? (config.gdn_inner_size * n_v_heads / n_v_heads_full)
-                                      : n_v_heads * d_v;
-            const int qkv_dim = 2 * key_dim + value_dim;
+            gdn_state_geometry_ = config.gdnStateGeometry();
+            const HybridGDNStateGeometry &geometry =
+                gdn_state_geometry_;
 
             gdn_states_.resize(n_gdn);
             for (auto &state : gdn_states_)
             {
-                state.n_v_heads = n_v_heads;
-                state.n_k_heads = n_k_heads;
-                state.d_k = d_k;
-                state.d_v = d_v;
+                state.n_v_heads = geometry.local_value_heads;
+                state.n_k_heads = geometry.local_key_heads;
+                state.d_k = geometry.d_k;
+                state.d_v = geometry.d_v;
                 state.conv_kernel_size = config.gdn_conv_kernel_size;
-                state.full_recurrence_state_size = full_recurrence_state_size;
-                state.full_conv_state_size = full_conv_state_size;
-                state.initializeShape(qkv_dim);
+                state.full_recurrence_state_size =
+                    geometry.full_recurrence_state_floats;
+                state.full_conv_state_size =
+                    geometry.full_conv_state_floats;
+                state.initializeShape(geometry.local_qkv_dim);
             }
 
             gdn_state_arena_.initialize(
                 DeviceId::cuda(this->device_id()),
                 this->batch_size_,
+                geometry,
                 gdn_states_,
-                gdnStateStream());
+                gdnStateStream(),
+                std::move(memory_authority));
 
             LOG_DEBUG("[CUDAHybridRingKVCache] Created: " << total_layers_ << " total layers, "
                                                           << layer_map_.kvLayerCount() << " KV (FA), "

@@ -30,19 +30,11 @@ namespace
         explicit FakeVerifierStateStage(
             bool captures,
             bool restore_ok = true,
-            bool required_for_publication = false,
-            bool post_restore_publication = false,
-            bool post_restore_ok = true,
-            std::vector<std::string> *operation_log = nullptr,
-            std::string label = {})
+            bool required_for_publication = false)
             : IComputeStage(DeviceId::cpu()),
               captures_(captures),
               restore_ok_(restore_ok),
-              required_for_publication_(required_for_publication),
-              post_restore_publication_(post_restore_publication),
-              post_restore_ok_(post_restore_ok),
-              operation_log_(operation_log),
-              label_(std::move(label))
+              required_for_publication_(required_for_publication)
         {
         }
 
@@ -77,7 +69,6 @@ namespace
         {
             restored_rows.push_back(row);
             streams.push_back(stream);
-            recordOperation("restore");
             return restore_ok_;
         }
 
@@ -87,7 +78,6 @@ namespace
         {
             device_restored_rows.push_back(device_row_index);
             device_streams.push_back(stream);
-            recordOperation("device_restore");
             return restore_ok_;
         }
 
@@ -101,7 +91,6 @@ namespace
             batch_request_counts.push_back(request_count);
             batch_row_index_strides.push_back(row_index_stride);
             batch_streams.push_back(stream);
-            recordOperation("batch_device_restore");
             return restore_ok_;
         }
 
@@ -117,25 +106,12 @@ namespace
                 host_row_indices + request_count);
             batch_host_request_counts.push_back(request_count);
             batch_host_streams.push_back(stream);
-            recordOperation("batch_host_restore");
             return restore_ok_;
         }
 
         void clearVerifierStateCaptureBindingAfterPublication() override
         {
             ++capture_binding_clear_calls;
-        }
-
-        bool requiresPostVerifierStatePublication() const override
-        {
-            return post_restore_publication_;
-        }
-
-        bool publishPostVerifierStateRestore(void *stream) override
-        {
-            post_restore_streams.push_back(stream);
-            recordOperation("post_restore");
-            return post_restore_ok_;
         }
 
         StageDumpInfo buildDumpInfoImpl() const override
@@ -154,27 +130,12 @@ namespace
         std::vector<std::vector<int>> batch_host_restored_rows;
         std::vector<int> batch_host_request_counts;
         std::vector<void *> batch_host_streams;
-        std::vector<void *> post_restore_streams;
         int capture_binding_clear_calls = 0;
 
     private:
-        void recordOperation(const char *operation)
-        {
-            if (!operation_log_)
-                return;
-            operation_log_->push_back(
-                label_.empty()
-                    ? std::string(operation)
-                    : label_ + "." + operation);
-        }
-
         bool captures_ = false;
         bool restore_ok_ = true;
         bool required_for_publication_ = false;
-        bool post_restore_publication_ = false;
-        bool post_restore_ok_ = true;
-        std::vector<std::string> *operation_log_ = nullptr;
-        std::string label_;
     };
 
     /**
@@ -1824,79 +1785,6 @@ TEST(Test__MTPSpecStateContract, GraphPublisherRestoresCapturedStagesInExecution
     EXPECT_THAT(captured1_ptr->restored_rows, ElementsAre(2));
     EXPECT_THAT(captured0_ptr->streams, ElementsAre(&explicit_stream));
     EXPECT_THAT(captured1_ptr->streams, ElementsAre(&explicit_stream));
-}
-
-/**
- * @brief Publication runs graph-order derived live-state handoffs after row restore.
- *
- * LocalTP GDN decode uses verifier-captured short-conv and recurrence rows as
- * inputs to a later live-state allgather stage.  That allgather stage does not
- * own verifier capture slots itself, but the next serial decode token consumes
- * its mirrored decode bank.  The MTP publisher must therefore invoke explicit
- * post-restore publication stages instead of counting them as ordinary skipped
- * non-capturing nodes.
- */
-TEST(Test__MTPSpecStateContract, GraphPublisherRunsPostRestorePublicationStagesInExecutionOrder)
-{
-    std::vector<std::string> operations;
-    auto captured0 = std::make_unique<FakeVerifierStateStage>(
-        /*captures=*/true,
-        /*restore_ok=*/true,
-        /*required_for_publication=*/false,
-        /*post_restore_publication=*/false,
-        /*post_restore_ok=*/true,
-        &operations,
-        "short_conv");
-    auto captured1 = std::make_unique<FakeVerifierStateStage>(
-        /*captures=*/true,
-        /*restore_ok=*/true,
-        /*required_for_publication=*/false,
-        /*post_restore_publication=*/false,
-        /*post_restore_ok=*/true,
-        &operations,
-        "gdn_recurrence");
-    auto handoff = std::make_unique<FakeVerifierStateStage>(
-        /*captures=*/false,
-        /*restore_ok=*/true,
-        /*required_for_publication=*/false,
-        /*post_restore_publication=*/true,
-        /*post_restore_ok=*/true,
-        &operations,
-        "gdn_allgather");
-
-    FakeVerifierStateStage *captured0_ptr = captured0.get();
-    FakeVerifierStateStage *captured1_ptr = captured1.get();
-    FakeVerifierStateStage *handoff_ptr = handoff.get();
-
-    ComputeGraph graph;
-    graph.addNode("short_conv", std::move(captured0), DeviceId::cpu());
-    graph.addNode("gdn_recurrence", std::move(captured1), DeviceId::cpu());
-    graph.addNode("gdn_allgather", std::move(handoff), DeviceId::cpu());
-    graph.addDependency("gdn_recurrence", "short_conv");
-    graph.addDependency("gdn_allgather", "gdn_recurrence");
-
-    int explicit_stream = 0;
-    MTPSpecStatePublicationResult result =
-        publishAcceptedMTPSpecState(
-            publishPlan(/*accepted_count=*/2),
-            graph,
-            DeviceId::cpu(),
-            &explicit_stream,
-            /*require_captured_stage=*/true);
-
-    ASSERT_TRUE(result.ok) << result.error;
-    EXPECT_EQ(result.restored_stage_count, 2);
-    EXPECT_EQ(result.post_restore_stage_count, 1);
-    EXPECT_EQ(result.skipped_stage_count, 0);
-    EXPECT_THAT(operations,
-                ElementsAre(
-                    "short_conv.restore",
-                    "gdn_recurrence.restore",
-                    "gdn_allgather.post_restore"));
-    EXPECT_THAT(captured0_ptr->restored_rows, ElementsAre(1));
-    EXPECT_THAT(captured1_ptr->restored_rows, ElementsAre(1));
-    EXPECT_TRUE(handoff_ptr->restored_rows.empty());
-    EXPECT_THAT(handoff_ptr->post_restore_streams, ElementsAre(&explicit_stream));
 }
 
 TEST(Test__MTPSpecStateContract, GraphPublisherRejectsMissingStage)

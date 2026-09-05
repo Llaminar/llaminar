@@ -158,6 +158,46 @@ namespace llaminar2
     }
 
     /**
+     * @brief Whether one forward owns a graph-integrated shifted-MTP archive.
+     *
+     * Prompt prefill and the one-row restored-prefix bridge have different
+     * mathematical phases, but both append depth-zero shifted KV and archive
+     * the terminal main-model hidden row inside the same captured transaction.
+     * Keeping this classification in one typed predicate prevents callers from
+     * publishing only one of those two legal lifecycle edges.  In particular,
+     * prefix harvest must not run a sidecar refresh after either transaction:
+     * that refresh can overwrite the just-produced main logits before they are
+     * archived.
+     *
+     * @param role Model-graph ownership of the forward.
+     * @param phase Mathematical execution phase.
+     * @param transaction Persistent-state transaction topology.
+     * @param batch_size Logical request count.
+     * @param seq_len Physical rows per request.
+     * @return true only for a complete shifted-MTP producer topology.
+     */
+    [[nodiscard]] constexpr bool isGraphIntegratedShiftedMTPTransaction(
+        ForwardExecutionRole role,
+        ForwardExecutionPhase phase,
+        ForwardStateTransaction transaction,
+        int batch_size,
+        int seq_len) noexcept
+    {
+        const bool main_prefill =
+            role == ForwardExecutionRole::MainInference &&
+            phase == ForwardExecutionPhase::Prefill &&
+            transaction == ForwardStateTransaction::Ordinary &&
+            batch_size > 0 && seq_len > 0;
+        const bool restored_prefix_bridge =
+            role == ForwardExecutionRole::MTPCondition &&
+            phase == ForwardExecutionPhase::Decode &&
+            transaction ==
+                ForwardStateTransaction::RestoredPrefixMTPDecodeBridge &&
+            batch_size == 1 && seq_len == 1;
+        return main_prefill || restored_prefix_bridge;
+    }
+
+    /**
      * @brief Signature for caching full forward graphs.
      *
      * Captures the execution shape so that graphs built for identical shapes
@@ -196,6 +236,8 @@ namespace llaminar2
         int bucket_seq_len = 0;
         bool rehydrate_prefix_runtime_on_device = false;
         uint64_t moe_placement_epoch = 0;
+        /** Semantic diagnostic-node topology embedded in the native graph. */
+        uint64_t snapshot_configuration_identity = 1;
 
         bool operator==(const ForwardGraphSignature &other) const
         {
@@ -232,9 +274,66 @@ namespace llaminar2
                    bucket_seq_len == other.bucket_seq_len &&
                    rehydrate_prefix_runtime_on_device ==
                        other.rehydrate_prefix_runtime_on_device &&
-                   moe_placement_epoch == other.moe_placement_epoch;
+                   moe_placement_epoch == other.moe_placement_epoch &&
+                   snapshot_configuration_identity ==
+                       other.snapshot_configuration_identity;
         }
     };
+
+    /**
+     * @brief Derive diagnostic-arena sharing solely from captured graph identity.
+     *
+     * The policy deliberately depends on typed execution roles rather than
+     * stage names or allocation sizes. Prefill buckets and grouped-verifier
+     * outcomes share the wide checkpoint lane because prefill publication is
+     * complete before device generation begins. Live/restored-prefix MTP
+     * conditions use another lane because a retained MTP parent can execute a
+     * condition and verifier in the same transaction. Every unproven graph
+     * stays dedicated.
+     *
+     * @param signature Complete forward-cache identity.
+     * @return Reuse class and diagnostic configuration namespace.
+     */
+    inline DeviceGraphExecutor::GraphSnapshotArenaReusePolicy
+    graphSnapshotArenaReusePolicyForSignature(
+        const ForwardGraphSignature &signature) noexcept
+    {
+        using ReuseClass =
+            DeviceGraphExecutor::GraphSnapshotArenaReuseClass;
+        using ReusePolicy =
+            DeviceGraphExecutor::GraphSnapshotArenaReusePolicy;
+
+        if (!signature.device.is_gpu())
+            return ReusePolicy{};
+
+        ReuseClass reuse_class = ReuseClass::Dedicated;
+        if (signature.execution_role ==
+            ForwardExecutionRole::GroupedMTPVerifier)
+        {
+            reuse_class =
+                ReuseClass::PrefillOrMTPVerifierAlternative;
+        }
+        else if (signature.execution_role ==
+                 ForwardExecutionRole::MTPCondition)
+        {
+            reuse_class = ReuseClass::MTPConditionAlternative;
+        }
+        else if (!signature.decode &&
+                 signature.execution_role ==
+                     ForwardExecutionRole::MainInference)
+        {
+            reuse_class =
+                ReuseClass::PrefillOrMTPVerifierAlternative;
+        }
+
+        if (reuse_class == ReuseClass::Dedicated)
+            return ReusePolicy{};
+        return ReusePolicy{
+            .reuse_class = reuse_class,
+            .configuration_identity =
+                signature.snapshot_configuration_identity,
+        };
+    }
 
     struct ForwardGraphSignatureHash
     {
@@ -282,6 +381,9 @@ namespace llaminar2
             h ^= (std::hash<int>{}(sig.bucket_seq_len) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.rehydrate_prefix_runtime_on_device) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(sig.moe_placement_epoch) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(
+                      sig.snapshot_configuration_identity) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             return h;
         }
     };

@@ -52,7 +52,7 @@ namespace
 
     struct ModeHarness
     {
-        explicit ModeHarness(int rank, int world_size)
+        explicit ModeHarness(int rank, int world_size, int authority_rank = 0)
         {
             auto owned_runner = std::make_unique<NiceMock<MockOrchestrationRunner>>();
             runner = owned_runner.get();
@@ -64,6 +64,8 @@ namespace
             ctx.tokenizer = tokenizer;
             ctx.config.prompt = "Hello";
             ctx.config.n_predict = 1;
+            ON_CALL(*runner, coordinatedRootRank())
+                .WillByDefault(Return(authority_rank));
         }
 
         AppContext ctx;
@@ -111,6 +113,40 @@ TEST(Test__BenchmarkMode, NonRootRankEntersWorkerLoopWithoutStartingASecondContr
 
     BenchmarkMode mode;
     EXPECT_EQ(mode.execute(h.ctx), 0);
+}
+
+TEST(Test__BenchmarkMode, WorldRankZeroFollowsInventorySelectedNonzeroAuthority)
+{
+    ModeHarness h(/*rank=*/0, /*world_size=*/2, /*authority_rank=*/1);
+    h.ctx.config.benchmark_mode = true;
+
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
+    EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(1);
+    EXPECT_CALL(*h.runner, prepareForInference()).Times(0);
+    EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(0);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+    EXPECT_CALL(*h.tokenizer, encode(_, _, _)).Times(0);
+
+    BenchmarkMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 0);
+}
+
+TEST(Test__BenchmarkMode, InventorySelectedNonzeroAuthorityOwnsRequestAndShutdown)
+{
+    ModeHarness h(/*rank=*/1, /*world_size=*/2, /*authority_rank=*/1);
+    h.ctx.config.benchmark_mode = true;
+
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
+    EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(0);
+    EXPECT_CALL(*h.runner, prepareForInference()).Times(1).WillOnce(Return(true));
+    EXPECT_CALL(*h.tokenizer, encode(_, false, false))
+        .WillOnce(Return(std::vector<int>{}));
+    EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(1);
+    EXPECT_CALL(*h.runner, abortMPIWorkers(_)).Times(0);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+
+    BenchmarkMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 1);
 }
 
 TEST(Test__BenchmarkMode, RootRankOwnsControllerAndClosesWorkersOnEarlyFailure)

@@ -99,6 +99,23 @@ TEST(Test__PrefixCacheStateProbe,
         << "Raw terminal values and their digest must come from one materialization";
 }
 
+TEST(Test__PrefixCacheStateProbe,
+     GDNValueCaptureAlsoSelectsAuthoritativeDeviceDigest)
+{
+    ScopedEnvVar hash_gdn(
+        "LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE",
+        nullptr);
+    ScopedEnvVar capture_gdn(
+        "LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES",
+        "1");
+
+    const PrefixProbeCapturePolicy policy =
+        PrefixProbeCapturePolicy::fromEnvironment();
+    EXPECT_TRUE(policy.capture_gdn_values);
+    EXPECT_TRUE(policy.hash_gdn_device_state)
+        << "Raw GPU GDN values and their digest must share one ordered export";
+}
+
 TEST(Test__PrefixCacheStateProbe, CapturesCPURingKVInventory)
 {
     CPURingKVCacheFP32 cache(getTestMPIContext(), 2, 1, 4, 2, 2, DeviceId::cpu());

@@ -620,7 +620,8 @@ namespace llaminar2
     bool ROCmBackend::registerExternalMappedHostMemory(
         void *ptr,
         size_t bytes,
-        int registration_device_id)
+        int registration_device_id,
+        MappedHostRegistrationScope scope)
     {
         std::lock_guard<std::mutex> lifecycle_lock(
             rocmRuntimeResourceLifecycleMutex());
@@ -634,15 +635,22 @@ namespace llaminar2
         HipDeviceSaveRestore device_guard;
         if (hipSetDevice(registration_device_id) != hipSuccess)
             return false;
-        const hipError_t error = hipHostRegister(
-            ptr,
-            bytes,
-            hipHostRegisterMapped | hipHostRegisterPortable |
-                hipExtHostRegisterUncached);
+        /* Portable registration mutates every ROCm page table and is
+         * materially more expensive on multi-GPU IOMMU hosts. In particular,
+         * thousands of one-device retained-graph tickets used to create an
+         * iova_depot backlog and IH-ring overflow storm. Only a genuinely
+         * shared same-family region is allowed to pay that cost. */
+        const unsigned int flags = hipHostRegisterMapped |
+                                   hipExtHostRegisterUncached |
+                                   (scope == MappedHostRegistrationScope::BackendPortable
+                                        ? hipHostRegisterPortable
+                                        : 0u);
+        const hipError_t error = hipHostRegister(ptr, bytes, flags);
         if (error != hipSuccess)
         {
-            LOG_ERROR("[ROCmBackend::registerExternalMappedHostMemory] hipHostRegister(mapped|portable|uncached) failed for "
-                      << bytes << " bytes: " << hipGetErrorString(error));
+            LOG_ERROR("[ROCmBackend::registerExternalMappedHostMemory] hipHostRegister failed for "
+                      << bytes << " bytes scope=" << to_string(scope)
+                      << ": " << hipGetErrorString(error));
             return false;
         }
         {
@@ -5185,17 +5193,7 @@ namespace llaminar2
             }
         }
 
-        int previous_device = -1;
-        hipError_t error = hipGetDevice(&previous_device);
-        if (error != hipSuccess || previous_device < 0)
-        {
-            result.diagnostic =
-                "hipGetDevice failed before runtime reset: " +
-                std::string(hipGetErrorString(error));
-            (void)hipGetLastError();
-            return result;
-        }
-        error = static_cast<hipError_t>(
+        hipError_t error = static_cast<hipError_t>(
             HipDeviceGuard::forceSetDevice(device_id));
         if (error != hipSuccess)
         {
@@ -5215,8 +5213,6 @@ namespace llaminar2
                 "hipMemGetInfo failed before runtime reset: " +
                 std::string(hipGetErrorString(error));
             (void)hipGetLastError();
-            if (previous_device != device_id)
-                (void)HipDeviceGuard::forceSetDevice(previous_device);
             return result;
         }
 
@@ -5224,8 +5220,6 @@ namespace llaminar2
         {
             result.diagnostic =
                 "ROCm tensor-validator generation could not retire";
-            if (previous_device != device_id)
-                (void)HipDeviceGuard::forceSetDevice(previous_device);
             return result;
         }
 
@@ -5238,8 +5232,6 @@ namespace llaminar2
                                 hipGetErrorString(error);
             (void)hipGetLastError();
             HipDeviceGuard::resetTracking();
-            if (previous_device != device_id)
-                (void)HipDeviceGuard::forceSetDevice(previous_device);
             return result;
         }
 
@@ -5263,50 +5255,31 @@ namespace llaminar2
         {
             std::lock_guard<std::mutex> generation_lock(
                 runtime_generation_mutex_);
-            result.active_generation = result.retired_generation + 1u;
+            result.successor_generation = result.retired_generation + 1u;
             runtime_generations_[static_cast<size_t>(device_id)] =
-                result.active_generation;
+                result.successor_generation;
         }
 
+        /*
+         * The retired device must remain absent from HipDeviceGuard's
+         * thread-local identity. Forcing a device or querying memory here
+         * would initialize the successor context and consume the capacity
+         * that retirement is meant to expose to the next model admission.
+         */
         HipDeviceGuard::resetTracking();
-        error = static_cast<hipError_t>(
-            HipDeviceGuard::forceSetDevice(device_id));
-        if (error == hipSuccess)
-        {
-            error = hipMemGetInfo(
-                &result.driver_free_bytes_after, &total_bytes);
-        }
-        if (error != hipSuccess)
-        {
-            result.diagnostic =
-                "HIP runtime could not materialize the fresh generation: " +
-                std::string(hipGetErrorString(error));
-            (void)hipGetLastError();
-            HipDeviceGuard::resetTracking();
-            if (previous_device != device_id &&
-                static_cast<hipError_t>(
-                    HipDeviceGuard::forceSetDevice(previous_device)) !=
-                    hipSuccess)
-            {
-                (void)hipGetLastError();
-                std::terminate();
-            }
-            return result;
-        }
 
-        if (previous_device != device_id &&
-            static_cast<hipError_t>(
-                HipDeviceGuard::forceSetDevice(previous_device)) != hipSuccess)
-        {
-            (void)hipGetLastError();
-            LOG_ERROR(
-                "[ROCmBackend] Failed to restore HIP device "
-                << previous_device << " after retiring ROCm:" << device_id);
-            std::terminate();
-        }
-
+        /*
+         * AMD HIP's deprecated primary-context APIs intentionally cannot
+         * certify inactivity: hipDevicePrimaryCtxRelease is documented as a
+         * successful no-op on the AMD path. hipDeviceReset is the native
+         * authority that discards execution state. Its success, the empty
+         * canonical ledgers above, and making no subsequent materializing HIP
+         * call are the ROCm proof that the successor remains quiescent.
+         */
+        result.post_reset_state = DeviceRuntimePostResetState::Quiescent;
         result.success = true;
-        result.diagnostic = "HIP runtime generation retired";
+        result.diagnostic =
+            "HIP runtime generation retired with quiescent successor";
         return result;
     }
 

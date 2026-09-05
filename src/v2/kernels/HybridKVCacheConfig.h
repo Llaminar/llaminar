@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "GDNDeviceStateBinding.h"
+#include "HybridGDNStateGeometry.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -207,6 +208,28 @@ namespace llaminar2
         /// Returns true if this config represents a hybrid model
         bool isHybrid() const { return !layer_types.empty(); }
 
+        /**
+         * @brief Resolve the sole GDN shape used by planning and allocation.
+         *
+         * Keeping physical-memory authority out of this value is deliberate:
+         * model geometry is immutable configuration, whereas the top-level
+         * KV-cache transaction carries the one rank-bound allocation ledger.
+         *
+         * @return Validated local/full state geometry.
+         */
+        [[nodiscard]] HybridGDNStateGeometry gdnStateGeometry() const
+        {
+            return HybridGDNStateGeometry::resolve(
+                n_heads,
+                local_head_start,
+                local_n_heads,
+                gdn_group_count,
+                gdn_time_step_rank,
+                gdn_state_size,
+                gdn_inner_size,
+                gdn_conv_kernel_size);
+        }
+
         /// Count the number of full-attention layers
         int countKVLayers() const
         {
@@ -217,6 +240,12 @@ namespace llaminar2
                     ++count;
             }
             return count;
+        }
+
+        /** @return Number of recurrent/GDN layers in this cache shard. */
+        int countGDNLayers() const
+        {
+            return static_cast<int>(layer_types.size()) - countKVLayers();
         }
     };
 

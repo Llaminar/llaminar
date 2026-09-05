@@ -1039,7 +1039,7 @@ namespace llaminar2
         }
         async_cv_.notify_one();
 
-        if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("heterogeneous_collective"))
         {
             const auto wait_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1146,7 +1146,7 @@ namespace llaminar2
         lock.unlock();
         async_cv_.notify_all();
 
-        if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("heterogeneous_collective"))
         {
             const auto wait_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1432,7 +1432,7 @@ namespace llaminar2
         const AsyncBridgeTransaction &transaction,
         size_t chunks) const
     {
-        if (!PerfStatsCollector::isEnabled())
+        if (!PerfStatsCollector::isDomainEnabled("heterogeneous_collective"))
             return;
         const size_t payload_bytes =
             transaction.count * collectiveDataTypeSize(transaction.dtype);

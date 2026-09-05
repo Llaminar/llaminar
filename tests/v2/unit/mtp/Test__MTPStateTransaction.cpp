@@ -97,8 +97,22 @@ namespace
         gdn.conv_hash = 0x5678;
         gdn.recurrence_all_zero = false;
         gdn.conv_all_zero = false;
-        gdn.recurrence_sample_values = {1.0f, 2.0f, 3.0f};
-        gdn.conv_sample_values = {4.0f, 5.0f};
+        gdn.recurrence_sample_values.resize(gdn.recurrence_values);
+        gdn.conv_sample_values.resize(gdn.conv_values);
+        for (size_t index = 0;
+             index < gdn.recurrence_sample_values.size();
+             ++index)
+        {
+            gdn.recurrence_sample_values[index] =
+                1.0f + static_cast<float>(index) * 0.01f;
+        }
+        for (size_t index = 0;
+             index < gdn.conv_sample_values.size();
+             ++index)
+        {
+            gdn.conv_sample_values[index] =
+                4.0f + static_cast<float>(index) * 0.01f;
+        }
         snapshot.gdn_layers.push_back(gdn);
         return snapshot;
     }
@@ -832,8 +846,8 @@ TEST(Test__MTPStateTransaction, RuntimeSnapshotCanUseToleranceAwareGDNValues)
     candidate.gdn_layers.front().recurrence_sample_values[1] += 1e-7f;
 
     MTPRuntimeSnapshotComparisonOptions options;
-    options.compare_gdn_hashes = false;
-    options.compare_gdn_values_if_available = true;
+    options.gdn_state_policy =
+        MTPGDNStateComparisonPolicy::NumericalValues;
     options.gdn_relative_l2_tolerance = 1e-5;
     options.gdn_max_abs_tolerance = 1e-5;
     options.gdn_min_cosine = 0.999999;
@@ -844,7 +858,121 @@ TEST(Test__MTPStateTransaction, RuntimeSnapshotCanUseToleranceAwareGDNValues)
     candidate.gdn_layers.front().recurrence_sample_values[1] += 1e-2f;
     result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
     ASSERT_FALSE(result);
-    EXPECT_NE(result.reason.find("GDN recurrence value mismatch"), std::string::npos);
+    EXPECT_NE(
+        result.reason.find("GDN recurrence numerical mismatch"),
+        std::string::npos);
+}
+
+TEST(Test__MTPStateTransaction,
+     PlacementAwareGDNRequiresExactBytesWithoutMovement)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 4;
+    candidate.moe_runtime_movement_epoch = 4;
+    candidate.gdn_layers.front().recurrence_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.gdn_state_policy =
+        MTPGDNStateComparisonPolicy::
+            ExactUnlessMoEPlacementChanged;
+    const auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+
+    ASSERT_FALSE(result);
+    EXPECT_FALSE(result.gdn_numerical.compared);
+    EXPECT_NE(result.reason.find("GDN recurrence hash mismatch"), std::string::npos)
+        << result.reason;
+}
+
+TEST(Test__MTPStateTransaction,
+     PlacementAwareGDNAcceptsCompleteNumericalStateAfterMovement)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 4;
+    candidate.moe_runtime_movement_epoch = 5;
+    candidate.gdn_layers.front().recurrence_hash ^= 0x1;
+    candidate.gdn_layers.front().conv_hash ^= 0x2;
+    candidate.gdn_layers.front().recurrence_sample_values[1] += 1e-4f;
+    candidate.gdn_layers.front().conv_sample_values[2] += 1e-4f;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.gdn_state_policy =
+        MTPGDNStateComparisonPolicy::
+            ExactUnlessMoEPlacementChanged;
+    options.gdn_relative_l2_tolerance = 1e-3;
+    options.gdn_max_abs_tolerance = 1e-3;
+    options.gdn_min_cosine = 0.999999;
+    const auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+
+    ASSERT_TRUE(result) << result.reason;
+    EXPECT_TRUE(result.gdn_numerical.compared);
+    EXPECT_TRUE(result.gdn_numerical.passed);
+    EXPECT_EQ(result.gdn_numerical.payloads, 2u);
+    EXPECT_EQ(result.gdn_numerical.elements, 76u);
+    EXPECT_GT(result.gdn_numerical.maximum_abs, 0.0);
+}
+
+TEST(Test__MTPStateTransaction,
+     PlacementAwareGDNRejectsMissingOrNumericallyBadState)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.moe_runtime_movement_epoch = 4;
+    candidate.moe_runtime_movement_epoch = 5;
+    candidate.gdn_layers.front().recurrence_hash ^= 0x1;
+
+    MTPRuntimeSnapshotComparisonOptions options;
+    options.gdn_state_policy =
+        MTPGDNStateComparisonPolicy::
+            ExactUnlessMoEPlacementChanged;
+    options.gdn_relative_l2_tolerance = 0.05;
+    options.gdn_max_abs_tolerance.reset();
+    options.gdn_min_cosine = 0.99;
+
+    candidate.gdn_layers.front().recurrence_sample_values.clear();
+    auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_NE(
+        result.reason.find("complete retained values"),
+        std::string::npos)
+        << result.reason;
+
+    candidate = oracle;
+    candidate.moe_runtime_movement_epoch = 5;
+    candidate.gdn_layers.front().recurrence_hash ^= 0x1;
+    std::fill(
+        candidate.gdn_layers.front().recurrence_sample_values.begin(),
+        candidate.gdn_layers.front().recurrence_sample_values.end(),
+        -10.0f);
+    result = compareMTPRuntimeStateSnapshots(oracle, candidate, options);
+    ASSERT_FALSE(result);
+    EXPECT_TRUE(result.gdn_numerical.compared);
+    EXPECT_FALSE(result.gdn_numerical.passed);
+    EXPECT_NE(
+        result.reason.find("GDN recurrence numerical mismatch"),
+        std::string::npos)
+        << result.reason;
+}
+
+TEST(Test__MTPStateTransaction,
+     RuntimeSnapshotRejectsAsymmetricGDNDeviceAuthority)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    oracle.gdn_layers.front().device_state_hash_available = true;
+
+    const auto result =
+        compareMTPRuntimeStateSnapshots(oracle, candidate);
+
+    ASSERT_FALSE(result);
+    EXPECT_NE(
+        result.reason.find("device-state hash availability mismatch"),
+        std::string::npos)
+        << result.reason;
 }
 
 TEST(Test__MTPStateTransaction, VisibleCommitPlanIsTotalAcrossMTPDepthAndResponseBudget)

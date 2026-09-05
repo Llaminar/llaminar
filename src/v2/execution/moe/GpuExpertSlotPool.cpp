@@ -27,6 +27,7 @@ namespace llaminar2
         struct SlotLeaseToken
         {
             int slot_index = -1;
+            int layer_idx = -1;
             int expert_id = -1;
             uint64_t residency_epoch = 0;
             bool transfer_slot = false;
@@ -42,7 +43,56 @@ namespace llaminar2
         int layer_idx,
         int active_capacity,
         std::vector<ProjectionSpec> specs,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+        PhysicalMemoryOwner active_owner,
         int transfer_capacity)
+    {
+        return createImpl(
+            backend,
+            device,
+            device_ordinal,
+            layer_idx,
+            active_capacity,
+            std::move(specs),
+            std::move(memory_authority),
+            active_owner,
+            transfer_capacity,
+            /*explicit_test_allocation=*/false);
+    }
+
+    std::shared_ptr<GpuExpertSlotPool> GpuExpertSlotPool::createForTest(
+        IBackend *backend,
+        DeviceId device,
+        int device_ordinal,
+        int layer_idx,
+        int active_capacity,
+        std::vector<ProjectionSpec> specs,
+        int transfer_capacity)
+    {
+        return createImpl(
+            backend,
+            device,
+            device_ordinal,
+            layer_idx,
+            active_capacity,
+            std::move(specs),
+            nullptr,
+            PhysicalMemoryOwner::RoutedExpertWeights,
+            transfer_capacity,
+            /*explicit_test_allocation=*/true);
+    }
+
+    std::shared_ptr<GpuExpertSlotPool> GpuExpertSlotPool::createImpl(
+        IBackend *backend,
+        DeviceId device,
+        int device_ordinal,
+        int layer_idx,
+        int active_capacity,
+        std::vector<ProjectionSpec> specs,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority,
+        PhysicalMemoryOwner active_owner,
+        int transfer_capacity,
+        bool explicit_test_allocation)
     {
         if (active_capacity <= 0)
             throw std::invalid_argument("GpuExpertSlotPool active capacity must be positive");
@@ -50,12 +100,28 @@ namespace llaminar2
             throw std::invalid_argument("GpuExpertSlotPool transfer capacity cannot be negative");
         if (specs.empty())
             throw std::invalid_argument("GpuExpertSlotPool requires at least one projection spec");
+        if (!explicit_test_allocation &&
+            (!memory_authority ||
+             (active_owner != PhysicalMemoryOwner::RoutedExpertWeights &&
+              active_owner != PhysicalMemoryOwner::ExpertShadowSlots)))
+        {
+            throw std::invalid_argument(
+                "GpuExpertSlotPool production allocation requires an authority and a routed-live or shadow owner");
+        }
 
-        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        auto orchestrator = explicit_test_allocation
+                                ? std::make_shared<LoadOrchestrator>(
+                                      backend,
+                                      kTestOnlyUnadmittedGPUAllocation)
+                                : std::make_shared<LoadOrchestrator>(
+                                      backend,
+                                      std::move(memory_authority),
+                                      active_owner);
         orchestrator->addDevice(device_ordinal);
 
         auto plan_slot_family = [&](int count,
-                                    const auto &slot_name_for)
+                                    const auto &slot_name_for,
+                                    PhysicalMemoryOwner owner)
         {
             for (int slot = 0; slot < count; ++slot)
             {
@@ -77,12 +143,13 @@ namespace llaminar2
                             throw std::invalid_argument(
                                 "GpuExpertSlotPool floating projection size overflows");
                         }
-                        orchestrator->planRawWeight(
+                        orchestrator->planRawWeightForOwner(
                             device_ordinal,
                             slot_name_for(slot, spec.label),
                             spec.N,
                             spec.K,
-                            elements * element_bytes);
+                            elements * element_bytes,
+                            owner);
                     }
                     else
                     {
@@ -92,7 +159,7 @@ namespace llaminar2
                             throw std::invalid_argument(
                                 "GpuExpertSlotPool NativeVNNI projection spec has invalid block geometry");
                         }
-                        orchestrator->planWeight(
+                        orchestrator->planWeightForOwner(
                             device_ordinal,
                             slot_name_for(slot, spec.label),
                             spec.N,
@@ -100,7 +167,8 @@ namespace llaminar2
                             spec.payload_bytes_per_block,
                             spec.is_asymmetric,
                             spec.has_emins,
-                            /*raw_gguf_bytes=*/0);
+                            /*raw_gguf_bytes=*/0,
+                            owner);
                     }
                 }
             }
@@ -111,13 +179,15 @@ namespace llaminar2
             [](int slot, const std::string &label)
             {
                 return activeSlotName(slot, label);
-            });
+            },
+            active_owner);
         plan_slot_family(
             transfer_capacity,
             [](int slot, const std::string &label)
             {
                 return transferSlotName(slot, label);
-            });
+            },
+            PhysicalMemoryOwner::ExpertMigrationStaging);
 
         orchestrator->allocate(/*pinned_slot_size=*/0, /*num_h2d_streams=*/0);
 
@@ -189,6 +259,7 @@ namespace llaminar2
           specs_(std::move(specs)),
           orchestrator_(std::move(orchestrator)),
           expert_by_slot_(static_cast<size_t>(active_capacity), -1),
+          layer_by_slot_(static_cast<size_t>(active_capacity), -1),
           epoch_by_slot_(static_cast<size_t>(active_capacity), 0),
           expert_by_transfer_slot_(static_cast<size_t>(transfer_capacity), -1),
           epoch_by_transfer_slot_(static_cast<size_t>(transfer_capacity), 0)
@@ -198,13 +269,17 @@ namespace llaminar2
     size_t GpuExpertSlotPool::SlotIdentityHash::operator()(
         const SlotIdentity &identity) const noexcept
     {
-        /* Mix both fields because successive epochs of one hot expert coexist. */
+        /* Mix every coordinate because layers reuse one exact-geometry arena. */
         const size_t epoch_hash =
             std::hash<uint64_t>{}(identity.residency_epoch);
         const size_t expert_hash = std::hash<int>{}(identity.expert_id);
-        return epoch_hash ^
+        const size_t layer_hash = std::hash<int>{}(identity.layer_idx);
+        const size_t expert_epoch = epoch_hash ^
                (expert_hash + static_cast<size_t>(0x9e3779b9u) +
                 (epoch_hash << 6u) + (epoch_hash >> 2u));
+        return expert_epoch ^
+               (layer_hash + static_cast<size_t>(0x9e3779b9u) +
+                (expert_epoch << 6u) + (expert_epoch >> 2u));
     }
 
     std::optional<GpuExpertSlotPool::AcquiredSlot>
@@ -218,10 +293,19 @@ namespace llaminar2
         int expert_id,
         uint64_t residency_epoch)
     {
-        if (expert_id < 0)
+        return acquireForLayer(layer_idx_, expert_id, residency_epoch);
+    }
+
+    std::optional<GpuExpertSlotPool::AcquiredSlot>
+    GpuExpertSlotPool::acquireForLayer(
+        int layer_idx,
+        int expert_id,
+        uint64_t residency_epoch)
+    {
+        if (layer_idx < 0 || expert_id < 0)
             return std::nullopt;
 
-        const SlotIdentity identity{expert_id, residency_epoch};
+        const SlotIdentity identity{layer_idx, expert_id, residency_epoch};
         int slot_index = -1;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -240,6 +324,7 @@ namespace llaminar2
                 return std::nullopt;
 
             expert_by_slot_[static_cast<size_t>(slot_index)] = expert_id;
+            layer_by_slot_[static_cast<size_t>(slot_index)] = layer_idx;
             epoch_by_slot_[static_cast<size_t>(slot_index)] = residency_epoch;
             slot_by_identity_[identity] = slot_index;
         }
@@ -254,6 +339,7 @@ namespace llaminar2
 
         AcquiredSlot acquired;
         acquired.slot_index = slot_index;
+        acquired.layer_idx = layer_idx;
         acquired.expert_id = expert_id;
         acquired.residency_epoch = residency_epoch;
         acquired.projections.reserve(specs_.size());
@@ -277,6 +363,7 @@ namespace llaminar2
 
         auto token = std::make_shared<SlotLeaseToken>(SlotLeaseToken{
             slot_index,
+            layer_idx,
             expert_id,
             residency_epoch,
             false,
@@ -296,6 +383,7 @@ namespace llaminar2
                 if (auto pool = token->pool.lock())
                 {
                     const SlotIdentity token_identity{
+                        token->layer_idx,
                         token->expert_id,
                         token->residency_epoch};
                     if (token->transfer_slot)
@@ -317,7 +405,7 @@ namespace llaminar2
             1.0,
             "rebalance",
             device_.to_string(),
-            {{"layer", std::to_string(layer_idx_)},
+            {{"layer", std::to_string(layer_idx)},
              {"slot", std::to_string(slot_index)},
              {"epoch", std::to_string(residency_epoch)}});
         return acquired;
@@ -337,7 +425,7 @@ namespace llaminar2
         if (expert_id < 0)
             return std::nullopt;
 
-        const SlotIdentity identity{expert_id, residency_epoch};
+        const SlotIdentity identity{layer_idx_, expert_id, residency_epoch};
         int slot_index = -1;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -395,6 +483,7 @@ namespace llaminar2
 
         auto token = std::make_shared<SlotLeaseToken>(SlotLeaseToken{
             slot_index,
+            layer_idx_,
             expert_id,
             residency_epoch,
             true,
@@ -409,6 +498,7 @@ namespace llaminar2
                 if (auto pool = token->pool.lock())
                 {
                     const SlotIdentity token_identity{
+                        token->layer_idx,
                         token->expert_id,
                         token->residency_epoch};
                     if (token->transfer_slot)
@@ -489,7 +579,7 @@ namespace llaminar2
         uint64_t residency_epoch) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = slot_by_identity_.find({expert_id, residency_epoch});
+        auto it = slot_by_identity_.find({layer_idx_, expert_id, residency_epoch});
         if (it == slot_by_identity_.end())
             return std::nullopt;
         return it->second;
@@ -506,7 +596,7 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = transfer_slot_by_identity_.find(
-            {expert_id, residency_epoch});
+            {layer_idx_, expert_id, residency_epoch});
         if (it == transfer_slot_by_identity_.end())
             return std::nullopt;
         return it->second;
@@ -533,13 +623,17 @@ namespace llaminar2
                 return;
 
             auto &assigned = expert_by_slot_[static_cast<size_t>(slot_index)];
+            auto &assigned_layer =
+                layer_by_slot_[static_cast<size_t>(slot_index)];
             auto &assigned_epoch =
                 epoch_by_slot_[static_cast<size_t>(slot_index)];
-            if (assigned != identity.expert_id ||
+            if (assigned_layer != identity.layer_idx ||
+                assigned != identity.expert_id ||
                 assigned_epoch != identity.residency_epoch)
                 return;
 
             assigned = -1;
+            assigned_layer = -1;
             assigned_epoch = 0;
             slot_by_identity_.erase(identity);
             released = true;
@@ -553,7 +647,7 @@ namespace llaminar2
                 1.0,
                 "rebalance",
                 device_.to_string(),
-                {{"layer", std::to_string(layer_idx_)},
+                {{"layer", std::to_string(identity.layer_idx)},
                  {"slot", std::to_string(slot_index)},
                  {"epoch", std::to_string(identity.residency_epoch)}});
         }

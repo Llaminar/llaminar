@@ -16,8 +16,10 @@
 #include "collective/IGlobalTPContext.h"
 #include "collective/ITPContext.h"
 #include "config/TensorParallelConfig.h"
+#include "execution/compute_stages/stages/AttentionComputeStage.h"
 #include "execution/compute_stages/stages/MTPConcatStage.h"
 #include "execution/compute_stages/stages/MTPVerifierOutcomeStage.h"
+#include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
@@ -29,6 +31,7 @@
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/mtp/HostedDeviceGenerationLifecycle.h"
+#include "execution/mtp/MTPCheckpointPolicy.h"
 #include "execution/runner/MTPVerifierForwardExecutor.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
@@ -40,9 +43,12 @@
 #include "loaders/PreparedWeightStore.h"
 #include "mocks/MockLocalTPContext.h"
 #include "mocks/MockMPIContext.h"
+#include "mocks/MockModelContext.h"
 #include "models/qwen/QwenStandardGraph.h"
 #include "models/qwen35/Qwen35Graph.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include "planning/KVCacheMemoryEstimator.h"
 #include "tensors/TensorSlice.h"
 #include "transfer/TransferEngine.h"
 #include "utils/DebugEnv.h"
@@ -646,6 +652,9 @@ namespace
             config.use_graph_buffer_management = true;
             config.mtp.enabled = true;
             config.mtp.draft_tokens = 1;
+            /* This fixture is the ordinary sharded-TP oracle. */
+            config.mtp.sidecar_dense_policy =
+                MTPSidecarDensePolicy::TensorParallel;
 
             const size_t d = static_cast<size_t>(config.d_model);
             const size_t q_dim = static_cast<size_t>(config.n_heads * config.head_dim);
@@ -758,6 +767,9 @@ namespace
             config.gdn.time_step_rank = config.n_heads;
             config.mtp.enabled = true;
             config.mtp.draft_tokens = 1;
+            /* This fixture proves the established sharded predictor path. */
+            config.mtp.sidecar_dense_policy =
+                MTPSidecarDensePolicy::TensorParallel;
 
             const size_t d = static_cast<size_t>(config.d_model);
             const size_t q_dim = static_cast<size_t>(config.n_heads * config.head_dim);
@@ -866,6 +878,7 @@ namespace
         hybrid.gdn_inner_size = 16;
         hybrid.gdn_group_count = 2;
         hybrid.gdn_time_step_rank = 2;
+        hybrid.n_heads = 2;
         return hybrid;
     }
 
@@ -2003,6 +2016,8 @@ TEST(Test__MTPGraphConstruction, LocalTPMirroredMTPHeadBuildsFullVocabSidecarLMH
     local_tp->setBackend(CollectiveBackendType::HOST);
 
     mirrored_fixture.config.mtp.enabled = true;
+    mirrored_fixture.config.mtp.sidecar_dense_policy =
+        MTPSidecarDensePolicy::TensorParallel;
     mirrored_fixture.config.mtp.terminal_head_policy =
         MTPTerminalHeadPolicy::MirroredFullVocabulary;
     mirrored_fixture.config.lm_head_column_parallel = true;
@@ -2072,6 +2087,8 @@ TEST(Test__MTPGraphConstruction,
     ScriptedGlobalTPContext global_tp;
 
     fixture.config.mtp.enabled = true;
+    fixture.config.mtp.sidecar_dense_policy =
+        MTPSidecarDensePolicy::TensorParallel;
     fixture.config.mtp.terminal_head_policy =
         MTPTerminalHeadPolicy::MirroredFullVocabulary;
     fixture.config.lm_head_column_parallel = true;
@@ -2642,6 +2659,252 @@ TEST(Test__MTPGraphConstruction, PhaseSplitKVOnlySidecarUsesMTPFullPrefillBuffer
     EXPECT_FALSE(contractReads(kv_append_contract, BufferId::V_FULL_PREFILL));
     EXPECT_TRUE(hasDependency(graph, "MTP0_tp_kv_state_allgather", "MTP0_k_rope"));
     EXPECT_TRUE(hasDependency(graph, "MTP0_kv_append", "MTP0_tp_kv_state_allgather"));
+}
+
+/**
+ * @brief A replicated predictor appends its complete KV row without a TP handoff.
+ *
+ * Shifted MTP prefill can share a rank-local TP context with the primary model,
+ * while its typed sidecar policy binds a complete attention block on every
+ * participant.  This regression proves that graph construction follows that
+ * ownership policy: it must not reinterpret the full projection as a compact
+ * TP shard or all-gather duplicate head prefixes into the shifted cache.
+ */
+TEST(Test__MTPGraphConstruction,
+     ReplicatedKVOnlySidecarPublishesFullProjectionDirectly)
+{
+    DenseMTPGraphFixture fixture;
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices(
+        {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setRawAllgatherGraphCaptureSupported(true);
+
+    fixture.config.default_device = DeviceId::cuda(0);
+    fixture.config.tp_ctx = tp_ctx.get();
+    fixture.config.tp_device_idx = 0;
+    fixture.config.dense_tp_enabled = true;
+    fixture.config.dense_tp_decode_replicated = true;
+    fixture.config.qkv_column_parallel = true;
+    fixture.config.local_n_heads = fixture.config.n_heads / 2;
+    fixture.config.local_n_kv_heads = fixture.config.n_kv_heads / 2;
+    fixture.config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/2,
+            fixture.config.n_heads,
+            fixture.config.n_kv_heads,
+            fixture.config.d_ff,
+            fixture.config.vocab_size));
+    fixture.config.mtp.enabled = true;
+    fixture.config.mtp.draft_tokens = 15;
+    fixture.config.mtp.sidecar_dense_policy =
+        MTPSidecarDensePolicy::ReplicatedPerParticipant;
+
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+    WeightBinding decode_embedding;
+    decode_embedding.tensor = fixture.embedding_table.get();
+    ModelWeightBindings decode_bindings =
+        makeDecodeReplicatedDenseBindingSource();
+    decode_bindings.embedding_table = &decode_embedding;
+    graph_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
+
+    const std::array<int, 2> draft_tokens = {17, 23};
+    const std::array<int, 2> positions = {5, 6};
+    auto input = fixture.input();
+    input.kv_cache_only = true;
+    input.seq_len = 2;
+    input.batch_size = 1;
+    input.device = DeviceId::cuda(0);
+    input.draft_token_ids = draft_tokens.data();
+    input.position_ids = positions.data();
+
+    auto output = fixture.output();
+    output.logits = nullptr;
+    output.hidden = nullptr;
+    output.attn_output = nullptr;
+    output.attn_proj = nullptr;
+    output.gate = nullptr;
+    output.up = nullptr;
+    output.ffn_output = nullptr;
+
+    ComputeGraph graph = graph_builder.buildMTPGraph(
+        /*depth_idx=*/0,
+        fixture.mtpWeights(),
+        input,
+        output);
+
+    ASSERT_GT(graph.size(), 0u);
+    EXPECT_EQ(graph.getNode("MTP0_tp_kv_state_allgather"), nullptr);
+
+    const auto *append_node = graph.getNode("MTP0_kv_append");
+    ASSERT_NE(append_node, nullptr);
+    const auto *append =
+        dynamic_cast<const KVCacheAppendStage *>(append_node->stage.get());
+    ASSERT_NE(append, nullptr);
+    EXPECT_EQ(append->getParams().K, output.k);
+    EXPECT_EQ(append->getParams().V, output.v);
+    ASSERT_TRUE(append->getParams().k_buffer_id.has_value());
+    ASSERT_TRUE(append->getParams().v_buffer_id.has_value());
+    EXPECT_EQ(*append->getParams().k_buffer_id, BufferId::MTP_K_PROJ);
+    EXPECT_EQ(*append->getParams().v_buffer_id, BufferId::MTP_V_PROJ);
+
+    const auto append_contract = append_node->stage->bufferContract();
+    EXPECT_TRUE(contractReads(append_contract, BufferId::MTP_K_PROJ));
+    EXPECT_TRUE(contractReads(append_contract, BufferId::MTP_V_PROJ));
+    EXPECT_FALSE(contractReads(append_contract, BufferId::MTP_K_FULL_PREFILL));
+    EXPECT_FALSE(contractReads(append_contract, BufferId::MTP_V_FULL_PREFILL));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_kv_append", "MTP0_k_rope"));
+}
+
+/**
+ * @brief Integrated shifted prefill cannot seed a replicated cache from TP shards.
+ *
+ * The main forward builder naturally carries its primary TP-local MTP binding
+ * when it appends the shifted-prefill transaction. The typed MTP graph entry
+ * point must replace that view with the installed auxiliary full-width binding
+ * before constructing the K/V projection. Otherwise each participant writes
+ * only its own compact head prefix into a full replicated cache row.
+ */
+TEST(Test__MTPGraphConstruction,
+     ReplicatedKVOnlySidecarSelectsAuxiliaryFullBindingOverPrimaryShard)
+{
+    DenseMTPGraphFixture fixture;
+    GraphConstructionTPContext tp_ctx;
+    fixture.config.tp_ctx = &tp_ctx;
+    fixture.config.dense_tp_enabled = true;
+    fixture.config.dense_tp_decode_replicated = true;
+    fixture.config.qkv_column_parallel = true;
+    fixture.config.local_n_heads = fixture.config.n_heads / 2;
+    fixture.config.local_n_kv_heads = fixture.config.n_kv_heads / 2;
+    fixture.config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/2,
+            fixture.config.n_heads,
+            fixture.config.n_kv_heads,
+            fixture.config.d_ff,
+            fixture.config.vocab_size));
+    fixture.config.mtp.enabled = true;
+    fixture.config.mtp.draft_tokens = 15;
+    fixture.config.mtp.sidecar_dense_policy =
+        MTPSidecarDensePolicy::ReplicatedPerParticipant;
+
+    const size_t d = static_cast<size_t>(fixture.config.d_model);
+    const size_t local_kv_dim = static_cast<size_t>(
+        fixture.config.local_n_kv_heads * fixture.config.head_dim);
+    auto primary_wk =
+        TestTensorFactory::createFP32Random({local_kv_dim, d});
+    auto primary_wv =
+        TestTensorFactory::createFP32Random({local_kv_dim, d});
+
+    auto binding = [](TensorBase *tensor)
+    {
+        WeightBinding result;
+        result.tensor = tensor;
+        return result;
+    };
+    WeightBinding fc = binding(fixture.fc.get());
+    WeightBinding pre_hidden = binding(fixture.pre_hidden_norm.get());
+    WeightBinding pre_embedding = binding(fixture.pre_embedding_norm.get());
+    WeightBinding final_norm = binding(fixture.final_norm.get());
+    WeightBinding attn_norm = binding(fixture.attn_norm.get());
+    WeightBinding wq = binding(fixture.wq.get());
+    WeightBinding sharded_wk = binding(primary_wk.get());
+    WeightBinding sharded_wv = binding(primary_wv.get());
+    WeightBinding full_wk = binding(fixture.wk.get());
+    WeightBinding full_wv = binding(fixture.wv.get());
+    WeightBinding wo = binding(fixture.wo.get());
+    WeightBinding q_norm = binding(fixture.q_norm.get());
+    WeightBinding k_norm = binding(fixture.k_norm.get());
+    WeightBinding ffn_norm = binding(fixture.ffn_norm.get());
+    WeightBinding gate = binding(fixture.gate_proj.get());
+    WeightBinding up = binding(fixture.up_proj.get());
+    WeightBinding down = binding(fixture.down_proj.get());
+    WeightBinding decode_embedding = binding(fixture.embedding_table.get());
+
+    MTPDepthWeightBindings primary;
+    primary.depth_index = 0;
+    primary.source_layer_index = 64;
+    primary.nextn_block_layout = true;
+    primary.fc = &fc;
+    primary.pre_fc_norm_hidden = &pre_hidden;
+    primary.pre_fc_norm_embedding = &pre_embedding;
+    primary.final_norm = &final_norm;
+    primary.fa_block.attn_norm = &attn_norm;
+    primary.fa_block.wq = &wq;
+    primary.fa_block.wk = &sharded_wk;
+    primary.fa_block.wv = &sharded_wv;
+    primary.fa_block.wo = &wo;
+    primary.fa_block.q_norm = &q_norm;
+    primary.fa_block.k_norm = &k_norm;
+    primary.fa_block.ffn_norm = &ffn_norm;
+    primary.fa_block.gate_proj = &gate;
+    primary.fa_block.up_proj = &up;
+    primary.fa_block.down_proj = &down;
+
+    MTPDepthWeightBindings replicated = primary;
+    replicated.fa_block.wk = &full_wk;
+    replicated.fa_block.wv = &full_wv;
+
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+    ModelWeightBindings auxiliary =
+        makeDecodeReplicatedDenseBindingSource();
+    auxiliary.embedding_table = &decode_embedding;
+    auxiliary.mtp.depth = 1;
+    auxiliary.mtp.depths.push_back(replicated);
+    graph_builder.setDecodeReplicatedDenseWeightBindings(auxiliary);
+
+    auto input = fixture.input();
+    input.kv_cache_only = true;
+    auto output = fixture.output();
+    output.logits = nullptr;
+    output.hidden = nullptr;
+    output.q = nullptr;
+    output.q_raw = nullptr;
+    output.q_gate = nullptr;
+    output.attn_output = nullptr;
+    output.attn_proj = nullptr;
+    output.gate = nullptr;
+    output.up = nullptr;
+    output.ffn_output = nullptr;
+
+    ComputeGraph graph = graph_builder.buildMTPGraph(
+        /*depth_idx=*/0,
+        primary,
+        input,
+        output);
+
+    const ComputeNode *projection = graph.getNode("MTP0_kv_proj");
+    ASSERT_NE(projection, nullptr);
+    const StageDumpInfo dump = projection->stage->getDumpInfoSnapshot();
+    const auto wk = std::find_if(
+        dump.weights.begin(),
+        dump.weights.end(),
+        [](const StageDumpInfo::WeightBuffer &weight)
+        {
+            return weight.name && std::string_view(weight.name) == "wk";
+        });
+    const auto wv = std::find_if(
+        dump.weights.begin(),
+        dump.weights.end(),
+        [](const StageDumpInfo::WeightBuffer &weight)
+        {
+            return weight.name && std::string_view(weight.name) == "wv";
+        });
+    ASSERT_NE(wk, dump.weights.end());
+    ASSERT_NE(wv, dump.weights.end());
+    EXPECT_EQ(wk->tensor, fixture.wk.get());
+    EXPECT_EQ(wv->tensor, fixture.wv.get());
+    EXPECT_NE(wk->tensor, primary_wk.get());
+    EXPECT_NE(wv->tensor, primary_wv.get());
+    EXPECT_EQ(
+        dumpScalarInt(dump, "n_k"),
+        fixture.config.n_kv_heads * fixture.config.head_dim);
+    EXPECT_EQ(
+        dumpScalarInt(dump, "n_v"),
+        fixture.config.n_kv_heads * fixture.config.head_dim);
+    EXPECT_EQ(graph.getNode("MTP0_tp_kv_state_allgather"), nullptr);
 }
 
 TEST(Test__MTPGraphConstruction, BuildsMultiRowKVOnlyQwen35SidecarGraphForShiftedCacheCatchup)
@@ -3226,6 +3489,150 @@ TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWei
     EXPECT_TRUE(hasDependency(graph, "MTP0_ffn_residual", "MTP0_down_allreduce"));
 }
 
+/**
+ * @brief A replicated predictor is local while embedding/head policy stays TP.
+ *
+ * This is the lifecycle boundary exercised by deep recursive MTP: the compact
+ * sidecar's row-parallel reductions disappear, but independently sharded token
+ * embedding and terminal vocabulary ownership must not be inferred from that
+ * choice. Missing auxiliary bindings are rejected before a graph is emitted.
+ */
+TEST(Test__MTPGraphConstruction,
+     ReplicatedPredictorOmitsDenseCollectivesWithoutChangingEmbeddingOrHead)
+{
+    DenseMTPGraphFixture fixture;
+    GraphConstructionTPContext tp_ctx;
+    fixture.config.tp_ctx = &tp_ctx;
+    fixture.config.dense_tp_enabled = true;
+    fixture.config.qkv_column_parallel = true;
+    fixture.config.local_n_heads = fixture.config.n_heads / 2;
+    fixture.config.local_n_kv_heads = fixture.config.n_kv_heads / 2;
+    fixture.config.head_start = fixture.config.local_n_heads;
+    fixture.config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/2,
+            fixture.config.n_heads,
+            fixture.config.n_kv_heads,
+            fixture.config.d_ff,
+            fixture.config.vocab_size));
+    fixture.config.mtp.enabled = true;
+    fixture.config.mtp.draft_tokens = 15;
+    fixture.config.mtp.sidecar_dense_policy =
+        MTPSidecarDensePolicy::ReplicatedPerParticipant;
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.vocab_local = fixture.config.vocab_size / 2;
+    fixture.embedding_table = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(fixture.config.vocab_local),
+         static_cast<size_t>(fixture.config.d_model)});
+    fixture.lm_head = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(fixture.config.vocab_local),
+         static_cast<size_t>(fixture.config.d_model)});
+
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    const size_t d = static_cast<size_t>(fixture.config.d_model);
+    const size_t q_dim = static_cast<size_t>(
+        fixture.config.n_heads * fixture.config.head_dim);
+    const size_t ff = static_cast<size_t>(fixture.config.d_ff);
+    auto wo_slice = makeRowParallelSlice(
+        TestTensorFactory::createFP32Random(
+            {d, q_dim}, -0.02f, 0.02f, 511));
+    auto down_slice = makeRowParallelSlice(
+        TestTensorFactory::createFP32Random(
+            {d, ff}, -0.02f, 0.02f, 512));
+    auto weights = fixture.mtpWeights();
+    weights.fa_block.wo = wo_slice.get();
+    weights.fa_block.down_proj = down_slice.get();
+    auto input = fixture.input();
+    auto output = fixture.output();
+
+    EXPECT_THROW(
+        (void)graph_builder.buildMTPGraph(0, weights, input, output),
+        std::runtime_error)
+        << "a retained replicated predictor cannot silently read TP bindings";
+
+    graph_builder.setDecodeReplicatedDenseWeightBindings(
+        makeDecodeReplicatedDenseBindingSource());
+    ComputeGraph graph = graph_builder.buildMTPGraph(
+        0, weights, input, output);
+
+    ASSERT_GT(graph.size(), 0u);
+    EXPECT_EQ(graph.getNode("MTP0_wo_allreduce"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_down_allreduce"), nullptr);
+
+    const auto *attention_node = graph.getNode("MTP0_attention");
+    ASSERT_NE(attention_node, nullptr);
+    const auto *attention = dynamic_cast<const AttentionComputeStage *>(
+        attention_node->stage.get());
+    ASSERT_NE(attention, nullptr);
+    EXPECT_EQ(attention->getParams().n_heads, fixture.config.n_heads);
+    EXPECT_EQ(attention->getParams().n_kv_heads, fixture.config.n_kv_heads);
+    EXPECT_EQ(attention->getParams().head_start, 0)
+        << "replicated MTP predictors must not retain the participant-local "
+           "primary-model Q-head offset";
+
+    const auto *embedding_allreduce =
+        graph.getNode("mtp0_embedding_allreduce");
+    ASSERT_NE(embedding_allreduce, nullptr)
+        << "replicating the predictor must not mirror the embedding table";
+    EXPECT_EQ(
+        embedding_allreduce->stage->type(),
+        ComputeStageType::ALLREDUCE);
+
+    const auto *lm_head = graph.getNode("mtp0_lm_head");
+    ASSERT_NE(lm_head, nullptr);
+    EXPECT_EQ(
+        dumpScalarInt(lm_head->stage->getDumpInfoSnapshot(), "vocab_size"),
+        fixture.config.vocab_local)
+        << "replicating the predictor must not override a vocabulary-sharded head";
+}
+
+/** @brief Sidecar placement is typed, total, and retained-capacity aware. */
+TEST(Test__MTPGraphConstruction,
+     ReplicatedPredictorPolicyRequiresTPAndRetainedMTPGraphs)
+{
+    MTPRuntimeConfig runtime;
+    EXPECT_EQ(
+        runtime.sidecar_dense_policy,
+        MTPSidecarDensePolicy::ReplicatedPerParticipant);
+    EXPECT_STREQ(
+        mtpSidecarDensePolicyToString(runtime.sidecar_dense_policy),
+        "replicated-per-participant");
+    EXPECT_EQ(
+        parseMTPSidecarDensePolicy("tensor_parallel"),
+        MTPSidecarDensePolicy::TensorParallel);
+    EXPECT_EQ(
+        parseMTPSidecarDensePolicy("replicated-per-participant"),
+        MTPSidecarDensePolicy::ReplicatedPerParticipant);
+    EXPECT_FALSE(parseMTPSidecarDensePolicy("implicit-fallback").has_value());
+
+    GraphConfig config;
+    config.mtp = runtime;
+    EXPECT_FALSE(config.mtpUsesReplicatedDenseSidecarBinding());
+
+    config.dense_tp_enabled = true;
+    EXPECT_FALSE(config.mtpUsesReplicatedDenseSidecarBinding());
+
+    config.mtp.enabled = true;
+    EXPECT_FALSE(config.mtpUsesReplicatedDenseSidecarBinding());
+
+    config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/2,
+            /*n_heads=*/4,
+            /*n_kv_heads=*/2,
+            /*d_ff=*/128,
+            /*vocab_size=*/1000));
+    EXPECT_TRUE(config.mtpUsesReplicatedDenseSidecarBinding());
+
+    config.mtp.sidecar_dense_policy =
+        MTPSidecarDensePolicy::TensorParallel;
+    EXPECT_FALSE(config.mtpUsesReplicatedDenseSidecarBinding());
+}
+
 TEST(Test__MTPGraphConstruction, DenseSidecarAllreducesVocabParallelEmbedding)
 {
     DenseMTPGraphFixture fixture;
@@ -3427,6 +3834,84 @@ TEST(Test__MTPGraphConstruction,
     EXPECT_EQ(
         typed_stage->serialEquivalentPartitionWidthForTesting(),
         fixture.config.vocab_local);
+}
+
+/**
+ * @test Uneven LocalTP vocabulary ownership has one mirrored-head policy.
+ *
+ * Vocabulary size 128 leaves a remainder at TP=3. The typed assignments are
+ * 43/43/42, so every full-vocabulary mirrored head must select 43 as the
+ * canonical serial arithmetic width rather than rejecting rank 2's shorter
+ * shard or deriving a different policy on each participant.
+ */
+TEST(Test__MTPGraphConstruction,
+     LocalTPMirroredHeadUsesCanonicalVocabularyWidthForUnevenTP3)
+{
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    MockLocalTPContext local_tp;
+    local_tp.setDevices(
+        {GlobalDeviceAddress::cpu(0),
+         GlobalDeviceAddress::cpu(1),
+         GlobalDeviceAddress::cpu(2)});
+    local_tp.setBackend(CollectiveBackendType::HOST);
+
+    fixture.config.mtp.enabled = false;
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.tp_ctx = &local_tp;
+    fixture.config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/3,
+            fixture.config.n_heads,
+            fixture.config.n_kv_heads,
+            fixture.config.d_ff,
+            fixture.config.vocab_size));
+    fixture.config.local_rank = 2;
+    fixture.config.tp_device_idx = 2;
+    fixture.config.vocab_local =
+        fixture.config.tp_config->forRank(2).vocab_count;
+
+    ASSERT_EQ(fixture.config.tp_config->forRank(0).vocab_count, 43);
+    ASSERT_EQ(fixture.config.tp_config->forRank(1).vocab_count, 43);
+    ASSERT_EQ(fixture.config.tp_config->forRank(2).vocab_count, 42);
+
+    QwenStandardGraph graph_builder(fixture.config, fixture.mpi);
+    ModelWeights weights = fixture.modelWeights();
+    graph_builder.setWeights(weights);
+
+    WeightBinding mirrored_final_norm;
+    mirrored_final_norm.tensor = weights.final_norm;
+    WeightBinding mirrored_lm_head;
+    mirrored_lm_head.tensor = weights.lm_head;
+    ModelWeightBindings mirrored_bindings;
+    mirrored_bindings.final_norm = &mirrored_final_norm;
+    mirrored_bindings.lm_head = &mirrored_lm_head;
+    graph_builder.setDecodeReplicatedDenseWeightBindings(mirrored_bindings);
+
+    auto hidden = TestTensorFactory::createFP32(
+        {1, static_cast<size_t>(fixture.config.d_model)});
+    auto logits = TestTensorFactory::createFP32(
+        {1, static_cast<size_t>(fixture.config.vocab_size)});
+    auto logits_local = TestTensorFactory::createFP32(
+        {1, static_cast<size_t>(fixture.config.vocab_local)});
+
+    ComputeGraph graph = graph_builder.buildLMHeadGraph(
+        hidden.get(),
+        logits.get(),
+        /*total_tokens=*/1,
+        DeviceId::cpu(),
+        logits_local.get());
+
+    const auto *const lm_head = graph.getNode("lm_head");
+    ASSERT_NE(lm_head, nullptr);
+    ASSERT_NE(lm_head->stage, nullptr);
+    const auto *const typed_stage =
+        dynamic_cast<const LMHeadStage *>(lm_head->stage.get());
+    ASSERT_NE(typed_stage, nullptr);
+    EXPECT_EQ(
+        typed_stage->serialEquivalentPartitionWidthForTesting(),
+        43);
 }
 
 TEST(Test__MTPGraphConstruction, PhaseSplitVerifierLMHeadUsesReplicatedFullVocabDecodeBinding)
@@ -3995,6 +4480,14 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
 
     EXPECT_EQ(graph.getNode("MTP0_moe_routing")->stage->type(), ComputeStageType::MOE_ROUTER);
     EXPECT_EQ(graph.getNode("MTP0_moe_expert_ffn")->stage->type(), ComputeStageType::MOE_EXPERT_FFN);
+    const auto *const direct_expert =
+        dynamic_cast<const MoEExpertComputeStage *>(
+            graph.getNode("MTP0_moe_expert_ffn")->stage.get());
+    ASSERT_NE(direct_expert, nullptr);
+    EXPECT_EQ(
+        direct_expert->serviceTelemetryPhaseHintForTesting(),
+        MoEOverlayServicePhaseHint::GroupedVerifier)
+        << "The direct continuation fast path shares the sidecar's typed MTP phase";
 
     const auto ffn_norm_contract = graph.getNode("MTP0_ffn_norm")->stage->bufferContract();
     EXPECT_TRUE(contractReads(ffn_norm_contract, BufferId::MTP_ATTN_PROJ));
@@ -4092,6 +4585,10 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarFromRegistryWithoutRawEx
     EXPECT_EQ(
         local_expert->params().expert_weight_resolution_policy,
         MoELocalExpertStage::ExpertWeightResolutionPolicy::RegistryOnly);
+    EXPECT_EQ(
+        local_expert->params().service_phase,
+        MoEOverlayServicePhaseHint::GroupedVerifier)
+        << "A one-row MTP sidecar is MTP-routed service, not serial decode";
 }
 
 TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespace)
@@ -6216,6 +6713,93 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
     EXPECT_NE(findMTPRecordContaining(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
               nullptr);
     PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Production checkpoint preallocation must materialize its exact BOM.
+ *
+ * This tiny full-attention model has no recurrent payload, so each retained
+ * rollback set owns exactly one terminal-hidden row. It makes the expected
+ * byte count transparent while exercising the real production Dependencies
+ * constructor and checkpoint-pool initialization rather than a ledger mock.
+ */
+TEST(Test__MTPGraphConstruction,
+     ProductionCPUCheckpointPoolClaimsAndReleasesExactBytes)
+{
+    DeviceManager::instance().initialize(-1, false);
+    TinyQwen35MTPForwardFixture fixture;
+    const size_t expected_checkpoint_bytes =
+        kMTPConcurrentLiveCheckpointSets *
+        static_cast<size_t>(fixture.config.d_model) * sizeof(float);
+    const size_t expected_kv_bytes =
+        KVCacheMemoryEstimator::estimate(
+            /*main plus shifted full-attention layers=*/2,
+            /*batch_size=*/1,
+            fixture.config.max_seq_len,
+            fixture.config.n_kv_heads,
+            fixture.config.head_dim,
+            "fp32",
+            DeviceId::cpu());
+
+    PhysicalMemoryBOMBuilder bom({
+        .world_rank = 0,
+        .device = DeviceId::cpu(),
+        .total_bytes = 1u << 30u,
+        .admission_available_bytes = 1u << 30u,
+    });
+    bom.add(
+        PhysicalMemoryOwner::RecurrentCheckpointState,
+        expected_checkpoint_bytes)
+        .add(PhysicalMemoryOwner::KVCache, expected_kv_bytes);
+    PhysicalMemoryPlanBuilder plan_builder;
+    plan_builder.add(bom.build());
+    auto certificate = std::make_shared<
+        const PhysicalMemoryPlanAdmissionCertificate>(
+        plan_builder.build());
+    auto authority = std::make_shared<PhysicalMemoryAuthority>(
+        certificate,
+        /*world_rank=*/0);
+
+    {
+        auto graph_builder =
+            std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+        DeviceGraphOrchestrator::Dependencies deps;
+        deps.model_ctx = test::MockModelContext::createMinimal();
+        deps.graph_builder = graph_builder;
+        deps.mpi_ctx = fixture.mpi;
+        deps.physical_memory_authority = authority;
+        DeviceGraphOrchestrator orchestrator(std::move(deps));
+
+        ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+            /*batch_size=*/1,
+            fixture.config.max_seq_len,
+            DeviceId::cpu()));
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::cpu(),
+                PhysicalMemoryOwner::RecurrentCheckpointState,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            expected_checkpoint_bytes);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::cpu(),
+                PhysicalMemoryOwner::KVCache,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            expected_kv_bytes);
+    }
+
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::RecurrentCheckpointState,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::KVCache,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
 }
 
 TEST(Test__MTPGraphConstruction, CPUReplayObservationsTrackLiveStateEpochAcrossRestore)

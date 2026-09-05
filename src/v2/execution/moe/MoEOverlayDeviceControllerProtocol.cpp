@@ -40,7 +40,19 @@ namespace llaminar2
                    kind == MoEOverlayDeviceControllerTransactionKind::
                                DynamicPlacement ||
                    kind == MoEOverlayDeviceControllerTransactionKind::
-                               CurrentBatchLLEP;
+                               CurrentBatchLLEP ||
+                   kind == MoEOverlayDeviceControllerTransactionKind::
+                               PreparedContextRestore;
+        }
+
+        /** Return whether @p kind advances one durable placement epoch. */
+        bool durablePlacementKind(
+            MoEOverlayDeviceControllerTransactionKind kind) noexcept
+        {
+            return kind == MoEOverlayDeviceControllerTransactionKind::
+                               DynamicPlacement ||
+                   kind == MoEOverlayDeviceControllerTransactionKind::
+                               PreparedContextRestore;
         }
     } // namespace
 
@@ -133,17 +145,14 @@ namespace llaminar2
         const std::uint64_t transaction = previous + 1u;
         const std::uint64_t base = loadAcquire(header_->current_durable_epoch);
         if (base == 0u ||
-            (kind == MoEOverlayDeviceControllerTransactionKind::
-                         DynamicPlacement &&
+            (durablePlacementKind(kind) &&
              base == std::numeric_limits<std::uint64_t>::max()))
         {
             fail(MoEOverlayDeviceControllerError::EpochOverflow);
             return std::nullopt;
         }
         const std::uint64_t candidate =
-            kind == MoEOverlayDeviceControllerTransactionKind::DynamicPlacement
-                ? base + 1u
-                : base;
+            durablePlacementKind(kind) ? base + 1u : base;
 
         // Group records are group-root-owned monotonic publications. The
         // leader starts a new transaction without clearing follower words;
@@ -231,26 +240,30 @@ namespace llaminar2
         const auto kind = static_cast<
             MoEOverlayDeviceControllerTransactionKind>(
             header_->transaction_kind);
-        if ((kind ==
-                 MoEOverlayDeviceControllerTransactionKind::StaticCheck &&
-             (command_count != 0u || packed_weight_bytes != 0u)) ||
-            (kind ==
-                 MoEOverlayDeviceControllerTransactionKind::StaticCheck &&
-             (parallel_command_count != 0u || movement_round_count != 0u ||
-              hazard_count != 0u)) ||
-            (kind == MoEOverlayDeviceControllerTransactionKind::
-                         DynamicPlacement &&
-             (command_count == 0u || packed_weight_bytes == 0u)) ||
-            (kind == MoEOverlayDeviceControllerTransactionKind::
-                         CurrentBatchLLEP &&
-             command_count == 0u) ||
-            (kind !=
-                 MoEOverlayDeviceControllerTransactionKind::StaticCheck &&
-             (parallel_command_count != command_count ||
-              movement_round_count != 1u || hazard_count != 0u)))
+        const bool has_commands = command_count != 0u;
+        const bool empty_shape = !has_commands && packed_weight_bytes == 0u &&
+            parallel_command_count == 0u && movement_round_count == 0u &&
+            hazard_count == 0u;
+        const bool parallel_shape = has_commands &&
+            parallel_command_count == command_count &&
+            movement_round_count == 1u && hazard_count == 0u;
+        const bool command_shape_valid =
+            kind == MoEOverlayDeviceControllerTransactionKind::StaticCheck
+                ? empty_shape
+                : durablePlacementKind(kind)
+                ? (empty_shape || (parallel_shape && packed_weight_bytes != 0u))
+                : kind == MoEOverlayDeviceControllerTransactionKind::
+                              CurrentBatchLLEP &&
+                      parallel_shape;
+        if (!command_shape_valid)
         {
             return fail(MoEOverlayDeviceControllerError::InvalidCommand);
         }
+
+        // Durable no-op commands are positive certification receipts, but
+        // they must not manufacture an epoch that has no physical placement.
+        if (durablePlacementKind(kind) && !has_commands)
+            header_->candidate_epoch = header_->base_epoch;
 
         command_->kind = static_cast<std::uint32_t>(kind);
         command_->command_count = command_count;
@@ -398,8 +411,7 @@ namespace llaminar2
         const auto kind = static_cast<
             MoEOverlayDeviceControllerTransactionKind>(
             header_->transaction_kind);
-        if (kind ==
-            MoEOverlayDeviceControllerTransactionKind::DynamicPlacement)
+        if (durablePlacementKind(kind))
         {
             storeRelease(
                 header_->current_durable_epoch,
@@ -437,8 +449,9 @@ namespace llaminar2
         std::uint64_t transaction_id) noexcept
     {
         if (state() != MoEOverlayDeviceControllerState::Admitted ||
-            header_->transaction_kind != static_cast<std::uint32_t>(
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement) ||
+            !durablePlacementKind(static_cast<
+                MoEOverlayDeviceControllerTransactionKind>(
+                header_->transaction_kind)) ||
             loadAcquire(header_->admission_transaction) != transaction_id)
         {
             return fail(MoEOverlayDeviceControllerError::InvalidState);

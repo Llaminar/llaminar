@@ -452,6 +452,11 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     # scheduler is running that backend concurrently.  Hybrid signatures keep
     # every backend they name, so topology discovery remains production-real.
     set(_campaign_runtime_env
+        # One process amortizes immutable model preparation across several
+        # exact cells. A red cell must nevertheless end that aggregate so the
+        # outer campaign authority can cancel disjoint backend siblings before
+        # admitting any more work.
+        "GTEST_FAIL_FAST=1"
         "LLAMINAR_LOG_LEVEL=INFO"
         "LLAMINAR_PRODUCTION_PARITY=1"
         "LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN=1"

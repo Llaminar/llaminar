@@ -322,7 +322,10 @@ namespace
             RecordingMPIContext *mpi;
         };
 
-        RunnerBundle createRunner(int mpi_rank, int mpi_world_size)
+        RunnerBundle createRunner(
+            int mpi_rank,
+            int mpi_world_size,
+            int retained_mtp_draft_capacity = 0)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get();
@@ -332,8 +335,17 @@ namespace
 
             OrchestrationConfig config;
             config.device_for_this_rank = GlobalDeviceAddress::cpu();
+            config.prefix_cache.enabled = false;
+            config.prefix_cache.storage_mode =
+                PrefixCacheStorageMode::Disabled;
+            config.mtp.graph_capacity_draft_tokens =
+                retained_mtp_draft_capacity;
 
             auto plan = createPlan(mpi_rank);
+            plan.runtime.prefix_cache.enabled = false;
+            plan.runtime.prefix_cache.storage_mode =
+                PrefixCacheStorageMode::Disabled;
+            plan.runtime.mtp = config.mtp;
 
             auto runner = std::make_unique<OrchestrationRunner>(
                 std::move(config), plan, std::move(mock), mpi);
@@ -745,6 +757,51 @@ namespace
         EXPECT_EQ(mpi->broadcastCount(), 0u);
     }
 
+    TEST_F(Test__MPICoordinatedMode,
+           RetainedRunnerYieldReopensOneCommandChannel)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        ASSERT_TRUE(runner->yieldMPIWorkersForRetainedRunner())
+            << runner->lastError();
+        ASSERT_EQ(mpi->broadcastCount(), 1u);
+        EXPECT_THAT(
+            mpi->broadcasts()[0].int_data,
+            ElementsAre(static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::YIELD_RETAINED_RUNNER)));
+
+        /* The fixture boundary disables command publication while every rank
+         * independently installs its next typed request policy. Re-enabling
+         * reopens exactly the yielded lifecycle, after which terminal shutdown
+         * remains a distinct command. */
+        runner->setMPICoordinatedMode(false);
+        runner->setMPICoordinatedMode(true);
+        runner->shutdownMPIWorkers();
+
+        ASSERT_EQ(mpi->broadcastCount(), 2u);
+        EXPECT_THAT(
+            mpi->broadcasts()[1].int_data,
+            ElementsAre(static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SHUTDOWN)));
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           RetainedRunnerYieldRejectsLiveRequestState)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        const size_t broadcasts_before_yield = mpi->broadcastCount();
+
+        EXPECT_FALSE(runner->yieldMPIWorkersForRetainedRunner());
+        EXPECT_THAT(
+            runner->lastError(),
+            HasSubstr("request-owned state is reset"));
+        EXPECT_EQ(mpi->broadcastCount(), broadcasts_before_yield)
+            << "A rejected yield must not publish a partial lifecycle edge";
+    }
+
     TEST_F(Test__MPICoordinatedMode, ShutdownMPIWorkersIsIdempotent)
     {
         auto [runner, mock, mpi] = createRunner(0, 2);
@@ -1036,6 +1093,15 @@ namespace
             script_.push_back(std::move(e));
         }
 
+        /** @brief Add an exact previously recorded int32 payload. */
+        void scriptInt32(const std::vector<int32_t> &data)
+        {
+            ScriptEntry e;
+            e.type = ScriptEntry::Type::INT32;
+            e.int_data = data;
+            script_.push_back(std::move(e));
+        }
+
         /// Add a scripted float broadcast response
         void scriptFloat(std::initializer_list<float> data)
         {
@@ -1173,7 +1239,8 @@ namespace
     };
 
     static WorkerBundle createWorkerRunner(
-        std::shared_ptr<ScriptedMPIContext> scripted_mpi)
+        std::shared_ptr<ScriptedMPIContext> scripted_mpi,
+        int retained_mtp_draft_capacity = 0)
     {
         auto mock = std::make_unique<MockInferenceRunner>();
         auto *mock_ptr = mock.get();
@@ -1181,6 +1248,11 @@ namespace
 
         OrchestrationConfig config;
         config.device_for_this_rank = GlobalDeviceAddress::cpu();
+        config.prefix_cache.enabled = false;
+        config.prefix_cache.storage_mode =
+            PrefixCacheStorageMode::Disabled;
+        config.mtp.graph_capacity_draft_tokens =
+            retained_mtp_draft_capacity;
 
         RankExecutionPlan plan;
         plan.rank = scripted_mpi->rank();
@@ -1192,6 +1264,10 @@ namespace
         plan.has_embedding = true;
         plan.has_lm_head = true;
         plan.primary_device = GlobalDeviceAddress::cpu();
+        plan.runtime.prefix_cache.enabled = false;
+        plan.runtime.prefix_cache.storage_mode =
+            PrefixCacheStorageMode::Disabled;
+        plan.runtime.mtp = config.mtp;
 
         auto runner = std::make_unique<OrchestrationRunner>(
             std::move(config), plan, std::move(mock), scripted_mpi);
@@ -1209,6 +1285,146 @@ namespace
     // =========================================================================
     // Worker Loop Dispatch Tests
     // =========================================================================
+
+    TEST_F(Test__MPICoordinatedMode,
+           TypedMTPRequestPolicyRoundTripsExactlyFromRootToWorker)
+    {
+        auto root = createRunner(
+            /*mpi_rank=*/0,
+            /*mpi_world_size=*/2,
+            /*retained_mtp_draft_capacity=*/15);
+        root.runner->setMPICoordinatedMode(true);
+
+        MTPRequestPolicy policy;
+        policy.enabled = true;
+        policy.draft_tokens = 7;
+        policy.verify_mode = MTPVerifyMode::SpeculativeSampling;
+        policy.require_terminal_hidden_for_full_hit = false;
+        policy.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        policy.depth_policy.backend = MTPDepthPolicyBackend::ROCm;
+        policy.depth_policy.model_class = MTPDepthPolicyModelClass::MoE;
+        policy.depth_policy.min_depth = 1;
+        policy.depth_policy.max_depth = 15;
+        policy.depth_policy.initial_depth = 7;
+        policy.depth_policy.window_size = 19;
+        policy.depth_policy.min_samples = 5;
+        policy.depth_policy.cooldown_steps = 2;
+        policy.depth_policy.promote_consecutive_windows = 4;
+        policy.depth_policy.use_generated_policy = false;
+        policy.depth_policy.promote_full_accept_rate = 0.987654321012345;
+        policy.depth_policy.demote_zero_accept_rate = 0.234567890123456;
+        policy.depth_policy.demote_acceptance_rate = 0.543210987654321;
+
+        ASSERT_TRUE(root.runner->configureMTPRequestPolicy(policy))
+            << root.runner->lastError();
+        ASSERT_EQ(root.mpi->broadcastCount(), 2u);
+        ASSERT_THAT(
+            root.mpi->broadcasts()[0].int_data,
+            ElementsAre(static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)));
+        ASSERT_EQ(root.mpi->broadcasts()[1].int_data.size(), 22u);
+
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32(
+            {static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)});
+        scripted->scriptInt32(root.mpi->broadcasts()[1].int_data);
+        scripted->scriptInt32(
+            {static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SHUTDOWN)});
+        auto worker = createWorkerRunner(
+            scripted,
+            /*retained_mtp_draft_capacity=*/15);
+        worker.runner->runMPIWorkerLoop();
+
+        const MTPRequestPolicy installed =
+            worker.runner->mtpRequestPolicy();
+        EXPECT_EQ(installed.enabled, policy.enabled);
+        EXPECT_EQ(installed.draft_tokens, policy.draft_tokens);
+        EXPECT_EQ(installed.verify_mode, policy.verify_mode);
+        EXPECT_EQ(
+            installed.require_terminal_hidden_for_full_hit,
+            policy.require_terminal_hidden_for_full_hit);
+        EXPECT_EQ(installed.depth_policy.mode, policy.depth_policy.mode);
+        EXPECT_EQ(installed.depth_policy.backend, policy.depth_policy.backend);
+        EXPECT_EQ(
+            installed.depth_policy.model_class,
+            policy.depth_policy.model_class);
+        EXPECT_EQ(installed.depth_policy.min_depth, policy.depth_policy.min_depth);
+        EXPECT_EQ(installed.depth_policy.max_depth, policy.depth_policy.max_depth);
+        EXPECT_EQ(
+            installed.depth_policy.initial_depth,
+            policy.depth_policy.initial_depth);
+        EXPECT_EQ(installed.depth_policy.window_size, policy.depth_policy.window_size);
+        EXPECT_EQ(installed.depth_policy.min_samples, policy.depth_policy.min_samples);
+        EXPECT_EQ(
+            installed.depth_policy.cooldown_steps,
+            policy.depth_policy.cooldown_steps);
+        EXPECT_EQ(
+            installed.depth_policy.promote_consecutive_windows,
+            policy.depth_policy.promote_consecutive_windows);
+        EXPECT_EQ(
+            installed.depth_policy.use_generated_policy,
+            policy.depth_policy.use_generated_policy);
+        EXPECT_DOUBLE_EQ(
+            installed.depth_policy.promote_full_accept_rate,
+            policy.depth_policy.promote_full_accept_rate);
+        EXPECT_DOUBLE_EQ(
+            installed.depth_policy.demote_zero_accept_rate,
+            policy.depth_policy.demote_zero_accept_rate);
+        EXPECT_DOUBLE_EQ(
+            installed.depth_policy.demote_acceptance_rate,
+            policy.depth_policy.demote_acceptance_rate);
+        EXPECT_EQ(scripted->scriptPosition(), scripted->scriptSize());
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           WorkerRetainedYieldCanEnterASecondSession)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32(
+            {static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::YIELD_RETAINED_RUNNER)});
+        scripted->scriptInt32(
+            {static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SHUTDOWN)});
+
+        auto [runner, mock, mpi] = createWorkerRunner(scripted);
+        runner->runMPIWorkerLoop();
+        EXPECT_EQ(mpi->scriptPosition(), 1u);
+
+        runner->setMPICoordinatedMode(false);
+        runner->setMPICoordinatedMode(true);
+        runner->runMPIWorkerLoop();
+        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
+    }
+
+    /**
+     * @brief A malformed policy frame is terminal for a coordinated follower.
+     *
+     * Continuing after an unknown wire version could leave ranks selecting
+     * different retained graph families. The scripted context has no live MPI
+     * communicator, so the production fatal path throws instead of aborting
+     * the test process.
+     */
+    TEST_F(Test__MPICoordinatedMode,
+           TypedMTPRequestPolicyRejectsUnknownWireVersionFatally)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32(
+            {static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)});
+        std::vector<int32_t> malformed(22u, 0);
+        malformed[0] = 99;
+        scripted->scriptInt32(malformed);
+
+        auto worker = createWorkerRunner(
+            scripted,
+            /*retained_mtp_draft_capacity=*/15);
+        EXPECT_THROW(worker.runner->runMPIWorkerLoop(), std::runtime_error);
+        EXPECT_FALSE(worker.runner->mtpRequestPolicy().enabled);
+        EXPECT_EQ(scripted->scriptPosition(), scripted->scriptSize());
+    }
 
     TEST_F(Test__MPICoordinatedMode, WorkerLoopDispatchesClearCache)
     {

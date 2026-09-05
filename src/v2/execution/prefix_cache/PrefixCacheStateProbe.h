@@ -202,7 +202,13 @@ namespace llaminar2
          */
         bool capture_terminal_logits_values = false;
 
-        /// Retain raw CPU-owned GDN values for tolerance-aware diagnostics.
+        /**
+         * @brief Retain complete authoritative FP32 GDN values.
+         *
+         * CPU caches copy their host-owned state. GPU caches reuse the same
+         * explicit-stream device export used for hashing and select the full
+         * replicated decode bank rather than a stale host mirror.
+         */
         bool capture_gdn_values = false;
 
         /**
@@ -260,10 +266,10 @@ namespace llaminar2
          * @brief Optional raw state copies for deep verifier-state diagnostics.
          *
          * Normal prefix probes only carry hashes so request summaries stay
-         * cheap.  Setting LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES=1 asks the
-         * probe to copy full FP32 GDN state into these vectors, which is useful
-         * for parity tests that need tolerance-aware comparisons between
-         * decode-equivalent state publication and serial decode.
+         * cheap. Setting LLAMINAR_PREFIX_PROBE_CAPTURE_GDN_VALUES=1 asks the
+         * probe to copy the complete authoritative FP32 bank into these
+         * vectors. On GPU this is the full replicated decode bank exported on
+         * the probe's exact stream, never the potentially stale host mirror.
          */
         std::vector<float> recurrence_sample_values;
         std::vector<float> conv_sample_values;

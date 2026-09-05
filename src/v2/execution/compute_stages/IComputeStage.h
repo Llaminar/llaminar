@@ -390,7 +390,6 @@ namespace llaminar2
         GDN_PROJECTION,        ///< 4 separate GEMMs: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b
         SHORT_CONV1D,          ///< Causal depthwise conv1d (kernel=4) + SiLU
         GDN_RECURRENCE,        ///< Delta rule recurrence (chunk prefill, single-step decode)
-        GDN_LIVE_STATE_LOCALIZE,  ///< Slice mirrored GDN state into TP-local verifier state
         GDN_LIVE_STATE_ALLGATHER, ///< Gather TP-local GDN state into mirrored decode state
 
         /** Captured device publication of the current long-prefill request bucket. */
@@ -632,6 +631,56 @@ namespace llaminar2
     {
         Capture,
         Replay,
+    };
+
+    /**
+     * @brief Typed lifecycle transition around one native graph recording.
+     *
+     * Launch preparation establishes immutable resources before capture, but
+     * a background authority may also need to know when an admitted stream is
+     * temporarily unavailable for external event publication.  Entering is
+     * delivered immediately before the backend `beginCapture()` call. Exactly
+     * one Completed or Aborted transition follows every successful Entering,
+     * including when backend capture itself refuses to start.
+     */
+    enum class GraphCaptureActivityTransition : uint8_t
+    {
+        Entering = 0, ///< The exact stage stream is about to enter native capture.
+        Completed,   ///< Native capture closed and the recorded unit is retained.
+        Aborted,     ///< Capture did not produce a usable retained unit.
+    };
+
+    /**
+     * @brief Declare how one intentional manual graph boundary is scheduled.
+     *
+     * Most manual stages sit between separately submitted native executables;
+     * their host completion is therefore the launch permission for the next
+     * executable. A retained heterogeneous ticket transaction is different:
+     * one complete GPU parent is submitted first and its captured consumers
+     * wait on mapped, release/acquire ticket state while the rank worker
+     * services CPU stages. Only stages whose complete protocol has that exact
+     * property may select @ref ConcurrentTicketService.
+     */
+    enum class ManualGraphBoundaryScheduling : uint8_t
+    {
+        BetweenExecutableLaunches = 0, ///< Host completion precedes the next native launch.
+        ConcurrentTicketService, ///< Pre-armed host work overlaps one retained parent submission.
+    };
+
+    /**
+     * @brief Failure-drain role within a concurrent manual ticket service.
+     *
+     * A retained parent may already be waiting on a mapped return ticket when
+     * CPU execution fails. Exactly the stages that own such a return
+     * publication advertise @ref DeviceIngressPublisher. The executor asks
+     * every advertised publisher to release its consumer with an authenticated
+     * abort record before fencing the failed parent. Other service stages do
+     * not own a device-visible terminal and therefore advertise @ref None.
+     */
+    enum class ConcurrentManualFailureRole : uint8_t
+    {
+        None = 0,
+        DeviceIngressPublisher,
     };
 
     /**
@@ -1164,6 +1213,49 @@ namespace llaminar2
         virtual bool manualGraphBoundaryComplete() const { return true; }
 
         /**
+         * @brief Return the exact scheduling contract for this manual stage.
+         *
+         * The conservative default keeps the stage between native launches.
+         * Selecting concurrent service requires immutable mapped ticket
+         * addresses, a captured device-side wait, and no arena-owned payload
+         * dependency that would otherwise rely on host sequencing.
+         */
+        virtual ManualGraphBoundaryScheduling
+        manualGraphBoundaryScheduling() const noexcept
+        {
+            return ManualGraphBoundaryScheduling::BetweenExecutableLaunches;
+        }
+
+        /**
+         * @brief Identify whether this stage can release a waiting parent on failure.
+         *
+         * This is meaningful only for @ref ConcurrentTicketService stages.
+         * The executor rejects a concurrent manual unit with no device-ingress
+         * publisher, preventing a CPU error from stranding a retained GPU graph.
+         */
+        virtual ConcurrentManualFailureRole
+        concurrentManualFailureRole() const noexcept
+        {
+            return ConcurrentManualFailureRole::None;
+        }
+
+        /**
+         * @brief Publish an authenticated abort for this stage's device ingress.
+         *
+         * The default rejects the operation. A stage advertising
+         * @ref ConcurrentManualFailureRole::DeviceIngressPublisher must
+         * override it and make the call idempotent for a payload already
+         * published successfully in the current transaction.
+         *
+         * @return True when the captured consumer is guaranteed to make
+         *         progress; false when the parent cannot be drained safely.
+         */
+        virtual bool publishConcurrentManualFailure() noexcept
+        {
+            return false;
+        }
+
+        /**
          * @brief True when the stage captured mutable verifier-row state.
          *
          * MTP verifier forwards may compute multiple candidate rows in one
@@ -1347,40 +1439,6 @@ namespace llaminar2
          * while clearing only the verifier-capture binding.
          */
         virtual void clearVerifierStateCaptureBindingAfterPublication() {}
-
-        /**
-         * @brief True when this stage must publish derived live state after verifier-row restore.
-         *
-         * Not every live-state mutation owns verifier capture slots directly.  A
-         * graph may restore TP-local recurrent state from captured rows and then
-         * run a later handoff stage that derives the mirrored decode state consumed
-         * by the next token.  Such stages return true here so the MTP publisher
-         * invokes publishPostVerifierStateRestore() in graph order instead of
-         * treating the stage as an irrelevant non-capturing node.
-         *
-         * This hook is intentionally separate from hasVerifierStateCapture(): it
-         * represents derived publication from already-restored state, not another
-         * verifier row snapshot owner.
-         */
-        virtual bool requiresPostVerifierStatePublication() const { return false; }
-
-        /**
-         * @brief Publish derived live state after accepted verifier rows are restored.
-         *
-         * The MTP publisher calls this on the same stream used for row restoration
-         * and before the runner records publication readiness.  Implementations
-         * must enqueue only deterministic state handoffs derived from the accepted
-         * restored state; they must not perform host fallback replay or mutate
-         * unrelated graph outputs.
-         *
-         * @param stream Explicit GPU stream for GPU stages, or nullptr for CPU-only stages.
-         * @return true when the derived live state was published successfully.
-         */
-        virtual bool publishPostVerifierStateRestore(void *stream = nullptr)
-        {
-            (void)stream;
-            return true;
-        }
 
         /**
          * @brief Whether this stage allows all-zero output tensors
@@ -1831,6 +1889,33 @@ namespace llaminar2
         virtual GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const
         {
             return GraphLaunchPreparationPolicy::None;
+        }
+
+        /**
+         * @brief Publish a typed native-capture activity transition.
+         *
+         * Most stages own no resource that can be touched by a background
+         * thread, so the default is a no-op. A stage that lends its exact
+         * capture stream to another authority must override this method and
+         * make the Entering-to-terminal transition exception safe. The method
+         * must not allocate device memory, synchronize a stream/device, or
+         * submit model arithmetic.
+         *
+         * @param ctx Device context that owns the capture.
+         * @param stream Exact non-null native capture stream.
+         * @param transition Lifecycle edge being published.
+         * @return true when the transition was accepted by every stage-owned
+         *         authority.
+         */
+        virtual bool transitionGraphCaptureActivity(
+            IDeviceContext *ctx,
+            void *stream,
+            GraphCaptureActivityTransition transition)
+        {
+            (void)ctx;
+            (void)stream;
+            (void)transition;
+            return true;
         }
 
     protected:

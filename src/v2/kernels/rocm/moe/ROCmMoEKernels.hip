@@ -1750,14 +1750,52 @@ namespace
 
     __device__ __forceinline__ bool runtime_shape_ok(
         const DeviceMoELayerRuntimeView *runtime,
+        uint32_t execution_bank,
         int num_experts,
         int top_k)
     {
         return runtime &&
-               runtime_execution_bank(runtime) <= 1u &&
+               execution_bank <= 1u &&
                runtime->active_epoch != 0u &&
                runtime->expert_count == static_cast<uint32_t>(num_experts) &&
                runtime->top_k == static_cast<uint32_t>(top_k);
+    }
+
+    /**
+     * @brief Resolve or fatally reject the immutable decode placement bank.
+     *
+     * A stale ticket must be rejected before any shape-gated publication. The
+     * one routing lane emits the complete bank evidence before trapping, so an
+     * asynchronous HIP error identifies the broken ownership edge directly.
+     */
+    __device__ __forceinline__ uint32_t
+    runtime_require_decode_execution_bank(
+        const DeviceMoELayerRuntimeView *runtime)
+    {
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
+        if (execution_bank <= 1u)
+            return execution_bank;
+
+        const auto *const ticket = runtime
+                                       ? runtime->overlay_epoch_ticket
+                                       : nullptr;
+        const auto *const banks = runtime_durable_placement_banks(runtime);
+        printf("runtime_decode_invalid_overlay_ticket "
+               "participant=%u active_bank=%u active_epoch=%u "
+               "ticket_epoch=%llu ticket_selector=%llu "
+               "bank0_epoch=%u bank1_epoch=%u transient=%u\n",
+               runtime ? runtime->participant_id : 0u,
+               runtime ? runtime->active_bank : 0u,
+               runtime ? runtime->active_epoch : 0u,
+               static_cast<unsigned long long>(ticket ? ticket->epoch : 0u),
+               static_cast<unsigned long long>(ticket ? ticket->selector : 0u),
+               banks ? banks[0].epoch : 0u,
+               banks ? banks[1].epoch : 0u,
+               runtime
+                   ? runtime->current_batch_llep_transient_bank_active
+                   : 0u);
+        fail_fast_incomplete_llep_transfer();
+        return execution_bank;
     }
 
     /** @return Whether decode can publish one final participant per route. */
@@ -2921,6 +2959,7 @@ namespace
 
     __device__ __forceinline__ void runtime_resolve_decode_dispatch(
         DeviceMoELayerRuntimeView *runtime,
+        uint32_t execution_bank,
         const int *selected_experts,
         int num_experts,
         int top_k,
@@ -2930,7 +2969,8 @@ namespace
         bool *local_compute_flags,
         int *assigned_participants)
     {
-        if (!runtime_shape_ok(runtime, num_experts, top_k) ||
+        if (!runtime_shape_ok(
+                runtime, execution_bank, num_experts, top_k) ||
             !selected_experts ||
             !local_compute_flags ||
             !assigned_participants)
@@ -2944,9 +2984,6 @@ namespace
             assigned_participants[slot] = -1;
         }
 
-        const uint32_t execution_bank = runtime_execution_bank(runtime);
-        if (execution_bank > 1u)
-            return;
         const auto &bank = runtime_placement_banks(runtime)[execution_bank];
         const uint32_t participant_count = runtime->participant_count;
         const uint32_t participant_id = runtime->participant_id;
@@ -3122,7 +3159,13 @@ namespace
         bool fully_replicated_local_rows,
         int32_t logical_position)
     {
-        const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
+        /* Authenticate ownership before shape-gated route publication. */
+        const uint32_t execution_bank =
+            runtime_require_decode_execution_bank(runtime);
+        if (execution_bank > 1u)
+            return;
+        const bool shape_ok = runtime_shape_ok(
+            runtime, execution_bank, num_experts, top_k);
         if (!runtime_route_assignment_ledger_ok(runtime, top_k))
         {
             fail_fast_incomplete_llep_transfer();
@@ -3134,6 +3177,7 @@ namespace
         {
             runtime_resolve_decode_dispatch(
                 runtime,
+                execution_bank,
                 selected_ids,
                 num_experts,
                 top_k,

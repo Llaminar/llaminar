@@ -100,26 +100,40 @@ namespace llaminar2::test
             .staging_stream_count = 3,
             .staging_budget_bytes = 512ULL * kMiB,
         };
-        const size_t expected_slot = (512ULL * kMiB) / 3ULL;
+        const size_t expected_slot =
+            ((512ULL * kMiB) / 3ULL) &
+            ~(kGPUWeightLoadAllocationAlignment - 1u);
         const size_t expected_staging = expected_slot * 3ULL;
         const size_t expected_required = kWeights + expected_staging;
+        const auto geometry = resolveGPUWeightLoadMemoryGeometry(
+            kLargestSource, policy);
 
         const auto exact = gpuWeightLoadMemoryBOM(
+            PhysicalMemoryResource{
+                .world_rank = -1,
+                .device = DeviceId::cuda(0),
+                .total_bytes = expected_required,
+                .admission_available_bytes = expected_required,
+            },
             kWeights,
-            kLargestSource,
-            expected_required,
-            policy);
-        EXPECT_EQ(exact.staging_slot_bytes, expected_slot);
-        EXPECT_EQ(exact.staging_bytes, expected_staging);
-        EXPECT_EQ(exact.load_bytes, kWeights + expected_staging);
-        EXPECT_EQ(exact.required_bytes, expected_required);
+            geometry);
+        EXPECT_EQ(geometry.staging_slot_bytes, expected_slot);
+        EXPECT_EQ(geometry.staging_slot_stride_bytes, expected_slot);
+        EXPECT_EQ(
+            exact.bytes(PhysicalMemoryOwner::WeightLoadStaging),
+            expected_staging);
+        EXPECT_EQ(exact.incrementalBytes(), expected_required);
         EXPECT_TRUE(exact.fits());
 
         const auto one_byte_short = gpuWeightLoadMemoryBOM(
+            PhysicalMemoryResource{
+                .world_rank = -1,
+                .device = DeviceId::cuda(0),
+                .total_bytes = expected_required,
+                .admission_available_bytes = expected_required - 1u,
+            },
             kWeights,
-            kLargestSource,
-            expected_required - 1,
-            policy);
+            geometry);
         EXPECT_FALSE(one_byte_short.fits());
     }
 
@@ -130,15 +144,23 @@ namespace llaminar2::test
             .staging_stream_count = 4,
             .staging_budget_bytes = 0,
         };
+        const auto geometry = resolveGPUWeightLoadMemoryGeometry(
+            /*maximum_source_bytes=*/101, policy);
         const auto bill = gpuWeightLoadMemoryBOM(
+            PhysicalMemoryResource{
+                .world_rank = -1,
+                .device = DeviceId::rocm(0),
+                .total_bytes = 1280,
+                .admission_available_bytes = 1280,
+            },
             /*planned_weight_bytes=*/23,
-            /*maximum_source_bytes=*/101,
-            /*free_vram_bytes=*/1000,
-            policy);
+            geometry);
 
-        EXPECT_EQ(bill.staging_slot_bytes, 101u);
-        EXPECT_EQ(bill.staging_bytes, 404u);
-        EXPECT_EQ(bill.required_bytes, 427u);
+        EXPECT_EQ(geometry.staging_slot_bytes, 101u);
+        EXPECT_EQ(geometry.staging_slot_stride_bytes, 256u);
+        EXPECT_EQ(
+            bill.bytes(PhysicalMemoryOwner::WeightLoadStaging), 1024u);
+        EXPECT_EQ(bill.incrementalBytes(), 1280u);
         EXPECT_TRUE(bill.fits());
     }
 
@@ -149,26 +171,39 @@ namespace llaminar2::test
             .staging_budget_bytes = 0,
         };
         EXPECT_THROW(
-            (void)gpuWeightLoadMemoryBOM(
-                /*planned_weight_bytes=*/0,
+            (void)resolveGPUWeightLoadMemoryGeometry(
                 std::numeric_limits<size_t>::max(),
-                /*free_vram_bytes=*/0,
                 policy),
             std::overflow_error);
     }
 
     TEST(Test__GPUVramPreflight, MappedGpuLoadUsesBoundedPinnedWorkingSet)
     {
-        const size_t model_bytes = 8ULL * 1024ULL * kMiB;
-        const size_t staging_bytes = 512ULL * kMiB;
+        const auto geometry = resolveGPUWeightLoadMemoryGeometry(
+            /*maximum_source_bytes=*/2ULL * 1024ULL * kMiB,
+            GPUWeightLoadMemoryPolicy{
+                .staging_stream_count = 3,
+                .staging_budget_bytes = 512ULL * kMiB,
+            });
+        const auto bom = hostWeightLoadMemoryBOM(
+            PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = DeviceId::cpu(),
+                .total_bytes = 16ULL * 1024ULL * kMiB,
+                .admission_available_bytes =
+                    16ULL * 1024ULL * kMiB,
+            },
+            /*eager_weight_bytes=*/8ULL * 1024ULL * kMiB,
+            /*target_is_gpu=*/true,
+            /*uses_mmap=*/true,
+            geometry.host_staging_bytes);
 
         EXPECT_EQ(
-            gpuHostLoadWorkingSetBytes(
-                model_bytes,
-                /*target_is_gpu=*/true,
-                /*uses_mmap=*/true,
-                staging_bytes),
-            staging_bytes);
+            bom.bytes(PhysicalMemoryOwner::WeightLoadStaging),
+            geometry.host_staging_bytes);
+        EXPECT_EQ(
+            bom.bytes(PhysicalMemoryOwner::ModelSourcePayload), 0u);
+        EXPECT_LE(geometry.host_staging_bytes, 512ULL * kMiB);
     }
 
     TEST(Test__GPUVramPreflight, DebugEnvStagingBudgetIsPerGpuAndNeverDividedByDeviceCount)
@@ -203,51 +238,65 @@ namespace llaminar2::test
         EXPECT_FALSE(gpuPerDeviceLoadStagingBudgetBytes(-1).has_value());
     }
 
-    TEST(Test__GPUVramPreflight, BoundedRingDoesNotInflateSmallModels)
+    TEST(Test__GPUVramPreflight, EveryPinnedSlotIsChargedForSmallModels)
     {
-        const size_t model_bytes = 128ULL * kMiB;
-        const size_t staging_bytes = 512ULL * kMiB;
-
-        EXPECT_EQ(
-            gpuHostLoadWorkingSetBytes(
-                model_bytes,
-                /*target_is_gpu=*/true,
-                /*uses_mmap=*/true,
-                staging_bytes),
-            model_bytes);
+        const auto geometry = resolveGPUWeightLoadMemoryGeometry(
+            /*maximum_source_bytes=*/128ULL * kMiB,
+            GPUWeightLoadMemoryPolicy{
+                .staging_stream_count = 3,
+                .staging_budget_bytes = 512ULL * kMiB,
+            });
+        EXPECT_EQ(geometry.host_staging_bytes, 384ULL * kMiB);
     }
 
-    TEST(Test__GPUVramPreflight, CpuAndNonMappedLoadsRequireFullEagerBytes)
+    TEST(Test__GPUVramPreflight,
+         CpuAndNonMappedGpuLoadsChargeDistinctPhysicalOwners)
     {
         const size_t model_bytes = 8ULL * 1024ULL * kMiB;
-        const size_t staging_bytes = 512ULL * kMiB;
+        constexpr size_t kPinned = 512ULL * kMiB;
+        const PhysicalMemoryResource host{
+            .world_rank = 2,
+            .device = DeviceId::cpu(),
+            .total_bytes = 32ULL * 1024ULL * kMiB,
+            .admission_available_bytes = 32ULL * 1024ULL * kMiB,
+        };
 
+        const auto cpu = hostWeightLoadMemoryBOM(
+            host,
+            model_bytes,
+            /*target_is_gpu=*/false,
+            /*uses_mmap=*/true,
+            /*pinned_ring_bytes=*/0);
         EXPECT_EQ(
-            gpuHostLoadWorkingSetBytes(
-                model_bytes,
-                /*target_is_gpu=*/false,
-                /*uses_mmap=*/true,
-                staging_bytes),
+            cpu.bytes(PhysicalMemoryOwner::PrimaryModelWeights),
+            model_bytes);
+        EXPECT_EQ(cpu.incrementalBytes(), model_bytes);
+
+        const auto gpu = hostWeightLoadMemoryBOM(
+            host,
+            model_bytes,
+            /*target_is_gpu=*/true,
+            /*uses_mmap=*/false,
+            kPinned);
+        EXPECT_EQ(
+            gpu.bytes(PhysicalMemoryOwner::ModelSourcePayload),
             model_bytes);
         EXPECT_EQ(
-            gpuHostLoadWorkingSetBytes(
-                model_bytes,
-                /*target_is_gpu=*/true,
-                /*uses_mmap=*/false,
-                staging_bytes),
-            model_bytes);
+            gpu.bytes(PhysicalMemoryOwner::WeightLoadStaging), kPinned);
+        EXPECT_EQ(gpu.incrementalBytes(), model_bytes + kPinned);
     }
 
-    TEST(Test__GPUVramPreflight, ZeroBudgetPreservesExplicitUnlimitedMode)
+    TEST(Test__GPUVramPreflight,
+         UnlimitedModeStillChargesEveryConcretePinnedSlot)
     {
-        const size_t model_bytes = 8ULL * 1024ULL * kMiB;
-
+        const auto geometry = resolveGPUWeightLoadMemoryGeometry(
+            /*maximum_source_bytes=*/2ULL * 1024ULL * kMiB,
+            GPUWeightLoadMemoryPolicy{
+                .staging_stream_count = 3,
+                .staging_budget_bytes = 0,
+            });
         EXPECT_EQ(
-            gpuHostLoadWorkingSetBytes(
-                model_bytes,
-                /*target_is_gpu=*/true,
-                /*uses_mmap=*/true,
-                /*staging_budget_bytes=*/0),
-            model_bytes);
+            geometry.host_staging_bytes,
+            6ULL * 1024ULL * kMiB);
     }
 } // namespace llaminar2::test

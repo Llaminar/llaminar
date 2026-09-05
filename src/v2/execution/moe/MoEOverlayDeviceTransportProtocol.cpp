@@ -51,6 +51,16 @@ namespace llaminar2
             return false;
         }
 
+        /** @return Whether @p kind owns a durable placement epoch. */
+        bool durablePlacementKind(
+            MoEOverlayDeviceControllerTransactionKind kind) noexcept
+        {
+            return kind == MoEOverlayDeviceControllerTransactionKind::
+                               DynamicPlacement ||
+                   kind == MoEOverlayDeviceControllerTransactionKind::
+                               PreparedContextRestore;
+        }
+
         /**
          * @return A bounded diagnostic for the sole authority's terminal edge.
          *
@@ -380,6 +390,16 @@ namespace llaminar2
 
         const auto kind = static_cast<
             MoEOverlayDeviceControllerTransactionKind>(header.kind);
+        const auto demand_phase = static_cast<MoEOverlayDeviceDemandPhase>(
+            header.demand_phase);
+        const bool phase_valid =
+            kind == MoEOverlayDeviceControllerTransactionKind::
+                        DynamicPlacement
+                ? demand_phase == MoEOverlayDeviceDemandPhase::Prefill ||
+                      demand_phase == MoEOverlayDeviceDemandPhase::Decode
+                : demand_phase == MoEOverlayDeviceDemandPhase::Invalid;
+        if (!phase_valid)
+            return false;
         std::uint64_t payload_bytes = 0u;
         for (std::size_t index = 0u; index < entries.size(); ++index)
         {
@@ -456,6 +476,33 @@ namespace llaminar2
                    header.layer_scan_start < num_layers &&
                    header.layer_scan_next < num_layers &&
                    measured_economy_is_coherent;
+        }
+        case MoEOverlayDeviceControllerTransactionKind::
+            PreparedContextRestore:
+        {
+            const bool has_movement = !entries.empty();
+            return header.candidate_epoch ==
+                       (has_movement ? header.base_epoch + 1u
+                                     : header.base_epoch) &&
+                   (entries.empty() ==
+                    (header.packed_weight_bytes == 0u)) &&
+                   (has_movement == (header.accepted_cycles != 0u)) &&
+                   (has_movement == (header.changed_layers != 0u)) &&
+                   static_cast<std::uint64_t>(header.promotions) +
+                           header.demotions + header.same_priority_moves ==
+                       entries.size() &&
+                   header.layer_scan_start < num_layers &&
+                   header.layer_scan_next < num_layers &&
+                   header.priority_cost_before == 0u &&
+                   header.priority_cost_after == 0u &&
+                   header.same_priority_makespan_before == 0u &&
+                   header.same_priority_makespan_after == 0u &&
+                   header.projected_service_gain_ns == 0u &&
+                   header.projected_transfer_and_repack_ns == 0u &&
+                   header.projected_inference_interference_ns == 0u &&
+                   header.projected_net_benefit_ns == 0u &&
+                   header.payoff_rejected_cycles == 0u &&
+                   header.residency_rejected_cycles == 0u;
         }
         case MoEOverlayDeviceControllerTransactionKind::CurrentBatchLLEP:
             return !entries.empty() &&
@@ -579,33 +626,42 @@ namespace llaminar2
     bool MoEOverlayDeviceTransportProtocol::snapshotTransactionAfter(
         std::uint64_t after_transaction,
         std::uint64_t *transaction,
+        MoEOverlayDeviceControllerTransactionKind *kind,
         MoEOverlayDeviceDemandPhase *phase) const noexcept
     {
         if (transaction)
             *transaction = 0u;
+        if (kind)
+            *kind = MoEOverlayDeviceControllerTransactionKind::Invalid;
         if (phase)
             *phase = MoEOverlayDeviceDemandPhase::Invalid;
-        if (!transaction || !phase || !binding_.valid() ||
+        if (!transaction || !kind || !phase || !binding_.valid() ||
             loadAcquire(binding_.controller->state) !=
                 static_cast<std::uint32_t>(
-                    MoEOverlayDeviceControllerState::CollectingSnapshots) ||
-            loadAcquire(binding_.controller->transaction_kind) !=
-                static_cast<std::uint32_t>(
-                    MoEOverlayDeviceControllerTransactionKind::
-                        DynamicPlacement))
+                    MoEOverlayDeviceControllerState::CollectingSnapshots))
         {
             return false;
         }
+        const auto observed_kind =
+            static_cast<MoEOverlayDeviceControllerTransactionKind>(
+                loadAcquire(binding_.controller->transaction_kind));
+        if (!durablePlacementKind(observed_kind))
+            return false;
         const std::uint64_t observed = loadAcquire(
             binding_.controller->transaction_id);
         const auto observed_phase =
             static_cast<MoEOverlayDeviceDemandPhase>(
                 loadAcquire(binding_.command->demand_phase));
-        if (observed == 0u || observed <= after_transaction ||
-            (observed_phase != MoEOverlayDeviceDemandPhase::Prefill &&
-             observed_phase != MoEOverlayDeviceDemandPhase::Decode))
+        const bool valid_phase =
+            observed_kind == MoEOverlayDeviceControllerTransactionKind::
+                                 DynamicPlacement
+                ? observed_phase == MoEOverlayDeviceDemandPhase::Prefill ||
+                      observed_phase == MoEOverlayDeviceDemandPhase::Decode
+                : observed_phase == MoEOverlayDeviceDemandPhase::Invalid;
+        if (observed == 0u || observed <= after_transaction || !valid_phase)
             return false;
         *transaction = observed;
+        *kind = observed_kind;
         *phase = observed_phase;
         return true;
     }
@@ -819,9 +875,9 @@ namespace llaminar2
         const MoEOverlayDeviceTransportCommandBatch &batch) const noexcept
     {
         return retirementOpen(batch) &&
-               batch.header.kind == static_cast<std::uint32_t>(
-                   MoEOverlayDeviceControllerTransactionKind::
-                       DynamicPlacement) &&
+               durablePlacementKind(static_cast<
+                   MoEOverlayDeviceControllerTransactionKind>(
+                   batch.header.kind)) &&
                (!batch.movesWeights() ||
                 allParticipantsReached(
                     binding_,
@@ -845,8 +901,9 @@ namespace llaminar2
         std::string *error) noexcept
     {
         if (!requireAcquired(batch, error) ||
-            batch.header.kind != static_cast<std::uint32_t>(
-                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement) ||
+            !durablePlacementKind(static_cast<
+                MoEOverlayDeviceControllerTransactionKind>(
+                batch.header.kind)) ||
             batch.header.candidate_epoch == batch.header.base_epoch ||
             loadAcquire(binding_.transport->published_transaction) !=
                 batch.header.transaction_id ||
@@ -890,9 +947,9 @@ namespace llaminar2
         return binding_.valid() && batch.valid() &&
                batch.header.topology_fingerprint ==
                    binding_.topology_fingerprint &&
-               batch.header.kind == static_cast<std::uint32_t>(
-                   MoEOverlayDeviceControllerTransactionKind::
-                       DynamicPlacement) &&
+               durablePlacementKind(static_cast<
+                   MoEOverlayDeviceControllerTransactionKind>(
+                   batch.header.kind)) &&
                loadAcquire(binding_.controller->transaction_id) >=
                    batch.header.transaction_id &&
                allGroupsReached(
@@ -956,8 +1013,8 @@ namespace llaminar2
             << loadAcquire(controller->admission_epoch)
             << ",completed="
             << loadAcquire(controller->completed_transaction)
-            << ",dynamic_layer_cursor="
-            << loadAcquire(controller->dynamic_layer_cursor)
+            << ",placement_layer_cursor="
+            << loadAcquire(controller->placement_layer_cursor)
             << ",error=" << loadAcquire(controller->error_code)
             << ",error_group=" << controller->error_group_id << '}';
 

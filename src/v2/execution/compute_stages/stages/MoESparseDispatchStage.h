@@ -139,6 +139,22 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return false; }
         bool isManualGraphBoundary() const override { return true; }
+        /**
+         * @brief Admit parent-overlapped service only for host-materialized tickets.
+         *
+         * This role consumes the descriptor already authenticated by
+         * MoEExpertDispatchStage. Direct captured-producer and tensor-backed
+         * forms retain ordinary between-executable sequencing.
+         */
+        ManualGraphBoundaryScheduling
+        manualGraphBoundaryScheduling() const noexcept override
+        {
+            return params_.ticket_storage && params_.dispatch_output &&
+                           params_.ticket_observation_role ==
+                               TicketObservationRole::MaterializedHostDispatch
+                       ? ManualGraphBoundaryScheduling::ConcurrentTicketService
+                       : ManualGraphBoundaryScheduling::BetweenExecutableLaunches;
+        }
         bool supportsPaddedPrefillGraphCapturePreflight() const override
         {
             return params_.ticket_storage != nullptr;

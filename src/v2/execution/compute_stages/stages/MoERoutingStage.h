@@ -249,6 +249,11 @@ namespace llaminar2
         bool prepareGroupedVerifierHistogramProducer(
             void *producer_stream) override;
 
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        bool transitionGroupedVerifierHistogramProducerCapture(
+            void *producer_stream,
+            RuntimeHistogramProducerCaptureTransition transition) override;
+
         /**
          * @brief Commit accepted overlay-verifier selections from this ledger.
          *
@@ -472,6 +477,9 @@ namespace llaminar2
 
         /// Pre-allocated routing result (avoids heap allocs per decode token)
         mutable MoERoutingResult cached_routing_;
+        /** Setup-owned accumulator for allocation-free host histogram merges. */
+        mutable std::vector<std::uint64_t>
+            routing_evidence_count_scratch_;
         DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
 
         IMoEKernel *ensureMoEKernel() const;

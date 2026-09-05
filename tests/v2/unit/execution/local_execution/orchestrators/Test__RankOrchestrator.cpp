@@ -3164,7 +3164,10 @@ public:
 
     bool hasBARBackedOutputs(const std::string & /*stage_name*/) const override { return false; }
     void clearBARBackedOutputs() override {}
-    bool reserveCollectiveResources(size_t /*bytes*/, size_t /*fp16_scratch_elements*/) override { return true; }
+    bool reserveCollectiveResources(
+        size_t /*bytes*/,
+        size_t /*fp16_scratch_elements*/,
+        const std::shared_ptr<PhysicalMemoryAuthority> & /*memory_authority*/) override { return true; }
 
     // =====================================================================
     // ILocalTPContext Broadcast (no-op)
@@ -4994,48 +4997,70 @@ TEST_F(Test__RankOrchestrator, RequestResetCannotPublishOrDiscardExpertPlacement
     }
 }
 
-TEST_F(Test__RankOrchestrator, ShutdownSynchronizesAllRankDevicesBeforeRelease)
+TEST_F(Test__RankOrchestrator,
+       ShutdownUsesParticipantEventRetirementWithoutDeviceWideDrain)
 {
     const std::string runner_source =
         readSourceFileForRankOrchestratorTest(
             "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
     ASSERT_FALSE(runner_source.empty());
-    const std::string rank_source =
+    const std::string device_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
-    ASSERT_FALSE(rank_source.empty());
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(device_source.empty());
 
-    EXPECT_EQ(runner_source.find("synchronizeRunnerPrimaryDeviceBeforeRelease"),
-              std::string::npos)
-        << "shutdown must not drain only the primary device in multi-device rank runners";
-    const auto shutdown_helper =
-        runner_source.find("void synchronizeRunnerDevicesBeforeRelease");
-    ASSERT_NE(shutdown_helper, std::string::npos);
-    const auto helper_end =
-        runner_source.find("const char *prefixStorageTierName", shutdown_helper);
-    ASSERT_NE(helper_end, std::string::npos);
-    const std::string helper_body =
-        runner_source.substr(shutdown_helper, helper_end - shutdown_helper);
-    EXPECT_NE(helper_body.find("dynamic_cast<IRankOrchestrator *>"), std::string::npos);
-    EXPECT_NE(helper_body.find("rank->synchronizeDevices()"), std::string::npos);
-    EXPECT_NE(runner_source.find("synchronizeRunnerDevicesBeforeRelease(\n                runner_.get(),\n                physical_runner_backend_access_enabled_)"),
-              std::string::npos);
-    EXPECT_NE(helper_body.find("if (!physical_backend_access_enabled)"),
-              std::string::npos)
-        << "Injected GPU-shaped unit runners must not initialize physical backends during teardown.";
+    const auto shutdown_begin =
+        runner_source.find("void OrchestrationRunner::shutdown()");
+    const auto shutdown_end = runner_source.find(
+        "bool OrchestrationRunner::leastLoadedCurrentBatchPrefillUsesStableWindows() const",
+        shutdown_begin);
+    ASSERT_NE(shutdown_begin, std::string::npos);
+    ASSERT_NE(shutdown_end, std::string::npos);
+    const std::string shutdown = runner_source.substr(
+        shutdown_begin, shutdown_end - shutdown_begin);
 
-    const auto sync_fn =
-        rank_source.find("void RankOrchestrator::synchronizeDevices()");
-    ASSERT_NE(sync_fn, std::string::npos);
-    const auto sync_end =
-        rank_source.find("MoERebalanceController *RankOrchestrator::moeRebalanceController", sync_fn);
-    ASSERT_NE(sync_end, std::string::npos);
-    const std::string sync_body = rank_source.substr(sync_fn, sync_end - sync_fn);
-    EXPECT_NE(sync_body.find("tp_ctx_->synchronize()"), std::string::npos);
-    EXPECT_NE(sync_body.find("for (const auto &runner : device_runners_)"), std::string::npos);
-    EXPECT_NE(sync_body.find("for (const auto &runner : pp_stage_runners_)"), std::string::npos);
-    EXPECT_NE(sync_body.find("backend->synchronize(device.gpu_ordinal())"), std::string::npos)
-        << "rank-level synchronization must drain child runner device streams, not only collectives";
+    const auto request_reset =
+        shutdown.find("resetUnderlyingRunnerRequestState(\"shutdown\")");
+    const auto runner_release = shutdown.find("runner_.reset();");
+    ASSERT_NE(request_reset, std::string::npos);
+    ASSERT_NE(runner_release, std::string::npos);
+    EXPECT_LT(request_reset, runner_release)
+        << "Shutdown must publish the terminal reset before participant RAII retirement.";
+    for (const char *forbidden_drain : {
+             "synchronizeRunnerDevicesBeforeRelease",
+             "synchronizeDevices()",
+             "backend->synchronize(",
+             "getBackendFor(",
+         })
+    {
+        EXPECT_EQ(shutdown.find(forbidden_drain), std::string::npos)
+            << "Runner shutdown must not broaden typed participant events into "
+               "a device-wide drain: "
+            << forbidden_drain;
+    }
+
+    const auto destructor_begin = device_source.find(
+        "DeviceGraphOrchestrator::~DeviceGraphOrchestrator()");
+    const auto retirement_begin = device_source.find(
+        "void DeviceGraphOrchestrator::retirePublishedDeviceWorkBeforeArenaRelease()",
+        destructor_begin);
+    const auto retirement_end = device_source.find(
+        "void DeviceGraphOrchestrator::destroyCapturedExecutionTopologyBeforeArenaRelease()",
+        retirement_begin);
+    ASSERT_NE(destructor_begin, std::string::npos);
+    ASSERT_NE(retirement_begin, std::string::npos);
+    ASSERT_NE(retirement_end, std::string::npos);
+    const std::string destructor = device_source.substr(
+        destructor_begin, retirement_begin - destructor_begin);
+    const std::string retirement = device_source.substr(
+        retirement_begin, retirement_end - retirement_begin);
+    EXPECT_NE(
+        destructor.find("retirePublishedDeviceWorkBeforeArenaRelease();"),
+        std::string::npos);
+    EXPECT_NE(retirement.find("backend->waitForEvent("), std::string::npos)
+        << "Each participant must close its exact producer events at the RAII boundary.";
+    EXPECT_EQ(retirement.find("backend->synchronize("), std::string::npos);
+    EXPECT_EQ(retirement.find("backend->synchronizeStream("), std::string::npos);
 }
 
 TEST_F(Test__RankOrchestrator, DeviceResidentExpertOverlaySkipsHostRuntimeHistogramBridge)
@@ -5080,8 +5105,16 @@ TEST_F(Test__RankOrchestrator, ProductionDecodeBoundaryCannotEnterLegacyLocalTPP
         runner_source.substr(maybe_pos, maybe_end - maybe_pos);
     EXPECT_NE(maybe_body.find("moe_expert_overlay_maintenance_service_"),
               std::string::npos);
-    EXPECT_NE(maybe_body.find("notifyMaintenanceProgress()"),
-              std::string::npos);
+    EXPECT_NE(
+        maybe_body.find("notifyHostMoEOverlayInferenceProgress("),
+        std::string::npos)
+        << "Host-coordinated ExpertOverlay must publish the exact committed "
+           "token cadence to its non-blocking maintenance worker";
+    EXPECT_NE(maybe_body.find("committed_tokens"), std::string::npos);
+    EXPECT_EQ(maybe_body.find("notifyMaintenanceProgress()"),
+              std::string::npos)
+        << "A wake without typed inference progress can deadlock a "
+           "device-owned histogram below the host window gate";
     for (const char *retired_entry : {
              "publishPendingMoERebalanceUpdate()",
              "moeRebalanceController()",
@@ -9333,10 +9366,15 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PackedColumnParallel_ReassemblesSemant
             .mode = SnapshotColumnGroupMode::PARTITIONED,
             .participant_cols = {1, 1}},
         SnapshotColumnGroup{
-            .name = "V",
-            .global_cols = 4,
+            .name = "V_REPEAT_0",
+            .global_cols = 2,
             .mode = SnapshotColumnGroupMode::PARTITIONED,
-            .participant_cols = {2, 2}},
+            .participant_cols = {1, 1}},
+        SnapshotColumnGroup{
+            .name = "V_REPEAT_1",
+            .global_cols = 2,
+            .mode = SnapshotColumnGroupMode::PARTITIONED,
+            .participant_cols = {1, 1}},
     };
 
     DeviceSnapshotData device0;
@@ -9344,16 +9382,16 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PackedColumnParallel_ReassemblesSemant
     device0.rows = 2;
     device0.cols = 4;
     device0.data = {
-        10.0f, 20.0f, 30.0f, 31.0f,
-        110.0f, 120.0f, 130.0f, 131.0f};
+        10.0f, 20.0f, 30.0f, 40.0f,
+        110.0f, 120.0f, 130.0f, 140.0f};
 
     DeviceSnapshotData device1;
     device1.device_index = 1;
     device1.rows = 2;
     device1.cols = 4;
     device1.data = {
-        11.0f, 21.0f, 32.0f, 33.0f,
-        111.0f, 121.0f, 132.0f, 133.0f};
+        11.0f, 21.0f, 31.0f, 41.0f,
+        111.0f, 121.0f, 131.0f, 141.0f};
 
     // Deliberately publish in reverse vector order. The typed TP index, not
     // incidental collection order, owns the production concatenation order.
@@ -9365,8 +9403,77 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_PackedColumnParallel_ReassemblesSemant
     EXPECT_EQ(
         snapshot.combined_data,
         (std::vector<float>{
-            10.0f, 11.0f, 20.0f, 21.0f, 30.0f, 31.0f, 32.0f, 33.0f,
-            110.0f, 111.0f, 120.0f, 121.0f, 130.0f, 131.0f, 132.0f, 133.0f}));
+            10.0f, 11.0f, 20.0f, 21.0f, 30.0f, 31.0f, 40.0f, 41.0f,
+            110.0f, 111.0f, 120.0f, 121.0f, 130.0f, 131.0f, 140.0f, 141.0f}));
+}
+
+TEST_F(Test__RankOrchestrator,
+       GDNModuloLinkedSnapshotLayoutReassemblesEveryUnevenTPRepeat)
+{
+    std::string error;
+    const std::array<size_t, 3> local_fused_widths = {16u, 8u, 24u};
+    const auto groups = resolveModuloLinkedGDNSnapshotColumnGroups(
+        local_fused_widths,
+        /*global_key_heads=*/6,
+        /*global_value_heads=*/12,
+        /*state_width=*/2,
+        ModuloLinkedGDNSnapshotLayout::FusedQKV,
+        &error);
+
+    ASSERT_TRUE(error.empty()) << error;
+    ASSERT_EQ(groups.size(), 4u);
+    EXPECT_EQ(groups[0].name, "Q");
+    EXPECT_EQ(groups[1].name, "K");
+    EXPECT_EQ(groups[2].name, "V_REPEAT_0");
+    EXPECT_EQ(groups[3].name, "V_REPEAT_1");
+    for (const auto &group : groups)
+    {
+        EXPECT_EQ(group.global_cols, 12u);
+        EXPECT_EQ(
+            group.participant_cols,
+            (std::vector<size_t>{4u, 2u, 6u}));
+    }
+
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_QKV_PROJECTION";
+    snapshot.mode = SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+    snapshot.tp_degree = 3;
+    snapshot.column_groups = groups;
+    for (int participant = 0; participant < snapshot.tp_degree; ++participant)
+    {
+        DeviceSnapshotData device;
+        device.device_index = participant;
+        device.rows = 1;
+        device.cols = local_fused_widths[static_cast<size_t>(participant)];
+        device.data.resize(device.cols);
+        const size_t local_group_cols =
+            groups.front().participant_cols[static_cast<size_t>(participant)];
+        for (size_t group = 0; group < groups.size(); ++group)
+        {
+            for (size_t column = 0; column < local_group_cols; ++column)
+            {
+                device.data[group * local_group_cols + column] =
+                    static_cast<float>(100 * group + 10 * participant + column);
+            }
+        }
+        snapshot.device_data.push_back(std::move(device));
+    }
+
+    ASSERT_TRUE(snapshot.computeCombined());
+    ASSERT_EQ(snapshot.combined_cols, 48u);
+    for (size_t group = 0; group < groups.size(); ++group)
+    {
+        const size_t group_offset = group * groups[group].global_cols;
+        EXPECT_FLOAT_EQ(
+            snapshot.combined_data[group_offset],
+            static_cast<float>(100 * group));
+        EXPECT_FLOAT_EQ(
+            snapshot.combined_data[group_offset + 4u],
+            static_cast<float>(100 * group + 10));
+        EXPECT_FLOAT_EQ(
+            snapshot.combined_data[group_offset + 6u],
+            static_cast<float>(100 * group + 20));
+    }
 }
 
 TEST_F(Test__RankOrchestrator, TPSnapshot_PackedColumnParallel_VerifiesReplicatedGroups)
@@ -9636,6 +9743,120 @@ TEST_F(
         << "Replicated GQA must not change query-head sharding";
     ASSERT_TRUE(q_norm.computeCombined());
     EXPECT_EQ(q_norm.combined_cols, replica.size() * 4u);
+}
+
+/**
+ * @brief Replicated MTP dense/shared checkpoints publish exactly one full view.
+ *
+ * The main model remains tensor parallel, the token embedding remains
+ * vocabulary parallel, and routed expert contributions remain owned by
+ * ExpertOverlay.  This regression locks the runtime layout boundary that the
+ * production snapshot collector must apply before comparing real-weight MTP
+ * checkpoints with the Hugging Face reference.
+ */
+TEST_F(
+    Test__RankOrchestrator,
+    TPSnapshot_ReplicatedMTPSidecarPreservesIndependentAuthorities)
+{
+    static constexpr std::array<std::string_view, 4>
+        kReplicatedDenseAndSharedStages = {
+            "Q_PROJECTION",
+            "ATTENTION_CONTEXT",
+            "ATTENTION_OUTPUT",
+            "MOE_SHARED_EXPERT_OUTPUT",
+        };
+    const std::vector<float> replica = {1.0f, 2.0f, 3.0f, 4.0f};
+    const std::vector<float> partial0 = {10.0f, 20.0f, 30.0f, 40.0f};
+    const std::vector<float> partial1 = {1.0f, 2.0f, 3.0f, 4.0f};
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    for (int participant = 0; participant < 2; ++participant)
+    {
+        auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
+        for (const std::string_view stage_type :
+             kReplicatedDenseAndSharedStages)
+        {
+            runner->set_mock_snapshot(
+                "MTP0_" + std::string(stage_type),
+                1,
+                replica.size(),
+                replica);
+        }
+        runner->set_mock_snapshot(
+            "MTP0_EMBEDDING",
+            1,
+            partial0.size(),
+            participant == 0 ? partial0 : partial1);
+        runner->set_mock_snapshot(
+            "MTP0_MOE_EXPERT_OUTPUT",
+            1,
+            partial0.size(),
+            participant == 0 ? partial0 : partial1);
+        runner->set_mock_snapshot(
+            "layer3_Q_PROJECTION",
+            1,
+            partial0.size(),
+            participant == 0 ? partial0 : partial1);
+        runners.push_back(std::move(runner));
+    }
+
+    auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
+    model_ctx->setArchitecture("qwen35moe");
+    model_ctx->setHeadCountKV(2);
+
+    RankOrchestrator::Config rank_config;
+    rank_config.devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1),
+    };
+    rank_config.weights = {0.5f, 0.5f};
+    rank_config.mtp.enabled = true;
+    rank_config.mtp.draft_tokens = 15;
+    rank_config.mtp.sidecar_dense_policy =
+        MTPSidecarDensePolicy::ReplicatedPerParticipant;
+
+    MockLocalTPContext::Config tp_config;
+    tp_config.devices = rank_config.devices;
+    tp_config.weights = rank_config.weights;
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        model_ctx,
+        std::move(runners),
+        std::make_unique<MockLocalTPContext>(tp_config),
+        rank_config);
+
+    for (const std::string_view stage_type :
+         kReplicatedDenseAndSharedStages)
+    {
+        const std::string key = "MTP0_" + std::string(stage_type);
+        SCOPED_TRACE(key);
+        auto snapshot = orchestrator->getTPSnapshot(key);
+        EXPECT_EQ(snapshot.mode, SnapshotShardingMode::REPLICATED);
+        ASSERT_TRUE(snapshot.computeCombined());
+        EXPECT_EQ(snapshot.combined_rows, 1u);
+        EXPECT_EQ(snapshot.combined_cols, replica.size());
+        EXPECT_EQ(snapshot.combined_data, replica);
+    }
+
+    const std::vector<float> expected_sum = {
+        11.0f, 22.0f, 33.0f, 44.0f};
+    for (const char *key : {
+             "MTP0_EMBEDDING",
+             "MTP0_MOE_EXPERT_OUTPUT",
+         })
+    {
+        SCOPED_TRACE(key);
+        auto snapshot = orchestrator->getTPSnapshot(key);
+        EXPECT_EQ(snapshot.mode, SnapshotShardingMode::ROW_PARALLEL);
+        ASSERT_TRUE(snapshot.computeCombined());
+        EXPECT_EQ(snapshot.combined_data, expected_sum);
+    }
+
+    auto main_q = orchestrator->getTPSnapshot("layer3_Q_PROJECTION");
+    EXPECT_EQ(main_q.mode, SnapshotShardingMode::COLUMN_PARALLEL)
+        << "the MTP placement policy must not widen the main graph";
+    ASSERT_TRUE(main_q.computeCombined());
+    EXPECT_EQ(main_q.combined_cols, partial0.size() + partial1.size());
 }
 
 TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutputReplicated)

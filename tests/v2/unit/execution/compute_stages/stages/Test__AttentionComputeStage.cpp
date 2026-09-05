@@ -339,9 +339,10 @@ namespace
      * GPU work: the thread-local capture guard and counting cache fake prove
      * that capture-time metadata neither observes host state nor substitutes
      * the declarative projection tensor for an unresolved production cache
-     * view. Eager diagnostics may still refresh ordinary host-visible inputs.
+     * view. GPU execution state remains device-owned outside capture as well;
+     * only a CPU stage may enter the host-visible cache descriptor path.
      */
-    TEST_F(Test__AttentionComputeStage, CaptureTimeDumpInfoDoesNotQueryHostKVState)
+    TEST_F(Test__AttentionComputeStage, GPUDumpInfoNeverQueriesHostKVState)
     {
         ScopedAttentionDebugEnv env({
             {"LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT", "1"},
@@ -398,8 +399,8 @@ namespace
             << "graph recording must not cross to host KV sequence state";
 
         (void)stage.buildDumpInfoImpl();
-        EXPECT_EQ(kv_cache.cached_token_queries, 1)
-            << "eager diagnostics may refresh cache-backed dump geometry";
+        EXPECT_EQ(kv_cache.cached_token_queries, 0)
+            << "GPU diagnostics must not query host KV sequence state outside capture either";
     }
 
     /**

@@ -15,8 +15,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstdint>
+#include <limits>
 #ifdef __linux__
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -36,6 +40,27 @@ namespace
 #else
         return -1;
 #endif
+    }
+
+    /**
+     * @brief Prove pre-allocation heap geometry against the materialized owner.
+     * @tparam T Element type whose byte multiplication is part of the contract.
+     * @param elements Logical element capacity.
+     * @param alignment Requested minimum address alignment.
+     */
+    template <typename T>
+    void expectHeapGeometryMatchesAllocation(
+        size_t elements,
+        size_t alignment)
+    {
+        using Vector = llaminar2::AlignedVector<T>;
+        const size_t planned = Vector::requiredAllocationBytes(
+            elements, alignment, Vector::StorageKind::Heap);
+        Vector materialized;
+        materialized.resize_uninitialized_aligned(elements, alignment);
+        EXPECT_EQ(materialized.allocationBytes(), planned);
+        EXPECT_TRUE(materialized.is_aligned_to(
+            std::max(alignment, Vector::ALIGNMENT)));
     }
 } // namespace
 
@@ -65,4 +90,136 @@ TEST(Test__AlignedVector, LargeAllocationsArePageAlignedForStrictNUMAPlacement)
     EXPECT_EQ(reinterpret_cast<uintptr_t>(buffer.data()) %
                   static_cast<uintptr_t>(page_size),
               0u);
+}
+
+TEST(Test__AlignedVector, DedicatedPageMappingMovesWithoutChangingItsOwner)
+{
+#ifndef __linux__
+    GTEST_SKIP() << "anonymous page mappings require Linux";
+#else
+    const long page_size = runtimePageSize();
+    ASSERT_GT(page_size, 0);
+
+    using Vector = llaminar2::AlignedVector<uint16_t>;
+    Vector source = Vector::pageMappedUninitialized(
+        static_cast<size_t>(page_size) + 37u);
+    ASSERT_NE(source.data(), nullptr);
+    EXPECT_EQ(source.storageKind(), Vector::StorageKind::AnonymousPageMapping);
+    EXPECT_EQ(
+        reinterpret_cast<uintptr_t>(source.data()) %
+            static_cast<uintptr_t>(page_size),
+        0u);
+    EXPECT_EQ(
+        source.allocationBytes() % static_cast<size_t>(page_size),
+        0u);
+
+    auto *const stable_address = source.data();
+    Vector destination(std::move(source));
+    EXPECT_EQ(destination.data(), stable_address);
+    EXPECT_EQ(
+        destination.storageKind(),
+        Vector::StorageKind::AnonymousPageMapping);
+    EXPECT_EQ(source.data(), nullptr);
+    EXPECT_EQ(source.storageKind(), Vector::StorageKind::Heap);
+
+    // The moved owner must retain ordinary read/write vector semantics.
+    destination.front() = 0x1234u;
+    destination.back() = 0x5678u;
+    EXPECT_EQ(destination.front(), 0x1234u);
+    EXPECT_EQ(destination.back(), 0x5678u);
+#endif
+}
+
+TEST(Test__AlignedVector, DedicatedPageMappingIsUnmappedAtOwnerRetirement)
+{
+#ifndef __linux__
+    GTEST_SKIP() << "anonymous page mappings require Linux";
+#else
+    const long page_size = runtimePageSize();
+    ASSERT_GT(page_size, 0);
+
+    void *retired_address = nullptr;
+    {
+        auto mapping =
+            llaminar2::AlignedVector<uint8_t>::pageMappedUninitialized(
+                static_cast<size_t>(page_size));
+        retired_address = mapping.data();
+        mapping.front() = 0xa5u;
+    }
+
+    unsigned char residency = 0;
+    errno = 0;
+    EXPECT_EQ(::mincore(
+                  retired_address,
+                  static_cast<size_t>(page_size),
+                  &residency),
+              -1);
+    EXPECT_EQ(errno, ENOMEM)
+        << "mapped owner retirement must revoke the virtual range completely";
+#endif
+}
+
+TEST(Test__AlignedVector, HeapAdmissionGeometryMatchesEveryExpertElementWidth)
+{
+    constexpr size_t requested_alignment = 4096u;
+    expectHeapGeometryMatchesAllocation<uint8_t>(37u, requested_alignment);
+    expectHeapGeometryMatchesAllocation<uint16_t>(2051u, requested_alignment);
+    expectHeapGeometryMatchesAllocation<float>(4099u, requested_alignment);
+}
+
+TEST(Test__AlignedVector, PageMappingAdmissionGeometryMatchesMaterialization)
+{
+#ifndef __linux__
+    GTEST_SKIP() << "anonymous page mappings require Linux";
+#else
+    const long page_size = runtimePageSize();
+    ASSERT_GT(page_size, 0);
+
+    using ByteVector = llaminar2::AlignedVector<uint8_t>;
+    using HalfVector = llaminar2::AlignedVector<uint16_t>;
+    using FloatVector = llaminar2::AlignedVector<float>;
+    const size_t page = static_cast<size_t>(page_size);
+
+    const auto byte = ByteVector::pageMappedUninitialized(page + 3u);
+    EXPECT_EQ(
+        byte.allocationBytes(),
+        ByteVector::requiredAllocationBytes(
+            page + 3u,
+            page,
+            ByteVector::StorageKind::AnonymousPageMapping));
+
+    const auto half = HalfVector::pageMappedUninitialized(page / 2u + 3u);
+    EXPECT_EQ(
+        half.allocationBytes(),
+        HalfVector::requiredAllocationBytes(
+            page / 2u + 3u,
+            page,
+            HalfVector::StorageKind::AnonymousPageMapping));
+
+    const auto fp32 = FloatVector::pageMappedUninitialized(page / 4u + 3u);
+    EXPECT_EQ(
+        fp32.allocationBytes(),
+        FloatVector::requiredAllocationBytes(
+            page / 4u + 3u,
+            page,
+            FloatVector::StorageKind::AnonymousPageMapping));
+#endif
+}
+
+TEST(Test__AlignedVector, AdmissionGeometryRejectsInvalidOrOverflowingRequests)
+{
+    using ByteVector = llaminar2::AlignedVector<uint8_t>;
+    using HalfVector = llaminar2::AlignedVector<uint16_t>;
+
+    EXPECT_THROW(
+        (void)ByteVector::requiredAllocationBytes(1u, 96u),
+        std::invalid_argument);
+    EXPECT_THROW(
+        (void)HalfVector::requiredAllocationBytes(
+            std::numeric_limits<size_t>::max() / sizeof(uint16_t) + 1u),
+        std::overflow_error);
+    EXPECT_THROW(
+        (void)ByteVector::requiredAllocationBytes(
+            std::numeric_limits<size_t>::max()),
+        std::overflow_error);
 }

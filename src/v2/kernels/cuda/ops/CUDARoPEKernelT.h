@@ -30,6 +30,7 @@
 #include "../../../utils/Logger.h"
 #include "../../rope/RoPEInvariantPublication.h"
 #include "../../rope/RoPEDeviceParams.h"
+#include "../../rope/RoPEWorkspaceContract.h"
 #include <cstdint>
 #include <memory>
 
@@ -75,28 +76,7 @@ namespace llaminar2
             {
                 (void)n;
                 (void)k;
-                WorkspaceRequirements reqs;
-                // Position IDs buffer - m is max sequence length
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::POSITION_IDS,
-                    static_cast<size_t>(m) * sizeof(int),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                // Inverse frequency table - allocated for worst-case head_dim
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::INV_FREQ,
-                    rope::kInvariantPublicationSlots *
-                        static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
-                    256, // CUDA alignment
-                    true, // Required
-                    WorkspaceExecutionRegime::Any,
-                    WorkspaceContentLifetime::SerialGraphFamily
-                });
-                // Device params buffer for graph capture
-                reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
-                                        sizeof(rope::RoPEDeviceParams), 256, true});
-                return reqs;
+                return rope_workspace::requirements({.graph_rows = m});
             }
 
             void bindWorkspace(DeviceWorkspaceManager *workspace) override
@@ -379,28 +359,7 @@ namespace llaminar2
             {
                 (void)n;
                 (void)k;
-                WorkspaceRequirements reqs;
-                // Position IDs buffer - m is max sequence length
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::POSITION_IDS,
-                    static_cast<size_t>(m) * sizeof(int),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                // Inverse frequency table - allocated for worst-case head_dim
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::INV_FREQ,
-                    rope::kInvariantPublicationSlots *
-                        static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
-                    256, // CUDA alignment
-                    true, // Required
-                    WorkspaceExecutionRegime::Any,
-                    WorkspaceContentLifetime::SerialGraphFamily
-                });
-                // Device params buffer for graph capture
-                reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
-                                        sizeof(rope::RoPEDeviceParams), 256, true});
-                return reqs;
+                return rope_workspace::requirements({.graph_rows = m});
             }
 
             void bindWorkspace(DeviceWorkspaceManager *workspace) override
@@ -635,32 +594,7 @@ namespace llaminar2
             {
                 (void)n;
                 (void)k;
-                WorkspaceRequirements reqs;
-                // Position IDs buffer - m is max sequence length
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::POSITION_IDS,
-                    static_cast<size_t>(m) * sizeof(int),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                // Inverse frequency table - allocated for worst-case head_dim
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::INV_FREQ,
-                    rope::kInvariantPublicationSlots *
-                        static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
-                    256, // CUDA alignment
-                    true, // Required
-                    WorkspaceExecutionRegime::Any,
-                    WorkspaceContentLifetime::SerialGraphFamily
-                });
-                // Device params for graph-captured RoPE kernels
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::DEVICE_PARAMS,
-                    sizeof(rope::RoPEDeviceParams),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                return reqs;
+                return rope_workspace::requirements({.graph_rows = m});
             }
 
             void bindWorkspace(DeviceWorkspaceManager *workspace) override

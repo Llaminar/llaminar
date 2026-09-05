@@ -1,4 +1,5 @@
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
+#include "loaders/GPUVramPreflight.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "backends/IBackend.h"
 #include "utils/DebugEnv.h"
@@ -227,7 +228,8 @@ namespace llaminar2
         // The persistent weight allocation is aligned independently so every
         // offset returned by getSlot() remains stable for the lifetime of kernels.
         size_t max_staging = 0;
-        weight_region_bytes_ = alignUp(current_offset_, kAlignment);
+        weight_region_bytes_ =
+            alignGPUWeightLoadAllocation(current_offset_);
 
         // Staging is temporary upload scratch. It uses its own allocation so
         // LoadOrchestrator::finalize() can free it after all pipeline streams drain.
@@ -256,7 +258,8 @@ namespace llaminar2
              * made the first non-zero lane fault with a misaligned-address
              * error.
              */
-            staging_slot_stride_bytes_ = alignUp(max_staging, kAlignment);
+            staging_slot_stride_bytes_ =
+                alignGPUWeightLoadAllocation(max_staging);
             staging_region_bytes_ =
                 staging_slot_stride_bytes_ * static_cast<size_t>(staging_slot_count);
         }
@@ -416,6 +419,17 @@ namespace llaminar2
             return total_bytes_;
         // Before allocation: current_offset_ tracks the weight regions planned so far
         return current_offset_;
+    }
+
+    size_t WeightVRAMPool::maximumPlannedStagingBytes() const
+    {
+        size_t maximum = 0;
+        for (const auto &[name, plan] : plans_)
+        {
+            (void)name;
+            maximum = std::max(maximum, plan.staging_bytes);
+        }
+        return maximum;
     }
 
     size_t WeightVRAMPool::numPlannedWeights() const { return plans_.size(); }

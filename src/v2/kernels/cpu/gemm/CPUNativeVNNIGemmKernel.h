@@ -90,7 +90,10 @@ namespace llaminar2::cpu::native_vnni
          * @param row_end End row for TP slicing (default -1 = all)
          */
         explicit CPUNativeVNNIGemmKernel(const TensorBase *weights,
-                                         int row_start = 0, int row_end = -1)
+                                         int row_start = 0, int row_end = -1,
+                                         CPUProjectionNumericalPolicy numerical_policy =
+                                             CPUProjectionNumericalPolicy::BackendNative)
+            : numerical_policy_(numerical_policy)
         {
             // Pick up activation rotation from the weight tensor (if set).
             // When present, activations will be rotated before Q8_1 quantization
@@ -106,6 +109,7 @@ namespace llaminar2::cpu::native_vnni
                 valid_ = false;
                 return;
             }
+            packed_.numerical_policy = numerical_policy_;
             valid_ = true;
 
             LOG_TRACE("[CPUNativeVNNIGemmKernel] Packed "
@@ -120,9 +124,15 @@ namespace llaminar2::cpu::native_vnni
         /**
          * @brief Construct from pre-packed weights (move).
          */
-        explicit CPUNativeVNNIGemmKernel(CPUNativeVNNIPackedWeights &&packed)
-            : packed_(std::move(packed)), valid_(packed_.hasInterleavedData())
+        explicit CPUNativeVNNIGemmKernel(
+            CPUNativeVNNIPackedWeights &&packed,
+            CPUProjectionNumericalPolicy numerical_policy =
+                CPUProjectionNumericalPolicy::BackendNative)
+            : packed_(std::move(packed)),
+              valid_(packed_.hasInterleavedData()),
+              numerical_policy_(numerical_policy)
         {
+            packed_.numerical_policy = numerical_policy_;
             if (!valid_)
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] Pre-packed CPU_NATIVE_VNNI weights are missing eager interleaved data");
         }
@@ -180,8 +190,7 @@ namespace llaminar2::cpu::native_vnni
             if (actual_output_columns <= 0 ||
                 serial_partition_columns <= 0 ||
                 actual_output_columns != packed_.N ||
-                serial_partition_columns > actual_output_columns ||
-                (actual_output_columns % serial_partition_columns) != 0)
+                serial_partition_columns > actual_output_columns)
             {
                 throw std::invalid_argument(
                     "[CPUNativeVNNIGemmKernel] Invalid replicated-output serial partition contract");
@@ -307,6 +316,7 @@ namespace llaminar2::cpu::native_vnni
             // interleaved representation and lets the wrapper release the
             // unneeded cross-backend section after this move.
             packed_ = cpu_packed->takePacked();
+            packed_.numerical_policy = numerical_policy_;
             if (!packed_.hasInterleavedData())
             {
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] Attached CPU_NATIVE_VNNI weights have no eager interleaved data");
@@ -424,12 +434,42 @@ namespace llaminar2::cpu::native_vnni
             // M=1 decode: use serial SwiGLU to avoid OMP fork/join overhead.
             // For MoE experts with intermediate=512, the 512-element SwiGLU
             // takes ~0.1µs in SIMD vs ~6µs OMP barrier cost.
-            if (m == 1)
-                primitives::compute_swiglu_serial(gate_fp32, up_fp32, swiglu_scratch_tls.data(),
-                                                  static_cast<int>(input_size));
+            if (numerical_policy_ ==
+                CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            {
+                if (m == 1)
+                {
+                    primitives::compute_swiglu_gpu_aligned_expert_serial(
+                        gate_fp32,
+                        up_fp32,
+                        swiglu_scratch_tls.data(),
+                        static_cast<int>(input_size));
+                }
+                else
+                {
+                    primitives::compute_swiglu_gpu_aligned_expert(
+                        gate_fp32,
+                        up_fp32,
+                        swiglu_scratch_tls.data(),
+                        static_cast<int>(input_size));
+                }
+            }
+            else if (m == 1)
+            {
+                primitives::compute_swiglu_serial(
+                    gate_fp32,
+                    up_fp32,
+                    swiglu_scratch_tls.data(),
+                    static_cast<int>(input_size));
+            }
             else
-                primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_scratch_tls.data(),
-                                           static_cast<int>(input_size));
+            {
+                primitives::compute_swiglu(
+                    gate_fp32,
+                    up_fp32,
+                    swiglu_scratch_tls.data(),
+                    static_cast<int>(input_size));
+            }
 
             // Apply activation rotation for kurtosis reduction (if configured)
             const float *gemm_input = maybe_rotate_activation(swiglu_scratch_tls.data(), m, k);
@@ -503,11 +543,23 @@ namespace llaminar2::cpu::native_vnni
                 PerfStatsCollector::isDomainEnabled("kernel");
             auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                            : PerfStatsCollector::Clock::time_point{};
-            primitives::compute_swiglu(
-                gate_fp32,
-                up_fp32,
-                swiglu_scratch_tls.data(),
-                static_cast<int>(input_size));
+            if (numerical_policy_ ==
+                CPUProjectionNumericalPolicy::GPUAlignedExpert)
+            {
+                primitives::compute_swiglu_gpu_aligned_expert(
+                    gate_fp32,
+                    up_fp32,
+                    swiglu_scratch_tls.data(),
+                    static_cast<int>(input_size));
+            }
+            else
+            {
+                primitives::compute_swiglu(
+                    gate_fp32,
+                    up_fp32,
+                    swiglu_scratch_tls.data(),
+                    static_cast<int>(input_size));
+            }
             recordVerifierTiming(
                 "cpu_native_vnni_verifier_swiglu_compute",
                 perf_start,
@@ -524,7 +576,13 @@ namespace llaminar2::cpu::native_vnni
                 shared_q8_tls.resize_uninitialized(shared_q8_blocks);
             perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                       : PerfStatsCollector::Clock::time_point{};
-            quantize_activations_to_q8_1(gemm_input, shared_q8_tls.data(), m, k, K_blocks);
+            quantize_activations_to_q8_1(
+                gemm_input,
+                shared_q8_tls.data(),
+                m,
+                k,
+                K_blocks,
+                numerical_policy_);
             recordVerifierTiming(
                 "cpu_native_vnni_verifier_activation_quantize",
                 perf_start,
@@ -642,7 +700,8 @@ namespace llaminar2::cpu::native_vnni
                 shared_q8_tls.data(),
                 m,
                 k,
-                K_blocks);
+                K_blocks,
+                numerical_policy_);
 
             if (m == 1)
             {
@@ -779,7 +838,13 @@ namespace llaminar2::cpu::native_vnni
             thread_local AlignedVector<Q8_1Block> shared_q8_tls;
             if (shared_q8_tls.size() < shared_q8_blocks)
                 shared_q8_tls.resize_uninitialized(shared_q8_blocks);
-            quantize_activations_to_q8_1(input_data, shared_q8_tls.data(), m, k, K_blocks);
+            quantize_activations_to_q8_1(
+                input_data,
+                shared_q8_tls.data(),
+                m,
+                k,
+                K_blocks,
+                numerical_policy_);
             recordVerifierTiming(
                 "cpu_native_vnni_verifier_projection_activation_quantize",
                 perf_start,
@@ -929,6 +994,13 @@ namespace llaminar2::cpu::native_vnni
             int rows = 0;                              ///< Runtime rows for this expert.
             int n = 0;                                 ///< Logical output columns.
             int ldc = 0;                               ///< Destination row stride.
+            /**
+             * Grouped-row policy override used by byte-exact certification.
+             * Production descriptors retain Auto. One-row projections ignore
+             * this field because their independent M=1 policy has a distinct
+             * generated authority.
+             */
+            VerifierRowsPolicy verifier_schedule = VerifierRowsPolicy::Auto;
         };
 
         /** Maximum gate/up descriptors for one 256-expert MoE layer. */
@@ -997,7 +1069,9 @@ namespace llaminar2::cpu::native_vnni
                     .rows = source.rows,
                     .input = source.input_q8,
                     .decode_schedule = DecodeSchedulePolicy::Auto,
-                    .verifier_schedule = VerifierRowsPolicy::Auto,
+                    .verifier_schedule = source.rows > 1
+                        ? source.verifier_schedule
+                        : VerifierRowsPolicy::Auto,
                 };
                 total_rows += source.rows;
                 max_rows = std::max(max_rows, source.rows);
@@ -1157,7 +1231,8 @@ namespace llaminar2::cpu::native_vnni
                     activation_q8,
                     route_rows,
                     intermediate,
-                    activation_blocks_per_row);
+                    activation_blocks_per_row,
+                    gate_up_descriptors[0].kernel->numerical_policy_);
 
                 if (!multiply_batched_preq_decode_equivalent(
                         down_descriptors,
@@ -1375,17 +1450,25 @@ namespace llaminar2::cpu::native_vnni
 
             for (int i = 0; i < num_descs; ++i)
             {
+                auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(
+                    descs[i].kernel);
                 Q8_1Block *A_q8 = multi_q8_tls.data() + static_cast<size_t>(i) * K_blocks;
                 const float *input_data = descs[i].input;
                 int kb = 0;
 #if defined(__AVX512F__)
                 for (; kb + 1 < K_blocks; kb += 2)
-                    simd::quantize_two_blocks_avx512(input_data + kb * 32,
-                                                     A_q8[kb], A_q8[kb + 1]);
+                    quantizeTwoActivationBlocks(
+                        input_data + kb * 32,
+                        A_q8[kb],
+                        A_q8[kb + 1],
+                        vnni->numerical_policy_);
 #endif
                 for (; kb < K_blocks; ++kb)
-                    simd::quantize_single_block(input_data + kb * 32, A_q8[kb],
-                                                std::min(32, k - kb * 32));
+                    quantizeActivationBlock(
+                        input_data + kb * 32,
+                        A_q8[kb],
+                        std::min(32, k - kb * 32),
+                        vnni->numerical_policy_);
             }
 
             std::array<FusedGemvMultiInputDesc,
@@ -1426,6 +1509,10 @@ namespace llaminar2::cpu::native_vnni
     private:
         CPUNativeVNNIPackedWeights packed_;
         bool valid_ = false;
+
+        /** Arithmetic identity retained across detach/attach lifecycle events. */
+        CPUProjectionNumericalPolicy numerical_policy_ =
+            CPUProjectionNumericalPolicy::BackendNative;
 
         /**
          * @brief Optional block-diagonal activation transform paired with weights.

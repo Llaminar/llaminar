@@ -22,6 +22,7 @@ namespace llaminar2
         case WeightRole::AttentionWO: return "AttentionWO";
         case WeightRole::FusedQKV: return "FusedQKV";
         case WeightRole::GDNProjection: return "GDNProjection";
+        case WeightRole::GDNAlphaBetaProjection: return "GDNAlphaBetaProjection";
         case WeightRole::GDNSsmParam: return "GDNSsmParam";
         case WeightRole::FFNGate: return "FFNGate";
         case WeightRole::FFNUp: return "FFNUp";
@@ -112,10 +113,11 @@ namespace llaminar2
         if (name.find("attn_output.weight") != std::string::npos ||
             name.find("attn_o.weight") != std::string::npos)
             return WeightRole::AttentionWO;
-        if (name.find("gdn_qkv.weight") != std::string::npos ||
-            name.find("ssm.qkv_proj.weight") != std::string::npos ||
-            name.find("ssm_alpha.weight") != std::string::npos ||
+        if (name.find("ssm_alpha.weight") != std::string::npos ||
             name.find("ssm_beta.weight") != std::string::npos)
+            return WeightRole::GDNAlphaBetaProjection;
+        if (name.find("gdn_qkv.weight") != std::string::npos ||
+            name.find("ssm.qkv_proj.weight") != std::string::npos)
             return WeightRole::GDNProjection;
         if (name.find("ssm_conv1d.weight") != std::string::npos ||
             name.find(".ssm_a") != std::string::npos)

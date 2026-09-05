@@ -58,7 +58,7 @@ device-generation parent. CUDA requires
 `generation_execution_policy=native_conditional_parent`, and
 `native_generation_parent=true`. ROCm instead requires the authenticated
 `host_scheduled_captured_transactions` policy: the device controller owns all
-mutable state and the host may copy only the exact 48-byte immutable ticket
+mutable state and the host may copy only the exact ABI-v2 52-byte immutable ticket
 that selects a complete retained transaction graph. Its ticket provenance,
 participant submission ledger, and controller transaction count must agree.
 `unclassified`, `inconsistent`, a mutable state payload, or hosted eager

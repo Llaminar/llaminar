@@ -134,6 +134,8 @@ namespace llaminar2
             Prepared,
             PublicationQueued,
             PublicationInFlight,
+            SelectorPublicationQueued,
+            SelectorPublicationInFlight,
             Published,
             AbortQueued,
             AbortInFlight,
@@ -1158,7 +1160,7 @@ namespace llaminar2
                 endpoint.phase = EndpointPhase::ReserveQueued;
             }
 
-            /** Upload only inactive banks/selectors, then mark the epoch ready. */
+            /** Upload only inactive banks, then mark the epoch ready. */
             void queueBankPrepare(DeviceBankEndpointWave &endpoint)
             {
                 auto *const resource = endpoint.endpoint;
@@ -1179,21 +1181,6 @@ namespace llaminar2
                                 sizeof(DeviceMoEPlacementBank),
                                 0u,
                                 sizeof(DeviceMoEPlacementBank),
-                                resource->binding.device,
-                                resource->stream);
-                        }
-                        for (std::uint32_t layer = 0u;
-                             layer < resource->binding.layer_count;
-                             ++layer)
-                        {
-                            const auto &recipe = wave->recipes.at(layer);
-                            transfer.enqueueMappedHostToPersistentDeviceRegion(
-                                *resource->page,
-                                resource->layout.selectorOffset(layer),
-                                recipe.device_runtime,
-                                sizeof(DeviceMoELayerRuntime),
-                                0u,
-                                sizeof(RuntimePublicationSelector),
                                 resource->binding.device,
                                 resource->stream);
                         }
@@ -1267,6 +1254,53 @@ namespace llaminar2
                         }
                     });
                 endpoint.phase = EndpointPhase::PublicationQueued;
+            }
+
+            /**
+             * @brief Publish maintenance-only runtime selectors after epoch success.
+             *
+             * Ticketed inference selects its immutable bank from the device RCU
+             * control record.  The leading runtime fields are retained only so
+             * the next maintenance transaction and diagnostics agree with that
+             * authority.  Updating them while the candidate is merely Prepared
+             * exposes an unpublished bank to any device-side maintenance reader;
+             * therefore this copy is submitted only after PublishCandidate has
+             * returned semantic success.
+             */
+            void queueRuntimeSelectorPublication(
+                DeviceBankEndpointWave &endpoint)
+            {
+                auto *const resource = endpoint.endpoint;
+                auto *const wave = &endpoint;
+                endpoint.submission = resource->worker->submitAsync(
+                    [resource, wave]
+                    {
+                        auto &transfer = TransferEngine::instance();
+                        for (std::uint32_t layer = 0u;
+                             layer < resource->binding.layer_count;
+                             ++layer)
+                        {
+                            const auto &recipe = wave->recipes.at(layer);
+                            transfer.enqueueMappedHostToPersistentDeviceRegion(
+                                *resource->page,
+                                resource->layout.selectorOffset(layer),
+                                recipe.device_runtime,
+                                sizeof(DeviceMoELayerRuntime),
+                                0u,
+                                sizeof(RuntimePublicationSelector),
+                                resource->binding.device,
+                                resource->stream);
+                        }
+                        if (!resource->worker->recordEventChecked(
+                                resource->terminal_event,
+                                resource->stream))
+                        {
+                            throw std::runtime_error(
+                                "GPU runtime-selector publication terminal event enqueue failed");
+                        }
+                    });
+                endpoint.phase =
+                    EndpointPhase::SelectorPublicationQueued;
             }
 
             /** Submit rollback of one reserved but unpublished device bank. */
@@ -1528,6 +1562,25 @@ namespace llaminar2
                     {
                         return MoEOverlayResidencyWaveProgress::Failed;
                     }
+                    queueRuntimeSelectorPublication(endpoint);
+                    return MoEOverlayResidencyWaveProgress::Pending;
+                }
+                if (endpoint.phase ==
+                        EndpointPhase::SelectorPublicationQueued &&
+                    !finishSubmission(
+                        endpoint,
+                        EndpointPhase::SelectorPublicationQueued,
+                        EndpointPhase::SelectorPublicationInFlight))
+                {
+                    return MoEOverlayResidencyWaveProgress::Pending;
+                }
+                if (endpoint.phase ==
+                    EndpointPhase::SelectorPublicationInFlight)
+                {
+                    if (!eventReady(endpoint))
+                        return MoEOverlayResidencyWaveProgress::Pending;
+                    const std::uint32_t bank =
+                        endpoint.recipes.front().bank;
                     for (std::uint32_t layer = 0u;
                          layer < endpoint.endpoint->binding.layer_count;
                          ++layer)

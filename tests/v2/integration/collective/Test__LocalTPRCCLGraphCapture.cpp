@@ -31,11 +31,15 @@
 #include "backends/DeviceId.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "backends/IBackend.h"
+#include "backends/rocm/HIPGraphCapture.h"
 #include "collective/ICollectiveBackend.h"
 #include "collective/LocalTPContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/moe/DeviceMoEOverlayEpochArena.h"
+#include "kernels/common/TPRankOrderedReductionKernels.h"
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "tensors/TensorClasses.h"
+#include "transfer/TransferEngine.h"
 #include "../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -3276,11 +3280,14 @@ TEST(Test__LocalTPRCCLGraphCapture,
     const std::array<void *, 2> recv_buffers{recv0, recv1};
     LayeredAllgatherTiming direct_timing;
     LayeredAllgatherTiming auxiliary_timing;
+    std::chrono::nanoseconds direct_capture_time{};
+    std::chrono::nanoseconds auxiliary_capture_time{};
     std::array<size_t, 2> direct_nodes{};
     std::array<size_t, 2> auxiliary_nodes{};
 
     auto run_variant = [&](bool auxiliary_lanes,
                            LayeredAllgatherTiming &timing,
+                           std::chrono::nanoseconds &capture_time,
                            std::array<size_t, 2> &node_counts)
     {
         LayeredAllgatherGraph graph;
@@ -3288,6 +3295,7 @@ TEST(Test__LocalTPRCCLGraphCapture,
             rocm_backend,
             kRoutedLayerCount,
             graph);
+        const auto capture_begin = std::chrono::steady_clock::now();
         captureLayeredAllgatherGraph(
             *ctx,
             send_buffers,
@@ -3296,6 +3304,7 @@ TEST(Test__LocalTPRCCLGraphCapture,
             kRoutedLayerCount,
             auxiliary_lanes,
             graph);
+        capture_time = std::chrono::steady_clock::now() - capture_begin;
 
         expectCapturedGraphReady(graph.results[0], "layered allgather graph 0");
         expectCapturedGraphReady(graph.results[1], "layered allgather graph 1");
@@ -3311,9 +3320,13 @@ TEST(Test__LocalTPRCCLGraphCapture,
         destroyLayeredAllgatherResources(rocm_backend, graph);
     };
 
-    run_variant(false, direct_timing, direct_nodes);
+    run_variant(false, direct_timing, direct_capture_time, direct_nodes);
     if (!::testing::Test::HasFailure())
-        run_variant(true, auxiliary_timing, auxiliary_nodes);
+        run_variant(
+            true,
+            auxiliary_timing,
+            auxiliary_capture_time,
+            auxiliary_nodes);
 
     if (!::testing::Test::HasFailure())
     {
@@ -3323,11 +3336,19 @@ TEST(Test__LocalTPRCCLGraphCapture,
             << "[RCCL_QWEN36_LLEP_LAYER_SCALING]"
             << " payload_bytes=" << kPreparedExpertPayloadBytes
             << " layers=" << kRoutedLayerCount
+            << " direct_capture_ms="
+            << std::chrono::duration<double, std::milli>(
+                   direct_capture_time)
+                   .count()
             << " direct_nodes=" << direct_nodes[0] << ',' << direct_nodes[1]
             << " direct_median_us=" << direct_timing.median_us
             << " direct_per_layer_us="
             << direct_timing.median_us / static_cast<double>(kRoutedLayerCount)
             << " direct_p95_us=" << direct_timing.p95_us
+            << " auxiliary_capture_ms="
+            << std::chrono::duration<double, std::milli>(
+                   auxiliary_capture_time)
+                   .count()
             << " auxiliary_nodes=" << auxiliary_nodes[0] << ',' << auxiliary_nodes[1]
             << " auxiliary_median_us=" << auxiliary_timing.median_us
             << " auxiliary_per_layer_us="
@@ -3462,6 +3483,1190 @@ TEST(Test__LocalTPRCCLGraphCapture, DISABLED_RCCLDecodeMaintenanceOverlap_Decode
 {
     runRcclDecodeMaintenanceOverlapLab(
         RcclOverlapPattern::DecodeWaitsForMaintenanceCompletion);
+}
+
+/**
+ * @test A captured RCCL byte gather followed by an ascending-rank device fold
+ *       publishes identical row-zero bytes for M=1, M=2, and M=3.
+ *
+ * Four participants make the reduction-order defect observable: the rank-zero
+ * row uses cancellation-sensitive values for which a balanced native tree and
+ * the required ascending-rank fold produce different answers. The protocol is
+ * captured and replayed as one retained graph per participant, matching the
+ * production MTP transaction boundary without any host arithmetic authority.
+ */
+TEST(Test__LocalTPRCCLGraphCapture,
+     RCCLCanonicalRankOrderReduction_GraphCapturedRowZeroIsBatchInvariant)
+{
+    auto *rocm_backend = getROCmBackend();
+    ASSERT_NE(rocm_backend, nullptr);
+    if (rocm_backend->deviceCount() < 4)
+    {
+        GTEST_SKIP() << "Requires 4+ ROCm GPUs, found "
+                     << rocm_backend->deviceCount();
+    }
+
+    constexpr int kParticipants = 4;
+    constexpr size_t kColumns = 3072;
+    auto ctx = createLocalTPContext(
+        {GlobalDeviceAddress::rocm(0),
+         GlobalDeviceAddress::rocm(1),
+         GlobalDeviceAddress::rocm(2),
+         GlobalDeviceAddress::rocm(3)},
+        {},
+        CollectiveBackendType::RCCL);
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+
+    const auto run_shape = [&](int rows, std::vector<float> *row_zero)
+    {
+        ASSERT_GT(rows, 0);
+        ASSERT_NE(row_zero, nullptr);
+        const size_t element_count = static_cast<size_t>(rows) * kColumns;
+        std::array<float *, kParticipants> values{};
+        std::array<float *, kParticipants> rank_banks{};
+        std::array<hipStream_t, kParticipants> streams{};
+        std::array<CaptureResult, kParticipants> results{};
+
+        constexpr std::array<float, kParticipants> kAdversarialRow{
+            16777216.0F,
+            1.0F,
+            -16777216.0F,
+            0.5F};
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            std::vector<float> host_values(element_count);
+            for (int row = 0; row < rows; ++row)
+            {
+                for (size_t column = 0; column < kColumns; ++column)
+                {
+                    host_values[static_cast<size_t>(row) * kColumns + column] =
+                        row == 0
+                            ? kAdversarialRow[participant]
+                            : static_cast<float>(participant + 1) * 0.25F +
+                                  static_cast<float>(column % 11u) * 0.03125F;
+                }
+            }
+            allocateAndUpload<float>(
+                participant, host_values, &values[participant]);
+            allocateAndUpload<float>(
+                participant,
+                std::vector<float>(
+                    element_count * static_cast<size_t>(kParticipants),
+                    -1.0F),
+                &rank_banks[participant]);
+            ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+            ASSERT_EQ(
+                hipStreamCreateWithFlags(
+                    &streams[participant], hipStreamNonBlocking),
+                hipSuccess);
+        }
+
+        Barrier ready_to_capture(kParticipants);
+        Barrier captured_protocol(kParticipants);
+        std::array<std::thread, kParticipants> capture_threads;
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            capture_threads[participant] = std::thread(
+                [&, participant]
+                {
+                    auto &result = results[participant];
+                    result.begin_status = hipSetDevice(participant);
+                    if (result.begin_status == hipSuccess)
+                    {
+                        result.begin_status = hipStreamBeginCapture(
+                            streams[participant],
+                            hipStreamCaptureModeRelaxed);
+                    }
+                    ready_to_capture.arriveAndWait();
+
+                    if (result.begin_status == hipSuccess)
+                    {
+                        GraphCaptureGuard guard;
+                        const bool gathered = ctx->allgatherRawOnStream(
+                            values[participant],
+                            rank_banks[participant],
+                            element_count,
+                            CollectiveDataType::FLOAT32,
+                            participant,
+                            streams[participant],
+                            "rccl_canonical_rank_order_m" +
+                                std::to_string(rows));
+                        const bool folded = gathered &&
+                            launchROCmTPRankOrderedSumFP32(
+                                rank_banks[participant],
+                                values[participant],
+                                element_count,
+                                kParticipants,
+                                participant,
+                                streams[participant]);
+                        result.collective_ok = gathered && folded;
+                    }
+                    captured_protocol.arriveAndWait();
+
+                    if (result.begin_status == hipSuccess &&
+                        result.collective_ok)
+                    {
+                        result.end_status = hipSetDevice(participant);
+                        if (result.end_status == hipSuccess)
+                        {
+                            result.end_status = hipStreamEndCapture(
+                                streams[participant], &result.graph);
+                        }
+                    }
+                    if (result.end_status == hipSuccess && result.graph)
+                    {
+                        result.instantiate_status = hipGraphInstantiate(
+                            &result.exec,
+                            result.graph,
+                            nullptr,
+                            nullptr,
+                            0);
+                    }
+                });
+        }
+        for (auto &thread : capture_threads)
+            thread.join();
+
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            const auto &result = results[participant];
+            ASSERT_EQ(result.begin_status, hipSuccess)
+                << "participant=" << participant << " M=" << rows;
+            ASSERT_TRUE(result.collective_ok)
+                << "participant=" << participant << " M=" << rows;
+            ASSERT_EQ(result.end_status, hipSuccess)
+                << "participant=" << participant << " M=" << rows;
+            ASSERT_EQ(result.instantiate_status, hipSuccess)
+                << "participant=" << participant << " M=" << rows;
+            ASSERT_NE(result.exec, nullptr);
+        }
+
+        Barrier ready_to_replay(kParticipants);
+        std::array<hipError_t, kParticipants> replay_status{};
+        std::array<std::thread, kParticipants> replay_threads;
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            replay_threads[participant] = std::thread(
+                [&, participant]
+                {
+                    replay_status[participant] = hipSetDevice(participant);
+                    ready_to_replay.arriveAndWait();
+                    if (replay_status[participant] == hipSuccess)
+                    {
+                        replay_status[participant] = hipGraphLaunch(
+                            results[participant].exec,
+                            streams[participant]);
+                    }
+                    if (replay_status[participant] == hipSuccess)
+                    {
+                        replay_status[participant] = hipStreamSynchronize(
+                            streams[participant]);
+                    }
+                });
+        }
+        for (auto &thread : replay_threads)
+            thread.join();
+
+        std::array<std::vector<float>, kParticipants> actual;
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            ASSERT_EQ(replay_status[participant], hipSuccess)
+                << "participant=" << participant << " M=" << rows;
+            actual[participant].resize(element_count);
+            downloadDeviceVector<float>(
+                participant, values[participant], &actual[participant]);
+        }
+        for (int participant = 1; participant < kParticipants; ++participant)
+        {
+            EXPECT_EQ(
+                std::memcmp(
+                    actual[0].data(),
+                    actual[participant].data(),
+                    element_count * sizeof(float)),
+                0)
+                << "Canonical TP publication differs by participant, M="
+                << rows;
+        }
+        EXPECT_TRUE(std::all_of(
+            actual[0].begin(),
+            actual[0].begin() + static_cast<std::ptrdiff_t>(kColumns),
+            [](float value) { return value == 0.5F; }))
+            << "Ascending rank order must be the sole arithmetic authority";
+
+        row_zero->assign(actual[0].begin(), actual[0].begin() + kColumns);
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            destroyCaptureResult(results[participant]);
+            ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+            EXPECT_EQ(hipStreamDestroy(streams[participant]), hipSuccess);
+            freeDevicePtr(participant, values[participant]);
+            freeDevicePtr(participant, rank_banks[participant]);
+        }
+    };
+
+    std::vector<float> serial_row;
+    std::vector<float> grouped_m2_row_zero;
+    std::vector<float> grouped_m3_row_zero;
+    ASSERT_NO_FATAL_FAILURE(run_shape(1, &serial_row));
+    ASSERT_NO_FATAL_FAILURE(run_shape(2, &grouped_m2_row_zero));
+    ASSERT_NO_FATAL_FAILURE(run_shape(3, &grouped_m3_row_zero));
+    ASSERT_EQ(serial_row.size(), kColumns);
+    ASSERT_EQ(grouped_m2_row_zero.size(), kColumns);
+    ASSERT_EQ(grouped_m3_row_zero.size(), kColumns);
+    EXPECT_EQ(
+        std::memcmp(
+            serial_row.data(),
+            grouped_m2_row_zero.data(),
+            kColumns * sizeof(float)),
+        0)
+        << "M=2 verifier row zero must be byte-identical to M=1 decode";
+    EXPECT_EQ(
+        std::memcmp(
+            serial_row.data(),
+            grouped_m3_row_zero.data(),
+            kColumns * sizeof(float)),
+        0)
+        << "M=3 verifier row zero must be byte-identical to M=1 decode";
+}
+
+/**
+ * @test A mapped linear activation copy remains executable after retained-parent import.
+ *
+ * HIP stream capture represents `hipMemcpyAsync` as a specialized 1D graph
+ * node whose runtime classification accounts for mapped and peer memory. The
+ * retained-parent importer must preserve that representation. Recreating the
+ * node through HIP's generic 3D API makes ROCm 7.1 on gfx906 advertise direct
+ * packet capture while producing no packet; graph instantiation and launch
+ * then report success even though the complete parent executes no work.
+ *
+ * The 12,288-byte payload is the Qwen 3.5 122B decode activation geometry that
+ * exposed the defect. Verification synchronizes only at the terminal test
+ * observation boundary, after the retained graph has been launched normally.
+ */
+TEST(Test__LocalTPRCCLGraphCapture,
+     MappedLinearMemcpy_RetainedParentImportExecutes)
+{
+    auto *rocm_backend = getROCmBackend();
+    ASSERT_NE(rocm_backend, nullptr);
+    if (rocm_backend->deviceCount() < 1)
+        GTEST_SKIP() << "Requires one ROCm GPU";
+
+    constexpr int kDeviceOrdinal = 0;
+    constexpr std::size_t kActivationBytes = 12'288u;
+    const DeviceId device = DeviceId::rocm(kDeviceOrdinal);
+    ASSERT_EQ(hipSetDevice(kDeviceOrdinal), hipSuccess);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(
+        hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+        hipSuccess);
+
+    const std::array<DeviceId, 1> mapped_devices{device};
+    auto source_region =
+        TransferEngine::instance().allocateMappedHostRegion(
+            kActivationBytes, mapped_devices);
+    ASSERT_NE(source_region, nullptr);
+    ASSERT_TRUE(source_region->isBound());
+    auto *const source = static_cast<std::uint8_t *>(
+        source_region->mutableHostData());
+    for (std::size_t index = 0u; index < kActivationBytes; ++index)
+        source[index] = static_cast<std::uint8_t>((index * 17u + 29u) & 0xffu);
+
+    std::uint8_t *destination = nullptr;
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&destination),
+            kActivationBytes),
+        hipSuccess);
+    ASSERT_NE(destination, nullptr);
+    ASSERT_EQ(hipMemset(destination, 0, kActivationBytes), hipSuccess);
+
+    auto child = std::make_unique<HIPGraphCapture>(
+        stream, kDeviceOrdinal);
+    ASSERT_TRUE(child->beginCapture());
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                destination,
+                source_region->deviceAlias(device),
+                kActivationBytes,
+                hipMemcpyDeviceToDevice,
+                stream),
+            hipSuccess);
+    }
+    ASSERT_TRUE(child->endCapture());
+    ASSERT_EQ(child->nodeCount(), 1u);
+
+    auto parent = std::make_unique<HIPGraphCapture>(
+        stream, kDeviceOrdinal);
+    const std::array<GPUOrderedTimelineStep, 1> ordered_steps{{
+        {
+            .name = "mapped_activation_copy",
+            .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+            .capture = child.get(),
+            .signal = nullptr,
+            .value = 0u,
+        },
+    }};
+    ASSERT_TRUE(parent->buildOrderedTimelineTransaction(ordered_steps));
+    ASSERT_EQ(parent->nodeCount(), 1u);
+    ASSERT_TRUE(parent->instantiate());
+    ASSERT_TRUE(parent->launch());
+
+    /* This synchronization is the test's terminal observation boundary, not
+     * part of the retained production transaction. */
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    std::vector<std::uint8_t> observed(kActivationBytes, 0u);
+    ASSERT_EQ(
+        hipMemcpy(
+            observed.data(),
+            destination,
+            kActivationBytes,
+            hipMemcpyDeviceToHost),
+        hipSuccess);
+    EXPECT_TRUE(std::equal(observed.begin(), observed.end(), source));
+
+    parent.reset();
+    child.reset();
+    EXPECT_EQ(hipFree(destination), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+/**
+ * @test A production-shaped captured epoch transaction remains launchable
+ *       after native parent composition on four ROCm participants.
+ *
+ * Qwen 3.5 122B decode records an embedding/dense rank-order reduction, an
+ * attention rank-order reduction, a mapped CPU ExpertOverlay ticket, and a
+ * rooted route reduce/broadcast in one child before flattening 49 children
+ * into its retained endpoint parent. A direct child launch does not exercise
+ * RCCL's persistent graph-plan lifetime after node import, while a single
+ * collective or tiny payload can select a different RCCL protocol. This
+ * focused regression therefore preserves the production order, decode payload
+ * classes, 49 layer fragments, and four independently instantiated retained
+ * parent families. The immutable child fragments are recorded once and
+ * imported into every parent, matching production's graph-cache ownership.
+ * Parent validation uses exact source-to-parent node conservation rather than
+ * duplicating a model graph's transient node census: real-weight parity owns
+ * the complete live graph-shape proof, while this model-free test owns the
+ * RCCL graph-plan, import, epoch, and ticket lifetime proof.
+ * The epoch acquire is the first node of fragment zero and its release is the
+ * terminal of fragment 48, proving that the ordinary main graph owns one
+ * self-contained residency transaction. Participant zero's mapped ticket is
+ * serviced concurrently by the CPU exactly between the dense and rooted
+ * collective families.
+ */
+TEST(Test__LocalTPRCCLGraphCapture,
+     RCCLCanonicalRankOrderReduction_TP4CapturedEpochTransactionParentCompletes)
+{
+    const auto test_started_at = std::chrono::steady_clock::now();
+    const auto report_phase = [&](const char *phase,
+                                  int participant = -1,
+                                  int ordinal = -1)
+    {
+        const auto elapsed_ms = std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - test_started_at)
+                                    .count();
+        std::cerr << "[RCCL retained-parent regression] phase=" << phase;
+        if (participant >= 0)
+            std::cerr << " participant=" << participant;
+        if (ordinal >= 0)
+            std::cerr << " ordinal=" << ordinal;
+        std::cerr << " elapsed_ms=" << elapsed_ms << std::endl;
+    };
+
+    auto *rocm_backend = getROCmBackend();
+    ASSERT_NE(rocm_backend, nullptr);
+    if (rocm_backend->deviceCount() < 4)
+    {
+        GTEST_SKIP() << "Requires 4+ ROCm GPUs, found "
+                     << rocm_backend->deviceCount();
+    }
+
+    constexpr int kParticipants = 4;
+    constexpr int kFragments = 49;
+    constexpr int kRetainedFamilies = 4;
+    constexpr std::size_t kDenseElements = 3072u;
+    constexpr std::size_t kRouteElements = 8u * kDenseElements;
+    constexpr std::size_t kProductionMemcpyBytes = 993280u;
+    auto ctx = createLocalTPContext(
+        {GlobalDeviceAddress::rocm(0),
+         GlobalDeviceAddress::rocm(1),
+         GlobalDeviceAddress::rocm(2),
+         GlobalDeviceAddress::rocm(3)},
+        {},
+        CollectiveBackendType::RCCL);
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+
+    constexpr std::size_t kTicketStride = 2u * sizeof(std::uint64_t);
+    const std::array<DeviceId, 1> ticket_devices{DeviceId::rocm(0)};
+    constexpr std::size_t kEntryTicketOffset =
+        kFragments * kTicketStride;
+    auto ticket_region =
+        TransferEngine::instance().allocateMappedHostRegion(
+            (kFragments + 1u) * kTicketStride, ticket_devices);
+    ASSERT_NE(ticket_region, nullptr);
+    ASSERT_TRUE(ticket_region->isBound());
+
+    /*
+     * The production continuation GPUs do not acquire their placement banks
+     * independently.  They first raise disjoint guards in one mapped barrier,
+     * then participant zero freezes the exact topology-wide admission epoch.
+     * Keep the scalar and record on separate cache-line boundaries so the test
+     * exercises the same system-scope memory protocol without false sharing.
+     */
+    constexpr std::size_t kAdmissionEpochOffset = 0u;
+    constexpr std::size_t kAdmissionBarrierOffset = 64u;
+    const std::array<DeviceId, kParticipants> admission_devices{
+        DeviceId::rocm(0),
+        DeviceId::rocm(1),
+        DeviceId::rocm(2),
+        DeviceId::rocm(3)};
+    auto admission_region =
+        TransferEngine::instance().allocateMappedHostRegion(
+            kAdmissionBarrierOffset +
+                sizeof(MoEOverlayDeviceControllerInferenceEpochRecord),
+            admission_devices);
+    ASSERT_NE(admission_region, nullptr);
+    ASSERT_TRUE(admission_region->isBound());
+    *static_cast<std::uint64_t *>(admission_region->mutableHostData(
+        kAdmissionEpochOffset)) = 1u;
+    auto *const admission_record = static_cast<
+        MoEOverlayDeviceControllerInferenceEpochRecord *>(
+        admission_region->mutableHostData(kAdmissionBarrierOffset));
+    *admission_record = MoEOverlayDeviceControllerInferenceEpochRecord{};
+    admission_record->participant_mask = 0b1111u;
+    admission_record->publisher_participant_id = 0u;
+    admission_record->topology_fingerprint = 1u;
+    admission_record->epoch = 1u;
+
+    std::array<float *, kParticipants> values{};
+    std::array<float *, kParticipants> rank_banks{};
+    std::array<float *, kParticipants> route_values{};
+    std::array<float *, kParticipants> compact_values{};
+    std::array<std::uint8_t *, kParticipants> copy_sources{};
+    std::array<std::uint8_t *, kParticipants> copy_destinations{};
+    std::array<std::unique_ptr<FP32Tensor>, kParticipants> consensus_values{};
+    std::array<
+        std::shared_ptr<DeviceMoEOverlayEpochArena>,
+        kParticipants>
+        epoch_arenas;
+    std::array<std::unique_ptr<ROCmMoEKernel>, kParticipants> epoch_kernels;
+    std::array<hipStream_t, kParticipants> streams{};
+    std::array<
+        std::vector<std::unique_ptr<HIPGraphCapture>>,
+        kParticipants>
+        children;
+    std::array<std::vector<void *>, kParticipants> residency_pressure;
+    for (int participant = 0; participant < kParticipants; ++participant)
+    {
+        report_phase("participant_setup_begin", participant);
+        allocateAndUpload<float>(
+            participant,
+            std::vector<float>(
+                kDenseElements,
+                static_cast<float>(participant + 1)),
+            &values[participant]);
+        allocateAndUpload<float>(
+            participant,
+            std::vector<float>(
+                kDenseElements * kParticipants, -1.0F),
+            &rank_banks[participant]);
+        allocateAndUpload<float>(
+            participant,
+            std::vector<float>(
+                kRouteElements,
+                static_cast<float>(participant + 1)),
+            &route_values[participant]);
+        allocateAndUpload<float>(
+            participant,
+            std::vector<float>(kDenseElements, -1.0F),
+            &compact_values[participant]);
+        ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+        ASSERT_EQ(
+            hipMalloc(
+                reinterpret_cast<void **>(&copy_sources[participant]),
+                kProductionMemcpyBytes),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMalloc(
+                reinterpret_cast<void **>(&copy_destinations[participant]),
+                kProductionMemcpyBytes),
+            hipSuccess);
+        ASSERT_NE(copy_sources[participant], nullptr);
+        ASSERT_NE(copy_destinations[participant], nullptr);
+        ASSERT_EQ(
+            hipMemset(copy_sources[participant], 0x5a, kProductionMemcpyBytes),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemset(
+                copy_destinations[participant],
+                0xa5,
+                kProductionMemcpyBytes),
+            hipSuccess);
+        consensus_values[participant] = TestTensorFactory::createFP32({1u});
+        TestTensorFactory::fillValue(
+            consensus_values[participant].get(),
+            static_cast<float>(participant + 1));
+        ASSERT_TRUE(consensus_values[participant]->ensureOnDevice(
+            DeviceId::rocm(participant)));
+        ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(
+                &streams[participant], hipStreamNonBlocking),
+            hipSuccess);
+        epoch_arenas[participant] =
+            std::make_shared<DeviceMoEOverlayEpochArena>(
+                DeviceMoEOverlayEpochArena::Config{
+                    .device_id = DeviceId::rocm(participant),
+                    .initial_epoch = 1u,
+                    .initial_bank = 0u,
+                    .request_slot_capacity = 1u,
+                    .external_admission_epoch = static_cast<
+                        const std::uint64_t *>(
+                        admission_region->deviceAlias(
+                            DeviceId::rocm(participant),
+                            kAdmissionEpochOffset)),
+                    .external_admission_lifetime = admission_region,
+                    .admission_barrier = {
+                        .record = static_cast<
+                            MoEOverlayDeviceControllerInferenceEpochRecord *>(
+                            admission_region->deviceAlias(
+                                DeviceId::rocm(participant),
+                                kAdmissionBarrierOffset)),
+                        .participant_id = static_cast<std::uint32_t>(
+                            participant),
+                    },
+                });
+        epoch_kernels[participant] =
+            std::make_unique<ROCmMoEKernel>(participant);
+        children[participant].reserve(kFragments);
+        report_phase("participant_setup_complete", participant);
+    }
+
+    report_phase("child_capture_begin");
+    Barrier capture_begin(kParticipants);
+    Barrier collective_recorded(kParticipants);
+    std::array<bool, kParticipants> capture_ok{};
+    std::array<std::thread, kParticipants> capture_threads;
+    for (int participant = 0; participant < kParticipants; ++participant)
+    {
+        capture_threads[participant] = std::thread(
+            [&, participant]
+            {
+                capture_ok[participant] =
+                    hipSetDevice(participant) == hipSuccess;
+                for (int fragment = 0;
+                     fragment < kFragments && capture_ok[participant];
+                     ++fragment)
+                {
+                    const auto fragment_begin =
+                        std::chrono::steady_clock::now();
+                    auto capture_begin_complete = fragment_begin;
+                    auto memcpy_capture_complete = fragment_begin;
+                    auto attention_capture_complete = fragment_begin;
+                    auto collective_capture_complete = fragment_begin;
+                    auto child = std::make_unique<HIPGraphCapture>(
+                        streams[participant], participant);
+                    capture_ok[participant] = child->beginCapture();
+                    capture_begin_complete =
+                        std::chrono::steady_clock::now();
+                    capture_begin.arriveAndWait();
+                    if (capture_ok[participant])
+                    {
+                        GraphCaptureGuard guard;
+                        const MoEKernelLaunchContext epoch_launch{
+                            .stream = streams[participant],
+                            .workspace = nullptr,
+                        };
+                        /* Production's continuation authority publishes its
+                         * mapped ticket-service entry as the parent root.  The
+                         * sibling parents begin at acquireEpochKernel.  Keep
+                         * this before participant zero's acquire so the native
+                         * root topology, not just eventual behavior, agrees. */
+                        if (participant == 0 && fragment == 0)
+                        {
+                            TransferEngine::instance().
+                                enqueueMappedTimelinePublish64(
+                                    *ticket_region,
+                                    kEntryTicketOffset,
+                                    1u,
+                                    DeviceId::rocm(0),
+                                    streams[participant]);
+                        }
+                        if (fragment == 0)
+                        {
+                            capture_ok[participant] =
+                                epoch_kernels[participant]
+                                    ->acquireMoEOverlayEpoch(
+                                        epoch_launch,
+                                        epoch_arenas[participant]->control(),
+                                        epoch_arenas[participant]
+                                            ->requestTicket(0u),
+                                        epoch_arenas[participant]
+                                            ->requestStatus(0u),
+                                        epoch_arenas[participant]
+                                            ->externalAdmissionEpoch(),
+                                        epoch_arenas[participant]
+                                            ->admissionBarrier());
+                        }
+                        /* Retain one production-maximum D2D payload in every
+                         * layer fragment. This selects the same HIP copy-node
+                         * class whose native import previously lost graph-plan
+                         * lifetime, without repeating thousands of identical
+                         * nodes from a stale model-specific census. */
+                        capture_ok[participant] = hipMemcpyAsync(
+                            copy_destinations[participant],
+                            copy_sources[participant],
+                            kProductionMemcpyBytes,
+                            hipMemcpyDeviceToDevice,
+                            streams[participant]) == hipSuccess;
+                        memcpy_capture_complete =
+                            std::chrono::steady_clock::now();
+                        const bool attention_gathered =
+                            capture_ok[participant] &&
+                            ctx->allgatherRawOnStream(
+                                values[participant],
+                                rank_banks[participant],
+                                kDenseElements,
+                                CollectiveDataType::FLOAT32,
+                                participant,
+                                streams[participant],
+                                "rccl_retained_tp4_attention_fragment_" +
+                                    std::to_string(fragment));
+                        const bool attention_folded = attention_gathered &&
+                            launchROCmTPRankOrderedSumFP32(
+                                rank_banks[participant],
+                                values[participant],
+                                kDenseElements,
+                                kParticipants,
+                                participant,
+                                streams[participant]);
+                        attention_capture_complete =
+                            std::chrono::steady_clock::now();
+                        const bool admission_consensus =
+                            attention_folded &&
+                            ctx->allreduceOnStream(
+                                consensus_values[participant].get(),
+                                "rccl_retained_tp4_admission_fragment_" +
+                                    std::to_string(fragment),
+                                1u,
+                                streams[participant],
+                                "fp32");
+                        const bool completion_consensus =
+                            admission_consensus &&
+                            ctx->allreduceOnStream(
+                                consensus_values[participant].get(),
+                                "rccl_retained_tp4_completion_fragment_" +
+                                    std::to_string(fragment),
+                                1u,
+                                streams[participant],
+                                "fp32");
+
+                        if (completion_consensus && participant == 0)
+                        {
+                            const std::uint64_t timeline =
+                                static_cast<std::uint64_t>(fragment + 1);
+                            TransferEngine::instance().
+                                enqueueMappedTimelinePublish64(
+                                    *ticket_region,
+                                    static_cast<std::size_t>(fragment) *
+                                        kTicketStride,
+                                    timeline,
+                                    DeviceId::rocm(0),
+                                    streams[participant]);
+                            TransferEngine::instance().
+                                enqueueMappedTimelineWait64(
+                                    *ticket_region,
+                                    static_cast<std::size_t>(fragment) *
+                                            kTicketStride +
+                                        sizeof(std::uint64_t),
+                                    timeline,
+                                    DeviceId::rocm(0),
+                                    streams[participant]);
+                        }
+
+                        const bool routes_reduced = completion_consensus &&
+                            ctx->reduceRawOnStream(
+                                route_values[participant],
+                                route_values[participant],
+                                kRouteElements,
+                                CollectiveDataType::FLOAT32,
+                                CollectiveOp::ALLREDUCE_SUM,
+                                /*root_device_index=*/0,
+                                participant,
+                                streams[participant],
+                                "rccl_retained_tp4_routes_reduce_fragment_" +
+                                    std::to_string(fragment));
+                        const bool routes_broadcast = routes_reduced &&
+                            ctx->broadcastRawOnStream(
+                                compact_values[participant],
+                                compact_values[participant],
+                                kDenseElements,
+                                CollectiveDataType::FLOAT32,
+                                /*root_device_index=*/0,
+                                participant,
+                                streams[participant],
+                                "rccl_retained_tp4_routes_broadcast_fragment_" +
+                                    std::to_string(fragment));
+                        capture_ok[participant] = routes_broadcast;
+                        if (capture_ok[participant] &&
+                            fragment == kFragments - 1)
+                        {
+                            capture_ok[participant] =
+                                epoch_kernels[participant]
+                                    ->releaseMoEOverlayEpoch(
+                                        epoch_launch,
+                                        epoch_arenas[participant]->control(),
+                                        epoch_arenas[participant]
+                                            ->requestTicket(0u),
+                                        epoch_arenas[participant]
+                                            ->requestStatus(0u));
+                        }
+                        collective_capture_complete =
+                            std::chrono::steady_clock::now();
+                    }
+                    collective_recorded.arriveAndWait();
+                    if (capture_ok[participant])
+                        capture_ok[participant] = child->endCapture();
+                    const auto fragment_complete =
+                        std::chrono::steady_clock::now();
+                    const auto fragment_ms = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                        fragment_complete - fragment_begin)
+                                                 .count();
+                    if (participant == 0 && fragment_ms >= 500)
+                    {
+                        const auto phase_ms = [](auto begin, auto end)
+                        {
+                            return std::chrono::duration_cast<
+                                std::chrono::milliseconds>(end - begin)
+                                .count();
+                        };
+                        std::cerr
+                            << "[RCCL retained-parent regression]"
+                            << " phase=slow_child_capture"
+                            << " participant=" << participant
+                            << " ordinal=" << fragment
+                            << " total_ms=" << fragment_ms
+                            << " begin_ms="
+                            << phase_ms(
+                                   fragment_begin,
+                                   capture_begin_complete)
+                            << " memcpy_ms="
+                            << phase_ms(
+                                   capture_begin_complete,
+                                   memcpy_capture_complete)
+                            << " attention_ms="
+                            << phase_ms(
+                                   memcpy_capture_complete,
+                                   attention_capture_complete)
+                            << " collective_ms="
+                            << phase_ms(
+                                   attention_capture_complete,
+                                   collective_capture_complete)
+                            << " end_ms="
+                            << phase_ms(
+                                   collective_capture_complete,
+                                   fragment_complete)
+                            << std::endl;
+                    }
+                    if (capture_ok[participant])
+                        children[participant].push_back(std::move(child));
+                    if (participant == 0 &&
+                        (fragment == 0 || fragment == 12 ||
+                         fragment == 24 || fragment == 36 ||
+                         fragment == kFragments - 1))
+                    {
+                        report_phase(
+                            "child_capture_checkpoint",
+                            participant,
+                            fragment);
+                    }
+                }
+            });
+    }
+    for (auto &thread : capture_threads)
+        thread.join();
+    for (int participant = 0; participant < kParticipants; ++participant)
+    {
+        ASSERT_TRUE(capture_ok[participant])
+            << "participant=" << participant;
+        ASSERT_EQ(children[participant].size(), kFragments)
+            << "participant=" << participant;
+    }
+    std::array<std::size_t, kParticipants> expected_parent_nodes{};
+    for (int participant = 0; participant < kParticipants; ++participant)
+    {
+        for (const auto &child : children[participant])
+            expected_parent_nodes[participant] += child->nodeCount();
+        ASSERT_GT(expected_parent_nodes[participant], 0u)
+            << "participant=" << participant;
+    }
+    report_phase("child_capture_complete");
+
+    /*
+     * Apply the model-residency envelope at the operation whose behavior it is
+     * intended to certify: native parent composition, AQL packet capture,
+     * executable instantiation, and replay. Artificially consuming nearly all
+     * VRAM before recording 49 otherwise identical RCCL children forces the
+     * runtime to repeat low-memory registration work for every distinct source
+     * graph. Real-model parity owns capture-time weight/arena residency and
+     * measures that path directly; multiplying it into this model-free
+     * lifecycle proof both duplicates that authority and obscures the packet
+     * path under test. These setup-only allocations remain live through every
+     * parent replay and are released only after all executables retire.
+     */
+    constexpr std::size_t kTargetFreeBytes =
+        3ull * 1024ull * 1024ull * 1024ull;
+    constexpr std::size_t kPressureChunkBytes =
+        512ull * 1024ull * 1024ull;
+    report_phase("parent_residency_pressure_begin");
+    for (int participant = 0; participant < kParticipants; ++participant)
+    {
+        ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+        for (;;)
+        {
+            std::size_t free_bytes = 0u;
+            std::size_t total_bytes = 0u;
+            ASSERT_EQ(
+                hipMemGetInfo(&free_bytes, &total_bytes), hipSuccess)
+                << "participant=" << participant;
+            if (free_bytes <= kTargetFreeBytes + kPressureChunkBytes)
+                break;
+            const std::size_t allocation_bytes = std::min(
+                kPressureChunkBytes,
+                free_bytes - kTargetFreeBytes);
+            void *allocation = nullptr;
+            ASSERT_EQ(
+                hipMalloc(&allocation, allocation_bytes), hipSuccess)
+                << "participant=" << participant
+                << " free_bytes=" << free_bytes
+                << " allocation_bytes=" << allocation_bytes;
+            ASSERT_NE(allocation, nullptr);
+            residency_pressure[participant].push_back(allocation);
+        }
+    }
+    report_phase("parent_residency_pressure_complete");
+
+    std::array<
+        std::array<std::unique_ptr<HIPGraphCapture>, kParticipants>,
+        kRetainedFamilies>
+        parents;
+    for (int family = 0; family < kRetainedFamilies; ++family)
+    {
+        report_phase("parent_family_begin", -1, family);
+        /*
+         * RankOrchestrator owns one persistent setup worker per LocalTP
+         * participant. Each worker composes and instantiates the same serving
+         * family concurrently on its exact device; serial parent construction
+         * here would omit the production runtime boundary that this regression
+         * exists to certify. The barrier removes incidental composition skew
+         * and makes hipGraphInstantiate concurrency explicit and repeatable.
+         */
+        Barrier ready_to_instantiate(kParticipants);
+        std::array<bool, kParticipants> build_ok{};
+        std::array<bool, kParticipants> instantiate_ok{};
+        std::array<std::thread, kParticipants> parent_threads;
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            parent_threads[participant] = std::thread(
+                [&, family, participant]
+                {
+                    build_ok[participant] =
+                        hipSetDevice(participant) == hipSuccess;
+                    if (build_ok[participant])
+                    {
+                        parents[family][participant] =
+                            std::make_unique<HIPGraphCapture>(
+                                streams[participant], participant);
+                        std::vector<std::string> names;
+                        std::vector<GPUOrderedTimelineStep> steps;
+                        names.reserve(kFragments);
+                        steps.reserve(kFragments);
+                        for (int fragment = 0; fragment < kFragments; ++fragment)
+                        {
+                            names.push_back(
+                                "canonical_rank_order_family_" +
+                                std::to_string(family) + "_fragment_" +
+                                std::to_string(fragment));
+                            steps.push_back({
+                                .name = names.back().c_str(),
+                                .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+                                .capture =
+                                    children[participant][fragment].get(),
+                                .signal = nullptr,
+                                .value = 0u,
+                            });
+                        }
+                        build_ok[participant] =
+                            parents[family][participant]
+                                ->buildOrderedTimelineTransaction(steps);
+                    }
+
+                    ready_to_instantiate.arriveAndWait();
+                    instantiate_ok[participant] =
+                        build_ok[participant] &&
+                        parents[family][participant]->instantiate();
+                });
+        }
+        for (auto &thread : parent_threads)
+            thread.join();
+
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            ASSERT_TRUE(build_ok[participant])
+                << "family=" << family << " participant=" << participant;
+            ASSERT_TRUE(instantiate_ok[participant])
+                << "family=" << family << " participant=" << participant;
+            ASSERT_EQ(
+                parents[family][participant]->nodeCount(),
+                expected_parent_nodes[participant])
+                << "retained parent lost one or more immutable child nodes, "
+                   "family="
+                << family << " participant=" << participant;
+        }
+        report_phase("parent_family_complete", -1, family);
+    }
+
+    for (int participant = 0; participant < kParticipants; ++participant)
+    {
+        for (int family = 0; family < kRetainedFamilies; ++family)
+        {
+            ASSERT_TRUE(parents[family][participant]->hasExecutable())
+                << "family=" << family
+                << " participant=" << participant;
+            if (family > 0)
+            {
+                ASSERT_NE(
+                    parents[family - 1][participant]->graph(),
+                    parents[family][participant]->graph())
+                    << "retained families must own distinct parent graphs, "
+                       "family="
+                    << family << " participant=" << participant;
+            }
+        }
+    }
+
+    const auto replay_family = [&](int family)
+    {
+        report_phase("replay_family_begin", -1, family);
+        ASSERT_GE(family, 0);
+        ASSERT_LT(family, kRetainedFamilies);
+        std::memset(
+            ticket_region->mutableHostData(),
+            0,
+            (kFragments + 1u) * kTicketStride);
+
+        Barrier replay_begin(kParticipants);
+        std::array<bool, kParticipants> replay_ok{};
+        std::array<std::thread, kParticipants> replay_threads;
+        std::atomic<bool> ticket_service_ok{true};
+        std::atomic<bool> entry_ticket_observed{false};
+        std::thread ticket_service(
+            [&]
+            {
+                auto *const entry = static_cast<std::uint64_t *>(
+                    ticket_region->mutableHostData(kEntryTicketOffset));
+                const auto entry_deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::seconds(30);
+                while (std::atomic_ref<std::uint64_t>(*entry).load(
+                           std::memory_order_acquire) < 1u)
+                {
+                    if (std::chrono::steady_clock::now() >= entry_deadline)
+                    {
+                        ticket_service_ok.store(
+                            false, std::memory_order_release);
+                        return;
+                    }
+                    std::this_thread::yield();
+                }
+                entry_ticket_observed.store(true, std::memory_order_release);
+                for (int fragment = 0; fragment < kFragments; ++fragment)
+                {
+                    const std::uint64_t timeline =
+                        static_cast<std::uint64_t>(fragment + 1);
+                    auto *const dispatch = static_cast<std::uint64_t *>(
+                        ticket_region->mutableHostData(
+                            static_cast<std::size_t>(fragment) *
+                            kTicketStride));
+                    auto *const returned = static_cast<std::uint64_t *>(
+                        ticket_region->mutableHostData(
+                            static_cast<std::size_t>(fragment) *
+                                kTicketStride +
+                            sizeof(std::uint64_t)));
+                    const auto deadline =
+                        std::chrono::steady_clock::now() +
+                        std::chrono::seconds(30);
+                    while (std::atomic_ref<std::uint64_t>(*dispatch).load(
+                               std::memory_order_acquire) < timeline)
+                    {
+                        if (std::chrono::steady_clock::now() >= deadline)
+                        {
+                            ticket_service_ok.store(
+                                false, std::memory_order_release);
+                            return;
+                        }
+                        std::this_thread::yield();
+                    }
+                    std::atomic_ref<std::uint64_t>(*returned).store(
+                        timeline, std::memory_order_release);
+                }
+            });
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            replay_threads[participant] = std::thread(
+                [&, participant]
+                {
+                    replay_ok[participant] =
+                        hipSetDevice(participant) == hipSuccess;
+                    replay_begin.arriveAndWait();
+                    if (family == kRetainedFamilies - 1)
+                    {
+                        /* Match the live LocalTP worker skew observed on the
+                         * 122B retained decode parent: the highest participant
+                         * submits first, followed by authority zero, then the
+                         * remaining peers. RCCL graph replay must not require
+                         * an accidental host-side simultaneous launch. */
+                        /* Cell 73's retained decode workers submitted
+                         * participant 2 first, then 3, then 1, with the
+                         * continuation authority (participant 0) last.  The
+                         * earlier fixture accidentally exercised the opposite
+                         * authority-first ordering and therefore could not
+                         * expose a packet-submission queue that stalls while
+                         * the leading RCCL participants await the authority. */
+                        constexpr std::array<int, kParticipants>
+                            kModelLikeLaunchDelayMs{30, 15, 0, 5};
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(
+                                kModelLikeLaunchDelayMs[participant]));
+                    }
+                    if (replay_ok[participant])
+                    {
+                        replay_ok[participant] =
+                            parents[family][participant]->launch();
+                    }
+                });
+        }
+        for (auto &thread : replay_threads)
+            thread.join();
+
+        /* Production decode does not synchronize after graph submission: the
+         * mapped ticket service must observe native progress while every
+         * capture stream remains asynchronous. A test that synchronizes here
+         * can accidentally make host-driven HIP submission progress look like
+         * a valid device-owned transaction. */
+        const auto asynchronous_entry_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!entry_ticket_observed.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < asynchronous_entry_deadline)
+        {
+            std::this_thread::yield();
+        }
+        EXPECT_TRUE(entry_ticket_observed.load(std::memory_order_acquire))
+            << "retained parent made no mapped-ticket progress before host "
+               "stream synchronization, family="
+            << family;
+
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+            if (replay_ok[participant])
+            {
+                replay_ok[participant] =
+                    hipStreamSynchronize(streams[participant]) == hipSuccess;
+            }
+        }
+        ticket_service.join();
+        EXPECT_TRUE(ticket_service_ok.load(std::memory_order_acquire))
+            << "family=" << family;
+        for (int participant = 0;
+             participant < kParticipants;
+             ++participant)
+        {
+            EXPECT_TRUE(replay_ok[participant])
+                << "family=" << family
+                << " participant=" << participant;
+            if (!replay_ok[participant])
+                continue;
+
+            ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+            DeviceMoEOverlayEpochControl control{};
+            DeviceMoEOverlayEpochTicket ticket{};
+            DeviceMoEOverlayEpochStatus status{};
+            ASSERT_EQ(
+                hipMemcpy(
+                    &control,
+                    epoch_arenas[participant]->control(),
+                    sizeof(control),
+                    hipMemcpyDeviceToHost),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpy(
+                    &ticket,
+                    epoch_arenas[participant]->requestTicket(0u),
+                    sizeof(ticket),
+                    hipMemcpyDeviceToHost),
+                hipSuccess);
+            ASSERT_EQ(
+                hipMemcpy(
+                    &status,
+                    epoch_arenas[participant]->requestStatus(0u),
+                    sizeof(status),
+                    hipMemcpyDeviceToHost),
+                hipSuccess);
+            EXPECT_EQ(control.bank_readers[0], 0u)
+                << "family=" << family
+                << " participant=" << participant;
+            EXPECT_EQ(control.bank_readers[1], 0u)
+                << "family=" << family
+                << " participant=" << participant;
+            EXPECT_EQ(control.acquisitions_in_flight, 0u)
+                << "family=" << family
+                << " participant=" << participant;
+            EXPECT_FALSE(ticket.valid())
+                << "family=" << family
+                << " participant=" << participant;
+            EXPECT_EQ(
+                status.typedOperation(),
+                DeviceMoEOverlayEpochOperation::Release)
+                << "family=" << family
+                << " participant=" << participant;
+            EXPECT_EQ(
+                status.typedCode(),
+                DeviceMoEOverlayEpochStatusCode::Success)
+                << "family=" << family
+                << " participant=" << participant;
+        }
+        report_phase("replay_family_complete", -1, family);
+    };
+    ASSERT_NO_FATAL_FAILURE(replay_family(0));
+    ASSERT_NO_FATAL_FAILURE(replay_family(kRetainedFamilies - 1));
+
+    for (int participant = 0; participant < kParticipants; ++participant)
+    {
+        for (auto &family : parents)
+            family[participant].reset();
+        children[participant].clear();
+        epoch_kernels[participant].reset();
+        epoch_arenas[participant].reset();
+        ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+        EXPECT_EQ(hipStreamDestroy(streams[participant]), hipSuccess);
+        freeDevicePtr(participant, values[participant]);
+        freeDevicePtr(participant, rank_banks[participant]);
+        freeDevicePtr(participant, route_values[participant]);
+        freeDevicePtr(participant, compact_values[participant]);
+        freeDevicePtr(participant, copy_sources[participant]);
+        freeDevicePtr(participant, copy_destinations[participant]);
+        for (void *allocation : residency_pressure[participant])
+            EXPECT_EQ(hipFree(allocation), hipSuccess);
+        residency_pressure[participant].clear();
+    }
 }
 
 #else

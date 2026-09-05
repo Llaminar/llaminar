@@ -34,6 +34,8 @@
 
 namespace llaminar2
 {
+    class MoEOverlayEconomyCalibrationLayerCatalog;
+
     /** @brief Thermal direction of one complete expert residency move. */
     enum class MoEOverlayTierMigrationDirection
     {
@@ -240,8 +242,18 @@ namespace llaminar2
     struct MoEOverlayParticipantRebalancePolicy
     {
         bool enabled = true;
+        /**
+         * Minimum max/min skew which opens candidate search. Certified host
+         * economics applies this to per-phase endpoint service work; an
+         * authority without service evidence applies it to raw activations.
+         */
         uint32_t imbalance_threshold_per_mille =
             moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille;
+        /**
+         * Minimum fractional reduction from one paired swap. Service-aware
+         * planning measures summed non-regressing phase makespans; raw
+         * planning retains the shared activation-spread definition.
+         */
         uint32_t minimum_improvement_per_mille =
             moe_rebalance_policy::kDefaultDynamicMinImprovementPerMille;
         uint32_t maximum_swaps_per_layer =
@@ -712,6 +724,8 @@ namespace llaminar2
         Started,
         Staging,
         Preparing,
+        /** Prepared weights are waiting for the current graph sequence to end. */
+        AwaitingGraphSequenceBoundary,
         Publishing,
         Published,
         DynamicNoMovement,
@@ -739,6 +753,8 @@ namespace llaminar2
             return status == MoEOverlayResidencyApplyStatus::Started ||
                    status == MoEOverlayResidencyApplyStatus::Staging ||
                    status == MoEOverlayResidencyApplyStatus::Preparing ||
+                   status == MoEOverlayResidencyApplyStatus::
+                                 AwaitingGraphSequenceBoundary ||
                    status == MoEOverlayResidencyApplyStatus::Publishing ||
                    status == MoEOverlayResidencyApplyStatus::Published ||
                    status == MoEOverlayResidencyApplyStatus::DynamicNoMovement ||
@@ -786,6 +802,12 @@ namespace llaminar2
         uint64_t commit_failures = 0;
         uint64_t background_waves_started = 0;
         uint64_t deferred_waves = 0;
+        /** Prepared waves that reserved a graph-sequence publication boundary. */
+        uint64_t publication_boundary_reservations = 0;
+        /** Reserved boundaries that had to drain an admitted graph sequence. */
+        uint64_t publication_boundary_drains = 0;
+        /** Graph-sequence admissions delayed by an irreversible publication. */
+        uint64_t graph_sequence_boundary_waits = 0;
         uint64_t published_with_old_tickets = 0;
         uint64_t old_epoch_retirements = 0;
         uint64_t aborted_waves_reaped = 0;
@@ -803,7 +825,17 @@ namespace llaminar2
     {
         Waiting, ///< The host-authoritative token boundary is not full.
         Pending, ///< At least one device evidence bank is still draining.
+        Reconciled, ///< Runtime evidence was merged but remains below capacity.
         Ready,   ///< A complete immutable window is returned to the caller.
+    };
+
+    /** @brief Evidence scope requested by one host maintenance poll. */
+    enum class MoEOverlayHistogramEvidenceScope : std::uint8_t
+    {
+        /** Inspect already-host-resident evidence and avoid a device drain. */
+        HostResident,
+        /** Reconcile registered runtime sources even when the host view is partial. */
+        RuntimeSources,
     };
 
     /** @brief Typed result from one background window-preparation poll. */
@@ -875,7 +907,13 @@ namespace llaminar2
             DecodeExpertHistogram *histogram = nullptr;
             /** Ceiling for host-authority adaptive demand windows; zero fixes it. */
             std::uint64_t histogram_max_window_tokens = 0u;
-            /** Multiplier applied after each host-authority RCU rotation. */
+            /**
+             * Multiplier applied after an observed host-authority no-op.
+             *
+             * A wave which selected movement is still converging and keeps the
+             * short initial cadence. Only a complete evidence window which
+             * produces no movement may enter adaptive cooldown.
+             */
             double histogram_window_growth_factor = 1.0;
             /**
              * Immutable setup-certified phase service costs.
@@ -896,6 +934,18 @@ namespace llaminar2
              */
             std::optional<MoEOverlayMigrationEconomyPolicy>
                 migration_economy_policy;
+            /**
+             * Exact model-layer equivalence partition used by Dynamic economy.
+             *
+             * Production graph construction and the later economy certifier
+             * retain this same immutable object.  That makes the layers which
+             * carry device service observations part of the placement
+             * authority's setup identity instead of letting each graph invent
+             * an independent sampling pattern.
+             */
+            std::shared_ptr<
+                const MoEOverlayEconomyCalibrationLayerCatalog>
+                economy_layer_catalog;
             /** Same-tier participant skew policy owned by this authority. */
             MoEOverlayParticipantRebalancePolicy participant_rebalance_policy;
             /**
@@ -984,6 +1034,12 @@ namespace llaminar2
          * sequence has retired.
          *
          * @return Race-safe lease for the current publication.
+         *
+         * If a fully prepared movement wave has reserved the next publication
+         * boundary, this call waits on the typed epoch gate until selector
+         * publication makes the successor current. Heavy transfer and bank
+         * preparation have already completed at that point; only the bounded
+         * inference-visible commit may delay admission.
          */
         std::optional<TicketLease> tryAcquireGraphSequenceSnapshot();
 
@@ -1056,6 +1112,18 @@ namespace llaminar2
         [[nodiscard]] bool migrationEnabled() const noexcept;
 
         /**
+         * @brief Return the immutable Dynamic layer-equivalence authority.
+         * @return Exact catalog shared by graph telemetry and certification,
+         *         or null for a non-Dynamic/test authority without telemetry.
+         */
+        [[nodiscard]] const std::shared_ptr<
+            const MoEOverlayEconomyCalibrationLayerCatalog> &
+        economyLayerCatalog() const noexcept
+        {
+            return config_.economy_layer_catalog;
+        }
+
+        /**
          * @brief Seal exact setup-certified service and migration economics.
          *
          * Graph construction must first publish the exact prepared expert
@@ -1125,15 +1193,22 @@ namespace llaminar2
         optimizationDemandWindow() const noexcept;
 
         /**
-         * @brief Start or poll exact device evidence, then rotate the host bank.
+         * @brief Start or poll exact runtime evidence, then rotate a full host bank.
+         * @param evidence_scope Whether an incomplete host view may initiate a
+         *        event-polled runtime-source reconciliation.
          *
-         * The first call is authorized only by a full host token window. Once
-         * started, later polls continue even after request-local activity
-         * changes. Pending never waits for a stream or device; failures throw
-         * with the owning drain's diagnostic.
+         * A host-resident call starts only for a full host token window. A
+         * runtime-source call may drain device-owned counters before the host
+         * can know that they crossed the threshold. Such a probe returns
+         * `Reconciled` without rotating when the merged total is still partial;
+         * only a full bank returns `Ready`. Once a drain starts, later polls
+         * continue it irrespective of the supplied scope. Pending never waits
+         * for a stream or device; failures throw with the owning diagnostic.
          */
         [[nodiscard]] MoEOverlayHistogramWindowResult
-        progressHistogramWindow();
+        progressHistogramWindow(
+            MoEOverlayHistogramEvidenceScope evidence_scope =
+                MoEOverlayHistogramEvidenceScope::HostResident);
 
         /**
          * @brief Drain and discard demand collected before economy activation.
@@ -1310,18 +1385,25 @@ namespace llaminar2
 
         /** @brief Common non-blocking drain/merge/rotate implementation. */
         [[nodiscard]] MoEOverlayHistogramWindowResult
-        progressHistogramDrain(HistogramDrainState requested_state);
+        progressHistogramDrain(
+            HistogramDrainState requested_state,
+            MoEOverlayHistogramEvidenceScope evidence_scope);
 
         /**
-         * @brief Advance the next host demand window after one proposal rotation.
+         * @brief Advance the host cadence from one complete policy outcome.
+         * @param transaction Valid proposal carrying the consumed demand window.
          *
-         * Certification rebase is excluded: it removes synthetic startup
-         * demand before the first production window and therefore must not
-         * consume an adaptive step. Every ordinary proposal rotation advances
-         * exactly once, including an economically rejected proposal, matching
-         * the established Dynamic controller semantics.
+         * Movement resets the short convergence cadence because the newly
+         * selected placement can expose another profitable tier or participant
+         * objective. A real observed no-op grows the cooldown window. Tying the
+         * transition to the typed proposal prevents histogram rotation itself
+         * from masquerading as proof that the placement has converged.
          */
-        void growHistogramWindowAfterProposalRotation();
+        void advanceHistogramWindowAfterProposal(
+            const MoEOverlayResidencyTransaction &transaction);
+
+        /** @brief Grow one observed-no-op host cadence toward its ceiling. */
+        void growHistogramWindowAfterObservedNoMovement();
 
         /**
          * @brief Reject host planning/publication for a device-owned dynamic authority.
@@ -1423,6 +1505,8 @@ namespace llaminar2
 
         Config config_;
         MoERoutedExpertPlacementPlan planning_template_;
+        /** Initial short cadence restored whenever a proposal selects movement. */
+        int initial_histogram_window_tokens_ = 0;
         /** Immutable epoch-one logical/physical-owner identity for reuse sealing. */
         std::shared_ptr<const MoEOverlayResidencySnapshot> initial_snapshot_;
         std::atomic<std::shared_ptr<PublishedEpochState>> published_epoch_;
@@ -1486,6 +1570,9 @@ namespace llaminar2
         std::atomic<uint64_t> commit_failures_{0};
         std::atomic<uint64_t> background_waves_started_{0};
         std::atomic<uint64_t> deferred_waves_{0};
+        std::atomic<uint64_t> publication_boundary_reservations_{0};
+        std::atomic<uint64_t> publication_boundary_drains_{0};
+        std::atomic<uint64_t> graph_sequence_boundary_waits_{0};
         std::atomic<uint64_t> published_with_old_tickets_{0};
         std::atomic<uint64_t> old_epoch_retirements_{0};
         std::atomic<uint64_t> aborted_waves_reaped_{0};

@@ -995,6 +995,91 @@ TEST_F(MoEExpertComputeStageTest,
         << "Mask geometry is part of exact publication identity";
 }
 
+/**
+ * @brief A one-row retained MTP sidecar must not be accounted as decode.
+ *
+ * Sparse participant-local graph families bind an explicit immutable service
+ * phase. Row count cannot recover that identity because both an ordinary
+ * decode graph and an MTP predictor graph have M=1. This regression exercises
+ * the final stage-to-kernel hint selected after binding, which is the boundary
+ * that previously discarded GroupedVerifier and let device histogram deltas
+ * misclassify the predictor as decode.
+ */
+TEST_F(MoEExpertComputeStageTest,
+       SparseOneRowMTPPhaseOverridesDecodeShapedGeometry)
+{
+    constexpr int experts = 1;
+    constexpr int top_k = 1;
+    constexpr int d_model = 4;
+
+    auto input = TestTensorFactory::createFP32({1, d_model});
+    auto routing_indices = TestTensorFactory::createFP32({1, top_k});
+    auto routing_weights = TestTensorFactory::createFP32({1, top_k});
+    auto output = TestTensorFactory::createFP32({1, d_model});
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input = input.get();
+    params.routing_indices = routing_indices.get();
+    params.routing_weights = routing_weights.get();
+    params.output = output.get();
+    params.seq_len = 1;
+    params.d_model = d_model;
+    params.num_experts = experts;
+    params.top_k = top_k;
+    params.expert_mask = {false};
+
+    MoEExpertComputeStage stage(std::move(params));
+    ASSERT_EQ(
+        stage.serviceTelemetryPhaseHintForTesting(),
+        MoEOverlayServicePhaseHint::Decode)
+        << "Unbound one-row geometry is ordinary decode";
+
+    std::vector<bool> expert_mask{false};
+    std::vector<ITensorGemm *> engines(static_cast<size_t>(experts), nullptr);
+    ASSERT_TRUE(stage.bindSparseOverlayInvocation(
+        MoEExpertComputeStage::SparseOverlayInvocation{
+            .input = input.get(),
+            .routing_indices = routing_indices.get(),
+            .routing_weights = routing_weights.get(),
+            .output = output.get(),
+            .live_rows = 1,
+            .binding_kind =
+                MoEExpertComputeStage::SparseOverlayBindingKind::SetupPriming,
+            .service_phase = MoEOverlayServicePhaseHint::GroupedVerifier,
+            .expert_mask = &expert_mask,
+            .gate_engines = engines,
+            .up_engines = engines,
+            .down_engines = engines,
+        }));
+    EXPECT_EQ(
+        stage.serviceTelemetryPhaseHintForTesting(),
+        MoEOverlayServicePhaseHint::GroupedVerifier)
+        << "The typed graph role, not M=1, owns service identity";
+}
+
+/**
+ * @brief Inline sparse execution retains the same MTP phase as replay families.
+ *
+ * A continuation-domain participant may execute its local sparse packet inline
+ * while remote participants use retained replay families. Both paths are one
+ * semantic graph family and must publish to the same service plane.
+ */
+TEST_F(MoEExpertComputeStageTest,
+       InlineOneRowMTPPhaseOverridesDecodeShapedGeometry)
+{
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.seq_len = 1;
+    params.service_phase = MoEOverlayServicePhaseHint::GroupedVerifier;
+
+    MoEExpertComputeStage stage(std::move(params));
+    EXPECT_EQ(
+        stage.serviceTelemetryPhaseHintForTesting(),
+        MoEOverlayServicePhaseHint::GroupedVerifier)
+        << "Inline MTP predictor service must not be inferred from M=1";
+}
+
 TEST_F(MoEExpertComputeStageTest, SharedGate_FusedCombinePublishesGatedSharedAndCombinedOutput)
 {
     const int seq = 2;

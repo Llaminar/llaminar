@@ -165,6 +165,33 @@ namespace
     }
 
     TEST(
+        Test__ServingGraphFamilyMaterializationPlan,
+        CaptureIdentityIncludesEveryFrozenPlanValue)
+    {
+        ServingGraphFamilyMaterializationPlan plan{
+            .prefill_bucket_rows = {64, 128},
+            .prefill_pad_token_id = 7,
+            .main_decode_graph =
+                ServingMainDecodeGraphKind::HistoryBearingSerial,
+        };
+        ASSERT_TRUE(plan.valid());
+        EXPECT_TRUE(plan.sameCaptureIdentity(plan));
+
+        auto changed = plan;
+        changed.prefill_bucket_rows.push_back(256);
+        EXPECT_FALSE(plan.sameCaptureIdentity(changed));
+        changed = plan;
+        ++changed.prefill_pad_token_id;
+        EXPECT_FALSE(plan.sameCaptureIdentity(changed));
+        changed = plan;
+        changed.main_decode_graph = ServingMainDecodeGraphKind::Unspecified;
+        EXPECT_FALSE(plan.sameCaptureIdentity(changed));
+        changed = plan;
+        changed.pipeline_hidden_input = reinterpret_cast<TensorBase *>(0x1);
+        EXPECT_FALSE(plan.sameCaptureIdentity(changed));
+    }
+
+    TEST(
         Test__DeviceGraphOrchestratorSourcePolicy,
         ServingFamilySealsHistoryBearingDecodeBeforeFollowerAdmission)
     {
@@ -188,21 +215,85 @@ namespace
         const size_t history_identity = method.find(
             "decode_input.position_offset = 1", decode_phase);
         const size_t materialize_decode = method.find(
-            "executeForward(decode_input, decode_output)", history_identity);
+            "decode_materialized = executeForward(", history_identity);
+        const size_t decode_input_argument = method.find(
+            "decode_input, decode_output", materialize_decode);
         const size_t family_completion = method.find(
             "serving_graph_family_participant_completions",
             materialize_decode);
         ASSERT_NE(decode_phase, std::string::npos);
         ASSERT_NE(history_identity, std::string::npos);
         ASSERT_NE(materialize_decode, std::string::npos);
+        ASSERT_NE(decode_input_argument, std::string::npos);
         ASSERT_NE(family_completion, std::string::npos);
         EXPECT_LT(decode_phase, history_identity);
         EXPECT_LT(history_identity, materialize_decode);
+        EXPECT_LT(materialize_decode, decode_input_argument);
         EXPECT_LT(materialize_decode, family_completion);
         EXPECT_NE(
             method.find(
                 "MaterializeExecutableWithoutLaunch", decode_phase),
             std::string::npos);
+    }
+
+    /**
+     * @brief Keep request-independent MTP forwards inside the serving seal.
+     *
+     * The first device-generation transaction used to discover the live
+     * condition and grouped verifier cache identities after readiness.  That
+     * made a valid depth-15 request pay several seconds of native recording per
+     * participant.  The setup edge must now retain both greedy and stochastic
+     * verifier topologies before the lifecycle can become Sealed.
+     */
+    TEST(
+        Test__DeviceGraphOrchestratorSourcePolicy,
+        ServingFamilyMaterializesCompleteMTPForwardInventoryBeforeSeal)
+    {
+        const std::string source =
+            readSourceFileForDeviceGraphOrchestratorTest(
+                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/"
+                "DeviceGraphOrchestrator.cpp");
+        ASSERT_FALSE(source.empty());
+
+        const size_t helper_begin = source.find(
+            "materializeMTPServingForwardExecutablesWithoutLaunch(");
+        const size_t serving_begin = source.find(
+            "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch");
+        ASSERT_NE(helper_begin, std::string::npos);
+        ASSERT_NE(serving_begin, std::string::npos);
+        ASSERT_LT(helper_begin, serving_begin);
+
+        const std::string helper = source.substr(
+            helper_begin, serving_begin - helper_begin);
+        EXPECT_NE(
+            helper.find("ForwardExecutionRole::MTPCondition"),
+            std::string::npos);
+        EXPECT_NE(
+            helper.find("ForwardExecutionRole::GroupedMTPVerifier"),
+            std::string::npos);
+        EXPECT_NE(
+            helper.find("MTPVerifierOutcomeGraphMode::Greedy"),
+            std::string::npos);
+        EXPECT_NE(
+            helper.find("MTPVerifierOutcomeGraphMode::Disabled"),
+            std::string::npos);
+        EXPECT_NE(
+            helper.find("MaterializeExecutableWithoutLaunch"),
+            std::string::npos);
+
+        const size_t serving_end = source.find(
+            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            serving_begin);
+        ASSERT_NE(serving_end, std::string::npos);
+        const std::string serving = source.substr(
+            serving_begin, serving_end - serving_begin);
+        const size_t mtp_family = serving.find(
+            "materializeMTPServingForwardExecutablesWithoutLaunch(");
+        const size_t sealed = serving.rfind(
+            "ServingGraphFamilyLifecycle::Sealed");
+        ASSERT_NE(mtp_family, std::string::npos);
+        ASSERT_NE(sealed, std::string::npos);
+        EXPECT_LT(mtp_family, sealed);
     }
 
     /**
@@ -343,7 +434,7 @@ namespace
         const auto execute_pos = source.find(
             "bool DeviceGraphOrchestrator::executeForward(");
         const auto next_method_pos = source.find(
-            "bool DeviceGraphOrchestrator::waitForLastForwardCompletionForBenchmark(",
+            "bool DeviceGraphOrchestrator::waitForLastInferenceCompletionForBenchmark(",
             execute_pos);
         ASSERT_NE(execute_pos, std::string::npos);
         ASSERT_NE(next_method_pos, std::string::npos);
@@ -1250,9 +1341,9 @@ TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAttentionStateUsesDecodeDenseGdn
     auto decode_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
     auto decode_lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
     WeightBinding primary_alpha_binding = make_binding(
-        1, "blk.0.ssm_alpha.weight", WeightRole::GDNProjection, primary_alpha.get());
+        1, "blk.0.ssm_alpha.weight", WeightRole::GDNAlphaBetaProjection, primary_alpha.get());
     WeightBinding decode_alpha_binding = make_binding(
-        2, "blk.0.ssm_alpha.weight", WeightRole::GDNProjection, decode_alpha.get());
+        2, "blk.0.ssm_alpha.weight", WeightRole::GDNAlphaBetaProjection, decode_alpha.get());
     WeightBinding decode_embedding_binding = make_binding(
         3, "token_embd.weight", WeightRole::Embedding, decode_embedding.get());
     WeightBinding decode_norm_binding = make_binding(
@@ -2581,10 +2672,33 @@ TEST_F(Test__DeviceGraphOrchestrator, DeviceHotPrefixTierHasNoRamReplayPath)
         arena_create_body.find("backend->allocate("),
         std::string::npos)
         << "The bounded hot-prefix arena must become physical before capture.";
+    const auto authority_claim_pos = arena_create_body.find(
+        "memory_authority->claimNewAllocation(");
+    const auto backend_allocate_pos = arena_create_body.find(
+        "backend->allocate(");
+    ASSERT_NE(authority_claim_pos, std::string::npos)
+        << "The hot-prefix arena must consume the canonical PrefixDeviceTier line.";
+    EXPECT_LT(authority_claim_pos, backend_allocate_pos)
+        << "Capacity must be claimed before the backend allocation can succeed.";
     EXPECT_EQ(lease_body.find("backend->allocate("), std::string::npos)
         << "Prefix harvest/promotion must only lease the pre-capture arena.";
     EXPECT_EQ(lease_body.find("backend->free("), std::string::npos)
         << "A request-path lease must never free GPU memory.";
+
+    const auto orchestrator_hot_create = orchestrator_source.find(
+        "prefix_device_hot_backend_ = DeviceHotPrefixStorageBackend::create(");
+    ASSERT_NE(orchestrator_hot_create, std::string::npos);
+    const auto orchestrator_hot_create_end = orchestrator_source.find(
+        "&device_hot_error);", orchestrator_hot_create);
+    ASSERT_NE(orchestrator_hot_create_end, std::string::npos);
+    const std::string orchestrator_hot_create_body =
+        orchestrator_source.substr(
+            orchestrator_hot_create,
+            orchestrator_hot_create_end - orchestrator_hot_create);
+    EXPECT_NE(
+        orchestrator_hot_create_body.find("memory_authority"),
+        std::string::npos)
+        << "Production prefix setup must pass the rank-bound authority.";
 
     const auto find_pos =
         cache_source.find("std::optional<PrefixBlockHandle> PrefixStateCache::find");
@@ -2622,7 +2736,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DeviceHotPrefixTierHasNoRamReplayPath)
     const auto materialize_pos = orchestrator_source.find(
         "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch(");
     const auto prefix_ready_pos = orchestrator_source.find(
-        "!ensurePrefixCacheReady()", materialize_pos);
+        "prefix_cache_ready = ensurePrefixCacheReady()", materialize_pos);
     const auto graph_materialization_pos = orchestrator_source.find(
         "materializeForwardGraphForShape(", materialize_pos);
     ASSERT_NE(materialize_pos, std::string::npos);
@@ -2830,6 +2944,37 @@ TEST_F(
         std::string::npos)
         << "The event join must name the host-result owner rather than "
            "impersonating a sampler or diagnostic stream.";
+    const auto benchmark_wait_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::waitForLastInferenceCompletionForBenchmark(");
+    const auto forward_wait_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::waitForForwardGraphOutputReady(",
+            benchmark_wait_pos);
+    ASSERT_NE(benchmark_wait_pos, std::string::npos);
+    ASSERT_NE(forward_wait_pos, std::string::npos);
+    const std::string benchmark_wait_body =
+        source.substr(
+            benchmark_wait_pos,
+            forward_wait_pos - benchmark_wait_pos);
+    EXPECT_NE(
+        benchmark_wait_body.find(
+            "MainLogitsPublicationSource::PrefixTerminalRestore"),
+        std::string::npos)
+        << "A full prefix hit intentionally launches no forward graph; host "
+           "timing must select the prefix-restore completion authority.";
+    EXPECT_NE(
+        benchmark_wait_body.find(
+            "live_prefix_mutation_ready_.event"),
+        std::string::npos)
+        << "Benchmark timing must query the same durable event that owns the "
+           "restored terminal logits, hidden row, and MTP state.";
+    EXPECT_NE(
+        benchmark_wait_body.find(
+            "prefix_terminal_restore_event"),
+        std::string::npos)
+        << "Perf evidence must distinguish restored-prefix timing from a "
+           "captured forward replay.";
     const auto restore_clear_pos =
         source.find(
             "void DeviceGraphOrchestrator::clearLivePrefixRestoreTransientHandoffs(");

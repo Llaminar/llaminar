@@ -138,20 +138,21 @@ namespace llaminar2
     bool MoEOverlayCertifiedEconomyProfiles::valid() const noexcept
     {
         return service != nullptr && migration != nullptr &&
-               !service->identity.empty() && !migration->identity.empty() &&
+               !service->identity.empty() &&
+               service->production_topology.valid() &&
+               !migration->identity.empty() &&
                policy.valid();
     }
 
     std::vector<MoEOverlayParticipantLayerServiceMeasurement>
     MoEOverlayEconomyProfileComposer::normalizeServiceTotals(
         std::vector<MoEOverlayParticipantLayerServiceTotals> totals,
-        ExpertHistogramProductionSourceMask active_sources)
+        const ExpertHistogramProductionTopology &production_topology)
     {
-        if (totals.empty() ||
-            !validExpertHistogramProductionSourceMask(active_sources))
+        if (totals.empty() || !production_topology.valid())
         {
             throw std::invalid_argument(
-                "ExpertOverlay service normalization requires endpoint totals and valid runtime phases");
+                "ExpertOverlay service normalization requires endpoint totals and a valid production topology");
         }
         std::sort(
             totals.begin(),
@@ -169,7 +170,9 @@ namespace llaminar2
         int previous_layer = -1;
         for (const auto &raw : totals)
         {
-            if (!raw.valid() ||
+            if (!raw.valid() || raw.layer < 0 ||
+                static_cast<std::size_t>(raw.layer) >=
+                    production_topology.layerCount() ||
                 (raw.participant_id == previous_participant &&
                  raw.layer == previous_layer))
             {
@@ -187,13 +190,24 @@ namespace llaminar2
                 const uint64_t duration = raw.total_nanoseconds[phase];
                 const uint64_t activations = raw.activation_count[phase];
                 const uint64_t samples = raw.sample_count[phase];
-                if (!active_sources[phase])
+                if (!production_topology.reachable(raw.layer, phase))
                 {
                     if (duration != 0 || activations != 0 || samples != 0)
                     {
                         throw std::invalid_argument(
                             "ExpertOverlay service totals sampled a runtime-disabled phase");
                     }
+                    continue;
+                }
+                if (!production_topology.requiresServiceEvidence(
+                        raw.layer, phase))
+                {
+                    /*
+                     * A retained catch-up/tail graph may contribute a real
+                     * observation without becoming recurring movement
+                     * economics. Keep the graph evidence legal, but publish a
+                     * zero profile column so it cannot steer placement.
+                     */
                     continue;
                 }
                 if (duration == 0 || activations == 0 || samples == 0)
@@ -217,17 +231,18 @@ namespace llaminar2
     std::vector<MoEOverlayParticipantLayerServiceMeasurement>
     MoEOverlayEconomyProfileComposer::normalizeEquivalentServiceTotals(
         std::vector<MoEOverlayParticipantLayerServiceTotals> totals,
-        ExpertHistogramProductionSourceMask active_sources,
+        const ExpertHistogramProductionTopology &production_topology,
         const MoEOverlayEconomyCalibrationLayerCatalog &catalog)
     {
         const std::size_t layer_count =
             catalog.completeExpertBytesPerLayer().size();
         if (totals.empty() || layer_count == 0 ||
             totals.size() % layer_count != 0 ||
-            !validExpertHistogramProductionSourceMask(active_sources))
+            !production_topology.valid() ||
+            production_topology.layerCount() != layer_count)
         {
             throw std::invalid_argument(
-                "ExpertOverlay equivalent service normalization requires complete endpoint/layer geometry and valid runtime phases");
+                "ExpertOverlay equivalent service normalization requires complete endpoint/layer geometry and a matching production topology");
         }
 
         std::sort(
@@ -305,10 +320,12 @@ namespace llaminar2
                         raw.total_nanoseconds[phase] != 0 &&
                         raw.activation_count[phase] != 0 &&
                         raw.sample_count[phase] != 0;
-                    if (!active_sources[phase] && has_evidence)
+                    if (!production_topology.reachable(
+                            static_cast<int>(layer), phase) &&
+                        has_evidence)
                     {
                         throw std::invalid_argument(
-                            "ExpertOverlay equivalent service totals sampled a runtime-disabled phase");
+                            "ExpertOverlay equivalent service totals sampled an unreachable layer phase");
                     }
                 }
             }
@@ -325,6 +342,9 @@ namespace llaminar2
                          phase < kExpertHistogramProductionSourceCount;
                          ++phase)
                     {
+                        if (!production_topology.requiresServiceEvidence(
+                                layer, phase))
+                            continue;
                         checkedAdd(
                             aggregate.total_nanoseconds[phase],
                             raw.total_nanoseconds[phase],
@@ -351,11 +371,19 @@ namespace llaminar2
                      phase < kExpertHistogramProductionSourceCount;
                      ++phase)
                 {
+                    const bool class_phase_requires_evidence = std::any_of(
+                        group.member_layers.begin(),
+                        group.member_layers.end(),
+                        [&production_topology, phase](int layer)
+                        {
+                            return production_topology
+                                .requiresServiceEvidence(layer, phase);
+                        });
                     const bool class_has_evidence =
                         aggregate.total_nanoseconds[phase] != 0 &&
                         aggregate.activation_count[phase] != 0 &&
                         aggregate.sample_count[phase] != 0;
-                    if (active_sources[phase] != class_has_evidence)
+                    if (class_phase_requires_evidence != class_has_evidence)
                     {
                         throw std::invalid_argument(
                             "ExpertOverlay equivalent service class lacks measured production-phase evidence");
@@ -371,12 +399,24 @@ namespace llaminar2
                 {
                     auto member = aggregate;
                     member.layer = layer;
+                    for (std::size_t phase = 0;
+                         phase < kExpertHistogramProductionSourceCount;
+                         ++phase)
+                    {
+                        if (production_topology.requiresServiceEvidence(
+                                layer, phase))
+                            continue;
+                        member.total_nanoseconds[phase] = 0u;
+                        member.activation_count[phase] = 0u;
+                        member.sample_count[phase] = 0u;
+                    }
                     pooled.push_back(std::move(member));
                 }
             }
             previous_participant = participant_id;
         }
-        return normalizeServiceTotals(std::move(pooled), active_sources);
+        return normalizeServiceTotals(
+            std::move(pooled), production_topology);
     }
 
     std::vector<MoEOverlayParticipantLayerMigrationCost>
@@ -488,11 +528,12 @@ namespace llaminar2
         }
         if (measurements.service_measurement_identity.empty() ||
             measurements.migration_measurement_identity.empty() ||
-            !validExpertHistogramProductionSourceMask(
-                measurements.active_sources))
+            !measurements.production_topology.valid() ||
+            measurements.production_topology.layerCount() !=
+                static_cast<std::size_t>(metadata.num_layers))
         {
             throw std::invalid_argument(
-                "ExpertOverlay economy measurements require setup identities and valid runtime phases");
+                "ExpertOverlay economy measurements require setup identities and matching production topology");
         }
 
         const std::size_t participant_count = owner_map.participants().size();
@@ -574,7 +615,9 @@ namespace llaminar2
                 const bool has_cost =
                     row.nanoseconds_per_activation[phase] != 0;
                 const bool has_samples = row.sample_count[phase] != 0;
-                const bool phase_valid = measurements.active_sources[phase]
+                const bool phase_valid =
+                    measurements.production_topology.requiresServiceEvidence(
+                        row.layer, phase)
                                              ? has_cost && has_samples
                                              : !has_cost && !has_samples;
                 invalid_phase_evidence =
@@ -587,7 +630,7 @@ namespace llaminar2
                 invalid_phase_evidence)
             {
                 throw std::invalid_argument(
-                    "ExpertOverlay service measurement has an invalid coordinate or evidence inconsistent with the active runtime phases");
+                    "ExpertOverlay service measurement has an invalid coordinate or evidence inconsistent with layer reachability");
             }
             const std::size_t offset =
                 static_cast<std::size_t>(row.participant_id) * layer_count +
@@ -611,7 +654,8 @@ namespace llaminar2
 
         auto service_profile =
             std::make_shared<MoERoutedTierServiceProfile>();
-        service_profile->active_sources = measurements.active_sources;
+        service_profile->production_topology =
+            measurements.production_topology;
         service_profile->participant_costs.reserve(expected_service_rows);
         for (const auto &row : measurements.participant_service)
         {
@@ -660,9 +704,18 @@ namespace llaminar2
         hashUnsigned(service_hash, static_cast<uint64_t>(metadata.num_layers));
         hashUnsigned(service_hash, static_cast<uint64_t>(metadata.num_experts));
         hashUnsigned(service_hash, static_cast<uint64_t>(tier_count));
-        for (const bool active : measurements.active_sources)
+        for (int layer = 0; layer < metadata.num_layers; ++layer)
         {
-            hashUnsigned(service_hash, active ? 1u : 0u);
+            for (const bool reachable :
+                 measurements.production_topology.sources(layer))
+            {
+                hashUnsigned(service_hash, reachable ? 1u : 0u);
+            }
+            for (const bool priced :
+                 measurements.production_topology.economySources(layer))
+            {
+                hashUnsigned(service_hash, priced ? 1u : 0u);
+            }
         }
         for (std::size_t tier = 0; tier < tier_count; ++tier)
         {

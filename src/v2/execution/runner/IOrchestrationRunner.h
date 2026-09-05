@@ -28,6 +28,7 @@
 #include "../moe/MoEOptimizationStatus.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../transfer/TransferEngine.h"
+#include "../../planning/GraphSnapshotMemoryCapacity.h"
 #include "../../utils/Sampler.h"
 #include "../../utils/ToolCallTypes.h"
 #include <algorithm>
@@ -44,7 +45,10 @@ namespace llaminar2
     class IMPIContext;         // Forward declaration
     class IModelContext;       // Forward declaration
     class ModelContext;        // Forward declaration
+    class PhysicalMemoryAuthority; // CPU/GPU admission and live-allocation owner
     class ReusableExecutionWorkspaceRegistry; // Model-lifetime workspace owner
+    struct MoEOverlaySealedMigrationMeasurements;
+    struct MoEOverlayResolvedCapacityPlan;
     struct GraphExecutorStats; // Forward declaration
 }
 
@@ -292,6 +296,14 @@ namespace llaminar2
          */
         std::shared_ptr<ReusableExecutionWorkspaceRegistry>
             reusable_execution_workspaces;
+        /**
+         * Exact admission/materialization ledger retained by model-owned
+         * weights and workspace backing. A consumer must keep this same object
+         * identity; rebuilding it from current free-memory telemetry would
+         * count those live allocations under two authorities.
+         */
+        std::shared_ptr<PhysicalMemoryAuthority>
+            physical_memory_authority;
         RankExecutionPlan prepared_weight_plan;
         /**
          * Model-frozen quotas and initial placements whose prepared engines are
@@ -301,6 +313,15 @@ namespace llaminar2
          */
         std::shared_ptr<const MoERoutedExpertPlacementPlan>
             prepared_routed_weight_plan;
+        /**
+         * Complete CPU/GPU physical-memory certificate that admitted the
+         * model-frozen ExpertOverlay plan above.  Capacity resolution and
+         * final preflight consume this same immutable value; a reused model
+         * context must never reconstruct its bill from allocator telemetry.
+         * Null exactly when no ExpertOverlay authority participated.
+         */
+        std::shared_ptr<const MoEOverlayResolvedCapacityPlan>
+            expert_overlay_memory_admission;
         /**
          * Canonical, collision-free identity of the requested routed-weight
          * topology that populated @ref context.
@@ -313,6 +334,18 @@ namespace llaminar2
          * occupied by the retained physical plan.
          */
         std::string routed_weight_authority_identity;
+        /**
+         * Pointer-free physical transfer evidence retained across compatible
+         * runner lifetimes. No graph, stream, controller, histogram, service
+         * timing, or mutable placement state is shared through this value.
+         */
+        std::shared_ptr<const MoEOverlaySealedMigrationMeasurements>
+            expert_overlay_migration_profile;
+        /**
+         * Exact model/topology/catalog identity that admits the profile above.
+         * A consumer may reuse the evidence only on byte-identical equality.
+         */
+        std::string expert_overlay_migration_profile_identity;
     };
 
     /**
@@ -463,16 +496,17 @@ namespace llaminar2
         virtual bool prefill(const std::vector<int32_t> &tokens) = 0;
 
         /**
-         * @brief Observe completion of the latest forward pass for host timing.
+         * @brief Observe completion of the latest inference transaction for host timing.
          *
          * GPU implementations wait on the exact durable terminal event published
-         * by the complete graph transaction, including shifted MTP KV population
-         * during prefill. This is a benchmark result boundary, not permission to
-         * add a stream/device synchronization to production inference.
+         * by either the complete graph transaction or a full prefix-terminal
+         * restore, including shifted MTP KV population during prefill. This is a
+         * benchmark result boundary, not permission to add a stream/device
+         * synchronization to production inference.
          *
-         * @return true when the latest forward pass has completed.
+         * @return true when the latest inference transaction has completed.
          */
-        virtual bool waitForLastForwardCompletionForBenchmark()
+        virtual bool waitForLastInferenceCompletionForBenchmark()
         {
             return !primaryDeviceId().is_gpu();
         }
@@ -705,6 +739,30 @@ namespace llaminar2
          */
         virtual const OrchestrationConfig &config() const = 0;
 
+        /**
+         * @brief Select MTP behavior for the next reset request lifetime.
+         *
+         * The runner's graph width, request-batch capacity, sidecar placement,
+         * and terminal-head placement remain immutable. Implementations must
+         * reject this transition while request state is live or when the
+         * requested depth exceeds the retained physical envelope; they must
+         * never allocate, rebind, or recapture in response to this call.
+         *
+         * Multi-rank implementations apply one identical policy on every
+         * participant before admitting the next prefill.
+         *
+         * @param policy Typed request-selectable execution policy.
+         * @return True only when the idle runner accepted the complete policy.
+         */
+        virtual bool configureMTPRequestPolicy(
+            const MTPRequestPolicy &policy) = 0;
+
+        /**
+         * @brief Return the request-selectable policy currently installed.
+         * @return A value copy independent of immutable physical capacity.
+         */
+        [[nodiscard]] virtual MTPRequestPolicy mtpRequestPolicy() const = 0;
+
         // =====================================================================
         // Status
         // =====================================================================
@@ -887,6 +945,56 @@ namespace llaminar2
         }
 
         /**
+         * @brief Declare graph-resident diagnostic storage before initialize().
+         *
+         * The caller that selects checkpoint topology supplies a complete
+         * per-accelerator bound. Production runners charge it through the
+         * physical-memory authority before graph or expert admission.
+         *
+         * @param capacity Maximum simultaneously live snapshot backing.
+         * @return True only when the pre-initialization declaration is accepted.
+         */
+        virtual bool setSnapshotMemoryCapacity(
+            GraphSnapshotMemoryCapacity capacity)
+        {
+            (void)capacity;
+            return false;
+        }
+
+        /**
+         * @brief Declare a diagnostic graph family that starts inference inactive.
+         *
+         * The implementation must materialize both the requested diagnostic
+         * topology and the lean topology before request admission. This is a
+         * readiness policy, not permission to capture after inference starts.
+         * The caller supplies the snapshot filter through
+         * @ref setSnapshotCaptureFilter before this transition.
+         *
+         * @param output_dir Optional diagnostic destination.
+         * @return True when the pre-initialization policy was accepted.
+         */
+        virtual bool prepareInactiveSnapshotCapture(
+            const std::string &output_dir = "")
+        {
+            (void)output_dir;
+            return false;
+        }
+
+        /**
+         * @brief Select a previously materialized diagnostic graph family.
+         *
+         * This transition may clear request-local snapshot values, but it must
+         * not capture, instantiate, allocate, synchronize, or alter serving
+         * geometry. Implementations fail when preparation was not completed.
+         *
+         * @return True only when the selected executable family was setup-ready.
+         */
+        virtual bool activatePreparedSnapshotCapture()
+        {
+            return false;
+        }
+
+        /**
          * @brief Disable snapshot capture and clear stored snapshots
          */
         virtual void disableSnapshotCapture() = 0;
@@ -1028,11 +1136,27 @@ namespace llaminar2
         /**
          * @brief Run as MPI worker for non-root ranks in server mode.
          *
-         * Blocks in a loop, participating in inference collectives when
-         * rank 0 initiates them. Returns when rank 0 signals shutdown.
+         * Blocks in a loop, participating in inference collectives when the
+         * inventory-resolved continuation authority initiates them. Returns
+         * when that authority signals shutdown.
          * Default implementation is a no-op (single-rank doesn't need this).
          */
         virtual void runMPIWorkerLoop() {}
+
+        /**
+         * @brief Leave the coordinated worker loop while retaining this runner.
+         *
+         * This is a nonterminal serving-session boundary. The caller must have
+         * reset all request-owned state first. Multi-rank implementations send
+         * one typed command that makes every follower return without draining
+         * or destroying model-lifetime graph, weight, stream, or maintenance
+         * owners. A later @ref setMPICoordinatedMode call reopens command
+         * admission on the same participants.
+         *
+         * @return True only when every participant entered the retained idle
+         *         state; the default rejects runners without this lifecycle.
+         */
+        virtual bool yieldMPIWorkersForRetainedRunner() { return false; }
 
         /**
          * @brief Close coordinated inference admission and drain maintenance.

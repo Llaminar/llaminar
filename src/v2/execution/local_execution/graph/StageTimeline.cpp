@@ -384,12 +384,12 @@ namespace llaminar2
                                         const char *domain,
                                         std::map<std::string, std::string> tags) const
     {
-        if (!PerfStatsCollector::isEnabled())
-            return;
-
         const std::string phase = phase_name ? phase_name : "";
         const std::string device = device_name ? device_name : "";
         const std::string perf_domain = domain ? domain : "stage_gpu";
+        if (!PerfStatsCollector::isDomainEnabled(perf_domain))
+            return;
+
         auto merge_tags = [&](PerfStatsCollector::Tags record_tags = {}) {
             record_tags.emplace("attribution", "gpu_event");
             record_tags.emplace("source", "stage_timeline");

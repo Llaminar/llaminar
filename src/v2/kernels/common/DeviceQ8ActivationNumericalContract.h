@@ -1,6 +1,6 @@
 /**
  * @file DeviceQ8ActivationNumericalContract.h
- * @brief Cross-backend byte contract for movable Q8 activation publication.
+ * @brief Cross-backend byte contract for GPU-aligned expert Q8 activation publication.
  *
  * ExpertOverlay can move one expert between CUDA and ROCm while retaining the
  * same prepared weights. Its FP32 activation row must therefore quantize to the
@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "kernels/common/DeviceHalfMetadataContract.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
 
@@ -19,19 +20,29 @@
 
 namespace llaminar2::device_q8_activation_contract
 {
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define LLAMINAR_Q8_CONTRACT_INLINE __device__ __forceinline__
+#else
+#define LLAMINAR_Q8_CONTRACT_INLINE inline
+#endif
+
     /**
      * @brief Derive the canonical symmetric Q8 scale for a 32-value block.
      * @param maximum_absolute_value Maximum absolute finite FP32 value.
      * @return Positive scale mapping the maximum magnitude to 127.
      */
-    __device__ __forceinline__ float scale(
+    LLAMINAR_Q8_CONTRACT_INLINE float scale(
         float maximum_absolute_value) noexcept
     {
-        return maximum_absolute_value > 0.0f
-                   ? device_fp32_contract::multiply(
-                         maximum_absolute_value,
-                         MoEProjectionNumericalContract::q8_scale_multiplier)
-                   : 1.0f;
+        const float binary32_scale = maximum_absolute_value > 0.0f
+                                         ? device_fp32_contract::multiply(
+                                               maximum_absolute_value,
+                                               MoEProjectionNumericalContract::q8_scale_multiplier)
+                                         : 1.0f;
+        // CPU Q8_1 persists `d` as binary16.  GPU sidecars deliberately widen
+        // that same word back to binary32 rather than retaining extra precision
+        // that would make residency select a different dequantization scale.
+        return canonicalPreparedHalfValue(binary32_scale);
     }
 
     /**
@@ -46,7 +57,7 @@ namespace llaminar2::device_q8_activation_contract
      * @param block_scale Positive scale returned by scale().
      * @return Signed integer in the inclusive range [-127, 127].
      */
-    __device__ __forceinline__ std::int32_t quantize(
+    LLAMINAR_Q8_CONTRACT_INLINE std::int32_t quantize(
         float value,
         float block_scale) noexcept
     {
@@ -61,4 +72,6 @@ namespace llaminar2::device_q8_activation_contract
             quantized = 127;
         return quantized;
     }
+
+#undef LLAMINAR_Q8_CONTRACT_INLINE
 } // namespace llaminar2::device_q8_activation_contract

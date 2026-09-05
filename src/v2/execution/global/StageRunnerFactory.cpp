@@ -201,7 +201,6 @@ namespace llaminar2
         ro_config.kv_cache_precision = ctx.runner_config.kv_cache_precision;
         ro_config.tp_allreduce_precision_override =
             ctx.runner_config.tp_allreduce_precision_override;
-        ro_config.use_mapped_memory = ctx.runner_config.use_mapped_memory;
         ro_config.nested_pp_stage_config = pp_cfg;
         ro_config.prepared_weight_store = weight_context->prepared_store;
 

@@ -10,6 +10,7 @@
 #include "../../../execution/moe/MoEOverlayDeviceControllerABI.h"
 #include "../../../execution/moe/MoEOverlayDeviceEpochProtocol.h"
 #include "../../cpu/primitives/SoftmaxPrimitives_New.h"
+#include "../../cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
 #include "../../cpu/primitives/VectorPrimitives.h"
 #include "../gemm/CPUNativeVNNIGemv.h"
@@ -719,7 +720,7 @@ namespace llaminar2
             {
                 for (; block + 1 < blocks_per_row; block += 2)
                 {
-                    simd::quantize_two_blocks_avx512(
+                    cpu::gpu_aligned_expert_q8::quantizeTwoBlocks(
                         row_source + static_cast<size_t>(block) * Q8_1Block::BLOCK_SIZE,
                         row_q8[block],
                         row_q8[block + 1]);
@@ -729,7 +730,7 @@ namespace llaminar2
             for (; block < blocks_per_row; ++block)
             {
                 const int block_start = block * Q8_1Block::BLOCK_SIZE;
-                simd::quantize_single_block(
+                cpu::gpu_aligned_expert_q8::quantizeBlock(
                     row_source + block_start,
                     row_q8[block],
                     std::min(
@@ -1091,7 +1092,7 @@ namespace llaminar2
 
     void CPUMoEKernel::swiGLU(float *gate, const float *up, int count)
     {
-        primitives::compute_swiglu(gate, up, gate, count);
+        primitives::compute_swiglu_gpu_aligned_expert(gate, up, gate, count);
     }
 
 } // namespace llaminar2

@@ -912,7 +912,7 @@ namespace
         int grouped_rows = 0,
         int policy_graph_captured = -1)
     {
-        if (!llaminar2::PerfStatsCollector::isEnabled())
+        if (!llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
             return;
 
         int effective_kb = 1;
@@ -982,7 +982,7 @@ namespace
         int cuda_device_id,
         bool graph_captured)
     {
-        if (!llaminar2::PerfStatsCollector::isEnabled())
+        if (!llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
             return;
 
         llaminar2::PerfStatsCollector::addCounter(

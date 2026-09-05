@@ -13,6 +13,7 @@
 #include "../backends/BackendManager.h" // For getCUDABackend, getROCmBackend
 #include "../backends/ComputeBackend.h" // For DeviceManager (NUMA lookup)
 #include "../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../planning/CollectiveMemoryEstimator.h"
 #include "../transfer/TransferEngine.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -145,7 +146,8 @@ namespace llaminar2
             const std::string &path,
             const std::string &requested_precision)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled(
+                    "tp_allreduce_runtime"))
                 return;
 
             const size_t element_bytes = collectiveDataTypeBytes(dtype);
@@ -196,7 +198,8 @@ namespace llaminar2
             CollectiveDataType dtype,
             bool graph_capture)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled(
+                    "tp_raw_allgather_runtime"))
                 return;
 
             const size_t element_bytes = collectiveDataTypeBytes(dtype);
@@ -261,7 +264,8 @@ namespace llaminar2
             const char *operation,
             bool graph_capture)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled(
+                    "tp_rooted_collective_runtime"))
                 return;
 
             const size_t element_bytes = collectiveDataTypeBytes(dtype);
@@ -350,7 +354,8 @@ namespace llaminar2
             int device_index,
             const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled(
+                    "tp_allreduce_runtime"))
                 return;
 
             for (const auto &sideband : sidebands)
@@ -610,7 +615,9 @@ namespace llaminar2
         onstream_sequence_by_slot_.assign(devices_.size(), 0);
         fp16_scratch_buffers_.assign(devices_.size(), nullptr);
         fp16_scratch_counts_.assign(devices_.size(), 0);
+        fp16_scratch_memory_leases_.resize(devices_.size());
         graph_capture_boundary_device_words_.assign(devices_.size(), nullptr);
+        graph_capture_boundary_memory_leases_.resize(devices_.size());
 
         LOG_DEBUG("LocalTPContext created: degree=" << degree()
                                                     << ", backend=" << collectiveBackendTypeToString(backend_));
@@ -2543,7 +2550,8 @@ namespace llaminar2
                                            const LocalTPCollectiveSidebandBuffer &sideband,
                                            const char *backend_primitive)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled(
+                    "tp_allreduce_runtime"))
                 return;
 
             const size_t element_bytes = collectiveDataTypeBytes(sideband.dtype);
@@ -4680,15 +4688,6 @@ namespace llaminar2
         }
 
         backend_initialized_ = true;
-        if (!initializeGraphCaptureBoundaryDeviceWords())
-        {
-            LOG_ERROR("LocalTPContext: Failed to initialize persistent graph-capture "
-                      "boundary storage");
-            backend_impl_->abort();
-            backend_impl_.reset();
-            backend_initialized_ = false;
-            return false;
-        }
         LOG_DEBUG("LocalTPContext: Backend " << backend_impl_->name()
                                              << " initialized for " << degree() << " devices");
 
@@ -4703,11 +4702,9 @@ namespace llaminar2
         return true;
     }
 
-    bool LocalTPContext::initializeGraphCaptureBoundaryDeviceWords()
+    bool LocalTPContext::initializeGraphCaptureBoundaryDeviceWords(
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority)
     {
-        releaseGraphCaptureBoundaryDeviceWords();
-        graph_capture_boundary_device_words_.assign(devices_.size(), nullptr);
-
         if (degree() <= 1 ||
             (backend_ != CollectiveBackendType::NCCL &&
              backend_ != CollectiveBackendType::RCCL))
@@ -4716,20 +4713,70 @@ namespace llaminar2
         }
         if (!device_group_.allCUDA() && !device_group_.allROCm())
             return false;
+        if (!memory_authority)
+        {
+            LOG_ERROR("LocalTPContext: native graph-boundary storage has no "
+                      "physical-memory authority");
+            return false;
+        }
+        if (graph_capture_boundary_device_words_.size() != devices_.size() ||
+            graph_capture_boundary_memory_leases_.size() != devices_.size())
+        {
+            LOG_ERROR("LocalTPContext: graph-boundary storage metadata has "
+                      "invalid participant geometry");
+            return false;
+        }
 
         constexpr size_t kControlBytes = sizeof(int32_t);
         for (size_t slot = 0; slot < devices_.size(); ++slot)
         {
+            if (graph_capture_boundary_device_words_[slot])
+            {
+                if (!graph_capture_boundary_memory_leases_[slot].has_value() ||
+                    !graph_capture_boundary_memory_leases_[slot]->valid())
+                {
+                    LOG_ERROR("LocalTPContext: graph-boundary storage exists "
+                              "without its physical-memory lease");
+                    return false;
+                }
+                continue;
+            }
+
             const DeviceId device = devices_[slot].toLocalDeviceId();
             IBackend *const backend = getBackendForDevice(device);
-            void *const buffer =
-                backend ? backend->allocate(kControlBytes, device.ordinal) : nullptr;
-            if (!buffer)
+            std::optional<PhysicalMemoryAllocationLease> lease;
+            void *buffer = nullptr;
+            try
             {
+                lease.emplace(memory_authority->claimNewAllocation(
+                    device,
+                    PhysicalMemoryOwner::LocalCollective,
+                    kControlBytes));
+                buffer = backend
+                             ? backend->allocate(
+                                   kControlBytes, device.ordinal)
+                             : nullptr;
+                if (!buffer)
+                {
+                    throw std::runtime_error(
+                        "backend allocation returned a null graph-boundary pointer");
+                }
+            }
+            catch (const std::exception &error)
+            {
+                // A backend may throw after the ledger claim. Roll back both
+                // halves of this participant transaction before releasing any
+                // already-published peers from the incomplete generation.
+                if (buffer && backend)
+                    backend->free(buffer, device.ordinal);
+                LOG_ERROR("LocalTPContext: graph-boundary memory claim failed"
+                          << " device=" << device.toString()
+                          << " error=" << error.what());
                 releaseGraphCaptureBoundaryDeviceWords();
                 return false;
             }
             graph_capture_boundary_device_words_[slot] = buffer;
+            graph_capture_boundary_memory_leases_[slot] = std::move(lease);
         }
         return true;
     }
@@ -4741,13 +4788,16 @@ namespace llaminar2
              slot < devices_.size();
              ++slot)
         {
-            void *buffer = graph_capture_boundary_device_words_[slot];
-            if (!buffer)
-                continue;
-            const DeviceId device = devices_[slot].toLocalDeviceId();
-            if (IBackend *const backend = getBackendForDevice(device))
-                backend->free(buffer, device.ordinal);
+            void *const buffer = graph_capture_boundary_device_words_[slot];
+            if (buffer)
+            {
+                const DeviceId device = devices_[slot].toLocalDeviceId();
+                if (IBackend *const backend = getBackendForDevice(device))
+                    backend->free(buffer, device.ordinal);
+            }
             graph_capture_boundary_device_words_[slot] = nullptr;
+            if (slot < graph_capture_boundary_memory_leases_.size())
+                graph_capture_boundary_memory_leases_[slot].reset();
         }
     }
 
@@ -4868,7 +4918,9 @@ namespace llaminar2
         LOG_DEBUG("[LocalTPContext] Cleared all output registrations");
     }
 
-    bool LocalTPContext::reserveFp16ScratchElements(size_t element_count)
+    bool LocalTPContext::reserveFp16ScratchElements(
+        size_t element_count,
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority)
     {
         if (backend_ != CollectiveBackendType::NCCL &&
             backend_ != CollectiveBackendType::RCCL)
@@ -4876,20 +4928,69 @@ namespace llaminar2
             return true;
         }
         if ((!device_group_.allCUDA() && !device_group_.allROCm()) ||
-            element_count == 0 ||
-            element_count >
-                (std::numeric_limits<size_t>::max() - 4096) / sizeof(uint16_t))
+            element_count == 0)
         {
             LOG_ERROR("[LocalTPContext] Invalid FP16 collective scratch reservation"
                       << " elements=" << element_count
                       << " backend=" << collectiveBackendTypeToString(backend_));
             return false;
         }
+        if (!memory_authority)
+        {
+            LOG_ERROR("[LocalTPContext] Native FP16 scratch reservation has no "
+                      "physical-memory authority");
+            return false;
+        }
 
-        constexpr size_t kFP16ScratchGuardBytes = 4096;
-        const size_t allocation_bytes =
-            element_count * sizeof(uint16_t) + kFP16ScratchGuardBytes;
+        size_t allocation_bytes = 0u;
+        try
+        {
+            allocation_bytes =
+                CollectiveMemoryEstimator::fp16ScratchAllocationBytes(
+                    element_count);
+        }
+        catch (const std::overflow_error &error)
+        {
+            LOG_ERROR("[LocalTPContext] Invalid FP16 collective scratch reservation"
+                      << " elements=" << element_count
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " error=" << error.what());
+            return false;
+        }
+        if (fp16_scratch_buffers_.size() != devices_.size() ||
+            fp16_scratch_counts_.size() != devices_.size() ||
+            fp16_scratch_memory_leases_.size() != devices_.size())
+        {
+            LOG_ERROR("[LocalTPContext] FP16 scratch metadata has invalid "
+                      "participant geometry");
+            return false;
+        }
+        for (size_t slot = 0; slot < devices_.size(); ++slot)
+        {
+            if (fp16_scratch_buffers_[slot] &&
+                (!fp16_scratch_memory_leases_[slot].has_value() ||
+                 !fp16_scratch_memory_leases_[slot]->valid()))
+            {
+                LOG_ERROR("[LocalTPContext] FP16 scratch exists without its "
+                          "physical-memory lease"
+                          << " slot=" << slot);
+                return false;
+            }
+            if (fp16_scratch_buffers_[slot] &&
+                fp16_scratch_counts_[slot] < element_count)
+            {
+                LOG_ERROR("[LocalTPContext] FP16 scratch capacity is immutable "
+                          "after authoritative reservation"
+                          << " slot=" << slot
+                          << " existing_elements="
+                          << fp16_scratch_counts_[slot]
+                          << " requested_elements=" << element_count);
+                return false;
+            }
+        }
         std::vector<void *> replacements(devices_.size(), nullptr);
+        std::vector<std::optional<PhysicalMemoryAllocationLease>>
+            replacement_leases(devices_.size());
         std::vector<bool> replace(devices_.size(), false);
 
         /*
@@ -4909,6 +5010,11 @@ namespace llaminar2
 
                 const DeviceId device = devices_[slot].toLocalDeviceId();
                 IBackend *const backend = getBackendForDevice(device);
+                replacement_leases[slot].emplace(
+                    memory_authority->claimNewAllocation(
+                        device,
+                        PhysicalMemoryOwner::LocalCollective,
+                        allocation_bytes));
                 replacements[slot] =
                     backend ? backend->allocate(allocation_bytes, device.ordinal) : nullptr;
                 if (!replacements[slot])
@@ -4951,6 +5057,8 @@ namespace llaminar2
             }
             fp16_scratch_buffers_[slot] = replacements[slot];
             fp16_scratch_counts_[slot] = element_count;
+            fp16_scratch_memory_leases_[slot] =
+                std::move(replacement_leases[slot]);
         }
 
         LOG_DEBUG("[LocalTPContext] Reserved persistent FP16 collective scratch"
@@ -4967,13 +5075,16 @@ namespace llaminar2
              ++slot)
         {
             void *const buffer = fp16_scratch_buffers_[slot];
-            if (!buffer)
-                continue;
-            const DeviceId device = devices_[slot].toLocalDeviceId();
-            if (IBackend *const backend = getBackendForDevice(device))
-                backend->free(buffer, device.ordinal);
+            if (buffer)
+            {
+                const DeviceId device = devices_[slot].toLocalDeviceId();
+                if (IBackend *const backend = getBackendForDevice(device))
+                    backend->free(buffer, device.ordinal);
+            }
             fp16_scratch_buffers_[slot] = nullptr;
             fp16_scratch_counts_[slot] = 0;
+            if (slot < fp16_scratch_memory_leases_.size())
+                fp16_scratch_memory_leases_[slot].reset();
         }
     }
 
@@ -5013,8 +5124,9 @@ namespace llaminar2
     }
 
     bool LocalTPContext::reserveCollectiveResources(
-        size_t backend_temp_bytes,
-        size_t fp16_scratch_elements)
+        size_t backend_payload_capacity_bytes,
+        size_t fp16_scratch_elements,
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority)
     {
         if (!backend_impl_ || !backend_initialized_)
         {
@@ -5022,7 +5134,7 @@ namespace llaminar2
                       "backend is not initialized");
             return false;
         }
-        if (backend_temp_bytes == 0 || fp16_scratch_elements == 0)
+        if (backend_payload_capacity_bytes == 0 || fp16_scratch_elements == 0)
         {
             LOG_ERROR("[LocalTPContext] Collective resource reservation requires "
                       "non-zero byte and element capacities");
@@ -5031,15 +5143,23 @@ namespace llaminar2
 
         std::lock_guard<std::mutex> lock(mutex_);
         LOG_DEBUG("[LocalTPContext] Reserving collective resources"
-                  << " backend_temp_bytes=" << backend_temp_bytes
+                  << " backend_payload_capacity_bytes="
+                  << backend_payload_capacity_bytes
                   << " fp16_scratch_elements=" << fp16_scratch_elements);
-        if (!backend_impl_->reserveTempBufferBytes(backend_temp_bytes))
+        if (!initializeGraphCaptureBoundaryDeviceWords(memory_authority))
         {
-            LOG_ERROR("[LocalTPContext] Backend temp-buffer reservation failed"
-                      << " bytes=" << backend_temp_bytes);
+            LOG_ERROR("[LocalTPContext] Graph-boundary resource reservation failed");
             return false;
         }
-        return reserveFp16ScratchElements(fp16_scratch_elements);
+        if (!backend_impl_->reserveTempBufferBytes(
+                backend_payload_capacity_bytes))
+        {
+            LOG_ERROR("[LocalTPContext] Backend payload-capacity reservation failed"
+                      << " bytes=" << backend_payload_capacity_bytes);
+            return false;
+        }
+        return reserveFp16ScratchElements(
+            fp16_scratch_elements, memory_authority);
     }
 
     // =========================================================================

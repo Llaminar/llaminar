@@ -14,11 +14,13 @@
 #include "ILocalTPContext.h"
 #include "DeviceGroup.h"
 #include "ICollectiveBackend.h"
+#include "../planning/PhysicalMemoryAuthority.h"
 #include <memory>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 
 namespace llaminar2
@@ -279,13 +281,15 @@ namespace llaminar2
          * This method is initialization-only. Collective execution never grows
          * the reservation and fails hard when graph planning underestimates it.
          *
-         * @param backend_temp_bytes Backend transport workspace capacity.
+         * @param backend_payload_capacity_bytes Maximum logical backend payload.
          * @param fp16_scratch_elements Maximum FP16 transport element count.
+         * @param memory_authority Sole rank-local allocation ledger.
          * @return true only when all backend and participant allocations succeed.
          */
         bool reserveCollectiveResources(
-            size_t backend_temp_bytes,
-            size_t fp16_scratch_elements) override;
+            size_t backend_payload_capacity_bytes,
+            size_t fp16_scratch_elements,
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority) override;
 
         /**
          * @brief Get all registered tensors for a stage (concrete implementation)
@@ -496,11 +500,14 @@ namespace llaminar2
         /**
          * @brief Persistent device words used only for graph lifecycle fences.
          *
-         * One INT32 word is allocated per homogeneous GPU participant during
-         * collective-context initialization. Values are immaterial; an in-place
+         * One INT32 word is allocated per homogeneous GPU participant by the
+         * authoritative setup reservation. Values are immaterial; an in-place
          * allreduce exists solely to establish cross-device stream ordering.
          */
         std::vector<void *> graph_capture_boundary_device_words_;
+        /// Physical-ledger claims paired with the graph-boundary words.
+        std::vector<std::optional<PhysicalMemoryAllocationLease>>
+            graph_capture_boundary_memory_leases_;
 
         // =====================================================================
         // FP16 Mixed-Precision Allreduce Scratch Buffers
@@ -515,6 +522,9 @@ namespace llaminar2
         std::vector<void *> fp16_scratch_buffers_;
         /// Setup-time element capacity per device.
         std::vector<size_t> fp16_scratch_counts_;
+        /// Physical-ledger claims paired with the FP16 scratch buffers.
+        std::vector<std::optional<PhysicalMemoryAllocationLease>>
+            fp16_scratch_memory_leases_;
         /// Compute streams registered with the collective backend, retained so
         /// non-explicit-stream collectives can publish completion on the exact
         /// stream that receives the backend's completion wait.
@@ -539,9 +549,12 @@ namespace llaminar2
          * @return true if backend was successfully initialized
          */
         bool initializeBackend();
-        bool initializeGraphCaptureBoundaryDeviceWords();
+        bool initializeGraphCaptureBoundaryDeviceWords(
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority);
         void releaseGraphCaptureBoundaryDeviceWords() noexcept;
-        bool reserveFp16ScratchElements(size_t element_count);
+        bool reserveFp16ScratchElements(
+            size_t element_count,
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority);
         void releaseFp16ScratchBuffers() noexcept;
         void *requireReservedFp16Scratch(
             int device_index,

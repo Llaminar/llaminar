@@ -385,6 +385,7 @@ namespace llaminar2
         ModelBuffers buffers_;
         StageSnapshotCallback snapshot_callback_;
         bool decode_replicated_dense_graph_active_ = false;
+        bool mtp_replicated_dense_graph_active_ = false;
         bool replicated_attention_state_graph_active_ = false;
         bool decode_mirrored_embedding_graph_active_ = false;
         bool mtp_mirrored_lm_head_graph_active_ = false;
@@ -463,6 +464,8 @@ namespace llaminar2
          */
         std::string describeDecodeReplicatedDenseBindingState() const;
         bool useDecodeReplicatedDenseWeights() const;
+        /** @return Whether the active MTP graph owns complete dense/shared bindings. */
+        bool useReplicatedMTPSidecarDenseWeights() const;
         bool hasDecodeMirroredEmbeddingWeightSource() const;
         bool useDecodeMirroredEmbeddingWeights() const;
         bool hasMirroredMTPHeadWeightSource() const;
@@ -507,6 +510,48 @@ namespace llaminar2
          * explicit phase and may select replicated topology only for Decode.
          */
         bool forwardPhaseAllowsDecodeTopology() const noexcept;
+
+        /**
+         * @brief Immutable arithmetic decision for one TP reduction node.
+         *
+         * Policy and transport precision form one numerical contract.  They
+         * must be resolved together: a canonical FP32 rank fold transported
+         * through a lower-precision collective would no longer be the same
+         * arithmetic operation.
+         */
+        struct TPAllreducePlan
+        {
+            TPAllreduceArithmeticPolicy arithmetic_policy =
+                TPAllreduceArithmeticPolicy::NativeCollective;
+            std::string transport_precision;
+        };
+
+        /**
+         * @brief Resolve the sole arithmetic authority for a TP sum.
+         *
+         * The typed forward phase, rather than MTP enablement or row-count
+         * heuristics, decides whether serial-row byte equivalence is required.
+         * Decode on LocalTP GPU domains wider than two participants uses a
+         * native allgather followed by an ascending-rank device fold.  Prefill
+         * and mathematically unambiguous two-participant sums retain the native
+         * throughput collective.
+         *
+         * @param buffer In-place FP32 tensor being reduced.
+         * @param count Exact number of elements participating in the sum.
+         * @param device Participant that owns @p buffer.
+         * @param layer_idx Layer used to resolve native transport precision.
+         * @param precision_override Optional caller-selected native precision.
+         * @return Complete immutable policy/precision plan for the stage.
+         * @throws std::logic_error when a decode graph requiring canonical
+         *         arithmetic has malformed geometry or an unsupported LocalTP
+         *         backend.
+         */
+        [[nodiscard]] TPAllreducePlan resolveTPAllreducePlan(
+            const TensorBase *buffer,
+            size_t count,
+            DeviceId device,
+            int layer_idx,
+            const std::optional<std::string> &precision_override) const;
 
         /**
          * @brief Declarative source for the norm that feeds a final projection.
@@ -584,6 +629,21 @@ namespace llaminar2
          * @return true when LMHeadStage must bind the primary sharded LM head.
          */
         bool useColumnParallelLMHeadForGraph(TensorBase *logits_local) const;
+
+        /**
+         * @brief Resolve the canonical serial arithmetic width for a mirrored head.
+         *
+         * The largest typed vocabulary assignment defines the regular serial
+         * partition. Smaller assignments are legal remainder shards. Mirrored
+         * participants all use this same width for generated-policy selection,
+         * while still launching the complete physical vocabulary projection.
+         *
+         * @param column_parallel True when the graph owns only its local shard.
+         * @return Zero when no equivalence scope is required, otherwise the
+         *         positive canonical serial vocabulary width.
+         * @throws std::logic_error When TP accounting is incomplete or disagrees
+         *         with the graph's local vocabulary width.
+         */
         int serialEquivalentLMHeadPartitionWidth(bool column_parallel) const;
 
         /**
@@ -635,7 +695,18 @@ namespace llaminar2
         class DecodeReplicatedDenseScope
         {
         public:
-            DecodeReplicatedDenseScope(QwenGraphBase &owner, int total_tokens);
+            /**
+             * @brief Select the complete participant-local dense binding view.
+             * @param owner Graph builder whose immutable build state is scoped.
+             * @param total_tokens Physical row count of the graph being built.
+             * @param force_replicated_dense True only for a typed graph family,
+             *        such as a replicated MTP predictor, that owns complete
+             *        dense/shared bindings independently of ordinary decode.
+             */
+            DecodeReplicatedDenseScope(
+                QwenGraphBase &owner,
+                int total_tokens,
+                bool force_replicated_dense = false);
             ~DecodeReplicatedDenseScope();
 
             DecodeReplicatedDenseScope(const DecodeReplicatedDenseScope &) = delete;
@@ -644,6 +715,7 @@ namespace llaminar2
         private:
             QwenGraphBase &owner_;
             bool previous_;
+            bool previous_mtp_dense_;
             bool previous_attention_;
             bool previous_embedding_;
             bool previous_mtp_head_;
@@ -1052,20 +1124,64 @@ namespace llaminar2
             bool layer_idx_is_cache_local = false);
 
         /**
-         * Add Wo GEMM projection + optional TP allreduce.
-         * @return Terminal node name
+         * @brief Add the participant-local attention output projection.
+         *
+         * This transition publishes only the local row-parallel partial.  A
+         * caller that requires tensor-parallel reconstruction must pass the
+         * returned node through addWoAllreduce().  Keeping the two transitions
+         * explicit allows architecture-specific diagnostics to observe the
+         * local partial without racing the collective that consumes it.
+         *
+         * @param graph Participant-local graph being assembled.
+         * @param prefix Stable layer node prefix.
+         * @param buffers Activation tensors and their arena identities.
+         * @param wo_weight Local or replicated output-projection weight.
+         * @param wo_binding Prepared-weight binding for @p wo_weight.
+         * @param total_tokens Physical activation rows in this graph.
+         * @param device Participant that owns the projection.
+         * @param dependency Node that publishes @c buffers.attn_output.
+         * @param wo_node_suffix Stable suffix for the projection node.
+         * @return Projection node, or @p dependency when no weight exists.
          */
-        std::string addWoProjectionAndAllreduce(
+        std::string addWoProjection(
             ComputeGraph &graph,
             const std::string &prefix,
             ActivationBuffers &buffers,
             TensorBase *wo_weight,
             const WeightBinding *wo_binding,
             int total_tokens,
+            DeviceId device,
+            const std::string &dependency,
+            const std::string &wo_node_suffix = "wo_proj");
+
+        /**
+         * @brief Reconstruct a row-parallel attention projection with TP sum.
+         *
+         * The collective consumes the already-published local partial from
+         * @c buffers.attn_proj.  Replicated weights and non-TP graphs retain
+         * @p dependency unchanged, making the returned node the exact published
+         * attention-output boundary in every topology.
+         *
+         * @param graph Participant-local graph being assembled.
+         * @param prefix Stable layer node prefix.
+         * @param buffers Activation tensors and their arena identities.
+         * @param wo_weight Weight whose sharding declares whether reduction is required.
+         * @param total_tokens Physical activation rows in this graph.
+         * @param layer_idx Global layer index used by precision policy.
+         * @param device Participant that owns the collective.
+         * @param dependency Local projection or an ordered observation of it.
+         * @param allreduce_node_suffix Stable suffix for the collective node.
+         * @return Collective node when required, otherwise @p dependency.
+         */
+        std::string addWoAllreduce(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            TensorBase *wo_weight,
+            int total_tokens,
             int layer_idx,
             DeviceId device,
             const std::string &dependency,
-            const std::string &wo_node_suffix = "wo_proj",
             const std::string &allreduce_node_suffix = "wo_allreduce");
 
         /**
@@ -1078,6 +1194,7 @@ namespace llaminar2
          *
          * @param graph Forward graph under construction.
          * @param source Complete embedding output matrix.
+         * @param source_buffer_id Arena slot that owns @p source.
          * @param dependency Embedding or embedding-collective producer node.
          * @param total_tokens Exact physical row count in @p source.
          * @param device Device that owns source and checkpoint destinations.
@@ -1086,12 +1203,14 @@ namespace llaminar2
         virtual std::string maybeAddEmbeddingDiagnosticCheckpoints(
             ComputeGraph &graph,
             TensorBase *source,
+            BufferId source_buffer_id,
             const std::string &dependency,
             int total_tokens,
             DeviceId device)
         {
             (void)graph;
             (void)source;
+            (void)source_buffer_id;
             (void)total_tokens;
             (void)device;
             return dependency;
@@ -1108,6 +1227,7 @@ namespace llaminar2
          * @param graph Forward graph under construction.
          * @param boundary Stable semantic boundary name.
          * @param source Tensor whose terminal row should be retained.
+         * @param source_buffer_id Arena slot that owns @p source.
          * @param dependency Producer that must complete before the checkpoint.
          * @param total_tokens Number of logical rows in @p source.
          * @param device Device that owns @p source.
@@ -1121,6 +1241,7 @@ namespace llaminar2
             ComputeGraph &graph,
             const std::string &boundary,
             TensorBase *source,
+            BufferId source_buffer_id,
             const std::string &dependency,
             int total_tokens,
             DeviceId device,
@@ -1129,6 +1250,7 @@ namespace llaminar2
             (void)graph;
             (void)boundary;
             (void)source;
+            (void)source_buffer_id;
             (void)total_tokens;
             (void)device;
             (void)sequence_lengths_device;

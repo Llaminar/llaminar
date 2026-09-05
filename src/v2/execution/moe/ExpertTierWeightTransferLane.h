@@ -15,6 +15,7 @@
 #include "ExpertTierTransferMeasurement.h"
 #include "ExpertTierWeightDeviceLayout.h"
 #include "../../backends/DeviceId.h"
+#include "../../transfer/TransferEngine.h"
 
 #include <chrono>
 #include <cstddef>
@@ -76,7 +77,10 @@ namespace llaminar2
         struct Config
         {
             DeviceId device;
-            std::size_t staging_capacity_bytes = 0;
+            /** Exclusive host/device staging region from one shared slab. */
+            PersistentTransferStagingSlice staging;
+            /** Exact participant/cycle stream shared across compatible work. */
+            PersistentTransferExecutionLane execution;
             std::string lane_name;
             std::string perf_device;
             /** Collect timing-event evidence for economy certification. */
@@ -100,13 +104,15 @@ namespace llaminar2
             const ExpertTierWeightTransferLane &) = delete;
 
         /**
-         * @brief Allocate the stream, event, device chunk, and pinned chunk.
+         * @brief Bind the pooled stream/staging slice and create lane events.
          * @param error Optional exact construction failure.
          * @return Whether every persistent resource now exists.
          *
-         * Call during topology construction, never during inference or graph
-         * replay. Repeated calls validate the original binding and allocate
-         * nothing.
+         * The enclosing pool allocates one TransferEngine slab before lane
+         * construction, and TransferEngine has already materialized the exact
+         * background stream pool. Call this method during topology construction,
+         * never during inference or graph replay. Repeated calls validate the
+         * original binding and allocate nothing.
          */
         bool materialize(std::string *error = nullptr) noexcept;
 

@@ -56,7 +56,7 @@ namespace llaminar2
         bool maybeApplyDecodeBoundaryMaintenance(
             uint64_t committed_tokens) override;
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
-        bool waitForLastForwardCompletionForBenchmark() override;
+        bool waitForLastInferenceCompletionForBenchmark() override;
         InferenceReadiness inferenceReadiness() const override;
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;

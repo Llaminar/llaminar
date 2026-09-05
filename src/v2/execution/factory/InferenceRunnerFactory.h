@@ -158,12 +158,6 @@ namespace llaminar2
         /// Durable expert-residency observation and maintenance settings.
         MoERebalanceRuntimeConfig moe_rebalance;
 
-        // Use mapped memory for GPU tensor allocation (zero-copy host access)
-        // When true, FP32 activation buffers are allocated using cudaHostAllocMapped /
-        // hipHostMallocMapped, enabling direct host access without memcpy.
-        // Essential for snapshot capture mode on GPU to avoid slow D2H syncs.
-        bool use_mapped_memory = false;
-
         // Orchestration: computed PlacementPlan for layer device assignment
         // When set, the inference runner will use this plan to determine which
         // device executes each layer. If not set, defaults to single-device execution.

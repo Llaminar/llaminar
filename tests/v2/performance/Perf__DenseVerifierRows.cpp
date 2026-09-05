@@ -251,7 +251,6 @@ namespace
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision =
             parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = max_verifier_rows;
 

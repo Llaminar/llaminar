@@ -96,16 +96,6 @@ extern "C"
         int state_size,
         int device_idx,
         void *stream);
-    bool cudaGDN_compact_modular_conv_state(
-        const float *gathered,
-        float *full,
-        int degree,
-        int qk_channels,
-        int local_v_channels,
-        int full_v_channels,
-        int history_len,
-        int device_idx,
-        void *stream);
 }
 
 namespace llaminar2

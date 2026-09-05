@@ -168,7 +168,7 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertIn("routed_decode_assignment=static-owner", result.stdout)
         self.assertIn("routed_prefill_assignment=static-owner", result.stdout)
         self.assertIn("priority=0", result.stdout)
-        self.assertIn("fallback=true", result.stdout)
+        self.assertNotIn("fallback=", result.stdout)
 
     def test_twocard_dry_run_can_request_llep_assignment_policy(self) -> None:
         result = self.run_script(

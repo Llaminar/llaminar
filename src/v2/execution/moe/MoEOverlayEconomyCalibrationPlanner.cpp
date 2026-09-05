@@ -67,6 +67,57 @@ namespace llaminar2
             }
             return left * right;
         }
+
+        /**
+         * @brief Return ceil(sqrt(value)) using exact integer arithmetic.
+         *
+         * Layer counts are small, but avoiding floating point keeps catalog
+         * identity and graph topology identical on every rank and host ISA.
+         */
+        std::size_t ceilingSquareRoot(std::size_t value) noexcept
+        {
+            if (value == 0u)
+                return 0u;
+            std::size_t root = 1u;
+            while (root < value / root ||
+                   (root == value / root && value % root != 0u))
+            {
+                ++root;
+            }
+            return root;
+        }
+
+        /**
+         * @brief Select one midpoint from each equal ordinal layer stratum.
+         *
+         * A remainder accumulator distributes non-divisible members without a
+         * potentially overflowing `stratum * layer_count` product.
+         */
+        std::vector<int> stratifiedServiceLayers(
+            const std::vector<int> &members)
+        {
+            const std::size_t sample_count = ceilingSquareRoot(members.size());
+            std::vector<int> selected;
+            selected.reserve(sample_count);
+            const std::size_t base_width = members.size() / sample_count;
+            const std::size_t remainder = members.size() % sample_count;
+            std::size_t remainder_accumulator = 0u;
+            std::size_t first_ordinal = 0u;
+            for (std::size_t stratum = 0u; stratum < sample_count; ++stratum)
+            {
+                std::size_t width = base_width;
+                remainder_accumulator += remainder;
+                if (remainder_accumulator >= sample_count)
+                {
+                    ++width;
+                    remainder_accumulator -= sample_count;
+                }
+                const std::size_t ordinal = first_ordinal + width / 2u;
+                selected.push_back(members[ordinal]);
+                first_ordinal += width;
+            }
+            return selected;
+        }
     } // namespace
 
     bool MoEOverlayEconomyCalibrationLayerGroup::valid() const noexcept
@@ -77,7 +128,23 @@ namespace llaminar2
                std::is_sorted(member_layers.begin(), member_layers.end()) &&
                std::adjacent_find(
                    member_layers.begin(), member_layers.end()) ==
-                   member_layers.end();
+                   member_layers.end() &&
+               !service_telemetry_layers.empty() &&
+               std::is_sorted(
+                   service_telemetry_layers.begin(),
+                   service_telemetry_layers.end()) &&
+               std::adjacent_find(
+                   service_telemetry_layers.begin(),
+                   service_telemetry_layers.end()) ==
+                   service_telemetry_layers.end() &&
+               std::all_of(
+                   service_telemetry_layers.begin(),
+                   service_telemetry_layers.end(),
+                   [this](int layer)
+                   {
+                       return std::binary_search(
+                           member_layers.begin(), member_layers.end(), layer);
+                   });
     }
 
     MoEOverlayEconomyCalibrationLayerCatalog::
@@ -126,6 +193,7 @@ namespace llaminar2
                 groups_.push_back({
                     .representative_layer = static_cast<int>(layer),
                     .member_layers = {static_cast<int>(layer)},
+                    .service_telemetry_layers = {},
                     .complete_expert_bytes = complete_bytes,
                 });
             }
@@ -144,14 +212,20 @@ namespace llaminar2
         std::uint64_t hash = kFNV1a64OffsetBasis;
         hashUnsigned(hash, static_cast<std::uint64_t>(manifest.size()));
         hashUnsigned(hash, static_cast<std::uint64_t>(groups_.size()));
-        for (const auto &group : groups_)
+        for (auto &group : groups_)
         {
+            group.service_telemetry_layers =
+                stratifiedServiceLayers(group.member_layers);
             if (!group.valid())
             {
                 throw std::logic_error(
                     "ExpertOverlay calibration constructed an invalid layer equivalence class");
             }
             representative_layers_.push_back(group.representative_layer);
+            service_telemetry_layers_.insert(
+                service_telemetry_layers_.end(),
+                group.service_telemetry_layers.begin(),
+                group.service_telemetry_layers.end());
             hashUnsigned(
                 hash,
                 static_cast<std::uint64_t>(group.representative_layer));
@@ -184,7 +258,36 @@ namespace llaminar2
                     projection.format.native_vnni.is_superblock ? 1u : 0u);
             }
         }
+        std::sort(
+            service_telemetry_layers_.begin(),
+            service_telemetry_layers_.end());
+        if (std::adjacent_find(
+                service_telemetry_layers_.begin(),
+                service_telemetry_layers_.end()) !=
+            service_telemetry_layers_.end())
+        {
+            throw std::logic_error(
+                "ExpertOverlay service telemetry strata overlap across exact layer classes");
+        }
         identity_ = catalogIdentity(hash);
+    }
+
+    bool MoEOverlayEconomyCalibrationLayerCatalog::isRepresentativeLayer(
+        int layer) const noexcept
+    {
+        return std::binary_search(
+            representative_layers_.begin(),
+            representative_layers_.end(),
+            layer);
+    }
+
+    bool MoEOverlayEconomyCalibrationLayerCatalog::isServiceTelemetryLayer(
+        int layer) const noexcept
+    {
+        return std::binary_search(
+            service_telemetry_layers_.begin(),
+            service_telemetry_layers_.end(),
+            layer);
     }
 
     MoEOverlaySealedMigrationMeasurements

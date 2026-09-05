@@ -837,6 +837,92 @@ TEST_F(Test__WeightSlicer, FusedQKV_GQA_AllDegrees_Llama3)
     }
 }
 
+/**
+ * @brief Assignment-aware fused QKV preserves semantic heads for TP=2..8.
+ *
+ * The Qwen3.5-122B TP=3 production failure was caused by replacing the typed
+ * 12/10/10 query-head assignment with an equal 8192/3 row split.  This sweep
+ * locks down both the uneven Q rows and the replicated-KV policy used whenever
+ * the TP degree exceeds the model's two KV heads.
+ */
+TEST_F(Test__WeightSlicer, FusedQKV_AssignmentAwareUnevenTP2ThroughTP8)
+{
+    constexpr int HEADS = 32;
+    constexpr int KV_HEADS = 2;
+    constexpr int HEAD_DIM = 256;
+    constexpr int GDN_HEADS = 32;
+    constexpr int GDN_STATE = 256;
+    constexpr size_t Q_ROWS = HEADS * HEAD_DIM;
+    constexpr size_t KV_ROWS = KV_HEADS * HEAD_DIM;
+    constexpr size_t ATTENTION_TOTAL = Q_ROWS + 2 * KV_ROWS;
+    constexpr size_t GDN_BLOCK_ROWS = GDN_HEADS * GDN_STATE;
+    constexpr size_t GDN_TOTAL = 3 * GDN_BLOCK_ROWS;
+
+    ModelDimensions dimensions{
+        .n_heads = HEADS,
+        .n_kv_heads = KV_HEADS,
+        .head_dim = HEAD_DIM,
+        .gdn_n_k_heads = GDN_HEADS,
+        .gdn_n_v_heads = GDN_HEADS,
+        .gdn_d_state = GDN_STATE,
+    };
+
+    for (int degree = 2; degree <= 8; ++degree)
+    {
+        auto config = std::make_shared<TensorParallelConfig>(
+            TensorParallelConfig::equalSplit(
+                degree, HEADS, KV_HEADS, D_FF, VOCAB));
+        WeightSlicer slicer(dimensions, qwen35Config(), config);
+
+        size_t covered_q_rows = 0u;
+        size_t covered_gdn_rows = 0u;
+        for (int rank = 0; rank < degree; ++rank)
+        {
+            const auto &assignment = config->forRank(rank);
+            const auto attention =
+                slicer.computeFusedQKVSliceForAssignment(
+                    "blk.1.attn_qkv.weight",
+                    ATTENTION_TOTAL,
+                    assignment);
+            ASSERT_TRUE(attention.has_value())
+                << "TP=" << degree << " rank=" << rank;
+            EXPECT_EQ(
+                attention->q,
+                (SliceSpec{
+                    static_cast<size_t>(assignment.head_start) * HEAD_DIM,
+                    static_cast<size_t>(assignment.head_count) * HEAD_DIM}));
+            EXPECT_EQ(
+                attention->k,
+                (SliceSpec{
+                    static_cast<size_t>(assignment.kv_head_start) * HEAD_DIM,
+                    static_cast<size_t>(assignment.kv_head_count) * HEAD_DIM}));
+            ASSERT_EQ(attention->v.size(), 1u);
+            EXPECT_EQ(attention->v.front(), attention->k);
+            covered_q_rows += attention->q.count;
+
+            const auto gdn =
+                slicer.computeFusedQKVSliceForAssignment(
+                    "blk.0.attn_qkv.weight", GDN_TOTAL, assignment);
+            ASSERT_TRUE(gdn.has_value())
+                << "TP=" << degree << " rank=" << rank;
+            EXPECT_TRUE(gdn->modulo_linked_gdn);
+            EXPECT_EQ(
+                gdn->q,
+                (SliceSpec{
+                    static_cast<size_t>(assignment.head_start) * GDN_STATE,
+                    static_cast<size_t>(assignment.head_count) * GDN_STATE}));
+            EXPECT_EQ(gdn->k, gdn->q);
+            ASSERT_EQ(gdn->v.size(), 1u);
+            EXPECT_EQ(gdn->v.front(), gdn->q);
+            covered_gdn_rows += gdn->q.count;
+        }
+
+        EXPECT_EQ(covered_q_rows, Q_ROWS) << "TP=" << degree;
+        EXPECT_EQ(covered_gdn_rows, GDN_BLOCK_ROWS)
+            << "TP=" << degree;
+    }
+}
+
 TEST_F(Test__WeightSlicer, FusedQKV_GDN_AllDegrees_Qwen35_4B)
 {
     // Qwen3.5-4B GDN: n_k=16, n_v=32, d_state=128

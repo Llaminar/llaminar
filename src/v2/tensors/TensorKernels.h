@@ -443,7 +443,8 @@ namespace llaminar2
          * @param actual_output_columns Number of columns physically produced by
          *        this invocation.
          * @param serial_partition_columns Number of columns produced by one
-         *        partition of the serial reference graph.
+         *        regular partition of the serial reference graph. The final
+         *        typed partition may contain fewer columns.
          * @return A scope token that must outlive every affected kernel launch.
          *
          * The default implementation accepts only the identity case. Backends

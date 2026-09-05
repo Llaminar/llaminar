@@ -1569,8 +1569,7 @@ namespace llaminar2
             if (actual_output_columns <= 0 ||
                 serial_partition_columns <= 0 ||
                 actual_output_columns != static_cast<int>(N_) ||
-                serial_partition_columns > actual_output_columns ||
-                (actual_output_columns % serial_partition_columns) != 0)
+                serial_partition_columns > actual_output_columns)
             {
                 throw std::invalid_argument(
                     "[CUDAQuantisedGemmKernel] Invalid replicated-output serial partition contract");
@@ -2555,7 +2554,7 @@ namespace llaminar2
                     }
                 }
 
-                if (PerfStatsCollector::isEnabled())
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -2925,7 +2924,7 @@ namespace llaminar2
                  * concurrency test that merely enables the policy but falls
                  * through to sequential projection dispatch is not evidence.
                  */
-                if (PerfStatsCollector::isEnabled())
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -3650,7 +3649,7 @@ namespace llaminar2
 
             auto record_small_m_route = [&](const char *route)
             {
-                if (!PerfStatsCollector::isEnabled())
+                if (!PerfStatsCollector::isDomainEnabled("kernel"))
                     return;
 
                 PerfStatsCollector::addCounter(
@@ -3840,7 +3839,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (PerfStatsCollector::isEnabled())
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
             {
                 PerfStatsCollector::addCounter(
                     "kernel",

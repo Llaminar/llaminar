@@ -247,7 +247,10 @@ namespace
         }
         bool hasBARBackedOutputs(const std::string & /*stage_name*/) const override { return false; }
         void clearBARBackedOutputs() override {}
-        bool reserveCollectiveResources(size_t /*bytes*/, size_t /*fp16_scratch_elements*/) override { return true; }
+        bool reserveCollectiveResources(
+            size_t /*bytes*/,
+            size_t /*fp16_scratch_elements*/,
+            const std::shared_ptr<PhysicalMemoryAuthority> & /*memory_authority*/) override { return true; }
 
         // Broadcast (no-op)
         bool broadcast(TensorBase * /*tensor*/, int /*source_device_index*/ = 0) override { return true; }
@@ -810,6 +813,41 @@ namespace
         EXPECT_NE(source.find("grouped MTP rows remain mathematically identical to serial decode"),
                   std::string::npos)
             << "the source contract should document the parity reason for keeping MTP sidecar weights";
+    }
+
+    /**
+     * @brief The MTP replica plan consumes typed manifest ownership directly.
+     *
+     * Source-layer substring filters cannot distinguish a locally replicated
+     * MoE sidecar from one whose routed parents are already owned by
+     * ExpertOverlay. Guard the exact typed policy handoff at all runner sites.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract,
+         ReplicatedMTPSidecarUsesManifestAndTypedExpertAuthority)
+    {
+        const std::string source =
+            readFactorySourceFile(
+                "src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        ASSERT_FALSE(source.empty());
+
+        EXPECT_NE(
+            source.find("manifest.participantReplicaNames("),
+            std::string::npos)
+            << "the sidecar plan must use the discovered typed manifest";
+        EXPECT_NE(
+            source.find("mtpRoutedExpertWeightAuthority(graph_config)"),
+            std::string::npos)
+            << "routed-parent ownership must derive from the frozen graph topology";
+        EXPECT_GE(
+            countFactorySourceOccurrences(
+                source,
+                ".mtp_routed_expert_weight_authority ="),
+            3u)
+            << "ordinary, nested PP/TP, and LocalTP construction must share one ownership policy";
+        EXPECT_EQ(
+            source.find("includeWeightInReplicatedMTPSidecarPlan"),
+            std::string::npos)
+            << "the obsolete name/role heuristic must not remain as a second authority";
     }
 
     /**

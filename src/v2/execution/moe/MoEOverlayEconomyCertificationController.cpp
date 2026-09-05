@@ -113,15 +113,14 @@ namespace llaminar2
              config_.target !=
                  MoEOverlayEconomyCertificationTarget::
                      DetachedDeviceAuthority) ||
-            !validExpertHistogramProductionSourceMask(
-                config_.active_sources) ||
-            config_.active_sources !=
+            !config_.production_topology.valid() ||
+            config_.production_topology.economyActiveSources() !=
                 config_.calibration->requiredSources() ||
             config_.service_readiness_retry_interval <
                 std::chrono::milliseconds::zero())
         {
             throw std::invalid_argument(
-                "ExpertOverlay economy certification requires complete dynamic dependencies, a valid typed target, and one consistent runtime phase mask");
+                "ExpertOverlay economy certification requires complete dynamic dependencies, a valid typed target, and one consistent production topology");
         }
         if (config_.perf_device.empty())
             config_.perf_device = "expert_overlay";
@@ -132,6 +131,9 @@ namespace llaminar2
                 snapshot->layered_ownership.layerCount() ||
             config_.model_metadata.num_experts !=
                 snapshot->layered_ownership.expertCount() ||
+            config_.production_topology.layerCount() !=
+                static_cast<std::size_t>(
+                    config_.model_metadata.num_layers) ||
             config_.layer_catalog->completeExpertBytesPerLayer().size() !=
                 static_cast<std::size_t>(config_.model_metadata.num_layers))
         {
@@ -678,12 +680,12 @@ namespace llaminar2
             serviceMeasurementIdentity(raw_service);
         measurements.migration_measurement_identity =
             expanded_migration_measurements_->identity;
-        measurements.active_sources = config_.active_sources;
+        measurements.production_topology = config_.production_topology;
         measurements.participant_service =
             MoEOverlayEconomyProfileComposer::
                 normalizeEquivalentServiceTotals(
                     std::move(raw_service),
-                    config_.active_sources,
+                    config_.production_topology,
                     *config_.layer_catalog);
         measurements.directed_migration =
             MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(
@@ -808,7 +810,8 @@ namespace llaminar2
                  phase < kExpertHistogramProductionSourceCount;
                  ++phase)
             {
-                if (!profile.active_sources[phase])
+                if (!profile.production_topology.requiresServiceEvidence(
+                        row.layer, phase))
                     continue;
                 const std::uint64_t cost =
                     row.nanoseconds_per_activation[phase];
@@ -873,7 +876,8 @@ namespace llaminar2
                  phase < kExpertHistogramProductionSourceCount;
                  ++phase)
             {
-                if (!profile.active_sources[phase])
+                if (!profile.production_topology.requiresServiceEvidence(
+                        static_cast<int>(layer), phase))
                     continue;
                 for (std::size_t rank = 1;
                      rank < priority_order.size();
@@ -998,11 +1002,21 @@ namespace llaminar2
                      phase < kExpertHistogramProductionSourceCount;
                      ++phase)
                 {
-                    if (!config_.active_sources[phase] &&
+                    if (!config_.production_topology.reachable(
+                            layer, phase) &&
                         row.sample_count[phase] != 0)
                     {
-                        throw std::invalid_argument(
-                            "ExpertOverlay service snapshot sampled a runtime-disabled inference phase");
+                        std::ostringstream message;
+                        message
+                            << "ExpertOverlay service snapshot sampled a "
+                               "runtime-disabled inference phase"
+                            << " participant=" << participant_id
+                            << " layer=" << layer
+                            << " source=" << serviceSourceName(phase)
+                            << " samples=" << row.sample_count[phase]
+                            << " activations="
+                            << row.activation_count[phase];
+                        throw std::invalid_argument(message.str());
                     }
                 }
             }
@@ -1011,7 +1025,7 @@ namespace llaminar2
         /*
          * Sparse packets may legitimately leave individual equivalent layers
          * idle. Readiness is therefore one real observation per participant,
-         * authenticated manifest class, and active production phase. The
+         * authenticated manifest class, and economy-priced production phase. The
          * composer later pools exact integer totals over the same classes.
          */
         for (std::size_t participant = 0;
@@ -1032,14 +1046,24 @@ namespace llaminar2
                      phase < kExpertHistogramProductionSourceCount;
                      ++phase)
                 {
-                    if (!config_.active_sources[phase])
+                    const bool class_phase_requires_evidence = std::any_of(
+                        group.member_layers.begin(),
+                        group.member_layers.end(),
+                        [this, phase](int layer)
+                        {
+                            return config_.production_topology
+                                .requiresServiceEvidence(layer, phase);
+                        });
+                    if (!class_phase_requires_evidence)
                         continue;
                     const bool observed = std::any_of(
                         group.member_layers.begin(),
                         group.member_layers.end(),
-                        [&rows, base, phase](int layer)
+                        [this, &rows, base, phase](int layer)
                         {
-                            return rows[
+                            return config_.production_topology
+                                       .requiresServiceEvidence(layer, phase) &&
+                                   rows[
                                        base + static_cast<std::size_t>(layer)]
                                        .sample_count[phase] != 0;
                         });
@@ -1066,8 +1090,21 @@ namespace llaminar2
     {
         std::uint64_t hash = kFNV1a64OffsetBasis;
         hashString(hash, config_.layer_catalog->identity());
-        for (const bool active : config_.active_sources)
-            hashUnsigned(hash, active ? 1u : 0u);
+        for (int layer = 0;
+             layer < config_.model_metadata.num_layers;
+             ++layer)
+        {
+            for (const bool reachable :
+                 config_.production_topology.sources(layer))
+            {
+                hashUnsigned(hash, reachable ? 1u : 0u);
+            }
+            for (const bool priced :
+                 config_.production_topology.economySources(layer))
+            {
+                hashUnsigned(hash, priced ? 1u : 0u);
+            }
+        }
         hashUnsigned(hash, static_cast<std::uint64_t>(rows.size()));
         for (const auto &row : rows)
         {

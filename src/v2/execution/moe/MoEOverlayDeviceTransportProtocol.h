@@ -87,8 +87,9 @@ namespace llaminar2
          * @brief Observe the immutable ticket for a new snapshot transaction.
          * @param after_transaction Last transaction completed by this worker.
          * @param transaction Receives the new transaction when collection is open.
-         * @param phase Receives the authority-selected phase-pure snapshot plane.
-         * @return True only for an exact newer Dynamic transaction.
+         * @param kind Receives the authority-selected transaction objective.
+         * @param phase Receives the phase-pure plane, or Invalid for restore.
+         * @return True only for an exact newer durable transaction.
          *
          * This is a scheduler ticket, not a host policy mirror. The host learns
          * only the monotonic transaction identity needed to submit retained
@@ -97,6 +98,7 @@ namespace llaminar2
         [[nodiscard]] bool snapshotTransactionAfter(
             std::uint64_t after_transaction,
             std::uint64_t *transaction,
+            MoEOverlayDeviceControllerTransactionKind *kind,
             MoEOverlayDeviceDemandPhase *phase) const noexcept;
 
         /** @return Whether every local participant published @p transaction. */

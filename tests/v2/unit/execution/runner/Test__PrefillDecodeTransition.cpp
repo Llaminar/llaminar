@@ -4710,6 +4710,7 @@ namespace
             ++device_generation_admission_count_;
             last_device_generation_request_count_ = request.request_count;
             last_device_generation_max_new_tokens_ = request.max_new_tokens;
+            last_device_generation_depth_policy_ = request.depth_policy;
             last_device_generation_initial_leading_row_disposition_ =
                 request.initial_leading_row_disposition;
             device_generation_admission_dispositions_.push_back(
@@ -5929,6 +5930,11 @@ namespace
         {
             return last_device_generation_max_new_tokens_;
         }
+        const sampling_math::DeviceGenerationDepthPolicy &
+        lastDeviceGenerationDepthPolicy() const
+        {
+            return last_device_generation_depth_policy_;
+        }
         sampling_math::DeviceGenerationLeadingRowDisposition
         lastDeviceGenerationInitialLeadingRowDisposition() const
         {
@@ -6792,6 +6798,9 @@ namespace
         int device_generation_admission_count_{0};
         int last_device_generation_request_count_{0};
         int last_device_generation_max_new_tokens_{0};
+        sampling_math::DeviceGenerationDepthPolicy
+            last_device_generation_depth_policy_ =
+                sampling_math::DeviceGenerationDepthPolicy::fixed(0);
         sampling_math::DeviceGenerationLeadingRowDisposition
             last_device_generation_initial_leading_row_disposition_{
                 sampling_math::DeviceGenerationLeadingRowDisposition::
@@ -9257,6 +9266,118 @@ namespace
 
         EXPECT_EQ(probe.current_position, 37);
         EXPECT_THAT(probe.positions, ElementsAre(37));
+    }
+
+    /**
+     * @brief One retained depth-15 family may execute a shallower request.
+     *
+     * The public policy transition is the serving/parity amortization seam:
+     * changing depth must reset only request-owned controller state and must
+     * never mutate the setup configuration that owns captured graph capacity.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           TypedMTPRequestPolicySelectsDepthWithinRetainedFamily)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/15,
+            /*chained_mtp_support=*/true);
+
+        MTPRequestPolicy depth_two = runner->mtpRequestPolicy();
+        depth_two.enabled = true;
+        depth_two.draft_tokens = 2;
+        depth_two.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+        ASSERT_TRUE(runner->configureMTPRequestPolicy(depth_two))
+            << runner->lastError();
+
+        EXPECT_EQ(runner->config().mtp.draft_tokens, 15)
+            << "request selection must not mutate retained graph capacity";
+        EXPECT_EQ(runner->mtpRequestPolicy().draft_tokens, 2);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult step = runner->decodeStep();
+        ASSERT_TRUE(step.success()) << step.error;
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 1)
+            << "depth two is one initial sidecar plus one chained sidecar";
+
+        const PrefixRuntimeStateSnapshot probe = runner->prefixStateProbe();
+        EXPECT_TRUE(probe.mtp_request.enabled);
+        EXPECT_EQ(probe.mtp_current_depth, 2);
+        EXPECT_EQ(probe.mtp_max_depth, 2);
+        EXPECT_EQ(probe.mtp_last_transaction_draft_depth, 2);
+    }
+
+    /**
+     * @brief Request reset permits MTP-off without retiring retained graphs.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           TypedMTPRequestPolicyCanDisableNextRequestWithoutRecapture)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true);
+
+        runner->clearCache();
+        MTPRequestPolicy disabled = runner->mtpRequestPolicy();
+        disabled.enabled = false;
+        ASSERT_TRUE(runner->configureMTPRequestPolicy(disabled))
+            << runner->lastError();
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult step = runner->decodeStep();
+        ASSERT_TRUE(step.success()) << step.error;
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 0);
+        EXPECT_EQ(runner->config().mtp.draft_tokens, 3);
+        EXPECT_FALSE(runner->mtpRequestPolicy().enabled);
+        EXPECT_FALSE(runner->prefixStateProbe().mtp_request.enabled);
+    }
+
+    /**
+     * @brief Typed policy admission rejects unsafe capacity and lifecycle edges.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           TypedMTPRequestPolicyRejectsOverCapacityAndLiveMutation)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true);
+
+        MTPRequestPolicy over_capacity = runner->mtpRequestPolicy();
+        over_capacity.draft_tokens = 4;
+        EXPECT_FALSE(runner->configureMTPRequestPolicy(over_capacity));
+        EXPECT_THAT(runner->lastError(), HasSubstr("retained graph-capacity"));
+        EXPECT_EQ(runner->mtpRequestPolicy().draft_tokens, 3);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        MTPRequestPolicy live_change = runner->mtpRequestPolicy();
+        live_change.draft_tokens = 2;
+        EXPECT_FALSE(runner->configureMTPRequestPolicy(live_change));
+        EXPECT_THAT(runner->lastError(), HasSubstr("reset runner"));
+        EXPECT_EQ(runner->mtpRequestPolicy().draft_tokens, 3);
+        EXPECT_EQ(mock->forwardMTPCount(), 0)
+            << "failed policy admission must not execute or mutate the request";
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPFirstDecodeAcceptsGreedyDraftAndCommitsVerifierState)
@@ -13749,6 +13870,18 @@ namespace
         ASSERT_TRUE(step.success()) << step.error;
         EXPECT_EQ(step.tokens, terminal_tokens);
         EXPECT_EQ(mock->deviceGenerationMaterializationCount(), 1);
+        const auto &admitted_policy =
+            mock->lastDeviceGenerationDepthPolicy();
+        EXPECT_EQ(
+            admitted_policy.mode,
+            sampling_math::DeviceGenerationDepthPolicyMode::Dynamic);
+        EXPECT_EQ(admitted_policy.minimum_depth, 1);
+        EXPECT_EQ(admitted_policy.maximum_depth, 3);
+        EXPECT_EQ(admitted_policy.initial_depth, 2);
+        EXPECT_EQ(admitted_policy.window_size, 1);
+        EXPECT_EQ(admitted_policy.minimum_samples, 1);
+        EXPECT_EQ(admitted_policy.cooldown_steps, 0);
+        EXPECT_EQ(admitted_policy.promote_consecutive_windows, 1);
         EXPECT_EQ(mock->lastDeviceGenerationDraftDepth(), 3)
             << "Dynamic capture must materialize the complete configured depth family.";
         EXPECT_EQ(
@@ -15666,9 +15799,18 @@ namespace
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 1;
         config.mtp.verify_mode = MTPVerifyMode::Greedy;
+        config.prefix_cache.enabled = false;
+        config.prefix_cache.storage_mode =
+            PrefixCacheStorageMode::Disabled;
+
+        RankExecutionPlan runner_plan = plan_;
+        runner_plan.runtime.prefix_cache.enabled = false;
+        runner_plan.runtime.prefix_cache.storage_mode =
+            PrefixCacheStorageMode::Disabled;
 
         auto runner = std::make_unique<OrchestrationRunner>(
-            std::move(config), plan_, std::move(global_runner), mpi);
+            std::move(config), std::move(runner_plan),
+            std::move(global_runner), mpi);
         SamplingParams greedy;
         greedy.temperature = 0.0f;
         runner->setSamplingParams(greedy);
@@ -15726,9 +15868,18 @@ namespace
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 3;
         config.mtp.verify_mode = MTPVerifyMode::Greedy;
+        config.prefix_cache.enabled = false;
+        config.prefix_cache.storage_mode =
+            PrefixCacheStorageMode::Disabled;
+
+        RankExecutionPlan runner_plan = plan_;
+        runner_plan.runtime.prefix_cache.enabled = false;
+        runner_plan.runtime.prefix_cache.storage_mode =
+            PrefixCacheStorageMode::Disabled;
 
         auto runner = std::make_unique<OrchestrationRunner>(
-            std::move(config), plan_, std::move(global_runner), mpi);
+            std::move(config), std::move(runner_plan),
+            std::move(global_runner), mpi);
         SamplingParams greedy;
         greedy.temperature = 0.0f;
         runner->setSamplingParams(greedy);

@@ -223,6 +223,12 @@ namespace llaminar2
             ExpertTierGpuBlobRelayKind relay_kind =
                 ExpertTierGpuBlobRelayKind::CrossBackend;
             std::size_t staging_capacity_bytes = 0;
+            /** Two exclusive source-mapped slices from one device pool. */
+            std::array<std::shared_ptr<MappedHostTransferRegion>, 2>
+                source_mapped_staging;
+            /** Two exclusive destination-mapped slices from one device pool. */
+            std::array<std::shared_ptr<MappedHostTransferRegion>, 2>
+                destination_mapped_staging;
             /** Source-device epoch shared across every physical relay lane. */
             std::shared_ptr<MappedTransferProgressEpoch>
                 source_progress_epoch;
@@ -257,12 +263,15 @@ namespace llaminar2
             const ExpertTierGpuBlobTransferLane &) = delete;
 
         /**
-         * @brief Lease epoch slots and allocate both mapped staging directions.
+         * @brief Bind preallocated staging and lease both epoch directions.
          * @param error Optional exact construction failure.
          * @return Whether the complete persistent resource set exists.
          *
-         * This method belongs to topology construction, before inference or
-         * graph capture. Repeated calls allocate nothing.
+         * The physical fabric preallocates one mapped slab per GPU from its
+         * complete slot BOM. This method only binds the lane's four exclusive
+         * slices and reserves their immutable retained-command identities.
+         * It belongs to topology construction, before inference or graph
+         * capture, and repeated calls allocate nothing.
          */
         bool materialize(std::string *error = nullptr) noexcept;
 

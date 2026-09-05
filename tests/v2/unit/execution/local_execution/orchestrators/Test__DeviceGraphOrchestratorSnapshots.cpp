@@ -202,14 +202,23 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_SemanticPolicyIsIdemp
         changed_epoch);
 
     orchestrator.disableSnapshotCapture();
-    const uint64_t disabled_epoch =
+    const uint64_t disabled_identity =
         orchestrator.executor().snapshotConfigurationEpoch();
-    EXPECT_GT(disabled_epoch, changed_epoch);
+    EXPECT_EQ(disabled_identity, initial_epoch)
+        << "The lean graph topology has one stable identity across diagnostic toggles";
 
     orchestrator.disableSnapshotCapture();
     EXPECT_EQ(
         orchestrator.executor().snapshotConfigurationEpoch(),
-        disabled_epoch);
+        disabled_identity);
+
+    // Re-selecting the exact diagnostic inventory must recover its old cache key.
+    orchestrator.setSnapshotCaptureFilter(
+        {"layer0_FFN_RESIDUAL", "LM_HEAD", "EMBEDDING"});
+    orchestrator.enableSnapshotCapture();
+    EXPECT_EQ(
+        orchestrator.executor().snapshotConfigurationEpoch(),
+        changed_epoch);
 }
 
 TEST(Test__DeviceGraphOrchestratorSnapshots, GetSnapshot_ReturnsNullForMissingKey)

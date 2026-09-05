@@ -560,6 +560,58 @@ TEST_F(Test__LocalTPContext, CollectTimeoutPolicySeparatesCollectivesFromWorkerJ
     EXPECT_EQ(effectiveWorkerJoinTimeoutMs(450000), 0);
 }
 
+/**
+ * @test Authoritative collective allocations roll back as one transaction.
+ *
+ * The physical-memory lease must be acquired before the device allocation,
+ * and any exception from either half must free a returned pointer, release the
+ * current claim, and unwind already-published participant allocations. This
+ * source-policy regression keeps the ownership edge intact without requiring
+ * a GPU in the unit suite.
+ */
+TEST_F(Test__LocalTPContext,
+       GraphBoundaryAllocationFailureRollsBackPointerAndLedgerLease)
+{
+    const std::string source = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t begin = source.find(
+        "bool LocalTPContext::initializeGraphCaptureBoundaryDeviceWords(");
+    const size_t end = source.find(
+        "void LocalTPContext::releaseGraphCaptureBoundaryDeviceWords()", begin);
+    ASSERT_NE(begin, std::string::npos);
+    ASSERT_NE(end, std::string::npos);
+    const std::string body = source.substr(begin, end - begin);
+
+    const size_t claim = body.find("claimNewAllocation(");
+    const size_t allocate = body.find("backend->allocate(", claim);
+    const size_t catch_block = body.find("catch (const std::exception", claim);
+    ASSERT_NE(claim, std::string::npos);
+    ASSERT_NE(allocate, std::string::npos);
+    ASSERT_NE(catch_block, std::string::npos);
+    EXPECT_LT(claim, allocate);
+    EXPECT_LT(allocate, catch_block)
+        << "The backend allocation must remain inside the rollback try block.";
+
+    const std::string rollback = body.substr(catch_block);
+    EXPECT_NE(rollback.find("backend->free(buffer"), std::string::npos);
+    EXPECT_NE(
+        rollback.find("releaseGraphCaptureBoundaryDeviceWords();"),
+        std::string::npos);
+
+    const size_t release_end = source.find(
+        "CollectiveDataType LocalTPContext::tensorDTypeToCollective", end);
+    ASSERT_NE(release_end, std::string::npos);
+    const std::string release = source.substr(end, release_end - end);
+    const size_t pointer_guard = release.find("if (buffer)");
+    const size_t lease_reset = release.find(
+        "graph_capture_boundary_memory_leases_[slot].reset();");
+    ASSERT_NE(pointer_guard, std::string::npos);
+    ASSERT_NE(lease_reset, std::string::npos);
+    EXPECT_LT(release.find("}", pointer_guard), lease_reset)
+        << "A lease-only partial state must still be returned to the ledger.";
+}
+
 TEST_F(Test__LocalTPContext, FP16TransportFailuresFailBeforeFP32GroupedAllreduce)
 {
     const std::string source = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
@@ -656,7 +708,7 @@ TEST_F(Test__LocalTPContext, FP16CastWrappersBindParticipantOrdinalBeforeLaunch)
                              "!fp16_input || !fp32_output || !stream");
 }
 
-TEST_F(Test__LocalTPContext, GDNCompactWrappersFailFastOnDeviceBindAndClearLaunchState)
+TEST_F(Test__LocalTPContext, GDNLinkedReassemblyWrappersFailFastOnDeviceBindAndClearLaunchState)
 {
     const std::string cuda_gdn = readTextFile(LLAMINAR_CUDA_GDN_KERNELS_SOURCE);
     const std::string rocm_gdn = readTextFile(LLAMINAR_ROCM_GDN_KERNELS_SOURCE);
@@ -675,8 +727,12 @@ TEST_F(Test__LocalTPContext, GDNCompactWrappersFailFastOnDeviceBindAndClearLaunc
                                           : next_wrapper - sig_pos);
     };
 
-    const std::string cuda_body = extractWrapper(cuda_gdn, "cudaGDN_compact_modular_conv_state(");
-    const std::string rocm_body = extractWrapper(rocm_gdn, "rocmGDN_compact_modular_conv_state(");
+    const std::string cuda_body = extractWrapper(
+        cuda_gdn,
+        "cudaGDN_reassemble_modulo_linked_state(");
+    const std::string rocm_body = extractWrapper(
+        rocm_gdn,
+        "rocmGDN_reassemble_modulo_linked_state(");
     ASSERT_FALSE(cuda_body.empty());
     ASSERT_FALSE(rocm_body.empty());
 
@@ -697,14 +753,14 @@ TEST_F(Test__LocalTPContext, GDNCompactWrappersFailFastOnDeviceBindAndClearLaunc
         EXPECT_LT(set_pos, failure_pos);
         EXPECT_LT(failure_pos, clear_pos);
         EXPECT_LT(clear_pos, launch_pos)
-            << "stale launch errors must be cleared immediately before the compaction launch";
+            << "stale launch errors must be cleared immediately before the reassembly launch";
     };
 
     expectStrictLaunchWrapper(cuda_body,
                               "cudaSetDevice(device_idx)",
                               "set_err != cudaSuccess",
                               "cudaGetLastError()",
-                              "cuda_gdn_compact_modular_conv_state_kernel<<<");
+                              "cuda_gdn_reassemble_modulo_linked_state_kernel<<<");
     expectStrictLaunchWrapper(rocm_body,
                               "HipDeviceGuard::setDevice(device_idx)",
                               "set_err != hipSuccess",
@@ -784,6 +840,54 @@ TEST_F(Test__LocalTPContext, WorkerGpuCheckedEventHelpersBindContextDevice)
               std::string::npos);
     EXPECT_NE(rocm_sync.find("setAMDDeviceForResource(device_ordinal_, \"synchronizeStreamChecked\")"),
               std::string::npos);
+}
+
+TEST_F(Test__LocalTPContext, WorkerGpuStreamQueriesThrowBackendSymmetricAsyncErrors)
+{
+    const std::string cuda_context =
+        readTextFile(LLAMINAR_NVIDIA_DEVICE_CONTEXT_SOURCE);
+    const std::string rocm_context =
+        readTextFile(LLAMINAR_AMD_DEVICE_CONTEXT_SOURCE);
+    ASSERT_FALSE(cuda_context.empty());
+    ASSERT_FALSE(rocm_context.empty());
+
+    auto extractTypedQuery = [](const std::string &source,
+                                const char *signature,
+                                const char *next_signature)
+    {
+        const size_t begin = source.find(signature);
+        EXPECT_NE(begin, std::string::npos) << signature;
+        if (begin == std::string::npos)
+            return std::string{};
+        const size_t end = source.find(next_signature, begin + 1u);
+        EXPECT_NE(end, std::string::npos) << next_signature;
+        return source.substr(
+            begin,
+            end == std::string::npos ? std::string::npos : end - begin);
+    };
+
+    const std::string cuda_query = extractTypedQuery(
+        cuda_context,
+        "GPUStreamExecutionState NvidiaDeviceContext::queryStreamExecutionState(",
+        "void NvidiaDeviceContext::synchronizeEvent(");
+    const std::string rocm_query = extractTypedQuery(
+        rocm_context,
+        "GPUStreamExecutionState AMDDeviceContext::queryStreamExecutionState(",
+        "void AMDDeviceContext::synchronizeEvent(");
+    ASSERT_FALSE(cuda_query.empty());
+    ASSERT_FALSE(rocm_query.empty());
+
+    EXPECT_NE(cuda_query.find("cudaSetDevice(device_ordinal_)"), std::string::npos);
+    EXPECT_NE(cuda_query.find("cudaStreamQuery"), std::string::npos);
+    EXPECT_NE(cuda_query.find("cudaErrorNotReady"), std::string::npos);
+    EXPECT_NE(cuda_query.find("throw std::runtime_error"), std::string::npos);
+    EXPECT_NE(cuda_query.find("boundary="), std::string::npos);
+
+    EXPECT_NE(rocm_query.find("hipSetDevice(device_ordinal_)"), std::string::npos);
+    EXPECT_NE(rocm_query.find("hipStreamQuery"), std::string::npos);
+    EXPECT_NE(rocm_query.find("hipErrorNotReady"), std::string::npos);
+    EXPECT_NE(rocm_query.find("throw std::runtime_error"), std::string::npos);
+    EXPECT_NE(rocm_query.find("boundary="), std::string::npos);
 }
 
 TEST_F(Test__LocalTPContext, RawAllgatherUsesParticipantProducerStreams)

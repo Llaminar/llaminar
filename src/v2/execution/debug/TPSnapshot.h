@@ -41,6 +41,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <span>
+#include <utility>
 
 namespace llaminar2
 {
@@ -366,6 +368,146 @@ namespace llaminar2
             SnapshotColumnGroupMode::PARTITIONED; ///< Group ownership rule.
         std::vector<size_t> participant_cols; ///< Local width indexed by TP participant.
     };
+
+    /**
+     * @brief Semantic row layouts produced by dependency-closed GDN sharding.
+     *
+     * Every layout stores value heads repeat-major. Fused rows prepend one
+     * local Q group and one local K group; value-only checkpoints contain only
+     * the repeated value groups, with either a state vector or scalar per head.
+     */
+    enum class ModuloLinkedGDNSnapshotLayout
+    {
+        FusedQKV,
+        ValueVector,
+        ValueScalar,
+    };
+
+    /**
+     * @brief Build exact semantic groups for modulo-linked GDN TP snapshots.
+     *
+     * A participant owns a contiguous key-head interval and the corresponding
+     * interval from every value-head repeat. Concatenating each participant's
+     * complete value suffix would interleave repeats incorrectly. This helper
+     * instead describes one partitioned group per repeat, allowing
+     * `TPSnapshot::computeCombined()` to reconstruct global model order before
+     * any comparison-time GGUF-to-Hugging-Face permutation is applied.
+     *
+     * @param participant_row_cols Captured local row width by TP index.
+     * @param global_key_heads Global GDN query/key head count.
+     * @param global_value_heads Global GDN value head count.
+     * @param state_width Elements in one non-scalar GDN head.
+     * @param layout Semantic checkpoint layout.
+     * @param error Optional failure diagnostic; cleared on success.
+     * @return Ordered semantic groups, or an empty vector when the captured
+     *         widths cannot represent the declared dependency-closed layout.
+     */
+    inline std::vector<SnapshotColumnGroup>
+    resolveModuloLinkedGDNSnapshotColumnGroups(
+        std::span<const size_t> participant_row_cols,
+        int global_key_heads,
+        int global_value_heads,
+        int state_width,
+        ModuloLinkedGDNSnapshotLayout layout,
+        std::string *error = nullptr)
+    {
+        const auto fail = [error](const std::string &message)
+        {
+            if (error)
+                *error = message;
+            return std::vector<SnapshotColumnGroup>{};
+        };
+
+        if (participant_row_cols.empty() || global_key_heads <= 0 ||
+            global_value_heads <= 0 || state_width <= 0 ||
+            global_value_heads % global_key_heads != 0)
+        {
+            return fail("invalid global GDN snapshot geometry");
+        }
+
+        const size_t repeat_factor = static_cast<size_t>(
+            global_value_heads / global_key_heads);
+        const size_t elements_per_head =
+            layout == ModuloLinkedGDNSnapshotLayout::ValueScalar
+                ? 1u
+                : static_cast<size_t>(state_width);
+        const size_t prefix_group_count =
+            layout == ModuloLinkedGDNSnapshotLayout::FusedQKV ? 2u : 0u;
+        const size_t local_group_count = prefix_group_count + repeat_factor;
+        if (elements_per_head >
+            std::numeric_limits<size_t>::max() / local_group_count)
+        {
+            return fail("GDN local group geometry overflows size_t");
+        }
+        const size_t local_head_stride =
+            elements_per_head * local_group_count;
+
+        std::vector<size_t> participant_group_cols(
+            participant_row_cols.size(), 0u);
+        size_t assigned_key_heads = 0u;
+        for (size_t participant = 0;
+             participant < participant_row_cols.size();
+             ++participant)
+        {
+            const size_t local_width = participant_row_cols[participant];
+            if (local_width == 0 || local_width % local_head_stride != 0)
+            {
+                return fail(
+                    "captured GDN row does not contain an integral linked-head assignment");
+            }
+            const size_t local_key_heads = local_width / local_head_stride;
+            if (local_key_heads == 0 ||
+                local_key_heads > std::numeric_limits<size_t>::max() /
+                                      elements_per_head)
+            {
+                return fail("captured GDN participant owns an invalid key-head count");
+            }
+            participant_group_cols[participant] =
+                local_key_heads * elements_per_head;
+            if (local_key_heads > std::numeric_limits<size_t>::max() -
+                                      assigned_key_heads)
+            {
+                return fail("captured GDN key-head accounting overflows size_t");
+            }
+            assigned_key_heads += local_key_heads;
+        }
+        if (assigned_key_heads != static_cast<size_t>(global_key_heads))
+        {
+            return fail("captured GDN participants do not cover every global key head");
+        }
+
+        if (static_cast<size_t>(global_key_heads) >
+            std::numeric_limits<size_t>::max() / elements_per_head)
+        {
+            return fail("global GDN group width overflows size_t");
+        }
+        const size_t global_group_cols =
+            static_cast<size_t>(global_key_heads) * elements_per_head;
+
+        std::vector<SnapshotColumnGroup> groups;
+        groups.reserve(local_group_count);
+        const auto append_group = [&](std::string name)
+        {
+            groups.push_back(SnapshotColumnGroup{
+                .name = std::move(name),
+                .global_cols = global_group_cols,
+                .mode = SnapshotColumnGroupMode::PARTITIONED,
+                .participant_cols = participant_group_cols,
+            });
+        };
+
+        if (layout == ModuloLinkedGDNSnapshotLayout::FusedQKV)
+        {
+            append_group("Q");
+            append_group("K");
+        }
+        for (size_t repeat = 0; repeat < repeat_factor; ++repeat)
+            append_group("V_REPEAT_" + std::to_string(repeat));
+
+        if (error)
+            error->clear();
+        return groups;
+    }
 
     // =========================================================================
     // Complete TP-Aware Snapshot

@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 #include "memory/NUMAAllocator.h"
+#include "tensors/AlignedVector.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -230,6 +231,68 @@ TEST(Test__NUMAAllocator, PrepareExternalReceiveRangeUsesCertifiedFirstTouch)
                 target_node)
                 << "round " << round << " page offset " << offset
                 << " ignored certified first touch";
+        }
+    }
+}
+
+TEST(Test__NUMAAllocator, DedicatedMappingsSurviveAlternatingNodeChurn)
+{
+    NUMAAllocator &allocator = NUMAAllocator::instance();
+    if (!allocator.isNUMAAvailable())
+        GTEST_SKIP() << "NUMA policy APIs are unavailable";
+
+    constexpr size_t page_size =
+        NUMAAllocator::externalRangeAlignment();
+    constexpr size_t pages_per_round = 384;
+    const int rounds = allocator.numNUMANodes() > 1 ? 32 : 4;
+    for (int round = 0; round < rounds; ++round)
+    {
+        const int target_node = round % allocator.numNUMANodes();
+        auto storage =
+            AlignedVector<std::uint8_t>::pageMappedUninitialized(
+                pages_per_round * page_size - 17u);
+        ASSERT_TRUE(allocator.prepareExternalReceiveRangeOnNode(
+            storage.data(), storage.size(), target_node));
+
+        for (size_t offset = 0;
+             offset < storage.allocationBytes();
+             offset += page_size)
+        {
+            ASSERT_EQ(
+                allocator.getNUMANodeForAddress(storage.data() + offset),
+                target_node)
+                << "round " << round << " page offset " << offset;
+        }
+    }
+}
+
+TEST(Test__NUMAAllocator, HugePageAdvisedMappingsRetainExactFirstTouchNode)
+{
+    NUMAAllocator &allocator = NUMAAllocator::instance();
+    if (!allocator.isNUMAAvailable())
+        GTEST_SKIP() << "NUMA policy APIs are unavailable";
+
+    constexpr size_t page_size =
+        NUMAAllocator::externalRangeAlignment();
+    constexpr size_t mapping_bytes = 4u * 1024u * 1024u;
+    const int rounds = allocator.numNUMANodes() > 1 ? 16 : 4;
+    for (int round = 0; round < rounds; ++round)
+    {
+        const int target_node = round % allocator.numNUMANodes();
+        auto storage =
+            AlignedVector<std::uint8_t>::pageMappedUninitialized(
+                mapping_bytes);
+        ASSERT_TRUE(allocator.prepareExternalReceiveRangeOnNode(
+            storage.data(), storage.size(), target_node));
+
+        for (size_t offset = 0; offset < storage.allocationBytes();
+             offset += page_size)
+        {
+            ASSERT_EQ(
+                allocator.getNUMANodeForAddress(storage.data() + offset),
+                target_node)
+                << "round " << round << " page offset " << offset
+                << " escaped the exact first-touch node";
         }
     }
 }

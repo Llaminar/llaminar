@@ -6,9 +6,12 @@
 #include <gtest/gtest.h>
 
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
+#include <string>
 
 using namespace llaminar2;
 
@@ -28,6 +31,26 @@ namespace
     PrefixCacheKey keyFor(int block)
     {
         return makePrefixCacheKey(0xfeed, 0, block, block * 2, {block, block + 1});
+    }
+
+    /** @brief Admit one readable CPU prefix-tier capacity for focused tests. */
+    std::shared_ptr<PhysicalMemoryAuthority> makePrefixAuthority(
+        size_t prefix_bytes)
+    {
+        PhysicalMemoryPlanBuilder builder;
+        builder.add(
+            PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = DeviceId::cpu(),
+                .total_bytes = 4096u,
+                .admission_available_bytes = 4096u,
+            },
+            PhysicalMemoryOwner::PrefixHostTier,
+            prefix_bytes);
+        auto admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(builder.build());
+        return std::make_shared<PhysicalMemoryAuthority>(
+            std::move(admission), 0);
     }
 } // namespace
 
@@ -83,6 +106,101 @@ TEST(Test__RamPrefixStorageBackend, RejectsBlocksThatDoNotFit)
     auto handle = backend.allocate(keyFor(0), makeLayout());
     EXPECT_FALSE(handle.valid());
     EXPECT_EQ(backend.usedBytes(), 0u);
+}
+
+TEST(Test__RamPrefixStorageBackend,
+     ProductionCapacityAndPayloadClaimsFollowPhysicalLifetime)
+{
+    auto authority = makePrefixAuthority(96u);
+    std::string error;
+    auto backend = RamPrefixStorageBackend::create(
+        DeviceId::cpu(), 96u, authority, &error);
+    ASSERT_NE(backend, nullptr) << error;
+    EXPECT_TRUE(backend->accounted());
+    EXPECT_EQ(
+        authority->reservedBytes(
+            DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier),
+        96u);
+
+    auto handle = backend->allocate(keyFor(0), makeLayout());
+    ASSERT_TRUE(handle.valid());
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::PrefixHostTier,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        32u);
+
+    // Cache retirement only removes the key. A request-held copy must retain
+    // both its backing vectors and the exact ledger claim.
+    PrefixBlockHandle retained = handle;
+    ASSERT_TRUE(backend->release(handle));
+    handle = {};
+    backend.reset();
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::PrefixHostTier,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        32u);
+    EXPECT_EQ(
+        authority->reservedBytes(
+            DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier),
+        96u);
+
+    retained = {};
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::PrefixHostTier,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
+    EXPECT_EQ(
+        authority->reservedBytes(
+            DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier),
+        0u);
+}
+
+TEST(Test__RamPrefixStorageBackend,
+     ModelRuntimeStateUsesTheSameBoundedHostTier)
+{
+    auto authority = makePrefixAuthority(64u);
+    auto backend = RamPrefixStorageBackend::create(
+        DeviceId::cpu(), 64u, authority);
+    ASSERT_NE(backend, nullptr);
+    auto handle = backend->allocate(keyFor(0), makeLayout());
+    ASSERT_TRUE(handle.valid());
+
+    auto runtime_state =
+        std::make_shared<std::vector<uint8_t>>(16u, uint8_t{0x5a});
+    ASSERT_TRUE(backend->attachModelRuntimeState(
+        &handle, std::move(runtime_state)));
+    EXPECT_EQ(handle.total_bytes, 48u);
+    EXPECT_EQ(backend->usedBytes(), 48u);
+    EXPECT_TRUE(handle.has_model_runtime_state);
+    ASSERT_NE(handle.model_runtime_state_storage, nullptr);
+    EXPECT_EQ(handle.model_runtime_state_storage->front(), 0x5a);
+    EXPECT_EQ(
+        authority->claimedBytes(
+            DeviceId::cpu(),
+            PhysicalMemoryOwner::PrefixHostTier,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        48u);
+}
+
+TEST(Test__RamPrefixStorageBackend,
+     IndependentPoolsCannotSpendTheSameAdmittedCapacity)
+{
+    auto authority = makePrefixAuthority(128u);
+    auto first = RamPrefixStorageBackend::create(
+        DeviceId::cpu(), 96u, authority);
+    ASSERT_NE(first, nullptr);
+
+    std::string error;
+    auto conflicting = RamPrefixStorageBackend::create(
+        DeviceId::cpu(), 64u, authority, &error);
+    EXPECT_EQ(conflicting, nullptr);
+    EXPECT_NE(error.find("exceeds admitted"), std::string::npos);
 }
 
 /**

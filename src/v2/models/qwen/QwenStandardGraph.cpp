@@ -213,10 +213,13 @@ namespace llaminar2
             device, has_qkv_proj, attention_policy, rope_node,
             cache_source_dependencies);
 
-        // Stage 5: Wo projection + optional TP allreduce
-        std::string terminal = addWoProjectionAndAllreduce(
+        // Stage 5: publish the local Wo partial, then reconstruct TP output.
+        const std::string wo_projection = addWoProjection(
             graph, prefix, buffers, layer.wo, layer_bindings.wo,
-            total_tokens, layer_idx, device, attn_node);
+            total_tokens, device, attn_node);
+        const std::string terminal = addWoAllreduce(
+            graph, prefix, buffers, layer.wo,
+            total_tokens, layer_idx, device, wo_projection);
 
         graph.setTerminalNode(terminal);
         return graph;

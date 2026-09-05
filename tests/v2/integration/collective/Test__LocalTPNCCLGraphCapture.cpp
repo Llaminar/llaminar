@@ -35,6 +35,7 @@
 #include "collective/ICollectiveBackend.h"
 #include "collective/LocalTPContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "kernels/common/TPRankOrderedReductionKernels.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
 #include "tensors/TensorClasses.h"
 #include "../../utils/TestTensorFactory.h"
@@ -2211,6 +2212,242 @@ TEST(Test__LocalTPNCCLGraphCapture, NCCLRawAllgather_GraphCapturedLargeBackToBac
     freeDevicePtr(1, recv_k1);
     freeDevicePtr(0, recv_v0);
     freeDevicePtr(1, recv_v1);
+}
+
+/**
+ * @test A captured NCCL byte gather followed by the device-owned rank fold is
+ *       invariant to verifier row count.
+ *
+ * Production MTP compares grouped row zero with an independently captured M=1
+ * decode. Native collective reduction trees may change with message size, so
+ * the canonical protocol transports immutable rank banks and performs its only
+ * arithmetic in ascending rank order. This test binds that complete protocol
+ * into retained CUDA graphs for M=1, M=2, and M=3 and requires byte-identical
+ * row-zero results.
+ */
+TEST(Test__LocalTPNCCLGraphCapture,
+     NCCLCanonicalRankOrderReduction_GraphCapturedRowZeroIsBatchInvariant)
+{
+    auto *cuda_backend = getCUDABackend();
+    ASSERT_NE(cuda_backend, nullptr);
+    if (cuda_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found "
+                     << cuda_backend->deviceCount();
+    }
+
+    constexpr int kParticipants = 2;
+    constexpr size_t kColumns = 3072;
+    auto ctx = createLocalTPContext(
+        {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+        {},
+        CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+
+    const auto run_shape = [&](int rows, std::vector<float> *row_zero)
+    {
+        ASSERT_GT(rows, 0);
+        ASSERT_NE(row_zero, nullptr);
+        const size_t element_count = static_cast<size_t>(rows) * kColumns;
+        std::array<float *, kParticipants> values{};
+        std::array<float *, kParticipants> rank_banks{};
+        std::array<cudaStream_t, kParticipants> streams{};
+        std::array<CaptureResult, kParticipants> results{};
+
+        std::array<std::vector<float>, kParticipants> host_values;
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            auto &host = host_values[static_cast<size_t>(participant)];
+            host.resize(element_count);
+            for (int row = 0; row < rows; ++row)
+            {
+                for (size_t column = 0; column < kColumns; ++column)
+                {
+                    const float row_term = static_cast<float>(row) * 0.25F;
+                    const float column_term =
+                        static_cast<float>(column % 17u) * 0.03125F;
+                    host[static_cast<size_t>(row) * kColumns + column] =
+                        participant == 0
+                            ? 1.0F + row_term + column_term
+                            : 2.0F - row_term - column_term * 0.5F;
+                }
+            }
+            allocateAndUpload<float>(participant, host, &values[participant]);
+            allocateAndUpload<float>(
+                participant,
+                std::vector<float>(
+                    element_count * static_cast<size_t>(kParticipants),
+                    -1.0F),
+                &rank_banks[participant]);
+            ASSERT_EQ(cudaSetDevice(participant), cudaSuccess);
+            ASSERT_EQ(
+                cudaStreamCreateWithFlags(
+                    &streams[participant], cudaStreamNonBlocking),
+                cudaSuccess);
+        }
+
+        Barrier ready_to_capture(kParticipants);
+        Barrier captured_protocol(kParticipants);
+        std::array<std::thread, kParticipants> capture_threads;
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            capture_threads[participant] = std::thread(
+                [&, participant]
+                {
+                    auto &result = results[participant];
+                    result.begin_status = cudaSetDevice(participant);
+                    if (result.begin_status == cudaSuccess)
+                    {
+                        result.begin_status = cudaStreamBeginCapture(
+                            streams[participant],
+                            cudaStreamCaptureModeRelaxed);
+                    }
+                    ready_to_capture.arriveAndWait();
+
+                    if (result.begin_status == cudaSuccess)
+                    {
+                        GraphCaptureGuard guard;
+                        const bool gathered = ctx->allgatherRawOnStream(
+                            values[participant],
+                            rank_banks[participant],
+                            element_count,
+                            CollectiveDataType::FLOAT32,
+                            participant,
+                            streams[participant],
+                            "nccl_canonical_rank_order_m" +
+                                std::to_string(rows));
+                        const bool folded = gathered &&
+                            launchCUDATPRankOrderedSumFP32(
+                                rank_banks[participant],
+                                values[participant],
+                                element_count,
+                                kParticipants,
+                                participant,
+                                streams[participant]);
+                        result.collective_ok = gathered && folded;
+                    }
+                    captured_protocol.arriveAndWait();
+
+                    if (result.begin_status == cudaSuccess &&
+                        result.collective_ok)
+                    {
+                        result.end_status = cudaSetDevice(participant);
+                        if (result.end_status == cudaSuccess)
+                        {
+                            result.end_status = cudaStreamEndCapture(
+                                streams[participant], &result.graph);
+                        }
+                    }
+                    if (result.end_status == cudaSuccess && result.graph)
+                    {
+                        result.instantiate_status = cudaGraphInstantiate(
+                            &result.exec,
+                            result.graph,
+                            nullptr,
+                            nullptr,
+                            0);
+                    }
+                });
+        }
+        for (auto &thread : capture_threads)
+            thread.join();
+
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            const auto &result = results[participant];
+            ASSERT_EQ(result.begin_status, cudaSuccess)
+                << "participant=" << participant << " M=" << rows;
+            ASSERT_TRUE(result.collective_ok)
+                << "participant=" << participant << " M=" << rows;
+            ASSERT_EQ(result.end_status, cudaSuccess)
+                << "participant=" << participant << " M=" << rows;
+            ASSERT_EQ(result.instantiate_status, cudaSuccess)
+                << "participant=" << participant << " M=" << rows;
+            ASSERT_NE(result.exec, nullptr);
+        }
+
+        Barrier ready_to_replay(kParticipants);
+        std::array<cudaError_t, kParticipants> replay_status{};
+        std::array<std::thread, kParticipants> replay_threads;
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            replay_threads[participant] = std::thread(
+                [&, participant]
+                {
+                    replay_status[participant] = cudaSetDevice(participant);
+                    ready_to_replay.arriveAndWait();
+                    if (replay_status[participant] == cudaSuccess)
+                    {
+                        replay_status[participant] = cudaGraphLaunch(
+                            results[participant].exec,
+                            streams[participant]);
+                    }
+                    if (replay_status[participant] == cudaSuccess)
+                    {
+                        replay_status[participant] = cudaStreamSynchronize(
+                            streams[participant]);
+                    }
+                });
+        }
+        for (auto &thread : replay_threads)
+            thread.join();
+
+        std::array<std::vector<float>, kParticipants> actual;
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            ASSERT_EQ(replay_status[participant], cudaSuccess)
+                << "participant=" << participant << " M=" << rows;
+            actual[participant].resize(element_count);
+            downloadDeviceVector<float>(
+                participant, values[participant], &actual[participant]);
+        }
+        for (int participant = 1; participant < kParticipants; ++participant)
+        {
+            EXPECT_EQ(
+                std::memcmp(
+                    actual[0].data(),
+                    actual[participant].data(),
+                    element_count * sizeof(float)),
+                0)
+                << "Canonical TP publication differs by participant, M="
+                << rows;
+        }
+
+        row_zero->assign(actual[0].begin(), actual[0].begin() + kColumns);
+        for (int participant = 0; participant < kParticipants; ++participant)
+        {
+            destroyCaptureResult(results[participant]);
+            ASSERT_EQ(cudaSetDevice(participant), cudaSuccess);
+            EXPECT_EQ(cudaStreamDestroy(streams[participant]), cudaSuccess);
+            freeDevicePtr(participant, values[participant]);
+            freeDevicePtr(participant, rank_banks[participant]);
+        }
+    };
+
+    std::vector<float> serial_row;
+    std::vector<float> grouped_m2_row_zero;
+    std::vector<float> grouped_m3_row_zero;
+    ASSERT_NO_FATAL_FAILURE(run_shape(1, &serial_row));
+    ASSERT_NO_FATAL_FAILURE(run_shape(2, &grouped_m2_row_zero));
+    ASSERT_NO_FATAL_FAILURE(run_shape(3, &grouped_m3_row_zero));
+    ASSERT_EQ(serial_row.size(), kColumns);
+    ASSERT_EQ(grouped_m2_row_zero.size(), kColumns);
+    ASSERT_EQ(grouped_m3_row_zero.size(), kColumns);
+    EXPECT_EQ(
+        std::memcmp(
+            serial_row.data(),
+            grouped_m2_row_zero.data(),
+            kColumns * sizeof(float)),
+        0)
+        << "M=2 verifier row zero must be byte-identical to M=1 decode";
+    EXPECT_EQ(
+        std::memcmp(
+            serial_row.data(),
+            grouped_m3_row_zero.data(),
+            kColumns * sizeof(float)),
+        0)
+        << "M=3 verifier row zero must be byte-identical to M=1 decode";
 }
 
 #endif // HAVE_CUDA

@@ -847,6 +847,7 @@ namespace llaminar2
         plan.evidence.layer_scan_start = input.layer_start_cursor;
         plan.evidence.layer_scan_next =
             (input.layer_start_cursor + 1u) % input.num_layers;
+        moe_rebalance_policy::DynamicPlacementAxisProgress axis_progress;
 
         for (std::uint32_t layer_offset = 0u;
              layer_offset < input.num_layers;
@@ -951,9 +952,15 @@ namespace llaminar2
                        input.maximum_cycles_per_wave &&
                    layer_cycles < input.dynamic_maximum_cycles_per_layer)
             {
+                const auto preferred_objective =
+                    axis_progress.nextObjective(
+                        input.maximum_cycles_per_wave,
+                        plan.evidence.accepted_cycles);
                 std::vector<bool> enumerated = excluded;
                 std::vector<std::uint32_t> best_cycle;
                 CycleEconomyScore best_economy;
+                std::vector<std::uint32_t> fallback_cycle;
+                CycleEconomyScore fallback_economy;
                 while (true)
                 {
                     const auto cycle = findCycle(
@@ -1013,14 +1020,48 @@ namespace llaminar2
                             excluded[expert] = true;
                         continue;
                     }
-                    if (best_cycle.empty() ||
-                        economyScoreBetter(economy, best_economy))
+                    if (fallback_cycle.empty() ||
+                        economyScoreBetter(economy, fallback_economy))
+                    {
+                        fallback_cycle = cycle;
+                        fallback_economy = economy;
+                    }
+                    const bool advances_participant =
+                        candidate_score.same_priority_makespan <
+                        working_score.same_priority_makespan;
+                    if (moe_rebalance_policy::
+                            DynamicPlacementAxisProgress::matches(
+                                preferred_objective,
+                                improves_priority,
+                                advances_participant) &&
+                        (best_cycle.empty() ||
+                         economyScoreBetter(economy, best_economy)))
                     {
                         best_cycle = cycle;
                         best_economy = economy;
                     }
                 }
 
+                /* Reservation is wave-wide: inspect the remaining layers
+                 * before allowing this layer's ordinary economy fallback to
+                 * consume the independent-axis slot. */
+                if (moe_rebalance_policy::DynamicPlacementAxisProgress::
+                        searchesLaterLayerBeforeFallback(
+                            preferred_objective,
+                            !best_cycle.empty(),
+                            layer_offset,
+                            input.num_layers))
+                {
+                    break;
+                }
+
+                /* After the complete layer scan, a missing preferred axis
+                 * never suppresses an otherwise economical wave. */
+                if (best_cycle.empty())
+                {
+                    best_cycle = std::move(fallback_cycle);
+                    best_economy = fallback_economy;
+                }
                 if (best_cycle.empty())
                     break;
                 auto candidate = current;
@@ -1034,6 +1075,8 @@ namespace llaminar2
                 const bool advances_participant =
                     candidate_score.same_priority_makespan <
                     working_score.same_priority_makespan;
+                axis_progress.observe(
+                    advances_priority, advances_participant);
                 const auto movement_axis =
                     advances_priority && advances_participant
                         ? MoEOverlayDeviceMovementAxis::Combined

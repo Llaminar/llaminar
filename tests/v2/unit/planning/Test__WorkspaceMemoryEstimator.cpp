@@ -14,7 +14,14 @@
 #include "config/GDNHeadAssignment.h"
 #include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include "kernels/attention/AttentionWorkspaceContract.h"
+#include "kernels/common/EmbeddingWorkspaceContract.h"
+#include "kernels/kvcache/KVCacheWorkspaceContract.h"
+#include "kernels/rocm/gemm/ROCmQuantisedGemmWorkspaceContract.h"
+#include "kernels/rope/RoPEWorkspaceContract.h"
+#include "tensors/TensorType.h"
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 
 using namespace llaminar2;
@@ -143,10 +150,68 @@ TEST(Test__WorkspaceMemoryEstimator, GPU_ReturnsNonZero)
 
 TEST(Test__WorkspaceMemoryEstimator, CPU_ReturnsZero)
 {
+    // The legacy dimension-only overload cannot express local attention heads
+    // or the configured physical-core worker team. Production CPU planning
+    // uses the model-aware overload exercised below.
     size_t bytes = WorkspaceMemoryEstimator::estimate(
         1, 4096, 896, 4864, 151936, DeviceId::cpu());
 
     EXPECT_EQ(bytes, 0u);
+}
+
+/**
+ * @brief Reproduce the exact mixed LocalPP CPU workspace admission failure.
+ *
+ * The CPU stage retains sixteen verifier rows. With fourteen query heads and
+ * the production 28-physical-core OpenMP team, each head owns two producer
+ * slots plus one deterministic merge slot. Runtime and metadata preflight must
+ * therefore publish the same 177,408-byte stable-name family.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     Qwen2CPUStageUsesCanonicalParallelAttentionContract)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen2";
+    profile.n_layers = 24;
+    profile.d_model = 896;
+    profile.d_ff = 4864;
+    profile.n_heads = 14;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 64;
+    profile.vocab_size = 151936;
+    profile.max_seq_len = 4096;
+
+    const WorkspaceMemoryGeometry geometry{
+        .device = DeviceId::cpu(),
+        .device_compute_units = 28,
+        .batch_size = 1,
+        .resident_graph_rows = 9,
+        .max_context_rows = 4096,
+        .local_d_ff = 4864,
+        .local_query_heads = 14,
+        .local_kv_heads = 2,
+        .first_layer = 12,
+        .last_layer = 23,
+        .total_shards = 1,
+    };
+    const auto cardinality = attention::planAttentionWorkspaceCardinality(
+        geometry.resident_graph_rows,
+        geometry.batch_size);
+    const auto runtime_contract =
+        attention_workspace::cpuParallelRequirements({
+            .compact_query_rows = cardinality.compact_query_rows,
+            .local_query_heads = geometry.local_query_heads,
+            .head_dim = profile.head_dim,
+            .worker_count = geometry.device_compute_units,
+        });
+
+    ASSERT_NE(runtime_contract.find(attention_workspace::kPartialOutput), nullptr);
+    ASSERT_NE(runtime_contract.find(attention_workspace::kPartialM), nullptr);
+    ASSERT_NE(runtime_contract.find(attention_workspace::kPartialL), nullptr);
+    EXPECT_EQ(runtime_contract.total_bytes_with_alignment(), 177408u);
+    EXPECT_EQ(
+        WorkspaceMemoryEstimator::estimate(profile, geometry),
+        runtime_contract.total_bytes_with_alignment());
 }
 
 TEST(Test__WorkspaceMemoryEstimator, GPU_HasMinimumFloor)
@@ -218,6 +283,300 @@ TEST(Test__WorkspaceMemoryEstimator, ROCm_AddsExactMoERequirementFactoryBytes)
     EXPECT_EQ(moe_bytes - dense_bytes, exact_moe_bytes);
 }
 
+/**
+ * @brief Stable fused-scatter names are one physical buffer, not one per layer.
+ *
+ * Every quantized GDN block declares the same captured workspace ABI. Adding a
+ * second block with identical geometry must therefore leave admission bytes
+ * unchanged. This reproduces the metadata-only overcharge that previously
+ * summed one `rocm_scatter_partial_batched` descriptor per model layer while
+ * runtime correctly canonicalized the name.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     ROCmFusedProjectionWorkspaceCanonicalizesAcrossLayers)
+{
+    auto profile = qwen35MoEProfile(false);
+    profile.expert_count = 0;
+    profile.expert_used_count = 0;
+    profile.expert_feed_forward_length = 0;
+    profile.expert_shared_feed_forward_length = 0;
+
+    const auto add_fused_gdn_bundle = [&](int layer)
+    {
+        const auto add_matrix = [&](std::string suffix,
+                                    std::size_t output_columns)
+        {
+            TensorSizeInfo tensor;
+            tensor.name = "blk." + std::to_string(layer) + suffix;
+            tensor.quant_type = "Q8_K";
+            tensor.elements = output_columns * size_t{2048};
+            tensor.K = 2048;
+            tensor.layer_index = layer;
+            profile.tensors.push_back(std::move(tensor));
+        };
+        add_matrix(".attn_qkv.weight", 8192);
+        add_matrix(".attn_gate.weight", 4096);
+        add_matrix(".ssm_alpha.weight", 32);
+        add_matrix(".ssm_beta.weight", 32);
+    };
+
+    add_fused_gdn_bundle(0);
+    const size_t one_layer = WorkspaceMemoryEstimator::estimate(
+        profile, graphGeometry(DeviceId::rocm(0)));
+
+    add_fused_gdn_bundle(1);
+    const size_t two_layers = WorkspaceMemoryEstimator::estimate(
+        profile, graphGeometry(DeviceId::rocm(0)));
+
+    EXPECT_EQ(two_layers, one_layer)
+        << "A shared captured workspace name retains its maximum extent across "
+           "serial layers; layer count cannot multiply physical bytes.";
+}
+
+/** @brief K/V conversion admission and runtime share one typed size policy. */
+TEST(Test__WorkspaceMemoryEstimator,
+     KVConversionContractRetainsConfiguredHorizonAndStablePair)
+{
+    const auto requirements =
+        kv_cache_workspace::conversionRequirements({
+            .configured_batch_size = 2,
+            .configured_context_rows = 4096,
+            .requested_graph_rows = 256,
+            .requested_batch_size = 1,
+            .conversion_row_bytes = 512,
+            .native_row_bytes = 1024,
+        });
+
+    constexpr size_t kPerBufferBytes =
+        size_t{2} * size_t{4096} * size_t{1024};
+    ASSERT_EQ(requirements.buffers.size(), 2u);
+    EXPECT_EQ(requirements.buffers[0].name,
+              KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+    EXPECT_EQ(requirements.buffers[1].name,
+              KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+    EXPECT_EQ(requirements.buffers[0].size_bytes, kPerBufferBytes);
+    EXPECT_EQ(requirements.buffers[1].size_bytes, kPerBufferBytes);
+    EXPECT_EQ(requirements.total_bytes_with_alignment(),
+              2u * kPerBufferBytes);
+}
+
+/**
+ * @brief Embedding ownership prices the exact retained token-ID descriptor.
+ *
+ * A nine-row LocalTP graph declares 36 bytes, aligned as one 256-byte serial
+ * family member. Omitting that member previously left the production ROCm
+ * interval plan four bytes beyond its admitted total after neighboring
+ * descriptors reused the other 252 bytes of alignment padding.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     EmbeddingOwnerAddsCanonicalGraphStableTokenIdsABI)
+{
+    auto profile = qwen35MoEProfile(false);
+    auto without_embedding = graphGeometry(DeviceId::rocm(0));
+    without_embedding.resident_graph_rows = 9;
+    without_embedding.owns_embedding = false;
+    auto with_embedding = without_embedding;
+    with_embedding.owns_embedding = true;
+
+    const auto requirements = embedding_workspace::requirements({
+        .graph_rows = 9,
+    });
+    ASSERT_EQ(requirements.buffers.size(), 1u);
+    EXPECT_EQ(requirements.buffers.front().name,
+              EmbeddingWorkspaceBuffers::TOKEN_IDS);
+    EXPECT_EQ(requirements.buffers.front().size_bytes, 36u);
+    EXPECT_EQ(requirements.total_bytes_with_alignment(), 256u);
+    EXPECT_EQ(
+        WorkspaceMemoryEstimator::estimate(profile, with_embedding) -
+            WorkspaceMemoryEstimator::estimate(profile, without_embedding),
+        requirements.total_bytes_with_alignment());
+}
+
+/**
+ * @brief Reproduce the exact Qwen2 PP terminal-stage workspace admission miss.
+ *
+ * The production serial family requires 199,837,188 bytes. Its canonical
+ * descriptor sum rounds to 199,837,440 bytes: quantized GEMM, full attention,
+ * both independent K/V conversion pairs, and RoPE publications. Admission
+ * formerly omitted the attention-owned pair and all RoPE state and reserved
+ * only 195,633,920 bytes.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     Qwen2ROCmPipelineStageCoversCanonicalAttentionAndRoPEABI)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen2";
+    profile.n_layers = 24;
+    profile.d_model = 896;
+    profile.d_ff = 4864;
+    profile.n_heads = 14;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 64;
+    profile.vocab_size = 151936;
+    profile.max_seq_len = 4096;
+
+    const auto add_matrix = [&](std::string name,
+                                int layer,
+                                std::size_t output_columns,
+                                std::size_t input_columns)
+    {
+        TensorSizeInfo tensor;
+        tensor.name = std::move(name);
+        tensor.quant_type = "Q4_0";
+        tensor.elements = output_columns * input_columns;
+        tensor.K = input_columns;
+        tensor.layer_index = layer;
+        profile.tensors.push_back(std::move(tensor));
+    };
+    add_matrix("output.weight", -1, 151936, 896);
+    for (int layer = 12; layer < 24; ++layer)
+    {
+        const std::string prefix = "blk." + std::to_string(layer);
+        add_matrix(prefix + ".attn_q.weight", layer, 896, 896);
+        add_matrix(prefix + ".attn_k.weight", layer, 128, 896);
+        add_matrix(prefix + ".attn_v.weight", layer, 128, 896);
+        add_matrix(prefix + ".attn_output.weight", layer, 896, 896);
+        add_matrix(prefix + ".ffn_gate.weight", layer, 4864, 896);
+        add_matrix(prefix + ".ffn_up.weight", layer, 4864, 896);
+        add_matrix(prefix + ".ffn_down.weight", layer, 896, 4864);
+    }
+
+    const WorkspaceMemoryGeometry geometry{
+        .device = DeviceId::rocm(1),
+        .device_compute_units = 60,
+        .batch_size = 1,
+        .resident_graph_rows = 9,
+        .max_context_rows = 4096,
+        .local_d_ff = 4864,
+        .local_query_heads = 14,
+        .local_kv_heads = 2,
+        .first_layer = 12,
+        .last_layer = 23,
+        .total_shards = 1,
+    };
+
+    constexpr std::size_t kRuntimeSerialFamilyBytes = 199837188ULL;
+    constexpr std::size_t kAlignedCanonicalAdmissionBytes = 199837440ULL;
+    const std::size_t admitted =
+        WorkspaceMemoryEstimator::estimate(profile, geometry);
+    EXPECT_EQ(admitted, kAlignedCanonicalAdmissionBytes);
+    EXPECT_GE(admitted, kRuntimeSerialFamilyBytes);
+    EXPECT_LT(admitted - kRuntimeSerialFamilyBytes, 256u)
+        << "Only terminal descriptor alignment may exceed the runtime interval plan.";
+}
+
+/**
+ * @brief A retained MTP sidecar is sized by verifier depth, not prefill rows.
+ *
+ * The sidecar projection runs only in the compact transaction. Varying the
+ * unrelated main prefill bucket must therefore leave its physical workspace
+ * unchanged. This catches the former 600-row charge for a three-row sidecar.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     ROCmRetainedMTPSidecarIgnoresMainPrefillBucket)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35moe";
+    profile.n_layers = 49;
+    profile.mtp_layer_count = 1;
+    profile.d_model = 3072;
+    profile.d_ff = 1024;
+    profile.n_heads = 32;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 256;
+    profile.vocab_size = 248320;
+    profile.max_seq_len = 4096;
+
+    TensorSizeInfo hybrid_marker;
+    hybrid_marker.name = "blk.0.ssm_out.weight";
+    hybrid_marker.layer_index = 0;
+    profile.tensors.push_back(std::move(hybrid_marker));
+
+    TensorSizeInfo sidecar;
+    sidecar.name = "blk.48.nextn.eh_proj.weight";
+    sidecar.quant_type = "Q8_K";
+    sidecar.elements = size_t{3072} * size_t{6144};
+    sidecar.K = 6144;
+    sidecar.layer_index = 48;
+    profile.tensors.push_back(std::move(sidecar));
+
+    auto compact = graphGeometry(
+        DeviceId::rocm(0), /*local_d_ff=*/256, /*total_shards=*/4);
+    compact.first_layer = 48;
+    compact.last_layer = 48;
+    compact.local_query_heads = 8;
+    compact.local_kv_heads = 2;
+    compact.mtp_target_query_rows = 16;
+    compact.resident_graph_rows = 32;
+
+    auto large_prefill = compact;
+    large_prefill.resident_graph_rows = 4096;
+
+    EXPECT_EQ(
+        WorkspaceMemoryEstimator::estimate(profile, compact),
+        WorkspaceMemoryEstimator::estimate(profile, large_prefill));
+}
+
+/**
+ * @brief Every production quantized codebook prices the same prepared ABI.
+ *
+ * Source codebooks change persistent packed-weight bytes, but ROCm prepares
+ * every supported matrix into the same NativeVNNI execution contract. The
+ * graph workspace therefore depends on N/K/rows and cannot vary by codebook.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     ROCmQuantizedWorkspaceIsCodebookIndependent)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35moe";
+    profile.n_layers = 1;
+    profile.d_model = 3072;
+    profile.d_ff = 1024;
+    profile.n_heads = 32;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 256;
+    profile.vocab_size = 248320;
+    profile.max_seq_len = 4096;
+
+    TensorSizeInfo hybrid_marker;
+    hybrid_marker.name = "blk.0.ssm_out.weight";
+    hybrid_marker.layer_index = 0;
+    profile.tensors.push_back(std::move(hybrid_marker));
+
+    TensorSizeInfo projection;
+    projection.name = "output.weight";
+    projection.elements = size_t{248320} * size_t{3072};
+    projection.K = 3072;
+    projection.layer_index = -1;
+    profile.tensors.push_back(std::move(projection));
+
+    auto geometry = graphGeometry(
+        DeviceId::rocm(0), /*local_d_ff=*/256, /*total_shards=*/4);
+    geometry.resident_graph_rows = 16;
+    geometry.local_query_heads = 8;
+    geometry.local_kv_heads = 2;
+    geometry.mtp_terminal_logits_layout =
+        MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+
+    size_t expected = 0u;
+    size_t exercised_codebooks = 0u;
+    for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
+    {
+        const auto type = static_cast<TensorType>(raw);
+        if (!isNativeVnniFormat(type) && !isInt8VnniFormat(type))
+            continue;
+        profile.tensors.back().quant_type = tensorTypeName(type);
+        const size_t actual =
+            WorkspaceMemoryEstimator::estimate(profile, geometry);
+        if (exercised_codebooks == 0u)
+            expected = actual;
+        EXPECT_EQ(actual, expected) << "codebook=" << tensorTypeName(type);
+        ++exercised_codebooks;
+    }
+    EXPECT_EQ(exercised_codebooks, 21u)
+        << "The canonical NativeVNNI predicates must enumerate every supported quantized codebook.";
+}
+
 TEST(Test__WorkspaceMemoryEstimator, DeclaredMoERejectsIncompleteGeometry)
 {
     auto profile = qwen35MoEProfile(false);
@@ -249,18 +608,50 @@ TEST(Test__WorkspaceMemoryEstimator,
     geometry.max_context_rows = 4096;
     geometry.apportioned_routed_experts = true;
 
-    WorkspaceRequirements expected = MoEWorkspaceBuffers::rocmMoE(
+    const auto add_expert_parent = [&](std::string suffix,
+                                       std::size_t output_columns,
+                                       std::size_t input_columns)
+    {
+        TensorSizeInfo tensor;
+        tensor.name = "blk.0." + std::move(suffix);
+        tensor.quant_type = "Q4_K_XL";
+        tensor.elements = output_columns * input_columns *
+                          static_cast<std::size_t>(profile.expert_count);
+        tensor.K = input_columns;
+        tensor.layer_index = 0;
+        profile.tensors.push_back(std::move(tensor));
+    };
+    add_expert_parent("ffn_gate_exps.weight", 1024, 3072);
+    add_expert_parent("ffn_up_exps.weight", 1024, 3072);
+    add_expert_parent("ffn_down_exps.weight", 3072, 1024);
+
+    WorkspaceRequirements direct = MoEWorkspaceBuffers::rocmMoE(
         /*max_seq_len=*/768,
         /*d_model=*/3072,
         /*intermediate=*/1024,
         /*num_experts=*/256,
         /*top_k=*/8);
-    expected.merge(MoEWorkspaceBuffers::rocmMoE(
+    direct.merge(
+        rocm::quantized_gemm_workspace::projectionRequirements(
+            /*rows=*/768, /*N=*/1024, /*K=*/3072));
+    const std::vector<int> fused_columns(/*count=*/16, /*value=*/1024);
+    rocm::quantized_gemm_workspace::appendFusedProjectionRequirements(
+        direct, /*rows=*/768, fused_columns);
+
+    WorkspaceRequirements compact = MoEWorkspaceBuffers::rocmMoE(
         /*max_seq_len=*/768 * 8,
         /*d_model=*/3072,
         /*intermediate=*/1024,
         /*num_experts=*/256,
-        /*top_k=*/1));
+        /*top_k=*/1);
+    compact.merge(
+        rocm::quantized_gemm_workspace::projectionRequirements(
+            /*rows=*/768 * 8, /*N=*/1024, /*K=*/3072));
+    compact.merge(
+        rocm::quantized_gemm_workspace::projectionRequirements(
+            /*rows=*/768 * 8, /*N=*/3072, /*K=*/1024));
+
+    direct.merge(compact);
 
     const size_t compact_only =
         MoEWorkspaceBuffers::rocmMoE(768 * 8, 3072, 1024, 256, 1)
@@ -268,8 +659,125 @@ TEST(Test__WorkspaceMemoryEstimator,
     const size_t actual =
         WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
             profile, geometry);
-    EXPECT_EQ(actual, expected.total_bytes_with_alignment());
+    EXPECT_EQ(actual, direct.total_bytes_with_alignment());
     EXPECT_GT(actual, compact_only + 90ULL * 1024ULL * 1024ULL);
+}
+
+/**
+ * @brief Every prepared quantized expert codebook shares one ROCm GEMM ABI.
+ *
+ * Source compression changes persistent expert bytes, not the NativeVNNI
+ * activation/reduction workspace. This sweep prevents a fix for the model's
+ * current Q4_K_XL source format from becoming a format-specific admission
+ * branch when future checkpoints select any other supported codebook.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     ROCmRoutedParticipantQuantizedWorkspaceIsCodebookIndependent)
+{
+    auto profile = qwen35MoEProfile(false);
+    auto geometry = graphGeometry(DeviceId::rocm(0));
+    geometry.resident_graph_rows = 9;
+    geometry.apportioned_routed_experts = true;
+
+    const auto add_expert_parent = [&](std::string suffix,
+                                       std::size_t output_columns,
+                                       std::size_t input_columns)
+    {
+        TensorSizeInfo tensor;
+        tensor.name = "blk.0." + std::move(suffix);
+        tensor.elements = output_columns * input_columns *
+                          static_cast<std::size_t>(profile.expert_count);
+        tensor.K = input_columns;
+        tensor.layer_index = 0;
+        profile.tensors.push_back(std::move(tensor));
+    };
+    add_expert_parent("ffn_gate_exps.weight", 512, 2048);
+    add_expert_parent("ffn_up_exps.weight", 512, 2048);
+    add_expert_parent("ffn_down_exps.weight", 2048, 512);
+
+    std::size_t expected = 0u;
+    std::size_t exercised_codebooks = 0u;
+    for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
+    {
+        const TensorType type = static_cast<TensorType>(raw);
+        if (!isNativeVnniFormat(type) && !isInt8VnniFormat(type))
+            continue;
+        for (TensorSizeInfo& tensor : profile.tensors)
+            tensor.quant_type = tensorTypeName(type);
+
+        const std::size_t actual =
+            WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
+                profile, geometry);
+        if (exercised_codebooks == 0u)
+            expected = actual;
+        EXPECT_EQ(actual, expected) << "codebook=" << tensorTypeName(type);
+        ++exercised_codebooks;
+    }
+    EXPECT_EQ(exercised_codebooks, 21u);
+    EXPECT_EQ(expected, 374859776ULL)
+        << "The nine-row Qwen3.6-35B mapped/compact follower family must "
+           "retain the exact typed ROCm MoE and NativeVNNI workspace ABI.";
+    EXPECT_GE(expected, 365474564ULL)
+        << "Admission must cover the mapped 40-layer serial plan observed by "
+           "the production graph allocator.";
+}
+
+/** @brief FP16, BF16, and FP32 routed experts publish the same ROCm pointer ABI. */
+TEST(Test__WorkspaceMemoryEstimator,
+     ROCmRoutedParticipantFloatingFormatsSharePointerWorkspaceABI)
+{
+    auto profile = qwen35MoEProfile(false);
+    auto geometry = graphGeometry(DeviceId::rocm(0));
+    geometry.resident_graph_rows = 9;
+    geometry.apportioned_routed_experts = true;
+
+    const auto add_expert_parent = [&](std::string suffix,
+                                       std::size_t output_columns,
+                                       std::size_t input_columns)
+    {
+        TensorSizeInfo tensor;
+        tensor.name = "blk.0." + std::move(suffix);
+        tensor.elements = output_columns * input_columns *
+                          static_cast<std::size_t>(profile.expert_count);
+        tensor.K = input_columns;
+        tensor.layer_index = 0;
+        profile.tensors.push_back(std::move(tensor));
+    };
+    add_expert_parent("ffn_gate_exps.weight", 512, 2048);
+    add_expert_parent("ffn_up_exps.weight", 512, 2048);
+    add_expert_parent("ffn_down_exps.weight", 2048, 512);
+
+    std::size_t expected = 0u;
+    for (const std::string_view format : {"F16", "BF16", "F32"})
+    {
+        for (TensorSizeInfo& tensor : profile.tensors)
+            tensor.quant_type = format;
+        const std::size_t actual =
+            WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
+                profile, geometry);
+        if (expected == 0u)
+            expected = actual;
+        EXPECT_EQ(actual, expected) << "format=" << format;
+    }
+
+    WorkspaceRequirements base = MoEWorkspaceBuffers::rocmMoE(
+        /*max_seq_len=*/9,
+        /*d_model=*/2048,
+        /*intermediate=*/512,
+        /*num_experts=*/256,
+        /*top_k=*/8);
+    base.merge(MoEWorkspaceBuffers::rocmMoE(
+        /*max_seq_len=*/72,
+        /*d_model=*/2048,
+        /*intermediate=*/512,
+        /*num_experts=*/256,
+        /*top_k=*/1));
+    constexpr std::size_t kPointerArrayCount = 3u;
+    constexpr std::size_t kAlignedPointerArrayBytes = 256u;
+    EXPECT_EQ(
+        expected,
+        base.total_bytes_with_alignment() +
+            kPointerArrayCount * kAlignedPointerArrayBytes);
 }
 
 TEST(Test__WorkspaceMemoryEstimator, Qwen35MoE4K_CoversObservedCUDAFamilyPlan)
@@ -369,6 +877,126 @@ TEST(Test__WorkspaceMemoryEstimator,
         2288657668ULL;
     EXPECT_GE(bytes, kObservedExactDepth15SerialFamilyBytes)
         << "Depth-fifteen admission must price the retained main, grouped-verifier, and MTP namespaces before loading experts.";
+}
+
+/**
+ * @brief Reproduce the retained ROCm TP4 matrix family that defeated preflight.
+ *
+ * The production Q8_K_XL model prepares every quantized codebook into the same
+ * NativeVNNI ABI.  In particular, the mirrored vocabulary head needs a
+ * 16-row split-K arena while the replicated MTP projector owns the widest K.
+ * This inventory is metadata-only and therefore remains a fast device-free
+ * regression for the exact late graph-materialization failure.
+ */
+TEST(Test__WorkspaceMemoryEstimator,
+     Qwen122ROCmTP4Depth15CoversExactQuantizedGemmFamily)
+{
+    auto profile = qwen35MoEProfile(false);
+    profile.architecture = "qwen35moe";
+    profile.d_model = 3072;
+    profile.d_ff = 1024;
+    profile.n_heads = 32;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 256;
+    profile.vocab_size = 248320;
+    profile.expert_feed_forward_length = 1024;
+    profile.mtp_layer_count = 1;
+    installQwen122HybridLayerInventory(profile);
+
+    const auto add_matrix = [&](std::string name,
+                                int layer,
+                                std::size_t n,
+                                std::size_t k)
+    {
+        TensorSizeInfo tensor;
+        tensor.name = std::move(name);
+        tensor.quant_type = "Q8_K";
+        tensor.elements = n * k;
+        tensor.K = k;
+        tensor.layer_index = layer;
+        profile.tensors.push_back(std::move(tensor));
+    };
+    add_matrix("output.weight", -1, 248320, 3072);
+    add_matrix("blk.48.nextn.eh_proj.weight", 48, 3072, 6144);
+    add_matrix("blk.0.attn_qkv.weight", 0, 12288, 3072);
+    add_matrix("blk.0.attn_gate.weight", 0, 8192, 3072);
+    add_matrix("blk.0.ssm_alpha.weight", 0, 64, 3072);
+    add_matrix("blk.0.ssm_beta.weight", 0, 64, 3072);
+    add_matrix("blk.3.attn_q.weight", 3, 16384, 3072);
+    add_matrix("blk.3.attn_k.weight", 3, 512, 3072);
+    add_matrix("blk.3.attn_v.weight", 3, 512, 3072);
+
+    /*
+     * Routed parents retain all 256 experts in one 3-D inventory entry. Their
+     * logical K is one expert matrix's K, while `elements` includes the outer
+     * expert axis. This is the real GGUF geometry that exposed a 10+ GiB
+     * phantom split-K charge when the expert count was mistaken for K.
+     */
+    const auto add_expert_parent = [&](std::string name,
+                                       std::size_t n,
+                                       std::size_t k)
+    {
+        TensorSizeInfo tensor;
+        tensor.name = std::move(name);
+        tensor.quant_type = "Q8_K";
+        tensor.elements = n * k *
+                          static_cast<std::size_t>(profile.expert_count);
+        tensor.K = k;
+        tensor.layer_index = 0;
+        profile.tensors.push_back(std::move(tensor));
+    };
+    add_expert_parent("blk.0.ffn_gate_exps.weight", 1024, 3072);
+    add_expert_parent("blk.0.ffn_up_exps.weight", 1024, 3072);
+    add_expert_parent("blk.0.ffn_down_exps.weight", 3072, 1024);
+
+    auto geometry = graphGeometry(
+        DeviceId::rocm(0), /*local_d_ff=*/256, /*total_shards=*/4);
+    geometry.resident_graph_rows = 600;
+    geometry.max_context_rows = 4096;
+    geometry.shard_index = 0;
+    geometry.has_exact_tensor_parallel_assignment = true;
+    geometry.local_d_ff_start = 0;
+    geometry.local_query_head_start = 0;
+    geometry.local_query_heads = 8;
+    geometry.local_kv_head_start = 0;
+    geometry.local_kv_heads = 2;
+    geometry.local_vocab_start = 0;
+    geometry.local_vocab = 62080;
+    geometry.first_layer = 0;
+    geometry.last_layer = 47;
+    geometry.mtp_target_query_rows = 16;
+    geometry.mtp_terminal_logits_layout =
+        MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+
+    WorkspaceRequirements gemm_contract =
+        rocm::quantized_gemm_workspace::projectionRequirements(
+            /*rows=*/16, /*N=*/248320, /*K=*/3072);
+    gemm_contract.merge(
+        rocm::quantized_gemm_workspace::projectionRequirements(
+            /*rows=*/600, /*N=*/3072, /*K=*/6144));
+    const std::array<int, 4> gdn_fused_columns = {
+        3072, 2048, 16, 16};
+    rocm::quantized_gemm_workspace::appendFusedProjectionRequirements(
+        gemm_contract, /*rows=*/600, gdn_fused_columns);
+
+    EXPECT_EQ(
+        gemm_contract.total_bytes_with_alignment(),
+        1089370368ULL)
+        << "The metadata contract must remain byte-identical to the runtime "
+           "ROCm kernel ABI.";
+
+    const std::size_t bytes =
+        WorkspaceMemoryEstimator::estimate(profile, geometry);
+    constexpr std::size_t kExactRuntimeSerialFamilyBytes = 2546278148ULL;
+    EXPECT_GE(bytes, kExactRuntimeSerialFamilyBytes)
+        << "Preflight must cover the runtime interval plan before expert "
+           "weights consume the remaining VRAM.";
+    EXPECT_LE(
+        bytes,
+        kExactRuntimeSerialFamilyBytes + 33ULL * 1024ULL * 1024ULL)
+        << "The typed contract should not strand meaningful expert capacity "
+           "behind a coarse safety reserve. The final MiB covers the routed "
+           "fused-scatter ABI added by the explicit expert-parent inventory.";
 }
 
 /**

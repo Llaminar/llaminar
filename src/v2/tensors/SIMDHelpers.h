@@ -6237,6 +6237,88 @@ namespace llaminar2
             return fp16_to_fp32(fp32_to_fp16(value));
         }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        /**
+         * @brief Transcode two IQ2 grid halves with the canonical Q16 arithmetic.
+         *
+         * Both the one-block decoder and the whole-superblock preparation path
+         * must publish byte-identical Q8 values.  In particular, the Q16
+         * multiply followed by a logical shift is an intentional truncation
+         * edge; replacing it with floating-point round-to-nearest changes some
+         * weights by one.  Keeping this operation in one helper prevents the
+         * optimized bulk decoder from acquiring a second arithmetic contract.
+         *
+         * @param grid_low First sixteen unsigned grid values.
+         * @param grid_high Second sixteen unsigned grid values.
+         * @param factor_low Published source scale for the first half.
+         * @param factor_high Published source scale for the second half.
+         * @param negative_low Lanes negated in the first half.
+         * @param negative_high Lanes negated in the second half.
+         * @param output Destination for exactly 32 signed Q8 values.
+         * @param output_scale Destination for the canonical FP16 Q8 scale.
+         */
+        inline void transcode_iq2_grid_halves_to_q8_0_avx512(
+            __m128i grid_low,
+            __m128i grid_high,
+            float factor_low,
+            float factor_high,
+            __mmask16 negative_low,
+            __mmask16 negative_high,
+            int8_t *output,
+            uint16_t *output_scale)
+        {
+            const uint8_t max_grid_low = hmax_epu8_128(grid_low);
+            const uint8_t max_grid_high = hmax_epu8_128(grid_high);
+            const float max_abs = std::max(
+                factor_low * static_cast<float>(max_grid_low),
+                factor_high * static_cast<float>(max_grid_high));
+
+            constexpr float kMinimumScale = 1e-6f;
+            if (max_abs < kMinimumScale)
+            {
+                *output_scale = 0;
+                _mm256_storeu_si256(
+                    reinterpret_cast<__m256i *>(output),
+                    _mm256_setzero_si256());
+                return;
+            }
+
+            const float scale = std::min(max_abs / 127.0f, 65504.0f);
+            *output_scale = fp32_to_fp16(scale);
+            const float inverse_scale = 1.0f / scale;
+            const int32_t ratio_low = static_cast<int32_t>(
+                factor_low * inverse_scale * 65536.0f + 0.5f);
+            const int32_t ratio_high = static_cast<int32_t>(
+                factor_high * inverse_scale * 65536.0f + 0.5f);
+
+            __m512i values_low = _mm512_mullo_epi32(
+                _mm512_cvtepu8_epi32(grid_low),
+                _mm512_set1_epi32(ratio_low));
+            __m512i values_high = _mm512_mullo_epi32(
+                _mm512_cvtepu8_epi32(grid_high),
+                _mm512_set1_epi32(ratio_high));
+            values_low = _mm512_srli_epi32(values_low, 16);
+            values_high = _mm512_srli_epi32(values_high, 16);
+            values_low = _mm512_mask_sub_epi32(
+                values_low,
+                negative_low,
+                _mm512_setzero_si512(),
+                values_low);
+            values_high = _mm512_mask_sub_epi32(
+                values_high,
+                negative_high,
+                _mm512_setzero_si512(),
+                values_high);
+
+            _mm_storeu_si128(
+                reinterpret_cast<__m128i *>(output),
+                _mm512_cvtepi32_epi8(values_low));
+            _mm_storeu_si128(
+                reinterpret_cast<__m128i *>(output + 16),
+                _mm512_cvtepi32_epi8(values_high));
+        }
+#endif
+
         // IQ2_XXS → Q8_0 (256-element super-blocks with grid lookup)
         // =====================================================================
 
@@ -6548,126 +6630,50 @@ namespace llaminar2
                 {
                     __m128i vg0 = _mm256_castsi256_si128(vgrid_ib);
                     __m128i vg1 = _mm256_extracti128_si256(vgrid_ib, 1);
-
-                    __m512 vf0 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vg0));
-                    __m512 vf1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vg1));
-
-                    __m512 vdb = _mm512_set1_ps(db_arr[ib]);
-                    vf0 = _mm512_mul_ps(vf0, vdb);
-                    vf1 = _mm512_mul_ps(vf1, vdb);
-
                     uint32_t aux1 = aux1_arr[ib];
                     uint8_t s0 = ksigns_iq2xs[aux1 & 127];
                     uint8_t s1 = ksigns_iq2xs[(aux1 >> 7) & 127];
                     uint8_t s2 = ksigns_iq2xs[(aux1 >> 14) & 127];
                     uint8_t s3 = ksigns_iq2xs[(aux1 >> 21) & 127];
-
-                    __mmask16 k0 = s0 | (s1 << 8);
-                    __mmask16 k1 = s2 | (s3 << 8);
-
-                    vf0 = _mm512_mask_sub_ps(vf0, k0, _mm512_setzero_ps(), vf0);
-                    vf1 = _mm512_mask_sub_ps(vf1, k1, _mm512_setzero_ps(), vf1);
-
-                    // Quantize
-                    __m512 abs0 = _mm512_abs_ps(vf0);
-                    __m512 abs1 = _mm512_abs_ps(vf1);
-                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs0, abs1));
-
-                    float scale = max_abs / 127.0f;
-                    if (scale > 65504.0f)
-                        scale = 65504.0f;
-                    if (max_abs < 1e-6f)
-                        scale = 0.0f;
-
+                    uint16_t scale_fp16 = 0;
+                    transcode_iq2_grid_halves_to_q8_0_avx512(
+                        vg0,
+                        vg1,
+                        db_arr[ib],
+                        db_arr[ib],
+                        static_cast<__mmask16>(s0 | (s1 << 8)),
+                        static_cast<__mmask16>(s2 | (s3 << 8)),
+                        output + ib * 32,
+                        &scale_fp16);
                     if (scales)
-                        scales[ib] = scale;
+                        scales[ib] = fp16_to_fp32(scale_fp16);
                     if (mins)
                         mins[ib] = 0.0f;
-
-                    if (scale == 0.0f)
-                    {
-                        _mm256_storeu_si256((__m256i *)(output + ib * 32), _mm256_setzero_si256());
-                    }
-                    else
-                    {
-                        float inv_scale = 1.0f / scale;
-                        __m512 vinv = _mm512_set1_ps(inv_scale);
-
-                        __m512 vq0 = _mm512_mul_ps(vf0, vinv);
-                        __m512i vi0 = _mm512_cvtps_epi32(vq0);
-
-                        __m512 vq1 = _mm512_mul_ps(vf1, vinv);
-                        __m512i vi1 = _mm512_cvtps_epi32(vq1);
-
-                        __m128i vout0 = _mm512_cvtepi32_epi8(vi0);
-                        __m128i vout1 = _mm512_cvtepi32_epi8(vi1);
-
-                        _mm_storeu_si128((__m128i *)(output + ib * 32), vout0);
-                        _mm_storeu_si128((__m128i *)(output + ib * 32 + 16), vout1);
-                    }
                 }
 
                 // Process ib+1
                 {
                     __m128i vg0 = _mm256_castsi256_si128(vgrid_ib1);
                     __m128i vg1 = _mm256_extracti128_si256(vgrid_ib1, 1);
-
-                    __m512 vf0 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vg0));
-                    __m512 vf1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vg1));
-
-                    __m512 vdb = _mm512_set1_ps(db_arr[ib + 1]);
-                    vf0 = _mm512_mul_ps(vf0, vdb);
-                    vf1 = _mm512_mul_ps(vf1, vdb);
-
                     uint32_t aux1 = aux1_arr[ib + 1];
                     uint8_t s0 = ksigns_iq2xs[aux1 & 127];
                     uint8_t s1 = ksigns_iq2xs[(aux1 >> 7) & 127];
                     uint8_t s2 = ksigns_iq2xs[(aux1 >> 14) & 127];
                     uint8_t s3 = ksigns_iq2xs[(aux1 >> 21) & 127];
-
-                    __mmask16 k0 = s0 | (s1 << 8);
-                    __mmask16 k1 = s2 | (s3 << 8);
-
-                    vf0 = _mm512_mask_sub_ps(vf0, k0, _mm512_setzero_ps(), vf0);
-                    vf1 = _mm512_mask_sub_ps(vf1, k1, _mm512_setzero_ps(), vf1);
-
-                    // Quantize
-                    __m512 abs0 = _mm512_abs_ps(vf0);
-                    __m512 abs1 = _mm512_abs_ps(vf1);
-                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs0, abs1));
-
-                    float scale = max_abs / 127.0f;
-                    if (scale > 65504.0f)
-                        scale = 65504.0f;
-                    if (max_abs < 1e-6f)
-                        scale = 0.0f;
-
+                    uint16_t scale_fp16 = 0;
+                    transcode_iq2_grid_halves_to_q8_0_avx512(
+                        vg0,
+                        vg1,
+                        db_arr[ib + 1],
+                        db_arr[ib + 1],
+                        static_cast<__mmask16>(s0 | (s1 << 8)),
+                        static_cast<__mmask16>(s2 | (s3 << 8)),
+                        output + (ib + 1) * 32,
+                        &scale_fp16);
                     if (scales)
-                        scales[ib + 1] = scale;
+                        scales[ib + 1] = fp16_to_fp32(scale_fp16);
                     if (mins)
                         mins[ib + 1] = 0.0f;
-
-                    if (scale == 0.0f)
-                    {
-                        _mm256_storeu_si256((__m256i *)(output + (ib + 1) * 32), _mm256_setzero_si256());
-                    }
-                    else
-                    {
-                        float inv_scale = 1.0f / scale;
-                        __m512 vinv = _mm512_set1_ps(inv_scale);
-
-                        __m512 vq0 = _mm512_mul_ps(vf0, vinv);
-                        __m512i vi0 = _mm512_cvtps_epi32(vq0);
-
-                        __m512 vq1 = _mm512_mul_ps(vf1, vinv);
-                        __m512i vi1 = _mm512_cvtps_epi32(vq1);
-
-                        __m128i vout0 = _mm512_cvtepi32_epi8(vi0);
-                        __m128i vout1 = _mm512_cvtepi32_epi8(vi1);
-
-                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32), vout0);
-                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32 + 16), vout1);
-                    }
                 }
             }
 #else
@@ -8177,118 +8183,46 @@ namespace llaminar2
                 // 2. Gather grid values
                 __m512i vgrid = _mm512_i32gather_epi64(vindices, iq2s_grid, 8);
 
-                // 3. Process 4 chunks of 16 elements
-                // Chunk 0: Subblock ib, first 16
-                __m128i vchunk0 = _mm512_castsi512_si128(vgrid);
-                __m512 vfp0 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk0));
-                vfp0 = _mm512_mul_ps(vfp0, _mm512_set1_ps(db_arr[2 * ib]));
+                // Process both subblocks with the same fixed-point arithmetic
+                // used by the one-block AVX-512 decoder. The paired gather is
+                // retained; only the formerly divergent rounding edge is shared.
+                uint16_t scale_fp16 = 0;
+                transcode_iq2_grid_halves_to_q8_0_avx512(
+                    _mm512_castsi512_si128(vgrid),
+                    _mm512_extracti32x4_epi32(vgrid, 1),
+                    db_arr[2 * ib],
+                    db_arr[2 * ib + 1],
+                    static_cast<__mmask16>(
+                        *reinterpret_cast<const uint16_t *>(
+                            signs_ptr + ib * 4)),
+                    static_cast<__mmask16>(
+                        *reinterpret_cast<const uint16_t *>(
+                            signs_ptr + ib * 4 + 2)),
+                    output + ib * 32,
+                    &scale_fp16);
+                if (scales)
+                    scales[ib] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[ib] = 0.0f;
 
-                uint16_t s0 = *(const uint16_t *)(signs_ptr + ib * 4);
-                vfp0 = _mm512_mask_sub_ps(vfp0, s0, _mm512_setzero_ps(), vfp0);
-
-                // Chunk 1: Subblock ib, next 16
-                __m128i vchunk1 = _mm512_extracti32x4_epi32(vgrid, 1);
-                __m512 vfp1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk1));
-                vfp1 = _mm512_mul_ps(vfp1, _mm512_set1_ps(db_arr[2 * ib + 1]));
-
-                uint16_t s1 = *(const uint16_t *)(signs_ptr + ib * 4 + 2);
-                vfp1 = _mm512_mask_sub_ps(vfp1, s1, _mm512_setzero_ps(), vfp1);
-
-                // Quantize Block 1 (ib)
-                {
-                    __m512 abs0 = _mm512_abs_ps(vfp0);
-                    __m512 abs1 = _mm512_abs_ps(vfp1);
-                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs0, abs1));
-
-                    float scale = max_abs / 127.0f;
-                    if (scale > 65504.0f)
-                        scale = 65504.0f;
-                    if (max_abs < 1e-6f)
-                        scale = 0.0f;
-
-                    if (scales)
-                        scales[ib] = scale;
-                    if (mins)
-                        mins[ib] = 0.0f;
-
-                    if (scale == 0.0f)
-                    {
-                        _mm256_storeu_si256((__m256i *)(output + ib * 32), _mm256_setzero_si256());
-                    }
-                    else
-                    {
-                        float inv_scale = 1.0f / scale;
-                        __m512 vinv = _mm512_set1_ps(inv_scale);
-
-                        __m512 vq0 = _mm512_mul_ps(vfp0, vinv);
-                        __m512i vi0 = _mm512_cvtps_epi32(vq0);
-
-                        __m512 vq1 = _mm512_mul_ps(vfp1, vinv);
-                        __m512i vi1 = _mm512_cvtps_epi32(vq1);
-
-                        __m128i vout0 = _mm512_cvtepi32_epi8(vi0);
-                        __m128i vout1 = _mm512_cvtepi32_epi8(vi1);
-
-                        _mm_storeu_si128((__m128i *)(output + ib * 32), vout0);
-                        _mm_storeu_si128((__m128i *)(output + ib * 32 + 16), vout1);
-                    }
-                }
-
-                // Chunk 2: Subblock ib+1, first 16
-                __m128i vchunk2 = _mm512_extracti32x4_epi32(vgrid, 2);
-                __m512 vfp2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk2));
-                vfp2 = _mm512_mul_ps(vfp2, _mm512_set1_ps(db_arr[2 * (ib + 1)]));
-
-                uint16_t s2 = *(const uint16_t *)(signs_ptr + (ib + 1) * 4);
-                vfp2 = _mm512_mask_sub_ps(vfp2, s2, _mm512_setzero_ps(), vfp2);
-
-                // Chunk 3: Subblock ib+1, next 16
-                __m128i vchunk3 = _mm512_extracti32x4_epi32(vgrid, 3);
-                __m512 vfp3 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(vchunk3));
-                vfp3 = _mm512_mul_ps(vfp3, _mm512_set1_ps(db_arr[2 * (ib + 1) + 1]));
-
-                uint16_t s3 = *(const uint16_t *)(signs_ptr + (ib + 1) * 4 + 2);
-                vfp3 = _mm512_mask_sub_ps(vfp3, s3, _mm512_setzero_ps(), vfp3);
-
-                // Quantize Block 2 (ib+1)
-                {
-                    __m512 abs2 = _mm512_abs_ps(vfp2);
-                    __m512 abs3 = _mm512_abs_ps(vfp3);
-                    float max_abs = _mm512_reduce_max_ps(_mm512_max_ps(abs2, abs3));
-
-                    float scale = max_abs / 127.0f;
-                    if (scale > 65504.0f)
-                        scale = 65504.0f;
-                    if (max_abs < 1e-6f)
-                        scale = 0.0f;
-
-                    if (scales)
-                        scales[ib + 1] = scale;
-                    if (mins)
-                        mins[ib + 1] = 0.0f;
-
-                    if (scale == 0.0f)
-                    {
-                        _mm256_storeu_si256((__m256i *)(output + (ib + 1) * 32), _mm256_setzero_si256());
-                    }
-                    else
-                    {
-                        float inv_scale = 1.0f / scale;
-                        __m512 vinv = _mm512_set1_ps(inv_scale);
-
-                        __m512 vq2 = _mm512_mul_ps(vfp2, vinv);
-                        __m512i vi2 = _mm512_cvtps_epi32(vq2);
-
-                        __m512 vq3 = _mm512_mul_ps(vfp3, vinv);
-                        __m512i vi3 = _mm512_cvtps_epi32(vq3);
-
-                        __m128i vout2 = _mm512_cvtepi32_epi8(vi2);
-                        __m128i vout3 = _mm512_cvtepi32_epi8(vi3);
-
-                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32), vout2);
-                        _mm_storeu_si128((__m128i *)(output + (ib + 1) * 32 + 16), vout3);
-                    }
-                }
+                scale_fp16 = 0;
+                transcode_iq2_grid_halves_to_q8_0_avx512(
+                    _mm512_extracti32x4_epi32(vgrid, 2),
+                    _mm512_extracti32x4_epi32(vgrid, 3),
+                    db_arr[2 * (ib + 1)],
+                    db_arr[2 * (ib + 1) + 1],
+                    static_cast<__mmask16>(
+                        *reinterpret_cast<const uint16_t *>(
+                            signs_ptr + (ib + 1) * 4)),
+                    static_cast<__mmask16>(
+                        *reinterpret_cast<const uint16_t *>(
+                            signs_ptr + (ib + 1) * 4 + 2)),
+                    output + (ib + 1) * 32,
+                    &scale_fp16);
+                if (scales)
+                    scales[ib + 1] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[ib + 1] = 0.0f;
             }
 #else
             for (int i = 0; i < 8; ++i)

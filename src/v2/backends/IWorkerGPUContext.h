@@ -17,6 +17,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace llaminar2
 {
@@ -35,6 +36,20 @@ namespace llaminar2
         Normal = 0,
         LatencyCritical = 1,
         BackgroundMaintenance = 2,
+    };
+
+    /**
+     * @brief Observable completion state of one exact GPU stream.
+     *
+     * Backend execution failures are deliberately absent from this enum. A
+     * CUDA/HIP failure is not a scheduling state that callers may ignore: the
+     * concrete context throws with the backend, device, and lifecycle boundary
+     * that first observed it.
+     */
+    enum class GPUStreamExecutionState : std::uint8_t
+    {
+        Pending = 0, ///< At least one command on the stream has not retired.
+        Complete, ///< Every command submitted before the query has retired.
     };
 
     struct PointerValidationResult
@@ -394,6 +409,27 @@ namespace llaminar2
             (void)event;
             return false;
         }
+
+        /**
+         * @brief Query one exact stream and throw on any CUDA/HIP execution fault.
+         *
+         * This is the nonblocking error-observation primitive for graph and
+         * transfer lifecycles. `Pending` and `Complete` are both successful
+         * backend observations; every other backend result is a fatal
+         * asynchronous execution error and must throw rather than being folded
+         * into a boolean scheduling decision.
+         *
+         * @param stream Exact non-null stream whose submitted work is observed.
+         * @param boundary Stable lifecycle name included in fatal diagnostics.
+         * @return Pending or Complete without synchronizing the host.
+         * @throws std::invalid_argument for a null stream or empty boundary.
+         * @throws std::runtime_error when device selection or stream execution failed.
+         * @thread_safety May be called by the owning worker or by the persistent
+         *                orchestration thread that owns the exact stream.
+         */
+        [[nodiscard]] virtual GPUStreamExecutionState queryStreamExecutionState(
+            void *stream,
+            std::string_view boundary) = 0;
 
         /**
          * @brief Synchronize the CPU with an event (blocking)

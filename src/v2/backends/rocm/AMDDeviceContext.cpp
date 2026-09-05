@@ -740,6 +740,48 @@ namespace llaminar2
         return false;
     }
 
+    GPUStreamExecutionState AMDDeviceContext::queryStreamExecutionState(
+        void *stream,
+        std::string_view boundary)
+    {
+        if (!stream)
+        {
+            throw std::invalid_argument(
+                "AMDDeviceContext::queryStreamExecutionState requires the exact non-null stream");
+        }
+        if (boundary.empty())
+        {
+            throw std::invalid_argument(
+                "AMDDeviceContext::queryStreamExecutionState requires a lifecycle boundary");
+        }
+
+        const hipError_t set_error = hipSetDevice(device_ordinal_);
+        if (set_error != hipSuccess)
+        {
+            std::ostringstream message;
+            message << "ROCm device selection failed while observing GPU stream"
+                    << " device=ROCm:" << device_ordinal_
+                    << " boundary=" << boundary
+                    << " error=" << hipGetErrorString(set_error);
+            throw std::runtime_error(message.str());
+        }
+
+        const hipError_t status =
+            hipStreamQuery(static_cast<hipStream_t>(stream));
+        if (status == hipSuccess)
+            return GPUStreamExecutionState::Complete;
+        if (status == hipErrorNotReady)
+            return GPUStreamExecutionState::Pending;
+
+        std::ostringstream message;
+        message << "Asynchronous ROCm execution failed"
+                << " device=ROCm:" << device_ordinal_
+                << " boundary=" << boundary
+                << " error=" << hipGetErrorString(status)
+                << " code=" << static_cast<int>(status);
+        throw std::runtime_error(message.str());
+    }
+
     void AMDDeviceContext::synchronizeEvent(void *event)
     {
         (void)synchronizeEventChecked(event);

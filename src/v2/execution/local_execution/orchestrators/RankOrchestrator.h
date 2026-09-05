@@ -284,10 +284,6 @@ namespace llaminar2
             /// Durable expert-residency observation and maintenance settings.
             MoERebalanceRuntimeConfig moe_rebalance;
 
-            /// Use mapped memory for GPU tensors (zero-copy host access)
-            /// Required for correct coherence with column-parallel LM head
-            bool use_mapped_memory = false;
-
             // =================================================================
             // Nested TP-in-PP Configuration
             // =================================================================
@@ -1167,8 +1163,8 @@ namespace llaminar2
          */
         void setSkipLogitsGatherPrefill(bool skip) override;
 
-        /** Wait for every submitted participant's exact terminal event. */
-        bool waitForLastForwardCompletionForBenchmark() override;
+        /** Wait for every participant's exact latest-transaction terminal event. */
+        bool waitForLastInferenceCompletionForBenchmark() override;
 
         void setSuppressTimeline(bool suppress) override;
         void setAccumulatePrefill(bool accumulate) override;
@@ -1412,6 +1408,21 @@ namespace llaminar2
          * @return TPSnapshot with per-device data and combined view
          */
         TPSnapshot getTPSnapshot(const std::string &key) const;
+
+        /**
+         * @brief Compare bounded device-owned MTP state across LocalTP children.
+         *
+         * This diagnostic is called only after a replicated snapshot has
+         * already failed exact participant combination and only when the
+         * explicit graph-reuse diagnostic switch is enabled. Each child
+         * exports compact error-path digests through its exact stream; the
+         * returned text identifies every mismatching lifecycle boundary.
+         * Correctness never depends on these host-visible hashes.
+         *
+         * @return Empty text when diagnostics are disabled, otherwise a
+         *         participant-by-participant mismatch description.
+         */
+        std::string describeFailedMirroredMTPState() const;
 
         /**
          * @brief Get all snapshot keys with their sharding modes
@@ -1823,6 +1834,27 @@ namespace llaminar2
          * first-class runtime owner instead of scattering ad hoc overrides.
          */
         void applyRuntimeSnapshotShardingOverrides();
+
+        /**
+         * @brief Return whether this LocalTP rank owns replicated MTP dense graphs.
+         *
+         * The retained MTP sidecar policy is independent of the main model's
+         * tensor-parallel layout.  When the policy replicates the predictor,
+         * dense and shared-expert checkpoints contain one complete tensor on
+         * every participant and must not be concatenated or reduced by the
+         * diagnostic collector.
+         */
+        bool replicatedMTPSidecarSnapshotsActive() const noexcept;
+
+        /**
+         * @brief Identify MTP checkpoints whose authority remains outside the
+         *        replicated dense/shared predictor block.
+         * @param stage_type Schema-facing checkpoint stage type.
+         * @return True for embedding, terminal-head, or ExpertOverlay partial
+         *         publications that retain their ordinary schema sharding.
+         */
+        static bool mtpSnapshotRetainsIndependentSharding(
+            const std::string &stage_type);
 
         SnapshotShardingMode resolveSnapshotShardingMode(const std::string &key) const;
         bool phaseSplitReplicatedDecodeSnapshotsActive() const;

@@ -244,7 +244,8 @@ namespace llaminar2::test
         if (!backend)
             throw std::runtime_error("registerGpuPreparedGemmInStore: no GPU backend available for device");
 
-        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        auto orchestrator = std::make_shared<LoadOrchestrator>(
+            backend, kTestOnlyUnadmittedGPUAllocation);
         orchestrator->addDevice(device.ordinal);
         orchestrator->planWeight(
             device.ordinal, canonical_name, N, K,
@@ -505,7 +506,8 @@ namespace llaminar2::test
         // Step 2: Create the orchestrator + plan the single weight on its device pool.
         // The orchestrator owns the WeightVRAMPool; we retain it as the kernel's
         // lifetime owner so the VRAM payload outlives the kernel's execution.
-        out.orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        out.orchestrator = std::make_shared<LoadOrchestrator>(
+            backend, kTestOnlyUnadmittedGPUAllocation);
         out.orchestrator->addDevice(device.ordinal);
         out.orchestrator->planWeight(
             device.ordinal, canonical_name, N, K,
@@ -646,7 +648,8 @@ namespace llaminar2::test
             throw std::runtime_error("makeGpuPreparedFloatingPointGemm: no GPU backend available for device");
 
         GpuPreparedGemm out;
-        out.orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        out.orchestrator = std::make_shared<LoadOrchestrator>(
+            backend, kTestOnlyUnadmittedGPUAllocation);
         out.orchestrator->addDevice(device.ordinal);
         out.orchestrator->planRawWeight(device.ordinal, canonical_name, N, K, raw_bytes);
 

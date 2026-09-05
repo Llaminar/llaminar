@@ -34,6 +34,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -54,16 +55,93 @@ namespace llaminar2::test::parity
     };
 
     /**
-     * Prefix block size used by the mandatory full/partial restore proof.
+     * @brief Phase-aware route evidence retained by one ExpertOverlay cell.
      *
-     * A one-token block lets even the shortest authenticated prompt seed a
-     * strict partial hit by appending one known reference token. Production
-     * keeps its coarser default; this test geometry exercises the identical
-     * cache implementation without requiring synthetic long-context work in
-     * every matrix cell.
+     * Main-model route ledgers execute in ordinary prefill and decode. MTP
+     * sidecars execute only inside speculative transactions, but their graph
+     * outputs still have to be selected before the serving graphs are sealed.
+     * Keeping these inventories distinct prevents setup selection from being
+     * confused with a claim that every request phase executes every graph.
      */
-    inline constexpr int kModelParityPrefixRestoreProofBlockSize =
-        kProductionParityPrefixRestoreProofBlockSize;
+    struct ModelParityExpertOverlayRouteSnapshotInventory
+    {
+        /** Route ledgers that every ordinary main-model forward must publish. */
+        std::vector<std::string> main_model;
+        /** Route ledgers selected at setup and proved by live MTP transactions. */
+        std::vector<std::string> mtp_sidecar;
+    };
+
+    /**
+     * @brief Build the complete phase-aware pinned-route inventory for a case.
+     *
+     * ExpertOverlay movement proofs need the global placement banks and the
+     * invocation-local route projection that one ordered reducer consumed.
+     * GPU snapshot manifests filter individual outputs, not merely stages, so
+     * naming `MOE_EXPERT_OUTPUT` does not implicitly retain these companion
+     * values. MTP sidecars reuse an `MTP0_` graph inside context-qualified
+     * transaction banks; those keys belong to setup capture and the explicit
+     * speculative-transaction proof, not ordinary prefill validation.
+     *
+     * @param main_layer_count Number of ordinary transformer layers.
+     * @param mtp Generated MTP policy for the exact matrix cell.
+     * @return Stable main-model and MTP-sidecar semantic key inventories.
+     */
+    inline ModelParityExpertOverlayRouteSnapshotInventory
+    modelParityExpertOverlayRouteSnapshotInventory(
+        int main_layer_count,
+        ModelParityMTP mtp)
+    {
+        if (main_layer_count <= 0)
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay pinned-route inventory requires a positive main-layer count");
+        }
+
+        static constexpr std::array<std::string_view, 8> kRouteSuffixes{
+            "_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
+            "_MOE_RUNTIME_ROUTE_WEIGHTS",
+            "_MOE_ROUTE_CONTRIBUTIONS",
+            "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+            "_MOE_OVERLAY_ROUTE_BANK0_EPOCH",
+            "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+            "_MOE_OVERLAY_ROUTE_BANK1_EPOCH",
+            "_MOE_OVERLAY_ROUTE_SELECTED_BANK",
+        };
+
+        ModelParityExpertOverlayRouteSnapshotInventory inventory;
+        inventory.main_model.reserve(
+            static_cast<std::size_t>(main_layer_count) *
+            kRouteSuffixes.size());
+        const auto append_prefix = [&](std::vector<std::string> &keys,
+                                       const std::string &prefix)
+        {
+            for (const std::string_view suffix : kRouteSuffixes)
+                keys.push_back(prefix + std::string(suffix));
+        };
+        for (int layer = 0; layer < main_layer_count; ++layer)
+        {
+            append_prefix(
+                inventory.main_model,
+                "layer" + std::to_string(layer));
+        }
+        if (mtp != ModelParityMTP::Off)
+        {
+            inventory.mtp_sidecar.reserve(kRouteSuffixes.size());
+            append_prefix(inventory.mtp_sidecar, "MTP0");
+        }
+        return inventory;
+    }
+
+    /** Geometry policy for the non-optional prefix restore proof. */
+    enum class ModelParityPrefixRestoreGeometry : std::uint8_t
+    {
+        /**
+         * Store the authenticated prompt as one terminal block, then append
+         * one reference token to prove a real partial restore. The fixture
+         * resolves the block width only after token identity is authenticated.
+         */
+        AuthenticatedPromptBlock,
+    };
 
     /** Durable ExpertOverlay residency policy selected by one generated case. */
     enum class ModelParityExpertMovement : std::uint8_t
@@ -150,10 +228,10 @@ namespace llaminar2::test::parity
      * End-to-end economy evidence owned by a generated Dynamic cell.
      *
      * Every Dynamic cell must certify production economics and publish real
-     * movement.  One centrally selected cell per topology, precision pair,
-     * and owner order additionally owns the costly matched before/after speed
-     * proof.  MTP depth and alternate prefill schedules remain independent
-     * numerical axes and therefore must not repeat that identical proof.
+     * movement.  A definition may additionally select an explicit owner-order
+     * representative for the costly matched before/after speed proof. MTP
+     * depth, alternate prefill schedules, and additional precision pairs remain
+     * independent numerical axes and do not repeat that identical benchmark.
      */
     enum class ModelParityDynamicEvidence : std::uint8_t
     {
@@ -161,6 +239,48 @@ namespace llaminar2::test::parity
         EconomicMovement,
         EconomicMovementAndObservedSpeedup,
     };
+
+    /**
+     * @brief Owner-order cohort selected for one matched Dynamic speed proof.
+     *
+     * Physical movement remains mandatory in every Dynamic matrix cell.  This
+     * policy only assigns the substantially more expensive before/after timing
+     * cohort.  Keeping the selection in the model definition prevents the
+     * expander from multiplying one economy benchmark across every topology,
+     * precision pair, and owner order merely because a CPU participant exists.
+     */
+    enum class ModelParityDynamicSpeedupWitness : std::uint8_t
+    {
+        Disabled,
+        Ordinal,
+        Random,
+        BothOwnerOrders,
+    };
+
+    /**
+     * @brief Return whether an owner order owns the definition's speed witness.
+     *
+     * @param witness Definition-selected matched timing cohort.
+     * @param owner_order Physical owner placement of the generated cell.
+     * @return True exactly for owner orders selected by @p witness.
+     */
+    [[nodiscard]] constexpr bool selectsDynamicSpeedupWitness(
+        ModelParityDynamicSpeedupWitness witness,
+        RoutedExpertOwnerOrder owner_order) noexcept
+    {
+        switch (witness)
+        {
+        case ModelParityDynamicSpeedupWitness::Disabled:
+            return false;
+        case ModelParityDynamicSpeedupWitness::Ordinal:
+            return owner_order == RoutedExpertOwnerOrder::Ordinal;
+        case ModelParityDynamicSpeedupWitness::Random:
+            return owner_order == RoutedExpertOwnerOrder::Random;
+        case ModelParityDynamicSpeedupWitness::BothOwnerOrders:
+            return true;
+        }
+        return false;
+    }
 
     /**
      * @brief Runtime policies selected by the Dynamic evidence a cell owns.
@@ -226,10 +346,12 @@ namespace llaminar2::test::parity
         /**
          * Transformer blocks in the authenticated GGUF.
          *
-         * This is required only for an explicitly staged pipeline topology.
-         * The production runner validates the resulting layer ranges against
-         * the loaded model, so a stale declaration fails during setup rather
-         * than silently constructing a different graph.
+         * This is required for an explicitly staged pipeline topology and for
+         * any ExpertOverlay whose immutable snapshot graph names per-layer
+         * route publications before model loading. The production runner or
+         * fixture validates the declaration against the loaded model, so a
+         * stale value fails during setup rather than silently constructing a
+         * different graph identity.
          */
         int transformer_layers = 0;
         /**
@@ -339,10 +461,27 @@ namespace llaminar2::test::parity
         float maximum_kl_divergence = 0.0f;
     };
 
+    /** One deep-MTP-policy-specific override of the recursive cosine floor. */
+    struct ModelParityMTPAggregateCosineThresholdOverride
+    {
+        ModelParityMTP policy = ModelParityMTP::Off;
+        float minimum_cosine_similarity = 0.0f;
+    };
+
     /** Optional standard feature axes for one model/topology definition. */
     struct ModelParityFeatureMatrix
     {
         ModelParityAxisProfile mtp = ModelParityAxisProfile::Disabled;
+        /**
+         * Matched Dynamic timing cohort for this exact model/topology.
+         *
+         * Disabled is deliberate: ordinary definitions certify movement and
+         * numerical parity without silently becoming performance benchmarks.
+         * A selected witness is emitted only for the first activation/KV pair,
+         * ordinary prefill schedule, and MTP-off policy.
+         */
+        ModelParityDynamicSpeedupWitness dynamic_speedup_witness =
+            ModelParityDynamicSpeedupWitness::Disabled;
         /**
          * Prefill graph schedules crossed with precision and execution policy.
          * One ordinary profile preserves the historical matrix by default.
@@ -354,10 +493,21 @@ namespace llaminar2::test::parity
          * Policy-local recursive KL budgets applied after precision overrides.
          *
          * Keeping this keyed by the typed MTP policy prevents a deep-recursion
-         * tolerance from weakening shallower fixed depths or adaptive depth.
+         * tolerance from weakening policies that cannot reach the authorized
+         * recurrence. Adaptive depth must be named explicitly when its
+         * admitted ceiling reaches the same recurrence as a fixed-depth cell.
          */
         std::vector<ModelParityMTPKLThresholdOverride>
             mtp_kl_threshold_overrides;
+        /**
+         * Policy-local recursive aggregate floors for depth-15-capable cells.
+         *
+         * Individual checkpoint, routing, KL, ordinary decode, and prefill
+         * contracts remain unchanged. Fixed shallow policies are deliberately
+         * ineligible, making a deep quantized-recurrence allowance explicit.
+         */
+        std::vector<ModelParityMTPAggregateCosineThresholdOverride>
+            mtp_recursive_aggregate_cosine_threshold_overrides;
     };
 
     /**
@@ -423,7 +573,7 @@ namespace llaminar2::test::parity
      *
      * Every selectable field is explicit even when disabled. Prefix restore is
      * instead a non-optional production-campaign invariant, so every case owns
-     * the same proof block size and fixtures never branch on a prefix mode.
+     * the same typed proof geometry and fixtures never branch on a prefix mode.
      */
     struct ModelParityCase
     {
@@ -433,6 +583,8 @@ namespace llaminar2::test::parity
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
         KVCachePrecision kv_cache_precision = KVCachePrecision::FP16;
         ModelParityMTP mtp = ModelParityMTP::Off;
+        /** Explicit recursive aggregate floor; absent retains the global 0.99. */
+        std::optional<float> mtp_recursive_aggregate_cosine_floor;
         /**
          * Setup-time MTP envelope shared by every cell in this definition.
          *
@@ -446,8 +598,8 @@ namespace llaminar2::test::parity
         ModelParityDynamicEvidence dynamic_evidence =
             ModelParityDynamicEvidence::NotApplicable;
         ModelParityPrefillGraphPolicy prefill_graph;
-        int prefix_cache_block_size =
-            kModelParityPrefixRestoreProofBlockSize;
+        ModelParityPrefixRestoreGeometry prefix_restore_geometry =
+            ModelParityPrefixRestoreGeometry::AuthenticatedPromptBlock;
         MoEHotExpertCacheConfig moe_hot_expert_cache;
         RoutedExpertPrefillRuntimeConfig moe_routed_prefill;
         MoERebalanceRuntimeConfig dynamic_rebalance;
@@ -460,6 +612,56 @@ namespace llaminar2::test::parity
         [[nodiscard]] constexpr bool mtpEnabled() const noexcept
         {
             return mtp != ModelParityMTP::Off;
+        }
+
+        /**
+         * @brief Whether this cell owns the TP>2 canonical MTP reduction proof.
+         *
+         * Canonical rank-order reduction exists to make a grouped verifier row
+         * byte-identical to its serial decode row when a homogeneous GPU
+         * continuation domain has more than two participants.  A TP1/TP2,
+         * CPU, heterogeneous-continuation, or MTP-off cell has no such graph
+         * value and must not require its diagnostic snapshots.
+         *
+         * @return True exactly when the typed topology can execute that proof.
+         * @throws std::logic_error when an MTP ExpertOverlay case names no
+         *         continuation domain in its immutable placement plan.
+         */
+        [[nodiscard]] bool requiresCanonicalTPAllreduceMTPDiagnostics() const
+        {
+            if (!mtpEnabled() || !expert_overlay ||
+                !topology.expert_overlay_plan)
+            {
+                return false;
+            }
+
+            const auto &plan = *topology.expert_overlay_plan;
+            const auto continuation = std::find_if(
+                plan.domains.begin(),
+                plan.domains.end(),
+                [&](const RoutedExpertDomain &domain)
+                { return domain.name == plan.continuation_domain; });
+            if (continuation == plan.domains.end())
+            {
+                throw std::logic_error(
+                    "MTP ExpertOverlay parity topology has no continuation domain: " +
+                    topology.test_id);
+            }
+            if (continuation->participants.size() <= 2u)
+                return false;
+
+            const GlobalDeviceAddress &first =
+                continuation->participants.front();
+            if (!first.isGPU())
+                return false;
+            return std::all_of(
+                continuation->participants.begin(),
+                continuation->participants.end(),
+                [&](const GlobalDeviceAddress &participant)
+                {
+                    return (first.isCUDA() && participant.isCUDA()) ||
+                           (first.isROCm() && participant.isROCm());
+                });
         }
 
         /** @return Whether this cell uses the adaptive device depth controller. */
@@ -643,6 +845,8 @@ namespace llaminar2::test::parity
             config.mtp_expected_draft_depth = requestedMTPDraftDepth();
             config.mtp_expected_graph_capacity =
                 retained_mtp_draft_capacity;
+            config.mtp_recursive_aggregate_cosine_floor =
+                mtp_recursive_aggregate_cosine_floor;
             return config;
         }
 
@@ -663,11 +867,11 @@ namespace llaminar2::test::parity
             config.kv_cache_precision = kvCacheConfigValue();
 
             // Prefix restore is a production invariant, not a generated axis.
-            // Preserve the bounded production budgets while using one-token
-            // blocks so every authenticated prompt can prove a partial hit.
+            // The parity fixture resolves authenticated-prompt block geometry
+            // after tokenization; this typed projection only enables the real
+            // bounded production tiers and terminal-state payload.
             config.prefix_cache.enabled = true;
             config.prefix_cache.storage_mode = PrefixCacheStorageMode::Tiered;
-            config.prefix_cache.block_size = prefix_cache_block_size;
             config.prefix_cache.terminal_state =
                 PrefixCacheTerminalStateMode::Auto;
 
@@ -1330,11 +1534,64 @@ namespace llaminar2::test::parity
                     "model parity MTP KL overrides must be unique by policy");
             }
         }
+        if (!definition.features
+                 .mtp_recursive_aggregate_cosine_threshold_overrides.empty() &&
+            definition.features.mtp != ModelParityAxisProfile::Standard)
+        {
+            throw std::invalid_argument(
+                "model parity recursive MTP cosine overrides require the standard MTP axis");
+        }
+        for (std::size_t index = 0;
+             index < definition.features
+                         .mtp_recursive_aggregate_cosine_threshold_overrides
+                         .size();
+             ++index)
+        {
+            const auto &override = definition.features
+                                       .mtp_recursive_aggregate_cosine_threshold_overrides[index];
+            if ((override.policy != ModelParityMTP::Depth15 &&
+                 override.policy != ModelParityMTP::DynamicDepth) ||
+                !std::isfinite(override.minimum_cosine_similarity) ||
+                !(override.minimum_cosine_similarity > 0.0f) ||
+                override.minimum_cosine_similarity > 1.0f)
+            {
+                throw std::invalid_argument(
+                    "model parity recursive MTP cosine override requires depth-15/flexible-depth policy and a finite floor in (0, 1]");
+            }
+            const auto duplicate = std::find_if(
+                definition.features
+                    .mtp_recursive_aggregate_cosine_threshold_overrides.begin(),
+                definition.features
+                        .mtp_recursive_aggregate_cosine_threshold_overrides.begin() +
+                    static_cast<std::ptrdiff_t>(index),
+                [&](const ModelParityMTPAggregateCosineThresholdOverride &candidate)
+                { return candidate.policy == override.policy; });
+            if (duplicate !=
+                definition.features
+                        .mtp_recursive_aggregate_cosine_threshold_overrides.begin() +
+                    static_cast<std::ptrdiff_t>(index))
+            {
+                throw std::invalid_argument(
+                    "model parity recursive MTP cosine overrides must be unique by policy");
+            }
+        }
         if (topology.isExpertOverlay() &&
             !topology.expert_overlay_plan->enabled)
         {
             throw std::invalid_argument(
                 "ExpertOverlay parity topology supplied a disabled placement plan");
+        }
+        if (topology.isExpertOverlay() && model.transformer_layers <= 0)
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay parity requires an authenticated transformer layer count for pre-load graph identity");
+        }
+        if (!topology.isExpertOverlay() &&
+            definition.features.dynamic_speedup_witness !=
+                ModelParityDynamicSpeedupWitness::Disabled)
+        {
+            throw std::invalid_argument(
+                "Dynamic speedup witness requires an ExpertOverlay topology");
         }
         if (topology.isExpertOverlay())
         {
@@ -1342,6 +1599,18 @@ namespace llaminar2::test::parity
                 [&](const MoERebalanceRuntimeConfig &policy,
                     const char *evidence_name)
             {
+                if (policy.migration_transfer_slots == 0u ||
+                    policy.resolvedMigrationExecutionStreams() == 0u ||
+                    policy.resolvedMigrationExecutionStreams() >
+                        policy.migration_transfer_slots ||
+                    policy.resolvedMigrationCyclesPerWave() == 0u ||
+                    policy.resolvedMigrationCyclesPerWave() >
+                        policy.migration_transfer_slots)
+                {
+                    throw std::invalid_argument(
+                        std::string("ExpertOverlay ") + evidence_name +
+                        " policy requires positive stream/cycle geometry within its retained migration slots");
+                }
                 if (policy.device_maintenance_slack_tokens < 0 ||
                     policy.device_min_maintenance_period_tokens <= 0 ||
                     policy.device_initial_maintenance_period_tokens <= 0)
@@ -1578,11 +1847,6 @@ namespace llaminar2::test::parity
                                    : std::vector<std::optional<
                                          ModelParityExpertOverlayPolicy>>{
                                          std::nullopt};
-        const bool topology_has_cpu = std::any_of(
-            topology.participants.begin(), topology.participants.end(),
-            [](const ModelParityParticipant &participant)
-            { return participant.address.isCPU(); });
-
         std::vector<ModelParityCase> cases;
         cases.reserve(
             definition.precisions.activation.size() *
@@ -1629,12 +1893,35 @@ namespace llaminar2::test::parity
                                 thresholds.mtp_kl_threshold =
                                     mtp_kl_override->maximum_kl_divergence;
                             }
+                            const auto mtp_cosine_override = std::find_if(
+                                definition.features
+                                    .mtp_recursive_aggregate_cosine_threshold_overrides.begin(),
+                                definition.features
+                                    .mtp_recursive_aggregate_cosine_threshold_overrides.end(),
+                                [&](const ModelParityMTPAggregateCosineThresholdOverride &candidate)
+                                { return candidate.policy == mtp; });
+                            const std::optional<float>
+                                mtp_recursive_aggregate_cosine_floor =
+                                    mtp_cosine_override !=
+                                            definition.features
+                                                .mtp_recursive_aggregate_cosine_threshold_overrides.end()
+                                        ? std::optional<float>{
+                                              mtp_cosine_override
+                                                  ->minimum_cosine_similarity}
+                                        : std::nullopt;
                             const ModelParityDynamicEvidence dynamic_evidence =
                                 !overlay ||
                                         overlay->movement !=
                                             ModelParityExpertMovement::Dynamic
                                     ? ModelParityDynamicEvidence::NotApplicable
-                                    : topology_has_cpu &&
+                                    : activation ==
+                                              definition.precisions.activation.front() &&
+                                              kv_cache ==
+                                                  definition.precisions.kv_cache.front() &&
+                                              selectsDynamicSpeedupWitness(
+                                                  definition.features
+                                                      .dynamic_speedup_witness,
+                                                  overlay->owner_order) &&
                                               mtp == ModelParityMTP::Off &&
                                               prefill_graph ==
                                                   definition.features
@@ -1650,6 +1937,8 @@ namespace llaminar2::test::parity
                                 .activation_precision = activation,
                                 .kv_cache_precision = kv_cache,
                                 .mtp = mtp,
+                                .mtp_recursive_aggregate_cosine_floor =
+                                    mtp_recursive_aggregate_cosine_floor,
                                 .retained_mtp_draft_capacity =
                                     definition.features.mtp ==
                                             ModelParityAxisProfile::Standard
@@ -1658,8 +1947,9 @@ namespace llaminar2::test::parity
                                 .expert_overlay = overlay,
                                 .dynamic_evidence = dynamic_evidence,
                                 .prefill_graph = prefill_graph,
-                                .prefix_cache_block_size =
-                                    kModelParityPrefixRestoreProofBlockSize,
+                                .prefix_restore_geometry =
+                                    ModelParityPrefixRestoreGeometry::
+                                        AuthenticatedPromptBlock,
                                 .moe_hot_expert_cache =
                                     definition.moe_hot_expert_cache,
                                 .moe_routed_prefill =
