@@ -752,3 +752,10 @@ Reference docs:
 * Tensors want to be open and free: so is Llaminar.
 * Tensors want to be sliced, sharded, and pipelined: Llaminar lets them be.
 * Tensors want to run on a variety of hardware types without artificial handicaps: Llaminar helps them to do so.
+
+## Activation precision
+
+Production inference currently supports FP32 model activations only.
+`--activation-precision fp32` is the default; other activation modes fail as
+unimplemented. KV-cache precision and model/expert weight formats are separate
+settings and retain their own supported formats.

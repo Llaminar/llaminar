@@ -9,6 +9,59 @@ case.
 CTest registration in `tests/v2/CMakeLists.txt` is the matrix source of truth.
 Do not maintain a second model/backend/precision manifest in scripts or docs.
 
+Production activation precision is currently FP32 only. The shared admission
+policy rejects other activation axes before matrix expansion, just as CLI and
+configuration admission reject them as unimplemented. `ActFP32_KVFP16` means
+FP32 model activations with FP16 KV storage. Weight formats and kernel-local
+quantized operands are independent of those two settings. Historical 122B
+`ActFP16` results used an unsupported requested setting and do not certify
+FP16 model activations; their names must not be reused as precision evidence.
+
+## Matrix and cell naming
+
+Production binaries use `v2_integration_parity_<model>_<scope>_matrix`.
+The scope describes the fixture's execution family, such as `single_device`,
+`local_tp`, `node_pp`, or `node_expert_overlay`, not a particular generated
+configuration. Include model size when separate binaries load different sizes.
+For example, `v2_integration_parity_qwen35moe_122b_node_expert_overlay_matrix`
+covers its declared topology matrix, not a fixed CUDA/ROCm/CPU tier layout.
+Discovery rejects production cells in a binary without this matrix identity.
+
+CTest prefixes and GoogleTest fixture names likewise identify model and scope.
+The `ProductionCampaign` marker identifies a scheduled aggregate; its generated
+suffix identifies the backend signature and any required process-isolation
+slice. Each `ProductionParity/<case>` suffix comes from the typed expander and
+records topology, placement, movement, activation/KV precision, and MTP policy.
+Do not copy those axes into a shared fixture name. `Math` and `GraphNative` are
+not distinguishing production suite types: every production cell owes the
+same mathematical and graph-path proof. Focused-only diagnostics may retain
+feature-specific names such as `PrefixMTP`.
+
+Renaming a fixture changes exact GTest/artifact identities. Historical evidence
+keeps its original identity; never rename old CSV directories to imply a fresh
+pass. Audit the generated parameter inventory and scheduling properties before
+and after a rename, then run discovery's Unit regressions and the integration
+preflight gate.
+
+## Building shared fixtures
+
+Keep model registration separate from proof implementation. The Qwen3.5 node
+ExpertOverlay matrices link the same `v2_parity_qwen35moe_node_overlay` object
+library; the 35B and 122B registration sources select their own typed cases and
+model manifests without recompiling the implementation for a model-size macro.
+Object linkage retains the common GoogleTest registrars. The library and both
+registrations reuse one precompiled fixture header with identical compile
+settings.
+
+Implementation lives in `qwen35moe/node_overlay/`, split by lifecycle, placement,
+movement, graph/routing evidence, MTP diagnostics, and reference handling. Heavy
+method bodies belong in those source files, not the shared declaration header.
+Process-local bindings and retained caches must have one out-of-line definition;
+never turn them into anonymous-namespace header copies when splitting a file.
+The preflight shard-ownership test exercises configuration lookup across these
+translation-unit boundaries without loading a model. CMake owns the source
+inventory, and source-policy gates inspect the shared fixture family.
+
 ## What one production cell proves
 
 Each parameterized `ProductionParity` cell uses one production runner session
@@ -418,7 +471,7 @@ non-ExpertOverlay certification pass can omit the tier implementation slice:
 ```bash
 python3 scripts/ci/run_production_parity_campaigns.py \
   --build-dir build_v2_integration \
-  --exclude-campaign '.*(?:ExpertOverlay|MoEGraphNative).*' \
+  --exclude-campaign '.*ExpertOverlay.*' \
   --report /tmp/non-overlay-production-campaigns.json
 ```
 
@@ -505,7 +558,7 @@ Build parity targets with the repository's normal unrestricted concurrency:
 
 ```bash
 cmake --build build_v2_integration --parallel \
-  --target v2_integration_parity_qwen2_single_device
+  --target v2_integration_parity_qwen2_single_device_matrix
 ```
 
 ## Troubleshooting

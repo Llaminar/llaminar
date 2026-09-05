@@ -1,8 +1,8 @@
 /**
- * @file Test__Qwen35_NodeLocalPP_Parity.cpp
- * @brief Node-Local PP parity tests for Qwen3.5 using MPI (multi-rank, same node)
+ * @file Test__Qwen35_NodePP_Parity.cpp
+ * @brief Node PP parity tests for Qwen3.5 using MPI (multi-rank, same node)
  *
- * These tests validate Node-Local Pipeline Parallelism (NodeLocalPP) via
+ * These tests validate Node-scoped Pipeline Parallelism (NodePP) via
  * GlobalOrchestrator for Qwen3.5 GDN+FA hybrid architecture. Each MPI rank
  * handles a disjoint subset of transformer layers, with GlobalOrchestrator
  * coordinating activation transfer between ranks via MPI send/recv.
@@ -12,7 +12,7 @@
  *   - 2 MPI ranks for 2-way PP
  *
  * Test configurations:
- *   - NodeLocalPP_2xMPI_CPU_08B: 2 MPI ranks, CPU, Qwen3.5-0.8B Q4_0
+ *   - NodePP_2xMPI_CPU_08B: 2 MPI ranks, CPU, Qwen3.5-0.8B Q4_0
  *
  * @author David Sanftenberg
  * @date 2026
@@ -65,7 +65,13 @@ static const std::vector<ModelParityCase> &qwen35NodePipelineCases()
 // Parameterized Test Fixture
 // =============================================================================
 
-class Qwen35NodeLocalPPParityTest : public Qwen35ConfigDrivenParityTest<Qwen35NodeLocalPPParityTest>,
+/**
+ * @brief Generated node-scoped pipeline parity fixture.
+ *
+ * The typed case owns rank placement and precision; this suite names only the
+ * execution family shared by its production and focused setup checks.
+ */
+class Qwen35NodePPParityTest : public Qwen35ConfigDrivenParityTest<Qwen35NodePPParityTest>,
                                     public ModelParityCaseParameter
 {};
 
@@ -76,7 +82,7 @@ class Qwen35NodeLocalPPParityTest : public Qwen35ConfigDrivenParityTest<Qwen35No
 /**
  * @brief Verify GlobalOrchestrator pipeline setup for PP
  */
-TEST_P(Qwen35NodeLocalPPParityTest, GlobalOrchestratorSetup)
+TEST_P(Qwen35NodePPParityTest, GlobalOrchestratorSetup)
 {
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
 
@@ -86,7 +92,7 @@ TEST_P(Qwen35NodeLocalPPParityTest, GlobalOrchestratorSetup)
 
     // Verify GlobalOrchestrator was created
     ASSERT_NE(global_orchestrator_ptr_, nullptr)
-        << "GlobalOrchestrator should be created for NodeLocalPP";
+        << "GlobalOrchestrator should be created for NodePP";
 
     // Verify pipeline topology
     bool is_head = global_orchestrator_ptr_->isPipelineHead();
@@ -103,7 +109,7 @@ TEST_P(Qwen35NodeLocalPPParityTest, GlobalOrchestratorSetup)
         EXPECT_TRUE(is_tail) << "Last rank should be pipeline tail";
     }
 
-    LOG_INFO("[NodeLocalPP Qwen3.5] Rank " << mpi_ctx_->rank()
+    LOG_INFO("[NodePP Qwen3.5] Rank " << mpi_ctx_->rank()
                                            << " verified GlobalOrchestrator (head=" << is_head
                                            << ", tail=" << is_tail << ")");
 }
@@ -111,7 +117,7 @@ TEST_P(Qwen35NodeLocalPPParityTest, GlobalOrchestratorSetup)
 /**
  * @brief Full prefill/decode production parity via GlobalOrchestrator.
  */
-TEST_P(Qwen35NodeLocalPPParityTest, ProductionParity)
+TEST_P(Qwen35NodePPParityTest, ProductionParity)
 {
     runProductionParityCampaign();
 }
@@ -121,8 +127,8 @@ TEST_P(Qwen35NodeLocalPPParityTest, ProductionParity)
 // =============================================================================
 
 INSTANTIATE_TEST_SUITE_P(
-    Qwen35NodeLocalPP,
-    Qwen35NodeLocalPPParityTest,
+    Qwen35NodePP,
+    Qwen35NodePPParityTest,
     ::testing::ValuesIn(qwen35NodePipelineCases()),
     [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {

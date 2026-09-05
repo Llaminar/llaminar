@@ -347,6 +347,11 @@ Device selection forms and their mutual exclusions evolve with the topology
 planner. Use `--help`, `ConfigValidator`, `--validate-only`, `--dry-run`, and
 `--explain-placement` rather than relying on a copied flag matrix.
 
+Production model activations currently support FP32 only. Other activation
+precision requests fail as unimplemented. KV-cache precision and expert weight
+formats are independent settings; their support does not imply support for
+another model activation dtype.
+
 ## Benchmarking
 
 Use a Release binary and a fixed model, device, prompt bytes, decode length,

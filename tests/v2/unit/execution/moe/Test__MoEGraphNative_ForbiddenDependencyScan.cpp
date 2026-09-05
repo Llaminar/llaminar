@@ -66,6 +66,33 @@ namespace llaminar2::test
             return buffer.str();
         }
 
+        /**
+         * @brief Read a registration and its dedicated shared fixture sources.
+         * @param registration Thin model registration beside node_overlay/.
+         * @return Deterministically ordered source for architecture assertions.
+         *
+         * The split fixture owns this directory. Reading all C++ declarations
+         * and implementations keeps source guards complete without maintaining
+         * a second translation-unit inventory in the tests.
+         */
+        std::string readNodeOverlayFixture(const fs::path &registration)
+        {
+            std::vector<fs::path> paths;
+            const auto directory = registration.parent_path() / "node_overlay";
+            for (const auto &entry : fs::directory_iterator(directory))
+            {
+                if (entry.is_regular_file() &&
+                    (entry.path().extension() == ".cpp" ||
+                     entry.path().extension() == ".h"))
+                    paths.push_back(entry.path());
+            }
+            std::sort(paths.begin(), paths.end());
+            std::string contents = readFile(registration);
+            for (const auto &path : paths)
+                contents += "\n" + readFile(path);
+            return contents;
+        }
+
         size_t countOccurrences(
             const std::string &contents,
             const std::string &needle)
@@ -3825,7 +3852,7 @@ namespace llaminar2::test
             root / "tests/v2/integration/parity/qwen35moe";
         const fs::path canonical_path =
             parity_dir /
-            "Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp";
+            "Test__Qwen35MoE_NodeExpertOverlay_Parity.cpp";
         const fs::path definitions_path =
             parity_dir / "Qwen35MoEModelParityDefinitions.h";
         const fs::path cmake_path = root / "tests/v2/CMakeLists.txt";
@@ -3843,7 +3870,7 @@ namespace llaminar2::test
                 << "Superseded ExpertOverlay parity fixture returned: " << obsolete;
         }
 
-        const std::string canonical = readFile(canonical_path);
+        const std::string canonical = readNodeOverlayFixture(canonical_path);
         const std::string definitions = readFile(definitions_path);
         const std::string cmake = readFile(cmake_path);
         ASSERT_FALSE(canonical.empty()) << canonical_path;
@@ -3934,14 +3961,14 @@ namespace llaminar2::test
             root / "tests/v2/integration/parity/ParityCellLifecycle.h";
         const fs::path qwen122_path =
             root / "tests/v2/integration/parity/qwen35moe/"
-                   "Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp";
+                   "Test__Qwen35MoE_NodeExpertOverlay_Parity.cpp";
         ASSERT_TRUE(fs::exists(base_path)) << base_path;
         ASSERT_TRUE(fs::exists(lifecycle_path)) << lifecycle_path;
         ASSERT_TRUE(fs::exists(qwen122_path)) << qwen122_path;
 
         const std::string base = readFile(base_path);
         const std::string lifecycle = readFile(lifecycle_path);
-        const std::string qwen122 = readFile(qwen122_path);
+        const std::string qwen122 = readNodeOverlayFixture(qwen122_path);
         ASSERT_FALSE(base.empty());
         ASSERT_FALSE(lifecycle.empty());
         ASSERT_FALSE(qwen122.empty());
@@ -4058,25 +4085,36 @@ namespace llaminar2::test
                 << retired_api;
         }
 
-        const size_t evidence_begin =
-            qwen122.find("bool broadcastRootFlag(bool root_value) const");
-        const size_t fatal_abort =
-            qwen122.find("[[noreturn]] void abortGraphNativeWorld", evidence_begin);
-        ASSERT_NE(evidence_begin, std::string::npos);
-        ASSERT_NE(fatal_abort, std::string::npos);
-        const std::string evidence_region = qwen122.substr(
-            evidence_begin, fatal_abort - evidence_begin);
-        EXPECT_EQ(evidence_region.find("MPI_COMM_WORLD"), std::string::npos)
-            << "Cell evidence must not share the retained production communicator.";
-
-        const size_t production_body = qwen122.find(
-            "void runGraphNativeProductionParityBody()");
-        const size_t fixture_members =
-            qwen122.find("std::shared_ptr<MoERoutedExpertPlacementPlan>", production_body);
-        ASSERT_NE(production_body, std::string::npos);
-        ASSERT_NE(fixture_members, std::string::npos);
-        const std::string production_region = qwen122.substr(
-            production_body, fixture_members - production_body);
+        // Out-of-line definitions no longer have a meaningful contiguous
+        // evidence-to-members region. Audit every fixture method instead;
+        // only pre-cell rank admission/retirement and fatal process abort own
+        // world scope. These all preceded the old contiguous evidence region.
+        const std::regex fixture_method(
+            R"(auto Qwen35MoENodeExpertOverlayParityTest::([A-Za-z0-9_]+)\()");
+        size_t audited_methods = 0u;
+        for (auto it = std::sregex_iterator(
+                 qwen122.begin(), qwen122.end(), fixture_method);
+             it != std::sregex_iterator(); ++it)
+        {
+            const std::string method = (*it)[1].str();
+            if (method == "TearDownTestSuite" ||
+                method == "SetUp" ||
+                method == "retireIncompatibleQwen122OverlayRunner" ||
+                method == "abortGraphNativeWorld" ||
+                method == "abortAfterRootThrow")
+                continue;
+            const auto body = braceBalancedDeclarationRegion(
+                qwen122, it->str());
+            ASSERT_FALSE(body.empty()) << method;
+            EXPECT_EQ(body.find("MPI_COMM_WORLD"), std::string::npos)
+                << "Cell evidence must use cell control: " << method;
+            ++audited_methods;
+        }
+        ASSERT_GT(audited_methods, 0u);
+        const auto production_region = braceBalancedDeclarationRegion(
+            qwen122,
+            "Qwen35MoENodeExpertOverlayParityTest::runGraphNativeProductionParityBody()");
+        ASSERT_FALSE(production_region.empty());
         EXPECT_EQ(production_region.find("MPI_COMM_WORLD"), std::string::npos)
             << "The test-side worker-loop rendezvous belongs to cell control.";
 
@@ -4399,7 +4437,7 @@ namespace llaminar2::test
         const fs::path generic_parity_path =
             root / "tests/v2/integration/parity/ParityTestBase.h";
         const fs::path expert_overlay_parity_path =
-            root / "tests/v2/integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_MathParity.cpp";
+            root / "tests/v2/integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_Parity.cpp";
         const fs::path model_parity_definition_path =
             root / "tests/v2/integration/parity/ModelParityDefinition.h";
         const fs::path server_e2e_path =
@@ -11119,14 +11157,14 @@ namespace llaminar2::test
         const fs::path root = findRepoRoot();
         const fs::path exact_parity_path =
             root /
-            "tests/v2/integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp";
+            "tests/v2/integration/parity/qwen35moe/Test__Qwen35MoE_NodeExpertOverlay_Parity.cpp";
         const fs::path node_tp_parity_path =
             root /
             "tests/v2/integration/parity/qwen35moe/Test__Qwen35MoE_NodeTP_Parity.cpp";
         ASSERT_TRUE(fs::exists(exact_parity_path)) << exact_parity_path;
         ASSERT_TRUE(fs::exists(node_tp_parity_path)) << node_tp_parity_path;
 
-        const std::string exact_parity = readFile(exact_parity_path);
+        const std::string exact_parity = readNodeOverlayFixture(exact_parity_path);
         const std::string node_tp_parity = readFile(node_tp_parity_path);
         ASSERT_FALSE(exact_parity.empty());
         ASSERT_FALSE(node_tp_parity.empty());
@@ -11134,10 +11172,10 @@ namespace llaminar2::test
         const std::array<std::string, 3> lifecycle_drivers{
             braceBalancedDeclarationRegion(
                 exact_parity,
-                "bool certifyDynamicResidencyEconomy()"),
+                "Qwen35MoENodeExpertOverlayParityTest::certifyDynamicResidencyEconomy()"),
             braceBalancedDeclarationRegion(
                 exact_parity,
-                "bool driveDynamicResidencyToDistributedMigration()"),
+                "Qwen35MoENodeExpertOverlayParityTest::driveDynamicResidencyToDistributedMigration()"),
             braceBalancedDeclarationRegion(
                 node_tp_parity,
                 "bool driveDynamicEconomyAndMovement()"),
@@ -11162,7 +11200,7 @@ namespace llaminar2::test
         const std::string promotion_attribution =
             braceBalancedDeclarationRegion(
                 exact_parity,
-                "void cacheCommittedPromotionEvidence()");
+                "Qwen35MoENodeExpertOverlayParityTest::cacheCommittedPromotionEvidence()");
         ASSERT_FALSE(promotion_attribution.empty());
         EXPECT_NE(
             promotion_attribution.find(
@@ -11178,7 +11216,7 @@ namespace llaminar2::test
 
         const std::string movement_csv = braceBalancedDeclarationRegion(
             exact_parity,
-            "void writeCommittedMovementEvidenceCsv() const");
+            "Qwen35MoENodeExpertOverlayParityTest::writeCommittedMovementEvidenceCsv() const");
         ASSERT_FALSE(movement_csv.empty());
         EXPECT_NE(
             movement_csv.find("moeOptimizationMovementLedger()"),
@@ -11190,7 +11228,8 @@ namespace llaminar2::test
                "state, not parse optional telemetry";
 
         const std::string production_setup =
-            braceBalancedDeclarationRegion(exact_parity, "bool setupPipeline()");
+            braceBalancedDeclarationRegion(
+                exact_parity, "Qwen35MoENodeExpertOverlayParityTest::setupPipeline()");
         ASSERT_FALSE(production_setup.empty());
         EXPECT_NE(
             production_setup.find("modelContextReuseStatus()"),

@@ -2266,22 +2266,22 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidMoEConfig_Throws)
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision)
 {
-    ArgvHelper args{"llaminar2", "--activation-precision", "bf16"};
+    ArgvHelper args{"llaminar2", "--activation-precision", "fp32"};
     OrchestrationConfigParser parser;
 
     auto config = parser.parseArgs(args.argc(), args.argv());
 
-    EXPECT_EQ(config.activation_precision, "bf16");
+    EXPECT_EQ(config.activation_precision, "fp32");
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision_Alias)
 {
-    ArgvHelper args{"llaminar2", "--act-prec", "fp16"};
+    ArgvHelper args{"llaminar2", "--act-prec", "fp32"};
     OrchestrationConfigParser parser;
 
     auto config = parser.parseArgs(args.argc(), args.argv());
 
-    EXPECT_EQ(config.activation_precision, "fp16");
+    EXPECT_EQ(config.activation_precision, "fp32");
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_TPAllreducePrecision)
@@ -2562,10 +2562,10 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_KvCachePrecision_InvalidThrows)
     EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
 }
 
-TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision_InvalidThrowsViaValidValues)
+TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision_InvalidReportsUnimplemented)
 {
-    // --activation-precision uses CliSpec's valid_values whitelist, so an
-    // unknown value must be rejected with a listing of the accepted set.
+    // Admission reports the actual production support rather than advertising
+    // tensor dtypes as complete model activation modes.
     ArgvHelper args({"llaminar2", "--activation-precision", "int4"});
     auto parser = createOrchestrationConfigParser();
     try
@@ -2577,7 +2577,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision_InvalidThrow
     {
         std::string msg = e.what();
         EXPECT_NE(msg.find("fp32"), std::string::npos);
-        EXPECT_NE(msg.find("bf16"), std::string::npos);
+        EXPECT_NE(msg.find("unimplemented"), std::string::npos);
     }
 }
 
@@ -2585,10 +2585,35 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision_AllThreeAlia
 {
     for (const auto &flag : {"--activation-precision", "--activation-prec", "--act-prec"})
     {
-        ArgvHelper args({"llaminar2", flag, "bf16"});
+        ArgvHelper args({"llaminar2", flag, "fp32"});
         auto parser = createOrchestrationConfigParser();
         auto config = parser->parseArgs(args.argc(), args.argv());
-        EXPECT_EQ(config.activation_precision, "bf16") << "flag=" << flag;
+        EXPECT_EQ(config.activation_precision, "fp32") << "flag=" << flag;
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, UnimplementedActivationsRejectCLIYamlAndConfig)
+{
+    for (const auto *precision : {"fp16", "bf16", "q8_1", "q16_1", "hybrid", "hybridq16"})
+    {
+        SCOPED_TRACE(precision);
+        OrchestrationConfigParser parser;
+        for (const auto *flag : {"--activation-precision", "--activation-prec", "--act-prec"})
+        {
+            ArgvHelper args{"llaminar2", flag, precision};
+            EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+        }
+        EXPECT_THROW(
+            parser.parseYamlString(std::string("activation_precision: ") + precision),
+            std::invalid_argument);
+        OrchestrationConfig config;
+        config.activation_precision = precision;
+        const auto errors = config.validate();
+        EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &error)
+        {
+            return error.find("unimplemented") != std::string::npos &&
+                   error.find("fp32") != std::string::npos;
+        }));
     }
 }
 

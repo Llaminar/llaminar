@@ -1,5 +1,5 @@
 /**
- * @file Test__Qwen36MoE_ExpertOverlay_MathParity.cpp
+ * @file Test__Qwen36MoE_ExpertOverlay_Parity.cpp
  * @brief Typed production parity matrix for homogeneous Qwen3.6 MoE overlays.
  *
  * Each declaration names only a real model/reference pack and one physical

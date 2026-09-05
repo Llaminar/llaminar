@@ -18,6 +18,7 @@
 #include "ParityTestBase.h"
 
 #include "backends/GlobalDeviceAddress.h"
+#include "config/ActivationPrecisionPolicy.h"
 #include "execution/config/RoutedExpertPolicy.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
@@ -1415,6 +1416,9 @@ namespace llaminar2::test::parity
             throw std::invalid_argument(
                 "model parity precision and prefill graph axes must not be empty");
         }
+        for (const auto activation : definition.precisions.activation)
+            requireImplementedActivationPrecision(
+                activationPrecisionToString(activation));
         if (std::set<ActivationPrecision>(
                 definition.precisions.activation.begin(),
                 definition.precisions.activation.end())

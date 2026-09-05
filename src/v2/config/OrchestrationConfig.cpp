@@ -2,11 +2,16 @@
  * @file OrchestrationConfig.cpp
  * @brief Implementation of OrchestrationConfig and related structures
  *
+ * Validates user-authored topology and execution policy before model admission.
+ * Activation support uses the shared production precision policy; independent
+ * KV and collective storage formats retain their own validation contracts.
+ *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include "OrchestrationConfig.h"
+#include "config/ActivationPrecisionPolicy.h"
 #include "config/ConfigValidator.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
 #include "utils/Logger.h"
@@ -1211,13 +1216,13 @@ namespace llaminar2
 
         // Validate precision strings
         {
-            const std::string act = toLower(activation_precision);
-            static const std::unordered_set<std::string> valid_activation = {
-                "fp32", "bf16", "fp16", "q8_1", "q16_1", "hybrid", "hybridq16"};
-            if (!valid_activation.count(act))
+            try
             {
-                errors.push_back("Invalid activation_precision: '" + activation_precision +
-                                 "' (valid: fp32, bf16, fp16, q8_1, q16_1, hybrid, hybridq16)");
+                requireImplementedActivationPrecision(activation_precision);
+            }
+            catch (const std::invalid_argument &error)
+            {
+                errors.push_back(error.what());
             }
         }
 

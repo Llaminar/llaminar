@@ -246,7 +246,7 @@ INSTANTIATE_TEST_SUITE_P(
  * @brief Custom main() with MPI initialization for NodeTP tests
  *
  * NodeTP tests REQUIRE MPI to be initialized with multiple ranks.
- * Run with: mpirun -np 2 ./v2_integration_node_tp_parity
+ * Run with: mpirun -np 2 ./v2_integration_parity_qwen2_node_tp_matrix
  */
 int main(int argc, char **argv)
 {

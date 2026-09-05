@@ -671,8 +671,7 @@ namespace llaminar2::test::parity
         definition.features.dynamic_speedup_witness =
             ModelParityDynamicSpeedupWitness::Random;
         definition.precisions.activation = {
-            ActivationPrecision::FP16,
-            ActivationPrecision::BF16,
+            ActivationPrecision::FP32,
         };
         definition.precisions.kv_cache = {
             KVCachePrecision::FP16,
@@ -694,7 +693,7 @@ namespace llaminar2::test::parity
 
         const auto cases = expandModelParityDefinition(definition);
 
-        ASSERT_EQ(cases.size(), 96u);
+        ASSERT_EQ(cases.size(), 48u);
         std::size_t witnesses = 0;
         std::size_t movement_only = 0;
         for (const auto &test_case : cases)
@@ -759,7 +758,7 @@ namespace llaminar2::test::parity
             }
         }
         EXPECT_EQ(witnesses, 1u);
-        EXPECT_EQ(movement_only, 47u);
+        EXPECT_EQ(movement_only, 23u);
     }
 
     TEST(ModelParityDefinition,
@@ -955,12 +954,27 @@ namespace llaminar2::test::parity
         EXPECT_EQ(dynamic_random, 5u);
     }
 
+    TEST(ModelParityDefinition, UnimplementedActivationAxesFailBeforeExpansion)
+    {
+        for (const auto activation : {
+                 ActivationPrecision::FP16, ActivationPrecision::BF16,
+                 ActivationPrecision::Q8_1, ActivationPrecision::Q16_1,
+                 ActivationPrecision::Hybrid, ActivationPrecision::HybridQ16,
+                 ActivationPrecision::TQ4, ActivationPrecision::TQ8,
+                 ActivationPrecision::AQ8})
+        {
+            SCOPED_TRACE(activationPrecisionToString(activation));
+            auto definition = makeDefinition(makeSingleDeviceTopology());
+            definition.precisions.activation = {activation};
+            EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
+        }
+    }
+
     TEST(ModelParityDefinition, PrecisionAxesUseTheSameCentralCrossProduct)
     {
         auto definition = makeDefinition(makeSingleDeviceTopology());
         definition.precisions.activation = {
             ActivationPrecision::FP32,
-            ActivationPrecision::BF16,
         };
         definition.precisions.kv_cache = {
             KVCachePrecision::FP32,
@@ -972,7 +986,7 @@ namespace llaminar2::test::parity
         q8_thresholds.mtp_kl_threshold = 0.234f;
         definition.precisions.threshold_overrides = {
             {
-                .activation = ActivationPrecision::BF16,
+                .activation = ActivationPrecision::FP32,
                 .kv_cache = KVCachePrecision::Q8_1,
                 .thresholds = q8_thresholds,
             },
@@ -980,7 +994,7 @@ namespace llaminar2::test::parity
 
         const auto cases = expandModelParityDefinition(definition);
 
-        ASSERT_EQ(cases.size(), 6u);
+        ASSERT_EQ(cases.size(), 3u);
         std::set<std::pair<int, int>> precision_pairs;
         for (const auto &test_case : cases)
         {
@@ -988,13 +1002,13 @@ namespace llaminar2::test::parity
                 static_cast<int>(test_case.activation_precision),
                 static_cast<int>(test_case.kv_cache_precision));
         }
-        EXPECT_EQ(precision_pairs.size(), 6u);
+        EXPECT_EQ(precision_pairs.size(), 3u);
         const auto overridden = std::find_if(
             cases.begin(), cases.end(),
             [](const ModelParityCase &test_case)
             {
                 return test_case.activation_precision ==
-                           ActivationPrecision::BF16 &&
+                           ActivationPrecision::FP32 &&
                        test_case.kv_cache_precision ==
                            KVCachePrecision::Q8_1;
             });
@@ -1227,7 +1241,7 @@ namespace llaminar2::test::parity
         auto definition = makeDefinition(
             makeOverlayTopology(), kModelParityRequiredMaximumMTPDepth);
         definition.features.mtp = ModelParityAxisProfile::Standard;
-        definition.precisions.activation = {ActivationPrecision::BF16};
+        definition.precisions.activation = {ActivationPrecision::FP32};
         definition.precisions.kv_cache = {KVCachePrecision::Q8_1};
         const auto cases = expandModelParityDefinition(definition);
         const auto &test_case = findCase(
@@ -1239,7 +1253,7 @@ namespace llaminar2::test::parity
         OrchestrationConfig runtime;
         test_case.applyRuntimePolicy(runtime);
 
-        EXPECT_EQ(runtime.activation_precision, "bf16");
+        EXPECT_EQ(runtime.activation_precision, "fp32");
         EXPECT_EQ(runtime.kv_cache_precision, "q8_1");
         EXPECT_TRUE(runtime.prefix_cache.enabled);
         EXPECT_EQ(runtime.prefix_cache.storage_mode, PrefixCacheStorageMode::Tiered);

@@ -1786,7 +1786,11 @@ topology matrix is now certified; the remaining gaps are listed explicitly:
 
 The final fixed-seed Release comparison used the Qwen3.5 122B MoE Q8_K_XL
 weights, four ROCm participants plus two NodeTP CPU participants, random initial
-ownership, FP16 activations and KV cache, prefix caching, and fixed MTP depth 2.
+ownership, requested FP16 activation configuration and FP16 KV cache, prefix
+caching, and fixed MTP depth 2. Accounting correction: the model schema uses
+FP32 activation buffers, so these historical runs do not prove FP16 activation
+support. New runs must explicitly request FP32; the timings below preserve the
+original measurements and have not been remeasured with corrected admission.
 No profiling or diagnostic timing was enabled. Static averaged 33.631 tok/s
 over three 1,024-token iterations. Dynamic with the production defaults
 converged to 33.988 tok/s over its final three iterations, a 1.06% settled

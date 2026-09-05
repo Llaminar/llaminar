@@ -66,7 +66,7 @@ def ctest_document(*names: str) -> str:
                         },
                     ],
                     "command": [
-                        "fake_gtest",
+                        "v2_integration_parity_fake_single_device_matrix",
                         "--gtest_filter=Suite.ProductionParity/CPU_KV_FP16",
                     ],
                 }
@@ -398,24 +398,78 @@ class ProductionParityCampaignTest(unittest.TestCase):
     def test_every_production_parity_source_uses_the_typed_definition_expander(
         self,
     ) -> None:
-        """Prevent model fixtures from rebuilding a private stringly matrix."""
+        """Every compiled fixture family must use the typed matrix expander."""
 
         parity_root = REPO_ROOT / "tests" / "v2" / "integration" / "parity"
+        cmake_root = REPO_ROOT / "tests" / "v2"
+        cmake = (cmake_root / "CMakeLists.txt").read_text(encoding="utf-8")
+        # Compilation boundaries are not configuration authorities. Follow the
+        # declared object-library links so a thin registration can use a shared
+        # typed expander without copying it into every implementation shard.
+        sources_by_target = {
+            target: {
+                (cmake_root / source).resolve()
+                for source in re.findall(r"(?<!\S)[\w./-]+\.cpp(?!\S)", body)
+            }
+            for target, body in re.findall(
+                r"add_(?:executable|library)\(\s*(\w+)\s+(.*?)\)",
+                cmake, re.DOTALL | re.IGNORECASE,
+            )
+        }
+        links_by_target: dict[str, set[str]] = {}
+        for target, body in re.findall(
+            r"target_link_libraries\(\s*(\w+)\s+(.*?)\)",
+            cmake, re.DOTALL | re.IGNORECASE,
+        ):
+            links_by_target.setdefault(target, set()).update(body.split())
+
+        def source_closure(target: str) -> set[Path]:
+            """Collect declared source ownership, visiting shared objects once."""
+            pending = [target]
+            seen: set[str] = set()
+            sources: set[Path] = set()
+            while pending:
+                current = pending.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                sources.update(sources_by_target.get(current, set()))
+                pending.extend(links_by_target.get(current, set()) - seen)
+            return sources
+
+        contents_by_path: dict[Path, str] = {}
+        def contents_for(path: Path) -> str:
+            """Read each shared source once, without interpreting model files."""
+            if path not in contents_by_path:
+                contents_by_path[path] = path.read_text(encoding="utf-8")
+            return contents_by_path[path]
+
+        contracts_by_target = {
+            target: "\n".join(contents_for(path) for path in source_closure(target))
+            for target in sources_by_target
+            if any(parity_root in path.parents for path in sources_by_target[target])
+        }
         offenders: list[str] = []
         for source in sorted(parity_root.rglob("*.cpp")):
-            contents = source.read_text(encoding="utf-8")
+            contents = contents_for(source)
             if "ProductionParity" not in contents:
                 continue
-            if (
-                "ModelParityDefinition" not in contents
-                or "expandModelParityDefinition" not in contents
+            contracts = [
+                contracts_by_target[target]
+                for target, sources in sources_by_target.items()
+                if source.resolve() in sources
+            ]
+            if not any(
+                "ModelParityDefinition" in contract and
+                "expandModelParityDefinition" in contract
+                for contract in contracts
             ):
                 offenders.append(str(source.relative_to(REPO_ROOT)))
 
         self.assertEqual(
             offenders,
             [],
-            "ProductionParity sources must declare and expand the canonical "
+            "ProductionParity source families must declare and expand the canonical "
             "typed model/topology matrix: " + ", ".join(offenders),
         )
 
@@ -587,7 +641,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 campaigns.CampaignGroup("CUDA", "ALL"),
             ),
             campaigns.CampaignCell(
-                "Qwen35MoEGraphNative_ProductionCampaign_CUDA_ALL_PRECISIONS",
+                "Qwen35MoE_35B_NodeExpertOverlay_ProductionCampaign_CUDA_ALL_PRECISIONS",
                 campaigns.CampaignGroup("CUDA", "ALL"),
             ),
         ]
@@ -597,7 +651,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             ".*",
             ".*",
             ".*",
-            ".*(?:ExpertOverlay|MoEGraphNative).*",
+            ".*ExpertOverlay.*",
         )
 
         self.assertEqual(
@@ -630,7 +684,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 "/usr/bin/mpirun",
                 "-np",
                 "2",
-                "fake_gtest",
+                "v2_integration_parity_fake_single_device_matrix",
                 "--flag=retained",
                 "--gtest_filter=" + ":".join(cases),
             ),
@@ -653,14 +707,14 @@ class ProductionParityCampaignTest(unittest.TestCase):
             "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
             campaigns.CampaignGroup("CPU", "ALL"),
             gtest_cases=(case,),
-            command=("fake_gtest",),
+            command=("v2_integration_parity_fake_single_device_matrix",),
         )
         duplicate_filter = campaigns.CampaignCell(
             missing_filter.name,
             missing_filter.group,
             gtest_cases=(case,),
             command=(
-                "fake_gtest",
+                "v2_integration_parity_fake_single_device_matrix",
                 f"--gtest_filter={case}",
                 f"--gtest_filter={case}",
             ),
@@ -685,7 +739,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
             campaigns.CampaignGroup("CPU", "ALL"),
             gtest_cases=(case,),
-            command=("fake_gtest", f"--gtest_filter={case}"),
+            command=("v2_integration_parity_fake_single_device_matrix", f"--gtest_filter={case}"),
             environment=("OMP_NUM_THREADS=28", "MODE=registered"),
             working_directory="/workspaces/llaminar",
         )
@@ -708,7 +762,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertEqual(result.gtest_cases, (case,))
         self.assertEqual(
             run_process.call_args.args[0],
-            ["fake_gtest", f"--gtest_filter={case}"],
+            ["v2_integration_parity_fake_single_device_matrix", f"--gtest_filter={case}"],
         )
         self.assertEqual(
             run_process.call_args.kwargs["working_directory"],
@@ -732,7 +786,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
             campaigns.CampaignGroup("CPU", "ALL"),
             gtest_cases=cases,
-            command=("fake_gtest", "--gtest_filter=" + ":".join(cases)),
+            command=("v2_integration_parity_fake_single_device_matrix", "--gtest_filter=" + ":".join(cases)),
             environment=("MODE=production",),
             working_directory="/workspaces/llaminar",
         )
@@ -787,7 +841,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             "V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",
             campaigns.CampaignGroup("CPU", "ALL"),
             gtest_cases=(case,),
-            command=("fake_gtest", f"--gtest_filter={case}"),
+            command=("v2_integration_parity_fake_single_device_matrix", f"--gtest_filter={case}"),
             environment=("MODE=old",),
             working_directory="/workspaces/llaminar",
         )
@@ -833,7 +887,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             campaigns.CampaignGroup("CPU", "ALL"),
             gtest_cases=(prefix, first_red, unrun),
             command=(
-                "fake_gtest",
+                "v2_integration_parity_fake_single_device_matrix",
                 "--gtest_filter=" + ":".join((prefix, first_red, unrun)),
             ),
             environment=("GTEST_FAIL_FAST=1",),
@@ -845,7 +899,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             campaigns.CampaignGroup("CUDA", "ALL"),
             gtest_cases=(aggregate_green,),
             command=(
-                "fake_gtest",
+                "v2_integration_parity_fake_single_device_matrix",
                 f"--gtest_filter={aggregate_green}",
             ),
             environment=("GTEST_FAIL_FAST=1",),
@@ -1646,7 +1700,7 @@ time.sleep(30)
         )
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
-            executable = directory / "fake_gtest"
+            executable = directory / "v2_integration_parity_fake_single_device_matrix"
             executable.write_text(
                 "#!/bin/sh\n"
                 "cat <<'EOF'\n"
@@ -1698,6 +1752,20 @@ time.sleep(30)
                 msg=completed.stderr or completed.stdout,
             )
             registration = generated.read_text(encoding="utf-8")
+
+            # The same production inventory must not be published under a
+            # cell-shaped or legacy binary identity. Exercise real discovery,
+            # not a source scan of the target declarations.
+            stale_executable = directory / "v2_integration_parity_fake_fp16"
+            executable.rename(stale_executable)
+            stale_command = list(completed.args)
+            stale_command[1] = f"-DTEST_EXECUTABLE={stale_executable}"
+            rejected = subprocess.run(
+                stale_command, check=False, capture_output=True, text=True
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("configuration axes belong in generated cell names",
+                          " ".join(rejected.stderr.split()))
 
         self.assertEqual(
             registration.count(
@@ -1793,7 +1861,7 @@ time.sleep(30)
         )
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
-            executable = directory / "fake_gtest"
+            executable = directory / "v2_integration_parity_fake_single_device_matrix"
             executable.write_text(
                 "#!/bin/sh\n"
                 "cat <<'EOF'\n"
@@ -1865,7 +1933,7 @@ time.sleep(30)
         )
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
-            executable = directory / "fake_gtest"
+            executable = directory / "v2_integration_parity_fake_single_device_matrix"
             executable.write_text(
                 "#!/bin/sh\n"
                 "cat <<'EOF'\n"
@@ -1933,7 +2001,7 @@ time.sleep(30)
         )
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
-            executable = directory / "fake_gtest"
+            executable = directory / "v2_integration_parity_fake_single_device_matrix"
             executable.write_text(
                 "#!/bin/sh\n"
                 "cat <<'EOF'\n"
@@ -2018,7 +2086,7 @@ time.sleep(30)
         )
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
-            executable = directory / "fake_gtest"
+            executable = directory / "v2_integration_parity_fake_single_device_matrix"
             executable.write_text(
                 "#!/bin/sh\n"
                 "cat <<'EOF'\n"

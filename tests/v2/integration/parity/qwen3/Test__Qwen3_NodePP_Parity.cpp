@@ -1,10 +1,10 @@
 /**
- * @file Test__Qwen3_NodeLocalPP_Parity.cpp
- * @brief Node-Local PP parity tests for Qwen3 using MPI (multi-rank, same node)
+ * @file Test__Qwen3_NodePP_Parity.cpp
+ * @brief Node PP parity tests for Qwen3 using MPI (multi-rank, same node)
  *
- * These tests validate Node-Local Pipeline Parallelism (NodeLocalPP) via
+ * These tests validate Node-scoped Pipeline Parallelism (NodePP) via
  * GlobalOrchestrator for Qwen3 architecture. Unlike LocalPP which uses
- * intra-process device-to-device transfers, NodeLocalPP uses MPI send/recv
+ * intra-process device-to-device transfers, NodePP uses MPI send/recv
  * for cross-rank activation transfer — each MPI rank handles a disjoint
  * subset of transformer layers.
  *
@@ -18,7 +18,7 @@
  *   - 2 MPI ranks for 2-way PP
  *
  * Test configurations:
- *   - NodeLocalPP_2xMPI_CPU: 2 MPI ranks, CPU, Qwen3-0.6B Q8_0
+ *   - NodePP_2xMPI_CPU: 2 MPI ranks, CPU, Qwen3-0.6B Q8_0
  *
  * @author David Sanftenberg
  * @date 2026
@@ -64,7 +64,13 @@ static const std::vector<ModelParityCase> &qwen3NodePipelineCases()
 // Parameterized Test Fixture
 // =============================================================================
 
-class Qwen3NodeLocalPPParityTest : public Qwen3ConfigDrivenParityTest<Qwen3NodeLocalPPParityTest>,
+/**
+ * @brief Generated node-scoped pipeline parity fixture.
+ *
+ * The typed case owns rank placement and precision; this suite names only the
+ * execution family shared by its production and focused setup checks.
+ */
+class Qwen3NodePPParityTest : public Qwen3ConfigDrivenParityTest<Qwen3NodePPParityTest>,
                                    public ModelParityCaseParameter
 {
 };
@@ -76,7 +82,7 @@ class Qwen3NodeLocalPPParityTest : public Qwen3ConfigDrivenParityTest<Qwen3NodeL
 /**
  * @brief Verify GlobalOrchestrator pipeline setup for PP
  */
-TEST_P(Qwen3NodeLocalPPParityTest, GlobalOrchestratorSetup)
+TEST_P(Qwen3NodePPParityTest, GlobalOrchestratorSetup)
 {
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
 
@@ -86,7 +92,7 @@ TEST_P(Qwen3NodeLocalPPParityTest, GlobalOrchestratorSetup)
 
     // Verify GlobalOrchestrator was created
     ASSERT_NE(global_orchestrator_ptr_, nullptr)
-        << "GlobalOrchestrator should be created for NodeLocalPP";
+        << "GlobalOrchestrator should be created for NodePP";
 
     // Verify pipeline topology
     bool is_head = global_orchestrator_ptr_->isPipelineHead();
@@ -103,7 +109,7 @@ TEST_P(Qwen3NodeLocalPPParityTest, GlobalOrchestratorSetup)
         EXPECT_TRUE(is_tail) << "Last rank should be pipeline tail";
     }
 
-    LOG_INFO("[NodeLocalPP Qwen3] Rank " << mpi_ctx_->rank()
+    LOG_INFO("[NodePP Qwen3] Rank " << mpi_ctx_->rank()
                                          << " verified GlobalOrchestrator (head=" << is_head
                                          << ", tail=" << is_tail << ")");
 }
@@ -111,7 +117,7 @@ TEST_P(Qwen3NodeLocalPPParityTest, GlobalOrchestratorSetup)
 /**
  * @brief Full prefill/decode production parity via GlobalOrchestrator.
  */
-TEST_P(Qwen3NodeLocalPPParityTest, ProductionParity)
+TEST_P(Qwen3NodePPParityTest, ProductionParity)
 {
     runProductionParityCampaign();
 }
@@ -121,8 +127,8 @@ TEST_P(Qwen3NodeLocalPPParityTest, ProductionParity)
 // =============================================================================
 
 INSTANTIATE_TEST_SUITE_P(
-    Qwen3NodeLocalPP,
-    Qwen3NodeLocalPPParityTest,
+    Qwen3NodePP,
+    Qwen3NodePPParityTest,
     ::testing::ValuesIn(qwen3NodePipelineCases()),
     [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {

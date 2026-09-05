@@ -7600,18 +7600,18 @@ if(ZLIB_FOUND)
     # =========================================================================
 
     # ---- Single-Device Parity (CPU, CUDA, ROCm) ----
-    add_executable(v2_integration_parity_qwen2_single_device
+    add_executable(v2_integration_parity_qwen2_single_device_matrix
         integration/parity/qwen2/Test__Qwen2_SingleDevice_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen2_single_device
+    target_link_libraries(v2_integration_parity_qwen2_single_device_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen2_single_device PRIVATE
+    target_include_directories(v2_integration_parity_qwen2_single_device_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen2_single_device
+    discover_v2_parity_tests(v2_integration_parity_qwen2_single_device_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen2_SingleDevice
         LABELS "V2;Integration;Parity;Qwen2;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
@@ -7619,18 +7619,18 @@ if(ZLIB_FOUND)
     )
 
     # ---- Local Tensor Parallelism (NCCL, RCCL, HOST) ----
-    add_executable(v2_integration_parity_qwen2_local_tp
+    add_executable(v2_integration_parity_qwen2_local_tp_matrix
         integration/parity/qwen2/Test__Qwen2_LocalTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen2_local_tp
+    target_link_libraries(v2_integration_parity_qwen2_local_tp_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen2_local_tp PRIVATE
+    target_include_directories(v2_integration_parity_qwen2_local_tp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen2_local_tp
+    discover_v2_parity_tests(v2_integration_parity_qwen2_local_tp_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen2_LocalTP
         LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;NCCL;RCCL;LOCAL;TensorParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
@@ -7638,18 +7638,18 @@ if(ZLIB_FOUND)
     )
 
     # ---- Local Pipeline Parallelism (NCCL, RCCL, HOST) ----
-    add_executable(v2_integration_parity_qwen2_local_pp
+    add_executable(v2_integration_parity_qwen2_local_pp_matrix
         integration/parity/qwen2/Test__Qwen2_LocalPP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen2_local_pp
+    target_link_libraries(v2_integration_parity_qwen2_local_pp_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen2_local_pp PRIVATE
+    target_include_directories(v2_integration_parity_qwen2_local_pp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen2_local_pp
+    discover_v2_parity_tests(v2_integration_parity_qwen2_local_pp_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen2_LocalPP
         LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;CPU;NCCL;RCCL;HOST;LOCAL;PipelineParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
@@ -7657,14 +7657,14 @@ if(ZLIB_FOUND)
     )
 
     # ---- Hybrid PP+TP (nested TP domains within PP stages) ----
-    add_executable(v2_integration_parity_qwen2_hybrid_pptp
+    add_executable(v2_integration_parity_qwen2_hybrid_pptp_matrix
         integration/parity/qwen2/Test__Qwen2_HybridPPTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen2_hybrid_pptp
+    target_link_libraries(v2_integration_parity_qwen2_hybrid_pptp_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen2_hybrid_pptp PRIVATE
+    target_include_directories(v2_integration_parity_qwen2_hybrid_pptp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
@@ -7672,7 +7672,7 @@ if(ZLIB_FOUND)
     # accumulation between RCCL init/destroy cycles (a known ROCm bug
     # that causes "Memobj map does not have ptr: 0x0" crashes when
     # multiple TP configs or test types run back-to-back in the same process).
-    discover_v2_parity_tests(v2_integration_parity_qwen2_hybrid_pptp
+    discover_v2_parity_tests(v2_integration_parity_qwen2_hybrid_pptp_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen2_HybridPPTP
         LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;CPU;NCCL;RCCL;LOCAL;TensorParallel;PipelineParallel;Hybrid;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
@@ -7687,18 +7687,18 @@ if(ZLIB_FOUND)
     # =========================================================================
 
     # ---- Single-Device Parity (CPU, CUDA, ROCm) ----
-    add_executable(v2_integration_parity_qwen3_single_device
+    add_executable(v2_integration_parity_qwen3_single_device_matrix
         integration/parity/qwen3/Test__Qwen3_SingleDevice_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen3_single_device
+    target_link_libraries(v2_integration_parity_qwen3_single_device_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen3_single_device PRIVATE
+    target_include_directories(v2_integration_parity_qwen3_single_device_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen3_single_device
+    discover_v2_parity_tests(v2_integration_parity_qwen3_single_device_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen3_SingleDevice
         LABELS "V2;Integration;Parity;Qwen3;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
@@ -7706,18 +7706,18 @@ if(ZLIB_FOUND)
     )
 
     # ---- NodeTP Parity (Multi-Socket CPU TP) ----
-    add_executable(v2_integration_parity_qwen3_node_tp
+    add_executable(v2_integration_parity_qwen3_node_tp_matrix
         integration/parity/qwen3/Test__Qwen3_NodeTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen3_node_tp
+    target_link_libraries(v2_integration_parity_qwen3_node_tp_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen3_node_tp PRIVATE
+    target_include_directories(v2_integration_parity_qwen3_node_tp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen3_node_tp
+    discover_v2_parity_tests(v2_integration_parity_qwen3_node_tp_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen3_NodeTP
         LABELS "V2;Integration;Parity;Qwen3;NodeTP;MPI;TensorParallel;UPI;CrossRank;CPU"
         MPI_PROCS 2
@@ -7726,26 +7726,26 @@ if(ZLIB_FOUND)
 
     message(STATUS "V2: Qwen3 NodeTP parity tests enabled (requires mpirun -np 2+)")
 
-    # ---- NodeLocalPP Parity (Cross-Rank Pipeline Parallelism via GlobalOrchestrator) ----
-    add_executable(v2_integration_parity_qwen3_node_local_pp
-        integration/parity/qwen3/Test__Qwen3_NodeLocalPP_Parity.cpp
+    # ---- NodePP Parity (Cross-Rank Pipeline Parallelism via GlobalOrchestrator) ----
+    add_executable(v2_integration_parity_qwen3_node_pp_matrix
+        integration/parity/qwen3/Test__Qwen3_NodePP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen3_node_local_pp
+    target_link_libraries(v2_integration_parity_qwen3_node_pp_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen3_node_local_pp PRIVATE
+    target_include_directories(v2_integration_parity_qwen3_node_pp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen3_node_local_pp
-        TEST_PREFIX V2_Integration_Parity_Qwen3_NodeLocalPP
-        LABELS "V2;Integration;Parity;Qwen3;NodeLocalPP;MPI;PipelineParallel;CrossRank;CPU;GlobalOrchestrator"
+    discover_v2_parity_tests(v2_integration_parity_qwen3_node_pp_matrix
+        TEST_PREFIX V2_Integration_Parity_Qwen3_NodePP
+        LABELS "V2;Integration;Parity;Qwen3;NodePP;MPI;PipelineParallel;CrossRank;CPU;GlobalOrchestrator"
         MPI_PROCS 2
         MODEL_FILES ${V2_PARITY_MODEL_QWEN3_Q8}
     )
 
-    message(STATUS "V2: Qwen3 NodeLocalPP parity tests enabled (requires mpirun -np 2+)")
+    message(STATUS "V2: Qwen3 NodePP parity tests enabled (requires mpirun -np 2+)")
 
     # =========================================================================
     # Qwen3.5 Parity Test Matrix (integration/parity/qwen35/)
@@ -7757,18 +7757,18 @@ if(ZLIB_FOUND)
     # =========================================================================
 
     # ---- Single-Device Parity (CPU, CUDA, ROCm) ----
-    add_executable(v2_integration_parity_qwen35_single_device
+    add_executable(v2_integration_parity_qwen35_single_device_matrix
         integration/parity/qwen35/Test__Qwen35_SingleDevice_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen35_single_device
+    target_link_libraries(v2_integration_parity_qwen35_single_device_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35_single_device PRIVATE
+    target_include_directories(v2_integration_parity_qwen35_single_device_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen35_single_device
+    discover_v2_parity_tests(v2_integration_parity_qwen35_single_device_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen35_SingleDevice
         LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
@@ -7780,18 +7780,18 @@ if(ZLIB_FOUND)
     )
 
     # ---- Local Tensor Parallelism (HOST, NCCL, RCCL) ----
-    add_executable(v2_integration_parity_qwen35_local_tp
+    add_executable(v2_integration_parity_qwen35_local_tp_matrix
         integration/parity/qwen35/Test__Qwen35_LocalTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen35_local_tp
+    target_link_libraries(v2_integration_parity_qwen35_local_tp_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35_local_tp PRIVATE
+    target_include_directories(v2_integration_parity_qwen35_local_tp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen35_local_tp
+    discover_v2_parity_tests(v2_integration_parity_qwen35_local_tp_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen35_LocalTP
         LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CUDA;ROCm;NCCL;RCCL;LOCAL;TensorParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
@@ -7801,18 +7801,18 @@ if(ZLIB_FOUND)
     )
 
     # ---- Local Pipeline Parallelism (HOST, NCCL, RCCL) ----
-    add_executable(v2_integration_parity_qwen35_local_pp
+    add_executable(v2_integration_parity_qwen35_local_pp_matrix
         integration/parity/qwen35/Test__Qwen35_LocalPP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen35_local_pp
+    target_link_libraries(v2_integration_parity_qwen35_local_pp_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35_local_pp PRIVATE
+    target_include_directories(v2_integration_parity_qwen35_local_pp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen35_local_pp
+    discover_v2_parity_tests(v2_integration_parity_qwen35_local_pp_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen35_LocalPP
         LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CPU;CUDA;ROCm;NCCL;RCCL;HOST;LOCAL;PipelineParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
@@ -7892,23 +7892,23 @@ if(ZLIB_FOUND)
     #   - NodeTP_2xMPI_CPU_08B: 2 MPI ranks, CPU, Qwen3.5-0.8B Q4_0
     #   - NodeTP_2xMPI_CPU_4B:  2 MPI ranks, CPU, Qwen3.5-4B Q8_0
     # =========================================================================
-    add_executable(v2_integration_parity_qwen35_node_tp
+    add_executable(v2_integration_parity_qwen35_node_tp_matrix
         integration/parity/qwen35/Test__Qwen35_NodeTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     # Note: No gtest_main - test provides custom main() with MPI_Init
-    target_link_libraries(v2_integration_parity_qwen35_node_tp
+    target_link_libraries(v2_integration_parity_qwen35_node_tp_matrix
         llaminar2_core
         v2_test_utils
         GTest::gtest
         ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35_node_tp PRIVATE
+    target_include_directories(v2_integration_parity_qwen35_node_tp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    discover_v2_parity_tests(v2_integration_parity_qwen35_node_tp
+    discover_v2_parity_tests(v2_integration_parity_qwen35_node_tp_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen35_NodeTP
         LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;NodeTP;MPI;TensorParallel;UPI;CrossRank;CPU"
         MPI_PROCS 2
@@ -7920,26 +7920,26 @@ if(ZLIB_FOUND)
 
     message(STATUS "V2: Qwen3.5 NodeTP parity tests enabled (requires mpirun -np 2+)")
 
-    # ---- NodeLocalPP Parity (Cross-Rank Pipeline Parallelism via GlobalOrchestrator) ----
-    add_executable(v2_integration_parity_qwen35_node_local_pp
-        integration/parity/qwen35/Test__Qwen35_NodeLocalPP_Parity.cpp
+    # ---- NodePP Parity (Cross-Rank Pipeline Parallelism via GlobalOrchestrator) ----
+    add_executable(v2_integration_parity_qwen35_node_pp_matrix
+        integration/parity/qwen35/Test__Qwen35_NodePP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen35_node_local_pp
+    target_link_libraries(v2_integration_parity_qwen35_node_pp_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35_node_local_pp PRIVATE
+    target_include_directories(v2_integration_parity_qwen35_node_pp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen35_node_local_pp
-        TEST_PREFIX V2_Integration_Parity_Qwen35_NodeLocalPP
-        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;NodeLocalPP;MPI;PipelineParallel;CrossRank;CPU;GlobalOrchestrator"
+    discover_v2_parity_tests(v2_integration_parity_qwen35_node_pp_matrix
+        TEST_PREFIX V2_Integration_Parity_Qwen35_NodePP
+        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;NodePP;MPI;PipelineParallel;CrossRank;CPU;GlobalOrchestrator"
         MPI_PROCS 2
         MODEL_FILES ${V2_PARITY_MODEL_QWEN35_08B_Q4}
     )
 
-    message(STATUS "V2: Qwen3.5 NodeLocalPP parity tests enabled (requires mpirun -np 2+)")
+    message(STATUS "V2: Qwen3.5 NodePP parity tests enabled (requires mpirun -np 2+)")
 
     # =========================================================================
     # Qwen3.6 Dense Prefix Cache / MTP PyTorch Parity Matrix
@@ -7949,19 +7949,19 @@ if(ZLIB_FOUND)
     # The harness regenerates metadata-only PyTorch references when absent.
     # =========================================================================
 
-    add_executable(v2_integration_parity_qwen36_single_device_math
+    add_executable(v2_integration_parity_qwen36_single_device_matrix
         integration/parity/qwen36/Test__Qwen36_SingleDevice_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen36_single_device_math
+    target_link_libraries(v2_integration_parity_qwen36_single_device_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen36_single_device_math PRIVATE
+    target_include_directories(v2_integration_parity_qwen36_single_device_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen36_single_device_math
-        TEST_PREFIX V2_Integration_Parity_Qwen36_SingleDevice_Math
+    discover_v2_parity_tests(v2_integration_parity_qwen36_single_device_matrix
+        TEST_PREFIX V2_Integration_Parity_Qwen36_SingleDevice
         LABELS "V2;Integration;Parity;Qwen36;Dense;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
         TIMEOUT 3600
@@ -8317,7 +8317,7 @@ if(ZLIB_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp
-        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_ExpertOverlay
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_ExpertOverlay_PrefixMTP
         LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;ExpertOverlay;SparseCollectives;CUDA;ROCm;NCCL;RCCL;CPU;LocalTP;PyTorch"
         MPI_PROCS 1
         TIMEOUT 2400
@@ -8325,19 +8325,19 @@ if(ZLIB_FOUND)
         MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
 
-    add_executable(v2_integration_parity_qwen36moe_expert_overlay_math
-        integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_MathParity.cpp
+    add_executable(v2_integration_parity_qwen36moe_expert_overlay_matrix
+        integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen36moe_expert_overlay_math
+    target_link_libraries(v2_integration_parity_qwen36moe_expert_overlay_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen36moe_expert_overlay_math PRIVATE
+    target_include_directories(v2_integration_parity_qwen36moe_expert_overlay_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen36moe_expert_overlay_math
-        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math
+    discover_v2_parity_tests(v2_integration_parity_qwen36moe_expert_overlay_matrix
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_ExpertOverlay
         LABELS "V2;Integration;Parity;Qwen36MoE;MixtureOfExperts;GatedDeltaNet;CUDA;ROCm;LocalTP;ExpertOverlay;Static;Dynamic;MTP;PrefixCache;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
         TIMEOUT 3600
@@ -8345,19 +8345,19 @@ if(ZLIB_FOUND)
         MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
 
-    add_executable(v2_integration_parity_qwen36moe_single_device
+    add_executable(v2_integration_parity_qwen36moe_single_device_matrix
         integration/parity/qwen36/Test__Qwen36MoE_SingleDevice_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen36moe_single_device
+    target_link_libraries(v2_integration_parity_qwen36moe_single_device_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen36moe_single_device PRIVATE
+    target_include_directories(v2_integration_parity_qwen36moe_single_device_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen36moe_single_device
-        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_SingleDevice_Math
+    discover_v2_parity_tests(v2_integration_parity_qwen36moe_single_device_matrix
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_SingleDevice
         LABELS "V2;Integration;Parity;Qwen36MoE;MixtureOfExperts;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
         TIMEOUT 3600
@@ -8384,18 +8384,18 @@ if(ZLIB_FOUND)
     # =========================================================================
 
     # ---- Single-Device MoE Parity (CPU, CUDA, ROCm) ----
-    add_executable(v2_integration_parity_qwen35moe_single_device
+    add_executable(v2_integration_parity_qwen35moe_single_device_matrix
         integration/parity/qwen35moe/Test__Qwen35MoE_SingleDevice_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen35moe_single_device
+    target_link_libraries(v2_integration_parity_qwen35moe_single_device_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35moe_single_device PRIVATE
+    target_include_directories(v2_integration_parity_qwen35moe_single_device_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_single_device
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_single_device_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen35MoE_SingleDevice
         LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
@@ -8429,22 +8429,22 @@ if(ZLIB_FOUND)
     message(STATUS "V2: Qwen3.5 MoE LongContext CPU-vs-ROCm parity sweep enabled")
 
     # ---- LocalTP MoE Parity (2x ROCm expert-ID apportionment + RCCL) ----
-    add_executable(v2_integration_parity_qwen35moe_local_tp
+    add_executable(v2_integration_parity_qwen35moe_local_tp_matrix
         integration/parity/qwen35moe/Test__Qwen35MoE_LocalTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen35moe_local_tp
+    target_link_libraries(v2_integration_parity_qwen35moe_local_tp_matrix
         llaminar2_core
         v2_test_utils
         GTest::gtest
         ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35moe_local_tp PRIVATE
+    target_include_directories(v2_integration_parity_qwen35moe_local_tp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_local_tp
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_local_tp_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen35MoE_LocalTP
         LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;LocalTP;RCCL;ROCm;TensorParallel;RoutedExpertPlacement"
         MPI_PROCS 1
@@ -8454,22 +8454,60 @@ if(ZLIB_FOUND)
     message(STATUS "V2: Qwen3.5 MoE LocalTP parity tests enabled")
 
     # ---- Production graph-native Expert Overlay parity (sparse collective tiers) ----
-    add_executable(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold
-        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp
+    # Compile implementation once for both model sizes. Object linkage retains
+    # the common TEST/TEST_P registrars, which an unreferenced archive member
+    # could otherwise drop. Only the tiny registration sources select a model.
+    add_library(v2_parity_qwen35moe_node_overlay OBJECT
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParitySupportPolicy.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParitySupportTopology.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParitySupportReference.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityLifecycle.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityEconomy.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityGraphEvidence.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityRoutingEvidence.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityPlacement.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityMovement.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityMovementEvidence.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityPromotionEvidence.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityMTPDiagnostics.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityRunner.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityMTPReference.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityGeometryTests.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityShardOwnershipTests.cpp
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityMain.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold
-        llaminar2_core
-        v2_test_utils
-        GTest::gtest
-        ZLIB::ZLIB
+    target_link_libraries(v2_parity_qwen35moe_node_overlay PUBLIC
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold PRIVATE
+    target_include_directories(v2_parity_qwen35moe_node_overlay PUBLIC
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold
-        TEST_PREFIX V2_Integration_Parity_Qwen35MoEGraphNative_CudaHotRocmWarmCpuCold
+    target_compile_definitions(v2_parity_qwen35moe_node_overlay PUBLIC
+        LLAMINAR_PARITY_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/integration/parity"
+    )
+    # Parse the shared model/template declarations once as well. Both clients
+    # have the same compile contract: no model-size preprocessor specialization.
+    target_precompile_headers(v2_parity_qwen35moe_node_overlay PRIVATE
+        integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityFixture.h
+    )
+
+    add_executable(v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix
+        integration/parity/qwen35moe/Test__Qwen35MoE_NodeExpertOverlay_Parity.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix
+        v2_parity_qwen35moe_node_overlay
+    )
+    target_precompile_headers(v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix
+        REUSE_FROM v2_parity_qwen35moe_node_overlay
+    )
+    target_include_directories(v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_35B_NodeExpertOverlay
         LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;CPU;MPI;NodeTP;UPI"
         MPI_PROCS 2
         TIMEOUT 1800
@@ -8485,12 +8523,23 @@ if(ZLIB_FOUND)
         MODEL_FILES ${V2_PARITY_MODEL_QWEN35_MOE_Q4}
     )
 
+    # Cross-translation-unit ownership must remain process-local and singular.
+    add_v2_test(V2_Integration_ParityFixtureShardOwnership
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix>
+            --gtest_filter=Qwen35MoEFixtureShardOwnership.SharesActiveCaseAcrossPolicyAndLifecycle
+        LABELS "V2;Integration;ExpertOverlay;Lifecycle;ParityPreflight"
+        MPI_PROCS 1
+        TIMEOUT 120
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+    )
+
     # Model-free lifecycle regression for the finite Dynamic traffic horizon.
     # Keep this independent of discovery's real-weight fixture so the canonical
     # preflight proves exact partial-bank closure before any campaign occupies
     # an accelerator or stages a GGUF.
     add_v2_test(V2_Integration_DynamicConvergenceFiniteHorizonLifecycle
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold>
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix>
             --gtest_filter=Qwen35MoEDynamicConvergenceLifecycle.FiniteHorizonClosesPartialBankBeforeFinalPublication
         LABELS "V2;Integration;ExpertOverlay;Dynamic;Lifecycle;ParityPreflight"
         MPI_PROCS 1
@@ -8504,7 +8553,7 @@ if(ZLIB_FOUND)
     # request authenticated demand and suppress duplicates until the authority
     # publishes the submitted admission.
     add_v2_test(V2_Integration_DynamicEmptySuccessorDemandLifecycle
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold>
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix>
             --gtest_filter=Qwen35MoEDynamicConvergenceLifecycle.EmptySuccessorBankRequestsFreshDemandAfterSlowAsyncWave
         LABELS "V2;Integration;ExpertOverlay;Dynamic;Lifecycle;ParityPreflight"
         MPI_PROCS 1
@@ -8517,7 +8566,7 @@ if(ZLIB_FOUND)
     # parity cannot certify a sidecar expert; the primary MTP checkpoint must
     # publish its exact routed contribution before the promotion epilogue.
     add_v2_test(V2_Integration_DynamicPromotedExpertMTPProofLifecycle
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold>
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix>
             --gtest_filter=Qwen35MoEDynamicConvergenceLifecycle.RequiresPrimaryMTPCheckpointBeforePromotedExpertEvidence
         LABELS "V2;Integration;ExpertOverlay;Dynamic;MTP;Lifecycle;ParityPreflight"
         MPI_PROCS 1
@@ -8530,7 +8579,7 @@ if(ZLIB_FOUND)
     # traffic may author valid movement, but the mathematical gate settles only
     # after the exact Hugging Face prefill has selected a promoted expert.
     add_v2_test(V2_Integration_DynamicAuthenticatedPromotionProofLifecycle
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold>
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix>
             --gtest_filter=Qwen35MoEDynamicConvergenceLifecycle.RequiresAuthenticatedWorkloadPromotion
         LABELS "V2;Integration;ExpertOverlay;Dynamic;Lifecycle;ParityPreflight"
         MPI_PROCS 1
@@ -8542,31 +8591,26 @@ if(ZLIB_FOUND)
     message(STATUS "V2: Qwen3.5 MoE GraphNative parity tests enabled")
 
     # ---- Qwen3.5 122B typed ExpertOverlay topology matrix ----
-    # The source is shared with the mature coordinated two-rank graph-native
-    # fixture, while the compile definition registers only the 122B cells in
-    # this binary. This keeps model manifests exact: the 35B campaign does not
+    # The object library is shared with the coordinated node fixture, while
+    # this registration source admits only 122B cells. Model manifests remain
+    # exact: the 35B campaign does not
     # stage 126 GiB of unrelated weights and the 122B campaign cannot start
     # unless all four split GGUF files are authenticated in tmpfs.
-    add_executable(v2_integration_parity_qwen35moe_122b_expert_overlay
-        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    add_executable(v2_integration_parity_qwen35moe_122b_node_expert_overlay_matrix
+        integration/parity/qwen35moe/Test__Qwen35MoE_122B_NodeExpertOverlay_Parity.cpp
     )
-    target_compile_definitions(
-        v2_integration_parity_qwen35moe_122b_expert_overlay PRIVATE
-        LLAMINAR_QWEN122_MATRIX_ONLY=1
+    target_link_libraries(v2_integration_parity_qwen35moe_122b_node_expert_overlay_matrix
+        v2_parity_qwen35moe_node_overlay
     )
-    target_link_libraries(v2_integration_parity_qwen35moe_122b_expert_overlay
-        llaminar2_core
-        v2_test_utils
-        GTest::gtest
-        ZLIB::ZLIB
+    target_precompile_headers(v2_integration_parity_qwen35moe_122b_node_expert_overlay_matrix
+        REUSE_FROM v2_parity_qwen35moe_node_overlay
     )
-    target_include_directories(v2_integration_parity_qwen35moe_122b_expert_overlay PRIVATE
+    target_include_directories(v2_integration_parity_qwen35moe_122b_node_expert_overlay_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_122b_expert_overlay
-        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_122B_ExpertOverlay
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_122b_node_expert_overlay_matrix
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_122B_NodeExpertOverlay
         LABELS "V2;Integration;Parity;Qwen35MoE;122B;Q8;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;NCCL;RCCL;MPI;MTP;DynamicDepth;Static;Dynamic;Ordinal;Random;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 2
         # The aggregate 75-minute target remains a campaign-runner economy
@@ -8593,22 +8637,22 @@ if(ZLIB_FOUND)
     #   - Single allreduce per layer on attn_proj
     #
     # REQUIRES: mpirun -np 2 (or more)
-    add_executable(v2_integration_parity_qwen35moe_node_tp
+    add_executable(v2_integration_parity_qwen35moe_node_tp_matrix
         integration/parity/qwen35moe/Test__Qwen35MoE_NodeTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen35moe_node_tp
+    target_link_libraries(v2_integration_parity_qwen35moe_node_tp_matrix
         llaminar2_core
         v2_test_utils
         GTest::gtest
         ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35moe_node_tp PRIVATE
+    target_include_directories(v2_integration_parity_qwen35moe_node_tp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_node_tp
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_node_tp_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen35MoE_NodeTP
         LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;ExpertOverlay;NodeTP;MPI;TensorParallel;UPI;CrossRank;CPU;RoutedExpertPlacement"
         MPI_PROCS 2
@@ -8636,24 +8680,24 @@ if(ZLIB_FOUND)
     #   - Cross-rank allreduce, broadcast, barrier
     #   - Prefill and decode parity with sharded weights
     # =========================================================================
-    add_executable(v2_integration_node_tp_parity
+    add_executable(v2_integration_parity_qwen2_node_tp_matrix
         integration/parity/qwen2/Test__Qwen2_NodeTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     # Note: No gtest_main - test provides custom main() with MPI_Init
-    target_link_libraries(v2_integration_node_tp_parity
+    target_link_libraries(v2_integration_parity_qwen2_node_tp_matrix
         llaminar2_core
         v2_test_utils
         GTest::gtest
         ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_node_tp_parity PRIVATE
+    target_include_directories(v2_integration_parity_qwen2_node_tp_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes
     )
 
-    discover_v2_parity_tests(v2_integration_node_tp_parity
-        TEST_PREFIX V2_Integration_Parity_NodeTP
+    discover_v2_parity_tests(v2_integration_parity_qwen2_node_tp_matrix
+        TEST_PREFIX V2_Integration_Parity_Qwen2_NodeTP
         LABELS "V2;Integration;Parity;Qwen2;NodeTP;MPI;TensorParallel;UPI;CrossRank"
         MPI_PROCS 2
         MODEL_FILES ${V2_PARITY_MODEL_QWEN2_Q4}
@@ -17118,6 +17162,7 @@ set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
     V2_Integration_MTPReplicatedSidecarKVPublicationLifecycle
     V2_Integration_AssignmentAwareFusedQKVTP2ThroughTP8
     V2_Integration_DynamicConvergenceFiniteHorizonLifecycle
+    V2_Integration_ParityFixtureShardOwnership
     V2_Integration_DynamicEmptySuccessorDemandLifecycle
     V2_Integration_DynamicPromotedExpertMTPProofLifecycle
     V2_Integration_DynamicAuthenticatedPromotionProofLifecycle

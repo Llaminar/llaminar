@@ -465,7 +465,7 @@ namespace llaminar2
         // Precision
         // =========================================================================
 
-        std::string activation_precision = "fp32"; ///< "fp32", "bf16", "fp16", "q8_1"
+        std::string activation_precision = "fp32"; ///< Only FP32 is implemented for production model activations.
         std::string kv_cache_precision = "auto";   ///< "auto" (q16_1 on CPU, fp16 on GPU), "fp32", "fp16", "q8_1", "q16_1"
         std::string tp_allreduce_precision_override; ///< "", "auto"/"schema", "fp32", "fp16", or "bf16"
 

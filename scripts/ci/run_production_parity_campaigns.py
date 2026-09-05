@@ -4255,7 +4255,7 @@ def main(argv: list[str] | None = None) -> int:
                 precisions = ",".join(cell.precision_types)
                 print(
                     f"  {cell.name} [{len(cell.gtest_cases)} matrix cells; "
-                    f"precisions={precisions}]"
+                    f"kv_precisions={precisions}]"
                 )
         return 0
 

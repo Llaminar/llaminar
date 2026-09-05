@@ -4,6 +4,9 @@
 # POST_BUILD helper script: runs a GTest binary with --gtest_list_tests
 # (no mpirun), parses the output, and generates a CTest include file with
 # isolated focused tests plus backend-grouped ProductionParity campaigns.
+# Production binaries identify their model/scope and matrix role, never one
+# placement, precision, or MTP cell. Discovery enforces that role before it
+# publishes campaign registrations; focused-only binaries remain independent.
 #
 # Inputs (via -D):
 #   TEST_EXECUTABLE  - Full path to the GTest binary
@@ -377,6 +380,15 @@ foreach(_full_name IN LISTS _all_tests)
     string(APPEND _output "    RUN_SERIAL TRUE\n")
     string(APPEND _output ")\n\n")
 endforeach()
+
+get_filename_component(_parity_binary_name "${TEST_EXECUTABLE}" NAME_WE)
+if(_production_campaign_keys AND NOT _parity_binary_name MATCHES
+        "^v2_integration_parity_[a-z0-9]+(_[a-z0-9]+)+_matrix$")
+    message(FATAL_ERROR
+        "Production parity binary '${_parity_binary_name}' must use "
+        "v2_integration_parity_<model>_<scope>_matrix; "
+        "configuration axes belong in generated cell names")
+endif()
 
 if(_production_campaign_keys AND NOT _all_production_model_files)
     message(FATAL_ERROR

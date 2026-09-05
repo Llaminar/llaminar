@@ -295,6 +295,12 @@ parsing the generated GoogleTest name and do not build a second axis expander
 inside a model fixture.
 
 Register through `discover_v2_parity_tests()`. Supply
+production binaries named `v2_integration_parity_<model>_<scope>_matrix`, with
+model/scope fixture names; keep topology instances, precision, placement,
+movement, and MTP axes in generated cell names. Discovery rejects production
+registrations without the matrix binary role. Follow the parity README's naming
+contract and compare exact parameter inventories when renaming suites; never
+relabel historical CSV evidence as a new run. Supply
 `PRODUCTION_PERF_STATS_FILTER` when the cell must assert domains beyond
 `forward_graph`. Build the target to regenerate its CTest include, then verify
 that `--list` increases by exactly the intended cells and does not lose an old

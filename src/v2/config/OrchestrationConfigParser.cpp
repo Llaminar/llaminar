@@ -2,11 +2,16 @@
  * @file OrchestrationConfigParser.cpp
  * @brief Implementation of OrchestrationConfigParser
  *
+ * Converts CLI and YAML requests into orchestration configuration. Unsupported
+ * model activation modes fail at input admission through the same production
+ * policy used by configuration validation and parity-matrix discovery.
+ *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include "OrchestrationConfigParser.h"
+#include "config/ActivationPrecisionPolicy.h"
 #include "ParallelismTreeParser.h"          // For --topology parsing
 #include "execution/config/RuntimeConfig.h" // For parseFusedAttentionBackend
 #include "utils/Logger.h"
@@ -2333,9 +2338,13 @@ namespace llaminar2
             .aliases = {"--activation-prec", "--act-prec"},
             .category = "Precision",
             .value_label = "<type>",
-            .description = "Activation precision: fp32, bf16, fp16, q8_1",
-            .valid_values = {"fp32", "bf16", "fp16", "q8_1"},
-            .setter = setters::assignString(&OrchestrationConfig::activation_precision),
+            .description = "Model activation precision: fp32 only (other modes are unimplemented)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    requireImplementedActivationPrecision(v);
+                    c.activation_precision = "fp32";
+                }),
         });
         // --kv-cache-precision accepts many short aliases; normalise to
         // lowercase and validate against the full alias list.
@@ -3340,7 +3349,8 @@ namespace llaminar2
             }
             else if (key == "activation_precision")
             {
-                config.activation_precision = value;
+                requireImplementedActivationPrecision(value);
+                config.activation_precision = "fp32";
             }
             else if (key == "kv_cache_precision")
             {
