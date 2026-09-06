@@ -927,8 +927,17 @@ namespace llaminar2
                                   int device_id, void *stream) override;
         bool deviceToHostOnStream(void *dst, const void *src, size_t bytes,
                                   int device_id, void *stream) override;
-        /** @copydoc IBackend::deviceToMappedHostByKernelOnStream */
-        bool deviceToMappedHostByKernelOnStream(
+        /** @copydoc IBackend::prepareMappedHostCopyKernels */
+        bool prepareMappedHostCopyKernels(int device_id) override;
+
+        /** @copydoc IBackend::enqueueBackgroundMappedCopyOnStream */
+        bool enqueueBackgroundMappedCopyOnStream(
+            void *device_region, void *mapped_host, void *mapped_alias,
+            size_t bytes, MappedTransferDirection direction,
+            int device_id, void *stream) override;
+
+        /** @copydoc IBackend::copyDeviceVisibleRegionByKernelOnStream */
+        bool copyDeviceVisibleRegionByKernelOnStream(
             void *dst,
             const void *src,
             size_t bytes,

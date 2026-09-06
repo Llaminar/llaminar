@@ -1050,9 +1050,11 @@ namespace llaminar2
             return false;
         }
 
-        const auto branch_factory_for = [](DeviceId)
+        const auto branch_factory_for = [this](DeviceId device)
         {
-            return GraphCaptureAuxiliaryBranchFactory{};
+            const auto found = transfer_progress_epochs_.find(device);
+            return found == transfer_progress_epochs_.end()
+                ? GraphCaptureAuxiliaryBranchFactory{} : found->second->graphBranchFactory();
         };
         const auto endpoint_matches_final_identity =
             [&](const CachedParticipantGraph::MappedGPUFollowerEndpoint &endpoint)
@@ -4713,9 +4715,12 @@ namespace llaminar2
         {
             const auto &prepared = prepared_gpu_submissions[submission_index];
             auto *const endpoint = prepared.endpoint;
-            /* Transfer progress is a maintenance-owned retained replay. A
-             * follower inference graph must never join it or share its stream. */
-            const GraphCaptureAuxiliaryBranchFactory branch_factory{};
+            // Use the same immutable service identity as cold materialization.
+            // This branch joins bounded worker retirement, never an unfinished
+            // physical command, and owns no model execution decisions.
+            const auto epoch = transfer_progress_epochs_.find(endpoint->device);
+            const auto branch_factory = epoch == transfer_progress_epochs_.end()
+                ? GraphCaptureAuxiliaryBranchFactory{} : epoch->second->graphBranchFactory();
             bool submitted = false;
             DeviceGraphExecutor::GraphSegmentCache::
                 CaptureStreamTerminalTicket terminal_ticket;
@@ -5366,8 +5371,8 @@ namespace llaminar2
                         << ",published=" << progress.commands_published
                         << ",completed=" << progress.commands_completed
                         << ",bytes=" << progress.bytes_completed
-                        << ",dma_submissions="
-                        << progress.dma_submissions
+                        << ",copy_submissions="
+                        << progress.copy_submissions
                         << ",idle_skips="
                         << progress.idle_submission_skips
                         << ",in_flight_observations="

@@ -4,8 +4,8 @@
  *
  * A production inference executable may own a bounded auxiliary branch whose
  * work must begin at the graph's root and join before its terminal frontier.
- * The branch is recorded on an explicit auxiliary stream, while the primary
- * graph stream supplies the fork and join edges.  This interface keeps that
+ * Three small captured fragments supply Open, parallel work and Close. The
+ * final native graph owns their fork/join edges before instantiation. This keeps that
  * lifecycle backend-neutral and makes the branch a persistent part of graph
  * cache identity instead of an opportunistic host launch.
  */
@@ -20,19 +20,20 @@
 
 namespace llaminar2
 {
+    class IGPUGraphCapture;
     /**
      * @brief One cache-owned branch recorded into a complete native GPU graph.
      *
-     * Implementations allocate all events, device storage, and auxiliary
-     * streams before @ref recordFork is called.  `recordFork()` and
-     * `recordJoin()` execute only while the primary stream is inside native
-     * capture.  They may enqueue bounded capture-safe device work and event
-     * edges, but may never allocate, synchronize, invoke a host callback, or
-     * transfer a payload through a host API.
+     * Implementations prepare storage and graph-only fragments during setup.
+     * @ref attach decorates the final sealed graph exactly once, before it is
+     * instantiated. This is the same lifecycle for direct native capture and
+     * a topology-composed parent: never attach to its graph-only children.
+     * The branch spans every inference wait and retires after a bounded amount
+     * of work following Close, not after a complete maintenance command.
      *
      * Each instance belongs to exactly one graph cache.  This one-owner rule
-     * prevents two independently replayable graphs from sharing mutable event
-     * generations even when they use the same underlying maintenance authority.
+     * prevents independently replayable graphs from sharing interval state,
+     * even when they use the same underlying maintenance authority.
      */
     class IGraphCaptureAuxiliaryBranch
     {
@@ -54,20 +55,15 @@ namespace llaminar2
         [[nodiscard]] virtual std::string_view name() const noexcept = 0;
 
         /**
-         * @brief Record the root fork and bounded auxiliary device work.
-         * @param primary_capture_stream Exact non-null stream currently being captured.
-         * @return true after the complete fork-side DAG was recorded.
+         * @brief Attach one complete branch to its final native execution owner.
+         * @param graph Sealed, uninstantiated graph on this branch's exact GPU.
+         * @return true after native fork/join assembly, without executing work.
+         *
+         * Failure is fatal to materialization. A second attachment or an
+         * executable destination must be rejected, never silently replayed or
+         * recaptured. No host callback belongs to the resulting device graph.
          */
-        [[nodiscard]] virtual bool recordFork(
-            void *primary_capture_stream) noexcept = 0;
-
-        /**
-         * @brief Join the auxiliary terminal back to the primary graph frontier.
-         * @param primary_capture_stream Same exact stream passed to @ref recordFork.
-         * @return true after the terminal event edge was recorded.
-         */
-        [[nodiscard]] virtual bool recordJoin(
-            void *primary_capture_stream) noexcept = 0;
+        [[nodiscard]] virtual bool attach(IGPUGraphCapture &graph) noexcept = 0;
 
     protected:
         IGraphCaptureAuxiliaryBranch() = default;

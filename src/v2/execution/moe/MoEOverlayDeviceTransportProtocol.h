@@ -226,7 +226,7 @@ namespace llaminar2
          * for a fatal timeout diagnostic but cannot expose histograms,
          * placement maps, or mutable device-owned policy state to the host.
          *
-         * @return Compact group-scoped lifecycle description.
+         * @return Local transport and topology-wide lifecycle description.
          */
         [[nodiscard]] std::string describeLifecycle() const;
 

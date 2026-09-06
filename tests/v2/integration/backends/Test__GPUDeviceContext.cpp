@@ -332,6 +332,7 @@ namespace
 // GPUDeviceContextPool Tests
 // ===========================================================================
 
+/** @test Retained MTP capacity owns every general/helper slot before execution. */
 TEST(Test__GPUDeviceContextPool,
      RetainedMTPGraphCapacityIsPricedBeforeExecution)
 {
@@ -348,6 +349,8 @@ TEST(Test__GPUDeviceContextPool,
     ASSERT_EQ(
         inventory.mtp_graph_owners.auxiliaryExecutableSlotCount(),
         107u);
+    ASSERT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), 25u);
+    ASSERT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 82u);
 
     ModelMemoryProfile profile;
     // Workspace planning consults the production architecture's typed
@@ -389,8 +392,12 @@ TEST(Test__GPUDeviceContextPool,
                 .model_graph_identity_count =
                     /*two prefill + decode + prefix bridge + three MTP forwards=*/7u,
                 .model_graph_topology_variant_count = 1u,
+                // Match the physical classes declared by runtime graph owners;
+                // the total slot count alone overprices bounded CUDA helpers.
                 .auxiliary_executable_count =
-                    owner_plan.auxiliaryExecutableSlotCount(),
+                    owner_plan.generalAuxiliaryExecutableSlotCount(),
+                .bounded_helper_executable_count =
+                    owner_plan.boundedHelperExecutableSlotCount(),
             }));
     EXPECT_GT(
         plan.devices.front().captured_graph_bytes(),

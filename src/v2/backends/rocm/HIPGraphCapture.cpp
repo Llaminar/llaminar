@@ -13,11 +13,13 @@
 #ifdef HAVE_ROCM
 
 #include "HIPGraphCapture.h"
+#include "../NativeParallelGraphBranch.h"
 #include "HIPGraphTimelineKernels.h"
 #include "../../utils/Logger.h"
 #include "../../utils/VramBillOfMaterials.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <limits>
 #include <stdexcept>
@@ -1192,6 +1194,75 @@ namespace llaminar2
         return !frontier.empty() && node_count_ == expected_node_count;
     }
 
+    namespace
+    {
+        /** @brief Exact HIP operations for the shared cold branch-DAG builder. */
+        struct HIPParallelGraphAPI
+        {
+            using Graph = hipGraph_t;
+            using Node = hipGraphNode_t;
+            using Error = hipError_t;
+            static constexpr Error success = hipSuccess;
+            static constexpr Error invalid = hipErrorInvalidValue;
+            /** @brief Query the owner's nodes without executing device work. */
+            static Error nodes(Graph g, Node *n, std::size_t *s) { return hipGraphGetNodes(g, n, s); }
+            /** @brief Query a node's complete incoming frontier. */
+            static Error dependencies(Node n, Node *d, std::size_t *s) { return hipGraphNodeGetDependencies(n, d, s); }
+            /** @brief Query a node's complete outgoing frontier. */
+            static Error dependents(Node n, Node *d, std::size_t *s) { return hipGraphNodeGetDependentNodes(n, d, s); }
+            /** @brief Clone only a small branch fragment, never the original body. */
+            static Error child(Node *n, Graph g, const Node *d, std::size_t s, Graph c) { return hipGraphAddChildGraphNode(n, g, d, s, c); }
+            /** @brief Bind an explicit native producer/consumer edge set. */
+            static Error edges(Graph g, const Node *f, const Node *t, std::size_t s) { return hipGraphAddDependencies(g, f, t, s); }
+            /** @brief Join the bounded worker and the inference-owned Close. */
+            static Error empty(Node *n, Graph g, const Node *d, std::size_t s) { return hipGraphAddEmptyNode(n, g, d, s); }
+        };
+    }
+
+    bool HIPGraphCapture::appendParallelBranch(
+        const GPUCapturedParallelBranch &branch)
+    {
+        if (!activateOwner("appendParallelBranch") || !graph_ || exec_ ||
+            node_count_ == 0u)
+        {
+            LOG_ERROR("[HIPGraphCapture] Parallel decoration requires a sealed uninstantiated graph owner");
+            return false;
+        }
+        hipStreamCaptureStatus status{};
+        if (hipStreamIsCapturing(stream_, &status) != hipSuccess ||
+            status != hipStreamCaptureStatusNone)
+        {
+            LOG_ERROR("[HIPGraphCapture] Parallel decoration cannot mutate an active recording");
+            return false;
+        }
+        const IGPUGraphCapture *sources[] = {&branch.open, &branch.worker, &branch.close};
+        std::array<hipGraph_t, 3> fragments{};
+        for (std::size_t i = 0u; i < fragments.size(); ++i)
+        {
+            const auto *source = dynamic_cast<const HIPGraphCapture *>(sources[i]);
+            if (!source || source == this || source->deviceOrdinal() != device_ordinal_ ||
+                !source->graph() || source->graph() == graph_ || source->nodeCount() == 0u ||
+                source->hasExecutable())
+            {
+                LOG_ERROR("[HIPGraphCapture] Parallel fragment has incompatible graph/device ownership index=" << i);
+                return false;
+            }
+            fragments[i] = source->graph();
+        }
+        const auto result = detail::appendNativeParallelBranch<HIPParallelGraphAPI>(graph_, fragments);
+        if (result.error != hipSuccess)
+        {
+            LOG_ERROR("[HIPGraphCapture] Parallel graph assembly failed operation=" <<
+                      result.operation << " error=" << hipGetErrorString(result.error));
+            return false;
+        }
+        std::size_t count = 0u;
+        if (hipGraphGetNodes(graph_, nullptr, &count) != hipSuccess)
+            return false;
+        node_count_ = count;
+        return true;
+    }
+
     GPUOrderedTimelineTimingSnapshot
     HIPGraphCapture::consumeOrderedTimelineTiming()
     {
@@ -1281,6 +1352,43 @@ namespace llaminar2
     size_t HIPGraphCapture::nodeCount() const
     {
         return node_count_;
+    }
+
+    bool HIPGraphCapture::validateFlatHelperNodeKinds(std::string *error) const
+    {
+        const auto fail = [&](const std::string &detail)
+        {
+            if (error)
+                *error = "HIP bounded helper shape: " + detail;
+            return false;
+        };
+        if (!activateOwner("validateFlatHelperNodeKinds") || !graph_)
+            return fail("missing owner or native graph");
+        size_t count = 0u;
+        auto status = hipGraphGetNodes(graph_, nullptr, &count);
+        if (status != hipSuccess)
+            return fail(hipGetErrorString(status));
+        if (count != nodeCount() || count == 0u ||
+            count > GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes)
+            return fail("helper must own one complete bounded native graph");
+        // Match CUDA's cheap native-kind census. No symbol, occupancy, device
+        // memory, or execution-state observation belongs in admission proof.
+        std::array<hipGraphNode_t, GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes> nodes{};
+        status = hipGraphGetNodes(graph_, nodes.data(), &count);
+        if (status != hipSuccess)
+            return fail(hipGetErrorString(status));
+        for (size_t index = 0; index < count; ++index)
+        {
+            hipGraphNodeType kind;
+            status = hipGraphNodeGetType(nodes[index], &kind);
+            if (status != hipSuccess)
+                return fail(hipGetErrorString(status));
+            if (kind != hipGraphNodeTypeKernel && kind != hipGraphNodeTypeMemcpy &&
+                kind != hipGraphNodeTypeMemset)
+                return fail("forbidden nested/control node at index=" + std::to_string(index) +
+                            " kind=" + std::to_string(static_cast<int>(kind)));
+        }
+        return true;
     }
 
     bool HIPGraphCapture::inspectKernelNodes(

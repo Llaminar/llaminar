@@ -6,6 +6,9 @@
  * Metadata and compact payload kernels access one setup-owned mapped channel.
  * The adjacent mapped 64-bit timeline is the exact producer/consumer edge for
  * every byte; no host wait, default stream, or fixed-capacity DMA is involved.
+ * Sparse return payload grids are bounded independently of their capacity:
+ * grid-stride kernels cover every live element without scheduling an idle
+ * full-capacity grid for each participant lane.
  */
 
 #include "CUDAMoEOverlayActivationPacketKernels.h"
@@ -160,11 +163,12 @@ extern "C" bool cudaMoEOverlayConsumeCanonicalRouteTicket(
     {
         return false;
     }
-    const std::size_t capacity_elements =
-        launch->route_capacity * static_cast<std::size_t>(launch->d_model);
-    const unsigned int blocks = std::min(
-        kSparseRoutePayloadBlocks, blocksFor(capacity_elements));
+    // Route-row tiles amortize mapped metadata; the grid strides over rows.
+    const unsigned int blocks = static_cast<unsigned int>(std::min<std::size_t>(
+        kSparseRoutePayloadBlocks, launch->route_capacity));
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    llaminar2::moe_activation_packet_device::awaitCanonicalRouteTicketKernel
+        <<<1u, 1u, 0u, cuda_stream>>>(*launch);
     llaminar2::moe_activation_packet_device::
         materializeCanonicalRouteTicketKernel
         <<<blocks, kThreads, 0u, cuda_stream>>>(*launch);
@@ -296,8 +300,14 @@ extern "C" bool cudaMoEOverlayActivationConsumeMultiRowReturnBatch(
         static_cast<std::size_t>(launch->physical_rows) *
         static_cast<std::size_t>(launch->top_k) *
         static_cast<std::size_t>(launch->d_model);
+    // A lane owns only its compact live entries, not every possible route.
+    // Launching a capacity-sized grid per lane multiplies idle blocks and
+    // system-memory latency. The existing grid-stride loop retains unique
+    // writers and full coverage while reusing the bounded payload geometry.
+    const unsigned int payload_blocks = std::min(
+        kSparseRoutePayloadBlocks, blocksFor(output_elements));
     llaminar2::moe_activation_packet_device::materializeMultiRowCanonicalReturnBatchKernel
-        <<<dim3(blocksFor(output_elements), launch->lane_count, 1u),
+        <<<dim3(payload_blocks, launch->lane_count, 1u),
            kThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }

@@ -206,6 +206,27 @@ jobs:
                   -R '^(V2_Integration_Parity_Qwen36_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36MoE_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36_LocalTP_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfterClearCache|V2_Integration_Parity_Qwen36MoE_(ExpertOverlay|NodeTP)_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfter(ClearCache|PrefixRestore).*|V2_Integration_Parity_Qwen36MoE_ExpertOverlay_.*PrefixCacheMTPRestore_(CUDA2TP|ROCm2TP)(Dynamic|LLEP)PhaseSplit)$' \
                   --output-on-failure
 
+      - name: Export canonical E2E certification selections
+        run: |
+          mkdir -p parity-e2e-manifest
+          docker run --rm \
+            -v "${MODELS_DIR}:${MODELS_DIR}:ro" \
+            -v "${MODELS_DIR}:/src/models:ro" \
+            -v "${{ github.workspace }}/parity-e2e-manifest:/e2e-export" \
+            --workdir /src \
+            ${{ env.BUILDER_IMAGE }} \
+            python3 scripts/ci/run_model_parity_e2e.py \
+              --build-dir build_v2_integration \
+              --export-manifest /e2e-export/certifiable.json \
+              --source-revision "${{ github.sha }}"
+
+      - name: Publish canonical E2E manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-parity-e2e-manifest
+          path: parity-e2e-manifest/certifiable.json
+          if-no-files-found: error
+
       - name: Upload core dumps on failure
         if: failure()
         uses: actions/upload-artifact@v7
@@ -360,12 +381,22 @@ jobs:
       - name: Prepare host NUMA memory for E2E
         run: bash scripts/ci/prepare_numa_e2e_host.sh
 
+      - name: Download canonical E2E manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: model-parity-e2e-manifest
+          path: parity-e2e-manifest
+
+      - name: Prepare persistent model staging
+        run: scripts/ci/setup_production_parity_tmpfs.sh
+
       - name: E2E test runtime image
         env:
           LLAMINAR_E2E_DOCKER_NETWORK: bridge
         run: |
           scripts/ci/run_release_container_e2e.sh \
             --variant "${{ matrix.e2e_variant }}" \
+            --manifest parity-e2e-manifest/certifiable.json \
             --image "${{ steps.runtime-tags.outputs.primary_ref }}" \
             --port "${{ matrix.port }}" \
             --log-dir "/tmp/llaminar-e2e-${{ matrix.e2e_variant }}-${{ matrix.cpu_isa }}-container"

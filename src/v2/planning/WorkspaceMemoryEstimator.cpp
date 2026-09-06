@@ -973,6 +973,9 @@ WorkspaceRequirements rocmRoutedExpertGemmRequirements(
 
     const auto append_floating_pointer_abi = [](WorkspaceRequirements& target)
     {
+        target.buffers.push_back({
+            floating_gemm_abi::kROCmBlasMatmulWorkspace,
+            floating_gemm_abi::kBlasMatmulWorkspaceBytes, 256, true});
         const std::size_t bytes =
             floating_gemm_abi::kMaxBatchedProjections * sizeof(float*);
         target.buffers.push_back({
@@ -1062,19 +1065,27 @@ size_t maximumFloatingProjectionColumns(
  * The redirect is an eight-projection graph ABI, not a heuristic reserve. It
  * must use the same cardinality constant as CUDAFloatingPointGemmKernel.
  */
-size_t cudaFloatingPointWorkspaceBytes(
+size_t gpuFloatingPointWorkspaceBytes(
     const ModelMemoryProfile& profile,
     const WorkspaceMemoryGeometry& geometry,
     size_t execution_rows,
     bool routed_only)
 {
-    if (!geometry.device.is_cuda())
+    if (!geometry.device.is_gpu())
         return 0;
 
     const size_t columns = maximumFloatingProjectionColumns(
         profile, geometry, routed_only);
     if (columns == 0)
         return 0;
+
+    // The routed-only ROCm caller already composes the descriptor-based
+    // direct/compact GEMM contract. Dense/continuation graphs need its same
+    // BLAS region and pointer ABI here, without a second live ledger.
+    if (geometry.device.is_rocm())
+        return routed_only ? 0u : floating_gemm_abi::kBlasMatmulWorkspaceBytes +
+            3u * alignedWorkspaceBytes(
+                floating_gemm_abi::kMaxBatchedProjections * sizeof(float *));
 
     const size_t projection_capacity =
         floating_gemm_abi::kMaxBatchedProjections;
@@ -1097,6 +1108,8 @@ size_t cudaFloatingPointWorkspaceBytes(
         "CUDA floating GEMM redirect element bytes");
 
     size_t total = alignedWorkspaceBytes(redirect_bytes);
+    total = checkedAdd(total, floating_gemm_abi::kBlasMatmulWorkspaceBytes,
+                       "CUDA context-borrowing BLAS stage workspace");
     total = checkedAdd(total, pointer_array_bytes, "CUDA floating A pointers");
     total = checkedAdd(total, pointer_array_bytes, "CUDA floating B pointers");
     total = checkedAdd(total, pointer_array_bytes, "CUDA floating C pointers");
@@ -1531,12 +1544,12 @@ size_t WorkspaceMemoryEstimator::estimate(
         static_cast<size_t>(std::max(1, geometry.resident_graph_rows)),
         "floating projection execution rows");
     const size_t floating_projection_bytes =
-        cudaFloatingPointWorkspaceBytes(
+        gpuFloatingPointWorkspaceBytes(
             profile, geometry, execution_rows, /*routed_only=*/false);
     bytes = checkedAdd(
         bytes,
         floating_projection_bytes,
-        "CUDA floating projection requirements");
+        "GPU floating projection requirements");
 
     size_t hybrid_row_scratch_bytes = 0u;
     if (geometry.device.is_gpu() &&
@@ -1747,7 +1760,7 @@ size_t WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
     expert_geometry.apportioned_routed_experts = true;
     bytes = checkedAdd(
         bytes,
-        cudaFloatingPointWorkspaceBytes(
+        gpuFloatingPointWorkspaceBytes(
             profile,
             expert_geometry,
             static_cast<size_t>(compact_rows),

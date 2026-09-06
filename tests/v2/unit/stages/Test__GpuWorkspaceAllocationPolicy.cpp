@@ -2050,6 +2050,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoERebalanceMaintenanceAlwaysPublishesD
         "The completion event must be recorded before it is published to graph consumers.");
 }
 
+/** @brief A maintenance observer must never secretly acquire an epoch reader. */
+TEST(Test__GpuWorkspaceAllocationPolicy, MoEMaintenanceWaitHasNoResidencySideEffect)
+{
+    const auto source = readFile(repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto wait = stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::waitForPendingDeviceMoERebalanceMaintenance(",
+        "bool DeviceGraphOrchestrator::\n"
+        "        materializeDeviceMoERebalanceMaintenanceGraphForFamily()"));
+    ASSERT_FALSE(wait.empty());
+    EXPECT_EQ(wait.find("acquireMoEOverlayEpoch"), std::string::npos);
+    EXPECT_EQ(wait.find("moe_overlay_epoch_lease_lifecycle_"), std::string::npos);
+}
+
 /**
  * @brief Keep Static ExpertOverlay independent from Dynamic maintenance state.
  *
@@ -3099,6 +3114,42 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
     EXPECT_NE(partial_body.find("waitForPendingShiftedMTPKVReady"), std::string::npos);
 }
 
+/**
+ * @brief Device-outcome catch-up retires scratch, never consults prefill rows.
+ *
+ * A warm prefix restore need not admit any ordinary prefill lengths. Verifier
+ * acceptance owns the final row independently; keep the API and both catch-up
+ * implementations free of the redundant prefill refresh that broke this path.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, MTPOutcomeCatchupHasOneFinalTerminalProducer)
+{
+    const auto source = readFile(repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto initial = sliceBetween(source,
+        "bool DeviceGraphOrchestrator::commitMTPInitialShiftedRowFromDeviceOutcome(",
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowFromDeviceTargetSample(");
+    const auto suffix = sliceBetween(source,
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromDeviceOutcome(",
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromPartialForward(");
+    for (const auto *body : {&initial, &suffix})
+    {
+        const auto executable = stripCommentsAndStringLiterals(*body);
+        EXPECT_EQ(executable.find("refreshMTPTerminalHiddenState"), std::string::npos);
+        EXPECT_EQ(executable.find("request_sequence_lengths"), std::string::npos);
+        expectNeedleBefore(executable,
+            "executeMTPDepth0Batched(",
+            "state_.mtp_terminal_hidden_publication.invalidate()",
+            "Scratch must remain leased until the sidecar read has been submitted.");
+    }
+    EXPECT_EQ(stripCommentsAndStringLiterals(initial).find("main_forward_token_count"),
+              std::string::npos);
+    const auto accepted = sliceBetween(source,
+        "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecStateBatchFromDeviceOutcome(",
+        "bool DeviceGraphOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden(");
+    EXPECT_NE(accepted.find("selectMTPTerminalHiddenRowsFromDeviceAcceptedState("),
+              std::string::npos);
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPTerminalHiddenMailboxUsesExplicitDeviceOwnership)
 {
     const auto source =
@@ -4018,11 +4069,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCaptu
                                  "d_A_int8,d_scales_A_blockwise,d_output,d_bias,n,k,1.0f,0.0f,execution_stream)"),
               std::string::npos)
         << "Canonical M=1 verifier replay must receive the fused transaction stream.";
+    EXPECT_NE(fused_compact.find("autolaunch_projection=[&](intpi,void*projection_stream)"),
+              std::string::npos)
+        << "Grouped verifier projections must name their exact selected stream.";
     EXPECT_NE(fused_compact.find("binding.kernel->multiply_quantized_small_m_gemv("
                                  "d_A_int8,d_scales_A_blockwise,binding.output,binding.bias,"
-                                 "m,binding.n,k,1.0f,0.0f,true,execution_stream)"),
+                                 "m,binding.n,k,1.0f,0.0f,true,projection_stream)"),
               std::string::npos)
-        << "Grouped verifier fused projections must pass their captured stream.";
+        << "Grouped verifier fused projections must pass the explicit root or persistent side stream selected by the captured schedule.";
+    EXPECT_NE(fused_compact.find(
+                  "launch_projection(pi,verifier_pool->streams[plan.stream_index])"),
+              std::string::npos)
+        << "The concurrent verifier branch must bind each projection to its declared persistent stream.";
+    EXPECT_NE(fused_compact.find("launch_projection(pi,execution_stream)"),
+              std::string::npos)
+        << "An explicit debug-policy opt-out must remain pinned to the captured root stream.";
 
     const auto small_m_raw = sliceBetween(
         kernel_source,

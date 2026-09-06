@@ -97,6 +97,25 @@ namespace llaminar2
             EXPECT_EQ(rows, 3);
         }
 
+        TEST(Test__PrefillGraphBucketDefaults,
+             ScratchlessGroupedRowsDoNotInheritKparBudget)
+        {
+            EXPECT_EQ(nativeVNNIScratchlessBatchInvariantTileRows(0), 0);
+            EXPECT_EQ(nativeVNNIScratchlessBatchInvariantTileRows(1), 1);
+            EXPECT_EQ(nativeVNNIScratchlessBatchInvariantTileRows(4), 4);
+            EXPECT_EQ(
+                nativeVNNIScratchlessBatchInvariantTileRows(
+                    kDefaultNativeVNNIBatchInvariantTileRows + 1),
+                kDefaultNativeVNNIBatchInvariantTileRows);
+
+            // This vocabulary geometry cannot retain all four rows when KPAR
+            // scratch is required. A direct grouped verifier has no such arena.
+            constexpr int n = 248320;
+            constexpr int k = 5120;
+            EXPECT_LT(nativeVNNIBatchInvariantTileRows(4, n, k), 4);
+            EXPECT_EQ(nativeVNNIScratchlessBatchInvariantTileRows(4), 4);
+        }
+
         TEST(Test__PrefillGraphBucketDefaults, IsTotalAtPositiveIntExtremes)
         {
             constexpr int maximum = std::numeric_limits<int>::max();

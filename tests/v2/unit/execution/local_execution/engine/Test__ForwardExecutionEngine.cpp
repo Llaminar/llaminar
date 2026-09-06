@@ -39,6 +39,48 @@ using namespace llaminar2;
 
 namespace
 {
+    /** @brief Device-free observations of one retained maintenance branch. */
+    struct ForwardAuxiliaryBranchProbe
+    {
+        int creations = 0;
+        int attachments = 0;
+    };
+
+    /**
+     * @brief Record branch identity and capture edges without touching hardware.
+     *
+     * The shared probe outlives cache retirement. Replay must not construct or
+     * record another branch: only the immutable executable may be launched.
+     */
+    class MockForwardAuxiliaryBranch final : public IGraphCaptureAuxiliaryBranch
+    {
+    public:
+        /** @brief Bind the same authority and device advertised by the factory. */
+        MockForwardAuxiliaryBranch(
+            std::shared_ptr<ForwardAuxiliaryBranchProbe> probe, DeviceId device)
+            : probe_(std::move(probe)), device_(device)
+        {
+            ++probe_->creations;
+        }
+
+        /** @copydoc IGraphCaptureAuxiliaryBranch::authorityIdentity */
+        const void *authorityIdentity() const noexcept override { return probe_.get(); }
+        /** @copydoc IGraphCaptureAuxiliaryBranch::device */
+        DeviceId device() const noexcept override { return device_; }
+        /** @copydoc IGraphCaptureAuxiliaryBranch::name */
+        std::string_view name() const noexcept override { return "unit_forward_maintenance"; }
+        /** @brief Observe one attachment to a sealed, uninstantiated owner. */
+        bool attach(IGPUGraphCapture &graph) noexcept override
+        {
+            ++probe_->attachments;
+            return graph.executionStream() != nullptr && !graph.hasExecutable();
+        }
+
+    private:
+        std::shared_ptr<ForwardAuxiliaryBranchProbe> probe_;
+        DeviceId device_;
+    };
+
     std::string readTextFile(const char *path)
     {
         std::ifstream input(path);
@@ -288,6 +330,8 @@ namespace
         int pending_all_position_verifier_stream_calls = 0;
         int pending_main_decode_stream_calls = 0;
         int build_decode_policy_calls = 0;
+        int auxiliary_factory_queries = 0;
+        DeviceId auxiliary_factory_device = DeviceId::invalid();
         int resolve_pp_copy_calls = 0;
         int get_pipeline_contexts_calls = 0;
         bool has_last_forward_input = false;
@@ -322,7 +366,9 @@ namespace
         std::vector<std::function<std::unique_ptr<IComputeStage>(const std::string &, DeviceId)>> graph_stage_factories;
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
+        GraphCaptureAuxiliaryBranchFactory mock_auxiliary_factory;
         bool mock_compute_all_position_logits = false;
+        bool mock_live_mtp_request_batch_condition = false;
         bool mock_defer_all_position_verifier_sync = false;
         bool mock_defer_main_decode_sync = false;
         void *pending_all_position_verifier_stream = nullptr;
@@ -490,9 +536,24 @@ namespace
             return mock_pp_copy;
         }
 
+        /** @brief Supply the runner-owned branch to every forward submission route. */
+        GraphCaptureAuxiliaryBranchFactory forwardGraphAuxiliaryBranchFactory(
+            DeviceId device) override
+        {
+            ++auxiliary_factory_queries;
+            auxiliary_factory_device = device;
+            return mock_auxiliary_factory;
+        }
+
         bool computeAllPositionLogitsEnabled() const override
         {
             return mock_compute_all_position_logits;
+        }
+
+        /** @brief Expose the typed condition role without running a real MTP controller. */
+        bool liveMTPRequestBatchConditionEnabled() const override
+        {
+            return mock_live_mtp_request_batch_condition;
         }
 
         bool shouldDeferAllPositionVerifierFinalSync() const override
@@ -2741,6 +2802,161 @@ TEST_F(
         llaminar2::testing::sharedMockWorkerGPUContext()
             .graphCaptureCreateCount(),
         capture_count_before + 1);
+}
+
+/** @brief Setup and replay preserve decode, verifier and request-condition identities. */
+TEST_F(Test__ForwardExecutionEngine, SetupAndReplayPreserveGraphIdentity)
+{
+    ScopedDebugEnv env({{"LLAMINAR_PERF_STATS_JSON", "1"}});
+    for (const auto role : {ForwardExecutionRole::MainInference,
+                            ForwardExecutionRole::GroupedMTPVerifier,
+                            ForwardExecutionRole::MTPCondition})
+    {
+    SCOPED_TRACE(static_cast<int>(role));
+    PerfStatsCollector::reset();
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+    host.mock_compute_all_position_logits = role == ForwardExecutionRole::GroupedMTPVerifier;
+    host.mock_live_mtp_request_batch_condition = role == ForwardExecutionRole::MTPCondition;
+    host.mock_capture_policy.allow_fast_decode = true;
+    host.mock_capture_policy.allow_cached_graph_replay = true;
+    std::array<int, 2> tokens{42, 43};
+    std::array<int, 2> positions{1, 2};
+    auto input = makeTestInput(host.mock_compute_all_position_logits ? 2 : 1,
+                              1, DeviceId::cuda(0), tokens.data(), positions.data());
+    input.token_ids_device = tokens.data();
+    input.position_ids_device = positions.data();
+    input.execution_role = role;
+    input.execution_phase = ForwardExecutionPhase::Decode;
+    input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(input, output, host));
+    input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+    ASSERT_TRUE(engine.execute(input, output, host));
+    ASSERT_TRUE(engine.execute(input, output, host));
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const std::string expected_context = host.mock_compute_all_position_logits
+        ? "main_verifier" : (host.mock_live_mtp_request_batch_condition
+            ? "main_condition_batch" : "main_decode");
+    bool saw_capture = false;
+    bool saw_replay = false;
+    for (const auto &record : records)
+    {
+        if (record.name != "full_graph_capture_executable_nodes" &&
+            record.name != "decode_graph_phase") continue;
+        for (const auto &[key, value] : record.tags)
+        {
+            if (key == "phase" && value == "replay") saw_replay = true;
+            if (key != "context") continue;
+            EXPECT_EQ(value, expected_context);
+            if (record.name == "full_graph_capture_executable_nodes") saw_capture = true;
+        }
+    }
+    EXPECT_TRUE(saw_capture);
+    EXPECT_TRUE(saw_replay);
+    PerfStatsCollector::reset();
+    }
+}
+
+/**
+ * @brief Hosted MTP replay consumes the same runner authority as capture.
+ *
+ * The mixed-GPU dynamic-depth route previously supplied an empty factory to
+ * retained replay even though setup had captured a maintenance branch. Sweep
+ * both device identities and shallow/deep verifier geometries without loading
+ * a backend; repeated replay must neither omit that authority nor recapture.
+ */
+TEST_F(Test__ForwardExecutionEngine, RetainedVerifierReplayUsesHostAuxiliaryAuthority)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int depth : {1, 2, 3, 14, 15})
+    {
+        SCOPED_TRACE(device.toString() + " depth=" + std::to_string(depth));
+        auto engine = makeEngine(/*cache_enabled=*/true);
+        llaminar2::testing::MockDeviceContext gpu_ctx(
+            device, device == DeviceId::cuda(0)
+                        ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&gpu_ctx);
+        host.graph_stage_count = 1;
+        host.mock_compute_all_position_logits = true;
+        host.mock_capture_policy.allow_fast_decode = true;
+        host.mock_capture_policy.allow_cached_graph_replay = true;
+        const auto probe = std::make_shared<ForwardAuxiliaryBranchProbe>();
+        host.mock_auxiliary_factory = {
+            .authority_identity = probe.get(),
+            .device = device,
+            .create = [probe, device]() {
+                return std::make_unique<MockForwardAuxiliaryBranch>(probe, device);
+            }};
+        std::array<int, 16> tokens{};
+        std::array<int, 16> positions{};
+        auto input = makeTestInput(depth + 1, 1, device, tokens.data(), positions.data());
+        input.token_ids_device = tokens.data();
+        input.position_ids_device = positions.data();
+        input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        input.graph_submission_intent =
+            ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output{};
+        ASSERT_TRUE(engine.execute(input, output, host));
+        // Ordinary forward admission seals replay readiness before the hosted
+        // scheduler takes ownership of the same retained executable.
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        ASSERT_TRUE(engine.execute(input, output, host));
+        const auto graph = engine.lastAllPositionVerifierForwardGraph();
+        ASSERT_TRUE(graph.has_value());
+        const auto captures = llaminar2::testing::sharedMockWorkerGPUContext()
+                                  .graphCaptureCreateCount();
+        const auto queries = host.auxiliary_factory_queries;
+        ASSERT_GT(queries, 0);
+        ASSERT_EQ(probe->creations, 1);
+        ASSERT_EQ(probe->attachments, 1);
+
+        // The transaction owns this stable non-null mock handle. Only native
+        // event ordering is modeled; no physical stream or GPU is constructed.
+        int transaction_stream = 0;
+        void *producer_stream = nullptr;
+        std::string error;
+        for (int replay = 0; replay < 20; ++replay)
+        {
+            ASSERT_TRUE(engine.replayRetainedDecodeGraph(
+                graph->signature, &gpu_ctx, {}, {},
+                host,
+                &transaction_stream, &producer_stream, &error)) << error;
+            EXPECT_NE(producer_stream, nullptr);
+            EXPECT_EQ(host.auxiliary_factory_queries, queries + replay + 1);
+            EXPECT_EQ(host.auxiliary_factory_device, device);
+        }
+        EXPECT_EQ(llaminar2::testing::sharedMockWorkerGPUContext()
+                      .graphCaptureCreateCount(), captures);
+        EXPECT_EQ(probe->creations, 1);
+        EXPECT_EQ(probe->attachments, 1);
+
+        // Removal or replacement of the runner authority must still fail
+        // before a launch; obtaining policy from the host must not weaken the
+        // existing immutable-cache check or turn an invalidation into recapture.
+        host.mock_auxiliary_factory = {};
+        EXPECT_FALSE(engine.replayRetainedDecodeGraph(
+            graph->signature, &gpu_ctx, {}, {}, host,
+            &transaction_stream, &producer_stream, &error));
+        EXPECT_EQ(producer_stream, nullptr);
+        const auto replacement = std::make_shared<ForwardAuxiliaryBranchProbe>();
+        host.mock_auxiliary_factory = {
+            .authority_identity = replacement.get(),
+            .device = device,
+            .create = [replacement, device]() {
+                return std::make_unique<MockForwardAuxiliaryBranch>(replacement, device);
+            }};
+        EXPECT_FALSE(engine.replayRetainedDecodeGraph(
+            graph->signature, &gpu_ctx, {}, {}, host,
+            &transaction_stream, &producer_stream, &error));
+        EXPECT_EQ(producer_stream, nullptr);
+        EXPECT_EQ(replacement->creations, 0);
+        EXPECT_EQ(llaminar2::testing::sharedMockWorkerGPUContext()
+                      .graphCaptureCreateCount(), captures);
+    }
 }
 
 /**

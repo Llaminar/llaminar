@@ -143,9 +143,9 @@ namespace llaminar2
         int getCurrentNUMANode() const;
 
         /**
-         * Get the NUMA node for a memory address
-         * @param ptr Memory address to query
-         * @return NUMA node ID, or -1 if cannot be determined
+         * @brief Resolve the physical NUMA node, including in-progress kernel page migration.
+         * @param ptr Address in retained readable storage, not a preferred-node policy.
+         * @return Actual NUMA node ID, or -1 if the kernel cannot resolve the page.
          */
         int getNUMANodeForAddress(const void *ptr) const;
 

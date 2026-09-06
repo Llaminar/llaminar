@@ -62,7 +62,155 @@ The preflight shard-ownership test exercises configuration lookup across these
 translation-unit boundaries without loading a model. CMake owns the source
 inventory, and source-policy gates inspect the shared fixture family.
 
-## What one production cell proves
+## Tagged HTTP / long-context certification
+
+`ModelParityDefinition::e2e_certifiable` opts exact existing configurations into
+the Release HTTP gate. Each typed selector names activation/KV precision, MTP,
+prefill profile and, for ExpertOverlay, both movement and owner order. Model and
+topology are inherited from the containing definition. Tags do not multiply or
+remove numerical cells. Unmatched and overlapping selectors fail expansion.
+Eligibility is not a passing certificate.
+
+The profile also owns typed `thinking_modes`: `ThinkingAndNonThinking` (the
+default) or `NonThinkingOnly` for a model that does not support reasoning mode.
+Discovery exports `both` or `non-thinking` and pins the harness environment.
+Renaming a GGUF or testing a fine-tune must never silently remove thinking-mode
+checks. Stale manifests without this field fail admission. Standalone harness
+diagnostics use `LLAMINAR_E2E_THINKING_MODES` explicitly (default `both`);
+there is no filename-based model capability table.
+
+The initial tags select dynamic-depth MTP for single-GPU Qwen3.8 dense 27B
+and Qwen3.6 MoE 35B on CUDA and ROCm. The Qwen3.5 MoE 122B topology declarations
+also select Dynamic movement, ordinal initial placement, and dynamic-depth MTP
+for two CUDA GPUs plus two CPU sockets, two or four ROCm GPUs plus two CPU
+sockets, and two CUDA GPUs plus four ROCm GPUs. In each two-tier case the GPU
+continuation domain has priority zero; CPU, or ROCm in the mixed-vendor case,
+has the lower residency priority. GPU-to-socket placement remains inventory
+resolved. On the certification host these are the 3090 and MI50 devices, not
+hardcoded GPU product names in the topology. Use discovery below for the exact
+current inventory; adding a tag must not add a runner-side configuration.
+Qwen3.6 MoE 35B also tags a CPU-only, two-socket NodeTP cell with ordinal
+placement, Dynamic rebalancing, and dynamic-depth MTP. Its single CPU tier
+rebalances expert skew between participants; it has no tier-migration axis.
+
+Ornith 1.5 MoE 35B (`Ornith-1.5-35B-Q4_K_M.gguf`) inherits the tagged
+Qwen3.6 MoE topology definitions: single ROCm, two-CUDA NCCL and two-ROCm RCCL
+ExpertOverlay, and two-socket CPU NodeTP. All overlays select Dynamic movement
+with ordinal placement; all four use dynamic-depth MTP and full context budgets.
+The larger fine-tune uses two CUDA devices instead of a single CUDA cell. It
+retains the standard feature matrix and context budgets,
+but has independent model, reference-pack, and result identities. These
+definitions also expand the standard numerical cases; the HTTP runner has no
+Ornith-specific configuration branch.
+
+```mermaid
+flowchart LR
+    D[Typed model/topology definition] --> E[Canonical matrix expander]
+    E --> P[Every cell: HF checkpoint parity and CSVs]
+    E --> T[Tagged cells: full typed JSON discovery]
+    T --> R[Release HTTP server harness]
+    R --> N[Needle, long generation, reset and context-boundary checks]
+```
+
+Build and list without loading a model:
+
+```bash
+cmake --build build_v2_integration --parallel --target v2_model_parity_matrices
+python3 scripts/ci/run_model_parity_e2e.py --build-dir build_v2_integration --list
+```
+
+Run the selected certification set (or narrow using `--backend`, `--campaign`,
+and `--cell` full-match filters):
+
+```bash
+python3 scripts/ci/run_model_parity_e2e.py \
+  --build-dir build_v2_integration --binary build_v2_release/llaminar2 \
+  --report parity-results/e2e-certification.json
+```
+
+The runner reuses the parity driver's persistent tmpfs lease and staging
+authority. It starts one server per tagged cell, passes an argument vector
+exported from that cell's production configuration, and invokes the mature
+`test_server_e2e.sh` checks. The full helper proves beginning/middle/end needle
+recall, multi-needle JSON recall, structured long generation, cache reset,
+near-limit admission and oversized-context rejection. It additionally retains
+the harness's chat, streaming, prefix, error-response, graph/PerfStats, memory,
+and shutdown checks. There is no model-size skip for a tagged cell. Each HTTP
+cell has the canonical ten-minute watchdog, including startup and shutdown;
+expiry retires its full server/MPI process group and records a timeout.
+
+Prefix checks include both a different-answer shared-prefix request and an exact
+repeat. Short shared text alone may not reach a stored hybrid-state boundary.
+Short arithmetic responses must finish naturally; reaching the token limit
+with the expected number somewhere in a repeated answer is a failed check.
+Thinking delimiters frame response fields and cannot replace the runner's
+request-completion authority or truncate subsequent answer text. Qwen model
+schemas own the complete thinking-budget continuation, including its paragraph
+boundary; callers encode it without BOS/EOS and must not trim it.
+If a forced-thinking response loops, compare the exact forced token prefix
+against the CPU/FP32 reference before attributing it to MTP or cache reuse.
+Certification also requires a completed prefix restore (including MTP
+state when enabled), not merely lookup hits or correct answers after a miss.
+Selected MTP must attempt and accept drafts, and adaptive depth must advance
+its controller. Dynamic placement must publish completed physical movement;
+Static must not move experts. These post-shutdown observers consume production
+evidence and never become runtime state or placement authorities.
+Discovery exports `ModelParityCase::movementEvidence()` as `movement_evidence`
+(`not_applicable`, `forbidden`, or `required`). The runner pins this obligation
+for the harness; missing or stale metadata fails admission. A single-device
+cell may retain Dynamic maintenance defaults without a movement axis, so the
+validator must not derive this obligation from a CLI default or missing records.
+
+The typed profile owns context and token budgets. Inherited `lite` or shorter
+context settings cannot weaken certification. Each cell retains its exact
+configuration, harness/server logs, complete numbered non-streaming chat
+request/response JSON (including finish reason and reasoning fields), PerfStats
+and all eight outcomes in
+`long_context_results.json`; missing or incomplete evidence fails even when
+the shell exits zero. HTTP behavioral evidence complements, but does not replace,
+the numerical campaign's canonical CSVs or its separate economy target.
+
+Server PerfStats uses rank-qualified raw artifacts. The collector validates
+runtime-declared communicator membership (including a nonzero HTTP authority),
+then retains every participant row in one rank-qualified aggregate. Missing
+participants or mismatched membership fail certification; graph lifecycles are
+matched by rank as well as device and context. Memory checks use the canonical
+`PhysicalMemoryAuthority` admission and owner attestation, not a second budget
+derived from a GGUF filename or shard size. Process-tree RSS remains telemetry
+because shared/file-backed pages are not equivalent to engine-owned bytes.
+Graceful shutdown must return zero and preserve every rank's final evidence.
+
+Heterogeneous retained parents have their own executable/materialization/launch
+records; compilation children and an unrelated full-graph helper cannot certify
+them. The host-transfer gate admits the reviewed shared activation collective
+only with a declared mixed topology, same-rank node-local mapping evidence and
+its exact nonblocking payload contract. CPU expert inputs are an explicit
+collective boundary, not permission to mirror GPU execution state on the host.
+
+The same profile owns `readiness_timeout_seconds` (default 60). Override it in
+an exact certification selector's `.profile` when model loading and graph setup
+need a larger budget; the initial 122B tags use 180 seconds. Discovery exports
+this value and the driver passes it to the HTTP harness, overriding inherited
+startup-timeout environment settings. It is independent of the request timeout
+and cannot extend the ten-minute exact-cell watchdog. Neither the runner nor
+the harness infers a timeout from model size or a cell name. Rebuild and export
+the manifest after changing a profile.
+
+GoogleTest's JSON list output preserves full typed parameters; its console
+listing truncates parameters and must never be parsed as configuration. CI
+exports this discovery with `--export-manifest`, publishes the revision-bound
+artifact, then consumes it with `--manifest` in runtime-container jobs. The
+container adapter only filters backend signatures. Neither it nor the shell
+harness owns a default model/topology table. Explicit `--suite` remains a
+developer diagnostic, not canonical certification.
+
+Dense Qwen3.8 uses the installed `Qwen3.8-27B-IQ4_XS.gguf` and a distinct
+reference directory. The file declares `qwen35`, 64 main blocks and one MTP
+predictor, so it uses the existing hybrid-GDN/HF reference family. Its canonical
+dense matrix replaces Qwen3.6 dense; historical focused Qwen3.6 regressions and
+the separate Qwen3.6 MoE matrix retain their original model identities.
+
+## Numerical cell contract
 
 Each parameterized `ProductionParity` cell uses one production runner session
 to perform this contract:

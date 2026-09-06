@@ -531,8 +531,17 @@ namespace llaminar2
             deterministic = deterministic_env && std::atoi(deterministic_env) != 0;
             if (deterministic)
             {
+                /*
+                 * Large-M prefill candidates may select a different tiling or
+                 * reduction policy, so deterministic execution keeps that
+                 * experimental scheduler disabled.  Fused M=1 decode and
+                 * grouped verifier projections are different: every projection
+                 * retains its canonical fixed reduction and writes disjoint
+                 * output/scratch storage.  Their persistent-stream fork/join
+                 * changes only launch overlap, not arithmetic order, and is
+                 * covered by captured all-codebook byte-equivalence tests.
+                 */
                 cuda_concurrent_prefill = false;
-                cuda_concurrent_decode = false;
             }
 
 

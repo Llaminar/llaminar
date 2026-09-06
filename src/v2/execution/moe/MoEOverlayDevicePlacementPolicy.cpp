@@ -6,10 +6,10 @@
 #include "MoEOverlayDevicePlacementPolicy.h"
 
 #include "DeviceMoERebalancePolicyShared.h"
+#include "MoEOverlayCycleSearch.h"
 
 #include <algorithm>
 #include <array>
-#include <functional>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -641,65 +641,24 @@ namespace llaminar2
             return desired;
         }
 
-        /**
-         * Find one canonical simple cycle in the remaining balanced move graph.
-         * The returned expert ids name directed owner-to-desired-owner edges.
-         */
+        /** Find the canonical cycle using the same bounded search as the GPU. */
         std::vector<std::uint32_t> findCycle(
             const std::vector<std::int32_t> &current,
             const std::vector<std::int32_t> &desired,
             const std::vector<bool> &excluded,
             std::size_t participant_count)
         {
-            for (std::uint32_t first = 0u; first < current.size(); ++first)
-            {
-                if (excluded[first] || current[first] == desired[first])
-                    continue;
-                const std::uint32_t start = static_cast<std::uint32_t>(
-                    current[first]);
-                const std::uint32_t next = static_cast<std::uint32_t>(
-                    desired[first]);
-                std::vector<std::uint32_t> path{first};
-                if (next == start)
-                    return path;
-
-                std::vector<bool> visited(participant_count, false);
-                visited[start] = true;
-                visited[next] = true;
-                std::function<bool(std::uint32_t)> close =
-                    [&](std::uint32_t source)
-                {
-                    for (std::uint32_t expert = 0u;
-                         expert < current.size();
-                         ++expert)
-                    {
-                        if (excluded[expert] || expert == first ||
-                            current[expert] !=
-                                static_cast<std::int32_t>(source) ||
-                            current[expert] == desired[expert])
-                        {
-                            continue;
-                        }
-                        const auto destination =
-                            static_cast<std::uint32_t>(desired[expert]);
-                        path.push_back(expert);
-                        if (destination == start)
-                            return true;
-                        if (!visited[destination])
-                        {
-                            visited[destination] = true;
-                            if (close(destination))
-                                return true;
-                            visited[destination] = false;
-                        }
-                        path.pop_back();
-                    }
-                    return false;
-                };
-                if (close(next))
-                    return path;
-            }
-            return {};
+            std::vector<std::uint8_t> visited(participant_count);
+            std::vector<std::uint32_t> sources(participant_count);
+            std::vector<std::uint32_t> next_edges(participant_count);
+            std::vector<std::uint32_t> cycle(participant_count);
+            const auto result = findMoEOverlayPlacementCycle(
+                current.data(), desired.data(), excluded,
+                static_cast<std::uint32_t>(participant_count),
+                static_cast<std::uint32_t>(current.size()), visited.data(),
+                sources.data(), next_edges.data(), cycle.data());
+            cycle.resize(result.length);
+            return cycle;
         }
     } // namespace
 
@@ -909,17 +868,16 @@ namespace llaminar2
                  expert < input.num_experts;
                  ++expert)
             {
-                const std::uint64_t historical = saturatingAdd(
-                    input.economy->phase_expert_demand[demandOffset(
-                        input,
-                        kMoEOverlayDeviceControllerEconomyDecodePhase,
-                        layer,
-                        expert)],
-                    input.economy->phase_expert_demand[demandOffset(
-                        input,
-                        kMoEOverlayDeviceControllerEconomyPrefillPhase,
-                        layer,
-                        expert)]);
+                std::uint64_t historical = 0u;
+                // The oracle uses exactly the same source-complete history
+                // as the device authority; MTP verifier demand is not decode.
+                for (std::uint32_t phase = 0u;
+                     phase < kMoEOverlayDeviceControllerDemandPhaseCount; ++phase)
+                {
+                    historical = saturatingAdd(historical,
+                        input.economy->phase_expert_demand[demandOffset(
+                            input, phase, layer, expert)]);
+                }
                 if (historical < counts[expert])
                 {
                     throw std::invalid_argument(

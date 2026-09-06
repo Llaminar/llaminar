@@ -17,6 +17,13 @@
 
 namespace llaminar2
 {
+    /** Immutable direction owned by a mapped-copy command. */
+    enum class MappedTransferDirection : std::uint8_t
+    {
+        DeviceToHost = 0u, ///< Immutable residency into mapped staging.
+        HostToDevice = 1u, ///< Mapped staging into inactive residency.
+    };
+
     /** Binary identity of a mapped transfer-progress command (`MTPR`). */
     inline constexpr std::uint32_t kMappedTransferProgressMagic =
         0x5250544du;
@@ -48,6 +55,44 @@ namespace llaminar2
         InvalidAddress = 2u,
         InvalidByteCount = 3u,
     };
+
+    /** Captured service lifetime; only GPU nodes open and close an interval. */
+    enum class MappedTransferInterval : std::uint32_t
+    {
+        Closed = 0u, ///< No inference interval owns this private graph state.
+        Open = 1u,   ///< Copy quanta may run alongside this captured interval.
+    };
+
+    /** Explicit finite-idle versus captured-interval execution contract. */
+    enum class MappedTransferServiceRun : std::uint8_t
+    {
+        PublishedPass, ///< Visit the currently published inbox once and return.
+        CapturedInterval, ///< Retire at a quantum boundary when the graph closes.
+    };
+
+    /**
+     * @brief Device-only claimant and resumable cursor for one bounded inbox.
+     *
+     * The GPU lock is acquired by executing work, never reserved by host enqueue.
+     * A queued idle submission therefore cannot exclude a resident graph worker.
+     * The owner retains the lock through copying and system publication, then
+     * releases it. Graph retirement checkpoints the cursor without completing
+     * the command, so a later interval or finite idle pass resumes exactly once.
+     * This array is sized by physical concurrency, not permanent topology slots.
+     */
+    struct alignas(64) MappedTransferServiceCursor
+    {
+        std::uint64_t generation = 0u; ///< Inbox generation owning the cursor.
+        std::uint64_t copied_bytes = 0u; ///< Published only by the GPU claimant.
+        std::uint64_t command_bytes = 0u; ///< Immutable extent of this generation.
+        std::uint32_t claimed = 0u; ///< Device-scope exclusive claimant word.
+        std::uint32_t reserved0 = 0u;
+        std::uint64_t active_nanoseconds = 0u; ///< Sum of actual claimant intervals, excluding idle gaps.
+        std::uint64_t reserved[3] = {};
+    };
+
+    static_assert(sizeof(MappedTransferServiceCursor) == 64u);
+    static_assert(std::is_trivially_copyable_v<MappedTransferServiceCursor>);
 
     /**
      * @brief Host-authored immutable copy request for one permanent lane slot.
@@ -123,7 +168,9 @@ namespace llaminar2
         std::uint32_t error = static_cast<std::uint32_t>(
             MappedTransferProgressError::None);
         std::uint32_t reserved0 = 0u;
-        std::uint64_t reserved[5] = {};
+        /** GPU-measured active work, excluding time between graph intervals. */
+        std::uint64_t device_active_nanoseconds = 0u;
+        std::uint64_t reserved[4] = {};
     };
 
     static_assert(sizeof(MappedTransferProgressCommand) == 64u);

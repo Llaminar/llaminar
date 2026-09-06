@@ -141,6 +141,7 @@ namespace llaminar2::test
         MOCK_METHOD(std::string, getStopThinkingPrompt, (), (const, override));
         MOCK_METHOD(ToolCallFormat, getToolCallFormat, (), (const, override));
         MOCK_METHOD(PrefixRuntimeStateSnapshot, prefixStateProbe, (), (const, override));
+        MOCK_METHOD(RequestRuntimeSummary, requestRuntimeSummary, (), (const, override));
 
         // MPI worker coordination
         MOCK_METHOD(void, runMPIWorkerLoop, (), (override));

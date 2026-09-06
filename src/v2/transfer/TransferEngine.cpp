@@ -890,12 +890,12 @@ namespace llaminar2
     }
 
     PersistentTransferStagingSlice::PersistentTransferStagingSlice(
-        std::shared_ptr<PinnedHostTransferBuffer> pinned,
+        std::shared_ptr<MappedHostTransferRegion> mapped,
         std::shared_ptr<DeviceTransferBuffer> device_storage,
         size_t offset,
         size_t bytes,
         DeviceId device) noexcept
-        : pinned_(std::move(pinned)),
+        : mapped_(std::move(mapped)),
           device_storage_(std::move(device_storage)),
           offset_(offset),
           bytes_(bytes),
@@ -905,11 +905,11 @@ namespace llaminar2
 
     bool PersistentTransferStagingSlice::valid() const noexcept
     {
-        return pinned_ && device_storage_ && pinned_->isBound() &&
+        return mapped_ && device_storage_ && mapped_->isBound() &&
                device_storage_->isBound() && device_.is_gpu() && bytes_ > 0u &&
-               pinned_->registrationDevice() == device_ &&
+               mapped_->hasDevice(device_) &&
                device_storage_->device() == device_ &&
-               pinned_->contains(offset_, bytes_) &&
+               mapped_->contains(offset_, bytes_) &&
                device_storage_->contains(offset_, bytes_);
     }
 
@@ -920,7 +920,7 @@ namespace llaminar2
             throw std::logic_error(
                 "Persistent transfer staging slice has no valid pinned region");
         }
-        return pinned_->mutableData(offset_);
+        return mapped_->mutableHostData(offset_);
     }
 
     void *PersistentTransferStagingSlice::mutableDeviceData() const
@@ -1392,7 +1392,8 @@ namespace llaminar2
                 "Persistent transfer staging slab byte size overflowed");
         }
         const size_t total_bytes = bytes_per_slice * slice_count;
-        auto pinned = allocatePinnedHostBuffer(total_bytes, device);
+        const std::array devices{device};
+        auto mapped = allocateMappedHostRegion(total_bytes, devices);
         auto device_storage = allocateDeviceTransferBuffer(total_bytes, device);
 
         std::vector<PersistentTransferStagingSlice> slices;
@@ -1400,7 +1401,7 @@ namespace llaminar2
         for (size_t index = 0u; index < slice_count; ++index)
         {
             slices.push_back(PersistentTransferStagingSlice(
-                pinned,
+                mapped,
                 device_storage,
                 index * bytes_per_slice,
                 bytes_per_slice,
@@ -1409,12 +1410,22 @@ namespace llaminar2
         return slices;
     }
 
+    std::shared_ptr<MappedHostTransferRegion> TransferEngine::mappedStagingView(
+        const PersistentTransferStagingSlice &staging) const
+    {
+        if (!staging.valid())
+            throw std::invalid_argument("Mapped staging view requires a complete exclusive slice");
+        return sliceMappedHostRegion(staging.mapped_, staging.offset_, staging.bytes_);
+    }
+
     std::vector<PersistentTransferExecutionLane>
     TransferEngine::allocatePersistentTransferExecutionLanes(
         size_t lane_count,
         DeviceId device,
         const std::string &pool_name) const
     {
+        if (isGraphCaptureActive())
+            throw std::logic_error("Persistent transfer lanes must be prepared before graph capture");
         if (lane_count == 0u || !device.is_gpu() || pool_name.empty())
         {
             throw std::invalid_argument(
@@ -1428,6 +1439,16 @@ namespace llaminar2
         context.submitAndWait(
             [&]
             {
+                // Resolve native function handles while building the pool.
+                // Every lease returned below proves this setup edge completed;
+                // no first-use module load can synchronize a live inference graph.
+                if (isGraphCaptureActive())
+                    throw std::logic_error("Transfer function preparation cannot enter a captured worker");
+                auto *backend = resolveBackend(device);
+                if (!backend || !backend->prepareMappedHostCopyKernels(device.gpu_ordinal()))
+                    throw std::runtime_error(
+                        "Persistent transfer pool could not prepare mapped-copy kernels on " +
+                        device.toString());
                 for (size_t index = 0u; index < lane_count; ++index)
                 {
                     bool created = false;
@@ -2538,7 +2559,7 @@ namespace llaminar2
         }
         const auto *const source_bytes =
             static_cast<const std::uint8_t *>(source) + source_offset;
-        if (!backend->deviceToMappedHostByKernelOnStream(
+        if (!backend->copyDeviceVisibleRegionByKernelOnStream(
                 destination.deviceAlias(device, destination_offset),
                 source_bytes,
                 bytes,
@@ -2548,6 +2569,143 @@ namespace llaminar2
             throw std::runtime_error(
                 "TransferEngine progress-kernel launch was rejected");
         }
+    }
+
+    void TransferEngine::enqueueBackgroundMappedCopy(
+        const PersistentTransferExecutionLane &lane,
+        MappedTransferDirection direction,
+        void *device_region,
+        size_t device_capacity,
+        size_t device_offset,
+        const MappedHostTransferRegion &mapped_region,
+        size_t mapped_offset,
+        size_t bytes) const
+    {
+        if (!lane.valid() || !device_region || !mapped_region.isBound() ||
+            bytes == 0u ||
+            (direction != MappedTransferDirection::DeviceToHost &&
+             direction != MappedTransferDirection::HostToDevice))
+            throw std::invalid_argument(
+                "Background mapped copy requires a prepared lane, bounded owners and an exact direction");
+        if (device_offset > device_capacity ||
+            bytes > device_capacity - device_offset ||
+            !mapped_region.contains(mapped_offset, bytes))
+            throw std::out_of_range("Background mapped copy exceeds its immutable region");
+        const DeviceId device = lane.device();
+        IBackend *backend = resolveBackend(device);
+        if (!backend || backend != mapped_region.backendFor(device))
+            throw std::runtime_error("Background mapped copy backend identity mismatch");
+        auto *device_bytes = static_cast<std::uint8_t *>(device_region) + device_offset;
+        void *mapped_bytes = mapped_region.deviceAlias(device, mapped_offset);
+        if (!backend->enqueueBackgroundMappedCopyOnStream(
+                device_bytes, mapped_region.mutableHostData(mapped_offset), mapped_bytes,
+                bytes, direction, device.gpu_ordinal(), lane.stream()))
+            throw std::runtime_error("Background mapped copy submission failed");
+    }
+
+    bool TransferEngine::enqueueBackgroundStagingCopy(
+        const PersistentTransferExecutionLane &lane,
+        MappedTransferDirection direction,
+        void *device_region,
+        size_t device_capacity,
+        size_t device_offset,
+        const PersistentTransferStagingSlice &staging,
+        size_t staging_offset,
+        size_t bytes,
+        std::string *error) const noexcept
+    {
+        if (error)
+            error->clear();
+        try
+        {
+            if (!staging.valid() || !lane.valid() ||
+                staging.device() != lane.device())
+                throw std::invalid_argument(
+                    "Background staging copy requires matching prepared lane and slice owners");
+            if (staging_offset > staging.bytes_ ||
+                bytes > staging.bytes_ - staging_offset)
+                throw std::out_of_range(
+                    "Background staging copy exceeds its exclusive slice");
+            // Bounds belong to the exclusive slice before translating into the
+            // shared slab. A neighboring slot is never additional capacity.
+            enqueueBackgroundMappedCopy(lane, direction, device_region,
+                device_capacity, device_offset, *staging.mapped_,
+                staging.offset_ + staging_offset, bytes);
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+        }
+        catch (...)
+        {
+            if (error)
+                *error = "Background staging copy failed with a non-standard exception";
+        }
+        return false;
+    }
+
+    std::shared_ptr<DeviceTransferBuffer> TransferEngine::allocateMappedTransferServiceCursors(
+        size_t capacity, DeviceId device, void *stream) const
+    {
+        if (!capacity || !device.is_gpu() || !stream ||
+            capacity > std::numeric_limits<size_t>::max() / sizeof(MappedTransferServiceCursor))
+            throw std::invalid_argument("Mapped transfer service requires bounded capacity, one GPU and an exact setup stream");
+        if (isGraphCaptureActive())
+            throw std::logic_error("Mapped transfer service allocation is a cold setup operation");
+        auto cursors = allocateDeviceTransferBuffer(capacity * sizeof(MappedTransferServiceCursor), device);
+        auto *backend = resolveBackend(device);
+        if (!backend || !backend->initializeMappedTransferService(
+                static_cast<MappedTransferServiceCursor *>(cursors->mutableDeviceData()),
+                capacity, device.gpu_ordinal(), stream))
+            throw std::runtime_error("Mapped transfer service initialization failed");
+        return cursors;
+    }
+
+    void TransferEngine::enqueueMappedTransferInterval(
+        DeviceTransferBuffer &interval, MappedTransferInterval value,
+        void *stream) const
+    {
+        if (!interval.isBound() || !interval.contains(0u, sizeof(std::uint32_t)) || !stream ||
+            (value != MappedTransferInterval::Open && value != MappedTransferInterval::Closed))
+            throw std::invalid_argument("Mapped transfer interval requires a bound private word, typed state and exact stream");
+        auto *backend = resolveBackend(interval.device());
+        if (!backend || !backend->enqueueMappedTransferInterval(
+                static_cast<std::uint32_t *>(interval.mutableDeviceData()), value,
+                interval.device().gpu_ordinal(), stream))
+            throw std::runtime_error("Mapped transfer interval publication failed");
+    }
+
+    void TransferEngine::enqueueMappedTransferService(
+        const MappedHostTransferRegion &inbox, DeviceTransferBuffer &cursors,
+        size_t maximum_bytes, const DeviceTransferBuffer *interval,
+        MappedTransferServiceRun run, void *stream) const
+    {
+        const auto device = cursors.device();
+        const auto capacity = cursors.sizeBytes() / sizeof(MappedTransferServiceCursor);
+        constexpr auto record_bytes = sizeof(MappedTransferProgressCommand) +
+                                      sizeof(MappedTransferProgressCompletion);
+        if (!cursors.isBound() || !inbox.isBound() || !inbox.hasDevice(device) ||
+            !stream || !maximum_bytes || !capacity ||
+            cursors.sizeBytes() % sizeof(MappedTransferServiceCursor) != 0u ||
+            capacity > inbox.sizeBytes() / record_bytes ||
+            (run != MappedTransferServiceRun::PublishedPass && run != MappedTransferServiceRun::CapturedInterval) ||
+            ((run == MappedTransferServiceRun::CapturedInterval) != (interval != nullptr)) ||
+            (interval && (!interval->isBound() || interval->device() != device ||
+                          !interval->contains(0u, sizeof(std::uint32_t)))))
+            throw std::invalid_argument("Mapped transfer service has invalid physical inbox, cursor, interval or stream ownership");
+        auto *backend = resolveBackend(device);
+        if (!backend || backend != inbox.backendFor(device) ||
+            !backend->enqueueMappedTransferService(
+                static_cast<const MappedTransferProgressCommand *>(inbox.deviceAlias(device)),
+                static_cast<MappedTransferProgressCompletion *>(inbox.deviceAlias(
+                    device, capacity * sizeof(MappedTransferProgressCommand))),
+                static_cast<MappedTransferServiceCursor *>(cursors.mutableDeviceData()),
+                capacity, maximum_bytes,
+                interval ? static_cast<const std::uint32_t *>(interval->deviceData()) : nullptr,
+                run, device.gpu_ordinal(), stream))
+            throw std::runtime_error("Mapped transfer service launch rejected by the exact backend");
     }
 
     void TransferEngine::enqueueMappedTransferProgressClaims(

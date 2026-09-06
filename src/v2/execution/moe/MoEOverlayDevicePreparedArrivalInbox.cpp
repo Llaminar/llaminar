@@ -1,15 +1,24 @@
 /**
  * @file MoEOverlayDevicePreparedArrivalInbox.cpp
- * @brief Exact-stream descriptor handoff for device-authored MoE movement.
+ * @brief Immutable mapped descriptor handoff for device-authored MoE movement.
+ *
+ * The physical transport worker writes descriptors once, then releases its
+ * existing transaction receipt. The captured controller acquires that receipt
+ * and installs descriptors into an inactive device bank. A second H2D copy and
+ * completion event are unnecessary and can be serialized behind live inference
+ * by native GPU work queues. Pages remain immutable until device completion.
  */
 
 #include "MoEOverlayDevicePreparedArrivalInbox.h"
 
 #include "DeviceMoEExpertDescriptorBuilder.h"
 #include "backends/IBackend.h"
+#include "MoEOverlayDeviceTransportProtocol.h"
+#include "transfer/TransferEngine.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
@@ -88,18 +97,21 @@ namespace llaminar2
             sizeof(DeviceMoEExpertDescriptor);
         try
         {
+            const std::array<DeviceId, 1u> devices{
+                config_.runtime_binding.device};
+            mapped_arrivals_ =
+                TransferEngine::instance().allocateMappedHostRegion(
+                    arrival_bytes, devices);
             prepared_arrivals_device_ = static_cast<DeviceMoEExpertDescriptor *>(
-                config_.backend->allocate(arrival_bytes, ordinal));
+                mapped_arrivals_->deviceAlias(config_.runtime_binding.device));
             prepared_arrivals_staging_ = static_cast<DeviceMoEExpertDescriptor *>(
-                config_.backend->allocatePinned(arrival_bytes, ordinal));
+                mapped_arrivals_->mutableHostData());
             apply_status_device_ = static_cast<
                 MoEOverlayDeviceRuntimeApplyStatus *>(
                 config_.backend->allocate(
                     sizeof(MoEOverlayDeviceRuntimeApplyStatus), ordinal));
-            transfer_stream_ = config_.backend->createStream(ordinal);
-            transfer_event_ = config_.backend->createEvent(ordinal);
             if (!prepared_arrivals_device_ || !prepared_arrivals_staging_ ||
-                !apply_status_device_ || !transfer_stream_ || !transfer_event_)
+                !apply_status_device_)
             {
                 throw std::runtime_error(
                     "device prepared-arrival inbox setup allocation failed");
@@ -109,29 +121,18 @@ namespace llaminar2
                 prepared_arrivals_staging_,
                 config_.command_capacity,
                 DeviceMoEExpertDescriptor{});
+            // The status consumer uses this same setup stream. Host descriptor
+            // pages require no GPU initialization or cross-stream event edge.
             if (!config_.backend->memset(
-                    prepared_arrivals_device_,
-                    0,
-                    arrival_bytes,
-                    ordinal,
-                    transfer_stream_) ||
-                !config_.backend->memset(
                     apply_status_device_,
                     0,
                     sizeof(MoEOverlayDeviceRuntimeApplyStatus),
                     ordinal,
-                    transfer_stream_) ||
-                !config_.backend->recordEvent(
-                    transfer_event_, ordinal, transfer_stream_) ||
-                !config_.backend->streamWaitEvent(
-                    config_.consumer_stream,
-                    transfer_event_,
-                    ordinal))
+                    config_.consumer_stream))
             {
                 throw std::runtime_error(
                     "device prepared-arrival inbox setup initialization failed");
             }
-            state_ = State::InitializationSubmitted;
         }
         catch (...)
         {
@@ -166,16 +167,16 @@ namespace llaminar2
         };
     }
 
-    bool MoEOverlayDevicePreparedArrivalInbox::enqueue(
+    bool MoEOverlayDevicePreparedArrivalInbox::stage(
         const MoEOverlayDevicePhysicalMovementBatch &batch,
         const MoEOverlayParticipantPreparedTransfers &prepared,
         std::string *error) noexcept
     {
         if (error)
             error->clear();
-        if ((state_ != State::InitializationSubmitted &&
-             state_ != State::Ready) ||
+        if (state_ != State::Ready ||
             !batch.valid() ||
+            batch.transaction_id <= retired_transaction_ ||
             !batch.movesWeights() ||
             (batch.kind !=
                  MoEOverlayDeviceControllerTransactionKind::DynamicPlacement &&
@@ -242,27 +243,18 @@ namespace llaminar2
             ++local_arrivals;
         }
 
-        const int ordinal = config_.runtime_binding.device.gpu_ordinal();
         const std::size_t bytes =
             static_cast<std::size_t>(batch.command_count) *
             sizeof(DeviceMoEExpertDescriptor);
-        if (!config_.backend->hostToDeviceOnStream(
-                prepared_arrivals_device_,
-                prepared_arrivals_staging_,
-                bytes,
-                ordinal,
-                transfer_stream_) ||
-            !config_.backend->recordEvent(
-                transfer_event_, ordinal, transfer_stream_))
-        {
-            return reject(
-                error,
-                "device prepared-arrival inbox descriptor DMA submission failed");
-        }
-        state_ = State::WaveSubmitted;
+        // publishPrepared() follows on this transport worker. Its system-release
+        // receipt is the only publication edge; device candidate construction
+        // acquires it before reading these immutable physical descriptors.
+        staged_transaction_ = batch.transaction_id;
+        staged_digest_ = batch.command_digest;
+        state_ = State::Staged;
         PerfStatsCollector::addCounter(
             "moe_overlay_controller",
-            "prepared_arrival_descriptor_uploads",
+            "prepared_arrival_descriptor_publications",
             1.0,
             "maintenance",
             config_.perf_device,
@@ -272,55 +264,28 @@ namespace llaminar2
              {"commands", std::to_string(batch.command_count)},
              {"local_arrivals", std::to_string(local_arrivals)},
              {"bytes", std::to_string(bytes)},
+             {"handoff", "mapped_immutable"},
+             {"gpu_submissions", "0"},
              {"blocking", "false"}});
         return true;
     }
 
-    bool MoEOverlayDevicePreparedArrivalInbox::enqueueDependency(
-        std::string *error) const noexcept
-    {
-        if (state_ != State::WaveSubmitted || !transfer_event_ ||
-            !config_.backend->streamWaitEvent(
-                config_.consumer_stream,
-                transfer_event_,
-                config_.runtime_binding.device.gpu_ordinal()))
-        {
-            return reject(
-                error,
-                "device controller stream could not join its prepared-arrival event");
-        }
-        return true;
-    }
-
-    bool MoEOverlayDevicePreparedArrivalInbox::queryReady(
-        bool *ready,
-        std::string *error) const noexcept
-    {
-        if (ready)
-            *ready = false;
-        if (!ready || state_ != State::WaveSubmitted || !transfer_event_ ||
-            !config_.backend->queryEvent(
-                transfer_event_,
-                config_.runtime_binding.device.gpu_ordinal(),
-                ready))
-        {
-            return reject(
-                error,
-                "device prepared-arrival inbox event query failed");
-        }
-        return true;
-    }
-
     bool MoEOverlayDevicePreparedArrivalInbox::finishWave(
+        const MoEOverlayDeviceTransportProtocol &protocol,
+        const MoEOverlayDeviceTransportCommandBatch &command,
         std::string *error) noexcept
     {
-        bool ready = false;
-        if (!queryReady(&ready, error) || !ready)
+        if (state_ != State::Staged ||
+            command.header.transaction_id != staged_transaction_ ||
+            command.header.command_digest != staged_digest_ ||
+            !protocol.transactionComplete(command))
         {
-            if (error && error->empty())
-                *error = "device prepared-arrival inbox was reused before DMA completion";
-            return false;
+            return reject(error,
+                "device prepared-arrival inbox requires its exact completed controller transaction before reuse");
         }
+        retired_transaction_ = staged_transaction_;
+        staged_transaction_ = 0u;
+        staged_digest_ = 0u;
         state_ = State::Ready;
         return true;
     }
@@ -330,26 +295,11 @@ namespace llaminar2
         if (!config_.backend)
             return;
         const int ordinal = config_.runtime_binding.device.gpu_ordinal();
-        /* Initialization and a live wave can still own device/pinned storage.
-         * Teardown is the only host wait: normal reuse observes completion by
-         * query and reaches Ready before any resource is reclaimed. */
-        if ((state_ == State::InitializationSubmitted ||
-             state_ == State::WaveSubmitted) &&
-            transfer_event_)
-            (void)config_.backend->waitForEvent(transfer_event_, ordinal);
-        if (transfer_event_)
-            config_.backend->destroyEvent(transfer_event_, ordinal);
-        if (transfer_stream_)
-            config_.backend->destroyStream(transfer_stream_, ordinal);
+        // The service retires captured readers before releasing its endpoints.
+        // This inbox has no independent queued work or completion event to drain.
         if (apply_status_device_)
             config_.backend->free(apply_status_device_, ordinal);
-        if (prepared_arrivals_staging_)
-            config_.backend->freePinned(
-                prepared_arrivals_staging_, ordinal);
-        if (prepared_arrivals_device_)
-            config_.backend->free(prepared_arrivals_device_, ordinal);
-        transfer_event_ = nullptr;
-        transfer_stream_ = nullptr;
+        mapped_arrivals_.reset();
         apply_status_device_ = nullptr;
         prepared_arrivals_staging_ = nullptr;
         prepared_arrivals_device_ = nullptr;

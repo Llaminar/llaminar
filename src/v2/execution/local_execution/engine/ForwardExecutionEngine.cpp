@@ -2237,7 +2237,7 @@ namespace llaminar2
                 std::move(lookup_tags));
             touchPrefillForwardCache(forward_signature, *active_forward_cache);
             const bool success = executeCacheHit(effective_input, output, *active_forward_cache, host,
-                                                 is_decode, start);
+                                                 forward_signature, start);
             if (setup_materialization)
             {
                 if (success && !forward_signature.decode)
@@ -2567,8 +2567,7 @@ namespace llaminar2
         const IComputeStage::MoEOverlayCollectiveRuntimeParams &sparse_params,
         const DeviceGraphExecutor::GraphLaunchDependencyHook
             &launch_dependency,
-        const GraphCaptureAuxiliaryBranchFactory
-            &auxiliary_branch_factory,
+        IForwardExecutionHost &host,
         void *transaction_stream,
         void **out_producer_stream,
         std::string *error)
@@ -2659,6 +2658,12 @@ namespace llaminar2
          * declarative graph here clears only host lifecycle flags; the retained
          * executables, streams, workspaces, and device state remain untouched.
          */
+        // Retained MTP submission uses the same runner-owned authority as
+        // setup and ordinary forward. Reading the cached factory instead would
+        // hide a changed owner; accepting a caller-supplied empty descriptor
+        // previously dropped the maintenance branch only on hosted verification.
+        const auto auxiliary_branch_factory =
+            host.forwardGraphAuxiliaryBranchFactory(ctx->deviceId());
         cache.graph->reset();
         if (!executor_.executeWithCachedGraphReplay(
                 *cache.graph,
@@ -2871,8 +2876,9 @@ namespace llaminar2
         const ForwardInput &input,
         ForwardGraphCache &forward_cache,
         IForwardExecutionHost &host,
-        bool is_decode)
+        const ForwardGraphSignature &signature)
     {
+        const bool is_decode = signature.decode;
         if (input.graph_submission_intent !=
                 ForwardGraphSubmissionIntent::
                     MaterializeExecutableWithoutLaunch ||
@@ -2897,7 +2903,7 @@ namespace llaminar2
                 1.0,
                 "setup",
                 input.device.toString(),
-                {{"context", is_decode ? "main_decode" : "prefill"}});
+                {{"context", forwardGraphPerfContext(signature)}});
             return true;
         }
 
@@ -2985,7 +2991,7 @@ namespace llaminar2
         {
             capture_policy.auxiliary_branch_factory =
                 host.forwardGraphAuxiliaryBranchFactory(
-                    input, ctx->deviceId());
+                    ctx->deviceId());
             const GraphNativeCaptureEnvelope native_capture_envelope =
                 forward_cache.graph->nativeCaptureEnvelope();
             std::string envelope_error;
@@ -3036,7 +3042,9 @@ namespace llaminar2
         };
         capture_policy.launch_dependency = {};
         capture_policy.force_recapture = false;
-        forward_cache.segment_cache.perf_context = "main_decode";
+        // Setup and request replay must name the same graph owner. Treating
+        // every decode-shaped graph as main_decode hides verifier captures.
+        forward_cache.segment_cache.perf_context = forwardGraphPerfContext(signature);
 
         bool used_graph_replay = false;
         return executor_.executeDecodeWithCapturePolicy(
@@ -3060,9 +3068,10 @@ namespace llaminar2
         ForwardOutput &output,
         ForwardGraphCache &forward_cache,
         IForwardExecutionHost &host,
-        bool is_decode,
+        const ForwardGraphSignature &signature,
         std::chrono::high_resolution_clock::time_point start)
     {
+        const bool is_decode = signature.decode;
         // ===== CACHE HIT: Reuse cached decode graph =====
 
         // Setup sub-phase timing (only when profiling is active)
@@ -3423,7 +3432,7 @@ namespace llaminar2
                 input,
                 forward_cache,
                 host,
-                is_decode);
+                signature);
         }
 
         if (profiling_setup)
@@ -3646,7 +3655,7 @@ namespace llaminar2
             {
                 capture_policy.auxiliary_branch_factory =
                     host.forwardGraphAuxiliaryBranchFactory(
-                        input, ctx->deviceId());
+                        ctx->deviceId());
                 std::string envelope_error;
                 if (!DeviceGraphCaptureController::
                         constrainReplayPolicyToNativeEnvelope(
@@ -3815,7 +3824,7 @@ namespace llaminar2
                 1.0,
                 "decode",
                 input.device.toString(),
-                {{"context", all_position_verifier ? "main_verifier" : "main_decode"},
+                {{"context", forwardGraphPerfContext(signature)},
                  {"allow_graph_replay", boolTag(capture_policy.allow_cached_graph_replay)},
                  {"defer_final_sync", boolTag(capture_policy.defer_final_sync)},
                  {"has_collectives", boolTag(has_collective_nodes)},
@@ -3880,14 +3889,17 @@ namespace llaminar2
                     1.0,
                     "decode",
                     input.device.toString(),
-                    {{"context", all_position_verifier ? "main_verifier" : "main_decode"},
+                    {{"context", forwardGraphPerfContext(signature)},
                      {"old_epoch", std::to_string(forward_cache.graph_replay_live_state_epoch)},
                      {"new_epoch", std::to_string(live_state_epoch)}});
                 forward_cache.resetReplayState();
             }
 
+            // Replay retains the exact role that setup captured. A request-
+            // batch condition is decode-shaped but is not an ordinary decode;
+            // collapsing that distinction splits its capture/replay evidence.
             forward_cache.segment_cache.perf_context =
-                all_position_verifier ? "main_verifier" : "main_decode";
+                forwardGraphPerfContext(signature);
             success = executor_.executeDecodeWithCapturePolicy(
                 *forward_cache.graph,
                 ctx,
@@ -4368,7 +4380,7 @@ namespace llaminar2
         {
             prefill_capture_policy.auxiliary_branch_factory =
                 host.forwardGraphAuxiliaryBranchFactory(
-                    input, ctx->deviceId());
+                    ctx->deviceId());
             std::string envelope_error;
             if (!DeviceGraphCaptureController::
                     constrainReplayPolicyToNativeEnvelope(
@@ -5830,7 +5842,7 @@ namespace llaminar2
                 output,
                 *build_cache,
                 host,
-                is_decode,
+                signature,
                 start);
             if (!first_use_success)
             {

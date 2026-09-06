@@ -457,7 +457,11 @@ MemoryPlan MemoryPlanner::plan(
                         .auxiliary_executable_count =
                             cfg.captured_serving_graphs
                                 .mtp_graph_owners
-                                .auxiliaryExecutableSlotCount(),
+                                .generalAuxiliaryExecutableSlotCount(),
+                        .bounded_helper_executable_count =
+                            cfg.captured_serving_graphs
+                                .mtp_graph_owners
+                                .boundedHelperExecutableSlotCount(),
                     });
         }
 
@@ -919,18 +923,22 @@ MemoryPlan MemoryPlanner::plan(
                     }
                 }
             }
-            if (cfg.total_shards > 1)
+            // Weight sharding spans the full domain, whereas these allocations
+            // belong only to an installed rank-local collective. A one-device
+            // NodeTP rank must not invent LocalTP just because a peer rank owns
+            // another weight shard. Absence and unresolved AUTO are distinct.
+            if (cfg.local_tp_backend.has_value())
             {
                 if (cfg.local_tp_backend == CollectiveBackendType::AUTO)
                 {
                     throw std::invalid_argument(
-                        "Multi-shard memory planning requires a resolved LocalTP collective backend");
+                        "LocalTP memory planning requires a resolved collective backend");
                 }
                 collective_bytes =
                     CollectiveMemoryEstimator::localTP(
                         max_seq,
                         profile.d_model,
-                        cfg.local_tp_backend)
+                        *cfg.local_tp_backend)
                         .perDeviceBytes();
             }
         }

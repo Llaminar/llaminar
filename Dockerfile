@@ -81,9 +81,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 COPY scripts/docker/install-system-deps.sh \
      scripts/docker/install-cuda.sh \
+     scripts/docker/install-nccl.sh \
      scripts/docker/install-rocm.sh \
      scripts/docker/install-cutlass.sh \
      /tmp/install-scripts/
+COPY scripts/docker/patches/ /tmp/install-scripts/patches/
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh
 RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
@@ -343,9 +345,11 @@ RUN --mount=type=cache,target=/root/.ccache \
         \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
         -delete \
  && find build_v2_release -depth -type d -name CMakeFiles -exec rm -rf {} + \
- && mkdir -p /src/runtime-bin /src/runtime-libs \
+ && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses \
  && cp build_v2_release/llaminar2 /src/runtime-bin/llaminar2 \
  && cp build_v2_release/libllaminar2_core.so /src/runtime-libs/ \
+ && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -P /usr/local/lib/libllaminar_nccl.so* /src/runtime-libs/; fi \
+ && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -r /usr/local/share/licenses/llaminar-nccl /src/runtime-licenses/; fi \
  && cp "external/onednn/build-$(printf '%s' "${LLAMINAR_CPU_ISA}" | tr '[:upper:]' '[:lower:]')/lib/libdnnl.so.3.11" /src/runtime-libs/ \
  && if [ -e external/rccl/build/librccl.so.1.0 ]; then cp external/rccl/build/librccl.so.1.0 /src/runtime-libs/; fi \
  && echo "==> [release] done; final size: $(du -sh build_v2_release | cut -f1)"
@@ -422,6 +426,7 @@ RUN rm -rf /tmp/install-scripts
 # installed above (CUDA shared libs, ROCm runtime, MPI, OpenBLAS).
 COPY --from=builder /src/runtime-bin/ /usr/local/bin/
 COPY --from=builder /src/runtime-libs/ /usr/local/lib/
+COPY --from=builder /src/runtime-licenses/ /usr/local/share/licenses/
 RUN ln -sf libdnnl.so.3.11 /usr/local/lib/libdnnl.so.3 \
  && ln -sf libdnnl.so.3 /usr/local/lib/libdnnl.so \
  && if [ -e /usr/local/lib/librccl.so.1.0 ]; then \

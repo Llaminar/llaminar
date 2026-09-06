@@ -15,6 +15,8 @@
 
 #pragma once
 
+#include "memory/CPUWeightStoragePlacement.h"
+
 #ifndef HAVE_ONEDNN
 #error "OneDNN support is required for FloatingPointGemmKernel"
 #endif
@@ -2101,13 +2103,15 @@ namespace llaminar2
              * lifetime is identical to the GEMM engine's lifetime.
              *
              * @param source Live FP32, FP16, or BF16 expert matrix.
+             * @param placement Final native storage placement before copying source bytes.
              * @return Independent owning tensor containing the exact bytes.
              * @throws std::invalid_argument for null, non-matrix, unsupported,
              *         released, or internally inconsistent source storage.
              */
             static std::shared_ptr<const TensorBase>
             cloneExpertExecutionStorage(
-                const std::shared_ptr<const TensorBase> &source)
+                const std::shared_ptr<const TensorBase> &source,
+                CPUWeightStoragePlacement placement)
             {
                 if (!source || source->shape().size() != 2u ||
                     !source->raw_data())
@@ -2117,16 +2121,25 @@ namespace llaminar2
                 }
 
                 std::shared_ptr<TensorBase> owned;
+                // Allocate the final native storage before its first write;
+                // tensor adoption preserves the page mapping without a copy.
+                const auto copy_storage = [&]<typename T>() {
+                    if (source->size_bytes() % sizeof(T) != 0)
+                        throw std::invalid_argument("Floating expert byte count is not element-aligned");
+                    auto storage = placement.allocate<T>(source->size_bytes() / sizeof(T));
+                    std::memcpy(storage.data(), source->raw_data(), source->size_bytes());
+                    return storage;
+                };
                 switch (source->native_type())
                 {
                 case TensorType::FP32:
-                    owned = std::make_shared<FP32Tensor>(source->shape());
+                    owned = std::make_shared<FP32Tensor>(source->shape(), copy_storage.template operator()<float>());
                     break;
                 case TensorType::FP16:
-                    owned = std::make_shared<FP16Tensor>(source->shape());
+                    owned = std::make_shared<FP16Tensor>(source->shape(), copy_storage.template operator()<uint16_t>());
                     break;
                 case TensorType::BF16:
-                    owned = std::make_shared<BF16Tensor>(source->shape());
+                    owned = std::make_shared<BF16Tensor>(source->shape(), copy_storage.template operator()<uint16_t>());
                     break;
                 default:
                     throw std::invalid_argument(
@@ -2140,12 +2153,7 @@ namespace llaminar2
                         "Prepared floating expert allocation does not match source storage");
                 }
 
-                // Native-byte copy is the numerical contract: do not route this
-                // through FP32 conversion, which would alter FP16/BF16 payloads.
-                std::memcpy(
-                    owned->raw_mutable_data(),
-                    source->raw_data(),
-                    source->size_bytes());
+                // No conversion or second copy: FP16/BF16 native bits remain exact.
                 return owned;
             }
 
@@ -2187,12 +2195,14 @@ namespace llaminar2
              *
              * @param weight_tensor Shared weight tensor (FP32, FP16, or BF16).
              * @param numerical_policy Backend-native or GPU-aligned expert arithmetic.
+             * @param placement Final CPU storage placement, certified before the native copy.
              */
             explicit FloatingPointGemmKernel(
                 std::shared_ptr<const TensorBase> weight_tensor,
-                NumericalPolicy numerical_policy = NumericalPolicy::BackendNative)
+                NumericalPolicy numerical_policy = NumericalPolicy::BackendNative,
+                CPUWeightStoragePlacement placement = CPUWeightStoragePlacement::local())
                 : weight_tensor_lifetime_(
-                      cloneExpertExecutionStorage(weight_tensor)),
+                      cloneExpertExecutionStorage(weight_tensor, placement)),
                   weight_tensor_(weight_tensor_lifetime_.get()),
                   numerical_policy_(numerical_policy)
             {

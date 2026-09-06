@@ -6,19 +6,17 @@
  *
  * **Design**:
  * - Inherits from ROCmKernelBase for workspace and device context support
- * - Implements IDeviceKernel for universal caching via DeviceKernelCache
  * - Uses hipBLAS sgemm (FP32), hgemm (FP16), or emulated BF16 (via FP32 compute)
  * - Expects input/output matrices already on GPU device
  * - Caller responsible for device memory management
  *
- * **Device Context Support (Phase 4)**:
- * - Can use hipBLAS handle from IWorkerGPUContext instead of creating own
- * - Backward compatible: existing constructor still creates own handle
+ * All construction forms borrow context-owned library resources. Projection
+ * lifetime never owns hipBLAS teardown. Context-scoped submission locking
+ * protects exact stream and persistent arena workspace selection.
  *
- * **Usage** (via DeviceKernelCache):
+ * **Usage**:
  * ```cpp
- * auto* gemm = DeviceKernelCache::getKernel<HipBLASGemmKernel>(
- *     DeviceId::rocm(0), KernelType::BLAS_GEMM);
+ * auto gemm = std::make_unique<HipBLASGemmKernel>(DeviceId::rocm(0));
  * gemm->execute(d_A, d_B, d_C, M, N, K, transA, transB);
  * ```
  *
@@ -32,7 +30,6 @@
 #pragma once
 
 #include "../ROCmKernelBase.h"
-#include "../../DeviceKernelCache.h"
 #include "../../../backends/DeviceId.h"
 #include <cstddef>
 #include <memory>
@@ -56,7 +53,7 @@ namespace llaminar2
          * @brief hipBLAS-based GEMM kernel for floating-point tensors
          *
          * Inherits from ROCmKernelBase for workspace and device context support.
-         * Implements IDeviceKernel for universal caching.
+         * Library ownership and submission serialization belong to the context.
          *
          * Supports:
          * - FP32: hipblasSgemm
@@ -72,7 +69,7 @@ namespace llaminar2
          * - No Tensor Cores, but matrix FMA is well optimized
          * - BF16 requires conversion overhead (no hardware support)
          */
-        class HipBLASGemmKernel : public ROCmKernelBase, public IDeviceKernel
+        class HipBLASGemmKernel : public ROCmKernelBase
         {
         public:
             /**
@@ -86,7 +83,7 @@ namespace llaminar2
             };
 
             /**
-             * @brief Create hipBLAS GEMM kernel (legacy constructor - creates own handle)
+             * @brief Borrow the persistent worker context selected by device identity.
              *
              * @param device_id DeviceId (must be ROCm)
              * @param precision Floating-point precision to use
@@ -110,7 +107,7 @@ namespace llaminar2
             explicit HipBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision = Precision::FP32);
 
             /**
-             * @brief Destructor - destroys hipBLAS handle only if owned
+             * @brief Destroy only this projection view, never the context's library.
              */
             ~HipBLASGemmKernel() override;
 
@@ -126,8 +123,8 @@ namespace llaminar2
             // IDeviceKernel Interface
             // =================================================================
 
-            KernelType type() const override { return KernelType::BLAS_GEMM; }
-            DeviceId device() const override { return device_id_; }
+            /** @return Physical device whose context owns the library. */
+            DeviceId device() const { return device_id_; }
 
             // =================================================================
             // Device Query
@@ -175,9 +172,9 @@ namespace llaminar2
             /**
              * @brief Submit FP32 GEMM on one exact non-null HIP stream.
              *
-             * The cached hipBLAS kernel is shared by every floating projection
-             * on a device. This entry point binds the shared handle and submits
-             * the operation while holding its short host-side dispatch lock, so
+             * The context's hipBLAS handle is shared by floating projections
+             * on a device. This entry point binds that handle and submits
+             * the operation while holding its context-scoped dispatch lock, so
              * another stream cannot retarget the handle between those actions.
              * The lock is released immediately after enqueue and does not wait
              * for device execution.
@@ -285,10 +282,10 @@ namespace llaminar2
             Precision precision() const { return precision_; }
 
             /**
-             * @brief Check if this kernel owns its hipBLAS handle
-             * @return true if destructor will destroy the handle, false if using context's handle
+             * @brief Report that projection views never own library handles.
+             * @return false; the context is the sole library lifetime authority.
              */
-            bool ownsHandle() const { return owns_handle_; }
+            bool ownsHandle() const { return false; }
 
             /**
              * @brief Retain the exact validated stream for legacy entry points.
@@ -309,25 +306,12 @@ namespace llaminar2
             void clearStreamBinding() noexcept;
 
         private:
-            // hipblasHandle_t and hipblasLtHandle_t stored as void* to avoid including HIP headers.
-            // This allows g++-compiled files to include this header without HIP namespace pollution.
-            void *handle_ = nullptr;
-            void *lt_handle_ = nullptr; // hipBLASLt handle for fused operations
             DeviceId device_id_;
             Precision precision_ = Precision::FP32;
-            bool owns_handle_ = true;    ///< false when using context's hipBLAS handle
-            bool owns_lt_handle_ = true; ///< false when using context's hipBLASLt handle
-            /**
-             * Serializes only handle mutation plus asynchronous submission.
-             * Device execution is not waited here. Context-owned shared handles
-             * additionally rely on their single worker-thread submission
-             * contract; independently submitted cached wrappers share this lock.
-             */
-            mutable std::mutex dispatch_mutex_;
         };
 
         /**
-         * @brief Factory function for hipBLAS GEMM kernel (legacy - creates own handle)
+         * @brief Create a submission view borrowing the selected device context.
          */
         std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(
             const DeviceId &device_id,
@@ -339,13 +323,6 @@ namespace llaminar2
         std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(
             IWorkerGPUContext *ctx,
             HipBLASGemmKernel::Precision precision = HipBLASGemmKernel::Precision::FP32);
-
-        /**
-         * @brief Register hipBLAS GEMM kernel factory with DeviceKernelCache
-         *
-         * Call this at startup to enable automatic kernel creation for ROCm devices.
-         */
-        void registerHipBLASGemmKernelFactory();
 
     } // namespace rocm
 } // namespace llaminar2

@@ -1,23 +1,28 @@
 /**
  * @file MappedTransferProgressEpoch.h
- * @brief Node-local asynchronous-DMA scheduler for background expert movement.
+ * @brief Node-local asynchronous-copy scheduler for background expert movement.
  *
  * A physical ExpertOverlay fabric owns one epoch per local GPU. Permanent
  * command slots publish typed D2H or H2D work, while a separately bounded pool
  * of setup-owned execution lanes submits that work and observes terminal
- * events. Inference graphs never capture, join, or wait for this scheduler.
+ * events. CUDA captured graphs additionally own bounded copy-service branches;
+ * they retire at the inference terminal, never wait for a command to complete.
  */
 
 #pragma once
 
 #include "MappedTransferProgressABI.h"
+#include "TransferCommandProgressWatch.h"
 #include "TransferEngine.h"
+#include "TransferProducerDependency.h"
 #include "backends/DeviceId.h"
+#include "execution/local_execution/graph/IGraphCaptureAuxiliaryBranch.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -28,13 +33,6 @@ namespace llaminar2
     class IBackend;
     class IWorkerGPUContext;
     class MappedHostTransferRegion;
-
-    /** Immutable direction owned by one permanent DMA slot. */
-    enum class MappedTransferDirection : std::uint8_t
-    {
-        DeviceToHost = 0u, ///< Immutable residency bank into mapped staging.
-        HostToDevice = 1u, ///< Mapped staging into an inactive residency bank.
-    };
 
     /** Result of one non-blocking permanent-slot completion observation. */
     enum class MappedTransferProgress : std::uint8_t
@@ -51,7 +49,7 @@ namespace llaminar2
         std::uint64_t commands_published = 0u;
         std::uint64_t commands_completed = 0u;
         std::uint64_t bytes_completed = 0u;
-        std::uint64_t dma_submissions = 0u;
+        std::uint64_t copy_submissions = 0u;
         std::uint64_t idle_submission_skips = 0u;
         std::uint64_t in_flight_observations = 0u;
         std::uint64_t command_failures = 0u;
@@ -92,11 +90,12 @@ namespace llaminar2
         [[nodiscard]] std::size_t index() const noexcept { return index_; }
 
         /**
-         * @brief Publish a bounded device-to-mapped-host DMA command.
+         * @brief Publish a bounded device-to-mapped-host copy command.
          * @param source Stable base of an immutable device residency region.
          * @param source_capacity Complete byte capacity of @p source.
          * @param source_offset First source byte copied by this generation.
          * @param bytes Positive byte count within both fixed regions.
+         * @param dependency Exact producer edge, or an already-published source.
          * @return Positive monotonic slot generation.
          * @throws std::logic_error for the wrong slot direction or overlap.
          * @throws std::invalid_argument for invalid bounds or identity.
@@ -105,10 +104,11 @@ namespace llaminar2
             const void *source,
             std::size_t source_capacity,
             std::size_t source_offset,
-            std::size_t bytes);
+            std::size_t bytes,
+            TransferProducerDependency dependency = TransferProducerDependency::published());
 
         /**
-         * @brief Publish a mapped-host-to-device DMA command.
+         * @brief Publish a mapped-host-to-device copy command.
          * @param destination Stable base of an inactive device residency region.
          * @param destination_capacity Complete byte capacity of @p destination.
          * @param destination_offset First destination byte written by this generation.
@@ -130,6 +130,17 @@ namespace llaminar2
          */
         MappedTransferProgress poll(std::string *error = nullptr) noexcept;
 
+        /**
+         * @brief Return timing from the last acquired completion, never a guessed stream.
+         * @return Device-active nanoseconds when the executor measures them.
+         * @throws std::logic_error before a completed command or during a new command.
+         *
+         * CUDA sums claimant intervals across partial graph retirement. Native
+         * event executors without timing return an explicit empty observation;
+         * economy callers must reject missing evidence, not substitute host time.
+         */
+        [[nodiscard]] std::optional<std::uint64_t> completedDeviceNanoseconds() const;
+
     private:
         friend class MappedTransferProgressEpoch;
 
@@ -146,10 +157,12 @@ namespace llaminar2
         std::uint64_t next_generation_ = 0u;
         std::uint64_t pending_generation_ = 0u;
         bool pending_ = false;
+        std::uint64_t completed_generation_ = 0u;
+        std::optional<std::uint64_t> completed_device_nanoseconds_;
     };
 
     /**
-     * @brief One finite asynchronous-DMA scheduler shared by GPU relay lanes.
+     * @brief One finite asynchronous-copy scheduler shared by GPU relay lanes.
      *
      * Construction allocates the complete command directory plus a bounded
      * execution-lane pool. Maintenance publishes fixed commands and invokes
@@ -173,7 +186,7 @@ namespace llaminar2
             /** Permanent topology-addressable command identities. */
             std::size_t slot_capacity = 0u;
             /**
-             * Independently runnable DMA submissions on @ref device.
+             * Independently runnable copy submissions on @ref device.
              *
              * This is a physical resource bound, not a command-directory size.
              * It must be positive and no larger than @ref slot_capacity.
@@ -195,12 +208,23 @@ namespace llaminar2
         };
 
         /**
-         * @brief Materialize a complete DMA epoch during model setup.
+         * @brief Materialize a complete copy epoch during model setup.
          * @throws std::invalid_argument for incomplete geometry or identity.
          * @throws std::runtime_error for backend, allocation, or capture failure.
          */
         [[nodiscard]] static std::shared_ptr<MappedTransferProgressEpoch>
         create(Config config);
+
+        /**
+         * @brief Return the exact graph branch required by this backend's service.
+         *
+         * CUDA requires graph-resident progress when future event observers can
+         * occupy independent native queues. ROCm uses its proven native SDMA
+         * service and has no auxiliary compute branch. This is a backend-owned
+         * mechanism distinction, not a runtime retry or alternate inference mode.
+         * The factory retains this authority; every cache owns a private interval.
+         */
+        [[nodiscard]] GraphCaptureAuxiliaryBranchFactory graphBranchFactory();
 
         /** Destroy only after every command and event is quiescent. */
         ~MappedTransferProgressEpoch();
@@ -241,10 +265,10 @@ namespace llaminar2
             std::string *error = nullptr) noexcept;
 
         /**
-         * @brief Query and enqueue one DMA progress pass on the exact worker.
+         * @brief Query and enqueue one copy progress pass on the exact worker.
          *
          * This method must run on the exact device worker. It performs only an
-         * event queries, DMA submissions, and event records; it never synchronizes or
+         * event queries, copy submissions, and event records; it never synchronizes or
          * makes the inference stream wait. Idle and already-running epochs are
          * successful no-ops with distinct evidence counters.
          *
@@ -310,6 +334,7 @@ namespace llaminar2
 
     private:
         friend class MappedTransferProgressSlot;
+        class CapturedBranch;
 
         /** Store validated identity before the factory performs GPU setup. */
         explicit MappedTransferProgressEpoch(Config config);
@@ -325,7 +350,8 @@ namespace llaminar2
             const void *device_region,
             std::size_t device_capacity,
             std::size_t device_offset,
-            std::size_t bytes);
+            std::size_t bytes,
+            TransferProducerDependency dependency = TransferProducerDependency::published());
 
         /** Acquire one matching completion and retire its outstanding count. */
         MappedTransferProgress poll(
@@ -347,22 +373,31 @@ namespace llaminar2
         IWorkerGPUContext *context_ = nullptr;
         std::unique_ptr<MappedTransferProgressCommand[]> commands_;
         std::unique_ptr<MappedTransferProgressCompletion[]> completions_;
+        /** Physical-concurrency-sized inbox; never a mapped topology directory. */
+        std::shared_ptr<MappedHostTransferRegion> service_inbox_;
+        /** Sole GPU-owned claimant/cursor authority shared by all graph branches. */
+        std::shared_ptr<DeviceTransferBuffer> service_cursors_;
+        /** At most one independently queued finite idle pass is outstanding. */
+        enum class IdleServiceSubmission : std::uint8_t { Quiescent, InFlight };
+        IdleServiceSubmission idle_service_ = IdleServiceSubmission::Quiescent;
         /** Explicit lifecycle of one permanent command identity. */
         enum class SlotLifecycle : std::uint8_t
         {
             Unreserved,          ///< Topology construction has not leased it.
             Idle,                ///< Reserved and ready for one publication.
             Published,           ///< A command is queued for an execution lane.
-            InFlight,            ///< One exact execution lane owns its DMA.
+            InFlight,            ///< One exact execution lane owns its copy.
             CompletionPublished, ///< Device completion awaits owner polling.
         };
 
         /** Host runtime for one topology-addressable command slot. */
         struct SlotRuntime
         {
+            TransferCommandProgressWatch progress_watch;
             MappedTransferDirection direction =
                 MappedTransferDirection::DeviceToHost;
             std::shared_ptr<MappedHostTransferRegion> mapped_region;
+            TransferProducerDependency dependency = TransferProducerDependency::published();
             std::uint64_t launched_generation = 0u;
             std::size_t execution_lane_index = static_cast<std::size_t>(-1);
             SlotLifecycle lifecycle = SlotLifecycle::Unreserved;
@@ -374,6 +409,7 @@ namespace llaminar2
             void *stream = nullptr;
             void *terminal_event = nullptr;
             std::size_t active_slot = static_cast<std::size_t>(-1);
+            std::uint64_t service_generation = 0u; ///< Physical inbox namespace.
 
             /** @return Whether one submitted command owns this lane. */
             [[nodiscard]] bool busy() const noexcept
@@ -389,14 +425,10 @@ namespace llaminar2
         /** Setup-only labels indexed by permanent command-slot identity. */
         std::vector<std::string> slot_labels_;
         std::atomic<std::size_t> outstanding_commands_{0u};
-        /** Steady-clock origin of the current non-empty command batch. */
-        std::atomic<std::uint64_t> active_batch_started_ns_{0u};
-        /** Last throttled warning time for an unexpectedly retained command. */
-        std::atomic<std::uint64_t> last_pending_warning_ns_{0u};
         std::atomic<std::uint64_t> commands_published_{0u};
         std::atomic<std::uint64_t> commands_completed_{0u};
         std::atomic<std::uint64_t> bytes_completed_{0u};
-        std::atomic<std::uint64_t> dma_submissions_{0u};
+        std::atomic<std::uint64_t> copy_submissions_{0u};
         std::atomic<std::uint64_t> idle_submission_skips_{0u};
         std::atomic<std::uint64_t> in_flight_observations_{0u};
         std::atomic<std::uint64_t> command_failures_{0u};

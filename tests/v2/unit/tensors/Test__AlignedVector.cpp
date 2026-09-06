@@ -19,6 +19,9 @@
 #include <cerrno>
 #include <cstdint>
 #include <limits>
+#include <fstream>
+#include <sstream>
+#include <string>
 #ifdef __linux__
 #include <sys/mman.h>
 #include <unistd.h>
@@ -156,6 +159,53 @@ TEST(Test__AlignedVector, DedicatedPageMappingIsUnmappedAtOwnerRetirement)
               -1);
     EXPECT_EQ(errno, ENOMEM)
         << "mapped owner retirement must revoke the virtual range completely";
+    // Retirement includes both virtual guards, not only writable payload.
+    for (const auto address : {
+             reinterpret_cast<uintptr_t>(retired_address) - static_cast<size_t>(page_size),
+             reinterpret_cast<uintptr_t>(retired_address) + static_cast<size_t>(page_size)})
+    {
+        errno = 0;
+        EXPECT_EQ(::mincore(reinterpret_cast<void *>(address),
+                            static_cast<size_t>(page_size), &residency), -1);
+        EXPECT_EQ(errno, ENOMEM);
+    }
+#endif
+}
+
+TEST(Test__AlignedVector, DedicatedMappingGuardsPreventHugePageOwnershipSharing)
+{
+#ifndef __linux__
+    GTEST_SKIP() << "anonymous page mappings require Linux";
+#else
+    using Vector = llaminar2::AlignedVector<uint8_t>;
+    constexpr size_t huge_page = 2 * 1024 * 1024;
+    const size_t page = static_cast<size_t>(runtimePageSize());
+    auto storage = Vector::pageMappedUninitialized(huge_page + page);
+    const auto address = reinterpret_cast<uintptr_t>(storage.data());
+    EXPECT_EQ(address % huge_page, 0u);
+    // Virtual guards must not inflate the canonical physical capacity BOM.
+    EXPECT_EQ(storage.allocationBytes(), huge_page + page);
+    std::ifstream maps("/proc/self/maps");
+    ASSERT_TRUE(maps.good());
+    bool before = false, payload = false, after = false;
+    for (std::string line; std::getline(maps, line);)
+    {
+        std::istringstream fields(line);
+        uintptr_t start = 0, end = 0;
+        char separator = 0;
+        std::string permission;
+        fields >> std::hex >> start >> separator >> end >> permission;
+        if (start <= address - page && end >= address)
+            before = permission == "---p";
+        if (start == address && end == address + storage.allocationBytes())
+            payload = permission == "rw-p";
+        if (start <= address + storage.allocationBytes() &&
+            end >= address + storage.allocationBytes() + page)
+            after = permission == "---p";
+    }
+    EXPECT_TRUE(before);
+    EXPECT_TRUE(payload);
+    EXPECT_TRUE(after);
 #endif
 }
 

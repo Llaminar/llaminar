@@ -44,6 +44,7 @@
 #include "mocks/MockLocalTPContext.h"
 #include "mocks/MockMPIContext.h"
 #include "mocks/MockModelContext.h"
+#include "mocks/MockComputeStage.h"
 #include "models/qwen/QwenStandardGraph.h"
 #include "models/qwen35/Qwen35Graph.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
@@ -234,6 +235,48 @@ namespace
             graph.setNativeCaptureEnvelope(
                 GraphNativeCaptureEnvelope::
                     HeterogeneousTicketAuthorityTransaction);
+            return graph;
+        }
+    };
+
+    /** @brief Observe the exact sparse identity stamped by the live sidecar runner. */
+    class SparseIdentityProbeStage final : public llaminar2::testing::MockComputeStage
+    {
+    public:
+        /** @param records Shared evidence across full and chained graph objects. */
+        explicit SparseIdentityProbeStage(std::vector<MoEOverlayCollectiveRuntimeParams> &records)
+            : records_(records) {}
+        /** @return True: this stage requires the same explicit stamp as rank batching. */
+        bool hasMoEOverlayCollectiveRuntimeParams() const override { return true; }
+        /** @brief Retain the immutable identity for the next execution. */
+        void updateMoEOverlayCollectiveRuntimeParams(
+            const MoEOverlayCollectiveRuntimeParams &params) override { params_ = params; }
+        /** @brief Record actual execution, not merely graph construction or preparation. */
+        bool execute(IDeviceContext *) override
+        {
+            records_.push_back(params_);
+            return params_.valid() && params_.hasExecutionSemantics();
+        }
+    private:
+        std::vector<MoEOverlayCollectiveRuntimeParams> &records_;
+        MoEOverlayCollectiveRuntimeParams params_{};
+    };
+
+    /** @brief Append a protocol observer to otherwise real CPU MTP computation. */
+    class SparseIdentityQwen35Graph final : public Qwen35Graph
+    {
+    public:
+        using Qwen35Graph::Qwen35Graph;
+        std::vector<IComputeStage::MoEOverlayCollectiveRuntimeParams> observed;
+        /** @copydoc Qwen35Graph::buildMTPGraph */
+        ComputeGraph buildMTPGraph(int depth, const MTPDepthWeightBindings &weights,
+                                  const MTPForwardInput &input, MTPForwardOutput &output) override
+        {
+            auto graph = Qwen35Graph::buildMTPGraph(depth, weights, input, output);
+            const auto order = graph.getExecutionOrder();
+            graph.addNode("sparse_identity_probe", std::make_unique<SparseIdentityProbeStage>(observed),
+                          input.device);
+            graph.addDependency("sparse_identity_probe", order.back());
             return graph;
         }
     };
@@ -5120,6 +5163,68 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainExecutionAcross
     EXPECT_DOUBLE_EQ(collective_scans->value, 1.0);
 
     PerfStatsCollector::reset();
+}
+
+/**
+ * @test CPU sidecar wire operations remain unique across retained graph variants.
+ *
+ * Repeated positions intentionally model rejected/corrected speculative work.
+ * Neither token position nor a cache-local counter may identify an operation.
+ * The probe consumes the production runner stamp after real dense MTP math;
+ * it stands in for the explicit-identity contract of a NodeTP rank-batch stage.
+ */
+TEST(Test__MTPGraphConstruction, CPUSparseOperationSequenceTransfersItsSoleAuthority)
+{
+    MoESparseHostOperationSequence original;
+    EXPECT_EQ(original.issue(), 1u);
+    MoESparseHostOperationSequence moved(std::move(original));
+    EXPECT_FALSE(original.issue());
+    EXPECT_EQ(moved.issue(), 2u);
+    MoESparseHostOperationSequence replacement;
+    replacement = std::move(moved);
+    EXPECT_FALSE(moved.issue());
+    EXPECT_EQ(replacement.issue(), 3u);
+}
+
+/** @test The production CPU runner stamps every invocation, not every cache entry. */
+TEST(Test__MTPGraphConstruction, CPUSparseSidecarIdentitySurvivesReuseCorrectionAndRequestReset)
+{
+    DeviceManager::instance().initialize(-1, false);
+    TinyQwen35MTPForwardFixture fixture;
+    auto builder = std::make_shared<SparseIdentityQwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator runner(builder, fixture.mpi);
+    ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, fixture.config.max_seq_len, DeviceId::cpu()));
+    runner.setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*runner.frozenWeightSet(), store);
+    builder->setPreparedWeightStore(&store);
+
+    const auto publish_hidden = [&] {
+        auto *hidden = runner.inferenceState().hidden->mutable_data();
+        std::fill_n(hidden, fixture.config.d_model, 0.125f);
+        runner.markMainForwardHiddenProducedForTesting(1, 1);
+    };
+    publish_hidden();
+    // Reuse Full, then Chained, then Full at an already visited position.
+    for (int index = 0; index < 16; ++index)
+        ASSERT_TRUE(runner.forwardMTP(3));
+    ASSERT_TRUE(runner.forwardMTPFromLastDraft(4, 1));
+    ASSERT_TRUE(runner.forwardMTPFromLastDraft(5, 2));
+    ASSERT_TRUE(runner.forwardMTP(6));
+    ASSERT_EQ(builder->observed.size(), 19u);
+    for (std::size_t index = 1u; index < builder->observed.size(); ++index)
+    {
+        EXPECT_EQ(builder->observed[index].generation_id, builder->observed[0].generation_id);
+        EXPECT_GT(builder->observed[index].step_id, builder->observed[index - 1u].step_id)
+            << "Every sparse sidecar invocation needs a new operation, including cache hits and corrections";
+    }
+    const auto previous = builder->observed.back();
+    runner.clear_cache();
+    publish_hidden();
+    ASSERT_TRUE(runner.forwardMTP(3));
+    ASSERT_EQ(builder->observed.size(), 20u);
+    EXPECT_NE(builder->observed.back().generation_id, previous.generation_id);
+    EXPECT_GT(builder->observed.back().step_id, previous.step_id);
 }
 
 TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoEEpochIsStable)

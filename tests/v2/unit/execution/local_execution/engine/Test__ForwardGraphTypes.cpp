@@ -584,6 +584,7 @@ namespace
         bool restore_ok_ = true;
     };
 
+    /** @brief Device-free capture counters, including owner-created graph-only views. */
     class FakeReplayGraphCapture final : public IGPUGraphCapture
     {
     public:
@@ -604,6 +605,13 @@ namespace
                 return false;
             capturing_ = true;
             return true;
+        }
+        /** @brief Observe graph-only view creation without creating an executable. */
+        std::unique_ptr<IGPUGraphCapture> createOrderedTimelineFragment() override
+        {
+            auto fragment = std::make_unique<FakeReplayGraphCapture>(stream_, false, 0u);
+            created_fragments_.push_back(fragment.get());
+            return fragment;
         }
         bool endCapture() override
         {
@@ -657,6 +665,7 @@ namespace
         }
 
         int begin_capture_calls_ = 0;
+        std::vector<FakeReplayGraphCapture *> created_fragments_; ///< Borrowed test observations.
         int end_capture_calls_ = 0;
         int launch_calls_ = 0;
         int instantiate_calls_ = 0;
@@ -2511,16 +2520,17 @@ TEST(Test__GraphSegmentCache,
     };
 
     ASSERT_TRUE(submit());
-    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 4u);
+    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 1u);
+    auto *const parent = gpu_ctx.created_graph_captures_.front();
+    ASSERT_EQ(parent->created_fragments_.size(), 3u);
     for (size_t child = 0u; child < 3u; ++child)
     {
         EXPECT_EQ(
-            gpu_ctx.created_graph_captures_[child]->instantiate_calls_, 0);
-        EXPECT_EQ(gpu_ctx.created_graph_captures_[child]->launch_calls_, 0);
+            parent->created_fragments_[child]->instantiate_calls_, 0);
+        EXPECT_EQ(parent->created_fragments_[child]->launch_calls_, 0);
         EXPECT_FALSE(
-            gpu_ctx.created_graph_captures_[child]->hasExecutable());
+            parent->created_fragments_[child]->hasExecutable());
     }
-    auto *const parent = gpu_ctx.created_graph_captures_.back();
     ASSERT_NE(parent, nullptr);
     EXPECT_EQ(parent->instantiate_calls_, 1);
     EXPECT_EQ(parent->launch_calls_, 1);
@@ -2536,7 +2546,7 @@ TEST(Test__GraphSegmentCache,
     EXPECT_EQ(parent->instantiate_calls_, 1);
     EXPECT_EQ(parent->launch_calls_, 2);
     for (size_t child = 0u; child < 3u; ++child)
-        EXPECT_EQ(gpu_ctx.created_graph_captures_[child]->launch_calls_, 0);
+        EXPECT_EQ(parent->created_fragments_[child]->launch_calls_, 0);
     ASSERT_EQ(phases.size(), 2u);
     EXPECT_EQ(
         phases[0],
@@ -2665,8 +2675,9 @@ TEST(Test__GraphSegmentCache,
         DeviceGraphExecutor::GraphInitialSubmissionPolicy::
             MaterializeWithoutLaunch));
 
-    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 4u);
-    auto *const parent = gpu_ctx.created_graph_captures_.back();
+    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 1u);
+    auto *const parent = gpu_ctx.created_graph_captures_.front();
+    ASSERT_EQ(parent->created_fragments_.size(), 3u);
     ASSERT_NE(parent, nullptr);
     EXPECT_EQ(composer_calls, 1u);
     EXPECT_EQ(parent->instantiate_calls_, 1);
@@ -2684,7 +2695,7 @@ TEST(Test__GraphSegmentCache,
         DeviceGraphExecutor::GraphSegmentCache::ExecutableSubmissionState::
             MaterializedUnlaunched);
     for (size_t child = 0u; child < 3u; ++child)
-        EXPECT_EQ(gpu_ctx.created_graph_captures_[child]->launch_calls_, 0);
+        EXPECT_EQ(parent->created_fragments_[child]->launch_calls_, 0);
 
     std::vector<DeviceGraphExecutor::GraphExecutableLaunchPhase> phases;
     const DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency =
@@ -2717,8 +2728,10 @@ TEST(Test__GraphSegmentCache,
     };
 
     ASSERT_TRUE(submit());
-    EXPECT_EQ(gpu_ctx.created_graph_captures_.size(), 4u)
+    EXPECT_EQ(gpu_ctx.created_graph_captures_.size(), 1u)
         << "First inference must replay the setup-owned executable.";
+    EXPECT_EQ(parent->created_fragments_.size(), 3u)
+        << "Replay must not create or record replacement fragments.";
     EXPECT_EQ(composer_calls, 1u);
     EXPECT_EQ(parent->instantiate_calls_, 1);
     EXPECT_EQ(parent->launch_calls_, 1);
@@ -2739,7 +2752,7 @@ TEST(Test__GraphSegmentCache,
         phases[1],
         DeviceGraphExecutor::GraphExecutableLaunchPhase::SteadyReplay);
     for (size_t child = 0u; child < 3u; ++child)
-        EXPECT_EQ(gpu_ctx.created_graph_captures_[child]->launch_calls_, 0);
+        EXPECT_EQ(parent->created_fragments_[child]->launch_calls_, 0);
     EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
     EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
 }
@@ -2856,8 +2869,9 @@ TEST(Test__GraphSegmentCache,
     };
 
     ASSERT_TRUE(submit());
-    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 3u);
-    auto *const parent = gpu_ctx.created_graph_captures_.back();
+    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 1u);
+    auto *const parent = gpu_ctx.created_graph_captures_.front();
+    ASSERT_EQ(parent->created_fragments_.size(), 2u);
     ASSERT_NE(parent, nullptr);
     EXPECT_EQ(parent->launch_calls_, 1);
     EXPECT_EQ(service->execute_calls_, 1);

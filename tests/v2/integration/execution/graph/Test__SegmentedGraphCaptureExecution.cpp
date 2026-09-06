@@ -14,6 +14,8 @@
  *    stage overwrites the producer's arena storage.
  * 4. A retained GPU parent can wait on a concurrently serviced canonical CPU
  *    route ticket without serial child launches or a host stream fence.
+ * 5. Small auxiliary graph families certify aggregate native-pool growth over
+ *    cold and warm lifetimes without attributing a pool slab to one sibling.
  */
 
 #include <gtest/gtest.h>
@@ -27,10 +29,15 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <iostream>
+#include <thread>
 
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/moe/MoEOverlayRetainedParentComposer.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -41,6 +48,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "tensors/Tensors.h"
 #include "transfer/TransferEngine.h"
+#include "transfer/MappedTransferProgressEpoch.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -932,6 +940,88 @@ protected:
             << "Snapshot for " << stage_name << " did not refresh across graph execution";
     }
 };
+
+/**
+ * @test Native decoration keeps a Close-dependent worker parallel to the body.
+ *
+ * The original graph and all three fragments are recorded but never submitted
+ * separately. Twenty replays reset only data. A bounded diagnostic escape
+ * releases every wait before reporting failure, so a broken edge cannot strand
+ * the accelerator. This source runs identically on CUDA and ROCm.
+ */
+TEST_F(CachedGraphReplayExecutionTest, NativeParallelBranchJoinsAfterBodyClose)
+{
+    SKIP_IF_NO_GPU();
+    const auto device = device_ctx_->deviceId();
+    auto *backend = getBackendFor(device);
+    ASSERT_NE(backend, nullptr);
+    TransferEngine transfers;
+    const DeviceId devices[] = {device};
+    auto control = transfers.allocateMappedHostRegion(4096u, devices);
+    auto *words = static_cast<std::uint64_t *>(control->mutableHostData());
+    std::fill_n(words, 4u, 0u);
+    std::array<std::unique_ptr<IGPUGraphCapture>, 3> fragments;
+    std::unique_ptr<IGPUGraphCapture> body;
+    void *stream = nullptr;
+    gpu_ctx_->submitAndWait([&]
+    {
+        stream = gpu_ctx_->getOrCreateAuxiliaryStream("native_parallel_branch_proof");
+        if (!stream) throw std::runtime_error("parallel branch stream allocation failed");
+        // Word 0 is Open, 1 is the body terminal, 2 is Close and 3 is the
+        // worker receipt. The worker cannot finish until the body progresses.
+        auto record = [&](int wait_word, std::size_t publish_word)
+        {
+            auto graph = gpu_ctx_->createGraphCapture(stream);
+            if (!graph) throw std::runtime_error("parallel fragment allocation failed");
+            ScopedBackendGraphCapture capture(*gpu_ctx_, *graph, "parallel DAG ordering proof");
+            if (!capture.begin()) throw std::runtime_error("parallel fragment capture failed");
+            if ((wait_word >= 0 && !backend->streamWaitTimelineSignal64(
+                    stream, control->deviceAlias(device, sizeof(std::uint64_t) * wait_word),
+                    1u, device.gpu_ordinal())) ||
+                !backend->streamPublishTimelineSignal64(
+                    stream, control->deviceAlias(device, sizeof(std::uint64_t) * publish_word),
+                    1u, device.gpu_ordinal()))
+                throw std::runtime_error("parallel fragment recording failed");
+            capture.finish();
+            return graph;
+        };
+        fragments[0] = record(-1, 0u);
+        fragments[1] = record(2, 3u);
+        fragments[2] = record(1, 2u);
+        body = record(0, 1u);
+        if (!body->appendParallelBranch({*fragments[0], *fragments[1], *fragments[2]}) ||
+            !body->instantiate())
+            throw std::runtime_error("parallel body attachment/instantiation failed");
+        EXPECT_FALSE(body->appendParallelBranch({*fragments[0], *fragments[1], *fragments[2]}))
+            << "Instantiated topology must be immutable";
+    });
+    for (std::size_t replay = 0u; replay < 20u; ++replay)
+    {
+        SCOPED_TRACE(replay);
+        for (std::size_t i = 0u; i < 4u; ++i)
+            std::atomic_ref<std::uint64_t>(words[i]).store(0u, std::memory_order_release);
+        bool launched = false;
+        gpu_ctx_->submitAndWait([&] { launched = body->launch(); });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (launched && std::atomic_ref<std::uint64_t>(words[3]).load(std::memory_order_acquire) == 0u &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        const bool completed = launched &&
+            std::atomic_ref<std::uint64_t>(words[3]).load(std::memory_order_acquire) == 1u;
+        // Test-only cancellation precedes assertion and native teardown.
+        if (!completed)
+            for (std::size_t i = 0u; i < 4u; ++i)
+                std::atomic_ref<std::uint64_t>(words[i]).store(1u, std::memory_order_release);
+        gpu_ctx_->submitAndWait([&] { ASSERT_TRUE(gpu_ctx_->synchronizeStreamChecked(stream)); });
+        ASSERT_TRUE(completed) << "Worker serialized before the body's Close";
+        for (std::size_t i = 0u; i < 4u; ++i) EXPECT_EQ(words[i], 1u);
+    }
+    gpu_ctx_->submitAndWait([&]
+    {
+        body.reset();
+        for (auto &fragment : fragments) fragment.reset();
+    });
+}
 
 TEST_F(CachedGraphReplayExecutionTest, FirstUseMaterializesReplayWithoutSecondMutation)
 {
@@ -1839,6 +1929,22 @@ TEST_F(CachedGraphReplayExecutionTest,
     constexpr std::size_t payload_bytes = payload_elements * sizeof(float);
     const DeviceId device = device_ctx_->deviceId();
 
+    // Production CPU-tier continuations also own a background transfer epoch.
+    // Its one bounded branch must span the assembled parent, including GPU
+    // waits on CPU ticket service; graph-only children are not execution owners.
+    const auto progress_epoch = MappedTransferProgressEpoch::create({
+        .device = device,
+        .slot_capacity = 2u,
+        .execution_lane_capacity = 2u,
+        .execution_streams = TransferEngine::instance()
+            .allocatePersistentTransferExecutionLanes(
+                2u, device, "retained_cpu_ticket_progress"),
+        .maximum_bytes = 4096u,
+        .name = "retained_cpu_ticket_progress",
+        .perf_device = device.toString(),
+    });
+    const auto progress_branch = progress_epoch->graphBranchFactory();
+
     auto *prefix_input = createArenaFP32Tensor(
         BufferId::HIDDEN_STATE, {1u, static_cast<std::size_t>(d_model)});
     auto *prefix_residual = createArenaFP32Tensor(
@@ -2042,7 +2148,8 @@ TEST_F(CachedGraphReplayExecutionTest,
             /*launch_dependency=*/{},
             /*event_published_outputs=*/{},
             composer,
-            initial_submission);
+            initial_submission,
+            progress_branch);
     };
     const auto expect_payload = [&](float base)
     {
@@ -2364,6 +2471,111 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
         &segment_cache.snapshot_manifest));
     assertSnapshotDelta(snapshots, "stage1_norm", "stage2_overwrite", 10.0f);
     assertSnapshotsDiffer(capture_snapshots, snapshots, "stage1_norm");
+}
+
+/**
+ * @test A complete small-helper family fits a bounded native-pool envelope.
+ *
+ * MTP terminal selection and verifier preparation are small executables, not
+ * model forwards. Certify a deliberately wider 64-kernel shape across 128
+ * simultaneously retained owners against their typed admission contract.
+ * Each owner shares the same persistent tensors because these graphs execute
+ * serially. No allocation, weight loading, or profiler runs concurrently with
+ * the measured instantiations. The second lifetime also exercises the driver's
+ * warm pool after every first-lifetime executable has retired.
+ *
+ * The graph declares the same bounded class used by admission. Production
+ * capture therefore checks every native node before instantiation; larger or
+ * nested auxiliaries cannot silently borrow this smaller family reservation.
+ */
+TEST_F(CachedGraphReplayExecutionTest,
+       SmallHelperFamilyCertifiesColdAndWarmNativePoolGrowth)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+
+    constexpr size_t kHelperNodes = GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes;
+    constexpr size_t kFamilyOwners = 128u;
+    const size_t bytes_per_owner = GPUGraphMemoryContract::reservationBytesPerExecutable(
+        device_ctx_->deviceId(), GPUGraphExecutableClass::BoundedFlatHelper);
+    FP32Tensor *final_output = nullptr;
+    auto graph = buildProductionScaleSnapshotChain(
+        kHelperNodes, 256u, final_output);
+    graph.setExecutableMemoryClass(GPUGraphExecutableClass::BoundedFlatHelper);
+    ASSERT_NE(final_output, nullptr);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+
+    GraphExecutorConfig config;
+    config.enable_validation = false;
+    // The same chain builder serves snapshot tests, but this certificate has
+    // no snapshot callback: all native nodes are real ResidualAdd kernels.
+    DeviceGraphExecutor executor(config);
+    graph_arena_.bindExecutor(executor);
+    void *const stream = gpu_ctx_->defaultStream();
+    ASSERT_NE(stream, nullptr);
+
+    for (size_t lifetime = 0; lifetime < 2u; ++lifetime)
+    {
+        SCOPED_TRACE(lifetime);
+        std::vector<std::unique_ptr<DeviceGraphExecutor::GraphSegmentCache>>
+            family;
+        family.reserve(kFamilyOwners);
+        size_t family_growth = 0u;
+        for (size_t owner = 0; owner < kFamilyOwners; ++owner)
+        {
+            SCOPED_TRACE(owner);
+            auto cache =
+                std::make_unique<DeviceGraphExecutor::GraphSegmentCache>();
+            graph.reset();
+            ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+                graph, device_ctx_.get(), *cache, stream, gpu_ctx_, nullptr));
+            ASSERT_EQ(cache->segments.size(), 1u);
+            const auto &capture = cache->segments.front().capture;
+            ASSERT_NE(capture, nullptr);
+            ASSERT_EQ(capture->nodeCount(), kHelperNodes);
+            family_growth += capture->residentMemoryBytes();
+            family.push_back(std::move(cache));
+
+        }
+        // Admission owns the complete family before its first capture. Do not
+        // compare a prefix's growth with only the slots populated so far: the
+        // driver may grow storage that later admitted siblings will consume.
+        EXPECT_LE(family_growth, kFamilyOwners * bytes_per_owner);
+        RecordProperty(
+            "helper_family_pool_growth_bytes_" + std::to_string(lifetime),
+            std::to_string(family_growth));
+        std::cout << "[helper-family-certificate] device="
+                  << device_ctx_->deviceId().toString()
+                  << " lifetime=" << lifetime << " owners=" << family.size()
+                  << " nodes_per_owner=" << kHelperNodes
+                  << " pool_growth_bytes=" << family_growth << '\n';
+        // Explicit test teardown fence: no executable may outlive its pending
+        // launch. This is outside production inference and measured setup.
+        for (const auto &cache : family)
+            ASSERT_TRUE(gpu_ctx_->synchronizeStreamChecked(cache->capture_stream));
+    }
+}
+
+/** @test An oversized declared helper fails before its executable is allocated. */
+TEST_F(CachedGraphReplayExecutionTest, BoundedHelperRejectsOversizedNativeGraph)
+{
+    SKIP_IF_NO_GPU();
+    FP32Tensor *output = nullptr;
+    auto graph = buildProductionScaleSnapshotChain(
+        GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes + 1u, 256u, output);
+    graph.setExecutableMemoryClass(GPUGraphExecutableClass::BoundedFlatHelper);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+    GraphExecutorConfig config;
+    config.enable_validation = false;
+    DeviceGraphExecutor executor(config);
+    graph_arena_.bindExecutor(executor);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    EXPECT_FALSE(executor.executeWithCachedGraphReplay(
+        graph, device_ctx_.get(), cache, gpu_ctx_->defaultStream(), gpu_ctx_, nullptr));
+    for (const auto &segment : cache.segments)
+        if (segment.capture)
+            EXPECT_FALSE(segment.capture->hasExecutable());
 }
 
 /**

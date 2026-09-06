@@ -5,6 +5,11 @@
  * Endpoints:
  *   GET  /health                  — Liveness check
  *   POST /v1/chat/completions     — OpenAI-compatible chat completion (streaming + non-streaming)
+ *
+ * The resolved request authority, not MPI rank zero, owns HTTP serving.
+ * Every rank publishes its immutable membership in PerfStats so an external
+ * certificate can require complete participant evidence without steering
+ * inference or adding a diagnostic collective to the execution lifecycle.
  */
 
 #include "app/modes/ServerMode.h"
@@ -370,6 +375,13 @@ namespace llaminar2
         const bool is_authority =
             ctx.coordinatedRequestRole() ==
             CoordinatedRequestRole::Authority;
+        // Copy immutable topology only for observation. This runs once before
+        // serving/participating; graph and request decisions never consult it.
+        PerfStatsCollector::addCounter(
+            "server", "rank_membership", 1.0, "startup", {},
+            {{"rank", std::to_string(mpi_ctx->rank())},
+             {"world_size", std::to_string(mpi_ctx->world_size())},
+             {"authority_rank", std::to_string(runner->coordinatedRootRank())}});
         if (mpi_coordinated && !is_authority)
         {
             // Followers enter the MPI command loop and participate in the

@@ -244,8 +244,18 @@ namespace llaminar2
         cublas_status = cublasSetStream(cublas_handle_, default_stream_);
         if (cublas_status != CUBLAS_STATUS_SUCCESS)
         {
-            LOG_WARN("[NvidiaDeviceContext] cublasSetStream failed: " << cublas_status);
-            // Non-fatal - continue with default stream
+            LOG_ERROR("[NvidiaDeviceContext] cublasSetStream failed: " << cublas_status);
+            return false;
+        }
+
+        // Preserve the math policy previously selected by private GEMM handles.
+        // The context is the only library owner; projections never mutate math
+        // policy as a side effect of their creation or retirement.
+        cublas_status = cublasSetMathMode(cublas_handle_, CUBLAS_TENSOR_OP_MATH);
+        if (cublas_status != CUBLAS_STATUS_SUCCESS)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cublasSetMathMode failed: " << cublas_status);
+            return false;
         }
 
         // Step 4: Query device name

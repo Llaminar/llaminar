@@ -1,21 +1,67 @@
 /**
  * @file MoEOverlayDevicePhysicalMovement.cpp
  * @brief Validation and endpoint resolution for device-authored MoE movement.
+ *
+ * Immutable command identities are also used for fatal transport diagnostics.
+ * Those diagnostics consume existing receipts, never device state downloads
+ * or independent placement decisions, and run before abort changes lifecycle.
  */
 
 #include "MoEOverlayDevicePhysicalMovement.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
 
 namespace llaminar2
 {
+    std::string MoEOverlayDevicePhysicalMovementBatch::describeProjectionReadiness(
+        std::span<const std::uint8_t> ready) const
+    {
+        constexpr std::array<const char *, 3> projection_names{"gate", "up", "down"};
+        if (ready.size() / projection_names.size() != migrations.size() ||
+            ready.size() % projection_names.size() != 0u)
+            throw std::invalid_argument("physical-wave diagnostic readiness shape mismatch");
+
+        std::ostringstream message;
+        message << "transaction=" << transaction_id
+                << ",payload_bytes=" << packed_weight_bytes
+                << ",projections_ready="
+                << std::count_if(ready.begin(), ready.end(),
+                                 [](std::uint8_t value) { return value != 0u; })
+                << '/' << ready.size() << ",pending=[";
+        bool first = true;
+        for (std::size_t operation = 0; operation < ready.size(); ++operation)
+        {
+            if (ready[operation] != 0u)
+                continue;
+            const auto migration_index = operation / projection_names.size();
+            const auto &migration = migrations[migration_index];
+            if (!first)
+                message << ';';
+            first = false;
+            message << "migration=" << migration_index
+                    << ",layer=" << migration.layer_idx
+                    << ",expert=" << migration.expert_id
+                    << ",projection=" << projection_names[operation % projection_names.size()]
+                    << ",source=" << migration.source.owner_world_rank << ':'
+                    << migration.source.device.toString() << ":participant="
+                    << migration.source.owner_participant
+                    << ",destination=" << migration.destination.owner_world_rank << ':'
+                    << migration.destination.device.toString() << ":participant="
+                    << migration.destination.owner_participant;
+        }
+        message << ']';
+        return message.str();
+    }
+
     namespace
     {
         using RequirementKey = std::tuple<int, int, int>;

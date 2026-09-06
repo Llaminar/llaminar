@@ -16,6 +16,7 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/attention/AttentionWorkspaceContract.h"
 #include "kernels/common/EmbeddingWorkspaceContract.h"
+#include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "kernels/kvcache/KVCacheWorkspaceContract.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmWorkspaceContract.h"
 #include "kernels/rope/RoPEWorkspaceContract.h"
@@ -777,7 +778,8 @@ TEST(Test__WorkspaceMemoryEstimator,
     EXPECT_EQ(
         expected,
         base.total_bytes_with_alignment() +
-            kPointerArrayCount * kAlignedPointerArrayBytes);
+            kPointerArrayCount * kAlignedPointerArrayBytes +
+            floating_gemm_abi::kBlasMatmulWorkspaceBytes);
 }
 
 TEST(Test__WorkspaceMemoryEstimator, Qwen35MoE4K_CoversObservedCUDAFamilyPlan)
@@ -1109,7 +1111,8 @@ TEST(Test__WorkspaceMemoryEstimator,
     constexpr size_t kThreeAlignedPointerArrays = 3ULL * 256ULL;
     EXPECT_EQ(
         floating_bytes - quantized_bytes,
-        kRedirectBytes + kThreeAlignedPointerArrays);
+        kRedirectBytes + kThreeAlignedPointerArrays +
+            floating_gemm_abi::kBlasMatmulWorkspaceBytes);
 }
 
 TEST(Test__WorkspaceMemoryEstimator, PreparedEmbeddingPathDoesNotReserveEmbeddingTableTemp)

@@ -8,7 +8,8 @@
  *
  * **Design**: The adapter:
  * 1. Implements ITensorGemm (includes IMPIContext, etc.)
- * 2. Uses shared HipBLASGemmKernel* from DeviceKernelCache (avoids JIT overhead)
+ * 2. Retains a submission view borrowing context-owned hipBLAS handles, so
+ *    expert retirement never tears down a library or drains unrelated streams.
  * 3. Handles tensor type introspection in multiply_tensor()
  *
  * @author David Sanftenberg
@@ -20,7 +21,6 @@
 #include "HipBLASGemmKernel.h"
 #include "backends/ComputeBackend.h"   // DeviceManager
 #include "backends/DeviceId.h"         // DeviceId for cache lookup
-#include "kernels/DeviceKernelCache.h" // Universal kernel cache
 #include "kernels/rocm/ROCmKernelBase.h"
 #include "tensors/Tensors.h"           // FP32Tensor, BF16Tensor, FP16Tensor
 #include "tensors/KernelSnapshotInfo.h"
@@ -141,13 +141,13 @@ namespace llaminar2
                     "[ROCmFloatingPointGemmKernel] Weight tensor must be on GPU (call ensureOnDevice() first)");
             }
 
-            // Get shared hipBLAS kernel from DeviceKernelCache (avoids per-tensor JIT overhead)
+            // The lightweight view owns only bindings; the context owns BLAS.
             DeviceId device = DeviceId::rocm(rocm_device_id_);
-            hipblas_kernel_ = DeviceKernelCache::getKernel<HipBLASGemmKernel>(device, KernelType::BLAS_GEMM);
+            hipblas_kernel_ = std::make_unique<HipBLASGemmKernel>(device);
 
             LOG_DEBUG("[ROCmFloatingPointGemmKernel] Created for " << N_ << "x" << K_
                                                                    << " weights on ROCm device " << rocm_device_id_
-                                                                   << " (using cached hipBLAS kernel)");
+                                                                   << " (borrowing device-context hipBLAS handles)");
         }
 
         ROCmFloatingPointGemmKernel::ROCmFloatingPointGemmKernel(
@@ -171,13 +171,13 @@ namespace llaminar2
                 throw std::runtime_error("[ROCmFloatingPointGemmKernel] Null device weight pointer");
             }
 
-            // Get shared hipBLAS kernel from DeviceKernelCache
+            // Moving this view later must not move or destroy the library.
             DeviceId device = DeviceId::rocm(rocm_device_id_);
-            hipblas_kernel_ = DeviceKernelCache::getKernel<HipBLASGemmKernel>(device, KernelType::BLAS_GEMM);
+            hipblas_kernel_ = std::make_unique<HipBLASGemmKernel>(device);
 
             LOG_TRACE("[ROCmFloatingPointGemmKernel] Created (raw ptr) for " << N_ << "x" << K_
                       << " weights on ROCm device " << rocm_device_id_
-                      << " (using cached hipBLAS kernel)");
+                      << " (borrowing device-context hipBLAS handles)");
         }
 
         ROCmFloatingPointGemmKernel::~ROCmFloatingPointGemmKernel()
@@ -222,7 +222,7 @@ namespace llaminar2
               precision_(other.precision_),
               N_(other.N_),
               K_(other.K_),
-              hipblas_kernel_(other.hipblas_kernel_), // Just copy the shared pointer
+              hipblas_kernel_(std::move(other.hipblas_kernel_)),
               lifetime_owner_(std::move(other.lifetime_owner_)),
               workspace_(other.workspace_),
               slice_id_(other.slice_id_),
@@ -236,7 +236,6 @@ namespace llaminar2
             other.d_batch_B_ptrs_ = nullptr;
             other.d_batch_C_ptrs_ = nullptr;
             other.workspace_ = nullptr;
-            // Note: don't null other.hipblas_kernel_ - it's shared, not owned
         }
 
         ROCmFloatingPointGemmKernel &ROCmFloatingPointGemmKernel::operator=(ROCmFloatingPointGemmKernel &&other) noexcept
@@ -249,11 +248,10 @@ namespace llaminar2
                 precision_ = other.precision_;
                 N_ = other.N_;
                 K_ = other.K_;
-                hipblas_kernel_ = other.hipblas_kernel_; // Just copy the shared pointer
+                hipblas_kernel_ = std::move(other.hipblas_kernel_);
 
                 other.weights_ = nullptr;
                 other.d_weights_ = nullptr;
-                // Note: don't null other.hipblas_kernel_ - it's shared, not owned
 
                 workspace_ = other.workspace_;
                 slice_id_ = other.slice_id_;
@@ -587,6 +585,7 @@ namespace llaminar2
             }
 
             // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
+            hipblas_kernel_->bindWorkspace(effective_workspace);
             if (d_bias)
             {
                 bool success = hipblas_kernel_->executeWithBiasOnStream(
@@ -892,6 +891,7 @@ namespace llaminar2
                 }
                 else
                 {
+                    hipblas_kernel_->bindWorkspace(effective_workspace);
                     if (!hipblas_kernel_->executeBatchedOnStream(
                             ExplicitGPUStream{gpu_stream_},
                             d_batch_A_ptrs_,
@@ -1389,11 +1389,11 @@ namespace llaminar2
         // =====================================================================
 
         WorkspaceRequirements ROCmFloatingPointGemmKernel::getWorkspaceRequirements(
-            [[maybe_unused]] int m,
-            [[maybe_unused]] int n,
-            [[maybe_unused]] int k) const
+            int m, int n, int k) const
         {
-            WorkspaceRequirements reqs;
+            // The adapter must publish the complete low-level BOM, not merely
+            // its pointer tables. The memory authority admits/materializes it.
+            WorkspaceRequirements reqs = hipblas_kernel_->getWorkspaceRequirements(m, n, k);
 
             const size_t pointer_array_bytes =
                 floating_gemm_abi::kMaxBatchedProjections *
@@ -1407,6 +1407,7 @@ namespace llaminar2
         void ROCmFloatingPointGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
         {
             workspace_ = workspace;
+            hipblas_kernel_->bindWorkspace(workspace);
             d_batch_A_ptrs_ = nullptr;
             d_batch_B_ptrs_ = nullptr;
             d_batch_C_ptrs_ = nullptr;

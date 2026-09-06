@@ -40,6 +40,7 @@
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/ScopedGPUStream.h"
+#include "../../../utils/QuantizedVerifierFormats.h"
 
 #include <vector>
 #include <array>
@@ -1962,10 +1963,10 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentPrefillRepeatsBitwise)
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
-    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
+    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
     ScopedDebugEnvOverride concurrent_env("LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
     ScopedDebugEnvOverride force_decode_env("LLAMINAR_CUDA_CONCURRENT_DECODE", "1");
-    ASSERT_FALSE(debugEnv().gemm.deterministic);
+    ASSERT_TRUE(debugEnv().gemm.deterministic);
     EXPECT_TRUE(debugEnv().gemm.cuda_concurrent_prefill);
 
     cudaNativeVNNIPrefill_setForceTile(/*T64x128_w4x2=*/4);
@@ -2369,6 +2370,182 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentDecodeRepeatsBitwise)
     v_ws->unbindWorkspace();
     workspace_.reset();
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
+/**
+ * @brief Prove merged arena capacity cannot misalign concurrent GEMV partials.
+ *
+ * A graph family shares the maximum byte envelope, not an envelope divisible
+ * by every stage's fan-out. Four projections require three side-stream slots;
+ * an unrelated stage can enlarge their shared buffer by one aligned quantum.
+ * Exercise every source codebook against serial bytes, then retain and replay
+ * the real concurrent graph with poisoned outputs to exclude stale success.
+ */
+TEST_F(Test__CUDAGemmBatchInvariance,
+       CapturedConcurrentDecodeMergedWorkspaceAllFormats)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedDebugEnvOverride deterministic("LLAMINAR_DETERMINISTIC", "1");
+    ScopedDebugEnvOverride enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    ASSERT_TRUE(debugEnv().gemm.deterministic);
+    ASSERT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
+    constexpr int K = 2048;
+    constexpr std::array<int, 4> columns{128, 256, 128, 256};
+    auto stream = static_cast<cudaStream_t>(explicitProducerStream());
+
+    for (const auto &format : quantizedVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        std::vector<std::unique_ptr<TensorBase>> weights;
+        std::vector<std::unique_ptr<FP32Tensor>> outputs;
+        std::vector<ITensorGemm *> kernels;
+        std::vector<TensorProjectionDesc> projections;
+        WorkspaceRequirements reqs;
+        for (size_t i = 0; i < columns.size(); ++i)
+        {
+            weights.push_back(format.create(
+                {static_cast<size_t>(columns[i]), K}, 9801u + i));
+            auto *kernel = getPreparedKernel(weights.back().get(), gpu_device_);
+            ASSERT_NE(kernel, nullptr);
+            kernels.push_back(kernel);
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
+            ASSERT_NE(consumer, nullptr);
+            reqs.merge(consumer->getWorkspaceRequirements(1, columns[i], K));
+            outputs.push_back(std::make_unique<FP32Tensor>(
+                std::vector<size_t>{1u, static_cast<size_t>(columns[i])}));
+            projections.emplace_back(
+                kernel, outputs.back().get(), columns[i], nullptr, format.label);
+        }
+        addCudaConcurrentDecodeGemvSideStreamWorkspace(
+            reqs, gpu_device_, 1, columns.size());
+        const auto *side = reqs.find(
+            GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+        ASSERT_NE(side, nullptr);
+        WorkspaceRequirements other_stage;
+        auto enlarged = *side;
+        enlarged.size_bytes += enlarged.alignment;
+        other_stage.buffers.push_back(enlarged);
+        reqs.merge(other_stage);
+        ASSERT_NE(enlarged.size_bytes % (3u * sizeof(float)), 0u);
+
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(
+            gpu_device_, reqs.total_bytes_with_alignment() + 4096u);
+        ASSERT_TRUE(workspace_->allocate(reqs));
+        for (auto *kernel : kernels)
+        {
+            dynamic_cast<IWorkspaceConsumer *>(kernel)->bindWorkspace(workspace_.get());
+            kernel->setGPUStream(stream);
+        }
+        auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{1u, K});
+        for (int i = 0; i < K; ++i)
+            input->mutable_data()[i] = dist_(rng_);
+        ASSERT_TRUE(input->ensureOnDevice(gpu_device_, stream));
+        for (auto &output : outputs)
+            ASSERT_TRUE(output->ensureOnDevice(gpu_device_, stream));
+
+        // Keep all pointers identical between the serial oracle, warmup, and
+        // retained native graph. Only submission policy changes before capture.
+        auto submit = [&]
+        {
+            return kernels.front()->multiply_fused_tensor(
+                input.get(), projections, 1, K, nullptr, workspace_.get());
+        };
+        std::array<std::vector<float>, 4> expected;
+        {
+            ScopedDebugEnvOverride serial("LLAMINAR_CUDA_CONCURRENT_DECODE", "0");
+            ASSERT_TRUE(submit());
+            for (size_t i = 0; i < outputs.size(); ++i)
+            {
+                expected[i].resize(columns[i]);
+                ASSERT_EQ(cudaMemcpyAsync(
+                    expected[i].data(), outputs[i]->gpu_data_ptr(),
+                    columns[i] * sizeof(float), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+            }
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        }
+        ScopedDebugEnvOverride concurrent("LLAMINAR_CUDA_CONCURRENT_DECODE", "1");
+        ASSERT_TRUE(submit());
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        TransferEngine::requireDeviceInput(input.get(), gpu_device_, stream);
+        int stage_identity = 0;
+        GraphCaptureDependencyLedger::StagePlan stage_plan{
+            .stage_identity = &stage_identity,
+            .stage_name = "concurrent_decode_merged_workspace",
+            .external_inputs = {input.get()},
+            .internal_inputs = {},
+            .outputs = {outputs[0].get(), outputs[1].get(), outputs[2].get(), outputs[3].get()},
+        };
+        GraphCaptureDependencyLedger ledger(
+            gpu_device_, stream, {std::move(stage_plan)}, "merged workspace regression");
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
+        bool recorded = false;
+        std::string error;
+        try
+        {
+            GraphCaptureGuard guard(&ledger);
+            ScopedGraphCaptureStage stage(&stage_identity);
+            recorded = submit();
+            if (recorded)
+                stage.complete();
+        }
+        catch (const std::exception &failure)
+        {
+            error = failure.what();
+        }
+        const auto capture_end = cudaStreamEndCapture(stream, &graph);
+        ASSERT_TRUE(error.empty()) << error;
+        ASSERT_TRUE(recorded);
+        ASSERT_EQ(capture_end, cudaSuccess);
+        ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+        for (int replay = 0; replay < 20; ++replay)
+        {
+            for (size_t i = 0; i < outputs.size(); ++i)
+                ASSERT_EQ(cudaMemsetAsync(outputs[i]->gpu_data_ptr(), 0xff,
+                    columns[i] * sizeof(float), stream), cudaSuccess);
+            ASSERT_EQ(cudaGraphLaunch(executable, stream), cudaSuccess);
+            for (size_t i = 0; i < outputs.size(); ++i)
+            {
+                std::vector<float> actual(columns[i]);
+                ASSERT_EQ(cudaMemcpyAsync(actual.data(), outputs[i]->gpu_data_ptr(),
+                    columns[i] * sizeof(float), cudaMemcpyDeviceToHost, stream), cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+                expectBitwiseEqual(actual, expected[i], format.label);
+            }
+        }
+        ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
+        ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+        cleanupSharedWorkspace(kernels);
+        for (auto &weight : weights)
+            llaminar::v2::kernels::KernelFactory::clearCacheFor(weight.get());
+    }
+
+    const auto records = PerfStatsCollector::snapshot(
+        {"kernel.cuda_fused_projection_stream_pool_calls"});
+    uint64_t captured_concurrent_formats = 0;
+    for (const auto &record : records)
+    {
+        if (record.domain != "kernel" ||
+            record.name != "cuda_fused_projection_stream_pool_calls" ||
+            record.kind != PerfStatRecord::Kind::Counter)
+            continue;
+        EXPECT_EQ(record.tags.at("mode"), "decode");
+        EXPECT_EQ(record.tags.at("m"), "1");
+        EXPECT_EQ(record.tags.at("projections"),
+                  std::to_string(columns.size()));
+        EXPECT_EQ(record.tags.at("streams"),
+                  std::to_string(columns.size()));
+        captured_concurrent_formats += record.count;
+    }
+    EXPECT_GE(captured_concurrent_formats, quantizedVerifierFormats().size())
+        << "Every codebook must record the real deterministic side-stream "
+           "fork while constructing its retained CUDA graph";
+    PerfStatsCollector::reset();
 #endif
 }
 

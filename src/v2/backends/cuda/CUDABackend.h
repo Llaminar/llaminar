@@ -901,13 +901,40 @@ namespace llaminar2
                                   int device_id, void *stream) override;
         bool deviceToHostOnStream(void *dst, const void *src, size_t bytes,
                                   int device_id, void *stream) override;
-        /** @copydoc IBackend::deviceToMappedHostByKernelOnStream */
-        bool deviceToMappedHostByKernelOnStream(
+        /** @copydoc IBackend::prepareMappedHostCopyKernels */
+        bool prepareMappedHostCopyKernels(int device_id) override;
+
+        /** @copydoc IBackend::enqueueBackgroundMappedCopyOnStream */
+        bool enqueueBackgroundMappedCopyOnStream(
+            void *device_region, void *mapped_host, void *mapped_alias,
+            size_t bytes, MappedTransferDirection direction,
+            int device_id, void *stream) override;
+
+        /** @copydoc IBackend::copyDeviceVisibleRegionByKernelOnStream */
+        bool copyDeviceVisibleRegionByKernelOnStream(
             void *dst,
             const void *src,
             size_t bytes,
             int device_id,
             void *stream) override;
+        /** @copydoc IBackend::initializeMappedTransferService */
+        bool initializeMappedTransferService(
+            MappedTransferServiceCursor *cursors, size_t capacity,
+            int device_id, void *stream) override;
+
+        /** @copydoc IBackend::enqueueMappedTransferInterval */
+        bool enqueueMappedTransferInterval(
+            std::uint32_t *interval, MappedTransferInterval value,
+            int device_id, void *stream) override;
+
+        /** @copydoc IBackend::enqueueMappedTransferService */
+        bool enqueueMappedTransferService(
+            const MappedTransferProgressCommand *commands,
+            MappedTransferProgressCompletion *completions,
+            MappedTransferServiceCursor *cursors, size_t capacity,
+            size_t maximum_bytes, const std::uint32_t *interval,
+            MappedTransferServiceRun run, int device_id, void *stream) override;
+
         /** @copydoc IBackend::enqueueMappedTransferProgressClaims */
         bool enqueueMappedTransferProgressClaims(
             const MappedTransferProgressCommand *commands,

@@ -752,11 +752,11 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
+        /** @copydetails IInferenceRunner::commitMTPInitialShiftedRowFromDeviceOutcome */
         bool commitMTPInitialShiftedRowFromDeviceOutcome(
             const PrefixStateSnapshot &checkpoint,
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
-            int main_forward_token_count,
             bool allow_speculative_discard = false) override;
         bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,

@@ -39,6 +39,12 @@ namespace llaminar2::testing
     public:
         explicit MockGPUGraphCapture(void *stream) : stream_(stream) {}
 
+        /** @brief Preserve graph-only fragment construction in controller unit tests. */
+        std::unique_ptr<IGPUGraphCapture> createOrderedTimelineFragment() override
+        {
+            return std::make_unique<MockGPUGraphCapture>(stream_);
+        }
+
         bool beginCapture() override
         {
             if (capturing_)

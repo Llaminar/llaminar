@@ -12,6 +12,10 @@ Llaminar blocking synchronization call. Approved callers are listed with an
 exact expected call count and an architectural category. Consequently, adding
 another synchronization to an already-approved function still fails until the
 new ownership boundary is reviewed and recorded deliberately.
+
+BLAS library creation/destruction can also synchronize the entire device under
+the hood. Only the persistent device context may own those operations; retiring
+an expert projection must never acquire an implicit device-wide drain.
 """
 
 from __future__ import annotations
@@ -29,6 +33,10 @@ from collections.abc import Iterable
 SOURCE_SUFFIXES = {".cpp", ".cu", ".cuh", ".h", ".hip", ".hpp", ".inc"}
 
 SYNC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "blas_lifetime",
+        re.compile(r"\b(?:cublas|hipblas)(?:Lt)?(?:Create|Destroy)\s*\("),
+    ),
     (
         "raw_stream",
         re.compile(r"\b(?:cuda|hip)StreamSynchronize\s*\("),
@@ -126,6 +134,10 @@ class Allowance:
 
 
 CATEGORY_REASONS = {
+    "device_library_lifecycle": (
+        "The persistent device context alone creates and destroys BLAS handles; "
+        "projection retirement cannot synchronize unrelated inference streams."
+    ),
     "backend_primitive": (
         "Low-level implementation of an explicitly synchronous backend API; "
         "production execution uses its stream/event-aware sibling."
@@ -193,6 +205,13 @@ def reviewed(
 # ownership boundaries, never performance fallbacks. A new caller or an
 # additional wait in an existing caller fails validation.
 ALLOWANCES: tuple[Allowance, ...] = (
+    *reviewed(
+        "device_library_lifecycle",
+        ("src/v2/backends/cuda/NvidiaDeviceContext.cu", "NvidiaDeviceContext::cleanupOnWorker", "blas_lifetime", 2),
+        ("src/v2/backends/cuda/NvidiaDeviceContext.cu", "NvidiaDeviceContext::initializeOnWorker", "blas_lifetime", 2),
+        ("src/v2/backends/rocm/AMDDeviceContext.cpp", "AMDDeviceContext::cleanupOnWorker", "blas_lifetime", 2),
+        ("src/v2/backends/rocm/AMDDeviceContext.cpp", "AMDDeviceContext::initializeOnWorker", "blas_lifetime", 2),
+    ),
     *reviewed(
         "backend_primitive",
         ("src/v2/backends/cuda/CUDABackend.cu", "CUDABackend::argmaxF32", "raw_stream", 1),
@@ -341,6 +360,10 @@ ALLOWANCES: tuple[Allowance, ...] = (
     ),
     *reviewed(
         "lifecycle",
+        # A graph can complete a command before its independently queued idle
+        # service pass retires. Model destruction must join that exact finite
+        # pass before freeing its cursor/inbox; no inference caller may join it.
+        ("src/v2/transfer/MappedTransferProgressEpoch.cpp", "MappedTransferProgressEpoch::~MappedTransferProgressEpoch", "worker_event", 1),
         ("src/v2/execution/local_execution/engine/ForwardGraphTypes.h", "reset", "worker_stream", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePublishedDeviceWorkBeforeArenaRelease", "backend_event", 2),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePendingPrefixPayloadUses", "backend_event", 1),
@@ -351,7 +374,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/moe/MoEExpertWeightService.cpp", "finish", "worker_stream", 1),
         ("src/v2/execution/moe/MoEExpertWeightService.cpp", "~ScopedGpuDirectTransferStream", "worker_stream", 2),
         ("src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "MoEOverlayDeviceControllerGraphService::releaseEndpoint", "worker_event", 1),
-        ("src/v2/execution/moe/MoEOverlayDevicePreparedArrivalInbox.cpp", "MoEOverlayDevicePreparedArrivalInbox::release", "backend_event", 1),
         ("src/v2/execution/moe/MoEOverlayDeviceServiceTelemetryPublisher.cpp", "MoEOverlayDeviceServiceTelemetryPublisher::releaseEndpoint", "worker_event", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "retireRuntimeHistogramProducerStreamsLocked", "worker_stream", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "synchronizeMirror", "worker_stream", 1),
@@ -379,6 +401,9 @@ ALLOWANCES: tuple[Allowance, ...] = (
     ),
     *reviewed(
         "setup_certification",
+        # Construction must finish cursor initialization before capture; CUDA
+        # rejects an uncaptured setup-event dependency inside a retained graph.
+        ("src/v2/transfer/MappedTransferProgressEpoch.cpp", "MappedTransferProgressEpoch::materialize", "worker_event", 1),
         ("src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "validateAllStaticTerminals", "worker_event", 1),
     ),
 )
@@ -525,6 +550,8 @@ def scan_file(repo_root: pathlib.Path, path: pathlib.Path) -> list[Callsite]:
         token in raw_source
         for token in (
             "StreamSynchronize",
+            "cublas",
+            "hipblas",
             "DeviceSynchronize",
             "EventSynchronize",
             "synchronizeStream",

@@ -355,74 +355,6 @@ namespace llaminar2
             return true;
         }
 
-        /**
-         * @brief Pair one graph-owned auxiliary fork and join structurally.
-         *
-         * The owner lives wholly inside an already-open native capture. A stage
-         * failure still calls @ref finish before the backend capture closes, so
-         * the auxiliary stream can never remain an unjoined member of the
-         * capture transaction. Destruction with an active branch is fatal
-         * because ending the primary capture without its terminal edge would
-         * leave backend stream ownership unknowable.
-         */
-        class ScopedCapturedAuxiliaryBranch final
-        {
-        public:
-            /** Bind an optional cache-owned branch and exact primary stream. */
-            ScopedCapturedAuxiliaryBranch(
-                IGraphCaptureAuxiliaryBranch *branch,
-                void *primary_stream) noexcept
-                : branch_(branch), primary_stream_(primary_stream)
-            {
-            }
-
-            /** Join an abandoned active branch or terminate on lost ordering. */
-            ~ScopedCapturedAuxiliaryBranch()
-            {
-                if (!active_)
-                    return;
-                if (!branch_->recordJoin(primary_stream_))
-                {
-                    LOG_ERROR(
-                        "[DeviceGraphCaptureController] Fatal failure joining an abandoned captured auxiliary branch '"
-                        << branch_->name() << "'");
-                    std::terminate();
-                }
-            }
-
-            ScopedCapturedAuxiliaryBranch(
-                const ScopedCapturedAuxiliaryBranch &) = delete;
-            ScopedCapturedAuxiliaryBranch &operator=(
-                const ScopedCapturedAuxiliaryBranch &) = delete;
-
-            /** @return true after an absent branch or a complete recorded fork. */
-            [[nodiscard]] bool begin() noexcept
-            {
-                if (!branch_)
-                    return true;
-                if (!primary_stream_ || !branch_->recordFork(primary_stream_))
-                    return false;
-                active_ = true;
-                return true;
-            }
-
-            /** @return true after an absent branch or a complete recorded join. */
-            [[nodiscard]] bool finish() noexcept
-            {
-                if (!active_)
-                    return branch_ == nullptr;
-                if (!branch_->recordJoin(primary_stream_))
-                    return false;
-                active_ = false;
-                return true;
-            }
-
-        private:
-            IGraphCaptureAuxiliaryBranch *branch_ = nullptr;
-            void *primary_stream_ = nullptr;
-            bool active_ = false;
-        };
-
         const char *captureModeTag(GraphReplayCaptureMode mode)
         {
             return mode == GraphReplayCaptureMode::FullGraph ? "full_graph" : "segmented";
@@ -3234,6 +3166,11 @@ namespace llaminar2
         const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
+        if (auxiliary_branch)
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] A sealed auxiliary authority cannot be diagnostically recaptured");
+            return false;
+        }
         if (!ctx || !gpu_ctx)
         {
             LOG_ERROR("[DeviceGraphCaptureController] Re-capture missing context");
@@ -3357,15 +3294,6 @@ namespace llaminar2
                 return false;
             }
 
-            ScopedCapturedAuxiliaryBranch captured_auxiliary(
-                auxiliary_branch,
-                capture_stream);
-            if (!captured_auxiliary.begin())
-            {
-                exec_ok = false;
-                failed_stage_name = "<auxiliary_branch_fork>";
-            }
-
             for (const auto &stage_name : segment.stage_names)
             {
                 if (!exec_ok)
@@ -3386,12 +3314,6 @@ namespace llaminar2
                     failed_stage_name = stage_name;
                     break;
                 }
-            }
-
-            if (!captured_auxiliary.finish() && exec_ok)
-            {
-                exec_ok = false;
-                failed_stage_name = "<auxiliary_branch_join>";
             }
 
             capture_transaction.finish();
@@ -3451,6 +3373,13 @@ namespace llaminar2
          * directly. Runtime update failures are therefore genuine failures,
          * never a feature-probe or an invitation to clear errors and retry.
          */
+        std::string memory_contract_error;
+        if (!segment.capture->validateExecutableMemoryClass(
+                graph.executableMemoryClass(), &memory_contract_error))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Re-capture memory contract: " << memory_contract_error);
+            return false;
+        }
         GraphUpdateResult update_result = GraphUpdateResult::NeedsReinstantiate;
         if (segment.capture->supportsExecutableUpdate())
         {
@@ -3833,6 +3762,14 @@ namespace llaminar2
                 "[DeviceGraphCaptureController] Retained parent child unexpectedly owns an executable before composition");
             return false;
         }
+        std::string memory_contract_error;
+        if (!graph_only_child && !segment.capture->validateExecutableMemoryClass(
+                graph.executableMemoryClass(), &memory_contract_error))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Native executable memory contract: "
+                      << memory_contract_error << " context=" << perf_context);
+            return false;
+        }
         if (!graph_only_child && !segment.capture->instantiate())
         {
             LOG_ERROR("[DeviceGraphCaptureController] Segment instantiation failed ("
@@ -3967,7 +3904,8 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         uint64_t current_step,
         const ReplayHooks &hooks,
-        DeviceGraphExecutor::GraphInitialSubmissionPolicy initial_submission)
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy initial_submission,
+        std::unique_ptr<IGPUGraphCapture> parent)
     {
         if (!ctx || !gpu_ctx || !segment_cache.capture_stream ||
             !hooks.retained_parent_composer ||
@@ -3990,8 +3928,6 @@ namespace llaminar2
             return false;
         }
 
-        std::unique_ptr<IGPUGraphCapture> parent =
-            gpu_ctx->createGraphCapture(segment_cache.capture_stream);
         if (!parent ||
             parent->executionStream() != segment_cache.capture_stream ||
             parent->nodeCount() != 0u || parent->hasExecutable())
@@ -4020,6 +3956,21 @@ namespace llaminar2
         {
             LOG_ERROR(
                 "[DeviceGraphCaptureController] Retained parent composer did not produce one non-empty, uninstantiated graph on the exact stream");
+            return false;
+        }
+        // Only this parent is executable. Its branch must span all child and
+        // CPU-ticket waits, not stop in the gaps between graph-only children.
+        if (hooks.auxiliary_branch && !hooks.auxiliary_branch->attach(*parent))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Retained parent auxiliary attachment failed");
+            return false;
+        }
+        std::string memory_contract_error;
+        if (!parent->validateExecutableMemoryClass(
+                graph.executableMemoryClass(), &memory_contract_error))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Retained parent memory contract: "
+                      << memory_contract_error);
             return false;
         }
         if (!parent->instantiate())
@@ -4734,13 +4685,13 @@ namespace llaminar2
             return result;
         }
         if (hooks.auxiliary_branch &&
-            (retained_parent_composition || !full_graph_capture ||
-             segment_cache.segments.size() != 1u ||
-             !segment_cache.segments.front().capturable ||
-             hooks.auxiliary_branch->device() != ctx->deviceId()))
+            (hooks.auxiliary_branch->device() != ctx->deviceId() ||
+             (!retained_parent_composition &&
+              (!full_graph_capture || segment_cache.segments.size() != 1u ||
+               !segment_cache.segments.front().capturable))))
         {
             LOG_ERROR(
-                "[DeviceGraphCaptureController] A graph-owned auxiliary branch requires exactly one complete capturable graph on the same device");
+                "[DeviceGraphCaptureController] An auxiliary branch requires one final native executable on the same device");
             result.reset_cache = true;
             return result;
         }
@@ -4888,6 +4839,22 @@ namespace llaminar2
             /*segment=*/nullptr,
             /*segment_index=*/0u);
 
+        // The native owner must exist before recording: CUDA conditional
+        // handles cannot be transplanted from independent captured graphs.
+        // A local RAII owner also keeps failed construction out of the live cache.
+        std::unique_ptr<IGPUGraphCapture> recording_parent;
+        if (retained_parent_composition)
+        {
+            recording_parent = gpu_ctx->createGraphCapture(capture_stream);
+            if (!recording_parent || recording_parent->nodeCount() != 0u ||
+                recording_parent->hasExecutable() ||
+                recording_parent->executionStream() != capture_stream)
+            {
+                result.reset_cache = true;
+                return result;
+            }
+        }
+
         for (size_t segment_index = 0; segment_index < segment_cache.segments.size(); ++segment_index)
         {
             auto &seg = segment_cache.segments[segment_index];
@@ -4966,7 +4933,9 @@ namespace llaminar2
                 const auto native_record_begin =
                     PerfStatsCollector::Clock::now();
 
-                seg.capture = gpu_ctx->createGraphCapture(capture_stream);
+                seg.capture = recording_parent
+                    ? recording_parent->createOrderedTimelineFragment()
+                    : gpu_ctx->createGraphCapture(capture_stream);
                 if (!seg.capture)
                 {
                     LOG_ERROR("[DeviceGraphCaptureController] Failed to create graph capture for segment");
@@ -5055,20 +5024,6 @@ namespace llaminar2
                                 capture_begin_call)
                                 .count()));
 
-                    ScopedCapturedAuxiliaryBranch auxiliary_branch(
-                        hooks.auxiliary_branch,
-                        capture_stream);
-                    if (!auxiliary_branch.begin())
-                    {
-                        LOG_ERROR(
-                            "[DeviceGraphCaptureController] Could not record the graph-owned auxiliary fork for segment starting at "
-                            << (seg.stage_names.empty()
-                                    ? std::string("<empty>")
-                                    : seg.stage_names.front()));
-                        exec_ok = false;
-                        failed_stage_name = "<auxiliary_branch_fork>";
-                    }
-
                     for (const auto &stage_name : seg.stage_names)
                     {
                         if (!exec_ok)
@@ -5134,21 +5089,6 @@ namespace llaminar2
                             break;
                         }
                         graph.markCompleted(stage_name);
-                    }
-
-                    if (!auxiliary_branch.finish())
-                    {
-                        LOG_ERROR(
-                            "[DeviceGraphCaptureController] Could not record the graph-owned auxiliary join for segment starting at "
-                            << (seg.stage_names.empty()
-                                    ? std::string("<empty>")
-                                    : seg.stage_names.front()));
-                        if (exec_ok)
-                        {
-                            exec_ok = false;
-                            failed_stage_name =
-                                "<auxiliary_branch_join>";
-                        }
                     }
 
                     const auto capture_close_call =
@@ -5244,6 +5184,15 @@ namespace llaminar2
                                      InstantiateWithoutLaunch
                                : CapturedUnitFinalization::
                                      InstantiateAndLaunch);
+                // Direct capture and parent composition use the same single
+                // attachment operation, always on the final execution owner.
+                if (!retained_parent_composition && hooks.auxiliary_branch &&
+                    !hooks.auxiliary_branch->attach(*seg.capture))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Native executable auxiliary attachment failed");
+                    result.reset_cache = true;
+                    return result;
+                }
                 const auto native_finalize_begin =
                     PerfStatsCollector::Clock::now();
                 const bool capture_finalize_ok = finalizeCapturePhaseCapturableSegment(
@@ -5347,7 +5296,8 @@ namespace llaminar2
                 gpu_ctx,
                 current_step,
                 hooks,
-                initial_submission))
+                initial_submission,
+                std::move(recording_parent)))
         {
             result.reset_cache = true;
             return result;

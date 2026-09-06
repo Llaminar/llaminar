@@ -54,6 +54,11 @@ build through CMake, so an existing tree keeps using that same tool. Mixing
 Ninja executables can make their command-log hashes differ and cause a
 needless full rebuild.
 
+The image also builds the patched NCCL capture dependency through
+`scripts/docker/install-nccl.sh`. Native CUDA builds outside the devcontainer
+must install that dependency first; an unpatched system NCCL does not support
+the retained-parent capture lifecycle.
+
 ```bash
 LLAMINAR_NINJA_BIN="$(command -v ninja)"
 cmake -B build_v2_integration -S src/v2 -G Ninja \
@@ -68,7 +73,7 @@ Set these once before running the one-liners below:
 
 ```bash
 export MODEL_DIR=/opt/llaminar-models
-export MODEL_DENSE="$MODEL_DIR/Qwen3.6-27B-Q4_K_S.gguf"
+export MODEL_DENSE="$MODEL_DIR/Qwen3.8-27B-IQ4_XS.gguf"
 export MODEL_MOE="$MODEL_DIR/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
 export MODEL_PP_DENSE="$MODEL_DIR/Qwen3.5-27B-Q4_K_M.gguf"
 
@@ -483,7 +488,7 @@ container:
 export MODEL_DIR=/opt/llaminar-models
 
 export MODEL_SMALL="$MODEL_DIR/qwen2.5-1.5b-instruct-q8_0.gguf"
-export MODEL_CPU_DENSE="$MODEL_DIR/Qwen3.6-27B-Q4_K_S.gguf"
+export MODEL_CPU_DENSE="$MODEL_DIR/Qwen3.8-27B-IQ4_XS.gguf"
 export MODEL_PP_DENSE="$MODEL_DIR/Qwen3.5-27B-Q4_K_M.gguf"
 export MODEL_TP_MOE="$MODEL_DIR/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
 ```
@@ -737,9 +742,20 @@ docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 \
   -m "$MODEL_PP_DENSE"
 ```
 
-The release E2E matrix currently exercises CUDA TP2 and ROCm TP2/TP4 directly.
-The homogeneous CUDA/ROCm PP2 examples above reuse the same tested PP model,
-layer split, and domain syntax as the hybrid CUDA+ROCm PP case.
+Examples above demonstrate CLI topology syntax; they are not an inventory of
+current E2E certificates. Eligibility lives in the canonical typed model-parity
+definitions. List it with:
+
+```bash
+cmake --build build_v2_integration --parallel --target v2_model_parity_matrices
+python3 scripts/ci/run_model_parity_e2e.py --build-dir build_v2_integration --list
+```
+
+Run without `--list` to certify tagged cells through the Release HTTP server,
+including the full needle, long-generation, prefix/reset and context-boundary
+checks. Both local and container runners consume the same definitions. See the
+[parity workflow](tests/v2/integration/parity/README.md#tagged-http--long-context-certification)
+for selection, persistent tmpfs staging and evidence requirements.
 
 Reference docs:
 - NVIDIA CUDA release notes: https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html

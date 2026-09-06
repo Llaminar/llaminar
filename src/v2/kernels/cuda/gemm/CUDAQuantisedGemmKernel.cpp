@@ -12,6 +12,11 @@
  * 3. Handles tensor type introspection in multiply_tensor()
  * 4. Manages lazy weight conversion to INT8 + scales
  *
+ * Concurrent projections borrow disjoint aligned slices of the admitted
+ * workspace envelope. A merged graph-family capacity need not be divisible by
+ * a particular stage's fan-out, so slice offsets are computed in element
+ * alignment units, never by truncating an arbitrary byte division.
+ *
  * **Weight Conversion Pipeline**:
  * 1. Dequantize original quantized weights to FP32
  * 2. Per-column symmetric quantization to INT8
@@ -34,6 +39,7 @@
 #include "tensors/KernelSnapshotInfo.h"
 #include "transfer/TransferEngine.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/AlignedWorkspaceSlices.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h" // isGraphCaptureActive()
 #include "loaders/gpu_pipeline/RepackFormat.h"
@@ -46,12 +52,14 @@
 #include <cuda_runtime.h>
 
 #include <stdexcept>
+#include <array>
 #include <vector>
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <memory>
 #include <unordered_map>
@@ -222,6 +230,18 @@ namespace llaminar2
             int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
             void cudaNativeVNNIGemvTuned_setSerialPartitionN(int n);
             int cudaNativeVNNIGemvTuned_getSerialPartitionN();
+
+            /**
+             * @brief Query the exact ordered-reduction scratch contract used by
+             *        production graph-captured M=1 decode.
+             */
+            bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+                uint8_t codebook_id,
+                int n,
+                int k,
+                int sm_count,
+                int *uses_ordered_reducer,
+                int *k_partitions);
 
             bool cudaNativeVNNIInitIQGridTables_tuned();
 
@@ -1866,9 +1886,9 @@ namespace llaminar2
                 GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
             const size_t total_bytes = workspace_->getBufferSize(
                 GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
-            const size_t slot_bytes =
-                total_bytes /
-                static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
+            const AlignedWorkspaceSlices slices(
+                total_bytes, kCudaConcurrentPrefillWorkspaceSlots, alignof(float));
+            const size_t slot_bytes = slices.strideBytes();
             const size_t required_total =
                 canonical_kpart_bytes *
                 static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
@@ -1891,9 +1911,8 @@ namespace llaminar2
                     ", slots=" + std::to_string(
                         kCudaConcurrentPrefillWorkspaceSlots) + "]");
             }
-            auto *base = static_cast<unsigned char *>(buffer);
             auto *canonical_kpart_ptr = reinterpret_cast<float *>(
-                base + static_cast<size_t>(stream_idx) * slot_bytes);
+                slices.slice(buffer, stream_idx, canonical_kpart_bytes).data());
 
             cudaPrefillContext_bindWorkspace(
                 impl_->prefill_ctx,
@@ -1960,7 +1979,12 @@ namespace llaminar2
                 const size_t total_bytes = workspace_->getBufferSize(
                     GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
                 const int extra_slots = active_slots - 1;
-                slot_bytes = total_bytes / static_cast<size_t>(extra_slots);
+                // Other stages may enlarge this shared name using a different
+                // stream count. Partition complete FP32 elements, preserving
+                // alignment without allocating or disabling side streams.
+                const AlignedWorkspaceSlices slices(
+                    total_bytes, extra_slots, alignof(float));
+                slot_bytes = slices.strideBytes();
                 if (!buffer || slot_bytes < required_bytes ||
                     stream_idx > extra_slots)
                 {
@@ -1973,9 +1997,8 @@ namespace llaminar2
                         std::to_string(slot_bytes));
                 }
 
-                auto *base = static_cast<unsigned char *>(buffer);
                 partials = reinterpret_cast<float *>(
-                    base + static_cast<size_t>(stream_idx - 1) * slot_bytes);
+                    slices.slice(buffer, stream_idx - 1, required_bytes).data());
             }
 
             cudaGemvContext_bindWorkspace(
@@ -2526,11 +2549,200 @@ namespace llaminar2
                     return false;
                 }
 
-                for (int pi = 0; pi < static_cast<int>(bindings.size()); ++pi)
+                /**
+                 * Grouped verifier projections use one production schedule:
+                 * concurrent launches on persistent streams. Stream zero uses
+                 * the ordinary KPAR arena; the other streams use the bounded
+                 * side-stream arena declared by the fused stage before graph
+                 * capture. An explicit debug-policy opt-out may request the
+                 * ordered schedule, but missing production workspace is fatal
+                 * rather than an invisible performance fallback.
+                 */
+                enum class GroupedVerifierProjectionSchedule
+                {
+                    OrderedOnRootStream,
+                    ConcurrentOnPersistentStreams,
+                };
+
+                struct VerifierScratchSlot
+                {
+                    void *arena = nullptr;
+                    size_t arena_bytes = 0;
+                    int stream_index = 0;
+                    size_t required_bytes = 0;
+                    size_t offset_bytes = 0;
+                };
+
+                struct VerifierProjectionPlan
+                {
+                    int stream_index = 0;
+                    bool uses_ordered_reducer = false;
+                    size_t required_bytes = 0;
+                    size_t slot_index = 0;
+                };
+
+                GroupedVerifierProjectionSchedule verifier_schedule =
+                    GroupedVerifierProjectionSchedule::OrderedOnRootStream;
+                std::vector<VerifierScratchSlot> scratch_slots;
+                std::vector<VerifierProjectionPlan> projection_plans(
+                    bindings.size());
+                CUDAConcurrentPrefillPool *verifier_pool = nullptr;
+
+                if (debugEnv().gemm.cuda_concurrent_decode &&
+                    bindings.size() >= 2)
+                {
+                    auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
+                    verifier_pool = &pool;
+                    const int active_streams = std::min(
+                        static_cast<int>(bindings.size()), pool.count);
+
+                    int sm_count = 0;
+                    const cudaError_t sm_status = cudaDeviceGetAttribute(
+                        &sm_count,
+                        cudaDevAttrMultiProcessorCount,
+                        cuda_device_id_);
+                    if (sm_status != cudaSuccess || sm_count <= 0)
+                    {
+                        throw std::runtime_error(
+                            "[GroupedVerifier] Cannot resolve the physical SM "
+                            "count required by the canonical reduction policy");
+                    }
+
+                    bool complete_plan = true;
+                    for (size_t pi = 0; pi < bindings.size(); ++pi)
+                    {
+                        auto &binding = bindings[pi];
+                        auto &plan = projection_plans[pi];
+                        plan.stream_index =
+                            static_cast<int>(pi) % active_streams;
+
+                        const uint8_t policy_codebook =
+                            binding.kernel->impl_->native_source_identity.present
+                                ? canonicalDeviceVnniCodebookId(
+                                      binding.kernel->impl_
+                                          ->native_source_identity.codebook_id)
+                                : binding.kernel->impl_->native_codebook_id;
+                        int uses_ordered_reducer = 0;
+                        int k_partitions = 0;
+                        if (!cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+                                policy_codebook,
+                                binding.n,
+                                k,
+                                sm_count,
+                                &uses_ordered_reducer,
+                                &k_partitions))
+                        {
+                            throw std::runtime_error(
+                                "[GroupedVerifier] Missing canonical M=1 "
+                                "scratch policy for projection " +
+                                std::to_string(pi));
+                        }
+
+                        plan.uses_ordered_reducer =
+                            uses_ordered_reducer != 0;
+                        if (!plan.uses_ordered_reducer)
+                            continue;
+
+                        const int scratch_rows =
+                            nativeVNNIPersistentVerifierWorkspaceRows(
+                                m, binding.n, k);
+                        plan.required_bytes =
+                            static_cast<size_t>(k_partitions) *
+                            static_cast<size_t>(scratch_rows) *
+                            static_cast<size_t>(binding.n) * sizeof(float);
+
+                        const char *arena_name =
+                            plan.stream_index == 0
+                                ? GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS
+                                : GemmWorkspaceBuffers::
+                                      CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS;
+                        void *arena =
+                            binding.kernel->workspace_->getBuffer(arena_name);
+                        const size_t arena_bytes =
+                            binding.kernel->workspace_->getBufferSize(arena_name);
+                        if (!arena || plan.required_bytes == 0)
+                        {
+                            complete_plan = false;
+                            break;
+                        }
+
+                        auto slot = std::find_if(
+                            scratch_slots.begin(),
+                            scratch_slots.end(),
+                            [&](const VerifierScratchSlot &candidate)
+                            {
+                                return candidate.arena == arena &&
+                                       candidate.stream_index ==
+                                           plan.stream_index;
+                            });
+                        if (slot == scratch_slots.end())
+                        {
+                            scratch_slots.push_back(VerifierScratchSlot{
+                                arena,
+                                arena_bytes,
+                                plan.stream_index,
+                                plan.required_bytes,
+                                0});
+                            plan.slot_index = scratch_slots.size() - 1;
+                        }
+                        else
+                        {
+                            slot->required_bytes = std::max(
+                                slot->required_bytes,
+                                plan.required_bytes);
+                            plan.slot_index = static_cast<size_t>(
+                                std::distance(scratch_slots.begin(), slot));
+                        }
+                    }
+
+                    /*
+                     * Lay out slots independently inside each physical arena.
+                     * Projections assigned to the same persistent stream may
+                     * reuse a slot because their launches are ordered there.
+                     */
+                    constexpr size_t kScratchAlignment = 256;
+                    for (size_t si = 0;
+                         complete_plan && si < scratch_slots.size(); ++si)
+                    {
+                        auto &slot = scratch_slots[si];
+                        size_t cursor = 0;
+                        for (size_t previous = 0; previous < si; ++previous)
+                        {
+                            const auto &prior = scratch_slots[previous];
+                            if (prior.arena != slot.arena)
+                                continue;
+                            cursor = std::max(
+                                cursor,
+                                prior.offset_bytes + prior.required_bytes);
+                        }
+                        cursor = (cursor + kScratchAlignment - 1) &
+                                 ~(kScratchAlignment - 1);
+                        slot.offset_bytes = cursor;
+                        if (cursor > slot.arena_bytes ||
+                            slot.required_bytes > slot.arena_bytes - cursor)
+                        {
+                            complete_plan = false;
+                        }
+                    }
+
+                    if (!complete_plan)
+                    {
+                        throw std::runtime_error(
+                            "[GroupedVerifier] Concurrent projection scratch "
+                            "is missing or undersized; the workspace family "
+                            "must declare every side-stream KPAR slice before "
+                            "capture");
+                    }
+                    verifier_schedule =
+                        GroupedVerifierProjectionSchedule::
+                            ConcurrentOnPersistentStreams;
+                }
+
+                auto launch_projection = [&](int pi, void *projection_stream)
                 {
                     const auto &binding = bindings[static_cast<size_t>(pi)];
                     void *saved_stream = binding.kernel->getGPUStream();
-                    binding.kernel->setGPUStream(execution_stream);
+                    binding.kernel->setGPUStream(projection_stream);
                     const bool projection_ok = binding.kernel->multiply_quantized_small_m_gemv(
                         d_A_int8,
                         d_scales_A_blockwise,
@@ -2542,7 +2754,7 @@ namespace llaminar2
                         1.0f,
                         0.0f,
                         true,
-                        execution_stream);
+                        projection_stream);
                     binding.kernel->setGPUStream(saved_stream);
 
                     if (!projection_ok)
@@ -2551,6 +2763,89 @@ namespace llaminar2
                                   "Grouped small-M native-VNNI GEMV failed for projection "
                                   << pi << " (" << (binding.name ? binding.name : "unnamed") << ")");
                         return false;
+                    }
+                    return true;
+                };
+
+                if (verifier_schedule ==
+                    GroupedVerifierProjectionSchedule::
+                        ConcurrentOnPersistentStreams)
+                {
+                    if (!verifier_pool)
+                        throw std::logic_error(
+                            "Concurrent grouped verifier schedule has no "
+                            "persistent stream pool");
+
+                    const int active_streams = std::min(
+                        static_cast<int>(bindings.size()),
+                        verifier_pool->count);
+                    if (!cudaQuantGemm_recordEvent(
+                            verifier_pool->quant_ready, execution_stream))
+                    {
+                        throw std::runtime_error(
+                            "[GroupedVerifier] Failed to publish quantized "
+                            "activations to projection streams");
+                    }
+                    for (int si = 0; si < active_streams; ++si)
+                    {
+                        if (!cudaQuantGemm_streamWaitEvent(
+                                verifier_pool->streams[si],
+                                verifier_pool->quant_ready))
+                        {
+                            throw std::runtime_error(
+                                "[GroupedVerifier] Projection stream failed "
+                                "to wait for quantized activations");
+                        }
+                    }
+
+                    for (int pi = 0;
+                         pi < static_cast<int>(bindings.size()); ++pi)
+                    {
+                        const auto &plan =
+                            projection_plans[static_cast<size_t>(pi)];
+                        auto &binding = bindings[static_cast<size_t>(pi)];
+                        if (plan.uses_ordered_reducer)
+                        {
+                            const auto &slot =
+                                scratch_slots[plan.slot_index];
+                            auto *slice = reinterpret_cast<float *>(
+                                static_cast<std::byte *>(slot.arena) +
+                                slot.offset_bytes);
+                            cudaGemvContext_bindWorkspace(
+                                binding.kernel->impl_->gemv_ctx,
+                                slice,
+                                slot.required_bytes);
+                        }
+                        if (!launch_projection(
+                                pi,
+                                verifier_pool->streams[plan.stream_index]))
+                        {
+                            return false;
+                        }
+                    }
+
+                    for (int si = 0; si < active_streams; ++si)
+                    {
+                        if (!cudaQuantGemm_recordEvent(
+                                verifier_pool->completion[si],
+                                verifier_pool->streams[si]) ||
+                            !cudaQuantGemm_streamWaitEvent(
+                                execution_stream,
+                                verifier_pool->completion[si]))
+                        {
+                            throw std::runtime_error(
+                                "[GroupedVerifier] Failed to join a projection "
+                                "producer to the root publication stream");
+                        }
+                    }
+                }
+                else
+                {
+                    for (int pi = 0;
+                         pi < static_cast<int>(bindings.size()); ++pi)
+                    {
+                        if (!launch_projection(pi, execution_stream))
+                            return false;
                     }
                 }
 
@@ -2566,7 +2861,13 @@ namespace llaminar2
                             {"m", std::to_string(m)},
                             {"k", std::to_string(k)},
                             {"projections", std::to_string(projections.size())},
-                            {"route", "specialized"}});
+                            {"route", "specialized"},
+                            {"projection_schedule",
+                             verifier_schedule ==
+                                     GroupedVerifierProjectionSchedule::
+                                         ConcurrentOnPersistentStreams
+                                 ? "concurrent"
+                                 : "ordered"}});
                 }
 
                 publish_projection_outputs();
@@ -2804,8 +3105,10 @@ namespace llaminar2
                                 GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32);
                             const size_t extra_bytes = cuda_kernel->workspace_->getBufferSize(
                                 GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32);
-                            const size_t extra_slot_bytes =
-                                extra_bytes / static_cast<size_t>(kCudaConcurrentPrefillExtraAccumulatorSlots);
+                            const AlignedWorkspaceSlices slices(
+                                extra_bytes, kCudaConcurrentPrefillExtraAccumulatorSlots,
+                                alignof(int32_t));
+                            const size_t extra_slot_bytes = slices.strideBytes();
                             const size_t needed_bytes = acc_elements * sizeof(int32_t);
                             if (!extra_buffer || extra_slot_bytes < needed_bytes ||
                                 stream_idx > kCudaConcurrentPrefillExtraAccumulatorSlots)
@@ -2819,9 +3122,8 @@ namespace llaminar2
                                     std::to_string(extra_slot_bytes) + " bytes");
                             }
 
-                            auto *extra_bytes_ptr = static_cast<unsigned char *>(extra_buffer);
                             proj_d_C_int32 = reinterpret_cast<int32_t *>(
-                                extra_bytes_ptr + static_cast<size_t>(stream_idx - 1) * extra_slot_bytes);
+                                slices.slice(extra_buffer, stream_idx - 1, needed_bytes).data());
                         }
 
                         cuda_kernel->validateWorkspace();
@@ -4359,6 +4661,93 @@ namespace llaminar2
                       << ", temp_c_fp32=" << (temp_c_fp32_bytes / 1024) << "KB");
 
             return reqs;
+        }
+
+        void CUDAQuantisedGemmKernel::appendFusedProjectionWorkspaceRequirements(
+            WorkspaceRequirements &requirements,
+            int m,
+            std::span<const int> projection_columns,
+            int k) const
+        {
+            if (m <= 1 || projection_columns.size() <= 1)
+                return;
+            if (k <= 0)
+            {
+                throw std::invalid_argument(
+                    "CUDA fused verifier workspace requires positive K");
+            }
+
+            const size_t stream_count = std::min(
+                projection_columns.size(),
+                static_cast<size_t>(kCudaConcurrentDecodeWorkspaceSlots));
+            std::array<size_t, kCudaConcurrentDecodeWorkspaceSlots>
+                stream_bytes{};
+            const size_t k_groups = static_cast<size_t>((k + 31) / 32);
+
+            for (size_t projection = 0;
+                 projection < projection_columns.size(); ++projection)
+            {
+                const int columns = projection_columns[projection];
+                if (columns <= 0)
+                {
+                    throw std::invalid_argument(
+                        "CUDA fused verifier projection widths must be positive");
+                }
+                const int rows = nativeVNNIPersistentVerifierWorkspaceRows(
+                    m, columns, k);
+                if (rows <= 0)
+                    continue;
+
+                const size_t width = static_cast<size_t>(columns);
+                const size_t row_count = static_cast<size_t>(rows);
+                if (k_groups > std::numeric_limits<size_t>::max() / row_count ||
+                    k_groups * row_count >
+                        std::numeric_limits<size_t>::max() / width ||
+                    k_groups * row_count * width >
+                        std::numeric_limits<size_t>::max() / sizeof(float))
+                {
+                    throw std::overflow_error(
+                        "CUDA fused verifier workspace size overflow");
+                }
+                const size_t bytes =
+                    k_groups * row_count * width * sizeof(float);
+                const size_t stream = projection % stream_count;
+                stream_bytes[stream] = std::max(stream_bytes[stream], bytes);
+            }
+
+            /*
+             * Stream zero owns the ordinary serial arena. Side streams share
+             * one compact-decode descriptor whose aligned slices are selected
+             * by the runtime planner. A later projection reusing a stream is
+             * ordered behind that stream's completion event and therefore only
+             * needs the maximum slot for that stream, not another allocation.
+             */
+            constexpr size_t kScratchAlignment = 256;
+            size_t side_bytes = 0;
+            for (size_t stream = 1; stream < stream_count; ++stream)
+            {
+                const size_t aligned =
+                    (side_bytes + kScratchAlignment - 1) &
+                    ~(kScratchAlignment - 1);
+                if (aligned < side_bytes ||
+                    stream_bytes[stream] >
+                        std::numeric_limits<size_t>::max() - aligned)
+                {
+                    throw std::overflow_error(
+                        "CUDA fused verifier side-stream workspace overflow");
+                }
+                side_bytes = aligned + stream_bytes[stream];
+            }
+            if (side_bytes == 0)
+                return;
+
+            requirements.buffers.push_back({
+                GemmWorkspaceBuffers::
+                    CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS,
+                side_bytes,
+                kScratchAlignment,
+                true,
+                WorkspaceExecutionRegime::CompactDecodeOnly});
         }
 
         void CUDAQuantisedGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)

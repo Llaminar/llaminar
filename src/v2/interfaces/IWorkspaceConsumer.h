@@ -221,7 +221,7 @@ namespace llaminar2
 
         // GEMV kpar partials buffer for CUDA NativeVNNI two-phase reduction
         constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × bounded verifier rows × N] FP32 serial/grouped reduction arena
-        constexpr const char *CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS = "cuda_concurrent_decode_gemv_kpar_partials"; ///< per-side-stream [kpar × M × max_N] FP32 GEMV partials
+        constexpr const char *CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS = "cuda_concurrent_decode_gemv_kpar_partials"; ///< aligned side-stream [kpar × bounded rows × stream_N] FP32 GEMV partials
 
         // CUDA NativeVNNI public-M1 K-partition scratch. This persistent arena
         // is sized before capture and shared only across non-concurrent graphs.

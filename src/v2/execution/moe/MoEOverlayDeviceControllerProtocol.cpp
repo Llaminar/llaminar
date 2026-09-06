@@ -154,16 +154,15 @@ namespace llaminar2
         const std::uint64_t candidate =
             durablePlacementKind(kind) ? base + 1u : base;
 
-        // Group records are group-root-owned monotonic publications. The
-        // leader starts a new transaction without clearing follower words;
-        // each root advances its own fields from an older transaction id.
-        *command_ = MoEOverlayDeviceControllerCommandHeader{};
-        command_->topology_fingerprint = header_->topology_fingerprint;
+        // Preserve both follower receipts and the previous sealed command.
+        // An empty command can complete before a transport worker acquires it;
+        // that worker must consume it before joining this next snapshot. The
+        // existing snapshot fan-in therefore guards command replacement, with
+        // no extra acknowledgement or host-owned state mirror.
         header_->transaction_kind = static_cast<std::uint32_t>(kind);
-        command_->demand_phase = static_cast<std::uint32_t>(phase);
+        header_->transaction_demand_phase = static_cast<std::uint32_t>(phase);
         header_->base_epoch = base;
         header_->candidate_epoch = candidate;
-        header_->command_transaction = 0u;
         header_->commit_transaction = 0u;
         header_->admission_transaction = 0u;
         header_->active_llep_transaction = 0u;
@@ -276,6 +275,7 @@ namespace llaminar2
         command_->parallel_command_count = parallel_command_count;
         command_->movement_round_count = movement_round_count;
         command_->hazard_count = hazard_count;
+        command_->demand_phase = header_->transaction_demand_phase;
         command_->snapshot_observations = evidence.snapshot_observations;
         command_->priority_cost_before = evidence.priority_cost_before;
         command_->priority_cost_after = evidence.priority_cost_after;

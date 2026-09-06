@@ -828,7 +828,19 @@ namespace llaminar2
         virtual void drainCompletedDecodeBoundaryMaintenanceDiagnostics() {}
 
         /**
-         * @brief Read-only runtime state probe for prefix-cache/MTP development.
+         * @brief Return existing request/terminal observations without device work.
+         * @return Serving metadata, never a live execution-state snapshot.
+         *
+         * Implementations must not issue transfers, synchronize streams/devices,
+         * or delegate to prefixStateProbe. Logging cannot join background work.
+         */
+        virtual RequestRuntimeSummary requestRuntimeSummary() const { return {}; }
+
+        /**
+         * @brief Explicit, potentially intrusive prefix-cache/MTP diagnostic.
+         *
+         * May observe device state and synchronize. Ordinary serving summaries
+         * must use requestRuntimeSummary instead, regardless of logging level.
          */
         virtual PrefixRuntimeStateSnapshot prefixStateProbe() const { return {}; }
 

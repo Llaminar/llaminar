@@ -355,6 +355,7 @@ namespace llaminar2::test
                                      device,
                                      lane_prefix + ":" + phase.name)
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = lane_prefix + ":" + phase.name,
                 .perf_device = device.to_string(),
             });

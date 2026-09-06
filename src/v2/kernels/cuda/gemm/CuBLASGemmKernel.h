@@ -10,13 +10,14 @@
  * - Expects input/output matrices already on GPU device
  * - Caller responsible for device memory management
  *
- * **Device Context Support (Phase 4)**:
- * - Can use cuBLAS handle from IWorkerGPUContext instead of creating own
- * - Backward compatible: existing constructor still creates own handle
+ * **Ownership**: All construction forms borrow the worker context's handles.
+ * A kernel is only a projection/submission view. Retiring it during expert
+ * movement never creates or destroys a device library. Context-scoped host
+ * submission locking protects exact stream and arena workspace selection.
  *
  * **Usage**:
  * ```cpp
- * // Legacy: creates own cuBLAS handle
+ * // Resolve the persistent context by ordinal:
  * auto kernel = std::make_unique<CuBLASGemmKernel>(device_id);
  *
  * // New: uses context's cuBLAS handle
@@ -81,12 +82,12 @@ namespace llaminar2
             };
 
             /**
-             * @brief Create cuBLAS GEMM kernel (legacy constructor - creates own handle)
+             * @brief Resolve the persistent context and borrow its BLAS handles.
              *
              * @param device_id CUDA device ID (from cudaGetDevice)
              * @param precision Floating-point precision to use
              *
-             * @throws std::runtime_error if cuBLAS handle creation fails
+             * @throws std::runtime_error if device context initialization fails
              */
             explicit CuBLASGemmKernel(int device_id, Precision precision = Precision::FP32);
 
@@ -105,7 +106,7 @@ namespace llaminar2
             explicit CuBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision = Precision::FP32);
 
             /**
-             * @brief Destructor - destroys cuBLAS handle only if owned
+             * @brief Release only the projection view; the context retains its library.
              */
             ~CuBLASGemmKernel();
 
@@ -211,10 +212,10 @@ namespace llaminar2
             Precision precision() const { return precision_; }
 
             /**
-             * @brief Check if this kernel owns its cuBLAS handle
-             * @return true if destructor will destroy the handle, false if using context's handle
+             * @brief Report the invariant that library handles are never kernel-owned.
+             * @return false; context retirement is the only library destruction boundary.
              */
-            bool ownsHandle() const { return owns_handle_; }
+            bool ownsHandle() const { return false; }
 
             /**
              * @brief Retain the exact validated stream for the next submission.
@@ -237,18 +238,12 @@ namespace llaminar2
             void clearStreamBinding() noexcept;
 
         private:
-#ifdef HAVE_CUDA
-            cublasHandle_t handle_ = nullptr;
-            cublasLtHandle_t lt_handle_ = nullptr;
-#endif
             int device_id_ = 0;
             Precision precision_ = Precision::FP32;
-            bool owns_handle_ = true;    ///< false when using context's cuBLAS handle
-            bool owns_lt_handle_ = true; ///< false when using context's cuBLASLt handle
         };
 
         /**
-         * @brief Factory function for cuBLAS GEMM kernel (legacy - creates own handle)
+         * @brief Create a submission view through the persistent device context.
          *
          * @param device_id CUDA device ID
          * @param precision Desired precision (default FP32)

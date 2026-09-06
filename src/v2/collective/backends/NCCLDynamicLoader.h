@@ -25,7 +25,9 @@ namespace llaminar2
     {
         /**
          * @brief Load NCCL library dynamically with isolated symbols
-         * @param library_path Optional path to libnccl.so (nullptr for default search)
+         * @param library_path Exact explicit library, or nullptr for the
+         *        installed libllaminar_nccl.so.2 capture-reentry implementation.
+         *        A failed load never selects a different library.
          * @return true if loaded successfully
          *
          * The library is loaded with RTLD_NOW | RTLD_LOCAL to:

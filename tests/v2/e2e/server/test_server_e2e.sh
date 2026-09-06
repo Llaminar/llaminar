@@ -5,17 +5,13 @@
 # Tests the Llaminar HTTP server (serve subcommand) with curl against the
 # /v1/chat/completions endpoint for multiple model × backend combinations.
 #
-# Default test suites:
-#   Suite 1: Qwen2.5 1.5B Q8_0 on cpu, cuda:0, rocm:0
-#   Suite 2: Qwen3.5 4B   Q8_0 on cpu, cuda:0, rocm:0
-#   Suite 3: Qwen3.5 35B MoE Q4_K_XL on cpu
-#   Suite 4: Qwen3.5 35B MoE Q4_K_XL on rocm:0
-#   Suite 5: Qwen3.5 27B dense Q4_K_M on cpu, rocm:0 (too large for single 24GB CUDA GPU)
-#   Suite 6: Qwen3.5 27B dense Q4_K_M TP2 on rocm:0,rocm:1
-#   Suite 7: Qwen3.5 27B dense Q4_K_M PP2 on cuda:0+rocm:0 (equal 32/32 layer split)
-#   Suite 8+: Qwen3.6 dense/MoE baseline, prefix-cache, and MTP server cases
+# Default selection comes from ModelParityDefinition::e2e_certifiable through
+# scripts/ci/run_model_parity_e2e.py. This file owns HTTP checks and server
+# lifecycle, not a second model/topology/feature matrix.
 #
 # Each backend test:
+#   Every MPI rank exports its own evidence; after shutdown the harness requires
+#   the runtime-declared communicator in full before validating an aggregate.
 #   1. Starts llaminar2 serve on a unique port
 #   2. Waits for /health to respond
 #   3. Sends a single-turn greedy chat request, validates response
@@ -90,6 +86,9 @@
 #   LLAMINAR_E2E_LONG_REQUEST_TIMEOUT Long helper request timeout (default: 420)
 #   LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B Minimum parsed model size in billions (default: 4)
 #   LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS Seconds to wait for server startup.
+#   LLAMINAR_E2E_THINKING_MODES both|non-thinking (default: both).
+#                       Canonical cells supply this from their typed profile;
+#                       model filenames never select or suppress reasoning tests.
 #                       Default: 60.
 #   LLAMINAR_E2E_SHUTDOWN_TIMEOUT Seconds to wait for graceful server shutdown.
 #                       Default: 120 with PerfStats enabled, 15 otherwise.
@@ -154,9 +153,6 @@ if [[ "${LOG_LEVEL^^}" == "ERROR" ]]; then
 fi
 BASE_PORT=19080
 
-HOST_RSS_CPU_MODEL_MULTIPLIER="${LLAMINAR_E2E_HOST_RSS_CPU_MODEL_MULTIPLIER:-5}"
-HOST_RSS_GPU_MODEL_MULTIPLIER="${LLAMINAR_E2E_HOST_RSS_GPU_MODEL_MULTIPLIER:-2}"
-HOST_RSS_EXTRA_MB="${LLAMINAR_E2E_HOST_RSS_EXTRA_MB:-5120}"
 # CPU-only runs may still briefly create a vendor runtime context while the
 # server enumerates devices in a GPU-enabled host image. Keep the limit below
 # real model placement, but high enough for the fixed ROCm/HIP context charge.
@@ -175,6 +171,11 @@ PERF_STATS_GPU_STAGE_TIMING="${LLAMINAR_E2E_PERF_STATS_GPU_STAGE_TIMING:-1}"
 # to finish within the HTTP timeout. Set LLAMINAR_E2E_THINKING_BUDGET_TOKENS=""
 # to request the production default of no explicit budget.
 THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
+THINKING_MODES="${LLAMINAR_E2E_THINKING_MODES:-both}"
+case "$THINKING_MODES" in
+    both|non-thinking) ;;
+    *) echo "Invalid LLAMINAR_E2E_THINKING_MODES: $THINKING_MODES" >&2; exit 2 ;;
+esac
 
 # Model suites: "model_path|backend1,backend2,...[|max_tokens[|extra_flags[|label[|suite_options]]]]"
 #   or shorthand: "model_path|backend1,backend2,...|extra_flags" (max_tokens omitted → defaults to 200)
@@ -204,6 +205,8 @@ declare -a SUITES=()
 STARTED_SERVER_HANDLE=""
 OVERRIDE_MODEL=""
 OVERRIDE_BACKENDS=""
+SERVER_ARGS_FILE=""
+declare -a CANONICAL_SERVER_ARGS=()
 
 show_usage() {
     cat <<'EOF'
@@ -256,166 +259,36 @@ while [[ $# -gt 0 ]]; do
         --model)    OVERRIDE_MODEL="$2";    shift 2 ;;
         --backends) OVERRIDE_BACKENDS="$2"; shift 2 ;;
         --suite)    SUITES+=("$2");         shift 2 ;;
+        --server-args-file) SERVER_ARGS_FILE="$2"; shift 2 ;;
         --port)     BASE_PORT="$2";         shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
-# Build suite list — if no explicit --suite flags, use defaults
+# Preserve argv boundaries, including paths with spaces and domain semicolons.
+# Validate synchronously before mapfile; process-substitution errors alone do
+# not propagate through Bash's set -e and must not turn into empty arguments.
+if [[ -n "$SERVER_ARGS_FILE" ]]; then
+    python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); assert isinstance(a,list) and a and all(isinstance(v,str) and "\0" not in v for v in a)' "$SERVER_ARGS_FILE"
+    mapfile -d '' -t CANONICAL_SERVER_ARGS < <(python3 -c 'import json,sys; sys.stdout.buffer.write(b"\0".join(v.encode() for v in json.load(open(sys.argv[1])))+b"\0")' "$SERVER_ARGS_FILE")
+    if [[ ${#SUITES[@]} -ne 1 ]]; then
+        echo "Canonical server arguments require exactly one suite" >&2
+        exit 1
+    fi
+fi
+
+# No second default model/topology matrix lives in this harness. Explicit
+# --suite invocations remain useful diagnostics; certification always comes
+# from the typed model-parity definitions and their E2E selectors.
 if [ ${#SUITES[@]} -eq 0 ]; then
-    # Suite 1: Qwen2.5 (small, fast — all backends)
-    S1_MODEL="${OVERRIDE_MODEL:-${LLAMINAR_MODEL:-${REPO_ROOT}/models/qwen2.5-1.5b-instruct-q8_0.gguf}}"
-    S1_BACKENDS="${OVERRIDE_BACKENDS:-${LLAMINAR_BACKENDS:-cpu,cuda:0,rocm:0}}"
-    SUITES+=("${S1_MODEL}|${S1_BACKENDS}")
-    S1_GRAPH_MODEL="${REPO_ROOT}/models/qwen2.5-0.5b-instruct-q8_0.gguf"
-    if [ ! -f "$S1_GRAPH_MODEL" ]; then
-        S1_GRAPH_MODEL="$S1_MODEL"
-    fi
-    if [ -f "$S1_GRAPH_MODEL" ] && [ -z "$OVERRIDE_MODEL" ] && [ -z "$OVERRIDE_BACKENDS" ] &&
-       [ -z "${LLAMINAR_MODEL:-}" ] && [ -z "${LLAMINAR_BACKENDS:-}" ]; then
-        SUITES+=("${S1_GRAPH_MODEL}|cuda:0|16||qwen25-cuda-prefill-graph-probe|prefill-graph-probe")
-    fi
-
-    # Suite 2: Qwen3.5 4B (hybrid GDN/FA architecture — all backends)
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
-    # <think>...</think> tags before the actual answer.
-    S2_MODEL="${REPO_ROOT}/models/Qwen3.5-4B-Q8_0.gguf"
-    if [ -f "$S2_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S2_MODEL}|cpu,cuda:0,rocm:0|200")
-    fi
-
-    # Suite 3: Qwen3.5 35B MoE (MoE + GDN/FA architecture — CPU only)
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
-    # <think>...</think> tags before the actual answer.
-    S3_MODEL="${REPO_ROOT}/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"
-    if [ -f "$S3_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S3_MODEL}|cpu|200")
-    fi
-
-    # Suite 4: Qwen3.5 35B MoE on ROCm (GPU MoE inference, graph capture)
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
-    # <think>...</think> tags before the actual answer.
-    S4_MODEL="${REPO_ROOT}/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"
-    if [ -f "$S4_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S4_MODEL}|rocm:0|200")
-    fi
-
-    # Suite 4b: Qwen3.5 35B MoE Q3_K_S on CUDA (single-device CUDA MoE path)
-    # This is the proving model for CUDA MoE enablement and mirrors the parity
-    # configuration that regenerates its own Q3_K_S PyTorch snapshots.
-    S4B_MODEL="/opt/llaminar-models/Qwen3.5-35B-A3B-Q3_K_S.gguf"
-    if [ -f "$S4B_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S4B_MODEL}|cuda:0|200")
-    fi
-
-    # Suite 5: Qwen3.5 27B dense (hybrid GDN/FA architecture — all backends)
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
-    # <think>...</think> tags before the actual answer.
-    S5_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
-    if [ -f "$S5_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S5_MODEL}|cpu,rocm:0|200")
-    fi
-
-    # Suite 6: Qwen3.5 27B dense TP2 on ROCm (tensor parallel across 2 GPUs)
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
-    # <think>...</think> tags before the actual answer.
-    S6_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
-    if [ -f "$S6_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S6_MODEL}|tp|200|--tp-devices rocm:0,rocm:1|qwen35-dense-rocm2tp|no-prefill-graph-buckets")
-    fi
-
-    # Suite 7: Qwen3.5 27B dense PP2 (pipeline parallel: cuda:0 + rocm:0, equal layer split)
-    # 64 layers total: layers 0-31 on cuda:0, layers 32-63 on rocm:0.
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model.
-    S7_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
-    if [ -f "$S7_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S7_MODEL}|pp|200|--define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-31 --pp-stage 1=rocm_pp:32-63|qwen35-dense-localpp-cuda-rocm|no-prefill-graph-buckets")
-    fi
-
-    # Suite 8: Qwen3.6 27B dense baseline and feature server cases.
-    # These are the current vLLM-style MTP target model family. Include
-    # `cpu` explicitly: in Llaminar device selection, -d cpu exercises all
-    # CPU sockets as a NodeLocal CPU domain rather than pinning one socket.
-    S8_MODEL="/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf"
-    S8_PREFIX_FLAGS="--prefix-cache --prefix-cache-storage ram --prefix-cache-ram-budget-mb 1024 --prefix-cache-terminal-state auto"
-    S8_MTP_FLAGS="--mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed --mtp-verify-mode greedy"
-    if [ -f "$S8_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S8_MODEL}|cpu,cuda:0,rocm:0|200||qwen36-dense-baseline")
-        SUITES+=("${S8_MODEL}|cpu,cuda:0,rocm:0|200|${S8_PREFIX_FLAGS}|qwen36-dense-prefix-ram|no-long-context")
-        SUITES+=("${S8_MODEL}|cpu,cuda:0,rocm:0|200|${S8_MTP_FLAGS}|qwen36-dense-mtp-greedy-d2|no-long-context")
-    fi
-
-    # Suite 9: Qwen3.6 35B-A3B MoE baseline and feature server cases.
-    # Prefix cache uses the placement fingerprint policy so routed-expert
-    # placement becomes part of the restore contract.
-    S9_MODEL="/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
-    S9_PREFIX_FLAGS="${S8_PREFIX_FLAGS} --prefix-cache-moe-policy placement-fingerprint"
-    S9_MTP_FLAGS="${S8_MTP_FLAGS}"
-    S9_STOCHASTIC_MTP_FLAGS="--mtp --mtp-draft-tokens 4 --mtp-min-draft-tokens 1 --mtp-initial-draft-tokens 4 --mtp-max-draft-tokens 15 --mtp-depth-policy dynamic --mtp-depth-window 4 --mtp-depth-min-samples 4 --mtp-depth-promote-windows 1 --mtp-verify-mode speculative-sampling"
-    # MoE mode is part of the behavioral contract of every matrix cell. Keep
-    # static cells explicit because the production CLI default may evolve
-    # independently of this regression matrix.
-    S9_STATIC_FLAGS="--moe-residency-maintenance off"
-    S9_TP_CUDA2_FLAGS="--tp-devices cuda:0,cuda:1"
-    S9_TP_ROCM2_FLAGS="--tp-devices rocm:0,rocm:1"
-    S9_TP_ROCM4_FLAGS="--tp-devices rocm:0,rocm:1,rocm:2,rocm:3"
-    S9_DYNAMIC_RESIDENCY_FLAGS="--moe-residency-maintenance dynamic --moe-hot-expert-cache 2 --moe-residency-maintenance-window 8 --moe-residency-maintenance-max-window 8 --moe-residency-maintenance-window-growth 1 --moe-release-raw-expert-weights"
-    S9_DYNAMIC_MOVEMENT_FLAGS="--moe-hot-expert-cache off --moe-residency-maintenance-window 4 --moe-residency-maintenance-max-window 4 --moe-residency-maintenance-window-growth 1 --moe-dynamic-imbalance-threshold-permille 0 --moe-dynamic-min-improvement-permille 0 --moe-dynamic-max-swaps-per-layer 20 --moe-dynamic-max-plan-entries-per-wave 20 --moe-dynamic-min-window-activations 0 --moe-device-rebalance-min-load-spread-improvement 0 --moe-device-rebalance-min-load-spread-improvement-divisor 0 --moe-device-rebalance-min-wave-spread-improvement-per-payload-slot 0 --moe-device-rebalance-min-foreign-rows-per-critical-path-payload-slot 0 --moe-device-rebalance-min-router-spread-improvement-per-payload-slot 0 --moe-device-rebalance-max-post-wave-load-spread-permille 1000 --moe-release-raw-expert-weights"
-    S9_LLEP_MOVEMENT_FLAGS="--moe-hot-expert-cache off --moe-routed-prefill-assignment-window 4 --moe-routed-prefill-llep-alpha-numerator 1 --moe-routed-prefill-llep-alpha-denominator 2 --moe-routed-prefill-llep-disable-balanced-skip --moe-release-raw-expert-weights"
-    S9_OVERLAY_CUDA2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy tensor-parallel --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
-    S9_OVERLAY_ROCM2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot --moe-routed-expert-shared-domain qwen36_moe_rocm_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy tensor-parallel --moe-routed-expert-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=rank_local;backend=rccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
-    # Current-batch LLEP is the ordinary-prefill assignment axis. The
-    # economical target keeps whole experts apportioned, grouped verification
-    # on static owners, the dense/shared trunk tensor parallel, and the MTP
-    # terminal head mirrored. Durable residency maintenance remains off.
-    S9_LLEP_OVERLAY_CUDA2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy tensor-parallel --mtp-terminal-head-policy mirrored-full-vocabulary --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident;owner=0 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
-    S9_LLEP_OVERLAY_ROCM2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot --moe-routed-expert-shared-domain qwen36_moe_rocm_hot --moe-routed-expert-residency static-by-id --moe-continuation-dense-policy tensor-parallel --mtp-terminal-head-policy mirrored-full-vocabulary --moe-routed-expert-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=rank_local;backend=rccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident;owner=0 --moe-routed-expert-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
-    # Remote NodeLocal CPU-cold ExpertOverlay shapes are the production target,
-    # but they must not run in the default gate until non-root participant ranks
-    # execute matched MPI sparse dispatch/local-expert/return-reduce stages.
-    S9_OVERLAY_ROCM2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot --moe-routed-expert-shared-domain qwen36_moe_rocm_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=rank_local;backend=rccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0"
-    S9_OVERLAY_CUDA2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0"
-    S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS="--moe-routed-expert-placement tiered-overlay --moe-routed-expert-continuation-domain qwen36_moe_cuda_hot --moe-routed-expert-base-model-domain qwen36_moe_cuda_hot --moe-routed-expert-shared-domain qwen36_moe_cuda_hot --moe-routed-expert-residency static-by-id --moe-routed-expert-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-domain qwen36_moe_rocm_warm=rocm:0,rocm:1;scope=rank_local;backend=rccl;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0 --moe-routed-expert-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;ranks=0,1 --moe-routed-expert-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=192;memory-mb=4096 --moe-routed-expert-tier warm@qwen36_moe_rocm_warm;priority=1;max-experts-per-layer=64;memory-mb=4096 --moe-routed-expert-tier cold@qwen36_moe_cpu_cold;priority=2;max-experts-per-layer=0;memory-mb=0"
-    if [ -f "$S9_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_STATIC_FLAGS}|qwen36-moe-baseline")
-        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS}|qwen36-moe-prefix-ram|no-long-context")
-        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS}|qwen36-moe-mtp-greedy-d2|no-long-context")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-prefix-ram-cuda2tp|no-long-context,prefill-graph-probe")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-mtp-greedy-d2-cuda2tp|no-long-context,prefill-graph-probe")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-prefix-ram-rocm2tp|no-long-context,prefill-graph-probe")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context,prefill-graph-probe")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context,prefill-graph-probe")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context,prefill-graph-probe")
-        if [[ "$QWEN36_MOE_REBALANCE_E2E" == "1" ]]; then
-            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-ram-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-ram-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-cuda2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_MTP_FLAGS} ${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-mtp-greedy-d2-rocm2tp|prefill-graph-probe,non-thinking-only,moe-rebalance-movement-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-stochastic-d4to15-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance dynamic ${S9_DYNAMIC_MOVEMENT_FLAGS}|qwen36-moe-dynamic-prefix-mtp-stochastic-d4to15-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_LLEP_OVERLAY_CUDA2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-stochastic-d4to15-cuda2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
-            SUITES+=("${S9_MODEL}|tp|64|${S9_PREFIX_FLAGS} ${S9_STOCHASTIC_MTP_FLAGS} ${S9_LLEP_OVERLAY_ROCM2_FLAGS} --moe-residency-maintenance off ${S9_LLEP_MOVEMENT_FLAGS}|qwen36-moe-llep-prefix-mtp-stochastic-d4to15-rocm2tp|prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe,moe-rebalance-movement-probe,stochastic-mtp-probe")
+    if [[ -n "$OVERRIDE_MODEL" ]]; then
+        SUITES+=("${OVERRIDE_MODEL}|${OVERRIDE_BACKENDS:-cpu}")
+    else
+        canonical_args=(--binary "$BINARY")
+        if [[ -n "$CONTAINER_IMAGE" ]]; then
+            canonical_args+=(--container-image "$CONTAINER_IMAGE")
         fi
-        if [[ "$MOE_REBALANCE_CLEAR_PROBE_E2E" == "1" ]]; then
-            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS} --backend nccl ${S9_DYNAMIC_RESIDENCY_FLAGS}|qwen36-moe-prefix-rebalance-clear-cuda2tp|no-long-context,prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe")
-            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS} --backend rccl ${S9_DYNAMIC_RESIDENCY_FLAGS}|qwen36-moe-prefix-rebalance-clear-rocm2tp|no-long-context,prefill-graph-probe,non-thinking-only,prefix-cache-rebalance-clear-probe")
-        fi
-        if [[ "$REMOTE_EXPERT_OVERLAY_E2E" == "1" ]]; then
-            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_STATIC_FLAGS} ${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-        fi
+        exec python3 "$REPO_ROOT/scripts/ci/run_model_parity_e2e.py" "${canonical_args[@]}"
     fi
 fi
 
@@ -1042,12 +915,6 @@ start_server_process() {
     STARTED_SERVER_HANDLE="docker:${container_id}:${log_pid}"
 }
 
-is_thinking_model() {
-    local label="$1"
-    [[ "${label,,}" == *"qwen3.5"* || "${label,,}" == *"qwen35"* ||
-       "${label,,}" == *"qwen3.6"* || "${label,,}" == *"qwen36"* ]]
-}
-
 is_prefix_cache_case() {
     local extra_flags="$1"
     [[ " ${extra_flags} " == *" --prefix-cache "* ]]
@@ -1280,23 +1147,11 @@ cleanup_server() {
 request_server_shutdown() {
     local port="$1"
     local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X POST --max-time 10 "$(server_base_url "$port")/admin/shutdown" 2>/dev/null || echo "000")
+    # An empty POST still needs Content-Length: 0. Otherwise the HTTP parser
+    # waits for a body and rejects the request; signalling every MPI process
+    # afterwards can kill followers before their orderly evidence export.
+    code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -d '' --max-time 10 "$(server_base_url "$port")/admin/shutdown" 2>/dev/null || echo "000")
     [[ "$code" == "202" ]]
-}
-
-copy_container_artifact() {
-    local handle="$1"
-    local container_path="$2"
-    local host_path="$3"
-
-    [[ "$handle" == docker:* ]] || return 0
-    [[ -n "$container_path" && -n "$host_path" ]] || return 0
-    [[ -s "$host_path" ]] && return 0
-
-    local container
-    container="$(docker_handle_container "$handle")"
-    mkdir -p "$(dirname "$host_path")"
-    docker cp "${container}:${container_path}" "$host_path" >/dev/null 2>&1 || true
 }
 
 # Graceful shutdown with exit code, VRAM release, and crash validation.
@@ -1323,6 +1178,7 @@ shutdown_and_validate() {
             shutdown_requested=1
             local signalled=0
             if ! request_server_shutdown "$port"; then
+                fail "[${tag}] Shutdown: HTTP authority did not accept coordinated shutdown"
                 signal_container_llaminar_processes "$container" TERM || true
                 signalled=1
             fi
@@ -1365,6 +1221,7 @@ shutdown_and_validate() {
             # shutdown hooks such as PerfStats export.
             local signalled=0
             if ! request_server_shutdown "$port"; then
+                fail "[${tag}] Shutdown: HTTP authority did not accept coordinated shutdown"
                 signal_local_llaminar_processes "$pid" TERM || kill "$pid" 2>/dev/null || true
                 signalled=1
             fi
@@ -1408,7 +1265,7 @@ shutdown_and_validate() {
     # ─── Check 2: No crash/segfault on exit ──────────────────────────
     # exit_code meanings:
     #   0       = clean exit
-    #   143     = killed by SIGTERM (128 + 15) — acceptable for servers
+    #   143     = killed by SIGTERM (128 + 15) — not a clean lifecycle
     #   139     = SIGSEGV (segfault)
     #   134     = SIGABRT (abort/assertion)
     #   136     = SIGFPE (floating point exception)
@@ -1431,9 +1288,7 @@ shutdown_and_validate() {
             132) signal_name="SIGILL" ;;
         esac
         fail "[${tag}] Shutdown: process crashed with ${signal_name} (exit code ${exit_code})"
-    elif [ "$exit_code" -eq 0 ] || [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 143 ]; then
-        # 0 = clean exit, 1 = mpirun wrapper reporting child signal (normal),
-        # 143 = killed by SIGTERM directly (128+15)
+    elif [ "$exit_code" -eq 0 ]; then
         pass "[${tag}] Shutdown: clean exit (code ${exit_code})"
     else
         fail "[${tag}] Shutdown: unexpected exit code ${exit_code}"
@@ -1517,7 +1372,13 @@ extract_numeric_answer() {
 import json, re, sys
 try:
     data = json.load(sys.stdin)
-    message = data.get('choices', [{}])[0].get('message', {})
+    choice = data.get('choices', [{}])[0]
+    # Short arithmetic must finish naturally. A repeated correct number cut
+    # off by the request budget is not a behavioral certificate.
+    if choice.get('finish_reason') != 'stop':
+        print('')
+        sys.exit(0)
+    message = choice.get('message', {})
     content = message.get('content') or ''
     matches = re.findall(r'-?\\d+', content)
     print(matches[-1] if matches else '')
@@ -1992,7 +1853,10 @@ scan_server_log() {
         count=$(printf '%s\n' "$matches" | wc -l | xargs)
         fail "[${tag}] Server log: ${count} WARN/ERROR entries in ${log_path}"
         echo -e "    ${RED}── WARN/ERROR lines ──${NC}"
-        printf '%s\n' "$matches" | head -40 | sed 's/^/    /'
+        # Drain the complete producer while printing a bounded excerpt. head
+        # closes the pipe early and can abort this fail-closed harness with
+        # SIGPIPE before it reports later checks or writes the final summary.
+        printf '%s\n' "$matches" | sed -n '1,40s/^/    /p'
         if [ "$count" -gt 40 ]; then
             echo "    ... (${count} total matches; see ${log_path})"
         fi
@@ -2007,7 +1871,7 @@ scan_server_log() {
     mpi_crash=$(grep -c "mpirun detected that one or more processes exited with non-zero status" "$log_path" 2>/dev/null || true)
     if [ "$mpi_crash" -gt 0 ]; then
         local mpi_exit_code
-        mpi_exit_code=$(grep -oP 'Exit code:\s+\K\d+' "$log_path" 2>/dev/null | head -1 || echo "unknown")
+        mpi_exit_code=$(grep -m1 -oP 'Exit code:\s+\K\d+' "$log_path" 2>/dev/null || echo "unknown")
         fail "[${tag}] Server log: mpirun detected child process crashed (exit code: ${mpi_exit_code})"
         has_failure=true
     fi
@@ -2032,7 +1896,7 @@ check_memory_usage() {
         return
     fi
 
-    local ram_mb gpu_process_mb gpu_after_mb gpu_delta_mb abs_gpu_delta_mb model_mb rss_multiplier rss_limit_mb
+    local ram_mb gpu_process_mb gpu_after_mb gpu_delta_mb abs_gpu_delta_mb
     ram_mb=$(get_server_ram_mb "$server_handle" "$pids")
     if [ "$ram_mb" -lt 0 ]; then
         fail "[${tag}] Memory: unable to measure server RAM"
@@ -2042,20 +1906,11 @@ check_memory_usage() {
     gpu_after_mb=$(get_gpu_memory_mb_for_backend "$backend" "$extra_flags")
     gpu_delta_mb=$((gpu_after_mb - gpu_before_mb))
     abs_gpu_delta_mb=${gpu_delta_mb#-}
-    model_mb=$(du -m "$model" 2>/dev/null | awk '{print $1}' || echo 0)
-
-    if is_gpu_backend "$backend"; then
-        rss_multiplier="$HOST_RSS_GPU_MODEL_MULTIPLIER"
-    else
-        rss_multiplier="$HOST_RSS_CPU_MODEL_MULTIPLIER"
-    fi
-    rss_limit_mb=$((model_mb * rss_multiplier + HOST_RSS_EXTRA_MB))
-
-    if [ "$ram_mb" -le "$rss_limit_mb" ]; then
-        pass "[${tag}] Memory: RAM ${ram_mb} MiB within limit ${rss_limit_mb} MiB"
-    else
-        fail "[${tag}] Memory: RAM ${ram_mb} MiB exceeds limit ${rss_limit_mb} MiB"
-    fi
+    # Process-tree RSS includes shared/file-backed pages once per mapping and
+    # cannot be compared with the disk blocks of a symlink or first GGUF shard.
+    # It remains useful telemetry, but admission/owner bounds are certified
+    # from PhysicalMemoryAuthority below, never a second model-size estimator.
+    echo -e "  ${BLUE}INFO${NC} [${tag}] Memory: process-tree RAM ${ram_mb} MiB; canonical admission/ledger evidence is checked separately"
 
     if is_gpu_backend "$backend"; then
         if ! gpu_memory_telemetry_available_for_backend "$backend" "$extra_flags"; then
@@ -2086,22 +1941,10 @@ validate_perf_stats() {
         return
     fi
 
-    if [ ! -s "$perf_path" ]; then
-        if is_gpu_backend "$backend" ||
-           suite_runs_prefill_graph_probe "$suite_options" ||
-           suite_runs_prefix_cache_rebalance_clear_probe "$suite_options" ||
-           suite_runs_moe_rebalance_movement_probe "$suite_options" ||
-           suite_requires_cpu_fa2_context_parallel "$suite_options"; then
-            fail "[${tag}] PerfStats: missing required artifact (${perf_path})"
-        else
-            echo -e "  ${YELLOW}SKIP${NC} [${tag}] PerfStats: no records emitted (${perf_path})"
-        fi
-        return
-    fi
-
     local validation
     validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" "$SCRIPT_DIR" <<'PY'
 import json
+from pathlib import Path
 import shlex
 import sys
 
@@ -2122,6 +1965,9 @@ from mtp_device_generation_perf_policy import (
 from request_input_lifetime_perf_policy import (
     validate_request_input_lifetime_policy,
 )
+from ranked_perf_artifacts import collect_and_publish_ranked_perf_stats, validate_memory_authority
+from moe_route_scratch_perf_policy import validate_moe_route_scratch_policy
+from runtime_feature_perf_policy import MovementEvidence, validate_runtime_feature_policy
 
 is_gpu = backend.startswith(("cuda:", "rocm:")) or backend in {"tp", "pp"}
 is_mtp = f" {extra_flags} ".find(" --mtp ") >= 0
@@ -2152,12 +1998,23 @@ expect_decode_replay = (
     or "require-decode-graph-replay" in suite_option_set
 )
 
-with open(path, "r", encoding="utf-8") as handle:
-    data = json.load(handle)
+try:
+    # Collection and validation share one owned document. Preserve the complete
+    # aggregate artifact without reparsing it or copying every rank's records.
+    data = collect_and_publish_ranked_perf_stats(Path(path))
+except (ValueError, OSError) as error:
+    print(f"FAIL: PerfStats rank collection failed: {error}")
+    sys.exit(0)
 
 records = data.get("records")
 if not isinstance(records, list):
     print("FAIL: missing records array")
+    sys.exit(0)
+
+try:
+    validate_memory_authority(data)
+except ValueError as error:
+    print(f"FAIL: {error}")
     sys.exit(0)
 
 if is_gpu:
@@ -2185,7 +2042,8 @@ if is_gpu:
         print(f"FAIL: {request_input_validation.error}")
         sys.exit(0)
 
-    host_transfer_validation = validate_gpu_host_transfer_policy(records)
+    host_transfer_validation = validate_gpu_host_transfer_policy(
+        records, device_kinds=graph_capture_validation.device_kinds)
     if host_transfer_validation.error:
         print(f"FAIL: {host_transfer_validation.error}")
         sys.exit(0)
@@ -2307,55 +2165,10 @@ expect_shared_moe_route_scratch = (
     == "tiered-overlay"
 )
 if expect_shared_moe_route_scratch:
-    allocation_records = [
-        record
-        for record in records
-        if record.get("domain") == "memory"
-        and record.get("name")
-        == "moe_serial_route_scratch_arena_allocations"
-    ]
-    binding_records = [
-        record
-        for record in records
-        if record.get("domain") == "memory"
-        and record.get("name")
-        == "moe_serial_route_scratch_runtime_table_bindings"
-    ]
-    if not allocation_records:
-        print(
-            "FAIL: GPU MoE+MTP cell emitted no immutable shared route-scratch "
-            "arena allocation evidence"
-        )
+    route_scratch_error = validate_moe_route_scratch_policy(records)
+    if route_scratch_error:
+        print(f"FAIL: {route_scratch_error}")
         sys.exit(0)
-    for allocation in allocation_records:
-        device = str(allocation.get("device", ""))
-        tags = allocation.get("tags") or {}
-        if (
-            tags.get("ownership") != "per_device_serial_graph_domain"
-            or tags.get("immutable") != "true"
-            or tags.get("largest_participant") != "true"
-            or numeric(tags.get("bytes")) <= 0.0
-            or numeric(
-                allocation.get("value", allocation.get("count", 0.0))
-            )
-            != 1.0
-        ):
-            print(
-                "FAIL: GPU MoE route scratch is not exactly one immutable "
-                f"largest-participant arena for {device}: {allocation}"
-            )
-            sys.exit(0)
-        device_bindings = sum(
-            numeric(record.get("value", record.get("count", 0.0)))
-            for record in binding_records
-            if record.get("device") == device
-        )
-        if device_bindings <= 1.0:
-            print(
-                "FAIL: GPU MoE+MTP did not bind multiple graph-role runtime "
-                f"tables to the shared route arena for {device}"
-            )
-            sys.exit(0)
 
 decode_graph_captured = (
     has_record("decode_graph_phase", "forward_graph", {"phase": "capture"})
@@ -2367,6 +2180,18 @@ decode_graph_replayed = (
 if is_mtp and not has_record(domain="mtp"):
     print("FAIL: MTP case emitted no mtp-domain counters")
     sys.exit(0)
+
+if "e2e-certification" in suite_option_set:
+    import os
+    try:
+        required_movement = MovementEvidence(os.environ["LLAMINAR_E2E_MOVEMENT_EVIDENCE"])
+    except (KeyError, ValueError):
+        print("FAIL: E2E certification requires canonical typed movement evidence")
+        sys.exit(0)
+    runtime_feature_error = validate_runtime_feature_policy(records, extra_flags, required_movement)
+    if runtime_feature_error:
+        print(f"FAIL: {runtime_feature_error}")
+        sys.exit(0)
 
 if is_gpu:
     if not decode_graph_captured:
@@ -2898,6 +2723,19 @@ LOG_DIR="$(readlink -f "$LOG_DIR" 2>/dev/null || echo "$LOG_DIR")"
 
 LAST_RESPONSE=""
 
+# Retain exact black-box request/response bytes, including finish reason and
+# reasoning fields. Monotonic, harness-owned identities prevent repeated probes
+# from overwriting the evidence needed to distinguish truncation from drift.
+HTTP_CASE_SEQUENCE=0
+record_http_exchange() {
+    local payload="$1" response="$2" stem
+    HTTP_CASE_SEQUENCE=$((HTTP_CASE_SEQUENCE + 1))
+    printf -v stem '%s/http_%06d' "$LOG_DIR" "$HTTP_CASE_SEQUENCE"
+    printf '%s\n' "$payload" > "${stem}.request.json"
+    printf '%s\n' "$response" > "${stem}.response.json"
+    LAST_HTTP_RESPONSE_ARTIFACT="${stem}.response.json"
+}
+
 run_chat_answer_check() {
     local tag="$1"
     local port="$2"
@@ -2922,6 +2760,7 @@ run_chat_answer_check() {
             -d "$payload" \
             "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
         LAST_RESPONSE="$response"
+        record_http_exchange "$payload" "$response"
 
         content=$(printf '%s' "$response" | extract_content 2>/dev/null || echo "PARSE_ERROR")
         content_preview=$(printf '%s' "$content" | preview_text)
@@ -2930,7 +2769,7 @@ run_chat_answer_check() {
         if [ "$answer" = "$expected_answer" ]; then
             pass "[${tag}] ${test_name} (${mode}): got '${content_preview}' (answer ${expected_answer})"
         else
-            fail "[${tag}] ${test_name} (${mode}): expected answer ${expected_answer}, got '${content_preview}'"
+            fail "[${tag}] ${test_name} (${mode}): expected answer ${expected_answer}, got '${content_preview}' (response: ${LAST_HTTP_RESPONSE_ARTIFACT})"
         fi
 
         if [ "$thinking_model" = "true" ] && [ "$enable_thinking" = "true" ]; then
@@ -2951,6 +2790,19 @@ run_chat_answer_check() {
             fi
         fi
     done
+}
+
+# Prove restore with an exact prior prompt as well as distinct answers after a
+# shared textual prefix. Short shared prefixes need not reach a stored hybrid
+# state boundary, so the A/B pair alone is not a positive restore witness.
+run_prefix_cache_checks() {
+    local tag="$1" port="$2" max_tokens="$3" thinking_model="$4"
+    local prefix_a_messages prefix_b_messages
+    prefix_a_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 6+7?"}]'
+    prefix_b_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 9+5?"}]'
+    run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix A" "13" "$prefix_a_messages"
+    run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix B" "14" "$prefix_b_messages"
+    run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache exact-repeat A" "13" "$prefix_a_messages"
 }
 
 run_streaming_checks() {
@@ -3447,7 +3299,12 @@ run_backend_tests() {
     local suite_options="${7:-}"
     local tag="${label}/${backend}"
     local thinking_model="false"
-    if is_thinking_model "$label" && ! suite_runs_non_thinking_only "$suite_options"; then
+    if [[ ",${suite_options}," == *,e2e-certification,* ]] &&
+       [ "$THINKING_MODES" = "both" ] && suite_runs_non_thinking_only "$suite_options"; then
+        echo "Canonical thinking coverage conflicts with non-thinking-only diagnostic option" >&2
+        return 2
+    fi
+    if [ "$THINKING_MODES" = "both" ] && ! suite_runs_non_thinking_only "$suite_options"; then
         thinking_model="true"
     fi
 
@@ -3459,7 +3316,7 @@ run_backend_tests() {
         model_size_b=$(parse_model_size_b "$model" "$label")
         if suite_disables_long_context "$suite_options"; then
             echo -e "  ${YELLOW}SKIP${NC} [${tag}] Long-context: suite option no-long-context"
-        elif model_size_meets_threshold "$model_size_b" "$LONG_MIN_MODEL_SIZE_B"; then
+        elif [[ ",$suite_options," == *,e2e-certification,* ]] || model_size_meets_threshold "$model_size_b" "$LONG_MIN_MODEL_SIZE_B"; then
             long_context_run="true"
             echo -e "  ${BLUE}INFO${NC} [${tag}] Long-context enabled: size ${model_size_b}B, tier ${LONG_CONTEXT_TIER}, context ${CONTEXT_LENGTH}"
         else
@@ -3569,14 +3426,15 @@ run_backend_tests() {
         )
     fi
     if [ "$PERF_STATS_ENABLED" = "1" ]; then
-        server_env+=("LLAMINAR_PERF_STATS_JSON=$perf_path")
+        server_env+=("LLAMINAR_PERF_STATS_JSON=${perf_path%.json}.rank-{rank}.json")
         if [ "$PERF_STATS_GPU_STAGE_TIMING" = "1" ]; then
             server_env+=("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1")
         fi
     fi
 
-    # Build server args — always pass the device explicitly unless this suite's
-    # extra_flags describe a TP/PP topology.
+    # Canonical argv owns all placement. The legacy backend label only selects
+    # diagnostic assertions, including CPU NodeTP's CPU-only evidence lane.
+    # Manual suites still obtain their single-device placement from the label.
     local server_model_path="$model"
     if is_docker_mode; then
         server_model_path="$(container_model_path "$model")"
@@ -3587,11 +3445,13 @@ run_backend_tests() {
         # so a loopback-only server inside the container is not reachable.
         server_args+=(--host 0.0.0.0)
     fi
-    if [[ "$backend" != "tp" && "$backend" != "pp" ]]; then
+    if [[ -z "$SERVER_ARGS_FILE" && "$backend" != "tp" && "$backend" != "pp" ]]; then
         server_args+=(-d "$backend")
     fi
     local -a extra_arg_list=()
-    if [[ -n "$extra_flags" ]]; then
+    if [[ -n "$SERVER_ARGS_FILE" ]]; then
+        server_args+=("${CANONICAL_SERVER_ARGS[@]}")
+    elif [[ -n "$extra_flags" ]]; then
         read -r -a extra_arg_list <<< "$extra_flags"
         server_args+=("${extra_arg_list[@]}")
     fi
@@ -3607,7 +3467,11 @@ run_backend_tests() {
 
     # Wait for health (pass PID so we detect early exit / OOM)
     if ! wait_for_health "$port" "$server_handle"; then
-        fail "[${tag}] Server failed to start within ${STARTUP_TIMEOUT}s"
+        if server_is_alive "$server_handle"; then
+            fail "[${tag}] Server failed to start within ${STARTUP_TIMEOUT}s"
+        else
+            fail "[${tag}] Server exited before readiness (see initialization error below)"
+        fi
         echo "    ── Last 80 lines of server log (${log_path}) ──"
         tail -n 80 "$log_path" 2>/dev/null | sed 's/^/    /' || echo "    (server log not available)"
         echo "    ────────────────────────────────────────────────────────────"
@@ -3652,16 +3516,10 @@ run_backend_tests() {
     local response_format_sample="$LAST_RESPONSE"
 
     # ─── Prefix Cache Probe ───────────────────────────────────────────
-    # Feature suites that start the server with --prefix-cache get a pair of
-    # same-prefix requests. This keeps the check black-box and representative of
-    # served inference while still exercising lookup, restore/bypass, harvest,
-    # and ordinary response formatting through the HTTP path.
+    # Keep seed, different-answer and exact-repeat requests on the same public
+    # HTTP surface. Certification additionally requires actual restore counters.
     if is_prefix_cache_case "$extra_flags"; then
-        local prefix_a_messages prefix_b_messages
-        prefix_a_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 6+7?"}]'
-        prefix_b_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 9+5?"}]'
-        run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix A" "13" "$prefix_a_messages"
-        run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix B" "14" "$prefix_b_messages"
+        run_prefix_cache_checks "$tag" "$port" "$max_tokens" "$thinking_model"
     fi
 
     if suite_runs_prefix_cache_rebalance_clear_probe "$suite_options"; then
@@ -3746,12 +3604,13 @@ print(d.get('error', {}).get('type', ''))
 
     # ─── Test 11: Graceful shutdown validation ────────────────────────
     shutdown_and_validate "$tag" "$server_handle" "$port" "$gpu_before_mb" "$backend" "$extra_flags"
-    copy_container_artifact "$server_handle" "$perf_path" "$perf_path"
-
     # ─── Test 12: Server log hygiene (after shutdown) ─────────────────
     # Scan AFTER shutdown so we catch errors during teardown too.
     # This covers exit code 1 from mpirun — if the child actually crashed
     # or errored, the log will have [ERROR]/[FATAL] entries.
+    # The validator also collects rank files in this same process. LOG_DIR is
+    # bound identically in container mode; membership, not rank zero, selects
+    # the request authority. No merged JSON needs to be parsed a second time.
     validate_perf_stats "$tag" "$backend" "$extra_flags" "$perf_path" "$long_context_run" "$suite_options"
     scan_server_log "$tag" "$log_path"
     echo ""
@@ -3824,6 +3683,11 @@ for suite in "${SUITES[@]}"; do
     SUITE_EXTRA_FLAGS="${SUITE_EXTRA_FLAGS:-}"   # Default: no extra flags
     SUITE_LABEL_SUFFIX="${SUITE_LABEL_SUFFIX:-}" # Default: derive from flags or model basename
     SUITE_OPTIONS="${SUITE_OPTIONS:-}"           # Default: no harness-only suite options
+    if [[ -n "$SERVER_ARGS_FILE" ]]; then
+        # A diagnostic string is only for existing feature detectors. Launch
+        # uses CANONICAL_SERVER_ARGS above and never reparses this rendering.
+        SUITE_EXTRA_FLAGS="${CANONICAL_SERVER_ARGS[*]}"
+    fi
     SUITE_LABEL="$(basename "$SUITE_MODEL" .gguf)"
     if [ -n "$SUITE_LABEL_SUFFIX" ]; then
         SUITE_LABEL="${SUITE_LABEL} [${SUITE_LABEL_SUFFIX}]"
@@ -3833,8 +3697,8 @@ for suite in "${SUITES[@]}"; do
 
     # Validate model exists
     if [ ! -f "$SUITE_MODEL" ]; then
-        echo -e "${RED}Warning: Model not found: ${SUITE_MODEL} — skipping suite${NC}"
-        continue
+        echo -e "${RED}Model not found: ${SUITE_MODEL}${NC}" >&2
+        exit 1
     fi
 
     echo -e "${BLUE}══ Model: ${SUITE_LABEL} ══${NC}"

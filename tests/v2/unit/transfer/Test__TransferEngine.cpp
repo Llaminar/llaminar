@@ -204,17 +204,19 @@ namespace
             MockBackend::free(ptr, device_id);
         }
 
-        /** @brief Model one backend-pinned host slab with ordinary test RAM. */
-        void *allocatePinned(size_t bytes, int device_id) override
+        /** @brief Model one mapped pinned slab with an explicit device alias. */
+        void *allocateMapped(size_t bytes, int device_id, void **device_alias) override
         {
             ++pinned_allocations;
             last_pinned_bytes = bytes;
             last_pinned_ordinal = device_id;
-            return std::malloc(bytes);
+            void *allocation = std::malloc(bytes);
+            *device_alias = allocation;
+            return allocation;
         }
 
         /** @brief Observe the final shared-owner pinned release. */
-        void freePinned(void *ptr, int) override
+        void freeMapped(void *ptr, int) override
         {
             if (ptr)
             {
@@ -475,6 +477,22 @@ TEST(Test__TransferEngine_StagingSlab, RejectsInvalidOrOverflowingGeometry)
     transfer_staging_backend_spy = nullptr;
 }
 
+/** @brief An unprepared CPU-edge request cannot enter a backend or lose its diagnostic. */
+TEST(Test__TransferEngine_StagingSlab, UnpreparedCopyFailsWithoutThrowingOrGPUWork)
+{
+    TransferEngine engine;
+    std::uint8_t device_sentinel = 0u;
+    for (const auto direction : {MappedTransferDirection::DeviceToHost,
+                                 MappedTransferDirection::HostToDevice})
+    {
+        std::string error;
+        EXPECT_FALSE(engine.enqueueBackgroundStagingCopy({}, direction,
+            &device_sentinel, 1u, 0u, {}, 0u, 1u, &error));
+        EXPECT_FALSE(error.empty());
+        EXPECT_EQ(device_sentinel, 0u);
+    }
+}
+
 TEST(Test__TransferEngine_ExecutionStreamPool,
      InvalidGeometryFailsBeforeAnyDeviceContextIsRequired)
 {
@@ -502,6 +520,11 @@ TEST(Test__TransferEngine_ExecutionStreamPool,
             DeviceId::cuda(0),
             ""),
         std::invalid_argument);
+    // Function preparation can synchronize a native module loader, so reject
+    // even valid pool geometry before attempting a context lookup in capture.
+    GraphCaptureGuard capture_guard;
+    EXPECT_THROW((void)engine.allocatePersistentTransferExecutionLanes(
+        1u, DeviceId::cuda(0), "unit_forbidden_capture_preparation"), std::logic_error);
 }
 
 TEST(Test__TransferEngine_Reclamation, RequestFactoriesRejectInvalidOwnership)

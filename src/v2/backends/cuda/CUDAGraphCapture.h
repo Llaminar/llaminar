@@ -29,9 +29,11 @@ namespace llaminar2
      *
      * CUDA conditional nodes must remain children of the top-level captured
      * graph, so a complete ExpertOverlay transaction cannot be assembled later
-     * from child graphs. This helper inserts the native batch-memory wait at
+     * from child graphs. This helper inserts a system-acquire wait kernel at
      * the stream's exact current dependency frontier and makes it the frontier
      * for subsequently captured work.
+     * The sleeping single-warp wait leaves native scheduling channels available
+     * to independent controller and transfer producers while a peer is pending.
      *
      * @param stream Exact non-default stream currently being captured.
      * @param signal Aligned CUDA-visible mapping of the node-local signal word.
@@ -339,12 +341,17 @@ namespace llaminar2
         }
         bool buildDeviceControlledTransaction(
             std::span<const DeviceControlledLoopFragment> ordered_fragments) override;
+        /** @copydoc IGPUGraphCapture::createOrderedTimelineFragment */
+        std::unique_ptr<IGPUGraphCapture> createOrderedTimelineFragment() override;
         bool buildOrderedTimelineTransaction(
             std::span<const GPUOrderedTimelineStep> ordered_steps,
             GPUOrderedTimelineInstrumentation instrumentation =
                 GPUOrderedTimelineInstrumentation::Disabled) override;
         [[nodiscard]] GPUOrderedTimelineTimingSnapshot
         consumeOrderedTimelineTiming() override;
+        /** @copydoc IGPUGraphCapture::appendParallelBranch */
+        [[nodiscard]] bool appendParallelBranch(
+            const GPUCapturedParallelBranch &branch) override;
         using IGPUGraphCapture::buildDeviceControlledWhileLoop;
         bool buildDeviceControlledWhileLoop(
             std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
@@ -358,7 +365,10 @@ namespace llaminar2
             return static_cast<void *>(stream_);
         }
         GraphUpdateResult tryUpdate() override;
-        [[nodiscard]] bool supportsExecutableUpdate() const noexcept override { return true; }
+        [[nodiscard]] bool supportsExecutableUpdate() const noexcept override
+        {
+            return recording_role_ == RecordingRole::Owner && !timeline_recording_;
+        }
         bool hasExecutable() const override;
         [[nodiscard]] std::size_t residentMemoryBytes() const noexcept override
         {
@@ -368,6 +378,8 @@ namespace llaminar2
         bool inspectKernelNodes(
             std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
             std::string *error = nullptr) const override;
+        /** @copydoc IGPUGraphCapture::validateFlatHelperNodeKinds */
+        bool validateFlatHelperNodeKinds(std::string *error) const override;
         void reset() override;
         const char *backendName() const override { return "CUDA"; }
 
@@ -379,6 +391,19 @@ namespace llaminar2
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
     private:
+        /** @brief Shared native definition; fragments cannot outlive its storage. */
+        struct OrderedTimelineRecording;
+        /** @brief Distinguish executable owners from non-executable recording views. */
+        enum class RecordingRole { Owner, Fragment };
+        /** @brief A fragment is recorded exactly once, never recaptured or launched. */
+        enum class FragmentState { Unrecorded, Recording, Recorded };
+        std::shared_ptr<OrderedTimelineRecording> timeline_recording_;
+        RecordingRole recording_role_ = RecordingRole::Owner;
+        FragmentState fragment_state_ = FragmentState::Unrecorded;
+        cudaGraphNode_t fragment_entry_ = nullptr; ///< Explicit incoming DAG frontier.
+        cudaGraphNode_t fragment_exit_ = nullptr; ///< Join of all recorded outgoing work.
+        std::vector<cudaGraphNode_t> fragment_nodes_; ///< This view's diagnostic inventory only.
+
         /**
          * @brief Select the immutable owner before using a CUDA graph resource.
          *
@@ -405,7 +430,7 @@ namespace llaminar2
 
         cudaStream_t stream_ = nullptr;       ///< Non-owned stream
         int device_ordinal_ = -1;             ///< Immutable owner of stream/graph
-        cudaGraph_t graph_ = nullptr;         ///< Captured graph (owned)
+        cudaGraph_t graph_ = nullptr;         ///< Owned directly or by timeline_recording_.
         cudaGraphExec_t exec_ = nullptr;      ///< Instantiated executable (owned)
         size_t node_count_ = 0;               ///< Cached node count from last capture
         std::size_t resident_memory_bytes_ = 0u; ///< Setup-observed opaque driver VRAM.

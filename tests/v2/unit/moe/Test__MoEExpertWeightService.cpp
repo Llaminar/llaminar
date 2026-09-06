@@ -5,9 +5,11 @@
  *
  * Tests: extractExpertViews, prepareGemmEngines, releaseRawWeights,
  *        releaseDepartedExperts, registerAndPrepareNewExperts.
+ * A failed parallel preparation must publish no borrowed engine pointers.
  */
 
 #include <gtest/gtest.h>
+#include <omp.h>
 
 #include "execution/moe/MoEExpertWeightService.h"
 #include "execution/moe/GpuExpertSlotPool.h"
@@ -534,6 +536,32 @@ TEST(Test__MoEExpertWeightService, PrepareGemmEngines_CPU_AllExperts)
         EXPECT_NE(owner.prepared_gate_gemm[e], nullptr) << "gate engine null at expert " << e;
         EXPECT_NE(owner.prepared_up_gemm[e], nullptr) << "up engine null at expert " << e;
         EXPECT_NE(owner.prepared_down_gemm[e], nullptr) << "down engine null at expert " << e;
+    }
+}
+
+TEST(Test__MoEExpertWeightService, FailedPreparationPublishesNoBorrowedPointers)
+{
+    for (int threads : {1, 2, 4})
+    {
+        SCOPED_TRACE(threads);
+        TestWeightContextOwner owner;
+        auto ctx = owner.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+        // With one worker, earlier experts finish before the final view fails.
+        // Multi-worker variants also cover outstanding successful preparations.
+        owner.expert_down_views.back().reset();
+        const int previous_threads = omp_get_max_threads();
+        omp_set_num_threads(threads);
+        const bool prepared = MoEExpertWeightService::prepareGemmEngines(ctx);
+        omp_set_num_threads(previous_threads);
+        EXPECT_FALSE(prepared);
+        EXPECT_TRUE(owner.moe_owned_kernels.empty());
+        for (int e = 0; e < kNumExperts; ++e)
+        {
+            EXPECT_EQ(owner.prepared_gate_gemm[e], nullptr);
+            EXPECT_EQ(owner.prepared_up_gemm[e], nullptr);
+            EXPECT_EQ(owner.prepared_down_gemm[e], nullptr);
+        }
     }
 }
 

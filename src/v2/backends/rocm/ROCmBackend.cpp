@@ -52,7 +52,10 @@ namespace llaminar2
     {
         constexpr std::uintptr_t kDeviceAllocationAlignment = 256;
         constexpr unsigned int kMappedHostCopyThreads = 256u;
-        constexpr unsigned int kMappedHostCopyMaximumBlocks = 4096u;
+        // Small link-saturating grid: excess blocks consume inference resources
+        // without increasing PCIe throughput. Both backend economy sweeps cover
+        // 192 KiB through 4 MiB plus odd tails and both transfer directions.
+        constexpr unsigned int kMappedHostCopyMaximumBlocks = 32u;
 
         /**
          * @return Mutex serializing HIP resource mutation against runtime reset.
@@ -87,41 +90,7 @@ namespace llaminar2
                 __HIP_MEMORY_SCOPE_SYSTEM);
         }
 
-        /** @brief Vectorized VRAM-to-mapped-host progress copy. */
-        __global__ void mappedHostCopyVectorKernel(
-            uint4 *__restrict__ destination,
-            const uint4 *__restrict__ source,
-            std::size_t vector_count)
-        {
-            const std::size_t stride =
-                static_cast<std::size_t>(gridDim.x) * blockDim.x;
-            for (std::size_t index =
-                     static_cast<std::size_t>(blockIdx.x) * blockDim.x +
-                     threadIdx.x;
-                 index < vector_count;
-                 index += stride)
-            {
-                destination[index] = source[index];
-            }
-        }
-
-        /** @brief Byte-total tail path for an arbitrarily aligned region. */
-        __global__ void mappedHostCopyByteKernel(
-            std::uint8_t *__restrict__ destination,
-            const std::uint8_t *__restrict__ source,
-            std::size_t bytes)
-        {
-            const std::size_t stride =
-                static_cast<std::size_t>(gridDim.x) * blockDim.x;
-            for (std::size_t index =
-                     static_cast<std::size_t>(blockIdx.x) * blockDim.x +
-                     threadIdx.x;
-                 index < bytes;
-                 index += stride)
-            {
-                destination[index] = source[index];
-            }
-        }
+#include "../../kernels/common/MappedHostCopyDevice.inl"
 
         /** @brief Snapshot one mapped command per block into ordinary VRAM. */
         __global__ void mappedTransferProgressClaimKernel(
@@ -5790,7 +5759,75 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmBackend::deviceToMappedHostByKernelOnStream(
+    bool ROCmBackend::enqueueBackgroundMappedCopyOnStream(
+        void *device_region, void *mapped_host, void *mapped_alias,
+        size_t bytes, MappedTransferDirection direction,
+        int device_id, void *stream)
+    {
+        const hipStream_t hip_stream = requireExplicitStream(
+            stream, "ROCmBackend::enqueueBackgroundMappedCopyOnStream");
+        if (!mapped_host || !mapped_alias || !device_region || bytes == 0u)
+            return false;
+        if (device_id < 0 || device_id >= device_count_ || !setDevice(device_id))
+            return false;
+        // Both endpoints have registered device-visible identities. Explicit
+        // NoCU is required even for small copies: ordinary hipMemcpyAsync may
+        // choose a compute blit on a queue held by captured inference. The
+        // ticket consumer must also use a bounded acquisition node, rather than
+        // occupy a full payload grid while awaiting the CPU producer.
+        void *destination = nullptr;
+        const void *source = nullptr;
+        switch (direction)
+        {
+        case MappedTransferDirection::DeviceToHost:
+            destination = mapped_alias;
+            source = device_region;
+            break;
+        case MappedTransferDirection::HostToDevice:
+            destination = device_region;
+            source = mapped_alias;
+            break;
+        }
+        if (!destination || !source)
+            return false;
+        const hipError_t error = hipMemcpyAsync(
+            destination, source, bytes, hipMemcpyDeviceToDeviceNoCU, hip_stream);
+        const bool accepted = error == hipSuccess;
+        if (!accepted)
+            LOG_ERROR("[ROCmBackend::enqueueBackgroundMappedCopyOnStream] SDMA submission failed: "
+                      << hipGetErrorString(error));
+        if (accepted)
+            PerfStatsCollector::addCounter("moe_overlay_residency",
+                "background_mapped_copy_bytes", static_cast<double>(bytes),
+                "maintenance", "rocm:" + std::to_string(device_id),
+                {{"copy_mechanism", "async_dma"},
+                 {"direction", direction == MappedTransferDirection::DeviceToHost ? "d2h" : "h2d"}});
+        return accepted;
+    }
+
+    bool ROCmBackend::prepareMappedHostCopyKernels(int device_id)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !setDevice(device_id))
+            return false;
+        // Function resolution is a setup edge. It must not happen for the
+        // first time after inference has entered a peer-held native graph.
+        hipFuncAttributes attributes{};
+        const hipError_t vector_error = hipFuncGetAttributes(
+            &attributes, reinterpret_cast<const void *>(mappedHostCopyVectorKernel));
+        const hipError_t byte_error = hipFuncGetAttributes(
+            &attributes, reinterpret_cast<const void *>(mappedHostCopyByteKernel));
+        if (vector_error != hipSuccess || byte_error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend] mapped-copy preparation failed: "
+                      << hipGetErrorString(
+                             vector_error != hipSuccess ? vector_error : byte_error));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::copyDeviceVisibleRegionByKernelOnStream(
         void *dst,
         const void *src,
         size_t bytes,
@@ -5799,7 +5836,7 @@ namespace llaminar2
     {
         hipStream_t hip_stream = requireExplicitStream(
             stream,
-            "ROCmBackend::deviceToMappedHostByKernelOnStream");
+            "ROCmBackend::copyDeviceVisibleRegionByKernelOnStream");
         if (!dst || !src || bytes == 0u ||
             device_id < 0 || device_id >= device_count_ ||
             hipSetDevice(device_id) != hipSuccess)
@@ -5809,11 +5846,11 @@ namespace llaminar2
 
         const bool vector_aligned =
             reinterpret_cast<std::uintptr_t>(dst) % alignof(uint4) == 0u &&
-            reinterpret_cast<std::uintptr_t>(src) % alignof(uint4) == 0u &&
-            bytes % sizeof(uint4) == 0u;
+            reinterpret_cast<std::uintptr_t>(src) % alignof(uint4) == 0u;
         if (vector_aligned)
         {
-            const std::size_t vector_count = bytes / sizeof(uint4);
+            const std::size_t vector_count =
+                bytes / sizeof(uint4) + (bytes % sizeof(uint4) != 0u);
             hipLaunchKernelGGL(
                 mappedHostCopyVectorKernel,
                 dim3(mappedHostCopyBlocks(vector_count)),
@@ -5822,7 +5859,7 @@ namespace llaminar2
                 hip_stream,
                 static_cast<uint4 *>(dst),
                 static_cast<const uint4 *>(src),
-                vector_count);
+                bytes);
         }
         else
         {
@@ -5839,7 +5876,7 @@ namespace llaminar2
         const hipError_t error = hipGetLastError();
         if (error != hipSuccess)
         {
-            LOG_ERROR("[ROCmBackend::deviceToMappedHostByKernelOnStream] failed: "
+            LOG_ERROR("[ROCmBackend::copyDeviceVisibleRegionByKernelOnStream] failed: "
                       << hipGetErrorString(error));
             return false;
         }

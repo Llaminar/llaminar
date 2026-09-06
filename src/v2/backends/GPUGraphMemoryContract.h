@@ -19,6 +19,13 @@
 
 namespace llaminar2
 {
+    /** @brief Certified physical shape, independent of a graph's semantic role. */
+    enum class GPUGraphExecutableClass
+    {
+        General, ///< Complete forwards, nested parents, and unbounded auxiliaries.
+        BoundedFlatHelper, ///< At most 64 flat kernel/copy/memset nodes; no control or child nodes.
+    };
+
     /**
      * @brief Canonical opaque-driver pool contract for native graph families.
      *
@@ -26,8 +33,12 @@ namespace llaminar2
      * CUDA graph-pool growth has been observed in 2 MiB slabs. The canonical
      * 3,050-node production-checkpoint certificate consumes eleven slabs on a
      * cold CUDA process; HIP graphs from one through 3,050 nodes consume one
-     * two-MiB slab. @ref PhysicalMemoryAuthority reserves one unit for every
-     * retained executable slot before model placement. Runtime capture records
+     * two-MiB slab. A separate 128-owner/64-kernel flat-helper certificate fits
+     * two MiB per owner on both backends (including cold and warm lifetimes).
+     * The declaration must pass a native node-kind/count check before receiving
+     * this smaller class; sidecars and control graphs are not small by name.
+     * @ref PhysicalMemoryAuthority reserves the class-specific complete family
+     * before model placement. Runtime capture records
      * individual pool-growth deltas as evidence; a complete-family certificate
      * compares their aggregate with the family reservation. A future driver or
      * larger family must extend that certificate instead of drawing from model
@@ -36,6 +47,29 @@ namespace llaminar2
     class GPUGraphMemoryContract final
     {
     public:
+        /** Native-node ceiling certified by the complete small-helper family. */
+        static constexpr std::size_t kBoundedFlatHelperMaxNodes = 64u;
+        /** Both backends certify 128 retained 64-node helpers within this unit. */
+        static constexpr std::size_t kBoundedFlatHelperReservationBytes =
+            2ULL * 1024ULL * 1024ULL;
+
+        /**
+         * @brief Validate a typed class and return its bounded-shape obligation.
+         * @throws std::invalid_argument for an unknown enum value.
+         */
+        [[nodiscard]] static bool requiresBoundedFlatShape(
+            GPUGraphExecutableClass executable_class)
+        {
+            switch (executable_class)
+            {
+            case GPUGraphExecutableClass::General:
+                return false;
+            case GPUGraphExecutableClass::BoundedFlatHelper:
+                return true;
+            }
+            throw std::invalid_argument("Unknown GPU graph executable memory class");
+        }
+
         /** CUDA driver-pool reservation unit for one retained graph slot. */
         static constexpr std::size_t kCUDAExecutableReservationBytes =
             22ULL * 1024ULL * 1024ULL;
@@ -47,11 +81,21 @@ namespace llaminar2
         /**
          * @brief Return the reservation owned by one native executable.
          * @param device Exact GPU backend/device identity.
+         * @param executable_class Declared and capture-enforced physical shape.
          * @throws std::invalid_argument when @p device is not CUDA or ROCm.
          */
         [[nodiscard]] static std::size_t
-        reservationBytesPerExecutable(DeviceId device)
+        reservationBytesPerExecutable(
+            DeviceId device,
+            GPUGraphExecutableClass executable_class =
+                GPUGraphExecutableClass::General)
         {
+            const bool bounded = requiresBoundedFlatShape(executable_class);
+            if (!device.is_cuda() && !device.is_rocm())
+                throw std::invalid_argument(
+                    "Native graph memory contracts require a CUDA or ROCm device");
+            if (bounded)
+                return kBoundedFlatHelperReservationBytes;
             if (device.is_cuda())
                 return kCUDAExecutableReservationBytes;
             if (device.is_rocm())

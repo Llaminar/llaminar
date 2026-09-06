@@ -46,6 +46,10 @@ if [[ "${MODE}" == "full" ]]; then
         "libnccl2=*+cuda13.0" \
         "libnccl-dev=*+cuda13.0"
 
+    # The package supplies tooling; production loads the separately named,
+    # pinned source build that supports repeated capture into a native parent.
+    bash "$(dirname -- "${BASH_SOURCE[0]}")/install-nccl.sh"
+
     if [[ "${INSTALL_CUDA_PROFILERS}" == "1" ]]; then
         apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
             cuda-cupti-13-0 \
@@ -59,8 +63,7 @@ else
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         --allow-change-held-packages \
         cuda-cudart-13-0 \
-        libcublas-13-0 \
-        "libnccl2=*+cuda13.0"
+        libcublas-13-0
 fi
 
 rm -rf /var/lib/apt/lists/*

@@ -79,7 +79,8 @@ namespace llaminar2
      * @param model_graph_topology_variant_count Simultaneously retained
      *        snapshot/launch-topology variants.
      * @param auxiliary_executable_count Retained helper/controller executable
-     *        owners; semantic branch descriptors are excluded.
+     *        owners in the general class; semantic branch descriptors are excluded.
+     * @param bounded_helper_executable_count Separately certified flat helpers.
      * @return Valid plan whose resident view is consumed by memory admission.
      * @throws std::invalid_argument for unresolved authority or bad geometry.
      * @throws std::overflow_error when the segment count exceeds size_t.
@@ -96,7 +97,8 @@ namespace llaminar2
         MoEOverlayAuthorityExecutionKind authority_execution,
         std::size_t model_graph_identity_count,
         std::size_t model_graph_topology_variant_count,
-        std::size_t auxiliary_executable_count);
+        std::size_t auxiliary_executable_count,
+        std::size_t bounded_helper_executable_count = 0u);
 
     /** @brief Complete immutable input for one rank's zero-routed-expert BOM. */
     struct MoEOverlayLocalCapacityPlannerInput

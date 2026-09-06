@@ -172,11 +172,13 @@ extern "C" bool hipMoEOverlayConsumeCanonicalRouteTicket(
     {
         return false;
     }
-    const std::size_t capacity_elements =
-        launch->route_capacity * static_cast<std::size_t>(launch->d_model);
-    const unsigned int blocks = std::min(
-        kSparseRoutePayloadBlocks, blocksFor(capacity_elements));
+    // Route-row tiles amortize mapped metadata; the grid strides over rows.
+    const unsigned int blocks = static_cast<unsigned int>(std::min<std::size_t>(
+        kSparseRoutePayloadBlocks, launch->route_capacity));
     const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL(
+        llaminar2::moe_activation_packet_device::awaitCanonicalRouteTicketKernel,
+        dim3(1u), dim3(1u), 0u, hip_stream, *launch);
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::
             materializeCanonicalRouteTicketKernel,
@@ -323,10 +325,15 @@ extern "C" bool hipMoEOverlayActivationConsumeMultiRowReturnBatch(
         static_cast<std::size_t>(launch->physical_rows) *
         static_cast<std::size_t>(launch->top_k) *
         static_cast<std::size_t>(launch->d_model);
+    // Each lane copies its compact live entries with unique writers. Bound
+    // the grid independently of capacity so sparse lanes do not schedule
+    // thousands of idle workgroups; the shared loop covers every grid stride.
+    const unsigned int payload_blocks = std::min(
+        kSparseRoutePayloadBlocks, blocksFor(output_elements));
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::
             materializeMultiRowCanonicalReturnBatchKernel,
-        dim3(blocksFor(output_elements), launch->lane_count, 1u),
+        dim3(payload_blocks, launch->lane_count, 1u),
         dim3(kThreads), 0u, hip_stream,
         *launch);
     return launchAccepted();

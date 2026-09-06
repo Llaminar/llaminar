@@ -9,6 +9,7 @@
  * - Various sizes (square, tall-skinny, short-wide)
  * - Transpose variants (NN, NT, TN, TT)
  * - Edge cases (single row for decode, large prefill)
+ * - Expert-adapter retirement must not drain unrelated inference streams.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -18,6 +19,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
+#include <future>
 #include <stdexcept>
 #include <thread>
 
@@ -27,6 +30,7 @@
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
 #include "kernels/cuda/gemm/CuBLASGemmKernel.h"
+#include "kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -142,6 +146,11 @@ protected:
                 cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
                 cudaSuccess);
             kernel_->bindStream(ExplicitGPUStream{stream_});
+            const auto requirements = kernel_->getWorkspaceRequirements(1, 1, 1);
+            workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                DeviceId::cuda(0), requirements.total_bytes_with_alignment());
+            ASSERT_TRUE(workspace_->allocate(requirements));
+            kernel_->bindWorkspace(workspace_.get());
         }
     }
 
@@ -152,6 +161,7 @@ protected:
             (void)cudaStreamSynchronize(stream_);
         }
         kernel_.reset();
+        workspace_.reset();
         if (stream_)
         {
             (void)cudaStreamDestroy(stream_);
@@ -161,6 +171,7 @@ protected:
     }
 
     std::unique_ptr<cuda::CuBLASGemmKernel> kernel_;
+    std::unique_ptr<DeviceWorkspaceManager> workspace_;
     cudaStream_t stream_ = nullptr;
 #endif
 };
@@ -262,7 +273,114 @@ TEST_F(Test__CuBLASGemm, SmallMatrix_NT)
  * first projection must still complete on its own stream, and clearing its
  * binding must make the next launch fail instead of reusing stale library state.
  */
-TEST_F(Test__CuBLASGemm, IndependentHandlesKeepEachProjectionOnItsExactStream)
+/**
+ * @brief Retiring any floating expert must not destroy device-wide BLAS resources.
+ *
+ * The weight allocation outlives all adapters. Only projection-object lifetime
+ * ends inside the adversarial interval, matching a completed expert transfer
+ * releasing its old bank. A host gate represents unrelated unfinished inference;
+ * the test releases it before joining so the broken destructor fails boundedly.
+ */
+TEST_F(Test__CuBLASGemm, FloatingExpertRetirementDoesNotWaitForUnrelatedStream)
+{
+    using Adapter = cuda::CUDAFloatingPointGemmKernel;
+    void *weights = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&weights, 16 * 16 * sizeof(float)));
+    std::vector<std::unique_ptr<Adapter>> projections;
+    for (const auto precision : {Adapter::Precision::FP16,
+                                 Adapter::Precision::BF16,
+                                 Adapter::Precision::FP32})
+        projections.push_back(std::make_unique<Adapter>(
+            weights, 16, 16, 0, precision, std::shared_ptr<void>{}));
+
+    HostBlockedCudaStream blocked;
+    std::promise<void> retired;
+    auto completion = retired.get_future();
+    std::thread retirement([&]
+    {
+        (void)cudaSetDevice(0);
+        projections.clear();
+        retired.set_value();
+    });
+    const auto status = completion.wait_for(std::chrono::seconds(2));
+    blocked.release();
+    retirement.join();
+    EXPECT_EQ(status, std::future_status::ready)
+        << "Expert retirement waited for unrelated device work (private BLAS teardown)";
+    ASSERT_EQ(cudaSuccess, cudaFree(weights));
+}
+
+/** @brief A shared context handle captures independent stream/workspace pairs exactly. */
+TEST_F(Test__CuBLASGemm, ContextHandleCapturedConcurrentStreamsReplayExactly)
+{
+    constexpr int M = 8, N = 64, K = 128;
+    const auto a = generateRandomFP32(M * K, -0.2f, 0.2f, 0x5345);
+    const auto b = generateRandomFP32(N * K, -0.2f, 0.2f, 0x7210);
+    float *d_a = nullptr, *d_b = nullptr, *d_c0 = nullptr, *d_c1 = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_a, a.size() * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_b, b.size() * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_c0, M * N * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_c1, M * N * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(d_a, a.data(), a.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
+    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(d_b, b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice, stream_));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+    cudaStream_t side = nullptr;
+    cudaEvent_t fork = nullptr, join = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
+    ASSERT_EQ(cudaSuccess, cudaEventCreateWithFlags(&fork, cudaEventDisableTiming));
+    ASSERT_EQ(cudaSuccess, cudaEventCreateWithFlags(&join, cudaEventDisableTiming));
+    cuda::CuBLASGemmKernel secondary(0);
+    const auto requirements = secondary.getWorkspaceRequirements(M, N, K);
+    DeviceWorkspaceManager side_workspace(DeviceId::cuda(0), requirements.total_bytes_with_alignment());
+    ASSERT_TRUE(side_workspace.allocate(requirements));
+    secondary.bindWorkspace(&side_workspace);
+    secondary.bindStream(ExplicitGPUStream{side});
+
+    // Warm the identical library path once before recording. Save its exact
+    // result, then prove replay has not mixed either stream's mutable bindings.
+    ASSERT_TRUE(kernel_->execute(d_a, d_b, d_c0, M, N, K, false, false));
+    ASSERT_TRUE(secondary.execute(d_a, d_b, d_c1, M, N, K, false, false));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(side));
+    std::vector<float> expected(M * N), actual(M * N);
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(expected.data(), d_c0, expected.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+    ASSERT_EQ(cudaSuccess, cudaEventRecord(fork, stream_));
+    ASSERT_EQ(cudaSuccess, cudaStreamWaitEvent(side, fork, 0));
+    ASSERT_TRUE(kernel_->execute(d_a, d_b, d_c0, M, N, K, false, false));
+    ASSERT_TRUE(secondary.execute(d_a, d_b, d_c1, M, N, K, false, false));
+    ASSERT_EQ(cudaSuccess, cudaEventRecord(join, side));
+    ASSERT_EQ(cudaSuccess, cudaStreamWaitEvent(stream_, join, 0));
+    ASSERT_EQ(cudaSuccess, cudaStreamEndCapture(stream_, &graph));
+    ASSERT_EQ(cudaSuccess, cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        ASSERT_EQ(cudaSuccess, cudaMemsetAsync(d_c0, 0x7f, expected.size() * sizeof(float), stream_));
+        ASSERT_EQ(cudaSuccess, cudaMemsetAsync(d_c1, 0x7f, expected.size() * sizeof(float), stream_));
+        ASSERT_EQ(cudaSuccess, cudaGraphLaunch(executable, stream_));
+        ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+        for (auto *output : {d_c0, d_c1})
+        {
+            ASSERT_EQ(cudaSuccess, cudaMemcpy(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)))
+                << "replay=" << replay;
+        }
+    }
+    ASSERT_EQ(cudaSuccess, cudaGraphExecDestroy(executable));
+    ASSERT_EQ(cudaSuccess, cudaGraphDestroy(graph));
+    ASSERT_EQ(cudaSuccess, cudaEventDestroy(join));
+    ASSERT_EQ(cudaSuccess, cudaEventDestroy(fork));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(side));
+    ASSERT_EQ(cudaSuccess, cudaFree(d_c1));
+    ASSERT_EQ(cudaSuccess, cudaFree(d_c0));
+    ASSERT_EQ(cudaSuccess, cudaFree(d_b));
+    ASSERT_EQ(cudaSuccess, cudaFree(d_a));
+}
+
+TEST_F(Test__CuBLASGemm, ContextHandlesKeepEachProjectionOnItsExactStream)
 {
     constexpr int M = 8;
     constexpr int N = 64;
@@ -292,6 +410,7 @@ TEST_F(Test__CuBLASGemm, IndependentHandlesKeepEachProjectionOnItsExactStream)
     cuda::CuBLASGemmKernel projection_a(0);
     cuda::CuBLASGemmKernel projection_b(0);
     projection_a.bindStream(ExplicitGPUStream{stream_});
+    projection_a.bindWorkspace(workspace_.get());
 
     // Pay cuBLAS's one-time algorithm/module initialization before parking an
     // unrelated stream.  The adversarial interval below is intended to test

@@ -154,6 +154,28 @@ namespace llaminar2
     }
 
     /**
+     * @brief Select the row tile for a grouped kernel with no K-partial arena.
+     *
+     * Direct and wide public-M1 policies accumulate the complete reduction in
+     * registers and publish each verifier row directly.  Applying the KPAR
+     * scratch budget to those kernels is both conceptually wrong and expensive:
+     * a very wide LM head can be split into several launches even though it
+     * allocates no per-row partials.  Keep the ordinary row ceiling so launch
+     * geometry remains bounded, but otherwise let one launch cover the complete
+     * small-M verifier batch.
+     *
+     * @param m Runtime row count; every positive value is accepted.
+     * @return A positive row count no greater than @p m or the common tile
+     *         ceiling, or zero for invalid input.
+     */
+    inline constexpr int nativeVNNIScratchlessBatchInvariantTileRows(int m)
+    {
+        return m > 0
+                   ? std::min(m, kDefaultNativeVNNIBatchInvariantTileRows)
+                   : 0;
+    }
+
+    /**
      * @brief Plan persistent verifier scratch independently of prompt length.
      *
      * A prepared GEMM object is shared by prefill, serial decode, and grouped

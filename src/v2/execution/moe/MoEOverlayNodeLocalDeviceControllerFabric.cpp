@@ -397,7 +397,10 @@ namespace llaminar2
                         sizeof(MoEOverlayDeviceControllerTransportRecord) >
                     group.owned_page_end ||
                 group.collected_state_offset < group.owned_page_begin ||
-                group.collected_state_words == 0u ||
+                group.collected_state_words !=
+                    static_cast<std::uint64_t>(group.participant_count) *
+                        kMoEOverlayDeviceControllerDemandPhaseCount *
+                        header.num_layers * header.num_experts ||
                 group.collected_state_offset +
                         group.collected_state_words * sizeof(std::uint64_t) >
                     group.owned_page_end ||
@@ -723,9 +726,10 @@ namespace llaminar2
             const std::size_t state_words = checkedMultiply(
                 topology_group.participant_ids.size(),
                 checkedMultiply(
-                    num_layers,
-                    num_experts,
-                    "layer/expert state words"),
+                    kMoEOverlayDeviceControllerDemandPhaseCount,
+                    checkedMultiply(num_layers, num_experts,
+                                    "layer/expert state words"),
+                    "phase/layer/expert state words"),
                 "group member state words");
             group.collected_state_words = state_words;
             cursor = checkedAdd(
@@ -1768,8 +1772,9 @@ namespace llaminar2
         const std::size_t member_index = static_cast<std::size_t>(
             member - topology_group->participant_ids.begin());
         const std::size_t words_per_participant = checkedMultiply(
-            config_.num_layers,
-            config_.num_experts,
+            kMoEOverlayDeviceControllerDemandPhaseCount,
+            checkedMultiply(config_.num_layers, config_.num_experts,
+                            "participant layer/expert words"),
             "participant collected-state words");
 
         auto *const base = static_cast<std::byte *>(

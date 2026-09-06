@@ -511,6 +511,58 @@ namespace llaminar2::test::parity
             mtp_recursive_aggregate_cosine_threshold_overrides;
     };
 
+    /** HTTP reasoning coverage is declared, never inferred from a GGUF filename. */
+    enum class ModelParityE2EThinkingModes
+    {
+        NonThinkingOnly,
+        ThinkingAndNonThinking,
+    };
+
+    /** @return Stable harness spelling for one validated reasoning-coverage policy. */
+    inline const char *modelParityE2EThinkingModesName(ModelParityE2EThinkingModes modes)
+    {
+        switch (modes)
+        {
+        case ModelParityE2EThinkingModes::NonThinkingOnly: return "non-thinking";
+        case ModelParityE2EThinkingModes::ThinkingAndNonThinking: return "both";
+        }
+        throw std::invalid_argument("invalid E2E thinking coverage policy");
+    }
+
+    /** Full HTTP needle/long-context workload, independent of numerical prompt size. */
+    struct ModelParityE2EProfile
+    {
+        int context_length = 8192;
+        int minimum_prompt_tokens = 4096;
+        int generation_tokens = 2048;
+        int request_timeout_seconds = 600;
+        /** Startup readiness budget; independent of the request and exact-cell watchdogs. */
+        int readiness_timeout_seconds = 60;
+        /** Test both reasoning modes by default, including renamed fine-tunes. */
+        ModelParityE2EThinkingModes thinking_modes = ModelParityE2EThinkingModes::ThinkingAndNonThinking;
+        friend bool operator==(const ModelParityE2EProfile &,
+                               const ModelParityE2EProfile &) = default;
+    };
+
+    /**
+     * @brief Opt one existing configuration into full HTTP certification.
+     *
+     * The containing definition owns model and topology. All remaining axes
+     * are exact, typed matches: tags neither multiply nor prune parity cells.
+     * An absent owner/movement pair selects non-overlay cells only. Expansion
+     * rejects a tag that matches no cell or overlaps another tag.
+     */
+    struct ModelParityE2ESelection
+    {
+        ActivationPrecision activation = ActivationPrecision::FP32;
+        KVCachePrecision kv_cache = KVCachePrecision::FP16;
+        ModelParityMTP mtp = ModelParityMTP::Off;
+        std::optional<RoutedExpertOwnerOrder> owner_order;
+        std::optional<ModelParityExpertMovement> movement;
+        ModelParityPrefillGraphPolicy prefill_graph;
+        ModelParityE2EProfile profile;
+    };
+
     /**
      * @brief Complete suite-owned declaration for one model and one topology.
      *
@@ -531,6 +583,7 @@ namespace llaminar2::test::parity
         std::optional<ParityCollectiveEvidenceSource>
             collective_evidence_source;
         std::string tp_allreduce_precision_override;
+        std::vector<ModelParityE2ESelection> e2e_certifiable;
     };
 
     /** Placement and durable movement axes present only on ExpertOverlay. */
@@ -608,6 +661,9 @@ namespace llaminar2::test::parity
         std::optional<ParityCollectiveEvidenceSource>
             collective_evidence_source;
         std::string tp_allreduce_precision_override;
+
+        /** Eligibility is not a certificate: the HTTP runner must prove it. */
+        std::optional<ModelParityE2EProfile> e2e_certification;
 
         /** @return Whether this cell executes an MTP generation policy. */
         [[nodiscard]] constexpr bool mtpEnabled() const noexcept
@@ -1980,7 +2036,43 @@ namespace llaminar2::test::parity
                 }
             }
         }
+        for (const auto &selection : definition.e2e_certifiable)
+        {
+            const auto &profile = selection.profile;
+            (void)modelParityE2EThinkingModesName(profile.thinking_modes);
+            if (selection.owner_order.has_value() != selection.movement.has_value() ||
+                profile.context_length <= 0 || profile.minimum_prompt_tokens <= 0 ||
+                profile.generation_tokens <= 0 || profile.request_timeout_seconds <= 0 ||
+                profile.readiness_timeout_seconds <= 0 ||
+                static_cast<std::int64_t>(profile.minimum_prompt_tokens) + profile.generation_tokens >=
+                    profile.context_length)
+                throw std::invalid_argument("invalid E2E certification selection/profile");
+            std::size_t matched = 0;
+            for (auto &test_case : cases)
+            {
+                if (test_case.activation_precision != selection.activation ||
+                    test_case.kv_cache_precision != selection.kv_cache ||
+                    test_case.mtp != selection.mtp ||
+                    test_case.prefill_graph != selection.prefill_graph ||
+                    test_case.expert_overlay.has_value() != selection.owner_order.has_value())
+                    continue;
+                if (test_case.expert_overlay &&
+                    (test_case.expert_overlay->owner_order != *selection.owner_order ||
+                     test_case.expert_overlay->movement != *selection.movement))
+                    continue;
+                if (test_case.e2e_certification)
+                    throw std::invalid_argument("overlapping E2E certification selections");
+                test_case.e2e_certification = profile;
+                ++matched;
+            }
+            if (matched != 1)
+                throw std::invalid_argument("E2E certification selection must match exactly one parity cell");
+        }
         return cases;
     }
 
 } // namespace llaminar2::test::parity
+
+// Kept separate so the matrix definition and its HTTP transport projection
+// have independently reviewable ownership boundaries.
+#include "ModelParityE2EExport.h"

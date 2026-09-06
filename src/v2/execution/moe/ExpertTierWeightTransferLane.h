@@ -4,12 +4,14 @@
  *
  * Cross-tier movement must continue while inference executes against an older
  * immutable residency epoch. This class owns the staging resources for one GPU
- * endpoint and advances conversion plus DMA in bounded chunks on a named
+ * endpoint and advances conversion plus native background copies in bounded chunks on a named
  * auxiliary stream. The maintenance worker observes progress with event
  * queries; no inference stream ever waits for this lane.
  */
 
 #pragma once
+#include "transfer/BackgroundTransferProgressBinding.h"
+#include "transfer/MappedTransferProgressEpoch.h"
 
 #include "ExpertTierSourceReadiness.h"
 #include "ExpertTierTransferMeasurement.h"
@@ -33,7 +35,7 @@ namespace llaminar2
     enum class ExpertTierWeightTransferProgress
     {
         Idle,    ///< No transfer has been submitted on this lane.
-        Pending, ///< A conversion/DMA chunk or a later chunk remains outstanding.
+        Pending, ///< A conversion/copy chunk or a later chunk remains outstanding.
         Ready,   ///< Every destination byte is complete and safe to publish.
         Failed,  ///< Submission or event observation failed fatally.
     };
@@ -56,19 +58,21 @@ namespace llaminar2
     };
 
     /**
-     * @brief One pre-materialized conversion and DMA lane for a GPU endpoint.
+     * @brief One pre-materialized conversion and copy lane for a GPU endpoint.
      *
      * The lane supports both directions of a CPU edge:
      *
      * - GPU to CPU: the source GPU converts directly into final CPU-format
-     *   bytes in device staging storage, then DMA writes a pinned host chunk;
-     * - CPU to GPU: pinned CPU-format bytes DMA into device staging storage,
+     *   bytes in device staging storage, then a native copy writes a mapped host chunk;
+     * - CPU to GPU: pinned CPU-format bytes copy into device staging storage,
      *   then the destination GPU converts them into its inactive packed arrays.
      * - floating GPU/CPU edges: FP16, BF16, or FP32 bytes stream unchanged
      *   through the same pinned chunks and event-polled auxiliary stream.
      *
      * Only one transfer may occupy a lane at a time. A scheduler obtains true
      * parallelism by materializing several named lanes before inference starts.
+     * TransferEngine owns copy dispatch: CUDA uses bounded mapped-copy kernels;
+     * HIP uses native asynchronous DMA. Tensor formats do not choose transports.
      */
     class ExpertTierWeightTransferLane final
     {
@@ -81,6 +85,8 @@ namespace llaminar2
             PersistentTransferStagingSlice staging;
             /** Exact participant/cycle stream shared across compatible work. */
             PersistentTransferExecutionLane execution;
+            /** Explicit completion authority; no native retry after service failure. */
+            BackgroundTransferProgressBinding progress;
             std::string lane_name;
             std::string perf_device;
             /** Collect timing-event evidence for economy certification. */
@@ -213,7 +219,7 @@ namespace llaminar2
             return stats_;
         }
 
-        /** @brief Return the GPU endpoint that owns conversion and DMA. */
+        /** @brief Return the GPU endpoint that owns conversion and copies. */
         [[nodiscard]] DeviceId device() const noexcept { return config_.device; }
 
     private:
@@ -239,6 +245,19 @@ namespace llaminar2
 
         /** @brief Enqueue the next bounded chunk and its reusable ready event. */
         bool enqueueNextChunk(std::string *error) noexcept;
+
+        /**
+         * @brief Publish an FP16/BF16/FP32 byte chunk to the shared graph service.
+         * @param byte_offset First byte of the retained source/inactive destination.
+         * @param bytes Exact positive chunk size within the persistent slice.
+         * @param error Receives the precise publication failure.
+         * @return True only after acceptance; the GPU receipt still owns completion.
+         */
+        bool publishContiguousChunk(std::size_t byte_offset, std::size_t bytes,
+                                    std::string *error) noexcept;
+
+        /** @return Exact service command, or null for a native conversion/copy. */
+        [[nodiscard]] MappedTransferProgressSlot *serviceCommand() noexcept;
 
         /** @brief Dispatch the backend-specific GPU-to-CPU conversion kernel. */
         bool launchGpuToCpuChunk(
@@ -278,6 +297,9 @@ namespace llaminar2
         void *chunk_timing_stop_event_ = nullptr;
         std::uint8_t *device_chunk_ = nullptr;
         std::uint8_t *pinned_chunk_ = nullptr;
+        MappedTransferProgressSlot service_read_;
+        MappedTransferProgressSlot service_write_;
+        TransferProducerDependency source_dependency_ = TransferProducerDependency::published();
 
         Direction direction_ = Direction::None;
         ExpertTierWeightTransferProgress progress_ =

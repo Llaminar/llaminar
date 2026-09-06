@@ -20,6 +20,7 @@
 #pragma once
 
 #include "execution/config/RuntimeConfig.h"
+#include "backends/GPUGraphMemoryContract.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -51,6 +52,9 @@ namespace llaminar2
         static constexpr std::size_t kVerifierControlPolicyCount = 2u;
         /** Spec publication, generation parent, serial outcome, target distribution. */
         static constexpr std::size_t kControllerGraphSlots = 4u;
+        /** Four standalone preparation nodes/request plus two fixed nodes. */
+        static constexpr std::size_t kMaximumBoundedVerifierRequests =
+            (GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes - 2u) / 4u;
         /** One replaceable nonzero contiguous selector used by GPU catch-up. */
         static constexpr std::size_t
             kGenericTerminalHiddenGraphSlots = 1u;
@@ -250,6 +254,60 @@ namespace llaminar2
         [[nodiscard]] std::size_t controllerGraphSlots() const noexcept
         {
             return retains_graph_capacity_ ? kControllerGraphSlots : 0u;
+        }
+
+        /**
+         * @brief Declare the verifier-preparation shape before native capture.
+         * @param requests Logical requests represented by this cache slot.
+         * @return Certified helper class, or the general class for larger batches.
+         * @throws std::invalid_argument for a non-positive request count.
+         *
+         * Standalone preparation records at most three token operations and
+         * one KV checkpoint per request, plus geometry and base-count copies.
+         * Controlled preparation is smaller (one budget, two nodes/request).
+         * This bound is format-independent; native capture enforces the final
+         * shape as well, including nodes introduced by diagnostics.
+         */
+        [[nodiscard]] static GPUGraphExecutableClass
+        verifierPreparationExecutableClass(int requests)
+        {
+            if (requests <= 0)
+                throw std::invalid_argument("Verifier graph class requires positive requests");
+            return static_cast<std::size_t>(requests) <= kMaximumBoundedVerifierRequests
+                       ? GPUGraphExecutableClass::BoundedFlatHelper
+                       : GPUGraphExecutableClass::General;
+        }
+
+        /**
+         * @return Small native owners charged by the same contract as capture.
+         *
+         * Terminal selectors and individual draft publications stay bounded.
+         * Verifier directories are indexed by request count: only the prefix
+         * with a certified node bound receives the helper charge. Larger
+         * request counts remain full first-class graphs, not an alternate path.
+         */
+        [[nodiscard]] std::size_t boundedHelperExecutableSlotCount() const
+        {
+            if (!retains_graph_capacity_)
+                return 0u;
+            const auto requests = std::min(
+                static_cast<std::size_t>(request_capacity_), kMaximumBoundedVerifierRequests);
+            const auto verifier_slots = checkedSizeMultiply(
+                kVerifierControlPolicyCount,
+                checkedSizeMultiply(requests,
+                    static_cast<std::size_t>(verifier_rows_per_request_),
+                    "MTP bounded verifier geometries"),
+                "MTP bounded verifier slots");
+            return checkedSizeAdd(
+                checkedSizeAdd(terminal_hidden_graph_slots_,
+                    draft_publication_graph_slots_, "MTP bounded publication slots"),
+                verifier_slots, "MTP bounded helper slots");
+        }
+
+        /** @return General auxiliary owners, excluding every bounded helper. */
+        [[nodiscard]] std::size_t generalAuxiliaryExecutableSlotCount() const
+        {
+            return auxiliaryExecutableSlotCount() - boundedHelperExecutableSlotCount();
         }
 
         /**

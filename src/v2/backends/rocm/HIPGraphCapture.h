@@ -39,12 +39,22 @@ namespace llaminar2
         bool instantiate() override;
         bool launch() override;
         [[nodiscard]] bool launchOnStream(void *stream) const override;
+        /** @brief HIP has no conditional handles; its graph-only units are clonable. */
+        std::unique_ptr<IGPUGraphCapture> createOrderedTimelineFragment() override
+        {
+            if (graph_ || exec_)
+                return nullptr;
+            return std::make_unique<HIPGraphCapture>(stream_, device_ordinal_);
+        }
         bool buildOrderedTimelineTransaction(
             std::span<const GPUOrderedTimelineStep> ordered_steps,
             GPUOrderedTimelineInstrumentation instrumentation =
                 GPUOrderedTimelineInstrumentation::Disabled) override;
         [[nodiscard]] GPUOrderedTimelineTimingSnapshot
         consumeOrderedTimelineTiming() override;
+        /** @copydoc IGPUGraphCapture::appendParallelBranch */
+        [[nodiscard]] bool appendParallelBranch(
+            const GPUCapturedParallelBranch &branch) override;
         [[nodiscard]] void *executionStream() const noexcept override
         {
             return static_cast<void *>(stream_);
@@ -60,6 +70,8 @@ namespace llaminar2
         bool inspectKernelNodes(
             std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
             std::string *error = nullptr) const override;
+        /** @copydoc IGPUGraphCapture::validateFlatHelperNodeKinds */
+        bool validateFlatHelperNodeKinds(std::string *error) const override;
         void reset() override;
         const char *backendName() const override { return "HIP"; }
 

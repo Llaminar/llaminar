@@ -361,6 +361,7 @@ namespace
         int force_two_phase = 0;
         int exact_kb = 0;
         int grouped_rows = 0;
+        std::optional<CandidateFamily> serial_m1_family;
 
         [[nodiscard]] bool inheritsSerialM1() const
         {
@@ -370,6 +371,12 @@ namespace
         [[nodiscard]] bool usesTensorCoreMma16() const
         {
             return family == CandidateFamily::TensorCoreMma16;
+        }
+
+        /** Return whether this grouped diagnostic also forces its M1 schedule. */
+        [[nodiscard]] bool overridesSerialM1Schedule() const
+        {
+            return inheritsSerialM1() && serial_m1_family.has_value();
         }
 
         [[nodiscard]] std::string familyName() const
@@ -1006,6 +1013,49 @@ namespace
                 result.push_back(std::move(verifier));
             }
         }
+        if (!config.candidate_ids.empty())
+        {
+            /*
+             * Joint schedule/row candidates are diagnostic-only and can be
+             * requested by exact ID. Omitting them from an unfiltered sweep
+             * prevents multiplying the ordinary all-codebook corpus by every
+             * serial schedule, while still allowing a suspicious production
+             * cell to be trained as the complete MTP transaction it serves.
+             */
+            TrainerConfig base_config = config;
+            base_config.candidate_families.clear();
+            base_config.candidate_ids.clear();
+            const std::vector<Candidate> base_candidates =
+                fastM1Candidates(base_config, k_groups);
+            for (const int grouped_rows : {2, 4, 8, 16, 32, 64})
+            {
+                if (grouped_rows > maximum_useful_rows)
+                    continue;
+                for (const Candidate &base : base_candidates)
+                {
+                    Candidate joint = base;
+                    joint.family = CandidateFamily::InheritSerialM1;
+                    joint.serial_m1_family = base.family;
+                    joint.grouped_rows = grouped_rows;
+                    joint.id =
+                        "cuda.nvnni.decode.verifier.serial_m1." +
+                        base.familyName() +
+                        ".tn" + std::to_string(base.tile_n) +
+                        ".cpt" + std::to_string(base.cpt);
+                    if (base.family == CandidateFamily::KPar)
+                    {
+                        joint.id +=
+                            ".kb" + std::to_string(base.exact_kb);
+                    }
+                    joint.id += ".r" + std::to_string(grouped_rows);
+                    if (selected(config.candidate_families, joint.familyName()) &&
+                        selected(config.candidate_ids, joint.id))
+                    {
+                        result.push_back(std::move(joint));
+                    }
+                }
+            }
+        }
         Candidate tensor_core{
             "cuda.nvnni.decode.verifier.tensor_core_mma16",
             CandidateFamily::TensorCoreMma16};
@@ -1089,6 +1139,18 @@ namespace
             }
             else if (candidate.inheritsSerialM1())
             {
+                if (candidate.overridesSerialM1Schedule())
+                {
+                    cudaNativeVNNIGemvSweep_setConfig(
+                        static_cast<int>(*candidate.serial_m1_family),
+                        candidate.tile_n,
+                        candidate.cpt,
+                        candidate.target_waves,
+                        candidate.mkg,
+                        candidate.max_kb,
+                        candidate.exact_kb,
+                        candidate.force_two_phase);
+                }
                 cudaNativeVNNIGemvSweep_setGroupedRows(
                     candidate.grouped_rows);
             }

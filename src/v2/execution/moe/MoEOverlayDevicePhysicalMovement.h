@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace llaminar2
@@ -118,6 +119,19 @@ namespace llaminar2
         {
             return !migrations.empty();
         }
+
+        /**
+         * @brief Describe incomplete projections from existing physical receipts.
+         * @param ready One completion byte per migration's gate/up/down projection.
+         * @return Pointer-free transaction, geometry, and pending endpoint evidence.
+         * @throws std::invalid_argument if the receipt vector has a different shape.
+         *
+         * This fatal-diagnostic operation neither polls a device nor advances a
+         * transfer. Call it before abort mutates operation state; the physical
+         * follower remains the sole owner of the supplied readiness receipts.
+         */
+        [[nodiscard]] std::string describeProjectionReadiness(
+            std::span<const std::uint8_t> ready) const;
     };
 
     /**

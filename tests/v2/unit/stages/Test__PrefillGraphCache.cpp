@@ -933,6 +933,36 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketBelowFloor)
     EXPECT_EQ(reason, PrefillGraphRejectReason::PaddedBucketBelowMinimum);
 }
 
+TEST(Test__PrefillGraphCache, ServingRawPromptLadderPassesPreflightForEveryShortRequest)
+{
+    // The HTTP regression was 39 live rows scheduled into a 64-row bucket
+    // while preflight required 256. Exercise both GPU identities without
+    // initializing a device: this is a planner/preflight contract test.
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        for (const int capacity : {64, 128, 256, 512})
+        {
+            PrefillGraphConfig config;
+            config.minimum_padded_bucket_seq_len =
+                effectivePrefillGraphMinimumPaddedBucketSeqLen(256, capacity);
+            PrefillGraphCache cache(config);
+            const auto buckets = rawPrefillGraphBucketsForResidentCapacity(
+                {32, 64, 128, 256, 512}, capacity, 256);
+            for (int live_rows = 2; live_rows <= capacity; ++live_rows)
+            {
+                const auto selection = selectPrefillGraphBucket(live_rows, buckets);
+                auto key = makeGPUKey(selection.bucket_seq_len);
+                key.device_id = device;
+                const auto graph = buildCapturableGraph(device);
+                const auto reason = cache.preflight(graph, key, nullptr, false,
+                    false, live_rows, selection.bucket_seq_len);
+                EXPECT_NE(reason, PrefillGraphRejectReason::PaddedBucketBelowMinimum)
+                    << "live=" << live_rows << " capacity=" << capacity;
+            }
+        }
+    }
+}
+
 TEST(Test__PrefillGraphCache, Preflight_AllowsExactGraphBelowPaddedBucketFloor)
 {
     PrefillGraphConfig config;

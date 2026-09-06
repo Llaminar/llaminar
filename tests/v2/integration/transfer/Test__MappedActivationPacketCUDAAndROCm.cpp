@@ -10,6 +10,13 @@
  * compact return publication, and deterministic continuation accumulation.
  * The three stages reuse both alternating packet banks, and all work is
  * submitted before either terminal event is observed.
+ * CPU-return coverage likewise replays a retained consumer before publishing
+ * its payload and checks unrelated DMA and prepared maintenance-copy progress
+ * while that consumer waits, including model-sized prefill grids.
+ * Large odd-sized sparse packets additionally force multiple payload grid
+ * strides in both backend directions. Early replay also leaves the old admission and return timelines
+ * live while the new source graph is queued: both fused and forked paths must
+ * wait for the next generation, and explicit abort must drain that wait.
  */
 
 #include <gtest/gtest.h>
@@ -288,6 +295,15 @@ namespace
                 .model_layer_indices = std::vector<std::int32_t>(
                     kLayers.begin(), kLayers.end()),
             }},
+            // Use the admission planner's exact mapping rather than leaving
+            // the now-required physical layout absent in this fixture.
+            .activation_layout = planMoEOverlayNodeLocalActivationLayout({
+                .participant_count = 1u,
+                .max_rows_per_participant = static_cast<std::size_t>(Rows),
+                .max_entries_per_participant = entries,
+                .d_model = kDModel,
+                .activation_graph_family_count = 1u,
+            }),
             .local_lanes = {{
                 .participant_id = kTargetParticipant,
                 .device = local_device,
@@ -1676,6 +1692,36 @@ namespace
             return true;
         }
 
+        /**
+         * @brief Abort an unpublished successor and prove its graph drains.
+         * @return Success only after both the terminal event and semantic abort.
+         *
+         * This publishes the same mapped abort sentinels as failure cleanup;
+         * it never manufactures a new admission to release a stuck waiter.
+         */
+        bool abortQueuedSourceAndValidate()
+        {
+            if (!source_queued_ahead_)
+                return false;
+            publishAbort();
+            if (!awaitEvent(source_backend_, source_terminal_,
+                            std::chrono::seconds(2)))
+            {
+                error_ = "aborted epoch admission did not drain its retained graph";
+                return false;
+            }
+            const auto &control = source_transport_->activationEpochControl(
+                kTargetParticipant, 0u);
+            if (control.continuation_status.typedState() !=
+                MoEOverlayActivationEndpointState::Aborted)
+            {
+                error_ = "aborted epoch admission did not publish terminal failure";
+                return false;
+            }
+            source_queued_ahead_ = false;
+            return true;
+        }
+
         /** @brief Observe terminal events, then copy diagnostic outputs once. */
         bool awaitAndValidate()
         {
@@ -2736,10 +2782,14 @@ namespace
         }
     }
 
-    /** @brief Prove an ahead continuation cannot consume a prior lease's `1`. */
+    /**
+     * @brief Prove early replay cannot consume a prior lease's admission/return.
+     * @tparam Rows One-row fused decode or multi-row forked dispatch geometry.
+     */
+    template <std::int32_t Rows = 1>
     void runStaleAdmissionABAProof(DeviceId source, DeviceId target)
     {
-        PacketRoundTrip<1> transaction(source, target);
+        PacketRoundTrip<Rows> transaction(source, target);
         ASSERT_TRUE(transaction.initialize()) << transaction.error();
         ASSERT_TRUE(transaction.submit(/*generation=*/1u))
             << transaction.error();
@@ -2751,6 +2801,17 @@ namespace
             << transaction.error();
         ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
         ASSERT_TRUE(transaction.retire()) << transaction.error();
+    }
+
+    /** @brief Terminal abort releases a forked admission without another request. */
+    void runAdmissionAbortProof(DeviceId source, DeviceId target)
+    {
+        PacketRoundTrip<4> transaction(source, target);
+        ASSERT_TRUE(transaction.initialize()) << transaction.error();
+        ASSERT_TRUE(transaction.submit(1u)) << transaction.error();
+        ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
+        ASSERT_TRUE(transaction.queueSourceBeforePriorRetirement()) << transaction.error();
+        ASSERT_TRUE(transaction.abortQueuedSourceAndValidate()) << transaction.error();
     }
 
     /**
@@ -2846,6 +2907,125 @@ namespace
     };
 
     /**
+     * @brief Own disjoint maintenance copies that must progress behind a ticket.
+     *
+     * Streams and kernel preparation belong to setup, before graph launch. Each
+     * stream writes its own destination and publishes its own terminal event;
+     * observing one stream cannot accidentally certify the other queues. The
+     * caller must release the held inference graph before destroying this scope.
+     */
+    class CanonicalTicketMaintenanceProof final
+    {
+    public:
+        /** @brief Prepare thirty-two independent exact-stream copy witnesses. */
+        explicit CanonicalTicketMaintenanceProof(DeviceId device)
+            : device_(device), backend_(backendFor(device)),
+              destination_(TransferEngine::instance().allocateDeviceTransferBuffer(
+                  kLanes * kBytes, device)),
+              lanes_(TransferEngine::instance().allocatePersistentTransferExecutionLanes(
+                  kLanes, device, "canonical_ticket_maintenance_progress"))
+        {
+            echo_ = TransferEngine::instance().allocateMappedHostRegion(
+                kLanes * kBytes, std::array{device});
+            for (auto &event : events_)
+                event = backend_->createEvent(device_.ordinal);
+        }
+
+        /** @brief Drain accepted copies before retiring events or their storage. */
+        ~CanonicalTicketMaintenanceProof()
+        {
+            for (std::size_t lane = 0; lane < kLanes; ++lane)
+            {
+                (void)backend_->synchronizeStream(lanes_[lane].stream(), device_.ordinal);
+                if (events_[lane])
+                    backend_->destroyEvent(events_[lane], device_.ordinal);
+            }
+        }
+
+        CanonicalTicketMaintenanceProof(const CanonicalTicketMaintenanceProof &) = delete;
+        CanonicalTicketMaintenanceProof &operator=(const CanonicalTicketMaintenanceProof &) = delete;
+
+        /** @brief Queue one native copy and terminal event on every prepared lane. */
+        void submit(const MappedHostTransferRegion &source)
+        {
+            ASSERT_NE(destination_, nullptr);
+            for (std::size_t lane = 0; lane < kLanes; ++lane)
+            {
+                ASSERT_NE(events_[lane], nullptr);
+                TransferEngine::instance().enqueueBackgroundMappedCopy(
+                    lanes_[lane], MappedTransferDirection::HostToDevice,
+                    destination_->mutableDeviceData(), kLanes * kBytes, lane * kBytes,
+                    source, 0, kBytes);
+                TransferEngine::instance().enqueueBackgroundMappedCopy(
+                    lanes_[lane], MappedTransferDirection::DeviceToHost,
+                    destination_->mutableDeviceData(), kLanes * kBytes, lane * kBytes,
+                    *echo_, lane * kBytes, kBytes);
+                ASSERT_TRUE(backend_->recordEvent(
+                    events_[lane], device_.ordinal, lanes_[lane].stream()));
+            }
+        }
+
+        /**
+         * @brief Count exact native completions under one shared bounded deadline.
+         * @return Number of completed lanes, never inferred from another event.
+         */
+        std::size_t awaitAll()
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            std::array<bool, kLanes> ready{};
+            std::size_t completed = 0;
+            do
+            {
+                for (std::size_t lane = 0; lane < kLanes; ++lane)
+                {
+                    if (ready[lane])
+                        continue;
+                    bool native_ready = false;
+                    if (!backend_->queryEvent(events_[lane], device_.ordinal, &native_ready))
+                        return completed;
+                    if (native_ready)
+                    {
+                        ready[lane] = true;
+                        ++completed;
+                    }
+                }
+                if (completed == kLanes)
+                    return completed;
+                std::this_thread::yield();
+            } while (std::chrono::steady_clock::now() < deadline);
+            return completed;
+        }
+
+        /** @brief Verify every destination after the consumer and copies retire. */
+        void verify(const void *source, void *read_stream)
+        {
+            ASSERT_EQ(awaitAll(), kLanes);
+            std::array<std::byte, kLanes * kBytes> actual{};
+            ASSERT_TRUE(backend_->deviceToHost(
+                actual.data(), destination_->deviceData(), actual.size(),
+                device_.ordinal, read_stream));
+            for (std::size_t lane = 0; lane < kLanes; ++lane)
+            {
+                EXPECT_EQ(std::memcmp(actual.data() + lane * kBytes, source, kBytes), 0)
+                    << "maintenance lane=" << lane;
+                EXPECT_EQ(std::memcmp(echo_->mutableHostData(lane * kBytes), source, kBytes), 0)
+                    << "maintenance return lane=" << lane;
+            }
+        }
+
+        static constexpr std::size_t kLanes = 32;
+        static constexpr std::size_t kBytes = 4096;
+
+    private:
+        DeviceId device_;
+        IBackend *backend_;
+        std::shared_ptr<DeviceTransferBuffer> destination_;
+        std::shared_ptr<MappedHostTransferRegion> echo_;
+        std::vector<PersistentTransferExecutionLane> lanes_;
+        std::array<void *, kLanes> events_{};
+    };
+
+    /**
      * @brief Reuse one CPU-published canonical ticket for twenty GPU replays.
      *
      * Each replay publishes a different route permutation and payload. The CPU
@@ -2854,20 +3034,24 @@ namespace
      * the same storage must become reusable without a stream/device sync. This
      * proves both mapped bytes and the producer/consumer sequence protocol on
      * the selected continuation backend.
+     * @param continuation_device Native captured consumer backend and ordinal.
+     * @param route_capacity Original route slots, covering decode and prefill.
+     * @param d_model Hidden width, including partial-warp tails.
      */
-    void runCanonicalRouteTicketReuseProof(DeviceId continuation_device)
+    void runCanonicalRouteTicketReuseProof(
+        DeviceId continuation_device,
+        std::size_t route_capacity,
+        std::int32_t d_model = 3072)
     {
-        /* Qwen 3.5 122B decode publishes one original slot per top-k route at
-         * hidden width 3072. Keeping that exact geometry makes the regression
-         * cover the production 96-block mapped materialization launch. */
-        constexpr std::size_t route_capacity = 8u;
-        constexpr std::int32_t d_model = 3072;
+        /* Exercise both decode and prefill-sized grids at the real hidden
+         * width. A publication-first eager launch cannot prove that a retained
+         * waiting consumer leaves resources available to maintenance. */
         constexpr std::uint64_t workspace_generation = 17u;
         constexpr std::uint64_t first_residency_epoch = 101u;
         constexpr std::size_t replay_count = 20u;
-        constexpr std::size_t element_count =
+        const std::size_t element_count =
             route_capacity * static_cast<std::size_t>(d_model);
-        constexpr std::size_t payload_bytes = element_count * sizeof(float);
+        const std::size_t payload_bytes = element_count * sizeof(float);
 
         SparseRouteExchangeResources resources(
             continuation_device, continuation_device);
@@ -2881,6 +3065,16 @@ namespace
             continuation_device.ordinal);
         ASSERT_NE(resources.root_stream, nullptr);
         ASSERT_NE(resources.root_terminal, nullptr);
+        resources.producer_stream = resources.root_backend->createStream(
+            continuation_device.ordinal);
+        resources.producer_terminal = resources.root_backend->createEvent(
+            continuation_device.ordinal);
+        ASSERT_NE(resources.producer_stream, nullptr);
+        ASSERT_NE(resources.producer_terminal, nullptr);
+        constexpr std::size_t progress_bytes = 4096u;
+        void *const progress_device = resources.allocate(
+            resources.root_backend, continuation_device, progress_bytes);
+        ASSERT_NE(progress_device, nullptr);
 
         void *const output_device = resources.allocate(
             resources.root_backend, continuation_device, payload_bytes);
@@ -2900,6 +3094,7 @@ namespace
                 payload_bytes, endpoints);
         ASSERT_NE(contribution_region, nullptr);
         ASSERT_TRUE(contribution_region->isBound());
+        CanonicalTicketMaintenanceProof maintenance(continuation_device);
 
         MoEOverlayCanonicalRouteReturnTicketStorage storage;
         storage.bindFixedCapacity(
@@ -2949,10 +3144,9 @@ namespace
             << "dropping an unpublished lease must restore quiescent ownership";
 
         /*
-         * A failed CPU service must release the already-submitted GPU parent
-         * without manufacturing route rows. The same captured consumer owns the
-         * abort acknowledgement, after which the ordinary success sequence can
-         * reuse this storage immediately.
+         * Warm the consumer and verify its abort acknowledgement before graph
+         * capture. Aborts release the sequence without manufacturing route
+         * rows; subsequent retained success replays reuse the same storage.
          */
         ASSERT_TRUE(storage.publishAbort());
         EXPECT_FALSE(storage.payloadReady());
@@ -2970,6 +3164,31 @@ namespace
             continuation_device.ordinal));
         EXPECT_FALSE(storage.payloadReady());
 
+        auto &worker = GPUDeviceContextPool::instance().getContext(
+            continuation_device);
+        std::unique_ptr<IGPUGraphCapture> consumer;
+        worker.submitAndWait([&] {
+            consumer = worker.createGraphCapture(resources.root_stream);
+            ASSERT_NE(consumer, nullptr);
+            ASSERT_TRUE(consumer->beginCapture());
+            ASSERT_TRUE(kernel->consumeMoEOverlayCanonicalRouteTicket(
+                MoEKernelLaunchContext{.stream = resources.root_stream}, ticket));
+            ASSERT_TRUE(consumer->endCapture());
+            ASSERT_TRUE(consumer->instantiate());
+        });
+        ASSERT_TRUE(consumer && consumer->hasExecutable());
+        bool consumer_pending = false;
+        auto drain_consumer = [&](void *) {
+            if (!consumer_pending)
+                return;
+            // An assertion must not strand a retained wait or release mapped
+            // payload storage before the accepted graph has stopped reading.
+            (void)storage.publishAbort();
+            (void)resources.root_backend->synchronizeStream(
+                resources.root_stream, continuation_device.ordinal);
+        };
+        std::unique_ptr<void, decltype(drain_consumer)> consumer_guard(
+            &storage, drain_consumer);
         std::vector<float> actual(element_count, 0.0f);
         std::vector<float> expected(element_count, 0.0f);
         for (std::size_t replay = 0u; replay < replay_count; ++replay)
@@ -3014,27 +3233,55 @@ namespace
                 }
             }
 
-            ASSERT_TRUE(publication.publish(route_capacity))
-                << "replay=" << replay;
-            ASSERT_TRUE(storage.payloadReadyFor(residency_epoch));
-            ASSERT_TRUE(storage.publicationSucceededFor(residency_epoch));
-            EXPECT_FALSE(publication.publish(route_capacity))
-                << "publication requires one fresh arm transition";
-            EXPECT_FALSE(storage.arm(residency_epoch + 1u))
-                << "mapped payload cannot be overwritten before GPU acknowledgement";
-
-            ASSERT_TRUE(kernel->consumeMoEOverlayCanonicalRouteTicket(
-                MoEKernelLaunchContext{.stream = resources.root_stream},
-                ticket));
+            ASSERT_TRUE(consumer->launchOnStream(resources.root_stream));
+            consumer_pending = true;
             ASSERT_TRUE(resources.root_backend->recordEvent(
                 resources.root_terminal,
                 continuation_device.ordinal,
                 resources.root_stream));
+            // The CPU has deliberately not released its ticket yet. A
+            // separate exact stream must still complete unrelated transfer
+            // work; observing that event cannot satisfy the waiting ticket.
+            EXPECT_TRUE(resources.root_backend->hostToDeviceOnStream(
+                progress_device, contribution_rows, progress_bytes,
+                continuation_device.ordinal, resources.producer_stream));
+            EXPECT_TRUE(resources.root_backend->recordEvent(
+                resources.producer_terminal, continuation_device.ordinal,
+                resources.producer_stream));
+            EXPECT_TRUE(awaitEvent(
+                resources.root_backend, resources.producer_terminal,
+                std::chrono::seconds(1), continuation_device.ordinal))
+                << "Pending captured CPU ticket blocked independent DMA";
+            maintenance.submit(*contribution_region);
+            // CUDA maintenance uses bounded SM copies, unlike the DMA witness
+            // above. Both must progress while the real captured consumer waits.
+            const std::size_t maintenance_ready = maintenance.awaitAll();
+            bool consumer_ready = true;
+            EXPECT_TRUE(resources.root_backend->queryEvent(
+                resources.root_terminal, continuation_device.ordinal,
+                &consumer_ready));
+            EXPECT_FALSE(consumer_ready)
+                << "Consumer completed without its CPU publication";
+            EXPECT_FALSE(storage.arm(residency_epoch + 1u))
+                << "unpublished payload is still owned by its CPU producer";
+
+            ASSERT_TRUE(publication.publish(route_capacity))
+                << "replay=" << replay;
+            // A live captured consumer may acknowledge before publish returns.
+            // The durable success receipt, not transient readiness, is proof.
+            ASSERT_TRUE(storage.publicationSucceededFor(residency_epoch));
+            EXPECT_FALSE(publication.publish(route_capacity))
+                << "publication requires one fresh arm transition";
+
             ASSERT_TRUE(awaitEvent(
                 resources.root_backend,
                 resources.root_terminal,
                 std::chrono::seconds(5),
                 continuation_device.ordinal));
+            consumer_pending = false;
+            maintenance.verify(contribution_rows, resources.producer_stream);
+            ASSERT_EQ(maintenance_ready, CanonicalTicketMaintenanceProof::kLanes)
+                << "Pending captured CPU ticket blocked native background copies";
             EXPECT_FALSE(storage.payloadReady())
                 << "GPU did not acknowledge replay=" << replay;
             EXPECT_TRUE(storage.publicationSucceededFor(residency_epoch))
@@ -3051,11 +3298,8 @@ namespace
                 payload_bytes,
                 continuation_device.ordinal,
                 resources.root_stream));
-            for (std::size_t element = 0u; element < element_count; ++element)
-            {
-                EXPECT_FLOAT_EQ(actual[element], expected[element])
-                    << "replay=" << replay << " element=" << element;
-            }
+            EXPECT_EQ(std::memcmp(actual.data(), expected.data(), payload_bytes), 0)
+                << "Captured route permutation changed payload bytes; replay=" << replay;
         }
     }
 
@@ -3680,6 +3924,34 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CUDAContinuationLargeSparseReturnTraversesEveryGridStride)
+{
+    IBackend *const cuda = getCUDABackend();
+    IBackend *const rocm = getROCmBackend();
+    ASSERT_NE(cuda, nullptr);
+    ASSERT_NE(rocm, nullptr);
+    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
+        GTEST_SKIP() << "Requires CUDA and ROCm devices";
+    // The fixture uses width eight and alternating expert owners. This odd
+    // row count takes the live compact payload beyond one bounded grid, not
+    // merely its padded capacity. Two authenticated generations poison and
+    // validate every original route slot through the real captured stages.
+    runRoleAssignment<16385>(DeviceId::cuda(0), DeviceId::rocm(0));
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     ROCmContinuationLargeSparseReturnTraversesEveryGridStride)
+{
+    IBackend *const cuda = getCUDABackend();
+    IBackend *const rocm = getROCmBackend();
+    ASSERT_NE(cuda, nullptr);
+    ASSERT_NE(rocm, nullptr);
+    if (cuda->deviceCount() < 1 || rocm->deviceCount() < 1)
+        GTEST_SKIP() << "Requires CUDA and ROCm devices";
+    runRoleAssignment<16385>(DeviceId::rocm(0), DeviceId::cuda(0));
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
      SingleRowROCmContinuationCUDAFollowerFusesTimelineAndIsExact)
 {
     IBackend *const cuda = getCUDABackend();
@@ -3716,13 +3988,58 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CUDAForkedPrefillWaitsForNewGenerationAfterStaleAdmission)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    runStaleAdmissionABAProof<4>(DeviceId::cuda(0), DeviceId::rocm(0));
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     ROCmForkedPrefillWaitsForNewGenerationAfterStaleAdmission)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    runStaleAdmissionABAProof<4>(DeviceId::rocm(0), DeviceId::cuda(0));
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CUDAForkedPrefillAbortDrainsPendingAdmission)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    runAdmissionAbortProof(DeviceId::cuda(0), DeviceId::rocm(0));
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     ROCmForkedPrefillAbortDrainsPendingAdmission)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    runAdmissionAbortProof(DeviceId::rocm(0), DeviceId::cuda(0));
+}
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
      CPUCanonicalRouteTicketReusesSafelyOnCUDA)
 {
     IBackend *const cuda = getCUDABackend();
     ASSERT_NE(cuda, nullptr);
     if (cuda->deviceCount() < 1)
         GTEST_SKIP() << "Requires one CUDA device";
-    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0));
+    for (const auto slots : {8u, 512u, 4800u})
+    {
+        SCOPED_TRACE(slots);
+        runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), slots);
+    }
+    runCanonicalRouteTicketReuseProof(DeviceId::cuda(0), 19u, 67);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,
@@ -3732,7 +4049,12 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
     ASSERT_NE(rocm, nullptr);
     if (rocm->deviceCount() < 1)
         GTEST_SKIP() << "Requires one ROCm device";
-    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0));
+    for (const auto slots : {8u, 512u, 4800u})
+    {
+        SCOPED_TRACE(slots);
+        runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), slots);
+    }
+    runCanonicalRouteTicketReuseProof(DeviceId::rocm(0), 19u, 67);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,

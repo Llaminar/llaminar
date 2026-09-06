@@ -21,7 +21,7 @@ namespace llaminar2
         0x43454f4du;
 
     /** Version of every fixed-width controller record in this header. */
-    inline constexpr std::uint32_t kMoEOverlayDeviceControllerVersion = 7u;
+    inline constexpr std::uint32_t kMoEOverlayDeviceControllerVersion = 8u;
 
     /** Maximum participants represented by one node-local inference epoch barrier. */
     inline constexpr std::uint32_t
@@ -90,7 +90,7 @@ namespace llaminar2
         PreparedContextRestore = 4u,
     };
 
-    /** Phase-pure routed evidence selected by the sole transaction authority. */
+    /** Scheduler boundary triggering a phase-complete Dynamic demand snapshot. */
     enum class MoEOverlayDeviceDemandPhase : std::uint32_t
     {
         Invalid = 0u,
@@ -232,6 +232,11 @@ namespace llaminar2
         std::uint64_t transaction_id = 0u;
         std::uint64_t base_epoch = 0u;
         std::uint64_t candidate_epoch = 0u;
+        /**
+         * Latest sealed command. Opening the next snapshot does not clear this
+         * receipt or its payload: a delayed transport worker may still need an
+         * empty completed command. The next snapshot fan-in is the reuse edge.
+         */
         std::uint64_t command_transaction = 0u;
         std::uint64_t commit_transaction = 0u;
         std::uint64_t admission_transaction = 0u;
@@ -255,6 +260,13 @@ namespace llaminar2
          * model layers without imposing any topology-specific layer count.
          */
         std::uint32_t placement_layer_cursor = 0u;
+        /**
+         * Phase intent for transaction_id, published with its open ticket.
+         * This is separate from the retained command's demand_phase because
+         * snapshot N+1 can coexist with a not-yet-acquired empty command N.
+         */
+        std::uint32_t transaction_demand_phase = static_cast<std::uint32_t>(
+            MoEOverlayDeviceDemandPhase::Invalid);
     };
 
     /**
@@ -311,7 +323,7 @@ namespace llaminar2
         std::uint32_t movement_round_count = 0u;
         /** Must remain zero; conflicting destinations are never serialized. */
         std::uint32_t hazard_count = 0u;
-        /** Typed snapshot plane fixed before the transaction ticket publishes. */
+        /** Sealed phase copied from the matching transaction's open intent. */
         std::uint32_t demand_phase = static_cast<std::uint32_t>(
             MoEOverlayDeviceDemandPhase::Invalid);
         /** Total routed observations in the exact device-authored snapshot. */
@@ -378,8 +390,8 @@ namespace llaminar2
     static_assert(
         alignof(MoEOverlayDeviceControllerInferenceEpochRecord) == 64u);
     static_assert(
-        sizeof(MoEOverlayDeviceControllerSharedHeader) == 128u,
-        "The CUDA/HIP mapped controller header ABI must remain exactly two cache lines");
+        sizeof(MoEOverlayDeviceControllerSharedHeader) == 192u,
+        "The CUDA/HIP mapped controller header ABI must remain exactly three cache lines");
     static_assert(
         sizeof(MoEOverlayDeviceControllerGroupRecord) == 128u,
         "Each independently published group record must occupy two cache lines");

@@ -412,6 +412,42 @@ TEST(Test__PrefixMTPConfig, DisabledExecutionMayRetainMTPGraphCapacity)
     EXPECT_EQ(owner_plan.verifierPreparationGraphSlots(), 32u);
     EXPECT_EQ(owner_plan.controllerGraphSlots(), 4u);
     EXPECT_EQ(owner_plan.auxiliaryExecutableSlotCount(), 107u);
+    EXPECT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 82u);
+    EXPECT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), 25u);
+}
+
+/** @test Every retained depth/request geometry partitions the same owner set. */
+TEST(Test__PrefixMTPConfig, HelperGraphAdmissionTracksRequestScaledVerifierShape)
+{
+    for (const int depth : {1, 2, 3, 15, 31})
+    {
+        for (int requests = 1; requests <= 32; ++requests)
+        {
+            MTPRuntimeConfig config;
+            config.graph_capacity_draft_tokens = depth;
+            config.max_request_batch = requests;
+            const MTPGraphOwnerPlan plan(config);
+            size_t expected_helpers = plan.terminalHiddenGraphSlots() +
+                                      plan.draftPublicationGraphSlots();
+            for (int shape_requests = 1; shape_requests <= requests; ++shape_requests)
+            {
+                const auto executable_class =
+                    MTPGraphOwnerPlan::verifierPreparationExecutableClass(shape_requests);
+                const bool bounded = 4u * static_cast<size_t>(shape_requests) + 2u <=
+                                     GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes;
+                EXPECT_EQ(executable_class == GPUGraphExecutableClass::BoundedFlatHelper,
+                          bounded);
+                if (bounded)
+                    expected_helpers += 2u * static_cast<size_t>(depth + 1);
+            }
+            EXPECT_EQ(plan.boundedHelperExecutableSlotCount(), expected_helpers);
+            EXPECT_EQ(plan.generalAuxiliaryExecutableSlotCount() + expected_helpers,
+                      plan.auxiliaryExecutableSlotCount());
+        }
+    }
+    EXPECT_THROW((void)MTPGraphOwnerPlan::verifierPreparationExecutableClass(0),
+                 std::invalid_argument);
+    EXPECT_EQ(MTPGraphOwnerPlan(MTPRuntimeConfig{}).boundedHelperExecutableSlotCount(), 0u);
 }
 
 TEST(Test__PrefixMTPConfig,

@@ -2619,6 +2619,49 @@ TEST(Test__MTPTerminalHiddenPublication, TracksTypedProducerGenerations)
 }
 
 /**
+ * @brief Catch-up scratch cannot masquerade as the accepted terminal row.
+ *
+ * Neither a prefix hit nor a grouped verifier supplies prefill geometry. Both
+ * legal catch-up shapes must retire their temporary read generation and admit
+ * the accepted verifier as the next terminal producer without such geometry.
+ */
+TEST(Test__MTPTerminalHiddenPublication, CatchupRetiresScratchBeforeAcceptedPublication)
+{
+    for (const bool has_suffix : {false, true})
+    {
+        SCOPED_TRACE(has_suffix);
+        MTPTerminalHiddenPublication publication;
+        publication.publishCheckpointRestore();
+        const auto initial = publication.acquireReadLease();
+        ASSERT_TRUE(initial.has_value());
+        EXPECT_TRUE(publication.stillOwns(*initial));
+        publication.invalidate();
+        EXPECT_FALSE(publication.stillOwns(*initial));
+        EXPECT_FALSE(publication.acquireReadLease().has_value());
+
+        if (has_suffix)
+        {
+            publication.publishMainForward();
+            const auto suffix = publication.acquireReadLease();
+            ASSERT_TRUE(suffix.has_value());
+            EXPECT_GT(suffix->generation, initial->generation);
+            publication.invalidate();
+            EXPECT_FALSE(publication.stillOwns(*suffix));
+            EXPECT_FALSE(publication.acquireReadLease().has_value());
+        }
+
+        publication.publishAcceptedVerifier();
+        const auto accepted = publication.acquireReadLease();
+        ASSERT_TRUE(accepted.has_value());
+        EXPECT_EQ(accepted->source,
+                  MTPTerminalHiddenPublication::Source::AcceptedVerifier);
+        EXPECT_GT(accepted->generation, initial->generation);
+        EXPECT_FALSE(publication.stillOwns(*initial));
+        EXPECT_TRUE(publication.stillOwns(*accepted));
+    }
+}
+
+/**
  * @brief Guard the device-hot cache against reintroducing host round trips.
  *
  * A hot block is an accelerator-owned replica of the durable pinned-RAM

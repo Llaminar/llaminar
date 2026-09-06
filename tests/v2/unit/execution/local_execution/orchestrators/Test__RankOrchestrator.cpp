@@ -937,13 +937,11 @@ public:
         const PrefixStateSnapshot &checkpoint,
         const DeviceSpeculativeOutcomeHandle &outcome,
         int request_index,
-        int main_forward_token_count,
         bool allow_speculative_discard = false) override
     {
         using namespace sampling_math;
         ++commit_mtp_initial_device_outcome_calls_;
         last_commit_mtp_already_appended_ = 0;
-        last_commit_mtp_main_forward_token_count_ = main_forward_token_count;
         last_commit_mtp_allow_speculative_discard_ = allow_speculative_discard;
         last_commit_mtp_position_offset_override_ = checkpoint.cached_tokens;
         last_commit_mtp_checkpoint_valid_ = checkpoint.valid;
@@ -957,8 +955,7 @@ public:
             request_index < 0 ||
             request_index >= outcome.request_count ||
             outcome.meta_stride < kSpeculativeBatchMetaCount ||
-            outcome.output_token_stride < kSpeculativeBatchMaxOutputTokens ||
-            main_forward_token_count <= 0)
+            outcome.output_token_stride < kSpeculativeBatchMaxOutputTokens)
         {
             return false;
         }
@@ -5021,11 +5018,37 @@ TEST_F(Test__RankOrchestrator,
 
     const auto request_reset =
         shutdown.find("resetUnderlyingRunnerRequestState(\"shutdown\")");
+    const auto continuation_retirement =
+        shutdown.find("retireMTPRequestContinuationState();");
     const auto runner_release = shutdown.find("runner_.reset();");
     ASSERT_NE(request_reset, std::string::npos);
+    ASSERT_NE(continuation_retirement, std::string::npos);
     ASSERT_NE(runner_release, std::string::npos);
     EXPECT_LT(request_reset, runner_release)
         << "Shutdown must publish the terminal reset before participant RAII retirement.";
+    EXPECT_LT(request_reset, continuation_retirement)
+        << "The participant must first drain/reset the producer named by each resident MTP lease.";
+    EXPECT_LT(continuation_retirement, runner_release)
+        << "Orchestration-owned MTP leases must destroy their CUDA/HIP events while the participant backend is alive.";
+
+    const auto continuation_begin = runner_source.find(
+        "void OrchestrationRunner::retireMTPRequestContinuationState()");
+    const auto continuation_end = runner_source.find(
+        "bool OrchestrationRunner::publishMoEOverlayCollectiveRequestGeneration",
+        continuation_begin);
+    ASSERT_NE(continuation_begin, std::string::npos);
+    ASSERT_NE(continuation_end, std::string::npos);
+    const std::string continuation = runner_source.substr(
+        continuation_begin, continuation_end - continuation_begin);
+    for (const char *lease_owner : {
+             "ready_mtp_condition_.reset();",
+             "pending_mtp_condition_resident_state_.reset();",
+             "prelaunched_mtp_first_sidecar_resident_state_.reset();",
+         })
+    {
+        EXPECT_NE(continuation.find(lease_owner), std::string::npos)
+            << "The terminal MTP retirement transition omitted " << lease_owner;
+    }
     for (const char *forbidden_drain : {
              "synchronizeRunnerDevicesBeforeRelease",
              "synchronizeDevices()",
@@ -7026,7 +7049,6 @@ TEST_F(Test__RankOrchestrator,
         checkpoint,
         handle,
         /*request_index=*/0,
-        /*main_forward_token_count=*/2,
         /*allow_speculative_discard=*/true));
     EXPECT_EQ(runner0_ptr->commit_mtp_initial_device_outcome_call_count(), 1u);
     EXPECT_EQ(runner1_ptr->commit_mtp_initial_device_outcome_call_count(), 1u);

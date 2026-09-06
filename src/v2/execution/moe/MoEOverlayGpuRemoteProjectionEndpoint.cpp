@@ -6,6 +6,11 @@
  * Device ordering is expressed solely by one named auxiliary stream and exact
  * events; no method waits for a stream/device, allocates runtime storage, or
  * makes an inference stream depend on background migration.
+ * CPU repack and packed GPU blobs use the same TransferEngine background-copy
+ * contract as node-local relay lanes. Exact mapped aliases belong to persistent
+ * staging setup, never to a hot-path registration or assumed host-pointer cast.
+ * Command-local stall warnings reuse already-performed native event queries;
+ * they add no device observation and cannot decide transfer readiness.
  */
 
 #include "MoEOverlayGpuRemoteProjectionEndpoint.h"
@@ -25,6 +30,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <exception>
 #include <stdexcept>
@@ -34,6 +40,14 @@ namespace llaminar2
 {
     namespace
     {
+        /** @return Monotonic nanoseconds for observational chunk-stall timing. */
+        std::uint64_t remoteProjectionNanoseconds() noexcept
+        {
+            return static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
+
         /** @brief Write a caller-facing error only when storage was supplied. */
         void setGpuRemoteError(
             std::string *error,
@@ -134,6 +148,8 @@ namespace llaminar2
         if (config_.lane_name.empty())
             throw std::invalid_argument(
                 "Remote ExpertOverlay GPU lane requires a stable name");
+        if (config_.progress.epoch() && config_.progress.epoch()->device() != config_.device)
+            throw std::invalid_argument("Remote projection progress authority belongs to another device");
         if (config_.perf_device.empty())
             config_.perf_device = config_.device.to_string();
     }
@@ -197,6 +213,14 @@ namespace llaminar2
                 config_.staging.mutableDeviceData());
             pinned_chunk_ = static_cast<std::uint8_t *>(
                 config_.staging.mutablePinnedData());
+            if (const auto &epoch = config_.progress.epoch())
+            {
+                auto mapped = TransferEngine::instance().mappedStagingView(config_.staging);
+                service_read_ = epoch->reserveSlot(MappedTransferDirection::DeviceToHost,
+                    mapped, config_.lane_name + ":read");
+                service_write_ = epoch->reserveSlot(MappedTransferDirection::HostToDevice,
+                    std::move(mapped), config_.lane_name + ":write");
+            }
             if (!stream_ || !completion_event_ || !device_chunk_ ||
                 !pinned_chunk_)
             {
@@ -245,6 +269,7 @@ namespace llaminar2
         operation_kind_ = OperationKind::None;
         operation_bytes_ = 0;
         source_readiness_bound_ = false;
+        source_dependency_ = TransferProducerDependency::published();
         work_may_be_in_flight_ = false;
         fail_after_event_ = false;
         unfenced_work_ = false;
@@ -304,6 +329,7 @@ namespace llaminar2
         {
             if (readiness.requiresProducerWait())
             {
+                source_dependency_ = TransferProducerDependency::afterEvent(readiness.event());
                 if (!context_->waitEventChecked(readiness.event(), stream_))
                 {
                     setGpuRemoteError(
@@ -473,9 +499,10 @@ namespace llaminar2
         progress_ = MoEOverlayGpuRemoteLaneProgress::Pending;
         operation_kind_ = kind;
         operation_bytes_ = bytes;
+        progress_watch_.published(remoteProjectionNanoseconds());
         work_may_be_in_flight_ = true;
         fail_after_event_ = !submitted;
-        if (!submitted)
+        if (!submitted && failure_.empty())
             failure_ = "Remote ExpertOverlay GPU chunk submission failed before its completion fence";
         recordSubmissionLocked(kind, bytes);
         if (!submitted)
@@ -510,12 +537,10 @@ namespace llaminar2
         }
         const bool converted = launchGpuToCpuLocked(
             layout, source, first_unit, unit_count);
-        const bool copied = converted && backend_->deviceToHostOnStream(
-            pinned_chunk_,
-            device_chunk_,
-            bytes,
-            device_ordinal_,
-            stream_);
+        const bool copied = converted && TransferEngine::instance().enqueueBackgroundStagingCopy(
+            config_.execution, MappedTransferDirection::DeviceToHost,
+            device_chunk_, config_.staging.sizeBytes(), 0u,
+            config_.staging, 0u, bytes, &failure_);
         return fenceSubmissionLocked(
             converted && copied,
             OperationKind::GpuToCpuRepack,
@@ -537,12 +562,13 @@ namespace llaminar2
                 *error = "Remote GPU blob read has an invalid source range";
             return false;
         }
-        const bool copied = backend_->deviceToHostOnStream(
-            pinned_chunk_,
-            source,
-            bytes,
-            device_ordinal_,
-            stream_);
+        if (config_.progress.epoch())
+            return publishBlobLocked(OperationKind::GpuBlobRead,
+                const_cast<std::uint8_t *>(source), bytes, error);
+        const bool copied = TransferEngine::instance().enqueueBackgroundStagingCopy(
+            config_.execution, MappedTransferDirection::DeviceToHost,
+            const_cast<std::uint8_t *>(source), bytes, 0u,
+            config_.staging, 0u, bytes, &failure_);
         return fenceSubmissionLocked(
             copied,
             OperationKind::GpuBlobRead,
@@ -577,12 +603,10 @@ namespace llaminar2
 
         /* The MPI buffer is persistent but not necessarily GPU-DMA pinned. */
         std::memcpy(pinned_chunk_, payload.data(), bytes);
-        const bool copied = backend_->hostToDeviceOnStream(
-            device_chunk_,
-            pinned_chunk_,
-            bytes,
-            device_ordinal_,
-            stream_);
+        const bool copied = TransferEngine::instance().enqueueBackgroundStagingCopy(
+            config_.execution, MappedTransferDirection::HostToDevice,
+            device_chunk_, config_.staging.sizeBytes(), 0u,
+            config_.staging, 0u, bytes, &failure_);
         const bool converted = copied && launchCpuToGpuLocked(
             layout, destination, first_unit, unit_count, bytes);
         return fenceSubmissionLocked(
@@ -608,17 +632,66 @@ namespace llaminar2
             return false;
         }
         std::memcpy(pinned_chunk_, payload.data(), payload.size());
-        const bool copied = backend_->hostToDeviceOnStream(
-            destination,
-            pinned_chunk_,
-            payload.size(),
-            device_ordinal_,
-            stream_);
+        if (config_.progress.epoch())
+            return publishBlobLocked(OperationKind::GpuBlobWrite,
+                destination, payload.size(), error);
+        const bool copied = TransferEngine::instance().enqueueBackgroundStagingCopy(
+            config_.execution, MappedTransferDirection::HostToDevice,
+            destination, payload.size(), 0u,
+            config_.staging, 0u, payload.size(), &failure_);
         return fenceSubmissionLocked(
             copied,
             OperationKind::GpuBlobWrite,
             payload.size(),
             error);
+    }
+
+    MappedTransferProgressSlot *MoEOverlayGpuRemoteProjectionLane::serviceCommandLocked() noexcept
+    {
+        if (!config_.progress.epoch())
+            return nullptr;
+        if (operation_kind_ == OperationKind::GpuBlobRead)
+            return &service_read_;
+        if (operation_kind_ == OperationKind::GpuBlobWrite)
+            return &service_write_;
+        return nullptr;
+    }
+
+    bool MoEOverlayGpuRemoteProjectionLane::publishBlobLocked(
+        OperationKind kind, void *address, std::size_t bytes, std::string *error) noexcept
+    {
+        try
+        {
+            if (kind == OperationKind::GpuBlobRead)
+                service_read_.publishDeviceToMappedHost(address, bytes, 0u, bytes, source_dependency_);
+            else if (kind == OperationKind::GpuBlobWrite)
+                service_write_.publishMappedHostToDevice(address, bytes, 0u, bytes);
+            else
+                throw std::logic_error("Raw graph-service publication requires a blob operation");
+
+            // Acceptance retains the owner and staging even if a later runtime
+            // submission fails. No native event may certify these copied bytes.
+            operation_kind_ = kind;
+            operation_bytes_ = bytes;
+            progress_ = MoEOverlayGpuRemoteLaneProgress::Pending;
+            work_may_be_in_flight_ = true;
+            fail_after_event_ = false;
+            progress_watch_.published(remoteProjectionNanoseconds());
+            recordSubmissionLocked(kind, bytes);
+            if (!config_.progress.epoch()->submitOutstandingProgress())
+                throw std::runtime_error("Remote projection graph service could not progress accepted work");
+            if (error)
+                error->clear();
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            failure_ = exception.what();
+            progress_ = MoEOverlayGpuRemoteLaneProgress::Failed;
+            ++stats_.failures;
+            setGpuRemoteError(error, failure_);
+            return false;
+        }
     }
 
     MoEOverlayGpuRemoteLaneProgress
@@ -646,7 +719,19 @@ namespace llaminar2
         bool ready = false;
         try
         {
-            if (!context_->queryEventChecked(completion_event_, ready))
+            if (auto *command = serviceCommandLocked())
+            {
+                if (!config_.progress.epoch()->submitOutstandingProgress())
+                    throw std::runtime_error("Remote projection graph progress failed");
+                const auto result = command->poll(&failure_);
+                if (result == MappedTransferProgress::Failed)
+                {
+                    work_may_be_in_flight_ = command->pending();
+                    throw std::runtime_error(failure_);
+                }
+                ready = result == MappedTransferProgress::Ready;
+            }
+            else if (!context_->queryEventChecked(completion_event_, ready))
             {
                 failure_ =
                     "Remote ExpertOverlay GPU lane completion-event query failed";
@@ -679,6 +764,24 @@ namespace llaminar2
         if (!ready)
         {
             ++stats_.pending_event_polls;
+            // Reuse the exact not-ready observation above, never query again
+            // for logging. Each chunk resets the watch, so a healthy busy lane
+            // cannot be confused with one stalled command.
+            const auto now = remoteProjectionNanoseconds();
+            progress_watch_.observedIncompleteEvent(now);
+            if (const auto age = progress_watch_.pending(now))
+            {
+                LOG_WARN("[MoEOverlayGpuRemoteProjectionLane] chunk event remains pending"
+                         << " device=" << config_.device.toString()
+                         << " lane=" << config_.lane_name
+                         << " operation=" << operationName(operation_kind_)
+                         << " bytes=" << operation_bytes_
+                         << " command_pending_ns=" << *age
+                         << " native_not_ready_queries=" << progress_watch_.incompleteEventQueries()
+                         << " chunks_submitted=" << stats_.chunks_submitted
+                         << " chunks_completed=" << stats_.chunks_completed
+                         << " stream=" << stream_);
+            }
             if (error)
                 error->clear();
             return progress_;

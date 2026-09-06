@@ -126,7 +126,10 @@ namespace llaminar2
      * Decode uses a fused direct-mapped kernel and therefore needs no auxiliary
      * resources. Wider prefill/verifier rows fork every outbound lane from one
      * exact continuation stream and keep dispatch publication on context-owned
-     * auxiliary streams. The consumer later acquires each immutable mapped
+     * auxiliary streams. Stage zero joins only the lane-local admission writes
+     * before allowing the main graph to advance: a reusable return signal from
+     * the preceding transaction must not bypass acquisition of the new grant.
+     * Bulk copies and later stages remain asynchronous. The consumer acquires each mapped
      * return timeline directly on its own graph stream. The mapped timeline is
      * therefore the sole return-completion authority across both complete and
      * heterogeneously segmented graphs; no backend event crosses a native
@@ -210,6 +213,23 @@ namespace llaminar2
         }
         /** @return Context-owned auxiliary stream for canonical lane @p index. */
         [[nodiscard]] void *laneStream(std::size_t index) const;
+        /**
+         * @brief Publish stage-zero grant acquisition on the exact lane stream.
+         * @param index Canonical lane whose metadata kernel was just submitted.
+         * @return Success; later stages need no new epoch-admission edge.
+         *
+         * Called before bulk dispatch copies so their latency remains overlapped.
+         */
+        bool publishEpochAdmission(std::size_t index);
+        /**
+         * @brief Join all stage-zero grants before the main graph can advance.
+         * @param stream Exact originating graph stream, never null/default.
+         * @return Success; no host wait or cross-executable event is introduced.
+         *
+         * Fork and join are recorded within the same dispatch stage/capture.
+         * Later stages already inherit this generation and monotonic bank visits.
+         */
+        bool joinEpochAdmissions(void *stream);
         /** @return Number of distinct shared physical dispatch publications. */
         [[nodiscard]] std::size_t sharedDispatchPayloadGroupCount() const noexcept
         {
@@ -259,6 +279,8 @@ namespace llaminar2
         int event_device_ordinal_ = -1;
         void *producer_ready_event_ = nullptr;
         std::vector<void *> lane_streams_;
+        /** Stage-zero-only native fork/join events; no remote completion state. */
+        std::vector<void *> admission_ready_events_;
         /** Per-lane group index, or -1 for a direct compact packet. */
         std::vector<std::int32_t> lane_shared_dispatch_payload_groups_;
         /** Unique groups in first-canonical-lane order. */
@@ -272,7 +294,8 @@ namespace llaminar2
      * Exact one-row direct mappings retain the single-grid decode fast path.
      * Wider rows publish the physical activation matrix once per rank-pair,
      * then compact lane metadata and publication proceed independently on
-     * persistent lane streams. The public graph stream does not wait here,
+     * persistent lane streams. Only stage-zero admission is joined here;
+     * no copy or remote-compute completion is joined on the public stream,
      * allowing continuation-local experts to overlap the complete remote
      * transaction. Return acquisition belongs exclusively to the later
      * consumer so a backend event never crosses a native executable boundary.

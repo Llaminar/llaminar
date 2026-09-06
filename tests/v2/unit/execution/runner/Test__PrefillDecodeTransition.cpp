@@ -1396,7 +1396,6 @@ namespace
             const PrefixStateSnapshot &checkpoint,
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
-            int main_forward_token_count,
             bool allow_speculative_discard = false) override
         {
             using namespace sampling_math;
@@ -1406,8 +1405,7 @@ namespace
                 request_index < 0 ||
                 request_index >= outcome.request_count ||
                 outcome.meta_stride < kSpeculativeBatchMetaCount ||
-                outcome.output_token_stride < kSpeculativeBatchMaxOutputTokens ||
-                main_forward_token_count <= 0)
+                outcome.output_token_stride < kSpeculativeBatchMaxOutputTokens)
             {
                 return false;
             }
@@ -1431,8 +1429,6 @@ namespace
 
             ++commit_mtp_shifted_count_;
             last_commit_mtp_already_appended_ = 0;
-            last_commit_mtp_main_forward_token_count_ =
-                main_forward_token_count;
             last_commit_mtp_allow_speculative_discard_ =
                 allow_speculative_discard;
             /*
@@ -5765,6 +5761,7 @@ namespace
 
         PrefixRuntimeStateSnapshot prefixStateProbe() const override
         {
+            ++prefix_probe_call_count_;
             PrefixRuntimeStateSnapshot probe;
             probe.initialized = true;
             probe.architecture = architecture();
@@ -5815,6 +5812,12 @@ namespace
         void setPrefixProbePositionOverride(int position)
         {
             prefix_probe_position_override_ = position;
+        }
+
+        /** @return Number of explicit child-state observations, not summaries. */
+        int prefixProbeCallCount() const noexcept
+        {
+            return prefix_probe_call_count_;
         }
 
         void requireMTPDecodeEquivalentReplay()
@@ -6728,6 +6731,7 @@ namespace
         int set_all_position_count_{0};
         int set_row_indexed_all_position_count_{0};
         std::optional<int> prefix_probe_position_override_;
+        mutable int prefix_probe_call_count_ = 0;
         int set_mtp_spec_verifier_plan_count_{0};
         int clear_mtp_spec_verifier_plan_count_{0};
         int commit_mtp_shifted_count_{0};
@@ -9243,6 +9247,31 @@ namespace
         ASSERT_TRUE(step2.success());
         ASSERT_EQ(step2.tokens.size(), 1u);
         EXPECT_EQ(step2.tokens[0], MockInferenceRunner::DECODE_ARGMAX_TOKEN);
+    }
+
+    /** Request summaries must read the runner's existing ledger, not its child. */
+    TEST_F(Test__PrefillDecodeTransition,
+           RequestRuntimeSummaryDoesNotObserveChildExecutionState)
+    {
+        auto [runner, mock] = createRunner();
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        ASSERT_TRUE(runner->decodeStep().success());
+        const int before = mock->prefixProbeCallCount();
+        const auto summary = runner->requestRuntimeSummary();
+        EXPECT_EQ(mock->prefixProbeCallCount(), before);
+
+        // Explicit diagnostics retain their full inspection behavior and share
+        // the same summary builder, so separating the interfaces loses no facts.
+        const auto diagnostic = runner->prefixStateProbe();
+        EXPECT_EQ(mock->prefixProbeCallCount(), before + 1);
+        EXPECT_EQ(summary.prefix_request.requested_tokens,
+                  diagnostic.prefix_request.requested_tokens);
+        EXPECT_EQ(summary.prefix_request.matched_tokens,
+                  diagnostic.prefix_request.matched_tokens);
+        EXPECT_EQ(summary.mtp_request.enabled, diagnostic.mtp_request.enabled);
+        EXPECT_EQ(summary.mtp_request.current_depth, diagnostic.mtp_request.current_depth);
+        EXPECT_EQ(summary.mtp_request.accepted_tokens, diagnostic.mtp_request.accepted_tokens);
+        EXPECT_EQ(summary.mtp_verifier_runs, diagnostic.mtp_verifier_runs);
     }
 
     /**

@@ -31,6 +31,7 @@
 #include <exception>
 #include <mutex>
 #include <unordered_map>
+#include "MappedTransferServiceDevice.cuh"
 
 namespace llaminar2
 {
@@ -41,7 +42,10 @@ namespace llaminar2
     {
         constexpr std::uintptr_t kDeviceAllocationAlignment = 256;
         constexpr unsigned int kMappedHostCopyThreads = 256u;
-        constexpr unsigned int kMappedHostCopyMaximumBlocks = 4096u;
+        // Small link-saturating grid: excess blocks consume inference resources
+        // without increasing PCIe throughput. Both backend economy sweeps cover
+        // 192 KiB through 4 MiB plus odd tails and both transfer directions.
+        constexpr unsigned int kMappedHostCopyMaximumBlocks = 32u;
 
         /** Logical CUDA allocation tracked by the canonical backend allocator. */
         struct CUDADeviceAllocationRecord
@@ -150,41 +154,7 @@ namespace llaminar2
             reference.store(published, ::cuda::memory_order_release);
         }
 
-        /** @brief Vectorized VRAM-to-mapped-host progress copy. */
-        __global__ void mappedHostCopyVectorKernel(
-            uint4 *__restrict__ destination,
-            const uint4 *__restrict__ source,
-            std::size_t vector_count)
-        {
-            const std::size_t stride =
-                static_cast<std::size_t>(gridDim.x) * blockDim.x;
-            for (std::size_t index =
-                     static_cast<std::size_t>(blockIdx.x) * blockDim.x +
-                     threadIdx.x;
-                 index < vector_count;
-                 index += stride)
-            {
-                destination[index] = source[index];
-            }
-        }
-
-        /** @brief Byte-total tail path for an arbitrarily aligned region. */
-        __global__ void mappedHostCopyByteKernel(
-            std::uint8_t *__restrict__ destination,
-            const std::uint8_t *__restrict__ source,
-            std::size_t bytes)
-        {
-            const std::size_t stride =
-                static_cast<std::size_t>(gridDim.x) * blockDim.x;
-            for (std::size_t index =
-                     static_cast<std::size_t>(blockIdx.x) * blockDim.x +
-                     threadIdx.x;
-                 index < bytes;
-                 index += stride)
-            {
-                destination[index] = source[index];
-            }
-        }
+#include "../../kernels/common/MappedHostCopyDevice.inl"
 
         /**
          * @brief Snapshot every host-published transfer slot into device memory.
@@ -5579,7 +5549,58 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDABackend::deviceToMappedHostByKernelOnStream(
+    bool CUDABackend::enqueueBackgroundMappedCopyOnStream(
+        void *device_region, void *mapped_host, void *mapped_alias,
+        size_t bytes, MappedTransferDirection direction,
+        int device_id, void *stream)
+    {
+        (void)requireExplicitStream(stream, "CUDABackend::enqueueBackgroundMappedCopyOnStream");
+        if (!mapped_host || !mapped_alias || !device_region || bytes == 0u)
+            return false;
+        bool accepted = false;
+        switch (direction)
+        {
+        case MappedTransferDirection::DeviceToHost:
+            accepted = copyDeviceVisibleRegionByKernelOnStream(
+                mapped_alias, device_region, bytes, device_id, stream);
+            break;
+        case MappedTransferDirection::HostToDevice:
+            accepted = copyDeviceVisibleRegionByKernelOnStream(
+                device_region, mapped_alias, bytes, device_id, stream);
+            break;
+        }
+        if (accepted)
+            PerfStatsCollector::addCounter("moe_overlay_residency",
+                "background_mapped_copy_bytes", static_cast<double>(bytes),
+                "maintenance", "cuda:" + std::to_string(device_id),
+                {{"copy_mechanism", "bounded_copy_kernel"},
+                 {"direction", direction == MappedTransferDirection::DeviceToHost ? "d2h" : "h2d"}});
+        return accepted;
+    }
+
+    bool CUDABackend::prepareMappedHostCopyKernels(int device_id)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !setDevice(device_id))
+            return false;
+        // Function resolution is a setup edge. It must not happen for the
+        // first time after inference has entered a peer-held native graph.
+        cudaFuncAttributes attributes{};
+        const cudaError_t vector_error = cudaFuncGetAttributes(
+            &attributes, mappedHostCopyVectorKernel);
+        const cudaError_t byte_error = cudaFuncGetAttributes(
+            &attributes, mappedHostCopyByteKernel);
+        if (vector_error != cudaSuccess || byte_error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend] mapped-copy preparation failed: "
+                      << cudaGetErrorString(
+                             vector_error != cudaSuccess ? vector_error : byte_error));
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::copyDeviceVisibleRegionByKernelOnStream(
         void *dst,
         const void *src,
         size_t bytes,
@@ -5588,7 +5609,7 @@ namespace llaminar2
     {
         cudaStream_t cuda_stream = requireExplicitStream(
             stream,
-            "CUDABackend::deviceToMappedHostByKernelOnStream");
+            "CUDABackend::copyDeviceVisibleRegionByKernelOnStream");
         if (!dst || !src || bytes == 0u ||
             device_id < 0 || device_id >= device_count_ ||
             !setDevice(device_id))
@@ -5598,11 +5619,11 @@ namespace llaminar2
 
         const bool vector_aligned =
             reinterpret_cast<std::uintptr_t>(dst) % alignof(uint4) == 0u &&
-            reinterpret_cast<std::uintptr_t>(src) % alignof(uint4) == 0u &&
-            bytes % sizeof(uint4) == 0u;
+            reinterpret_cast<std::uintptr_t>(src) % alignof(uint4) == 0u;
         if (vector_aligned)
         {
-            const std::size_t vector_count = bytes / sizeof(uint4);
+            const std::size_t vector_count =
+                bytes / sizeof(uint4) + (bytes % sizeof(uint4) != 0u);
             mappedHostCopyVectorKernel<<<
                 mappedHostCopyBlocks(vector_count),
                 kMappedHostCopyThreads,
@@ -5610,7 +5631,7 @@ namespace llaminar2
                 cuda_stream>>>(
                 static_cast<uint4 *>(dst),
                 static_cast<const uint4 *>(src),
-                vector_count);
+                bytes);
         }
         else
         {
@@ -5626,11 +5647,62 @@ namespace llaminar2
         const cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess)
         {
-            LOG_ERROR("[CUDABackend::deviceToMappedHostByKernelOnStream] failed: "
+            LOG_ERROR("[CUDABackend::copyDeviceVisibleRegionByKernelOnStream] failed: "
                       << cudaGetErrorString(error));
             return false;
         }
         return true;
+    }
+
+    bool CUDABackend::initializeMappedTransferService(
+        MappedTransferServiceCursor *cursors, size_t capacity,
+        int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "initializeMappedTransferService");
+        if (!cursors || !capacity ||
+            capacity > std::numeric_limits<size_t>::max() / sizeof(*cursors) ||
+            !setDevice(device_id))
+            return false;
+        // Resolve both functions while setup may allocate/load modules. There
+        // must be no lazy module operation when a held graph is already live.
+        cudaFuncAttributes attributes{};
+        if (cudaFuncGetAttributes(&attributes, mappedTransferServiceKernel) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, mappedTransferIntervalKernel) != cudaSuccess)
+            return false;
+        return cudaMemsetAsync(cursors, 0, capacity * sizeof(*cursors), native) == cudaSuccess;
+    }
+
+    bool CUDABackend::enqueueMappedTransferInterval(
+        std::uint32_t *interval, MappedTransferInterval value,
+        int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "enqueueMappedTransferInterval");
+        if (!interval || (value != MappedTransferInterval::Open && value != MappedTransferInterval::Closed) ||
+            !setDevice(device_id))
+            return false;
+        mappedTransferIntervalKernel<<<1u, 1u, 0u, native>>>(interval, value);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    bool CUDABackend::enqueueMappedTransferService(
+        const MappedTransferProgressCommand *commands,
+        MappedTransferProgressCompletion *completions,
+        MappedTransferServiceCursor *cursors, size_t capacity,
+        size_t maximum_bytes, const std::uint32_t *interval,
+        MappedTransferServiceRun run, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "enqueueMappedTransferService");
+        if (!commands || !completions || !cursors || !capacity || !maximum_bytes ||
+            (run != MappedTransferServiceRun::PublishedPass && run != MappedTransferServiceRun::CapturedInterval) ||
+            ((run == MappedTransferServiceRun::CapturedInterval) != (interval != nullptr)) ||
+            !setDevice(device_id))
+            return false;
+        // Four independent CTAs bound interference while servicing concurrent
+        // lanes. The grid is physical-service geometry, never model layer count.
+        const auto blocks = static_cast<unsigned>(std::min<size_t>(capacity, 4u));
+        mappedTransferServiceKernel<<<blocks, 256u, 0u, native>>>(
+            commands, completions, cursors, capacity, maximum_bytes, interval, run);
+        return cudaGetLastError() == cudaSuccess;
     }
 
     bool CUDABackend::enqueueMappedTransferProgressClaims(

@@ -76,7 +76,7 @@ namespace
         BackendThresholds thresholds,
         std::vector<float> pipeline_weights = {})
     {
-        return qwen35ParityDefinition(
+        auto definition = qwen35ParityDefinition(
             std::move(model),
             ModelParityTopologyDefinition{
                 .test_id = std::move(topology_id),
@@ -91,6 +91,7 @@ namespace
                 .pipeline_weights = std::move(pipeline_weights),
             },
             std::move(thresholds));
+        return definition;
     }
 
     /** @return Canonically expanded dense Qwen3.5 local-pipeline cases. */

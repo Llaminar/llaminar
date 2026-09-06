@@ -6,6 +6,10 @@
  * ordered on a context-owned auxiliary stream, followed by one reusable event.
  * The maintenance worker queries that event and either commits a completed D2H
  * chunk to final CPU storage or submits the next H2D/conversion chunk.
+ * All physical copies use TransferEngine's backend-native background mechanism;
+ * an unrelated captured DMA node must not strand a CPU edge and the GPU relays
+ * sharing its stream. Repack arithmetic and the terminal-event lifecycle do not
+ * depend on the physical copy mechanism.
  */
 
 #include "ExpertTierWeightTransferLane.h"
@@ -67,6 +71,8 @@ namespace llaminar2
         if (config_.lane_name.empty())
             throw std::invalid_argument(
                 "Expert tier transfer lane requires a stable non-empty name");
+        if (config_.progress.epoch() && config_.progress.epoch()->device() != config_.device)
+            throw std::invalid_argument("Expert tier transfer progress authority belongs to another device");
         if (config_.perf_device.empty())
             config_.perf_device = config_.device.to_string();
     }
@@ -142,6 +148,14 @@ namespace llaminar2
                 config_.staging.mutableDeviceData());
             pinned_chunk_ = static_cast<std::uint8_t *>(
                 config_.staging.mutablePinnedData());
+            if (const auto &epoch = config_.progress.epoch())
+            {
+                auto mapped = TransferEngine::instance().mappedStagingView(config_.staging);
+                service_read_ = epoch->reserveSlot(MappedTransferDirection::DeviceToHost,
+                    mapped, config_.lane_name + ":read");
+                service_write_ = epoch->reserveSlot(MappedTransferDirection::HostToDevice,
+                    std::move(mapped), config_.lane_name + ":write");
+            }
             if (!chunk_ready_event_ || !device_chunk_ || !pinned_chunk_ ||
                 (config_.collect_timing_measurements &&
                  (!chunk_timing_start_event_ || !chunk_timing_stop_event_)))
@@ -333,6 +347,9 @@ namespace llaminar2
         }
 
         direction_ = Direction::GpuToCpuContiguous;
+        source_dependency_ = source_readiness.requiresProducerWait()
+            ? TransferProducerDependency::afterEvent(source_readiness.event())
+            : TransferProducerDependency::published();
         layout_ = {};
         gpu_source_ = {};
         gpu_destination_ = {};
@@ -548,6 +565,9 @@ namespace llaminar2
             return false;
         }
 
+        if (serviceCommand())
+            return publishContiguousChunk(byte_offset, bytes, error);
+
         bool timing_started = true;
         if (config_.collect_timing_measurements)
         {
@@ -562,9 +582,10 @@ namespace llaminar2
         {
             const bool converted = submitted && launchGpuToCpuChunk(
                 completed_units_, unit_count, bytes);
-            const bool copied = converted && backend_->deviceToHostOnStream(
-                pinned_chunk_, device_chunk_, bytes,
-                device_ordinal_, transfer_stream_);
+            const bool copied = converted && TransferEngine::instance().enqueueBackgroundStagingCopy(
+                config_.execution, MappedTransferDirection::DeviceToHost,
+                device_chunk_, config_.staging.sizeBytes(), 0u,
+                config_.staging, 0u, bytes, &failure_);
             submitted = converted && copied;
         }
         else if (direction_ == Direction::CpuToGpuRepacked)
@@ -581,21 +602,20 @@ namespace llaminar2
                 bytes);
             recordHostCopyDuration(
                 std::chrono::steady_clock::now() - host_copy_started);
-            const bool copied = submitted && backend_->hostToDeviceOnStream(
-                device_chunk_, pinned_chunk_, bytes,
-                device_ordinal_, transfer_stream_);
+            const bool copied = submitted && TransferEngine::instance().enqueueBackgroundStagingCopy(
+                config_.execution, MappedTransferDirection::HostToDevice,
+                device_chunk_, config_.staging.sizeBytes(), 0u,
+                config_.staging, 0u, bytes, &failure_);
             const bool converted = copied && launchCpuToGpuChunk(
                 completed_units_, unit_count, bytes);
             submitted = copied && converted;
         }
         else if (direction_ == Direction::GpuToCpuContiguous)
         {
-            submitted = submitted && backend_->deviceToHostOnStream(
-                pinned_chunk_,
-                gpu_contiguous_source_ + byte_offset,
-                bytes,
-                device_ordinal_,
-                transfer_stream_);
+            submitted = submitted && TransferEngine::instance().enqueueBackgroundStagingCopy(
+                config_.execution, MappedTransferDirection::DeviceToHost,
+                const_cast<std::uint8_t *>(gpu_contiguous_source_),
+                contiguous_total_bytes_, byte_offset, config_.staging, 0u, bytes, &failure_);
         }
         else if (direction_ == Direction::CpuToGpuContiguous)
         {
@@ -604,12 +624,10 @@ namespace llaminar2
                 pinned_chunk_, cpu_source_.data() + byte_offset, bytes);
             recordHostCopyDuration(
                 std::chrono::steady_clock::now() - host_copy_started);
-            submitted = submitted && backend_->hostToDeviceOnStream(
-                gpu_contiguous_destination_ + byte_offset,
-                pinned_chunk_,
-                bytes,
-                device_ordinal_,
-                transfer_stream_);
+            submitted = submitted && TransferEngine::instance().enqueueBackgroundStagingCopy(
+                config_.execution, MappedTransferDirection::HostToDevice,
+                gpu_contiguous_destination_, contiguous_total_bytes_, byte_offset,
+                config_.staging, 0u, bytes, &failure_);
         }
         else
         {
@@ -649,9 +667,10 @@ namespace llaminar2
         in_flight_timing_valid_ = timing_started && timing_stopped;
         if (!submitted)
         {
-            failure_ = in_flight_timing_valid_
-                           ? "Tier transfer failed to submit a conversion/DMA chunk"
-                           : "Tier transfer failed to record exact timing events";
+            if (failure_.empty())
+                failure_ = in_flight_timing_valid_
+                               ? "Tier transfer failed to submit a conversion/copy chunk"
+                               : "Tier transfer failed to record exact timing events";
             if (!in_flight_timing_valid_ &&
                 config_.collect_timing_measurements)
             {
@@ -660,6 +679,48 @@ namespace llaminar2
         }
         recordSubmittedChunk(bytes);
         return true;
+    }
+
+    MappedTransferProgressSlot *ExpertTierWeightTransferLane::serviceCommand() noexcept
+    {
+        if (!config_.progress.epoch() || !isContiguousDirection())
+            return nullptr;
+        return isGpuToCpuDirection() ? &service_read_ : &service_write_;
+    }
+
+    bool ExpertTierWeightTransferLane::publishContiguousChunk(
+        std::size_t byte_offset, std::size_t bytes, std::string *error) noexcept
+    {
+        try
+        {
+            if (isGpuToCpuDirection())
+                service_read_.publishDeviceToMappedHost(gpu_contiguous_source_,
+                    contiguous_total_bytes_, byte_offset, bytes, source_dependency_);
+            else
+            {
+                const auto started = std::chrono::steady_clock::now();
+                std::memcpy(pinned_chunk_, cpu_source_.data() + byte_offset, bytes);
+                recordHostCopyDuration(std::chrono::steady_clock::now() - started);
+                service_write_.publishMappedHostToDevice(gpu_contiguous_destination_,
+                    contiguous_total_bytes_, byte_offset, bytes);
+            }
+            // Once published, staging cannot be reclaimed on an enqueue error.
+            // Only this generation's GPU receipt can retire its ownership.
+            work_may_be_in_flight_ = true;
+            in_flight_bytes_ = bytes;
+            in_flight_units_ = 0u;
+            in_flight_timing_valid_ = false;
+            fail_after_in_flight_event_ = false;
+            recordSubmittedChunk(bytes);
+            if (!config_.progress.epoch()->submitOutstandingProgress())
+                throw std::runtime_error("Expert tier graph service could not progress accepted work");
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            fail(exception.what(), error);
+            return false;
+        }
     }
 
     ExpertTierWeightTransferProgress ExpertTierWeightTransferLane::poll(
@@ -673,7 +734,30 @@ namespace llaminar2
         }
 
         bool ready = false;
-        if (!gpu_context_->queryEventChecked(chunk_ready_event_, ready))
+        if (auto *command = serviceCommand())
+        {
+            if (!config_.progress.epoch()->submitOutstandingProgress())
+                return fail("Expert tier graph progress failed", error);
+            const auto result = command->poll(&failure_);
+            if (result == MappedTransferProgress::Failed)
+            {
+                work_may_be_in_flight_ = command->pending();
+                return fail(failure_, error);
+            }
+            ready = result == MappedTransferProgress::Ready;
+            if (ready && config_.collect_timing_measurements)
+            {
+                const auto elapsed = command->completedDeviceNanoseconds();
+                if (!elapsed)
+                {
+                    work_may_be_in_flight_ = false;
+                    return fail("Graph transfer completion lacks device timing evidence", error);
+                }
+                transfer_device_nanoseconds_ = saturatingExpertTierMeasurementAdd(
+                    transfer_device_nanoseconds_, *elapsed);
+            }
+        }
+        else if (!gpu_context_->queryEventChecked(chunk_ready_event_, ready))
             return fail("Tier transfer completion event query failed", error);
         if (!ready)
         {

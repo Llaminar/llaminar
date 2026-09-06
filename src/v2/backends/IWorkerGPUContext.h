@@ -10,6 +10,7 @@
 #pragma once
 
 #include "IGPUGraphCapture.h"
+#include "GPUBlasSubmission.h"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -92,11 +93,12 @@ namespace llaminar2
      * - `submitAndWait()`, `submitAsync()`
      * - `synchronize()`
      * - `collectiveComm()` (read-only access)
+     * - `acquireBlasSubmission()` (serialized host submission, no GPU wait)
      *
      * **Worker-thread-only methods** (must be called from within submitted work):
      * - `defaultStream()`, `createStream()`, `destroyStream()`
      * - `createEvent()`, `destroyEvent()`, `recordEvent()`, `waitEvent()`, `queryEventChecked()`, `synchronizeEvent()`
-     * - `blasHandle()`
+     * - Raw library-handle inspection outside a scoped BLAS submission
      * - `setCollectiveComm()` (write access)
      *
      * ## Usage Pattern
@@ -106,8 +108,8 @@ namespace llaminar2
      * context->submitAndWait([&] {
      *     // Inside here, we're on the worker thread
      *     void* stream = context->defaultStream();
-     *     void* handle = context->blasHandle();
-     *     // ... launch kernels, call cuBLAS/hipBLAS ...
+     *     auto blas = context->acquireBlasSubmission();
+     *     // Bind the exact stream and arena workspace, then enqueue BLAS work.
      * });
      *
      * // Or asynchronously
@@ -467,13 +469,14 @@ namespace llaminar2
         virtual float eventElapsedTime(void *start, void *stop) = 0;
 
         // =========================================================================
-        // Library Handles (worker-thread-only)
+        // Persistent library handles and serialized, exact-stream submissions
         // =========================================================================
 
         /**
          * @brief Get the BLAS library handle for this device
          * @return Platform-specific handle (cublasHandle_t or hipblasHandle_t)
-         * @thread_safety Must be called from worker thread (within submitted work)
+         * @thread_safety Immutable while initialized. Library calls require the
+         *                scope returned by acquireBlasSubmission(), on any thread.
          *
          * @note The handle is created during context initialization and persists
          *       for the lifetime of the context
@@ -484,12 +487,31 @@ namespace llaminar2
          * @brief Get the cuBLASLt/hipBLASLt handle for this device (for fused GEMM operations)
          * @return Raw handle pointer (cublasLtHandle_t or hipblasLtHandle_t cast to void*)
          *         nullptr if not available
-         * @thread_safety Must be called from worker thread (within submitted work)
+         * @thread_safety Immutable while initialized. Library calls require the
+         *                scope returned by acquireBlasSubmission(), on any thread.
          *
          * @note The handle is created during context initialization and persists
          *       for the lifetime of the context. Used for fused operations like GEMM+bias.
          */
         virtual void *blasLtHandle() = 0;
+
+        /**
+         * @brief Serialize exact stream/workspace binding and one complete BLAS call.
+         * @return Scope borrowing this context's persistent library handles.
+         * @throws std::logic_error If context initialization is incomplete.
+         *
+         * Unlike setup work submission, this scope does not marshal to a worker
+         * thread and never waits for device execution. Handle pointers are
+         * immutable throughout the live context generation. Every BLAS caller
+         * shares this lock, including distinct projection adapter instances.
+         * Context retirement remains an exclusive, already-quiescent lifecycle.
+         */
+        [[nodiscard]] GPUBlasSubmission acquireBlasSubmission()
+        {
+            if (!isInitialized())
+                throw std::logic_error("GPU BLAS submission requires a live worker context");
+            return GPUBlasSubmission(blas_submission_mutex_, blasHandle(), blasLtHandle());
+        }
 
         // =========================================================================
         // Collective Communicator (set by collective backend during initialization)
@@ -670,6 +692,9 @@ namespace llaminar2
 
     protected:
         IWorkerGPUContext() = default;
+
+    private:
+        std::mutex blas_submission_mutex_; ///< Host API state, not a GPU execution barrier.
     };
 
 } // namespace llaminar2

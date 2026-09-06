@@ -4,32 +4,118 @@
  *
  * CUDA conditional nodes accept a narrower set of body-node types than an
  * ordinary captured graph. Event record/wait nodes, host nodes, allocation
- * nodes, and nested conditionals are forbidden inside Llaminar's transaction
- * fragments. Parent construction authenticates every source graph recursively
- * and fails before composition when a producer exposes one of those nodes.
+ * nodes, and nested conditionals cannot be cloned into transaction bodies.
+ * Retained ordered timelines instead record fragments directly in their final
+ * parent, preserving conditional handle identity without cloning or recapture.
+ * Cloned conditional-body compositions authenticate source graphs recursively.
  * Ordering must be expressed by the graph's native dependency edges at the
  * producer; graph composition never rewrites a captured lifecycle after the
  * fact.
+ * Mapped peer waits occupy a single sleeping warp rather than a batch-memory
+ * scheduling channel: outstanding waits from distinct graph executables must
+ * not prevent an independent controller or DMA producer from making progress.
  */
 
 #ifdef HAVE_CUDA
 
 #include "CUDAGraphCapture.h"
+#include "../NativeParallelGraphBranch.h"
 #include "../../utils/Logger.h"
 
 #include <cuda.h>
+#include <cuda/atomic>
 
 #include <algorithm>
 #include <array>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace llaminar2
 {
+    /**
+     * @brief One native graph definition shared by its owner and recording views.
+     *
+     * Conditional handles are born in this definition and never cloned. Views
+     * keep storage alive but cannot instantiate it. Only the owner seals the
+     * complete fragment set, then creates the sole executable.
+     */
+    struct CUDAGraphCapture::OrderedTimelineRecording
+    {
+        enum class State { Open, Recording, Sealed, Failed };
+        cudaGraph_t graph = nullptr;
+        int device_ordinal = -1;
+        State state = State::Open;
+        std::size_t fragment_count = 0u;
+
+        /** @brief Release the definition once the last owner/view is retired. */
+        ~OrderedTimelineRecording()
+        {
+            if (graph)
+            {
+                if (cudaSetDevice(device_ordinal) != cudaSuccess ||
+                    cudaGraphDestroy(graph) != cudaSuccess)
+                {
+                    LOG_ERROR("[CUDAGraphCapture] Failed to retire ordered timeline definition");
+                    std::terminate();
+                }
+            }
+        }
+    };
+
     namespace
     {
+        /**
+         * @brief Acquire a peer timeline without blocking a CUDA work channel.
+         *
+         * Native batch-memory waits can starve unrelated submissions when
+         * distinct retained graphs expose several pending peers. A one-thread
+         * kernel leaves copy engines and other SMs available to the producer.
+         * The sleep limits polling traffic; the final system-acquire load
+         * orders the peer's payload before dependent graph work consumes it.
+         */
+        __global__ void waitSystemAcquireValue64(
+            std::uint64_t *signal,
+            std::uint64_t value)
+        {
+            cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system> word(*signal);
+            while (word.load(cuda::memory_order_acquire) < value)
+                __nanosleep(128u);
+        }
+
+        /**
+         * @brief Append one single-warp system-acquire wait at an exact frontier.
+         * @return CUDA validation or graph construction status.
+         *
+         * Active capture and explicit timeline composition use this same
+         * lowering so transaction construction cannot change progress semantics.
+         */
+        cudaError_t addSystemWaitValue64Node(
+            cudaGraphNode_t *node,
+            cudaGraph_t graph,
+            const cudaGraphNode_t *dependencies,
+            std::size_t dependency_count,
+            void *signal,
+            std::uint64_t value) noexcept
+        {
+            if (!node || !graph || !signal || value == 0u ||
+                (dependency_count > 0u && !dependencies) ||
+                (reinterpret_cast<std::uintptr_t>(signal) &
+                 (alignof(std::uint64_t) - 1u)) != 0u)
+                return cudaErrorInvalidValue;
+            auto *signal_argument = static_cast<std::uint64_t *>(signal);
+            void *arguments[] = {&signal_argument, &value};
+            cudaKernelNodeParams params{};
+            params.func = reinterpret_cast<void *>(waitSystemAcquireValue64);
+            params.gridDim = dim3(1u, 1u, 1u);
+            params.blockDim = dim3(1u, 1u, 1u);
+            params.kernelParams = arguments;
+            return cudaGraphAddKernelNode(
+                node, graph, dependencies, dependency_count, &params);
+        }
+
         /**
          * @brief Publish mapped timeline state after flushing prior GPU writes.
          *
@@ -126,55 +212,16 @@ namespace llaminar2
             return false;
         }
 
-        CUcontext context = nullptr;
-        CUresult driver_status = cuCtxGetCurrent(&context);
-        if (driver_status != CUDA_SUCCESS || !context)
+        cudaGraphNode_t runtime_node = nullptr;
+        runtime_status = addSystemWaitValue64Node(
+            &runtime_node, graph, dependencies, dependency_count, signal, value);
+        if (runtime_status != cudaSuccess || !runtime_node)
         {
             LOG_ERROR(
-                "[CUDAGraphCapture] Active timeline wait has no current CUDA context");
+                "[CUDAGraphCapture] addSystemWaitValue64Node(active timeline wait) failed: "
+                << cudaGetErrorString(runtime_status));
             return false;
         }
-
-        CUstreamBatchMemOpParams operation{};
-        operation.waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
-        operation.waitValue.address = static_cast<CUdeviceptr>(
-            reinterpret_cast<std::uintptr_t>(signal));
-        operation.waitValue.value64 = value;
-        operation.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
-        CUDA_BATCH_MEM_OP_NODE_PARAMS params{
-            .ctx = context,
-            .count = 1u,
-            .paramArray = &operation,
-            .flags = 0u,
-        };
-
-        std::vector<CUgraphNode> driver_dependencies;
-        driver_dependencies.reserve(dependency_count);
-        for (std::size_t index = 0u; index < dependency_count; ++index)
-        {
-            driver_dependencies.push_back(
-                reinterpret_cast<CUgraphNode>(dependencies[index]));
-        }
-        CUgraphNode driver_node = nullptr;
-        driver_status = cuGraphAddBatchMemOpNode(
-            &driver_node,
-            reinterpret_cast<CUgraph>(graph),
-            driver_dependencies.empty() ? nullptr
-                                        : driver_dependencies.data(),
-            driver_dependencies.size(),
-            &params);
-        if (driver_status != CUDA_SUCCESS || !driver_node)
-        {
-            const char *description = nullptr;
-            (void)cuGetErrorString(driver_status, &description);
-            LOG_ERROR(
-                "[CUDAGraphCapture] cuGraphAddBatchMemOpNode(active timeline wait) failed: "
-                << (description ? description : "unknown CUDA error"));
-            return false;
-        }
-
-        cudaGraphNode_t runtime_node =
-            reinterpret_cast<cudaGraphNode_t>(driver_node);
         runtime_status = cudaStreamUpdateCaptureDependencies(
             stream,
             &runtime_node,
@@ -857,6 +904,8 @@ namespace llaminar2
          * @param nesting_depth Number of child-graph edges already traversed.
          * @param kernel_nodes Destination inventory.
          * @param error Receives a precise native-API failure.
+         * @param selected_nodes Optional fragment-local roots/nodes; nested child
+         *        graphs are still traversed recursively. Null inspects the whole graph.
          * @return true only when every reachable node was inspected.
          */
         bool inspectCudaKernelNodesRecursive(
@@ -864,10 +913,12 @@ namespace llaminar2
             const std::string &graph_path,
             size_t nesting_depth,
             std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
-            std::string &error)
+            std::string &error,
+            const std::vector<cudaGraphNode_t> *selected_nodes = nullptr)
         {
             size_t node_count = 0;
-            CUresult status = cuGraphGetNodes(graph, nullptr, &node_count);
+            CUresult status = selected_nodes ? CUDA_SUCCESS :
+                cuGraphGetNodes(graph, nullptr, &node_count);
             if (status != CUDA_SUCCESS)
             {
                 error = "cuGraphGetNodes(count) failed at " + graph_path +
@@ -876,6 +927,9 @@ namespace llaminar2
             }
 
             std::vector<CUgraphNode> nodes(node_count);
+            if (selected_nodes)
+                for (const auto node : *selected_nodes)
+                    nodes.push_back(reinterpret_cast<CUgraphNode>(node));
             if (node_count > 0)
             {
                 status = cuGraphGetNodes(graph, nodes.data(), &node_count);
@@ -1499,6 +1553,12 @@ namespace llaminar2
           ordered_timeline_timing_pending_(
               other.ordered_timeline_timing_pending_)
     {
+        timeline_recording_ = std::move(other.timeline_recording_);
+        recording_role_ = other.recording_role_;
+        fragment_state_ = other.fragment_state_;
+        fragment_entry_ = other.fragment_entry_;
+        fragment_exit_ = other.fragment_exit_;
+        fragment_nodes_ = std::move(other.fragment_nodes_);
         other.stream_ = nullptr;
         other.device_ordinal_ = -1;
         other.graph_ = nullptr;
@@ -1523,6 +1583,12 @@ namespace llaminar2
                 std::move(other.ordered_timeline_timing_events_);
             ordered_timeline_timing_pending_ =
                 other.ordered_timeline_timing_pending_;
+            timeline_recording_ = std::move(other.timeline_recording_);
+            recording_role_ = other.recording_role_;
+            fragment_state_ = other.fragment_state_;
+            fragment_entry_ = other.fragment_entry_;
+            fragment_exit_ = other.fragment_exit_;
+            fragment_nodes_ = std::move(other.fragment_nodes_);
             other.stream_ = nullptr;
             other.device_ordinal_ = -1;
             other.graph_ = nullptr;
@@ -1562,6 +1628,34 @@ namespace llaminar2
     {
         if (!activateOwner("beginCapture"))
             return false;
+        if (recording_role_ == RecordingRole::Fragment && !timeline_recording_)
+            return false;
+
+        if (timeline_recording_)
+        {
+            if (recording_role_ != RecordingRole::Fragment ||
+                fragment_state_ != FragmentState::Unrecorded ||
+                timeline_recording_->state != OrderedTimelineRecording::State::Open)
+                return false;
+            // Each unit starts as an independent branch in the final owner.
+            // Sealing later joins these exact frontiers in declared order; no
+            // node or conditional handle is copied or submitted a second time.
+            auto error = cudaGraphAddEmptyNode(&fragment_entry_, graph_, nullptr, 0u);
+            if (error == cudaSuccess)
+                error = cudaStreamBeginCaptureToGraph(
+                    stream_, graph_, &fragment_entry_, nullptr, 1u,
+                    cudaStreamCaptureModeRelaxed);
+            if (error != cudaSuccess)
+            {
+                timeline_recording_->state = OrderedTimelineRecording::State::Failed;
+                LOG_ERROR("[CUDAGraphCapture] Cannot record into ordered timeline: "
+                          << cudaGetErrorString(error));
+                return false;
+            }
+            fragment_state_ = FragmentState::Recording;
+            timeline_recording_->state = OrderedTimelineRecording::State::Recording;
+            return true;
+        }
 
         // Destroy any previous graph (but keep exec_ for tryUpdate)
         if (graph_)
@@ -1592,6 +1686,63 @@ namespace llaminar2
     {
         if (!activateOwner("endCapture"))
             return false;
+        if (recording_role_ == RecordingRole::Fragment && !timeline_recording_)
+            return false;
+
+        if (timeline_recording_)
+        {
+            if (recording_role_ != RecordingRole::Fragment ||
+                fragment_state_ != FragmentState::Recording ||
+                timeline_recording_->state != OrderedTimelineRecording::State::Recording)
+                return false;
+            cudaStreamCaptureStatus capture_status{};
+            cudaGraph_t captured = nullptr;
+            const cudaGraphNode_t *frontier = nullptr;
+            size_t frontier_count = 0u;
+            auto error = cudaStreamGetCaptureInfo(
+                stream_, &capture_status, nullptr, &captured, &frontier, nullptr, &frontier_count);
+            if (error == cudaSuccess && captured == graph_ && frontier_count != 0u)
+                error = cudaGraphAddEmptyNode(
+                    &fragment_exit_, graph_, frontier, frontier_count);
+            else if (error == cudaSuccess)
+                error = cudaErrorInvalidValue;
+            const auto end_error = cudaStreamEndCapture(stream_, &captured);
+            if (error == cudaSuccess)
+                error = end_error;
+            if (error != cudaSuccess || captured != graph_)
+            {
+                timeline_recording_->state = OrderedTimelineRecording::State::Failed;
+                LOG_ERROR("[CUDAGraphCapture] Cannot seal ordered timeline fragment: "
+                          << cudaGetErrorString(error));
+                return false;
+            }
+
+            // Walk only this entry's descendants, not the growing whole graph.
+            // This keeps construction O(total nodes) across many model layers.
+            fragment_nodes_ = {fragment_entry_};
+            std::unordered_set<cudaGraphNode_t> visited{fragment_entry_};
+            for (size_t index = 0u; index < fragment_nodes_.size(); ++index)
+            {
+                size_t count = 0u;
+                error = cudaGraphNodeGetDependentNodes(fragment_nodes_[index], nullptr, nullptr, &count);
+                std::vector<cudaGraphNode_t> children(count);
+                if (error == cudaSuccess && count != 0u)
+                    error = cudaGraphNodeGetDependentNodes(
+                        fragment_nodes_[index], children.data(), nullptr, &count);
+                if (error != cudaSuccess)
+                {
+                    timeline_recording_->state = OrderedTimelineRecording::State::Failed;
+                    return false;
+                }
+                for (const auto child : children)
+                    if (visited.insert(child).second)
+                        fragment_nodes_.push_back(child);
+            }
+            node_count_ = fragment_nodes_.size();
+            fragment_state_ = FragmentState::Recorded;
+            timeline_recording_->state = OrderedTimelineRecording::State::Open;
+            return true;
+        }
 
         cudaError_t err = cudaStreamEndCapture(stream_, &graph_);
         if (err != cudaSuccess)
@@ -1619,6 +1770,12 @@ namespace llaminar2
 
     bool CUDAGraphCapture::instantiate()
     {
+        if (recording_role_ == RecordingRole::Fragment)
+            return false;
+        if (timeline_recording_ &&
+            (recording_role_ != RecordingRole::Owner ||
+             timeline_recording_->state != OrderedTimelineRecording::State::Sealed))
+            return false;
         if (!activateOwner("instantiate"))
             return false;
 
@@ -1779,6 +1936,8 @@ namespace llaminar2
     bool CUDAGraphCapture::buildDeviceControlledTransaction(
         std::span<const DeviceControlledLoopFragment> ordered_fragments)
     {
+        if (timeline_recording_ || recording_role_ != RecordingRole::Owner)
+            return false;
 #if CUDART_VERSION < 12030
         (void)ordered_fragments;
         LOG_ERROR("[CUDAGraphCapture] Device-controlled graph transactions require CUDA 12.3 or newer");
@@ -1897,17 +2056,49 @@ namespace llaminar2
 #endif
     }
 
+    std::unique_ptr<IGPUGraphCapture> CUDAGraphCapture::createOrderedTimelineFragment()
+    {
+        if (!activateOwner("createOrderedTimelineFragment") || exec_ ||
+            recording_role_ != RecordingRole::Owner || node_count_ != 0u ||
+            (timeline_recording_ &&
+             timeline_recording_->state != OrderedTimelineRecording::State::Open))
+            return nullptr;
+        if (!timeline_recording_)
+        {
+            if (graph_)
+                return nullptr;
+            auto recording = std::make_shared<OrderedTimelineRecording>();
+            recording->device_ordinal = device_ordinal_;
+            if (cudaGraphCreate(&recording->graph, 0u) != cudaSuccess)
+                return nullptr;
+            timeline_recording_ = std::move(recording);
+            graph_ = timeline_recording_->graph;
+        }
+        auto fragment = std::make_unique<CUDAGraphCapture>(stream_, device_ordinal_);
+        fragment->timeline_recording_ = timeline_recording_;
+        fragment->recording_role_ = RecordingRole::Fragment;
+        fragment->graph_ = graph_;
+        ++timeline_recording_->fragment_count;
+        return fragment;
+    }
+
     bool CUDAGraphCapture::buildOrderedTimelineTransaction(
         std::span<const GPUOrderedTimelineStep> ordered_steps,
         GPUOrderedTimelineInstrumentation instrumentation)
     {
-        if (!activateOwner("buildOrderedTimelineTransaction") ||
+        if (recording_role_ != RecordingRole::Owner ||
+            !activateOwner("buildOrderedTimelineTransaction") ||
             ordered_steps.empty())
         {
             LOG_ERROR("[CUDAGraphCapture] Ordered timeline transaction requires an exact owner and non-empty steps");
             return false;
         }
 
+        if (timeline_recording_ &&
+            (recording_role_ != RecordingRole::Owner ||
+             timeline_recording_->state != OrderedTimelineRecording::State::Open))
+            return false;
+        std::unordered_set<const CUDAGraphCapture *> recorded_fragments;
         std::vector<const CUDAGraphCapture *> fragments(
             ordered_steps.size(), nullptr);
         for (std::size_t index = 0u; index < ordered_steps.size(); ++index)
@@ -1936,10 +2127,23 @@ namespace llaminar2
                 return false;
             }
             fragments[index] = fragment;
+            if (fragment->timeline_recording_ != timeline_recording_)
+                return false;
+            if (timeline_recording_ &&
+                (fragment->timeline_recording_ != timeline_recording_ ||
+                 fragment->recording_role_ != RecordingRole::Fragment ||
+                 fragment->fragment_state_ != FragmentState::Recorded ||
+                 !recorded_fragments.insert(fragment).second))
+                return false;
         }
 
-        reset();
-        cudaError_t runtime_error = cudaGraphCreate(&graph_, 0u);
+        if (timeline_recording_ &&
+            recorded_fragments.size() != timeline_recording_->fragment_count)
+            return false;
+        if (!timeline_recording_)
+            reset();
+        cudaError_t runtime_error = timeline_recording_ ? cudaSuccess :
+            cudaGraphCreate(&graph_, 0u);
         if (runtime_error != cudaSuccess)
         {
             LOG_ERROR("[CUDAGraphCapture] cudaGraphCreate failed for ordered timeline transaction: "
@@ -1954,22 +2158,6 @@ namespace llaminar2
             reset();
             return false;
         };
-        auto failDriver = [&](const char *operation, CUresult error)
-        {
-            const char *description = nullptr;
-            (void)cuGetErrorString(error, &description);
-            LOG_ERROR("[CUDAGraphCapture] " << operation
-                      << " failed for ordered timeline transaction: "
-                      << (description ? description : "unknown CUDA error"));
-            reset();
-            return false;
-        };
-
-        CUcontext context = nullptr;
-        const CUresult context_result = cuCtxGetCurrent(&context);
-        if (context_result != CUDA_SUCCESS || !context)
-            return failDriver("cuCtxGetCurrent", context_result);
-
         if (instrumentation ==
             GPUOrderedTimelineInstrumentation::PerStepEvents)
         {
@@ -2016,6 +2204,18 @@ namespace llaminar2
             if (step.kind ==
                 GPUOrderedTimelineStepKind::CapturedFragment)
             {
+                if (timeline_recording_)
+                {
+                    const auto *fragment = fragments[index];
+                    if (tail)
+                        runtime_error = cudaGraphAddDependencies(
+                            graph_, &tail, &fragment->fragment_entry_, nullptr, 1u);
+                    if (runtime_error != cudaSuccess)
+                        return failRuntime("cudaGraphAddDependencies(fragment entry)", runtime_error);
+                    tail = fragment->fragment_exit_;
+                }
+                else
+                {
                 cudaGraphNode_t node = nullptr;
                 runtime_error = cudaGraphAddChildGraphNode(
                     &node,
@@ -2024,39 +2224,55 @@ namespace llaminar2
                     tail ? 1u : 0u,
                     fragments[index]->graph());
                 if (runtime_error != cudaSuccess)
+                {
+                    // A fragment name ties a native composition error back to
+                    // its declarative stage. Inventory only on failure: graph
+                    // diagnostics must not add work to successful replay.
+                    LOG_ERROR("[CUDAGraphCapture] Rejected ordered timeline child"
+                              << " index=" << index << " name=" << step.name
+                              << " nodes=" << fragments[index]->nodeCount());
+                    size_t count = 0u;
+                    if (cudaGraphGetNodes(fragments[index]->graph(), nullptr,
+                                          &count) == cudaSuccess)
+                    {
+                        std::vector<cudaGraphNode_t> nodes(count);
+                        if (cudaGraphGetNodes(fragments[index]->graph(),
+                                              nodes.data(), &count) == cudaSuccess)
+                        {
+                            std::array<size_t, cudaGraphNodeTypeCount> census{};
+                            for (const auto source_node : nodes)
+                            {
+                                cudaGraphNodeType type = cudaGraphNodeTypeCount;
+                                if (cudaGraphNodeGetType(source_node, &type) ==
+                                        cudaSuccess && type < cudaGraphNodeTypeCount)
+                                    ++census[type];
+                            }
+                            for (size_t type = 0u; type < census.size(); ++type)
+                                if (census[type] != 0u)
+                                    LOG_ERROR("[CUDAGraphCapture] Rejected child node inventory"
+                                              << " name=" << step.name
+                                              << " type=" << cudaGraphNodeTypeName(
+                                                     static_cast<cudaGraphNodeType>(type))
+                                              << " count=" << census[type]);
+                        }
+                    }
                     return failRuntime(
                         "cudaGraphAddChildGraphNode", runtime_error);
+                }
                 tail = node;
+                }
             }
             else
             {
-                CUstreamBatchMemOpParams operation{};
                 if (step.kind == GPUOrderedTimelineStepKind::WaitValue64)
                 {
-                    operation.waitValue.operation =
-                        CU_STREAM_MEM_OP_WAIT_VALUE_64;
-                    operation.waitValue.address = static_cast<CUdeviceptr>(
-                        reinterpret_cast<std::uintptr_t>(step.signal));
-                    operation.waitValue.value64 = step.value;
-                    operation.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
-                    CUDA_BATCH_MEM_OP_NODE_PARAMS params{
-                        .ctx = context,
-                        .count = 1u,
-                        .paramArray = &operation,
-                        .flags = 0u,
-                    };
-                    CUgraphNode driver_node = nullptr;
-                    CUgraphNode driver_dependency =
-                        reinterpret_cast<CUgraphNode>(tail);
-                    const CUresult result = cuGraphAddBatchMemOpNode(
-                        &driver_node,
-                        reinterpret_cast<CUgraph>(graph_),
-                        tail ? &driver_dependency : nullptr,
-                        tail ? 1u : 0u,
-                        &params);
-                    if (result != CUDA_SUCCESS)
-                        return failDriver("cuGraphAddBatchMemOpNode", result);
-                    tail = reinterpret_cast<cudaGraphNode_t>(driver_node);
+                    cudaGraphNode_t node = nullptr;
+                    runtime_error = addSystemWaitValue64Node(
+                        &node, graph_, tail ? &tail : nullptr,
+                        tail ? 1u : 0u, step.signal, step.value);
+                    if (runtime_error != cudaSuccess)
+                        return failRuntime("addSystemWaitValue64Node", runtime_error);
+                    tail = node;
                 }
                 else
                 {
@@ -2099,10 +2315,84 @@ namespace llaminar2
         if (runtime_error != cudaSuccess)
             return failRuntime("cudaGraphGetNodes", runtime_error);
         node_count_ = count;
+        if (timeline_recording_)
+        {
+            timeline_recording_->state = OrderedTimelineRecording::State::Sealed;
+            return tail != nullptr && node_count_ != 0u;
+        }
         const std::size_t expected_node_count =
             ordered_steps.size() *
             (ordered_timeline_timing_events_.empty() ? 1u : 3u);
         return tail != nullptr && node_count_ == expected_node_count;
+    }
+
+    namespace
+    {
+        /** @brief Exact CUDA operations for the shared cold branch-DAG builder. */
+        struct CUDAParallelGraphAPI
+        {
+            using Graph = cudaGraph_t;
+            using Node = cudaGraphNode_t;
+            using Error = cudaError_t;
+            static constexpr Error success = cudaSuccess;
+            static constexpr Error invalid = cudaErrorInvalidValue;
+            /** @brief Query the owner's nodes without executing device work. */
+            static Error nodes(Graph g, Node *n, std::size_t *s) { return cudaGraphGetNodes(g, n, s); }
+            /** @brief Query a node's complete incoming frontier. */
+            static Error dependencies(Node n, Node *d, std::size_t *s) { return cudaGraphNodeGetDependencies(n, d, nullptr, s); }
+            /** @brief Query a node's complete outgoing frontier. */
+            static Error dependents(Node n, Node *d, std::size_t *s) { return cudaGraphNodeGetDependentNodes(n, d, nullptr, s); }
+            /** @brief Clone only a small branch fragment, never the original body. */
+            static Error child(Node *n, Graph g, const Node *d, std::size_t s, Graph c) { return cudaGraphAddChildGraphNode(n, g, d, s, c); }
+            /** @brief Bind an explicit native producer/consumer edge set. */
+            static Error edges(Graph g, const Node *f, const Node *t, std::size_t s) { return cudaGraphAddDependencies(g, f, t, nullptr, s); }
+            /** @brief Join the bounded worker and the inference-owned Close. */
+            static Error empty(Node *n, Graph g, const Node *d, std::size_t s) { return cudaGraphAddEmptyNode(n, g, d, s); }
+        };
+    }
+
+    bool CUDAGraphCapture::appendParallelBranch(
+        const GPUCapturedParallelBranch &branch)
+    {
+        if (!activateOwner("appendParallelBranch") || !graph_ || exec_ ||
+            node_count_ == 0u || recording_role_ != RecordingRole::Owner)
+        {
+            LOG_ERROR("[CUDAGraphCapture] Parallel decoration requires a sealed uninstantiated graph owner");
+            return false;
+        }
+        cudaStreamCaptureStatus status{};
+        if (cudaStreamIsCapturing(stream_, &status) != cudaSuccess ||
+            status != cudaStreamCaptureStatusNone)
+        {
+            LOG_ERROR("[CUDAGraphCapture] Parallel decoration cannot mutate an active recording");
+            return false;
+        }
+        const IGPUGraphCapture *sources[] = {&branch.open, &branch.worker, &branch.close};
+        std::array<cudaGraph_t, 3> fragments{};
+        for (std::size_t i = 0u; i < fragments.size(); ++i)
+        {
+            const auto *source = dynamic_cast<const CUDAGraphCapture *>(sources[i]);
+            if (!source || source == this || source->deviceOrdinal() != device_ordinal_ ||
+                !source->graph() || source->graph() == graph_ || source->nodeCount() == 0u ||
+                source->hasExecutable())
+            {
+                LOG_ERROR("[CUDAGraphCapture] Parallel fragment has incompatible graph/device ownership index=" << i);
+                return false;
+            }
+            fragments[i] = source->graph();
+        }
+        const auto result = detail::appendNativeParallelBranch<CUDAParallelGraphAPI>(graph_, fragments);
+        if (result.error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAGraphCapture] Parallel graph assembly failed operation=" <<
+                      result.operation << " error=" << cudaGetErrorString(result.error));
+            return false;
+        }
+        std::size_t count = 0u;
+        if (cudaGraphGetNodes(graph_, nullptr, &count) != cudaSuccess)
+            return false;
+        node_count_ = count;
+        return true;
     }
 
     GPUOrderedTimelineTimingSnapshot
@@ -2168,6 +2458,8 @@ namespace llaminar2
         std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
         const DeviceControlledLoopPredicate &predicate)
     {
+        if (timeline_recording_ || recording_role_ != RecordingRole::Owner)
+            return false;
 #if CUDART_VERSION < 12030
         (void)ordered_body_fragments;
         (void)predicate;
@@ -2382,6 +2674,8 @@ namespace llaminar2
         const DeviceControlledLoopPredicate &predicate,
         const DeviceControlledLoopSelector &selector_policy)
     {
+        if (timeline_recording_ || recording_role_ != RecordingRole::Owner)
+            return false;
 #if CUDART_VERSION < 12030
         (void)ordered_body_fragments;
         (void)predicate;
@@ -2868,6 +3162,8 @@ namespace llaminar2
     }
     GraphUpdateResult CUDAGraphCapture::tryUpdate()
     {
+        if (!supportsExecutableUpdate())
+            return GraphUpdateResult::Failed;
         if (!activateOwner("tryUpdate"))
             return GraphUpdateResult::Failed;
 
@@ -2910,6 +3206,43 @@ namespace llaminar2
         return node_count_;
     }
 
+    bool CUDAGraphCapture::validateFlatHelperNodeKinds(std::string *error) const
+    {
+        const auto fail = [&](const std::string &detail)
+        {
+            if (error)
+                *error = "CUDA bounded helper shape: " + detail;
+            return false;
+        };
+        if (!activateOwner("validateFlatHelperNodeKinds") || !graph_)
+            return fail("missing owner or native graph");
+        size_t count = 0u;
+        auto status = cudaGraphGetNodes(graph_, nullptr, &count);
+        if (status != cudaSuccess)
+            return fail(cudaGetErrorString(status));
+        if (count != nodeCount() || count == 0u ||
+            count > GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes)
+            return fail("helper must own one complete bounded native graph");
+        // Inspect only node kinds: resolving kernel symbols/occupancy here
+        // would turn a tiny setup guard into unnecessary profiler work.
+        std::array<cudaGraphNode_t, GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes> nodes{};
+        status = cudaGraphGetNodes(graph_, nodes.data(), &count);
+        if (status != cudaSuccess)
+            return fail(cudaGetErrorString(status));
+        for (size_t index = 0; index < count; ++index)
+        {
+            cudaGraphNodeType kind;
+            status = cudaGraphNodeGetType(nodes[index], &kind);
+            if (status != cudaSuccess)
+                return fail(cudaGetErrorString(status));
+            if (kind != cudaGraphNodeTypeKernel && kind != cudaGraphNodeTypeMemcpy &&
+                kind != cudaGraphNodeTypeMemset)
+                return fail("forbidden nested/control node at index=" + std::to_string(index) +
+                            " kind=" + std::to_string(static_cast<int>(kind)));
+        }
+        return true;
+    }
+
     bool CUDAGraphCapture::inspectKernelNodes(
         std::vector<GPUGraphKernelNodeInfo> &kernel_nodes,
         std::string *error) const
@@ -2936,7 +3269,8 @@ namespace llaminar2
                 "root",
                 0,
                 kernel_nodes,
-                inspection_error))
+                inspection_error,
+                recording_role_ == RecordingRole::Fragment ? &fragment_nodes_ : nullptr))
         {
             kernel_nodes.clear();
             if (error)
@@ -2975,9 +3309,19 @@ namespace llaminar2
         resident_memory_bytes_ = 0u;
         if (graph_)
         {
-            CUDA_WARN_IF_FAIL(cudaGraphDestroy(graph_));
+            if (!timeline_recording_)
+                CUDA_WARN_IF_FAIL(cudaGraphDestroy(graph_));
             graph_ = nullptr;
         }
+        // Invalidating the owner revokes any surviving fragment views. Their
+        // shared definition remains alive only for safe diagnostic destruction.
+        if (timeline_recording_ && recording_role_ == RecordingRole::Owner)
+            timeline_recording_->state = OrderedTimelineRecording::State::Failed;
+        timeline_recording_.reset();
+        fragment_nodes_.clear();
+        fragment_entry_ = nullptr;
+        fragment_exit_ = nullptr;
+        fragment_state_ = FragmentState::Unrecorded;
         destroyOrderedTimelineTimingEvents();
         node_count_ = 0;
     }

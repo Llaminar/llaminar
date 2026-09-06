@@ -37,6 +37,8 @@
 
 #pragma once
 
+#include "memory/CPUWeightStoragePlacement.h"
+
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -760,6 +762,7 @@ namespace llaminar2::cpu::native_vnni
      * @param N_chunks Number of 64-column destination chunks.
      * @param use_superblock Whether one source decoder call produces eight
      *        consecutive logical K blocks.
+     * @param placement Final destination first-touch policy, never a post-pack migration.
      */
     inline void packExpandedInt8Direct(
         const IINT8Unpackable &unpackable,
@@ -768,7 +771,8 @@ namespace llaminar2::cpu::native_vnni
         int N,
         int blocks_per_row,
         int N_chunks,
-        bool use_superblock)
+        bool use_superblock,
+        CPUWeightStoragePlacement placement = CPUWeightStoragePlacement::local())
     {
         if (!out.usesExpandedInt8() || out.data_stride != 2048)
         {
@@ -779,7 +783,7 @@ namespace llaminar2::cpu::native_vnni
         const size_t interleaved_total =
             static_cast<size_t>(N_chunks) * blocks_per_row *
             static_cast<size_t>(out.interleaved_block_stride);
-        out.native_interleaved.resize_uninitialized(interleaved_total);
+        out.native_interleaved = placement.allocate<uint8_t>(interleaved_total);
 
         constexpr int kBlocksPerTile = 8;
         constexpr int kColumnsPerChunk = 64;
@@ -941,12 +945,15 @@ namespace llaminar2::cpu::native_vnni
      * @param out         Output packed weights
      * @param row_start   First row to pack (for TP slicing), default 0
      * @param row_end     One-past-last row, default -1 (all rows)
+     * @param rotation    Optional activation rotation to incorporate in packed weights.
+     * @param placement   Final destination first-touch policy for every encoding.
      * @return true on success
      */
     inline bool packWeightsCPUNativeVNNI(const TensorBase *weights,
                                          CPUNativeVNNIPackedWeights &out,
                                          int row_start = 0, int row_end = -1,
-                                         const ActivationRotation *rotation = nullptr)
+                                         const ActivationRotation *rotation = nullptr,
+                                         CPUWeightStoragePlacement placement = CPUWeightStoragePlacement::local())
     {
         // Validate
         int full_N = weights->shape()[0];
@@ -1214,7 +1221,7 @@ namespace llaminar2::cpu::native_vnni
             const size_t interleaved_total =
                 static_cast<size_t>(N_chunks) * blocks_per_row *
                 out.interleaved_block_stride;
-            out.native_interleaved.resize_uninitialized(interleaved_total);
+            out.native_interleaved = placement.allocate<uint8_t>(interleaved_total);
 
 #pragma omp parallel for schedule(static) collapse(2)
             for (int chunk = 0; chunk < N_chunks; ++chunk)
@@ -1436,7 +1443,7 @@ namespace llaminar2::cpu::native_vnni
             // The following parallel pass writes every byte. Avoid a
             // single-threaded zero fill here because it first-touches the whole
             // permanent weight buffer on the allocator thread's NUMA node.
-            out.native_interleaved.resize_uninitialized(interleaved_total);
+            out.native_interleaved = placement.allocate<uint8_t>(interleaved_total);
 
 #pragma omp parallel for schedule(static) collapse(2)
             for (int chunk = 0; chunk < N_chunks; ++chunk)
@@ -1527,7 +1534,8 @@ namespace llaminar2::cpu::native_vnni
                 N,
                 blocks_per_row,
                 N_chunks,
-                use_superblock);
+                use_superblock,
+                placement);
         }
 
         // =================================================================
@@ -1543,7 +1551,7 @@ namespace llaminar2::cpu::native_vnni
             // The following parallel pass writes every byte. Avoid a
             // single-threaded zero fill here because it first-touches the whole
             // permanent weight buffer on the allocator thread's NUMA node.
-            out.native_interleaved.resize_uninitialized(interleaved_total);
+            out.native_interleaved = placement.allocate<uint8_t>(interleaved_total);
 
 #pragma omp parallel for schedule(static) collapse(2)
             for (int chunk = 0; chunk < N_chunks; ++chunk)

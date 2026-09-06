@@ -21,12 +21,49 @@
 
 #pragma once
 
+#include "execution/mtp/MTPSidecarCaptureLayout.h"
+
 #include <atomic>
 #include <cstdint>
 #include <mutex>
 
 namespace llaminar2
 {
+    /** @brief Sole placement owner for one semantic MTP sidecar role. */
+    enum class MoEOverlaySidecarEpochOwnership : std::uint8_t
+    {
+        NoExpertAccess, ///< KV append uses fixed projections, never routed experts.
+        ExternalReader, ///< A standalone full sidecar acquires its own reader.
+        GraphSequence, ///< The coordinator's admitted sequence owns the reader.
+    };
+
+    /**
+     * @brief Select residency ownership independently of maintenance activity.
+     * @param role Semantic role of the retained sidecar graph.
+     * @param has_coordinator Whether an overlay graph-sequence authority is bound.
+     * @return The only authority allowed to acquire placement for this sidecar.
+     *
+     * KV-only work must not pin an ambient reader: placement may advance between
+     * shifted-KV completion and admission of the next main transaction. That
+     * transaction acquires its own admitted epoch after joining the KV event.
+     */
+    [[nodiscard]] constexpr MoEOverlaySidecarEpochOwnership
+    moeOverlaySidecarEpochOwnership(
+        MTPSidecarCaptureRole role, bool has_coordinator)
+    {
+        switch (role)
+        {
+        case MTPSidecarCaptureRole::KVOnly:
+            return MoEOverlaySidecarEpochOwnership::NoExpertAccess;
+        case MTPSidecarCaptureRole::Full:
+        case MTPSidecarCaptureRole::Chained:
+            return has_coordinator
+                       ? MoEOverlaySidecarEpochOwnership::GraphSequence
+                       : MoEOverlaySidecarEpochOwnership::ExternalReader;
+        }
+        throw std::logic_error("Unknown MTP sidecar residency role");
+    }
+
     /**
      * @brief Complete semantic owner of one device-resident overlay reader.
      *

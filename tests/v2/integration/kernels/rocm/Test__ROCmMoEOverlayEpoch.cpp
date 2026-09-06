@@ -8,6 +8,7 @@
  */
 
 #include "execution/moe/MoEOverlayDeviceEpochProtocol.h"
+#include "execution/moe/MoEOverlayEpochLeaseLifecycle.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "kernels/IMoEKernel.h"
@@ -730,6 +731,88 @@ namespace llaminar2::test
             device_control_,
             &device_tickets_[1],
             &device_statuses_[6]));
+    }
+
+    /**
+     * @brief KV-only completion cannot donate an obsolete reader to main decode.
+     *
+     * Record a KV-only stand-in (a persistent device mailbox write), publish a
+     * newer placement on the independent maintenance stream, then launch the
+     * retained main acquire/consume/release graph. The whole DAG is event-ordered;
+     * the host observes only the final ticket. Production uses the same typed
+     * sidecar policy, so changing KV-only to acquire recreates the stale reader.
+     */
+    TEST_F(ROCmMoEOverlayEpochTest,
+           KVOnlySidecarDoesNotPinPlacementBeforeMainAdmission)
+    {
+        ASSERT_EQ(hipStreamBeginCapture(
+                      inference_stream_, hipStreamCaptureModeGlobal),
+                  hipSuccess);
+        const auto owner = moeOverlaySidecarEpochOwnership(
+            MTPSidecarCaptureRole::KVOnly, true);
+        if (owner == MoEOverlaySidecarEpochOwnership::ExternalReader)
+        {
+            ASSERT_TRUE(kernel_->acquireMoEOverlayEpoch(
+                inferenceLaunch(), device_control_, &device_tickets_[0],
+                &device_statuses_[0]));
+        }
+        ASSERT_EQ(hipMemsetAsync(device_evidence_, 0,
+                                     sizeof(*device_evidence_), inference_stream_),
+                  hipSuccess);
+        ASSERT_EQ(hipStreamEndCapture(inference_stream_, &graph_),
+                  hipSuccess);
+        ASSERT_EQ(hipGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0),
+                  hipSuccess);
+        ASSERT_EQ(hipGraphLaunch(graph_exec_, inference_stream_), hipSuccess);
+        ASSERT_EQ(hipEventRecord(inference_event_, inference_stream_), hipSuccess);
+        ASSERT_EQ(hipStreamWaitEvent(maintenance_stream_, inference_event_, 0),
+                  hipSuccess);
+
+        ASSERT_TRUE(kernel_->reserveMoEOverlayEpochCandidate(
+            maintenanceLaunch(), device_control_, &device_epochs_[0],
+            &device_statuses_[2]));
+        ASSERT_TRUE(kernel_->markMoEOverlayEpochCandidateReady(
+            maintenanceLaunch(), device_control_, &device_epochs_[0],
+            &device_statuses_[3]));
+        ASSERT_TRUE(kernel_->publishMoEOverlayEpochCandidate(
+            maintenanceLaunch(), device_control_, &device_epochs_[0],
+            &device_statuses_[4]));
+        ASSERT_EQ(hipEventRecord(maintenance_event_, maintenance_stream_),
+                  hipSuccess);
+        ASSERT_EQ(hipStreamWaitEvent(inference_stream_, maintenance_event_, 0),
+                  hipSuccess);
+
+        // The next graph owns a fresh acquire, not the sidecar's old ticket.
+        ASSERT_EQ(hipStreamBeginCapture(
+                      inference_stream_, hipStreamCaptureModeGlobal),
+                  hipSuccess);
+        ASSERT_TRUE(kernel_->acquireMoEOverlayEpoch(
+            inferenceLaunch(), device_control_, &device_tickets_[0],
+            &device_statuses_[5]));
+        ASSERT_EQ(hipMemcpyAsync(device_evidence_, &device_tickets_[0],
+                                     sizeof(*device_evidence_),
+                                     hipMemcpyDeviceToDevice, inference_stream_),
+                  hipSuccess);
+        ASSERT_TRUE(kernel_->releaseMoEOverlayEpoch(
+            inferenceLaunch(), device_control_, &device_tickets_[0],
+            &device_statuses_[6]));
+        hipGraph_t main_graph = nullptr;
+        ASSERT_EQ(hipStreamEndCapture(inference_stream_, &main_graph),
+                  hipSuccess);
+        hipGraphExec_t main_exec = nullptr;
+        ASSERT_EQ(hipGraphInstantiate(&main_exec, main_graph, nullptr, nullptr, 0),
+                  hipSuccess);
+        ASSERT_EQ(hipGraphLaunch(main_exec, inference_stream_), hipSuccess);
+        DeviceMoEOverlayEpochTicket evidence{};
+        ASSERT_EQ(hipMemcpyAsync(&evidence, device_evidence_, sizeof(evidence),
+                                     hipMemcpyDeviceToHost, inference_stream_),
+                  hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(inference_stream_), hipSuccess);
+        EXPECT_EQ(owner, MoEOverlaySidecarEpochOwnership::NoExpertAccess);
+        EXPECT_TRUE(evidence.valid());
+        EXPECT_EQ(evidence.epoch, 2u);
+        EXPECT_EQ(hipGraphExecDestroy(main_exec), hipSuccess);
+        EXPECT_EQ(hipGraphDestroy(main_graph), hipSuccess);
     }
 
     TEST_F(ROCmMoEOverlayEpochTest,

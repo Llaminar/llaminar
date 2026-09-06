@@ -12,6 +12,7 @@
 
 #include "../../compute_stages/ComputeStages.h"
 #include "../../../backends/DeviceId.h"
+#include "../../../backends/GPUGraphMemoryContract.h"
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -453,6 +454,34 @@ namespace llaminar2
         }
 
         /**
+         * @brief Declare the native executable shape priced by admission.
+         * @param executable_class Certified class shared with the owner's BOM.
+         * @return This graph for declarative builder chaining.
+         * @throws std::invalid_argument for an unknown class.
+         *
+         * This is topology, not request state. Mutation invalidates captured
+         * identity; reset preserves it. Capture checks the actual native nodes
+         * before instantiation so a helper cannot silently consume full-graph
+         * storage after its owner received the smaller admission charge.
+         */
+        ComputeGraph &setExecutableMemoryClass(GPUGraphExecutableClass executable_class)
+        {
+            (void)GPUGraphMemoryContract::requiresBoundedFlatShape(executable_class);
+            if (executable_memory_class_ != executable_class)
+            {
+                executable_memory_class_ = executable_class;
+                noteTopologyMutation();
+            }
+            return *this;
+        }
+
+        /** @return Immutable shape obligation consumed by native capture. */
+        [[nodiscard]] GPUGraphExecutableClass executableMemoryClass() const noexcept
+        {
+            return executable_memory_class_;
+        }
+
+        /**
          * @brief Get the terminal node name
          *
          * Returns the terminal node set by setTerminalNode(), or falls back to
@@ -509,6 +538,8 @@ namespace llaminar2
         GraphNativeCaptureEnvelope native_capture_envelope_ =
             GraphNativeCaptureEnvelope::Ordinary;        ///< Typed graph-wide capture lifecycle selected by lowering.
         uint64_t topology_generation_ = 1;               ///< Monotonic captured-topology identity; zero is never published.
+        GPUGraphExecutableClass executable_memory_class_ =
+            GPUGraphExecutableClass::General; ///< Admission/capture shape, preserved across request reset.
     };
 
 } // namespace llaminar2

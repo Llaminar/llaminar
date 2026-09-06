@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include "app/MPIBootstrapPhase.h"
 #include "backends/HardwareInventory.h"
 #include "utils/DebugEnv.h"
 
@@ -148,5 +149,30 @@ TEST(Test__HardwareInventoryBackendIsolation,
     ASSERT_FALSE(inventory.cuda_devices.empty())
         << "CUDA integration hardware is required for this preflight";
     EXPECT_TRUE(inventory.rocm_devices.empty());
+    EXPECT_FALSE(hasOpenKfdDescriptor());
+}
+
+TEST(Test__HardwareInventoryBackendIsolation,
+     CpuNamedDomainBootstrapExcludesBothVendorsBeforeDiscovery)
+{
+    // Start with both vendors permitted: CLI intent, not a test-only
+    // environment exclusion, must close the accelerator startup boundary.
+    ASSERT_TRUE(debugEnv().backend_startup.cudaEnabled());
+    ASSERT_TRUE(debugEnv().backend_startup.rocmEnabled());
+    expectEveryCudaPrimaryContextInactive(cudaPrimaryContextActivity());
+    ASSERT_FALSE(hasOpenKfdDescriptor());
+
+    OrchestrationConfig config;
+    config.mpi_no_bootstrap = true;
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "cpu_node=localhost:0:cpu:0,localhost:1:cpu:0;scope=node_local;backend=mpi"));
+    MPIBootstrapPhase bootstrap;
+    ASSERT_EQ(bootstrap.execute(config, 0, nullptr).action,
+              BootstrapResult::Action::CONTINUE);
+
+    const HardwareInventory inventory = HardwareInventory::detect();
+    EXPECT_TRUE(inventory.cuda_devices.empty());
+    EXPECT_TRUE(inventory.rocm_devices.empty());
+    expectEveryCudaPrimaryContextInactive(cudaPrimaryContextActivity());
     EXPECT_FALSE(hasOpenKfdDescriptor());
 }

@@ -300,6 +300,8 @@ namespace llaminar2
 namespace llaminar2
 {
 
+    class MappedHostTransferRegion;
+
     /**
      * @brief Immutable backend-pinned host allocation for captured transfers.
      *
@@ -497,10 +499,13 @@ namespace llaminar2
      * A large transfer-lane family must preserve one independently writable host
      * and device region per concurrently runnable lane, but allocating and page
      * registering every small region independently is needlessly expensive on
-     * GPU runtimes.  TransferEngine creates one pinned-host slab and one device
+     * GPU runtimes. TransferEngine creates one mapped pinned-host slab and one device
      * slab, then returns typed slices retaining both owners.  The slice makes the
      * exact device, offset, capacity, and lifetime inseparable, so a lane cannot
      * accidentally borrow storage from another backend or outlive its arena.
+     * The host slab's exact device alias is setup-owned: every background copy,
+     * including CPU repack and remote MPI staging, can use the backend's native
+     * progress mechanism without re-registering pages or guessing UVA aliases.
      */
     class PersistentTransferStagingSlice final
     {
@@ -534,13 +539,13 @@ namespace llaminar2
 
         /** @brief Bind one checked offset to the two shared slab authorities. */
         PersistentTransferStagingSlice(
-            std::shared_ptr<PinnedHostTransferBuffer> pinned,
+            std::shared_ptr<MappedHostTransferRegion> mapped,
             std::shared_ptr<DeviceTransferBuffer> device_storage,
             size_t offset,
             size_t bytes,
             DeviceId device) noexcept;
 
-        std::shared_ptr<PinnedHostTransferBuffer> pinned_; ///< Shared host slab.
+        std::shared_ptr<MappedHostTransferRegion> mapped_; ///< Shared pinned host slab and exact alias.
         std::shared_ptr<DeviceTransferBuffer> device_storage_; ///< Shared GPU slab.
         size_t offset_ = 0u; ///< Start of this exclusive slot in both slabs.
         size_t bytes_ = 0u; ///< Immutable capacity of this exclusive slot.
@@ -560,7 +565,9 @@ namespace llaminar2
      *
      * The worker GPU context owns the named stream itself. The shared lifetime
      * retained here proves that the complete pool was materialized as one
-     * setup transaction and prevents callers from forging a raw stream handle.
+     * setup transaction, including mapped-copy function preparation, and prevents
+     * callers from forging a raw stream handle or performing lazy module setup
+     * during concurrent inference.
      */
     class PersistentTransferExecutionLane final
     {
@@ -1214,6 +1221,19 @@ namespace llaminar2
             DeviceId device) const;
 
         /**
+         * @brief Retain the exact mapped portion of an already-admitted staging slice.
+         * @param staging Exclusive setup-owned slice, not its containing slab.
+         * @return A bounded view sharing allocation/registration lifetime; no bytes are copied.
+         * @throws std::invalid_argument for an incomplete staging owner.
+         *
+         * Graph service commands retain this view until their GPU receipt is
+         * acquired. The public transfer authority alone may expose the private
+         * slab offset; callers cannot accidentally submit an adjacent slice.
+         */
+        [[nodiscard]] std::shared_ptr<MappedHostTransferRegion> mappedStagingView(
+            const PersistentTransferStagingSlice &staging) const;
+
+        /**
          * @brief Materialize a bounded shared background execution-stream pool.
          *
          * One logical migration cycle may contain several projection, edge, and
@@ -1615,6 +1635,106 @@ namespace llaminar2
             size_t bytes,
             DeviceId device,
             void *stream) const;
+
+        /**
+         * @brief Submit a prepared background copy independently of peer-held work.
+         * @param lane Unforgeable setup-owned stream and prepared-kernel lease.
+         * @param direction Immutable direction of the command.
+         * @param device_region Stable device source or inactive destination.
+         * @param device_capacity Exact capacity of the device allocation.
+         * @param device_offset First byte within the device allocation.
+         * @param mapped_region Registered host storage and exact device alias.
+         * @param mapped_offset First byte within the mapped storage.
+         * @param bytes Positive extent contained by both storage owners.
+         * @throws std::invalid_argument for missing ownership or wrong direction.
+         * @throws std::out_of_range for a region-boundary violation.
+         * @throws std::runtime_error for backend identity or submission failure.
+         *
+         * Native queues may alias despite logically independent streams. The
+         * backend owns its proven progress implementation: a bounded kernel on
+         * CUDA, native DMA on HIP. Maintenance never retries another transport,
+         * joins inference, allocates storage, or publishes residency by itself.
+         * The caller retains both regions until the exact terminal event.
+         */
+        void enqueueBackgroundMappedCopy(
+            const PersistentTransferExecutionLane &lane,
+            MappedTransferDirection direction,
+            void *device_region,
+            size_t device_capacity,
+            size_t device_offset,
+            const MappedHostTransferRegion &mapped_region,
+            size_t mapped_offset,
+            size_t bytes) const;
+
+        /**
+         * @brief Submit a CPU-edge copy through the same native background authority.
+         * @param lane Prepared exact-device maintenance stream lease.
+         * @param direction Copy direction, independent of expert tensor format.
+         * @param device_region Immutable source or inactive destination allocation.
+         * @param device_capacity Exact device allocation capacity.
+         * @param device_offset First device byte to copy.
+         * @param staging Exclusive setup-owned host/device staging slice.
+         * @param staging_offset First host byte inside this slice, not its parent slab.
+         * @param bytes Positive bounded copy extent.
+         * @param error Optional precise validation or native submission failure.
+         * @return Whether the native enqueue succeeded; never retries another path.
+         *
+         * Compound repack callers must record their terminal event even on false:
+         * an earlier kernel may already be queued. This non-throwing boundary
+         * preserves that ownership rule without duplicating backend dispatch.
+         */
+        [[nodiscard]] bool enqueueBackgroundStagingCopy(
+            const PersistentTransferExecutionLane &lane,
+            MappedTransferDirection direction,
+            void *device_region,
+            size_t device_capacity,
+            size_t device_offset,
+            const PersistentTransferStagingSlice &staging,
+            size_t staging_offset,
+            size_t bytes,
+            std::string *error = nullptr) const noexcept;
+
+        /**
+         * @brief Cold-allocate and initialize a device-owned cursor array once.
+         * @param capacity Positive physical-inbox count, not topology slot count.
+         * @param device Exact local GPU owning this service.
+         * @param stream Exact setup stream; consumers must join its setup event.
+         * @return Persistent initialized cursor storage; no public reset operation.
+         * @throws std::invalid_argument for invalid capacity, device or stream.
+         * @throws std::logic_error if invoked during captured execution.
+         * @throws std::runtime_error when the backend rejects initialization.
+         */
+        [[nodiscard]] std::shared_ptr<DeviceTransferBuffer> allocateMappedTransferServiceCursors(
+            size_t capacity, DeviceId device, void *stream) const;
+
+        /**
+         * @brief Record a graph-private device lifecycle transition.
+         * @param interval Bound private device word retained by one graph cache.
+         * @param value Open at root, Closed at the inference terminal frontier.
+         * @param stream Exact primary capture stream.
+         * @throws std::invalid_argument for incomplete ownership or invalid state.
+         * @throws std::runtime_error for native launch failure.
+         */
+        void enqueueMappedTransferInterval(
+            DeviceTransferBuffer &interval, MappedTransferInterval value,
+            void *stream) const;
+
+        /**
+         * @brief Submit a bounded resumable worker through the transfer authority.
+         * @param inbox Mapped slab of commands followed by completion records.
+         * @param cursors Device-only array whose extent defines physical capacity.
+         * @param maximum_bytes Immutable admitted extent limit per command.
+         * @param interval Private graph word, required only for CapturedInterval.
+         * @param run Explicit finite-idle or graph-bounded lifetime.
+         * @param stream Exact prepared auxiliary or idle execution stream.
+         * @throws std::invalid_argument for mismatched endpoint, bounds or lifetime.
+         * @throws std::runtime_error for native launch failure.
+         */
+        void enqueueMappedTransferService(
+            const MappedHostTransferRegion &inbox,
+            DeviceTransferBuffer &cursors, size_t maximum_bytes,
+            const DeviceTransferBuffer *interval,
+            MappedTransferServiceRun run, void *stream) const;
 
         /**
          * @brief Record the claim half of a mapped transfer progress branch.

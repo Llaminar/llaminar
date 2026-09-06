@@ -449,6 +449,7 @@ namespace llaminar2
         order_dirty_ = true;
         execution_stages_dirty_ = true;
         native_capture_envelope_ = GraphNativeCaptureEnvelope::Ordinary;
+        executable_memory_class_ = GPUGraphExecutableClass::General;
         noteTopologyMutation();
     }
 

@@ -12,6 +12,8 @@
 
 #include "backends/IBackend.h"
 #include "transfer/TransferEngine.h"
+#include "transfer/BackgroundTransferProgressBinding.h"
+#include "transfer/TransferProducerDependency.h"
 #include "../../mocks/MockBackend.h"
 
 #include <gtest/gtest.h>
@@ -20,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 using namespace llaminar2;
@@ -184,7 +187,7 @@ namespace
         }
 
         /** @brief Record the exact mapped alias and stream without GPU work. */
-        bool deviceToMappedHostByKernelOnStream(
+        bool copyDeviceVisibleRegionByKernelOnStream(
             void *dst,
             const void *src,
             size_t bytes,
@@ -209,6 +212,46 @@ namespace
                 (static_cast<std::uintptr_t>(device_id) + 1u) * 0x1000u);
         }
 
+        /** Record the exact setup cursor identity without executing GPU work. */
+        bool initializeMappedTransferService(MappedTransferServiceCursor *, size_t capacity,
+            int ordinal, void *stream) override
+        {
+            service_capacity = capacity; service_ordinal = ordinal; service_stream = stream;
+            ++service_initializations; return true;
+        }
+
+        /** Record one typed private graph transition, not a host-side state mirror. */
+        bool enqueueMappedTransferInterval(std::uint32_t *interval, MappedTransferInterval value,
+            int ordinal, void *stream) override
+        {
+            service_interval = interval; service_interval_value = value;
+            service_ordinal = ordinal; service_stream = stream;
+            ++service_transitions; return true;
+        }
+
+        /** Record only immutable service bindings and the explicit lifetime policy. */
+        bool enqueueMappedTransferService(const MappedTransferProgressCommand *commands,
+            MappedTransferProgressCompletion *completions, MappedTransferServiceCursor *,
+            size_t capacity, size_t, const std::uint32_t *interval,
+            MappedTransferServiceRun run, int ordinal, void *stream) override
+        {
+            service_commands = commands; service_completions = completions;
+            service_capacity = capacity; service_interval = interval; service_run = run;
+            service_ordinal = ordinal; service_stream = stream; ++service_calls;
+            return progress_calls_succeed;
+        }
+
+        size_t service_capacity = 0u;
+        size_t service_initializations = 0u;
+        size_t service_transitions = 0u;
+        size_t service_calls = 0u;
+        int service_ordinal = -1;
+        void *service_stream = nullptr;
+        const std::uint32_t *service_interval = nullptr;
+        const MappedTransferProgressCommand *service_commands = nullptr;
+        MappedTransferProgressCompletion *service_completions = nullptr;
+        MappedTransferInterval service_interval_value = MappedTransferInterval::Closed;
+        MappedTransferServiceRun service_run = MappedTransferServiceRun::PublishedPass;
         bool registration_succeeds = true;
         bool timeline_calls_succeed = true;
         bool progress_calls_succeed = true;
@@ -295,6 +338,108 @@ namespace
         TransferEngine engine_{&resolveMappedTimelineBackend};
     };
 } // namespace
+
+/** Setup must name its progress mechanism and reject an absent producer edge. */
+TEST_F(Test__MappedHostTransferRegion, BackgroundProgressAndProducerDependenciesAreExplicit)
+{
+    static_assert(!std::is_default_constructible_v<BackgroundTransferProgressBinding>);
+    static_assert(!std::is_default_constructible_v<TransferProducerDependency>);
+    EXPECT_FALSE(BackgroundTransferProgressBinding::nativeStream().epoch());
+    EXPECT_THROW((void)BackgroundTransferProgressBinding::graphService(nullptr), std::invalid_argument);
+    EXPECT_THROW((void)TransferProducerDependency::afterEvent(nullptr), std::invalid_argument);
+    auto *producer = reinterpret_cast<void *>(0x12340u);
+    EXPECT_EQ(TransferProducerDependency::afterEvent(producer).event(), producer);
+    EXPECT_EQ(TransferProducerDependency::published().event(), nullptr);
+}
+
+/** A service sees one exclusive staging slice, never the complete pooled slab. */
+TEST_F(Test__MappedHostTransferRegion, GraphServiceMappedStagingViewsPreserveExactBounds)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        auto slices = engine_.allocatePersistentTransferStagingSlices(257u, 3u, device);
+        for (const auto &slice : slices)
+        {
+            auto view = engine_.mappedStagingView(slice);
+            EXPECT_EQ(view->sizeBytes(), 257u);
+            EXPECT_EQ(view->mutableHostData(), slice.mutablePinnedData());
+            EXPECT_TRUE(view->hasDevice(device));
+            EXPECT_THROW((void)view->deviceAlias(device, 258u), std::out_of_range);
+        }
+    }
+    EXPECT_THROW((void)engine_.mappedStagingView({}), std::invalid_argument);
+}
+
+/** The public authority preserves device, stream, capacity and typed lifetime. */
+TEST_F(Test__MappedHostTransferRegion, ResumableServiceUsesExactBindingsWithoutBlocking)
+{
+    for (const auto device : {DeviceId::cuda(3), DeviceId::rocm(2)})
+    {
+        auto &spy = device.is_cuda() ? *cuda_ : *rocm_;
+        constexpr size_t capacity = 7u;
+        const DeviceId devices[] = {device};
+        auto inbox = engine_.allocateMappedHostRegion(capacity * 128u, devices);
+        auto interval = engine_.allocateDeviceTransferBuffer(sizeof(std::uint32_t), device);
+        auto *stream = reinterpret_cast<void *>(0x12340u);
+        auto cursors = engine_.allocateMappedTransferServiceCursors(capacity, device, stream);
+        engine_.enqueueMappedTransferInterval(*interval, MappedTransferInterval::Open, stream);
+        engine_.enqueueMappedTransferService(*inbox, *cursors, 4099u, interval.get(),
+            MappedTransferServiceRun::CapturedInterval, stream);
+        EXPECT_EQ(spy.service_capacity, capacity);
+        EXPECT_EQ(spy.service_ordinal, device.gpu_ordinal());
+        EXPECT_EQ(spy.service_stream, stream);
+        EXPECT_EQ(spy.service_interval, interval->deviceData());
+        EXPECT_EQ(spy.service_commands, inbox->deviceAlias(device));
+        EXPECT_EQ(spy.service_completions,
+            inbox->deviceAlias(device, capacity * sizeof(MappedTransferProgressCommand)));
+        engine_.enqueueMappedTransferInterval(*interval, MappedTransferInterval::Closed, stream);
+        engine_.enqueueMappedTransferService(*inbox, *cursors, 4099u, nullptr,
+            MappedTransferServiceRun::PublishedPass, stream);
+        EXPECT_EQ(spy.service_interval, nullptr);
+        EXPECT_EQ(spy.service_run, MappedTransferServiceRun::PublishedPass);
+        EXPECT_EQ(spy.service_initializations, 1u);
+        EXPECT_EQ(spy.service_transitions, 2u);
+        EXPECT_EQ(spy.service_calls, 2u);
+        EXPECT_EQ(spy.getSyncCount(), 0u);
+        EXPECT_EQ(spy.getStreamSyncCount(), 0u);
+    }
+}
+
+/** Invalid lifetime/bounds/device combinations never reach the backend. */
+TEST_F(Test__MappedHostTransferRegion, ResumableServiceRejectsIncompleteOrContradictoryOwnership)
+{
+    const auto device = DeviceId::cuda(0);
+    const DeviceId devices[] = {device};
+    auto inbox = engine_.allocateMappedHostRegion(4096u, devices);
+    auto cursors = engine_.allocateDeviceTransferBuffer(sizeof(MappedTransferServiceCursor), device);
+    auto odd = engine_.allocateDeviceTransferBuffer(sizeof(MappedTransferServiceCursor) + 1u, device);
+    auto oversized = engine_.allocateDeviceTransferBuffer(
+        (inbox->sizeBytes() / 128u + 1u) * sizeof(MappedTransferServiceCursor), device);
+    auto interval = engine_.allocateDeviceTransferBuffer(sizeof(std::uint32_t), device);
+    auto foreign = engine_.allocateDeviceTransferBuffer(sizeof(std::uint32_t), DeviceId::rocm(0));
+    auto *stream = reinterpret_cast<void *>(0x12340u);
+    EXPECT_THROW((void)engine_.allocateMappedTransferServiceCursors(0u, device, stream), std::invalid_argument);
+    EXPECT_THROW((void)engine_.allocateMappedTransferServiceCursors(1u, device, nullptr), std::invalid_argument);
+    EXPECT_THROW(engine_.enqueueMappedTransferInterval(*interval,
+        static_cast<MappedTransferInterval>(7u), stream), std::invalid_argument);
+    for (const auto *bad : {static_cast<const DeviceTransferBuffer *>(nullptr),
+                           static_cast<const DeviceTransferBuffer *>(foreign.get())})
+        EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *cursors, 4096u, bad,
+            MappedTransferServiceRun::CapturedInterval, stream), std::invalid_argument);
+    EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *cursors, 4096u, interval.get(),
+        MappedTransferServiceRun::PublishedPass, stream), std::invalid_argument);
+    EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *cursors, 4096u, interval.get(),
+        MappedTransferServiceRun::CapturedInterval, nullptr), std::invalid_argument);
+    EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *oversized, 4096u, nullptr,
+        MappedTransferServiceRun::PublishedPass, stream), std::invalid_argument);
+    EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *odd, 4096u, nullptr,
+        MappedTransferServiceRun::PublishedPass, stream), std::invalid_argument);
+    EXPECT_EQ(cuda_->service_calls, 0u);
+    cuda_->progress_calls_succeed = false;
+    EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *cursors, 4096u, nullptr,
+        MappedTransferServiceRun::PublishedPass, stream), std::runtime_error);
+    EXPECT_EQ(cuda_->service_calls, 1u); // One failure, no retry through another mechanism.
+}
 
 TEST_F(
     Test__MappedHostTransferRegion,
@@ -626,6 +771,26 @@ TEST_F(
             nullptr),
         std::invalid_argument);
     EXPECT_EQ(cuda_->progress_calls.size(), 1u);
+}
+
+/** @brief A raw/default stream cannot masquerade as a prepared maintenance lane. */
+TEST_F(Test__MappedHostTransferRegion, BackgroundCopyRejectsUnpreparedLaneWithoutDeviceWork)
+{
+    auto lifetime = std::make_shared<LifetimeProbe>(&lifetime_released_);
+    const std::array devices{DeviceId::cuda(0), DeviceId::rocm(0)};
+    auto region = engine_.registerExternalMappedHostRegion(
+        pages_.data(), pages_.size(), devices, lifetime);
+    std::array<std::byte, 32> source{};
+    const PersistentTransferExecutionLane missing;
+    for (const auto direction : {MappedTransferDirection::DeviceToHost,
+                                 MappedTransferDirection::HostToDevice})
+        EXPECT_THROW(engine_.enqueueBackgroundMappedCopy(missing, direction,
+            source.data(), source.size(), 0u, *region, 0u, source.size()),
+            std::invalid_argument);
+    EXPECT_TRUE(cuda_->progress_calls.empty());
+    EXPECT_TRUE(rocm_->progress_calls.empty());
+    EXPECT_EQ(cuda_->getStreamSyncCount(), 0u);
+    EXPECT_EQ(rocm_->getStreamSyncCount(), 0u);
 }
 
 TEST_F(

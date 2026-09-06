@@ -1231,6 +1231,7 @@ namespace llaminar2
                                          source_device,
                                          "remote_blob_source:" + direction)
                                      .front(),
+                    .progress = BackgroundTransferProgressBinding::nativeStream(),
                     .lane_name = "remote_blob_source:" + direction,
                     .perf_device = source_device.to_string(),
                 });
@@ -1250,6 +1251,7 @@ namespace llaminar2
                                          destination_device,
                                          "remote_blob_destination:" + direction)
                                      .front(),
+                    .progress = BackgroundTransferProgressBinding::nativeStream(),
                     .lane_name = "remote_blob_destination:" + direction,
                     .perf_device = destination_device.to_string(),
                 });
@@ -1600,6 +1602,7 @@ namespace llaminar2
                                              source_device,
                                              "remote_float_source:" + direction)
                                          .front(),
+                        .progress = BackgroundTransferProgressBinding::nativeStream(),
                         .lane_name = "remote_float_source:" + direction,
                         .perf_device = source_device.to_string(),
                     });
@@ -1619,6 +1622,7 @@ namespace llaminar2
                                              destination_device,
                                              "remote_float_destination:" + direction)
                                          .front(),
+                        .progress = BackgroundTransferProgressBinding::nativeStream(),
                         .lane_name = "remote_float_destination:" + direction,
                         .perf_device = destination_device.to_string(),
                     });

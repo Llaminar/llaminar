@@ -10,6 +10,7 @@
  */
 
 #include "execution/moe/MoEOverlayDeviceEpochProtocol.h"
+#include "execution/moe/MoEOverlayEpochLeaseLifecycle.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "kernels/IMoEKernel.h"
@@ -736,6 +737,88 @@ namespace llaminar2::test
             device_control_,
             &device_tickets_[1],
             &device_statuses_[6]));
+    }
+
+    /**
+     * @brief KV-only completion cannot donate an obsolete reader to main decode.
+     *
+     * Record a KV-only stand-in (a persistent device mailbox write), publish a
+     * newer placement on the independent maintenance stream, then launch the
+     * retained main acquire/consume/release graph. The whole DAG is event-ordered;
+     * the host observes only the final ticket. Production uses the same typed
+     * sidecar policy, so changing KV-only to acquire recreates the stale reader.
+     */
+    TEST_F(CUDAMoEOverlayEpochTest,
+           KVOnlySidecarDoesNotPinPlacementBeforeMainAdmission)
+    {
+        ASSERT_EQ(cudaStreamBeginCapture(
+                      inference_stream_, cudaStreamCaptureModeGlobal),
+                  cudaSuccess);
+        const auto owner = moeOverlaySidecarEpochOwnership(
+            MTPSidecarCaptureRole::KVOnly, true);
+        if (owner == MoEOverlaySidecarEpochOwnership::ExternalReader)
+        {
+            ASSERT_TRUE(kernel_->acquireMoEOverlayEpoch(
+                inferenceLaunch(), device_control_, &device_tickets_[0],
+                &device_statuses_[0]));
+        }
+        ASSERT_EQ(cudaMemsetAsync(device_evidence_, 0,
+                                     sizeof(*device_evidence_), inference_stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaStreamEndCapture(inference_stream_, &graph_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0),
+                  cudaSuccess);
+        ASSERT_EQ(cudaGraphLaunch(graph_exec_, inference_stream_), cudaSuccess);
+        ASSERT_EQ(cudaEventRecord(inference_event_, inference_stream_), cudaSuccess);
+        ASSERT_EQ(cudaStreamWaitEvent(maintenance_stream_, inference_event_, 0),
+                  cudaSuccess);
+
+        ASSERT_TRUE(kernel_->reserveMoEOverlayEpochCandidate(
+            maintenanceLaunch(), device_control_, &device_epochs_[0],
+            &device_statuses_[2]));
+        ASSERT_TRUE(kernel_->markMoEOverlayEpochCandidateReady(
+            maintenanceLaunch(), device_control_, &device_epochs_[0],
+            &device_statuses_[3]));
+        ASSERT_TRUE(kernel_->publishMoEOverlayEpochCandidate(
+            maintenanceLaunch(), device_control_, &device_epochs_[0],
+            &device_statuses_[4]));
+        ASSERT_EQ(cudaEventRecord(maintenance_event_, maintenance_stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaStreamWaitEvent(inference_stream_, maintenance_event_, 0),
+                  cudaSuccess);
+
+        // The next graph owns a fresh acquire, not the sidecar's old ticket.
+        ASSERT_EQ(cudaStreamBeginCapture(
+                      inference_stream_, cudaStreamCaptureModeGlobal),
+                  cudaSuccess);
+        ASSERT_TRUE(kernel_->acquireMoEOverlayEpoch(
+            inferenceLaunch(), device_control_, &device_tickets_[0],
+            &device_statuses_[5]));
+        ASSERT_EQ(cudaMemcpyAsync(device_evidence_, &device_tickets_[0],
+                                     sizeof(*device_evidence_),
+                                     cudaMemcpyDeviceToDevice, inference_stream_),
+                  cudaSuccess);
+        ASSERT_TRUE(kernel_->releaseMoEOverlayEpoch(
+            inferenceLaunch(), device_control_, &device_tickets_[0],
+            &device_statuses_[6]));
+        cudaGraph_t main_graph = nullptr;
+        ASSERT_EQ(cudaStreamEndCapture(inference_stream_, &main_graph),
+                  cudaSuccess);
+        cudaGraphExec_t main_exec = nullptr;
+        ASSERT_EQ(cudaGraphInstantiate(&main_exec, main_graph, nullptr, nullptr, 0),
+                  cudaSuccess);
+        ASSERT_EQ(cudaGraphLaunch(main_exec, inference_stream_), cudaSuccess);
+        DeviceMoEOverlayEpochTicket evidence{};
+        ASSERT_EQ(cudaMemcpyAsync(&evidence, device_evidence_, sizeof(evidence),
+                                     cudaMemcpyDeviceToHost, inference_stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(inference_stream_), cudaSuccess);
+        EXPECT_EQ(owner, MoEOverlaySidecarEpochOwnership::NoExpertAccess);
+        EXPECT_TRUE(evidence.valid());
+        EXPECT_EQ(evidence.epoch, 2u);
+        EXPECT_EQ(cudaGraphExecDestroy(main_exec), cudaSuccess);
+        EXPECT_EQ(cudaGraphDestroy(main_graph), cudaSuccess);
     }
 
     TEST_F(CUDAMoEOverlayEpochTest,

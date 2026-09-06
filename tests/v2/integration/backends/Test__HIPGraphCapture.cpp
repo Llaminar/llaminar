@@ -18,6 +18,10 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "backends/IGPUGraphCapture.h"
+#include "backends/BackendManager.h"
+#include "MTPTerminalScratchCaptureProof.h"
+#include "MTPMainForwardReadRetirementProof.h"
+#include "GPUGraphMemoryContractProof.h"
 
 #include <hip/hip_runtime.h>
 
@@ -31,9 +35,11 @@ using namespace llaminar2;
 // Test Fixture
 // ===========================================================================
 
+/** @brief Run retained-graph and mailbox lifetime checks on the HIP worker. */
 class Test__HIPGraphCapture : public ::testing::Test
 {
 protected:
+    /** @brief Register HIP before admitting real-device work. */
     void SetUp() override
     {
         ensureAMDFactoryRegistered();
@@ -41,6 +47,7 @@ protected:
             GTEST_SKIP() << "ROCm not available";
     }
 
+    /** @return The exact device-zero owner of all test streams. */
     IWorkerGPUContext &ctx()
     {
         return GPUDeviceContextPool::instance().getAMDContext(0);
@@ -50,6 +57,42 @@ protected:
 // ===========================================================================
 // Factory Tests
 // ===========================================================================
+
+/** @test Scratch invalidation preserves in-flight readers and accepted bytes. */
+TEST_F(Test__HIPGraphCapture, MTPCatchupScratchRetiresBeforeAcceptedPublication)
+{
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::proveMTPTerminalScratchCapture(ctx(), *backend); });
+}
+
+/** @test Every main-forward role protects a pending sidecar's terminal-hidden read. */
+TEST_F(Test__HIPGraphCapture, MTPMainForwardWaitsForSidecarReadRetirement)
+{
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::proveMTPMainForwardReadRetirement(ctx(), *backend, DeviceId::rocm(0)); });
+}
+
+/** @test Forced tokens retain the current forward's completion boundary. */
+TEST_F(Test__HIPGraphCapture, MTPForcedTokenWaitsForCurrentForward)
+{
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::proveMTPForcedTokenForwardBoundary(ctx(), *backend, DeviceId::rocm(0)); });
+}
+
+/** @test General control metadata must not receive a bounded helper charge. */
+TEST_F(Test__HIPGraphCapture, BoundedHelperRejectsEventNode)
+{
+    ctx().submitAndWait([&] {
+        test::proveBoundedHelperRejectsEventGraph(ctx(), [](void *event, void *stream) {
+            return hipEventRecordWithFlags(static_cast<hipEvent_t>(event),
+                       static_cast<hipStream_t>(stream), hipEventRecordExternal) ==
+                   hipSuccess;
+        });
+    });
+}
 
 TEST_F(Test__HIPGraphCapture, BackendNameIsHIP)
 {
@@ -162,7 +205,11 @@ TEST_F(Test__HIPGraphCapture, OrderedTimelinePerStepTimingIsConsumable)
         void *device_bytes = nullptr;
         ASSERT_EQ(hipMalloc(&device_bytes, 4096u), hipSuccess);
 
-        auto child = ctx().createGraphCapture();
+        // The production controller creates the owner before any graph-only
+        // unit on both vendors, even though HIP can clone its native children.
+        auto parent = ctx().createGraphCapture();
+        ASSERT_NE(parent, nullptr);
+        auto child = parent->createOrderedTimelineFragment();
         ASSERT_NE(child, nullptr);
         ASSERT_TRUE(child->beginCapture());
         ASSERT_EQ(
@@ -171,8 +218,6 @@ TEST_F(Test__HIPGraphCapture, OrderedTimelinePerStepTimingIsConsumable)
         ASSERT_TRUE(child->endCapture());
         ASSERT_GT(child->nodeCount(), 0u);
 
-        auto parent = ctx().createGraphCapture();
-        ASSERT_NE(parent, nullptr);
         const std::array<GPUOrderedTimelineStep, 1> steps{{{
             .name = "timed_memset",
             .kind = GPUOrderedTimelineStepKind::CapturedFragment,

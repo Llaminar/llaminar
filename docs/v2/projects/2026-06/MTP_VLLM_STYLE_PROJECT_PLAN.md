@@ -2,6 +2,162 @@
 
 ## Objective
 
+September 6, 13:40 UTC: the following CUDA2/CPU2 cell exposes an auxiliary
+branch attachment restriction during prefill setup. Its GPU children form one
+retained parent around CPU tickets, not host-segmented inference. One typed
+attachment now decorates that final parent or a directly captured body in
+place, replacing paired recording calls/events/thread flags. Model-free
+CUDA/ROCm ordering and CPU-ticket tests pass, as do all 22 transfer tests,
+87 engine tests and three new CPU-only DAG tests. The new lifecycle is in a
+twenty-round fresh-process stress gate. At 13:51 all twenty rounds pass (520
+test executions), Unit is 633/633 (68.15 s), preflight is 93/93 (220.83 s), and
+Release is rebuilt. CUDA2/CPU2 passes all eight long-context checks, clean
+shutdown and zero residual VRAM, but its 740281-record artifact processing hits
+the 600-second cell watchdog. All validators pass offline. One-pass collection
+and validation preserves byte-identical evidence while reducing isolated
+post-processing from 18.929 s to 10.819 s; 106 focused tests and Unit 633/633
+pass. The fresh online CPU-tier retry passes 43/43 checks, all eight long checks
+and 740078 evidence records in 597.234 s, with clean logs/shutdown and no GPU
+memory residue. Its 2.766-second watchdog margin still needs improvement before
+the full repeat campaign. Ornith 1.5 LocalTP 2xCUDA passes 43/43 checks in
+109.319 s, including all eight long checks and 34439 evidence records, with
+clean shutdown and zero residual VRAM. Qwen3.6 MoE NodeTP 2xCPU passes 43/43
+in 572.911 s, all eight long checks and 877663 evidence records, with clean
+shutdown and no GPU use. Ornith NodeTP 2xCPU also passes 43/43 in 572.858 s,
+all eight long checks and 838794 records, with clean shutdown and no GPU use.
+Four fresh cells pass. The remaining nine now run sequentially, starting with
+122B ROCm2/CPU2; that first cell passes 43/43 in 552.792 s with all eight long
+checks, 700812 evidence records, clean shutdown/logs and full VRAM release.
+ROCm4/CPU2 then passes 43/43 in 512.371 s with 558140 records, and Qwen3.6
+MoE CUDA1 passes 43/43 in 55.196 s with 7692 records. Both pass all eight long
+checks, clean shutdown/logs and exact VRAM return. Seven of thirteen are now
+fresh green. Qwen3.8 dense CUDA1 then passes 43/43 in 158.479 s, with all eight
+long checks, 5757 records, clean shutdown/logs and exact VRAM return. Eight of
+thirteen are fresh green; mixed 122B CUDA2/ROCm4 runs next. The complete
+aggregate and its repeat gate are still pending.
+
+Post-green sequence update: before the twenty full-suite repetitions, run a
+Release A/B against then-current upstream llama.cpp for Qwen3.6 MoE 35B and
+Qwen3.8 dense 27B on CUDA1 and ROCm1, fixed MTP depth three, with identical
+prompt/context/token/sampling inputs. Llaminar must beat both prefill and decode
+in all four comparable model/backend cells before stability stress resumes.
+
+Mixed 122B CUDA2/ROCm4 passes 43/43 in 389.070 s with all eight long checks,
+107654 records, clean shutdown/logs, exact VRAM return and no recurrence of the
+long transfer warnings. Nine of thirteen are fresh green; Ornith RCCL ROCm2
+runs next.
+
+Ornith RCCL ROCm2 passes 43/43 in 159.072 s with all eight long checks, 52878
+records, clean shutdown/logs and exact VRAM return. Ten of thirteen are fresh
+green; Qwen3.6 MoE ROCm1 runs next.
+Earlier mixed-topology green evidence below predates the graph refactor.
+
+September 6, 12:46 UTC: current E2E work is the hosted verifier's missing
+maintenance authority. The mixed 122B CUDA2/ROCm4 retry clears readiness and two
+needles, then depth 14 passes an empty factory to a graph captured with the
+transfer epoch. A device-free engine regression reproduces the exact cache
+rejection. Retained replay now obtains its policy from the same
+`IForwardExecutionHost` as materialization, without reconstructing ForwardInput
+or weakening cache identity. The 200-retained-replay regression and complete
+87-test engine binary pass. Release and all Unit/preflight targets rebuilt;
+Unit is 633/633 and preflight 93/93. The exact E2E retry passes 43/43 checks
+and all eight long-context checks in 394.907 s, with clean logs/shutdown and
+zero residual VRAM. Rank-zero evidence proves 19 committed movement
+transactions/170 edges/3.209 GB; remote endpoint p95 drops from 26.870 s to
+410.561 ms. Full topology refresh and stronger CPU-quantized transfer proof
+remain open; this is not a full-suite or inference-throughput certificate.
+The separate capture-thread fix is gated by Unit 633/633, preflight
+93/93, and 20 symmetric fresh-process repetitions. Current receipts and the
+simplified lifecycle map are in the September E2E handoff.
+
+Current September 6 slice: the stronger HTTP certificate now requires actual
+MTP-bearing prefix restores, accepted drafts, adaptive windows, and typed
+physical-movement obligations. Qwen3.6 single CUDA exposes a response-framing
+bug: the second thinking delimiter terminates generation before the answer
+when reasoning continues after forced budget closure. The HTTP/SSE mock
+reproduces before the fix. The parser fix and both event-ordering fixes are
+gated: Unit 633/633, preflight 92/92, and twenty symmetric GPU process
+repetitions. Short arithmetic now requires natural EOS. The remaining
+arithmetic-B loop occurs with MTP off and in the independent CPU/FP32 reference.
+Model schemas dropped Qwen's leading paragraph boundary from the forced-thinking
+continuation. Restoring only those bytes changes the reference from looping to
+`14` plus EOS. The shared schema policy fix passes Unit 633/633, preflight
+92/92, and twenty full canonical CUDA E2E repetitions, each 43/43 checks in
+54.49–55.60 s. The fresh aggregate passes both CUDA single-device cells, then
+the mixed 122B CUDA2/ROCm4 cell aborts during near-boundary prefill: transaction
+36 times out preparing physical transfers after all earlier behavioral checks
+pass. Fatal-only per-projection diagnostics are building; this new root cause
+is not established. No diagnostic synchronization or parser early-stop hides a
+runtime defect. The September handoff owns current receipts.
+
+Historical previous next step: gate the sealed-command retention fix, then retry the exact
+mixed122B E2E cell. A diagnostic run found empty transaction 16 erased by
+snapshot 17 before the remote worker acquired it. Retain the command through
+the existing next-snapshot fan-in; publish phase intent separately, without a
+new barrier or acknowledgement. CPU regression and twenty captured replays per
+CUDA/ROCm authority pass; full gates are rebuilding. This does not yet close the
+separate prefix/archive preparation stall or certify another E2E cell.
+
+2026-09-05 current E2E slice: resumed-parent NCCL capture is fixed and installed
+as a pinned, reproducible dependency. Its production-coordinator regression
+passes 20/20; Unit passes 632/632 and preflight 90/90, with no measured aggregate
+collective replay regression. Exact 122B CUDA2+CPU2 now clears graph preparation
+and shared-prefix checks, then rejects a stale expert epoch during forced-token
+SSE decode. A KV-only sidecar wrongly acquires an ambient expert reader before
+main graph-sequence admission. Separating maintenance event observation from
+typed expert ownership passes CUDA/HIP 20/20 each, Unit 632/632, and preflight
+90/90. Exact E2E now passes SSE and all four needle/JSON checks but times out
+at 600 seconds during structured generation; no stale epoch recurs through
+epoch 127. Next: attribute throughput and command-local DMA warning latency.
+Command-local diagnostic timing now passes Unit 633/633 and preflight 90/90.
+CPU sampling identifies OpenMP waits and ordered NativeVNNI expert projections;
+their critical-path contribution is not yet isolated. No kernel speedup is
+claimed. 122B ROCm4+CPU2 now passes all eight full behavioral checks, including
+2048 generated tokens and 7595/8192 context. Its certificate remains red:
+the harness's file-size RAM heuristic, empty shutdown POST framing, and
+rank-zero-only PerfStats export are wrong for the rank-1 GPU authority.
+Authority-based memory evidence, all-rank collection and strict clean shutdown
+are implemented; 71 focused harness regressions, Unit 633/633 and preflight
+90/90 pass. The unchanged ROCm4+CPU2 retry clears readiness but fails its first
+MTP answer: shifted-KV catch-up refreshes verifier terminal hidden using the
+unpopulated prefill request-length owner. The lifecycle audit identifies two
+intermediate refreshes before the existing accepted-state terminal publication;
+both are now removed in favor of typed scratch retirement. The initial append
+API no longer accepts prefill geometry; accepted publication owns the final row.
+New unit/source guards and symmetric captured two-stream CUDA/HIP regressions
+pass (20/20 per GPU backend), both builds pass, Unit is 633/633 (68.51 s), and
+preflight is 90/90 (190.47 s). Exact ROCm4/CPU2 passes all behavior and clean
+teardown in 514.54 s but its original receipt rejects retained-parent and mapped
+activation-collective evidence. Both validator omissions are corrected, with
+77 focused regressions and successful revalidation of all 550186 saved records.
+A fresh ROCm4/CPU2 receipt now passes in 523.24 s: all eight long checks,
+39/39 harness assertions, 555186 validated all-rank records, clean shutdown,
+and zero post-teardown VRAM delta. No original red receipt was relabeled.
+ROCm2/CPU2 also passes all 39 assertions/eight long checks in 597.62 s, with
+705832 validated records and clean teardown. Its 2.38 s watchdog margin remains
+an economy risk. Four other historical E2E cells need refresh; this is not
+a full certificate. See the
+dated September certification handoff for receipts and lifecycle maps.
+
+The CUDA admission follow-up now has a real-device memory certificate:
+128 retained 64-kernel graphs use 80 MiB cold / 0 MiB warm on CUDA and 256 MiB
+per lifetime on ROCm. Both focused certificates and both full affected graph
+suites pass. The typed bounded-helper inventory and capture-time native-shape
+guard are now implemented through canonical admission. Depth-15/request-one
+retains 82 bounded helpers and 25 general auxiliaries (107 unchanged owners),
+reducing CUDA admission by 1640 MiB per runner with no ROCm byte change. Both
+builds and four focused graph suites pass. Full Unit passes 633/633 and
+preflight 90/90. Exact dense CUDA E2E is green in 151.16 s, with all 39
+assertions/eight long checks, 2048 generated tokens, clean shutdown and no
+residual VRAM. Seven of nine cells have successful receipts; older cells still
+need shared-change refresh. CUDA2/ROCm4 122B reproduces the existing prefix
+archive/preparation stall in 282.98 s, with ROCm prepared at 28 and CUDA at 27.
+The first long needle passes; the CUDA host thread then blocks in KV gather
+submission. A separate CUDA debugger attachment fails internally and crashes
+the diagnostic target without device-kernel evidence. No production change is
+justified from that invalid diagnostic; reduce archive/controller ordering in
+a model-free fixture next.
+
 Port a vLLM-style MTP/speculative decoding architecture into Llaminar for
 Qwen3.6 dense and MoE models on CUDA, ROCm, and CPU. SingleDevice is the first
 acceptance target. Multi-device TP/PP/ExpertParallel follows only after the
@@ -19,6 +175,24 @@ uses this accepted-count verifier/publication transaction for a parallel
 block-diffusion drafter. DFlash is not a second verifier path; the shared MTP
 transaction is generalized behind proposer-neutral interfaces before DFlash is
 connected.
+
+2026-09-05 E2E identity audit: homogeneous CPU NodeTP executes an ordered host
+MTP program without a heterogeneous follower coordinator. Sparse sidecar
+operations must therefore receive a host-owner invocation ID, not constant
+zero, a token position that speculation may revisit, or a counter private to
+each retained graph variant. The new sequence is shared by full/chained/
+correction sidecars and is not rewound by request reset. GPU device epochs and
+heterogeneous coordinator IDs are unchanged. The real CPU sidecar runner
+regression and expanded real-MPI sidecar/verifier ring test each passed 20/20
+repeats; the rebuilt full Unit gate passed 632/632 and preflight passed 89/89.
+The CPU E2E retry cleared that defect and passed its first 5,232-token needle,
+then exposed invalid grouped-policy selection. A focused test reproduced a
+separate cache collision: eight-bit M identity aliases 258 prefill rows with
+two verifier rows. Full-width typed cache identity passes 20 repeats, CPU
+all-format grouped-verifier integration, refreshed Unit 632/632 and preflight
+89/89. The unchanged CPU2 Release E2E cell passes 40/40 in 572.2 s, including
+all long-context checks and 2,048 generated tokens. Other cells remain open.
+See the [current handoff](../2026-09/2026-09-05-model-parity-e2e-certification.md).
 
 2026-08-24 update: the mixed-vendor 122B depth-1 prefix-restored campaign
 localized a shifted-KV correction failure to an unnecessary terminal-hidden

@@ -8157,7 +8157,6 @@ namespace llaminar2
         const PrefixStateSnapshot &checkpoint,
         const DeviceSpeculativeOutcomeHandle &outcome,
         int request_index,
-        int main_forward_token_count,
         bool allow_speculative_discard)
     {
         PerfStatsCollector::ScopedTimer total_timer(
@@ -8166,7 +8165,7 @@ namespace llaminar2
             "decode",
             "rank",
             {{"participants", std::to_string(device_runners_.size())}});
-        if (!checkpoint.valid || request_index < 0 || main_forward_token_count <= 0)
+        if (!checkpoint.valid || request_index < 0)
             return false;
 
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
@@ -8178,7 +8177,6 @@ namespace llaminar2
                 *tail_checkpoint,
                 outcome,
                 request_index,
-                main_forward_token_count,
                 allow_speculative_discard);
         }
         if (device_runners_.empty())
@@ -8192,7 +8190,6 @@ namespace llaminar2
                 *child_checkpoint,
                 outcome,
                 request_index,
-                main_forward_token_count,
                 allow_speculative_discard);
         }
 
@@ -8250,7 +8247,6 @@ namespace llaminar2
             [this,
              &child_checkpoint,
              request_index,
-             main_forward_token_count,
              allow_speculative_discard,
              kernel_phase,
              rocm_phase,
@@ -8285,7 +8281,6 @@ namespace llaminar2
                     *child,
                     rank_mirrored_child_outcomes_[i],
                     request_index,
-                    main_forward_token_count,
                     allow_speculative_discard);
             });
 

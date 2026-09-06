@@ -88,11 +88,14 @@ namespace llaminar2::cpu::native_vnni
          * @param weights Source weight tensor [N, K]
          * @param row_start Start row for TP slicing (default 0)
          * @param row_end End row for TP slicing (default -1 = all)
+         * @param numerical_policy Arithmetic contract carried by the prepared engine.
+         * @param placement Final CPU storage placement established before packing.
          */
         explicit CPUNativeVNNIGemmKernel(const TensorBase *weights,
                                          int row_start = 0, int row_end = -1,
                                          CPUProjectionNumericalPolicy numerical_policy =
-                                             CPUProjectionNumericalPolicy::BackendNative)
+                                             CPUProjectionNumericalPolicy::BackendNative,
+                                         CPUWeightStoragePlacement placement = CPUWeightStoragePlacement::local())
             : numerical_policy_(numerical_policy)
         {
             // Pick up activation rotation from the weight tensor (if set).
@@ -103,7 +106,7 @@ namespace llaminar2::cpu::native_vnni
             activation_rotation_ = weights->activationRotation();
 
             if (!packWeightsCPUNativeVNNI(weights, packed_, row_start, row_end,
-                                          activation_rotation_))
+                                          activation_rotation_, placement))
             {
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] Failed to pack weights");
                 valid_ = false;

@@ -2,8 +2,9 @@
  * @file MemoryPlanner.h
  * @brief Typed admission contracts for model, graph, and routed-expert memory.
  *
- * The planner is the allocation authority before a production graph is built.
- * Its device configuration records not only model placement but also the
+ * The planner supplies typed allocation bills to PhysicalMemoryAuthority; it
+ * does not carry a parallel live ledger. Its device configuration records model
+ * placement separately from rank-local collective ownership, as well as the
  * lifetime topology of graph-stable routed-expert buffers, allowing
  * captured serial graph families to share storage without under-admitting
  * concurrent graph families.
@@ -226,13 +227,14 @@ struct DevicePlanConfig
     int total_shards = 1;
 
     /**
-     * Resolved rank-local collective backend for this participant.
+     * Optional resolved rank-local collective backend for this participant.
      *
-     * Multi-shard plans must name the same concrete backend installed by
-     * LocalTP. AUTO would make physical scratch ownership unknowable and is
-     * rejected by MemoryPlanner instead of being independently guessed.
+     * Absence means this rank installs no LocalTP context. Distributed TP may
+     * still shard weights across ranks, so total_shards cannot establish this
+     * allocation's presence. A present value must name the concrete backend
+     * installed by LocalTP; AUTO is invalid, not an alias for absence.
      */
-    CollectiveBackendType local_tp_backend = CollectiveBackendType::AUTO;
+    std::optional<CollectiveBackendType> local_tp_backend;
 
     /**
      * Exact tensor-parallel slice installed by the production assignment authority.

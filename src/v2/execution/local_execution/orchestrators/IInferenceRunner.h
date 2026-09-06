@@ -2647,12 +2647,16 @@ namespace llaminar2
          * compact metadata and discards the speculative row if it was not
          * accepted.
          *
+         * The checkpoint row is temporary sidecar input, not the new main
+         * terminal state. The append retires that mailbox publication. The
+         * caller must finish the transaction with captured accepted-state
+         * publication, which selects the terminal row from device acceptance
+         * metadata. No intervening prefill-geometry refresh is permitted.
+         *
          * @param checkpoint Verifier-base checkpoint containing terminal hidden
          *        for this runner or participant.
          * @param outcome Device-resident compact verifier outcome.
          * @param request_index Logical request row inside @p outcome.
-         * @param main_forward_token_count Verifier hidden-row count to restore
-         *        after the sidecar append; pass the grouped verifier row count.
          * @param allow_speculative_discard Whether stale speculative shifted rows
          *        may be truncated before appending row zero.
          * The verifier-base position must come from the same resident metadata
@@ -2663,13 +2667,11 @@ namespace llaminar2
             const PrefixStateSnapshot &checkpoint,
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
-            int main_forward_token_count,
             bool allow_speculative_discard = false)
         {
             (void)checkpoint;
             (void)outcome;
             (void)request_index;
-            (void)main_forward_token_count;
             (void)allow_speculative_discard;
             return false;
         }
@@ -2746,6 +2748,9 @@ namespace llaminar2
          * outcome on host to learn the accepted count.  They may run a fixed
          * bounded suffix shape and rely on device-resident shifted-KV publication
          * to discard rows beyond the compact accepted-state count.
+         * The selected rows are temporary sidecar input. The method retires
+         * their terminal-mailbox publication after submission; the caller's
+         * accepted-state publication is the sole next terminal-row producer.
          *
          * @param outcome Device-resident compact verifier output handle.
          * @param request_index Logical request row inside @p outcome.

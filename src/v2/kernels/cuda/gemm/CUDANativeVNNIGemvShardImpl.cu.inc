@@ -865,11 +865,32 @@ namespace
     {
         if (verifier_serial_m1 && M >= 2)
         {
-            std::string candidate =
-                "cuda.nvnni.decode.verifier.inherit_serial_m1";
             const int effective_grouped_rows = g_grouped_rows_override > 0
                                                    ? g_grouped_rows_override
                                                    : grouped_rows;
+            std::string candidate;
+            if (g_sweep.active)
+            {
+                /*
+                 * A joint trainer candidate varies the frozen serial-M1
+                 * schedule and row reuse together. Keep that diagnostic
+                 * identity distinct from the production grouped-policy ID so
+                 * corpus evidence cannot accidentally promote one axis while
+                 * labelling it as the other.
+                 */
+                candidate =
+                    "cuda.nvnni.decode.verifier.serial_m1." +
+                    std::string(shapeName(shape)) +
+                    ".tn" + std::to_string(tuning.tile_n) +
+                    ".cpt" + std::to_string(tuning.cpt);
+                if (shape == NativeGemvShape::KPAR)
+                    candidate += ".kb" + std::to_string(effective_kb);
+            }
+            else
+            {
+                candidate =
+                    "cuda.nvnni.decode.verifier.inherit_serial_m1";
+            }
             if (effective_grouped_rows > 0)
             {
                 candidate += ".r" +
@@ -2344,8 +2365,16 @@ namespace
          * still owns multiple rows and reuses one packed-weight traversal; no
          * row is replayed through the scalar public API.
          */
-        const int desired_tile_rows =
-            llaminar2::nativeVNNIBatchInvariantTileRows(M, N, K);
+        /*
+         * A direct/wide serial policy has one K partition and writes its final
+         * FP32 rows straight from the producer CTA.  It owns no K-partial
+         * arena, so constraining its row tile with the KPAR scratch formula can
+         * make a four-row vocabulary head stream the complete weights twice.
+         * Only true KPAR policies need the geometry-derived scratch bound.
+         */
+        const int desired_tile_rows = MATCH_WIDE_SERIAL
+            ? llaminar2::nativeVNNIScratchlessBatchInvariantTileRows(M)
+            : llaminar2::nativeVNNIBatchInvariantTileRows(M, N, K);
         const int workspace_tile_rows = [&]
         {
             if constexpr (MATCH_WIDE_SERIAL)
@@ -3087,6 +3116,7 @@ namespace
         GeneratedDispatchTuning tuning{};
         int grouped_rows = 0;
         bool grouped_tensor_core = false;
+        const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
 
         if (g_sweep.active)
         {
@@ -3125,6 +3155,18 @@ namespace
                 g_sweep.force_two_phase,
                 g_sweep.exact_kb,
             };
+            if (decode_equivalent_m1)
+            {
+                /*
+                 * The diagnostic controller may train the serial schedule and
+                 * verifier row reuse as one captured transaction. Both values
+                 * are compile-time dispatch selectors embedded during graph
+                 * recording; no mutable tuning state reaches replay.
+                 */
+                grouped_rows = g_grouped_rows_override;
+                if (grouped_rows <= 0)
+                    return false;
+            }
         }
         else
         {
@@ -3136,7 +3178,6 @@ namespace
              * (one grouped production operation) while matching the family that
              * serial decode uses for each accepted row.
              */
-            const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
             const int dispatch_m = decode_equivalent_m1 ? 1 : M;
             const bool dispatch_policy_graph_captured =
                 decode_equivalent_m1
@@ -3204,7 +3245,6 @@ namespace
             }
         }
 
-        const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
         if (grouped_tensor_core)
         {
             if (!decode_equivalent_m1 || g_sweep.active)

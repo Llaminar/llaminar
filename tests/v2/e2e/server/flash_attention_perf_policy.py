@@ -12,6 +12,11 @@ therefore prove that both complete-query ownership and K/V-context ownership
 ran in production, rather than inferring mode selection from unit-level policy
 tests or benchmark-only controls.
 
+Expert-only overlay domains own no attention: the exported public CLI's base
+model domain identifies the participants that must supply attention evidence.
+Ordinary TP/PP retains its all-participant requirement. No model/backend name
+or absence of evidence can grant the expert-only exception.
+
 The GPU check consumes only capture-time ``gpu_graph_inventory`` records. The
 CPU check consumes aggregate execution counters and never inspects tensor data
 or introduces an additional synchronization boundary.
@@ -20,6 +25,7 @@ or introduces an additional synchronization boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import shlex
 from typing import Any, Iterable, Mapping
 
 from graph_capture_perf_policy import device_kinds_for_cell
@@ -85,6 +91,70 @@ def _integer_tag(tags: Mapping[str, Any], key: str) -> int | None:
     except ValueError:
         return None
     return value
+
+
+def attention_device_kinds_for_cell(backend: str, extra_flags: str) -> frozenset[str]:
+    """Resolve attention ownership from the canonical exported CLI intent.
+
+    The engine's ``effectiveBaseModelDomain()`` uses the explicit base domain,
+    or the continuation domain when omitted. Only domain membership is needed
+    here; allocation, placement, and graph planning remain engine-owned.
+    General orchestration and routed-expert placement are separate CLI domain
+    namespaces. Their matching declarations corroborate the ordered physical
+    membership; duplicates within either namespace or conflicting membership
+    fail closed instead of exempting a GPU. Scope/compute policy attributes
+    remain engine-owned and do not change which backend owns attention.
+    """
+    options: dict[str, list[str]] = {}
+    arguments = shlex.split(extra_flags)
+    relevant = {"--moe-routed-expert-placement", "--moe-routed-expert-continuation-domain",
+                "--moe-routed-expert-base-model-domain", "--moe-routed-expert-domain",
+                "--define-domain"}
+    for index, argument in enumerate(arguments):
+        flag, separator, value = argument.partition("=")
+        if flag not in relevant:
+            continue
+        if not separator:
+            value = arguments[index + 1] if index + 1 < len(arguments) else ""
+        if not value or value.startswith("--"):
+            raise ValueError(f"attention ownership requires a value for {flag}")
+        options.setdefault(flag, []).append(value)
+    if "--moe-routed-expert-placement" not in options:
+        return device_kinds_for_cell(backend, extra_flags)
+
+    def single(flag: str) -> str:
+        values = options.get(flag, [])
+        if len(values) > 1:
+            raise ValueError(f"ambiguous attention ownership: repeated {flag}")
+        return values[0] if values else ""
+
+    single("--moe-routed-expert-placement")
+    continuation = single("--moe-routed-expert-continuation-domain")
+    base = single("--moe-routed-expert-base-model-domain") or continuation
+    if not base:
+        raise ValueError("overlay attention ownership has no base/continuation domain")
+    memberships: list[tuple[str, ...]] = []
+    for namespace in ("--moe-routed-expert-domain", "--define-domain"):
+        matches = [value.partition("=")[2].split(";", 1)[0]
+                   for value in options.get(namespace, [])
+                   if value.partition("=")[0] == base]
+        if len(matches) > 1:
+            raise ValueError(f"overlay attention domain {base!r} has repeated {namespace} declarations")
+        if matches:
+            members = tuple(member.strip() for member in matches[0].split(","))
+            if not all(members):
+                raise ValueError(f"overlay attention domain {base!r} has an empty participant")
+            memberships.append(members)
+    if not memberships:
+        raise ValueError(f"overlay attention domain {base!r} has no declaration")
+    # Participant identity and order, not just a matching GPU kind, must agree.
+    # Ignoring one namespace could otherwise hide a missing attention backend.
+    if any(members != memberships[0] for members in memberships[1:]):
+        raise ValueError(f"overlay attention domain {base!r} has conflicting domain membership")
+    kinds = device_kinds_for_cell("", ",".join(memberships[0]))
+    if not kinds:
+        raise ValueError(f"overlay attention domain {base!r} has no explicit devices")
+    return kinds
 
 
 def _validate_plan_record(
@@ -197,13 +267,15 @@ def validate_flash_attention_plan_policy(
     backend: str,
     extra_flags: str,
 ) -> FlashAttentionPlanValidation:
-    """Require one coherent FA2 capture plan for every explicit GPU backend."""
+    """Require coherent FA2 capture plans on every declared attention backend."""
 
-    expected_backends = frozenset(
-        kind
-        for kind in device_kinds_for_cell(backend, extra_flags)
-        if kind in _PLAN_RECORD_BY_BACKEND
-    )
+    ownership_error = None
+    try:
+        attention_kinds = attention_device_kinds_for_cell(backend, extra_flags)
+    except ValueError as error:
+        attention_kinds = frozenset()
+        ownership_error = str(error)
+    expected_backends = attention_kinds.intersection(_PLAN_RECORD_BY_BACKEND)
     plan_records: list[tuple[str, Mapping[str, Any]]] = []
     for record in records:
         name = record.get("name")
@@ -218,8 +290,10 @@ def validate_flash_attention_plan_policy(
         for _, record in plan_records
     )
 
-    error: str | None = None
-    if not expected_backends:
+    error: str | None = ownership_error
+    if error:
+        pass
+    elif not attention_kinds:
         error = "GPU cell has no explicit CUDA/ROCm device kind for FA2 validation"
     else:
         missing = expected_backends - observed_backends

@@ -793,6 +793,7 @@ namespace llaminar2
                                                              DeviceId::rocm(0),
                                                              "three_tier:" + identity)
                                                          .front(),
+                                        .progress = BackgroundTransferProgressBinding::nativeStream(),
                                         .lane_name = "three_tier:" + identity,
                                         .perf_device = "cuda-hot/rocm-warm/cpu-cold",
                                         .collect_timing_measurements = true,
@@ -824,6 +825,7 @@ namespace llaminar2
                                                              DeviceId::cuda(0),
                                                              "three_tier:" + identity)
                                                          .front(),
+                                        .progress = BackgroundTransferProgressBinding::nativeStream(),
                                         .lane_name = "three_tier:" + identity,
                                         .perf_device = "cuda-hot/rocm-warm/cpu-cold",
                                         .collect_timing_measurements = true,
@@ -1439,6 +1441,7 @@ namespace llaminar2
                                                          DeviceId::cuda(0),
                                                          "cuda_cpu_rotation:" + identity)
                                                      .front(),
+                                    .progress = BackgroundTransferProgressBinding::nativeStream(),
                                     .lane_name =
                                         "cuda_cpu_rotation:" + identity,
                                     .perf_device = "cuda-hot/cpu-cold",
@@ -2243,8 +2246,8 @@ namespace llaminar2
             EXPECT_EQ(
                 rocm_progress_stats.commands_completed,
                 blob_stats.chunks_submitted);
-            EXPECT_GT(cuda_progress_stats.dma_submissions, 0u);
-            EXPECT_GT(rocm_progress_stats.dma_submissions, 0u);
+            EXPECT_GT(cuda_progress_stats.copy_submissions, 0u);
+            EXPECT_GT(rocm_progress_stats.copy_submissions, 0u);
             EXPECT_EQ(cuda_progress_stats.command_failures, 0u);
             EXPECT_EQ(rocm_progress_stats.command_failures, 0u);
 

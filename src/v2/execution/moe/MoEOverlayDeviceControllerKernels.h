@@ -86,25 +86,9 @@ namespace llaminar2
     {
         /** New cumulative count for the phase that supplied this window. */
         std::uint64_t updated_phase_count = 0u;
-        /** Sum of the updated phase and the retained opposite phase. */
+        /** Sum of the updated phase and the aggregate of other priced phases. */
         std::uint64_t combined_count = 0u;
     };
-
-    /**
-     * @brief Convert a typed inference phase to its persistent-history plane.
-     * @return Plane zero for prefill, plane one for decode, or the plane count
-     *         for an invalid phase.
-     */
-    LLAMINAR_MOE_CONTROLLER_HD std::uint32_t
-    moeOverlayDeviceDemandPhaseIndex(
-        MoEOverlayDeviceDemandPhase phase) noexcept
-    {
-        return phase == MoEOverlayDeviceDemandPhase::Prefill
-            ? 0u
-            : phase == MoEOverlayDeviceDemandPhase::Decode
-            ? 1u
-            : kMoEOverlayDeviceControllerDemandPhaseCount;
-    }
 
     /**
      * @brief Locate one `[phase][layer][expert]` history word.
@@ -127,7 +111,7 @@ namespace llaminar2
     }
 
     /**
-     * @brief Add one phase delta without erasing demand learned in the other.
+     * @brief Add one phase delta while retaining the sum of other priced phases.
      *
      * Both additions saturate. A stalled maintenance worker can therefore
      * never wrap a very long-lived model's demand history and invert hotness.
@@ -202,7 +186,9 @@ namespace llaminar2
      *
      * `prepared_arrivals[ordinal]` is meaningful only on the command's exact
      * destination participant. The group transport record is the release edge
-     * proving those descriptor bytes were uploaded on their transfer streams.
+     * publishing those immutable mapped descriptor bytes. The candidate builder
+     * consumes them only after the exact transaction's system acquire, then
+     * copies them into an inactive device bank. There is no descriptor DMA edge.
      * Every other placement field is derived by the GPU from the authenticated
      * command and frozen participant metadata.
      */

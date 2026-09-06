@@ -29,6 +29,10 @@ namespace llaminar2
     struct MappedTransferProgressClaim;
     struct MappedTransferProgressCommand;
     struct MappedTransferProgressCompletion;
+    struct MappedTransferServiceCursor;
+    enum class MappedTransferInterval : std::uint32_t;
+    enum class MappedTransferServiceRun : std::uint8_t;
+    enum class MappedTransferDirection : std::uint8_t;
 
     /**
      * @brief One backend-owned device-memory observation at a lifecycle edge.
@@ -3994,24 +3998,25 @@ namespace llaminar2
         }
 
         /**
-         * @brief Launch a bounded device kernel that writes mapped host pages.
+         * @brief Launch a bounded byte copy between device-visible addresses.
          *
          * This primitive exists for progress-sensitive transfers competing
-         * with a retained graph's own mapped system-memory traffic. @p dst is
-         * the exact device alias of a TransferEngine-owned mapped region, not a
-         * host pointer. Implementations enqueue a byte-exact kernel on @p stream
+         * with a retained graph's own mapped system-memory traffic. The mapped
+         * endpoint is its exact TransferEngine-owned device alias, never a host
+         * pointer guessed to share that address. Either direction is supported.
+         * Implementations enqueue a byte-exact kernel on @p stream
          * and never allocate, wait, synchronize, or substitute a DMA copy.
          * Ordinary callers use TransferEngine, which validates registration,
          * bounds, endpoint identity, and the exact stream before reaching here.
          *
-         * @param dst Device-visible alias of mapped host destination bytes.
-         * @param src Stable device source bytes on @p device_id.
+         * @param dst Stable device or mapped-alias destination bytes.
+         * @param src Stable device or mapped-alias source bytes.
          * @param bytes Positive byte count to copy exactly.
          * @param device_id Exact source GPU ordinal.
-         * @param stream Exact non-null latency-critical compute stream.
+         * @param stream Exact non-null stream whose event owns publication.
          * @return True only when the kernel launch was accepted.
          */
-        virtual bool deviceToMappedHostByKernelOnStream(
+        virtual bool copyDeviceVisibleRegionByKernelOnStream(
             void *dst,
             const void *src,
             size_t bytes,
@@ -4023,6 +4028,48 @@ namespace llaminar2
             (void)bytes;
             (void)device_id;
             (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Resolve both mapped-copy kernels before concurrent execution.
+         * @param device_id Exact GPU whose module generation must be prepared.
+         * @return True when all required function handles are materialized.
+         *
+         * TransferEngine invokes this during execution-lane construction, not
+         * on submission. Lazy module loading can synchronize a context and
+         * strand a first-use kernel behind a peer-held inference graph.
+         */
+        virtual bool prepareMappedHostCopyKernels(int device_id)
+        {
+            (void)device_id;
+            return false;
+        }
+
+        /**
+         * @brief Submit a mapped copy with progress independent of peer-held graphs.
+         * @param device_region Stable device source or inactive destination.
+         * @param mapped_host Registered host address used by native DMA.
+         * @param mapped_alias Exact device alias used by device copy kernels.
+         * @param bytes Positive validated extent of both regions.
+         * @param direction Immutable source/destination ownership direction.
+         * @param device_id Exact local GPU ordinal.
+         * @param stream Exact prepared background stream, never null.
+         * @return True only when the native enqueue succeeds.
+         *
+         * CUDA copy queues can alias a peer-held graph's pending copy; HIP
+         * compute queues can alias its held kernel. Backends therefore own the
+         * native progress mechanism (CUDA bounded kernel, HIP asynchronous DMA).
+         * This is one contract, not a failed-operation retry or mode fallback.
+         * TransferEngine validates ownership and both aliases before calling it.
+         */
+        virtual bool enqueueBackgroundMappedCopyOnStream(
+            void *device_region, void *mapped_host, void *mapped_alias,
+            size_t bytes, MappedTransferDirection direction,
+            int device_id, void *stream)
+        {
+            (void)device_region; (void)mapped_host; (void)mapped_alias;
+            (void)bytes; (void)direction; (void)device_id; (void)stream;
             return false;
         }
 
@@ -4088,6 +4135,63 @@ namespace llaminar2
             (void)maximum_bytes;
             (void)device_id;
             (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Initialize device-only copy cursors on an exact setup stream.
+         * @param cursors Persistent physical-inbox state owned by TransferEngine.
+         * @param capacity Positive count of complete cursor records.
+         * @param device_id Exact GPU ordinal.
+         * @param stream Non-null setup stream, before any service execution.
+         * @return Whether initialization was enqueued; unsupported backends reject.
+         */
+        virtual bool initializeMappedTransferService(
+            MappedTransferServiceCursor *cursors, size_t capacity,
+            int device_id, void *stream)
+        {
+            (void)cursors; (void)capacity; (void)device_id; (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Record a GPU-owned graph interval transition, never a host flag.
+         * @param interval Persistent private word belonging to exactly one graph.
+         * @param value Typed Open at fork or Closed before join.
+         * @param device_id Exact GPU ordinal.
+         * @param stream Non-null primary capture stream.
+         * @return Whether the lifecycle kernel was accepted.
+         */
+        virtual bool enqueueMappedTransferInterval(
+            std::uint32_t *interval, MappedTransferInterval value,
+            int device_id, void *stream)
+        {
+            (void)interval; (void)value; (void)device_id; (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Submit a resumable copy worker under its explicit lifetime.
+         * @param commands Exact mapped physical-inbox command array.
+         * @param completions Exact mapped device-authored receipt array.
+         * @param cursors Persistent device claimant/cursor array.
+         * @param capacity Physical concurrency bound, not topology slot count.
+         * @param maximum_bytes Admission bound for every immutable command.
+         * @param interval Graph-private lifecycle word, absent for PublishedPass.
+         * @param run Finite idle pass or GPU-terminated captured interval.
+         * @param device_id Exact GPU ordinal.
+         * @param stream Non-null prepared worker stream.
+         * @return Whether the native kernel was accepted; never changes mechanisms.
+         */
+        virtual bool enqueueMappedTransferService(
+            const MappedTransferProgressCommand *commands,
+            MappedTransferProgressCompletion *completions,
+            MappedTransferServiceCursor *cursors, size_t capacity,
+            size_t maximum_bytes, const std::uint32_t *interval,
+            MappedTransferServiceRun run, int device_id, void *stream)
+        {
+            (void)commands; (void)completions; (void)cursors; (void)capacity;
+            (void)maximum_bytes; (void)interval; (void)run; (void)device_id; (void)stream;
             return false;
         }
 

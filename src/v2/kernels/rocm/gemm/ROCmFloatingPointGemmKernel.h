@@ -65,8 +65,8 @@ namespace llaminar2
          * - Output (C) must be on GPU
          *
          * **Thread Safety and stream ownership**:
-         * - Wrappers for the same weight shape may share one cached low-level
-         *   hipBLAS handle.
+         * - Each weight view retains its own stream/workspace binding. All
+         *   views borrow their persistent worker context's library handles.
          * - Every launch supplies its exact non-null operation stream.  The
          *   low-level kernel serializes only handle rebinding plus enqueue, so
          *   work already submitted on different streams remains concurrent.
@@ -281,9 +281,8 @@ namespace llaminar2
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)
 
-            // hipBLAS kernel - shared across all ROCm GEMM kernels on same device
-            // Owned by DeviceKernelCache, not this kernel instance
-            HipBLASGemmKernel *hipblas_kernel_ = nullptr;
+            // Per-weight submission view, borrowing context-owned library handles.
+            std::unique_ptr<HipBLASGemmKernel> hipblas_kernel_;
 
             // Lifetime owner: keeps VRAM pool alive when constructed from raw pointer
             std::shared_ptr<void> lifetime_owner_;

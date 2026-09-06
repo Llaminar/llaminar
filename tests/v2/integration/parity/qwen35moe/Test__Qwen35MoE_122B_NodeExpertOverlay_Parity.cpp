@@ -7,6 +7,7 @@
  * mathematics, graph execution, or evidence publication ordering.
  */
 #include "node_overlay/NodeExpertOverlayParityFixture.h"
+#include "config/OrchestrationConfigParser.h"
 
 namespace llaminar2::test::parity::qwen35moe::node_overlay
 {
@@ -287,6 +288,60 @@ TEST(Qwen122DynamicWaveGeometry,
             "CUDA2_CPU2_2xMPI_NodeExpertOverlay",
         }));
 }
+/** @brief HTTP certification tags select four existing Dynamic/adaptive cells only. */
+TEST(Qwen122E2ECertification, SelectsInitialTopologySubsetWithoutExpandingParity)
+{
+    std::set<std::string> selected;
+    for (const auto &spec : qwen122OverlayTopologySpecs())
+    {
+        const auto cases = expandModelParityDefinition(qwen122ExpertOverlayParityDefinition(spec));
+        ASSERT_EQ(cases.size(), 24u);
+        for (const auto &cell : cases)
+        {
+            if (!cell.e2e_certification) continue;
+            EXPECT_EQ(cell.e2e_certification->readiness_timeout_seconds, 180);
+            EXPECT_TRUE(selected.insert(cell.topology.test_id).second);
+            EXPECT_EQ(cell.mtp, ModelParityMTP::DynamicDepth);
+            ASSERT_TRUE(cell.expert_overlay);
+            EXPECT_EQ(cell.expert_overlay->movement, ModelParityExpertMovement::Dynamic);
+            EXPECT_EQ(cell.expert_overlay->owner_order, RoutedExpertOwnerOrder::Ordinal);
+            const auto config = cell.makeOrchestrationConfig(cell.model.model_path, 0);
+            EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+            EXPECT_TRUE(config.prefix_cache.enabled);
+            auto arguments = modelParityE2EServerArguments(cell);
+            arguments.insert(arguments.begin(), "llaminar2");
+            std::vector<char *> argv;
+            for (auto &argument : arguments) argv.push_back(argument.data());
+            const auto parsed = OrchestrationConfigParser{}.parseArgs(
+                static_cast<int>(argv.size()), argv.data());
+            ASSERT_TRUE(parsed.moe_routed_expert_plan);
+            const auto &expected = *config.moe_routed_expert_plan;
+            const auto &actual = *parsed.moe_routed_expert_plan;
+            EXPECT_EQ(actual.continuation_domain, expected.continuation_domain);
+            ASSERT_EQ(actual.domains.size(), expected.domains.size());
+            ASSERT_EQ(actual.routed_tiers.size(), expected.routed_tiers.size());
+            for (std::size_t i = 0; i < actual.domains.size(); ++i)
+            {
+                EXPECT_EQ(actual.domains[i].participants, expected.domains[i].participants);
+                EXPECT_EQ(actual.domains[i].scope, expected.domains[i].scope);
+                EXPECT_EQ(actual.domains[i].toExecutionDomainDefinition().ranks,
+                          expected.domains[i].toExecutionDomainDefinition().ranks);
+                EXPECT_EQ(actual.routed_tiers[i].priority, expected.routed_tiers[i].priority);
+                EXPECT_EQ(actual.routed_tiers[i].max_experts_per_layer, 0u);
+            }
+            EXPECT_EQ(parsed.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+            EXPECT_EQ(parsed.mtp.depth_policy.mode, config.mtp.depth_policy.mode);
+            EXPECT_EQ(parsed.mtp.depth_policy.max_depth, 15);
+        }
+    }
+    EXPECT_EQ(selected, (std::set<std::string>{
+        "CUDA2_CPU2_2xMPI_NodeExpertOverlay",
+        "ROCm2_CPU2_2xMPI_NodeExpertOverlay",
+        "ROCm4_CPU2_2xMPI_NodeExpertOverlay",
+        "CUDA2_ROCm4_2xMPI_NodeExpertOverlay",
+    }));
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Qwen35_122B_ExpertOverlay,
     Qwen35MoENodeExpertOverlayParityTest,

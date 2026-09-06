@@ -1,9 +1,14 @@
 /**
  * @file MoEOverlayNodeLocalRankBatchTransport.cpp
  * @brief In-place shared-row implementation of the node-local MoE channel.
+ *
+ * Same-node participants publish authenticated live rows in shared pages;
+ * topology-bounded telemetry observes those exchanges without retaining a
+ * per-token trace. Protocol state and publication ordering remain transport-owned.
  */
 
 #include "MoEOverlayNodeLocalRankBatchTransport.h"
+#include "MoEOverlayRankBatchTelemetry.h"
 
 #include "backends/BackendManager.h"
 #include "collective/CollectiveTimeoutPolicy.h"
@@ -247,77 +252,6 @@ namespace llaminar2
             std::atomic_flag &flag_;
             bool acquired_ = false;
         };
-
-        const char *phaseFor(const MoEOverlayRankBatchKey &key) noexcept
-        {
-            return key.histogram_source == ExpertHistogramSource::PrefillChunk
-                       ? "prefill"
-                       : (key.histogram_source ==
-                                  ExpertHistogramSource::GroupedVerifier
-                              ? "grouped_verifier"
-                              : "decode");
-        }
-
-        void recordSharedTransaction(
-            const MoEOverlayRankBatchKey &key,
-            size_t bytes,
-            const char *endpoint_role,
-            uint64_t wait_ns,
-            uint64_t total_ns)
-        {
-            if (PerfStatsCollector::isDomainEnabled("forward_graph"))
-            {
-                PerfStatsCollector::addCounter(
-                    "forward_graph",
-                    key.direction == MoEOverlayCollectiveDirection::Dispatch
-                        ? "moe_overlay_rank_batch_dispatch_transactions"
-                        : "moe_overlay_rank_batch_return_transactions",
-                    1.0,
-                    "moe_overlay",
-                    "node_local_shared_rows",
-                    {{"bytes", std::to_string(bytes)},
-                     {"endpoint_role", endpoint_role},
-                     {"layer", std::to_string(key.layer_idx)},
-                     {"source_world_rank", std::to_string(key.source_world_rank)},
-                     {"target_world_rank", std::to_string(key.target_world_rank)},
-                     {"transport", "node_local_shared_rows"}});
-            }
-            if (!PerfStatsCollector::isDomainEnabled("moe_overlay_transport"))
-                return;
-            const PerfStatsCollector::Tags tags{
-                {"bytes", std::to_string(bytes)},
-                {"direction", llaminar2::toString(key.direction)},
-                {"domain_ordinal", std::to_string(key.domain_ordinal)},
-                {"endpoint_role", endpoint_role},
-                {"generation", std::to_string(key.generation_id)},
-                {"layer", std::to_string(key.layer_idx)},
-                {"logical_step", std::to_string(key.step_id)},
-                {"source_world_rank", std::to_string(key.source_world_rank)},
-                {"target_world_rank", std::to_string(key.target_world_rank)},
-                {"tier", std::to_string(key.tier_idx)},
-                {"transport", "node_local_shared_rows"}};
-            PerfStatsCollector::recordTimingNs(
-                "moe_overlay_transport",
-                "rank_batch_total",
-                total_ns,
-                phaseFor(key),
-                "node_local_shared_rows",
-                tags);
-            PerfStatsCollector::recordTimingNs(
-                "moe_overlay_transport",
-                "rank_batch_wire_wait",
-                wait_ns,
-                phaseFor(key),
-                "node_local_shared_rows",
-                tags);
-            PerfStatsCollector::addCounter(
-                "moe_overlay_transport",
-                "rank_batch_zero_copy_publications",
-                1.0,
-                phaseFor(key),
-                "node_local_shared_rows",
-                tags);
-        }
 
     } // namespace
 
@@ -2248,12 +2182,11 @@ namespace llaminar2
                                                 Clock::now() - begin)
                                                 .count())
                                       : 0;
-        recordSharedTransaction(
-            key,
-            logical_bytes,
-            source ? "source" : "target",
-            wait_ns,
-            total_ns);
+        const MoEOverlayRankBatchTelemetry telemetry(
+            key, MoEOverlayRankBatchTransportKind::NodeLocalSharedRows,
+            source ? MoEOverlayRankBatchEndpoint::Source : MoEOverlayRankBatchEndpoint::Target);
+        telemetry.recordTransaction(logical_bytes, config_.workspace->participantIds().size());
+        telemetry.recordTimings(0u, wait_ns, total_ns);
         result.collective_complete = true;
         return result;
     }
@@ -2432,12 +2365,11 @@ namespace llaminar2
                                                 Clock::now() - begin)
                                                 .count())
                                       : 0;
-        recordSharedTransaction(
-            key,
-            logical_bytes,
-            target ? "target" : "source",
-            wait_ns,
-            total_ns);
+        const MoEOverlayRankBatchTelemetry telemetry(
+            key, MoEOverlayRankBatchTransportKind::NodeLocalSharedRows,
+            target ? MoEOverlayRankBatchEndpoint::Target : MoEOverlayRankBatchEndpoint::Source);
+        telemetry.recordTransaction(logical_bytes, config_.workspace->participantIds().size());
+        telemetry.recordTimings(0u, wait_ns, total_ns);
         result.collective_complete = true;
         return result;
     }

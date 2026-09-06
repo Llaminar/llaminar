@@ -490,11 +490,12 @@ namespace llaminar2
          *
          * Called only after every graph-only child and passive capture-wave
          * rendezvous has completed. The method validates complete graph coverage,
-         * creates the parent on the exact cache stream, invokes the topology
+         * accepts the parent created before fragment recording, invokes the topology
          * composer, and instantiates the resulting executable. Under the ordinary
          * submission policy it then applies the one external launch dependency,
          * launches transaction zero, and publishes every child segment's arena
          * writes. Setup materialization stops before those three operations.
+         * @param parent Sole native owner used to create every graph-only fragment.
          */
         static bool finalizeRetainedParentTransaction(
             ComputeGraph &graph,
@@ -504,7 +505,8 @@ namespace llaminar2
             uint64_t current_step,
             const ReplayHooks &hooks,
             DeviceGraphExecutor::GraphInitialSubmissionPolicy
-                initial_submission);
+                initial_submission,
+            std::unique_ptr<IGPUGraphCapture> parent);
 
         /**
          * @brief Execute one manual segment during Phase-2 capture.

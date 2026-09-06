@@ -297,7 +297,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
     EXPECT_EQ(source.find("MPI_Wait("), std::string::npos);
     EXPECT_NE(source.find("config_.mpi_ctx->test("), std::string::npos);
     EXPECT_NE(
-        source.find("rank_batch_async_send_submissions"),
+        source.find("telemetry.recordAsyncSendSubmission("),
         std::string::npos);
 
     const size_t preposted_return = source.find(

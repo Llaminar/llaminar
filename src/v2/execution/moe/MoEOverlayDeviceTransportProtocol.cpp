@@ -1,6 +1,10 @@
 /**
  * @file MoEOverlayDeviceTransportProtocol.cpp
  * @brief Host-side immutable-command authentication and physical completion.
+ *
+ * Physical transport owns only its completion lane. Device-owned participant
+ * and group receipts authorize lifecycle progress. Action-entry observations
+ * enrich fatal diagnostics but are never read by an admission predicate.
  */
 
 #include "MoEOverlayDeviceTransportProtocol.h"
@@ -651,7 +655,7 @@ namespace llaminar2
             binding_.controller->transaction_id);
         const auto observed_phase =
             static_cast<MoEOverlayDeviceDemandPhase>(
-                loadAcquire(binding_.command->demand_phase));
+                loadAcquire(binding_.controller->transaction_demand_phase));
         const bool valid_phase =
             observed_kind == MoEOverlayDeviceControllerTransactionKind::
                                  DynamicPlacement
@@ -1000,6 +1004,8 @@ namespace llaminar2
             << ",controller{state=" << loadAcquire(controller->state)
             << ",transaction=" << loadAcquire(controller->transaction_id)
             << ",kind=" << loadAcquire(controller->transaction_kind)
+            << ",intent_phase="
+            << loadAcquire(controller->transaction_demand_phase)
             << ",durable="
             << loadAcquire(controller->current_durable_epoch)
             << ",base=" << loadAcquire(controller->base_epoch)
@@ -1065,25 +1071,44 @@ namespace llaminar2
                 << ",retired=" << loadAcquire(record->retired_epoch);
         }
         description << "],participants=[";
-        for (std::uint32_t index = 0u;
-             index < binding_.participant_record_count;
-             ++index)
+        // A peer can time out after every local participant has progressed.
+        // Inspect every already-mapped lifecycle lane so that its diagnostic
+        // identifies the missing remote action/receipt too. These observations
+        // never authorize a transition and expose no runtime placement state.
+        for (std::uint32_t group = 0u;
+             group < binding_.group_record_count;
+             ++group)
         {
-            if (index != 0u)
+            if (group != 0u)
                 description << ';';
-            const auto &record = binding_.participant_records[index];
-            description
-                << record.participant_id
-                << ":status=" << loadAcquire(record.status_code)
-                << ",snapshot="
-                << loadAcquire(record.snapshot_transaction)
-                << ",prepared="
-                << loadAcquire(record.prepared_transaction)
-                << ",published="
-                << loadAcquire(record.published_transaction)
-                << ",ready="
-                << loadAcquire(record.retirement_ready_epoch)
-                << ",retired=" << loadAcquire(record.retired_epoch);
+            description << "group=" << group << '{';
+            // valid() above proves both the array bounds and each lane's
+            // presence before any remote pointer can be dereferenced.
+            for (std::uint32_t index = 0u;
+                 index < binding_.topology_participant_record_counts[group];
+                 ++index)
+            {
+                if (index != 0u)
+                    description << ';';
+                const auto &record =
+                    binding_.topology_participant_records[group][index];
+                description
+                    << record.participant_id
+                    << ":status=" << loadAcquire(record.status_code)
+                    << ",entered_action=" << loadAcquire(record.observed_action)
+                    << ",entry_transaction="
+                    << loadAcquire(record.observed_action_transaction)
+                    << ",snapshot="
+                    << loadAcquire(record.snapshot_transaction)
+                    << ",prepared="
+                    << loadAcquire(record.prepared_transaction)
+                    << ",published="
+                    << loadAcquire(record.published_transaction)
+                    << ",ready="
+                    << loadAcquire(record.retirement_ready_epoch)
+                    << ",retired=" << loadAcquire(record.retired_epoch);
+            }
+            description << '}';
         }
         description << ']';
         return description.str();

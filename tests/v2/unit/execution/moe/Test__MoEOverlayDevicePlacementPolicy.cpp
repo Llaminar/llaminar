@@ -6,17 +6,109 @@
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/MoEOverlayDeviceControllerKernels.h"
 #include "execution/moe/MoEOverlayDevicePlacementPolicy.h"
+#include "execution/moe/MoEOverlayCycleSearch.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <vector>
 
 namespace llaminar2::test
 {
+    TEST(MoEOverlayCycleSearch, ParallelDeadEndsHaveParticipantBoundedWork)
+    {
+        // A balanced 250-edge graph: 0 -> 1 -> 0 closes the requested cycle,
+        // while participants 2..5 form a deep dead end with 31 parallel edges
+        // per hop. Enumerating paths here costs multiplicatively more work.
+        constexpr std::uint32_t participants = 6u, experts = 250u;
+        std::array<std::int32_t, experts> current{}, desired{};
+        std::array<std::uint8_t, experts> excluded{};
+        std::uint32_t edge = 0u;
+        const auto append = [&](int source, int destination)
+        {
+            current[edge] = source;
+            desired[edge++] = destination;
+        };
+        append(0, 1);
+        for (int source = 1; source < 5; ++source)
+            for (int parallel = 0; parallel < 31; ++parallel) append(source, source + 1);
+        for (int source = 5; source > 1; --source)
+            for (int parallel = 0; parallel < 31; ++parallel) append(source, source - 1);
+        append(1, 0);
+        ASSERT_EQ(edge, experts);
+        std::array<std::uint8_t, participants> visited{};
+        std::array<std::uint32_t, participants> sources{}, next_edges{}, cycle{};
+        const auto result = findMoEOverlayPlacementCycle(
+            current.data(), desired.data(), excluded, participants, experts,
+            visited.data(), sources.data(), next_edges.data(), cycle.data());
+        ASSERT_EQ(result.length, 2u);
+        EXPECT_EQ(cycle[0], 0u);
+        EXPECT_EQ(cycle[1], experts - 1u);
+        // This is a structural work-count assertion, not a timing/perf gate.
+        EXPECT_LE(result.edge_visits, participants * experts);
+    }
+
+    TEST(MoEOverlayCycleSearch, ExhaustiveSmallGraphsRetainCanonicalCycleOrder)
+    {
+        // All directed four-edge graphs on three participants, including
+        // unbalanced graphs and excluded edges, against independent exhaustive
+        // simple-path enumeration. Only this tiny test oracle backtracks marks.
+        for (std::uint32_t encoding = 0u; encoding < 6561u; ++encoding)
+        {
+            std::array<std::int32_t, 4> current{}, desired{};
+            auto remaining = encoding;
+            for (unsigned edge = 0u; edge < 4u; ++edge)
+            {
+                current[edge] = remaining % 3u; remaining /= 3u;
+                desired[edge] = remaining % 3u; remaining /= 3u;
+            }
+            for (unsigned mask : {0u, 5u, 15u})
+            {
+                std::array<std::uint8_t, 4> excluded{};
+                for (unsigned edge = 0u; edge < 4u; ++edge)
+                    excluded[edge] = (mask >> edge) & 1u;
+                std::vector<std::uint32_t> expected;
+                for (unsigned first = 0u; first < 4u && expected.empty(); ++first)
+                {
+                    if (excluded[first] || current[first] == desired[first]) continue;
+                    std::array<bool, 3> seen{};
+                    seen[current[first]] = seen[desired[first]] = true;
+                    std::vector<std::uint32_t> path{first};
+                    std::function<bool(int)> close = [&](int source)
+                    {
+                        for (unsigned edge = 0u; edge < 4u; ++edge)
+                        {
+                            if (excluded[edge] || edge == first || current[edge] != source ||
+                                current[edge] == desired[edge]) continue;
+                            path.push_back(edge);
+                            if (desired[edge] == current[first]) return true;
+                            if (!seen[desired[edge]])
+                            {
+                                seen[desired[edge]] = true;
+                                if (close(desired[edge])) return true;
+                                seen[desired[edge]] = false;
+                            }
+                            path.pop_back();
+                        }
+                        return false;
+                    };
+                    if (close(desired[first])) expected = path;
+                }
+                std::array<std::uint8_t, 3> visited{};
+                std::array<std::uint32_t, 3> sources{}, next_edges{}, cycle{};
+                const auto result = findMoEOverlayPlacementCycle(
+                    current.data(), desired.data(), excluded, 3u, 4u,
+                    visited.data(), sources.data(), next_edges.data(), cycle.data());
+                EXPECT_EQ((std::vector<std::uint32_t>(cycle.begin(), cycle.begin() + result.length)), expected)
+                    << "graph=" << encoding << " exclusions=" << mask;
+            }
+        }
+    }
+
     namespace
     {
         /** Attach exact synthetic measured costs matching the device ABI. */
@@ -579,8 +671,13 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoEOverlayDevicePlacementPolicy,
-         DecodeGainCannotCrossSubsidizeAPrefillRegression)
+         SerialOrGroupedDecodeGainCannotCrossSubsidizeAPrefillRegression)
     {
+        for (const auto gain_phase : {
+                 kMoEOverlayDeviceControllerEconomyDecodePhase,
+                 kMoEOverlayDeviceControllerEconomyGroupedVerifierPhase})
+        {
+        SCOPED_TRACE(gain_phase);
         auto policy_input = input(
             /*priorities=*/{0, 17},
             /*owners=*/{1, 0},
@@ -600,10 +697,10 @@ namespace llaminar2::test
          * because the decode gain was larger than the prefill loss.
          */
         demand[phase_offset(
-                   kMoEOverlayDeviceControllerEconomyDecodePhase) +
+                   gain_phase) +
                0u] = 1000u;
         demand[phase_offset(
-                   kMoEOverlayDeviceControllerEconomyDecodePhase) +
+                   gain_phase) +
                1u] = 10u;
         demand[phase_offset(
                    kMoEOverlayDeviceControllerEconomyPrefillPhase) +
@@ -632,6 +729,7 @@ namespace llaminar2::test
         EXPECT_TRUE(accepted.hasMovement());
         EXPECT_GT(accepted.evidence.accepted_cycles, 0u);
         EXPECT_EQ(accepted.evidence.payoff_rejected_cycles, 0u);
+        }
     }
 
     TEST(Test__MoEOverlayDevicePlacementPolicy,
@@ -737,7 +835,7 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoEOverlayDevicePlacementPolicy,
-         PhaseHistoryCombinesPrefillAndDecodeWithoutOverwriteOrWrap)
+         PhaseHistoryCombinesAllProductionSourcesWithoutOverwriteOrWrap)
     {
         constexpr std::uint32_t kLayers = 2u;
         constexpr std::uint32_t kExperts = 3u;
@@ -745,58 +843,59 @@ namespace llaminar2::test
         std::vector<std::uint64_t> history(
             kMoEOverlayDeviceControllerDemandPhaseCount * kPlaneWords, 0u);
 
-        const auto prefill_phase = moeOverlayDeviceDemandPhaseIndex(
-            MoEOverlayDeviceDemandPhase::Prefill);
-        const auto decode_phase = moeOverlayDeviceDemandPhaseIndex(
-            MoEOverlayDeviceDemandPhase::Decode);
-        ASSERT_EQ(prefill_phase, 0u);
-        ASSERT_EQ(decode_phase, 1u);
-        EXPECT_EQ(
-            moeOverlayDeviceDemandPhaseIndex(
-                MoEOverlayDeviceDemandPhase::Invalid),
-            kMoEOverlayDeviceControllerDemandPhaseCount);
-
-        const auto update = [&](MoEOverlayDeviceDemandPhase phase,
+        const auto update = [&](std::uint32_t selected,
                                 std::uint32_t layer,
                                 std::uint32_t expert,
                                 std::uint64_t delta)
         {
-            const auto selected = moeOverlayDeviceDemandPhaseIndex(phase);
             EXPECT_LT(
                 selected, kMoEOverlayDeviceControllerDemandPhaseCount);
-            const auto other = 1u - selected;
             const auto selected_offset =
                 moeOverlayDeviceDemandHistoryOffset(
                     selected, layer, expert, kLayers, kExperts);
-            const auto other_offset = moeOverlayDeviceDemandHistoryOffset(
-                other, layer, expert, kLayers, kExperts);
+            std::uint64_t other_count = 0u;
+            for (std::uint32_t other = 0u;
+                 other < kMoEOverlayDeviceControllerDemandPhaseCount; ++other)
+            {
+                if (other != selected)
+                    other_count += history[moeOverlayDeviceDemandHistoryOffset(
+                        other, layer, expert, kLayers, kExperts)];
+            }
             const auto result = moeOverlayAccumulateDeviceDemandHistory(
-                history[selected_offset], history[other_offset], delta);
+                history[selected_offset], other_count, delta);
             history[selected_offset] = result.updated_phase_count;
             return result;
         };
 
         const auto prefill = update(
-            MoEOverlayDeviceDemandPhase::Prefill, 1u, 2u, 700u);
+            kMoEOverlayDeviceControllerEconomyPrefillPhase, 1u, 2u, 700u);
         EXPECT_EQ(prefill.updated_phase_count, 700u);
         EXPECT_EQ(prefill.combined_count, 700u);
-        EXPECT_EQ(history[5u], 700u);
-        EXPECT_EQ(history[kPlaneWords + 5u], 0u);
+        EXPECT_EQ(history[kPlaneWords + 5u], 700u);
+        EXPECT_EQ(history[5u], 0u);
 
         const auto decode = update(
-            MoEOverlayDeviceDemandPhase::Decode, 1u, 2u, 11u);
+            kMoEOverlayDeviceControllerEconomyDecodePhase, 1u, 2u, 11u);
         EXPECT_EQ(decode.updated_phase_count, 11u);
         EXPECT_EQ(decode.combined_count, 711u);
-        EXPECT_EQ(history[5u], 700u)
+        EXPECT_EQ(history[kPlaneWords + 5u], 700u)
             << "decode must retain the accumulated prefill plane";
-        EXPECT_EQ(history[kPlaneWords + 5u], 11u);
+        EXPECT_EQ(history[5u], 11u);
 
         const auto next_prefill = update(
-            MoEOverlayDeviceDemandPhase::Prefill, 1u, 2u, 13u);
+            kMoEOverlayDeviceControllerEconomyPrefillPhase, 1u, 2u, 13u);
         EXPECT_EQ(next_prefill.updated_phase_count, 713u);
         EXPECT_EQ(next_prefill.combined_count, 724u);
-        EXPECT_EQ(history[kPlaneWords + 5u], 11u)
+        EXPECT_EQ(history[5u], 11u)
             << "prefill must retain the accumulated decode plane";
+
+        const auto verifier = update(
+            kMoEOverlayDeviceControllerEconomyGroupedVerifierPhase, 1u, 2u, 17u);
+        EXPECT_EQ(verifier.updated_phase_count, 17u);
+        EXPECT_EQ(verifier.combined_count, 741u);
+        EXPECT_EQ(history[2u * kPlaneWords + 5u], 17u);
+        EXPECT_EQ(history[kPlaneWords + 5u], 713u);
+        EXPECT_EQ(history[5u], 11u);
 
         constexpr std::uint64_t kMaximum = ~std::uint64_t{0};
         const auto saturated = moeOverlayAccumulateDeviceDemandHistory(

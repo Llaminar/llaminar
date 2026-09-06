@@ -2334,11 +2334,14 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
+        /**
+         * @brief Append the initial shifted row from a device outcome/checkpoint.
+         * @copydetails IInferenceRunner::commitMTPInitialShiftedRowFromDeviceOutcome
+         */
         bool commitMTPInitialShiftedRowFromDeviceOutcome(
             const PrefixStateSnapshot &checkpoint,
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
-            int main_forward_token_count,
             bool allow_speculative_discard = false) override;
         bool commitMTPShiftedRowFromDeviceTargetSample(
             int target_sample_slot,
@@ -2349,6 +2352,10 @@ namespace llaminar2
             int request_index,
             int already_appended_tokens,
             bool allow_speculative_discard = false) override;
+        /**
+         * @brief Append bounded verifier rows, then retire their scratch mailbox.
+         * @copydetails IInferenceRunner::commitMTPShiftedRowsFromDeviceOutcome
+         */
         bool commitMTPShiftedRowsFromDeviceOutcome(
             const DeviceSpeculativeOutcomeHandle &outcome,
             int request_index,
@@ -4437,6 +4444,8 @@ namespace llaminar2
         CacheStats getCacheStats() const { return cache_stats_; }
 
     private:
+        /** @brief Model-free integration peer for the installed main-prelude event contract. */
+        friend struct DeviceGraphOrchestratorLiveStateTestAccess;
         // =========================================================================
         // Private Helpers
         // =========================================================================
@@ -4861,7 +4870,6 @@ namespace llaminar2
         /** @copydoc IForwardExecutionHost::forwardGraphAuxiliaryBranchFactory */
         GraphCaptureAuxiliaryBranchFactory
         forwardGraphAuxiliaryBranchFactory(
-            const ForwardInput &input,
             DeviceId execution_device) override;
 
         /** Queue the cold graph-build publication onto a setup capture stream. */
@@ -5856,6 +5864,8 @@ namespace llaminar2
          * never consume or retire the ordering edge owed by a main forward
          * stream, and diagnostic host observation cannot change production
          * ordering semantics.
+         * This observer never acquires an expert reader. Graph admission owns
+         * that separate operation, after its placement epoch has been selected.
          *
          * @param consumer_stream Explicit CUDA/HIP stream that will execute the
          *        consuming graph.
@@ -5872,8 +5882,7 @@ namespace llaminar2
         bool waitForPendingDeviceMoERebalanceMaintenance(
             void *consumer_stream,
             DeviceTimelineRole consumer_role,
-            const char *consumer_name,
-            bool acquire_overlay_epoch = true);
+            const char *consumer_name);
 
         /** @return Stable diagnostic name for a lease lifecycle phase. */
         static const char *moeOverlayEpochLeaseStateName(
@@ -10470,6 +10479,8 @@ namespace llaminar2
          * or a stage-object execution count.
          */
         uint64_t moe_overlay_collective_request_generation_ = 0;
+        /** CPU invocation authority shared across all retained MTP graph variants. */
+        MoESparseHostOperationSequence moe_sparse_host_operation_sequence_;
         /**
          * Rank-owned control authority for heterogeneous sparse graph launches.
          *
@@ -10989,14 +11000,13 @@ namespace llaminar2
         /**
          * @brief Resolve the one typed sparse-wire phase for an MTP graph.
          *
-         * A cross-rank graph takes generation and logical-step identity from
-         * @p graph_scope. A process-local heterogeneous graph has no remote
-         * transaction coordinator, but its sparse stages still require an
-         * explicit mathematical phase; in that case the request generation is
-         * taken from the orchestrator and the stage keeps ownership of its
-         * process-local step counter. Keeping both cases behind this method
-         * prevents coordinator presence from becoming an accidental proxy for
-         * whether execution semantics exist.
+         * A heterogeneous cross-rank graph takes generation and operation ID
+         * from @p graph_scope. A CPU graph without that coordinator consumes
+         * the root/local request generation and this runner's single host
+         * invocation sequence, including homogeneous NodeTP. GPU graphs keep
+         * device-owned invocation IDs. Every case receives an explicit phase;
+         * coordinator absence never implies that a CPU rank-batch stage may
+         * reuse a constant ID or maintain its own per-cache counter.
          *
          * @param graph_scope Optional cross-rank participant binding.
          * @param execution_semantics Exact MTP draft or grouped-verifier role.
@@ -11017,7 +11027,7 @@ namespace llaminar2
                 ExecutionSemantics execution_semantics,
             std::optional<int> expected_transaction_draft_depth,
             int sparse_graph_depth,
-            std::string *error = nullptr) const;
+            std::string *error = nullptr);
 
         /**
          * @brief Resolve the request-generation authority for this graph.

@@ -12,6 +12,9 @@
 #include "integration/parity/ProductionParityModelPath.h"
 #include "integration/parity/qwen35moe/Qwen35MoEModelParityDefinitions.h"
 #include "integration/parity/qwen36/Qwen36ModelParityDefinitions.h"
+#include "integration/parity/qwen36/Ornith15ModelParityDefinitions.h"
+#include "integration/parity/qwen38/Qwen38ModelParityDefinitions.h"
+#include "config/OrchestrationConfigParser.h"
 
 #include "config/OrchestrationConfig.h"
 
@@ -1616,6 +1619,328 @@ namespace llaminar2::test::parity
         EXPECT_THROW(
             static_cast<void>(expandModelParityDefinition(disabled_overlay)),
             std::invalid_argument);
+    }
+
+    TEST(ModelParityDefinition, E2ETagsSelectExistingCellsWithoutChangingMatrix)
+    {
+        auto definition = makeDefinition(makeOverlayTopology(), 15);
+        definition.features.mtp = ModelParityAxisProfile::Standard;
+        const auto before = expandModelParityDefinition(definition);
+        definition.e2e_certifiable = {{
+            .mtp = ModelParityMTP::Depth2,
+            .owner_order = RoutedExpertOwnerOrder::Random,
+            .movement = ModelParityExpertMovement::Dynamic,
+            .profile = {.readiness_timeout_seconds = 180},
+        }};
+        const auto after = expandModelParityDefinition(definition);
+        ASSERT_EQ(before.size(), after.size());
+        int tags = 0;
+        for (std::size_t i = 0; i < after.size(); ++i)
+        {
+            EXPECT_EQ(before[i].testName(), after[i].testName());
+            if (after[i].e2e_certification)
+            {
+                ++tags;
+                EXPECT_EQ(after[i].mtp, ModelParityMTP::Depth2);
+                EXPECT_EQ(after[i].expert_overlay->movement, ModelParityExpertMovement::Dynamic);
+                EXPECT_EQ(after[i].expert_overlay->owner_order, RoutedExpertOwnerOrder::Random);
+                EXPECT_EQ(after[i].e2e_certification->readiness_timeout_seconds, 180);
+                std::ostringstream exported;
+                PrintTo(after[i], &exported);
+                EXPECT_NE(exported.str().find("\"readiness_timeout_seconds\":180"), std::string::npos);
+            }
+        }
+        EXPECT_EQ(tags, 1);
+    }
+
+    /** @brief Discovery carries the matrix's obligation, not CLI default inference. */
+    TEST(ModelParityDefinition, E2EExportsTypedMovementObligations)
+    {
+        const auto expect_export = [](const ModelParityDefinition &definition,
+                                      const std::string &expected)
+        {
+            std::size_t tagged = 0;
+            for (const auto &cell : expandModelParityDefinition(definition))
+            {
+                if (!cell.e2e_certification) continue;
+                ++tagged;
+                std::ostringstream exported;
+                PrintTo(cell, &exported);
+                EXPECT_NE(exported.str().find(
+                              "\"movement_evidence\":\"" + expected + "\""),
+                          std::string::npos);
+            }
+            EXPECT_GT(tagged, 0u);
+        };
+        auto single = makeDefinition(makeSingleDeviceTopology());
+        single.e2e_certifiable = {{}};
+        expect_export(single, "not_applicable");
+        for (const auto movement : {ModelParityExpertMovement::Static,
+                                    ModelParityExpertMovement::Dynamic})
+        {
+            auto overlay = makeDefinition(makeOverlayTopology());
+            overlay.e2e_certifiable = {{
+                .owner_order = RoutedExpertOwnerOrder::Ordinal,
+                .movement = movement,
+            }};
+            expect_export(overlay, movement == ModelParityExpertMovement::Static
+                                       ? "forbidden" : "required");
+        }
+        EXPECT_THROW(modelParityE2EMovementEvidenceName(
+                         static_cast<ModelParityMovementEvidence>(255)),
+                     std::invalid_argument);
+    }
+
+    TEST(ModelParityDefinition, E2ETagsRejectUnmatchedOverlappingAndInvalidProfiles)
+    {
+        auto definition = makeDefinition(makeSingleDeviceTopology());
+        definition.e2e_certifiable = {{.mtp = ModelParityMTP::Depth15}};
+        EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
+        definition.e2e_certifiable = {{}, {}};
+        EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
+        definition.e2e_certifiable = {{.owner_order = RoutedExpertOwnerOrder::Ordinal}};
+        EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
+        definition.e2e_certifiable = {{.profile = {.context_length = 100}}};
+        EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
+        for (int timeout : {0, -1})
+        {
+            definition.e2e_certifiable = {{.profile = {.readiness_timeout_seconds = timeout}}};
+            EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
+        }
+        definition.e2e_certifiable = {{}};
+        const auto cells = expandModelParityDefinition(definition);
+        ASSERT_TRUE(cells.front().e2e_certification);
+        EXPECT_EQ(cells.front().e2e_certification->readiness_timeout_seconds, 60);
+    }
+
+    /** @return Public CLI round trip of one exported certification cell. */
+    OrchestrationConfig parseE2EArguments(const ModelParityCase &cell)
+    {
+        auto args = modelParityE2EServerArguments(cell);
+        args.insert(args.begin(), "llaminar2");
+        std::vector<char *> argv;
+        for (auto &arg : args) argv.push_back(arg.data());
+        return OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()), argv.data());
+    }
+
+    TEST(ModelParityDefinition, E2EThinkingModesAreTypedAndExportedWithoutFilenameInference)
+    {
+        auto definition = qwen36::qwen36MoECPU2NodeTPParityDefinition();
+        for (const auto mode : {ModelParityE2EThinkingModes::NonThinkingOnly,
+                                ModelParityE2EThinkingModes::ThinkingAndNonThinking})
+        {
+            definition.e2e_certifiable.front().profile.thinking_modes = mode;
+            for (const auto &cell : expandModelParityDefinition(definition))
+            {
+                if (!cell.e2e_certification) continue;
+                std::ostringstream exported;
+                PrintTo(cell, &exported);
+                EXPECT_NE(exported.str().find(std::string("\"thinking_modes\":\"") +
+                    modelParityE2EThinkingModesName(mode) + "\""), std::string::npos);
+            }
+        }
+        definition.e2e_certifiable.front().profile.thinking_modes =
+            static_cast<ModelParityE2EThinkingModes>(-1);
+        EXPECT_THROW(expandModelParityDefinition(definition), std::invalid_argument);
+    }
+
+    TEST(ModelParityDefinition, OrnithCertificationInheritsTopologyButNotReferenceIdentity)
+    {
+        std::vector<ModelParityDefinition> originals;
+        for (const auto address : {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
+            originals.push_back(qwen36::qwen36MoEParityDefinition(
+                qwen36::qwen36SingleDeviceTopology(address.toString(), address),
+                "/references/qwen36", qwen36::qwen36MoESingleDeviceThresholds()));
+        // Test identifiers are separate from the CLI's punctuation-bearing addresses.
+        originals[0].topology.test_id = "CPU0";
+        originals[1].topology.test_id = "CUDA0";
+        originals[2].topology.test_id = "ROCm0";
+        originals.push_back(qwen36::qwen36MoECPU2NodeTPParityDefinition());
+        for (const auto &topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
+                                    qwen36::qwen36MoERocm2ExpertOverlayTopology()})
+            originals.push_back(qwen36::qwen36MoEParityDefinition(
+                topology, "/references/qwen36", qwen36::qwen36MoEExpertOverlayThresholds()));
+
+        const auto definitions = qwen36::withOrnith15CertificationModels(originals);
+        ASSERT_EQ(definitions.size(), originals.size() + 4);
+        std::set<std::string> names;
+        std::set<std::string> references;
+        std::size_t added_cells = 0, added_tags = 0;
+        for (std::size_t i = 0; i < originals.size(); ++i)
+        {
+            const auto before = expandModelParityDefinition(originals[i]);
+            const auto after = expandModelParityDefinition(definitions[i]);
+            ASSERT_EQ(before.size(), after.size());
+            for (std::size_t j = 0; j < before.size(); ++j)
+            {
+                EXPECT_EQ(before[j].testName(), after[j].testName());
+                EXPECT_EQ(before[j].model.model_path, after[j].model.model_path);
+                EXPECT_TRUE(names.insert(after[j].testName()).second);
+            }
+        }
+        for (std::size_t i = originals.size(); i < definitions.size(); ++i)
+        {
+            const auto &variant = definitions[i];
+            const auto source = std::find_if(originals.begin(), originals.end(),
+                [&](const auto &d) { return d.topology.test_id == variant.topology.test_id; });
+            ASSERT_NE(source, originals.end());
+            EXPECT_NE(variant.model.reference_directory, source->model.reference_directory);
+            EXPECT_TRUE(references.insert(variant.model.reference_directory).second);
+            auto expected_definition = *source;
+            if (source->topology.expert_overlay_plan)
+                expected_definition.e2e_certifiable = {{
+                    .mtp = ModelParityMTP::DynamicDepth,
+                    .owner_order = RoutedExpertOwnerOrder::Ordinal,
+                    .movement = ModelParityExpertMovement::Dynamic,
+                }};
+            const auto before = expandModelParityDefinition(expected_definition);
+            const auto after = expandModelParityDefinition(variant);
+            ASSERT_EQ(before.size(), after.size());
+            added_cells += after.size();
+            for (std::size_t j = 0; j < after.size(); ++j)
+            {
+                EXPECT_TRUE(names.insert(after[j].testName()).second);
+                EXPECT_EQ(after[j].testName().substr(variant.model.test_id.size()),
+                          before[j].testName().substr(source->model.test_id.size()));
+                ASSERT_EQ(before[j].e2e_certification.has_value(), after[j].e2e_certification.has_value());
+                if (!after[j].e2e_certification) continue;
+                ++added_tags;
+                auto expected = modelParityE2EServerArguments(before[j]);
+                std::replace(expected.begin(), expected.end(), source->model.model_path, variant.model.model_path);
+                EXPECT_EQ(expected, modelParityE2EServerArguments(after[j]));
+                EXPECT_EQ(after[j].e2e_certification->readiness_timeout_seconds,
+                          before[j].e2e_certification->readiness_timeout_seconds);
+                EXPECT_EQ(after[j].e2e_certification->thinking_modes,
+                          ModelParityE2EThinkingModes::ThinkingAndNonThinking);
+                const auto config = parseE2EArguments(after[j]);
+                EXPECT_EQ(config.mtp.depth_policy.max_depth, 15);
+                EXPECT_TRUE(config.prefix_cache.enabled);
+            }
+        }
+        EXPECT_EQ(added_cells, 78u);
+        EXPECT_EQ(added_tags, 4u);
+    }
+
+    TEST(ModelParityDefinition, CPUNodeCertificationRetainsFullMatrixAndOneAuthority)
+    {
+        const auto definition = qwen36::qwen36MoECPU2NodeTPParityDefinition();
+        const auto cells = expandModelParityDefinition(definition);
+        ASSERT_EQ(cells.size(), 24u);
+        std::size_t tagged = 0;
+        for (const auto &cell : cells)
+        {
+            ASSERT_EQ(cell.topology.mpi_ranks, 2);
+            if (!cell.e2e_certification) continue;
+            ++tagged;
+            EXPECT_EQ(cell.mtp, ModelParityMTP::DynamicDepth);
+            ASSERT_TRUE(cell.expert_overlay);
+            EXPECT_EQ(cell.expert_overlay->movement, ModelParityExpertMovement::Dynamic);
+            EXPECT_EQ(cell.expert_overlay->owner_order, RoutedExpertOwnerOrder::Ordinal);
+            const auto config = parseE2EArguments(cell);
+            ASSERT_TRUE(config.moe_routed_expert_plan);
+            const auto &plan = *config.moe_routed_expert_plan;
+            ASSERT_EQ(plan.domains.size(), 1u);
+            ASSERT_EQ(plan.routed_tiers.size(), 1u);
+            EXPECT_EQ(plan.topology, RoutedExpertPlacementTopology::SingleDomain);
+            EXPECT_EQ(plan.domains[0].scope, ExecutionDomainScope::NODE_LOCAL);
+            EXPECT_EQ(plan.domains[0].participants,
+                      (std::vector<GlobalDeviceAddress>{GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)}));
+            EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+            EXPECT_EQ(config.mtp.depth_policy.max_depth, 15);
+            EXPECT_TRUE(config.prefix_cache.enabled);
+        }
+        EXPECT_EQ(tagged, 1u);
+    }
+
+    TEST(ModelParityDefinition, InitialSingleGPUCertificationSelectsOnlyAdaptiveMTP)
+    {
+        for (const auto address : {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
+        {
+            const auto topology = qwen36::qwen36SingleDeviceTopology("single", address);
+            for (const auto &definition : {
+                     qwen38::qwen38DenseParityDefinition(topology, "/references/dense"),
+                     qwen36::qwen36MoEParityDefinition(topology, "/references/moe", {})})
+            {
+                const auto cases = expandModelParityDefinition(definition);
+                ASSERT_EQ(cases.size(), 6u);
+                std::size_t tagged = 0;
+                for (const auto &cell : cases)
+                {
+                    if (!cell.e2e_certification) continue;
+                    ++tagged;
+                    EXPECT_EQ(cell.mtp, ModelParityMTP::DynamicDepth);
+                    EXPECT_EQ(cell.retained_mtp_draft_capacity, 15);
+                    EXPECT_FALSE(cell.expert_overlay.has_value());
+                }
+                EXPECT_EQ(tagged, address.isCPU() ? 0u : 1u);
+            }
+        }
+        for (const auto &topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
+                                    qwen36::qwen36MoERocm2ExpertOverlayTopology()})
+            EXPECT_TRUE(qwen36::qwen36MoEParityDefinition(topology, "/references/moe", {}).e2e_certifiable.empty());
+    }
+
+    TEST(ModelParityDefinition, Qwen38E2ERoundTripsAllMTPPoliciesOnEachBackend)
+    {
+        for (const auto address : {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
+        {
+            auto topology = makeSingleDeviceTopology();
+            topology.participants = {{address, 0}};
+            auto definition = qwen38::qwen38DenseParityDefinition(topology, "/references/qwen38");
+            definition.e2e_certifiable.clear();
+            for (const auto mtp : kCanonicalModelParityMTPPolicies)
+                definition.e2e_certifiable.push_back({.mtp = mtp});
+            for (const auto &cell : expandModelParityDefinition(definition))
+            {
+                SCOPED_TRACE(cell.testName());
+                const auto expected = cell.makeOrchestrationConfig(cell.model.model_path, 0);
+                const auto actual = parseE2EArguments(cell);
+                ASSERT_TRUE(actual.device_for_this_rank);
+                EXPECT_EQ(actual.device_for_this_rank, expected.device_for_this_rank);
+                EXPECT_EQ(actual.activation_precision, "fp32");
+                EXPECT_EQ(actual.kv_cache_precision, "fp16");
+                EXPECT_EQ(actual.mtp.enabled, cell.mtpEnabled());
+                EXPECT_EQ(actual.mtp.graph_capacity_draft_tokens,
+                          expected.mtp.graph_capacity_draft_tokens);
+                if (cell.mtpEnabled())
+                    EXPECT_EQ(actual.mtp.draft_tokens, expected.mtp.draft_tokens);
+                EXPECT_EQ(actual.mtp.depth_policy.mode, expected.mtp.depth_policy.mode);
+                EXPECT_TRUE(actual.prefix_cache.enabled);
+                EXPECT_EQ(actual.prefix_cache.storage_mode, PrefixCacheStorageMode::Tiered);
+                EXPECT_EQ(cell.model.transformer_layers, 64);
+                EXPECT_NE(cell.model.model_path.find("Qwen3.8-27B-IQ4_XS"), std::string::npos);
+            }
+        }
+    }
+
+    TEST(ModelParityDefinition, E2EOverlayRoundTripPreservesBothPlacementAxesAndEconomics)
+    {
+        for (auto topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(), qwen36::qwen36MoERocm2ExpertOverlayTopology()})
+        {
+            auto definition = qwen36::qwen36MoEParityDefinition(topology, "/references/moe", {});
+            definition.e2e_certifiable.clear();
+            for (const auto &policy : kCanonicalModelParityExpertOverlayPolicies)
+                definition.e2e_certifiable.push_back({
+                    .owner_order = policy.owner_order, .movement = policy.movement});
+            for (const auto &cell : expandModelParityDefinition(definition))
+            {
+                if (!cell.e2e_certification) continue;
+                SCOPED_TRACE(cell.testName());
+                const auto expected = cell.makeOrchestrationConfig(cell.model.model_path, 0);
+                const auto actual = parseE2EArguments(cell);
+                ASSERT_TRUE(actual.moe_routed_expert_plan);
+                const auto &plan = *actual.moe_routed_expert_plan;
+                EXPECT_EQ(plan.owner_order, cell.expert_overlay->owner_order);
+                EXPECT_EQ(plan.residency_policy, expected.moe_routed_expert_plan->residency_policy);
+                EXPECT_EQ(plan.domains.size(), topology.expert_overlay_plan->domains.size());
+                EXPECT_EQ(plan.domains[0].participants, topology.expert_overlay_plan->domains[0].participants);
+                EXPECT_EQ(plan.domains[0].backend, topology.expert_overlay_plan->domains[0].backend);
+                EXPECT_EQ(actual.moe_rebalance.mode, expected.moe_rebalance.mode);
+                EXPECT_EQ(actual.moe_rebalance.window_size, expected.moe_rebalance.window_size);
+                EXPECT_EQ(actual.moe_rebalance.migration_transfer_slots, expected.moe_rebalance.migration_transfer_slots);
+                EXPECT_EQ(actual.moe_rebalance.dynamic_min_improvement_per_mille, expected.moe_rebalance.dynamic_min_improvement_per_mille);
+            }
+        }
     }
 
 } // namespace llaminar2::test::parity

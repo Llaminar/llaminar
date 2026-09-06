@@ -324,8 +324,8 @@ namespace llaminar2
         std::unique_ptr<IGPUGraphCapture>
             prepared_context_restore_begin_graph;
         /** Participant-local demand publication with no peer dependency. */
-        std::unique_ptr<IGPUGraphCapture> dynamic_snapshot_prefill_graph;
-        std::unique_ptr<IGPUGraphCapture> dynamic_snapshot_decode_graph;
+        /** One phase-complete snapshot graph shared by both scheduler boundaries. */
+        std::unique_ptr<IGPUGraphCapture> dynamic_snapshot_graph;
         /** Participant snapshot of live ownership for terminal restoration. */
         std::unique_ptr<IGPUGraphCapture>
             prepared_context_restore_snapshot_graph;
@@ -359,7 +359,7 @@ namespace llaminar2
         void *stream = nullptr;
         void *terminal_event = nullptr;
         MoEOverlayDeviceControllerPolicyResult *policy_result = nullptr;
-        /** Two disjoint `[layer][expert]` cumulative phase baselines. */
+        /** Phase-pure decode, prefill, and verifier cumulative baselines. */
         std::uint64_t *histogram_phase_baselines = nullptr;
         std::size_t histogram_baseline_words = 0u;
         bool in_flight = false;
@@ -1183,14 +1183,14 @@ namespace llaminar2
                     if (endpoint.histogram_baseline_words == 0u ||
                         endpoint.histogram_baseline_words >
                             std::numeric_limits<std::size_t>::max() /
-                                (2u * sizeof(std::uint64_t)))
+                                (kMoEOverlayDeviceControllerDemandPhaseCount * sizeof(std::uint64_t)))
                     {
                         throw std::overflow_error(
                             "Device controller histogram baseline geometry overflowed size_t");
                     }
                     endpoint.histogram_phase_baselines = static_cast<
                         std::uint64_t *>(endpoint.backend->allocate(
-                        2u * endpoint.histogram_baseline_words *
+                        kMoEOverlayDeviceControllerDemandPhaseCount * endpoint.histogram_baseline_words *
                             sizeof(std::uint64_t),
                         endpoint.binding.device.gpu_ordinal()));
                     endpoint.arrival_inbox = std::make_unique<
@@ -1218,7 +1218,7 @@ namespace llaminar2
                     (!endpoint.backend->memset(
                          endpoint.histogram_phase_baselines,
                          0,
-                         2u * endpoint.histogram_baseline_words *
+                         kMoEOverlayDeviceControllerDemandPhaseCount * endpoint.histogram_baseline_words *
                              sizeof(std::uint64_t),
                          endpoint.binding.device.gpu_ordinal(),
                          endpoint.stream)))
@@ -1284,22 +1284,37 @@ namespace llaminar2
                 const auto pack_snapshot = [
                                                &endpoint,
                                                &launch](
-                                               std::uint32_t source_mask,
                                                std::uint64_t *baseline)
                 {
                     // Packing and publication share the participant's exact
                     // retained stream. The mapped participant record is the
                     // release edge consumed by the group root.
-                    return endpoint.kernel->packDeviceRebalanceHistograms(
-                        launch,
-                        endpoint.runtime_binding.runtime_layers_device,
-                        endpoint.binding.participant_collected_state,
-                        endpoint.snapshot_config,
-                        /*wave_state=*/nullptr,
-                        /*controller_state=*/nullptr,
-                        /*command_buffer_count=*/1u,
-                        source_mask,
-                        baseline);
+                    const auto plane_words = static_cast<std::size_t>(
+                        endpoint.snapshot_config.num_layers) *
+                        endpoint.snapshot_config.num_experts;
+                    // Histogram ABI and economy use the same source order.
+                    // All planes are packed before the single release edge;
+                    // no host histogram or additional collective is involved.
+                    static_assert(moe_runtime_abi::kHistogramSourceCount ==
+                                  kMoEOverlayDeviceControllerDemandPhaseCount);
+                    for (std::uint32_t phase = 0u;
+                         phase < kMoEOverlayDeviceControllerDemandPhaseCount;
+                         ++phase)
+                    {
+                        const auto offset = phase * plane_words;
+                        if (!endpoint.kernel->packDeviceRebalanceHistograms(
+                                launch,
+                                endpoint.runtime_binding.runtime_layers_device,
+                                endpoint.binding.participant_collected_state + offset,
+                                endpoint.snapshot_config,
+                                /*wave_state=*/nullptr,
+                                /*controller_state=*/nullptr,
+                                /*command_buffer_count=*/1u,
+                                1u << phase,
+                                baseline ? baseline + offset : nullptr))
+                            return false;
+                    }
+                    return true;
                 };
 
                 const auto capture = [&](std::unique_ptr<IGPUGraphCapture> &graph,
@@ -1334,8 +1349,6 @@ namespace llaminar2
                             }
                             captured = captured &&
                                 pack_snapshot(
-                                    moe_runtime_abi::
-                                        kAllHistogramSourcesMask,
                                     /*baseline=*/nullptr) &&
                                 enqueue(
                                     MoEOverlayDeviceControllerAction::
@@ -1416,26 +1429,10 @@ namespace llaminar2
                     },
                     "Dynamic service-telemetry snapshot phase");
 
-                const std::uint32_t prefill_source_mask =
-                    moe_runtime_abi::histogramSourceBit(
-                        moe_runtime_abi::HistogramSource::Prefill);
-                const std::uint32_t decode_source_mask =
-                    moe_runtime_abi::histogramSourceBit(
-                        moe_runtime_abi::HistogramSource::Decode) |
-                    moe_runtime_abi::histogramSourceBit(
-                        moe_runtime_abi::HistogramSource::GroupedVerifier);
-                std::uint64_t *const prefill_baseline =
-                    endpoint.histogram_phase_baselines;
-                std::uint64_t *const decode_baseline =
-                    endpoint.histogram_phase_baselines +
-                    endpoint.histogram_baseline_words;
                 const auto capture_decision_family = [&] (
                     std::unique_ptr<IGPUGraphCapture> &begin_graph,
-                    std::unique_ptr<IGPUGraphCapture> &snapshot_graph,
                     std::unique_ptr<IGPUGraphCapture> &author_graph,
                     MoEOverlayDeviceDemandPhase demand_phase,
-                    std::uint32_t source_mask,
-                    std::uint64_t *baseline,
                     const char *phase_name)
                 {
                     /*
@@ -1464,16 +1461,6 @@ namespace llaminar2
                             },
                             phase_name);
                     }
-                    capture(
-                        snapshot_graph,
-                        [&]
-                        {
-                            return pack_snapshot(source_mask, baseline) &&
-                                   enqueue(
-                                       MoEOverlayDeviceControllerAction::
-                                           PublishParticipantSnapshot);
-                        },
-                        phase_name);
                     if (endpoint.binding.authority_leader)
                     {
                         capture(
@@ -1497,6 +1484,14 @@ namespace llaminar2
                     }
                 };
                 capture(
+                    endpoint.dynamic_snapshot_graph,
+                    [&]
+                    {
+                        return pack_snapshot(endpoint.histogram_phase_baselines) &&
+                            enqueue(MoEOverlayDeviceControllerAction::PublishParticipantSnapshot);
+                    },
+                    "Dynamic phase-complete participant snapshot");
+                capture(
                     endpoint.dynamic_histogram_rebase_graph,
                     [&]
                     {
@@ -1504,29 +1499,18 @@ namespace llaminar2
                          * baseline. The packed scratch row is intentionally
                          * unpublished: certification traffic is valid economy
                          * evidence, but must not become placement demand. */
-                        return pack_snapshot(
-                                   prefill_source_mask,
-                                   prefill_baseline) &&
-                               pack_snapshot(
-                                   decode_source_mask,
-                                   decode_baseline);
+                        return pack_snapshot(endpoint.histogram_phase_baselines);
                     },
                     "Dynamic calibration-demand histogram rebase");
                 capture_decision_family(
                     endpoint.dynamic_begin_prefill_graph,
-                    endpoint.dynamic_snapshot_prefill_graph,
                     endpoint.dynamic_author_prefill_graph,
                     MoEOverlayDeviceDemandPhase::Prefill,
-                    prefill_source_mask,
-                    prefill_baseline,
                     "Dynamic bounded prefill decision phase");
                 capture_decision_family(
                     endpoint.dynamic_begin_decode_graph,
-                    endpoint.dynamic_snapshot_decode_graph,
                     endpoint.dynamic_author_decode_graph,
                     MoEOverlayDeviceDemandPhase::Decode,
-                    decode_source_mask,
-                    decode_baseline,
                     "Dynamic bounded decode decision phase");
                 if (endpoint.binding.authority_leader)
                 {
@@ -1570,8 +1554,6 @@ namespace llaminar2
                          * wire format carries both values; no phase baseline
                          * is advanced and the restore author ignores counts. */
                         return pack_snapshot(
-                                   moe_runtime_abi::
-                                       kAllHistogramSourcesMask,
                                    /*baseline=*/nullptr) &&
                                enqueue(
                                    MoEOverlayDeviceControllerAction::
@@ -2470,10 +2452,10 @@ namespace llaminar2
                 graph = endpoint.prepared_context_restore_begin_graph.get();
                 break;
             case DynamicGraphEpoch::SnapshotPrefillDemand:
-                graph = endpoint.dynamic_snapshot_prefill_graph.get();
+                graph = endpoint.dynamic_snapshot_graph.get();
                 break;
             case DynamicGraphEpoch::SnapshotDecodeDemand:
-                graph = endpoint.dynamic_snapshot_decode_graph.get();
+                graph = endpoint.dynamic_snapshot_graph.get();
                 break;
             case DynamicGraphEpoch::SnapshotPreparedContextRestore:
                 graph = endpoint.prepared_context_restore_snapshot_graph.get();
@@ -2739,12 +2721,14 @@ namespace llaminar2
     }
 
     bool MoEOverlayDeviceControllerGraphService::finishDynamicInboxes(
+        const MoEOverlayDeviceTransportProtocol &protocol,
+        const MoEOverlayDeviceTransportCommandBatch &command,
         std::string *error) noexcept
     {
         for (auto &endpoint : endpoints_)
         {
             if (!endpoint || !endpoint->arrival_inbox ||
-                !endpoint->arrival_inbox->finishWave(error))
+                !endpoint->arrival_inbox->finishWave(protocol, command, error))
             {
                 if (error && error->empty())
                     *error = "Dynamic participant arrival inbox could not close";
@@ -4121,7 +4105,6 @@ namespace llaminar2
         }
 
         bool graph_phase_in_flight = false;
-        bool inboxes_enqueued = false;
         bool physical_published = false;
         const auto unwind = [&](std::string message)
         {
@@ -4131,35 +4114,9 @@ namespace llaminar2
                 abortPrepared(batch, prepared);
             if (graph_phase_in_flight)
                 (void)wait_terminals("failed movement unwind");
-            if (inboxes_enqueued)
-            {
-                const auto deadline = protocolDeadline();
-                bool inboxes_ready = false;
-                while (std::chrono::steady_clock::now() < deadline)
-                {
-                    inboxes_ready = true;
-                    for (auto &endpoint : owner->endpoints_)
-                    {
-                        bool ready = false;
-                        std::string ignored;
-                        if (!endpoint->arrival_inbox->queryReady(
-                                &ready, &ignored))
-                        {
-                            inboxes_ready = false;
-                            break;
-                        }
-                        inboxes_ready = inboxes_ready && ready;
-                    }
-                    if (inboxes_ready)
-                        break;
-                    pollPause();
-                }
-                if (inboxes_ready)
-                {
-                    std::string ignored;
-                    (void)owner->finishDynamicInboxes(&ignored);
-                }
-            }
+            // A failed transaction cannot recycle its immutable descriptor
+            // pages. Endpoint teardown retains them until captured readers
+            // retire; there is no separate descriptor DMA to drain here.
             return fail(error, std::move(message));
         };
         const auto run_epoch = [&](DynamicGraphEpoch epoch,
@@ -4320,8 +4277,13 @@ namespace llaminar2
             [](std::uint8_t ready) { return ready != 0u; });
         if (!every_projection_ready)
         {
+            // Capture physical receipts before unwind aborts operations. This
+            // path adds no successful-wave polling, transfer, or event wait.
             return unwind(
-                "device physical transfers exceeded the protocol deadline");
+                "device physical transfers exceeded the protocol deadline; " +
+                batch.describeProjectionReadiness(projection_ready) +
+                "; poll_quanta=" + std::to_string(poll_quanta) +
+                "; operation_polls=" + std::to_string(operation_polls));
         }
         PerfStatsCollector::addCounter(
             "moe_overlay_controller",
@@ -4358,69 +4320,22 @@ namespace llaminar2
                     : std::move(stage_error));
         }
 
-        // Submit every descriptor DMA and event edge before launching any
-        // participant continuation. These worker futures cover API submission
-        // only; the copies remain asynchronous on their dedicated streams.
-        std::vector<std::future<void>> inbox_submissions;
-        inbox_submissions.reserve(owner->endpoints_.size());
-        try
+        // Physical descriptors are tiny immutable host-authored metadata, not
+        // live GPU placement state. Stage them on this transport worker before
+        // its existing system-release receipt. The candidate graph acquires
+        // that receipt and reads the mapped pages directly into the device bank.
+        // No worker dispatch, copy-engine queue, or extra readiness event exists.
+        for (auto &endpoint : owner->endpoints_)
         {
-            for (auto &owned_endpoint : owner->endpoints_)
+            std::string staging_error;
+            if (!endpoint->arrival_inbox ||
+                !endpoint->arrival_inbox->stage(batch, prepared, &staging_error))
             {
-                auto &endpoint = *owned_endpoint;
-                inbox_submissions.push_back(endpoint.worker->submitAsync(
-                    [&endpoint, &batch, &prepared]
-                    {
-                        std::string inbox_error;
-                        if (!endpoint.arrival_inbox ||
-                            !endpoint.arrival_inbox->enqueue(
-                                batch, prepared, &inbox_error) ||
-                            !endpoint.arrival_inbox->enqueueDependency(
-                                &inbox_error))
-                        {
-                            throw std::runtime_error(
-                                inbox_error.empty()
-                                    ? "participant descriptor/event submission failed"
-                                    : std::move(inbox_error));
-                        }
-                    }));
+                return unwind(staging_error.empty()
+                    ? "participant descriptor staging failed"
+                    : std::move(staging_error));
             }
-            for (auto &submission : inbox_submissions)
-                submission.get();
-            inboxes_enqueued = true;
         }
-        catch (const std::exception &exception)
-        {
-            return unwind(
-                std::string("device prepared-arrival submission failed: ") +
-                exception.what());
-        }
-
-        const auto descriptor_deadline = protocolDeadline();
-        bool descriptors_ready = false;
-        while (std::chrono::steady_clock::now() < descriptor_deadline)
-        {
-            descriptors_ready = true;
-            for (auto &endpoint : owner->endpoints_)
-            {
-                bool ready = false;
-                std::string query_error;
-                if (!endpoint->arrival_inbox->queryReady(
-                        &ready, &query_error))
-                {
-                    return unwind(
-                        query_error.empty()
-                            ? "descriptor event query failed"
-                            : std::move(query_error));
-                }
-                descriptors_ready = descriptors_ready && ready;
-            }
-            if (descriptors_ready)
-                break;
-            pollPause();
-        }
-        if (!descriptors_ready)
-            return unwind("prepared descriptor DMA exceeded the protocol deadline");
 
         for (std::size_t index = 0u; index < protocols.size(); ++index)
         {
@@ -4435,7 +4350,7 @@ namespace llaminar2
             }
         }
 
-        /* Completed destination bytes and descriptor DMA are already retained.
+        /* Completed destination bytes and mapped descriptors are already retained.
          * Publish their allocation lifetimes and the immutable physical receipt
          * before the device epoch begins. Neither operation can select E+1 for
          * inference; the captured publication graph below remains the sole RCU
@@ -4729,7 +4644,7 @@ namespace llaminar2
                               ? *error
                               : "device transaction completion was not published");
         }
-        if (!owner->finishDynamicInboxes(error))
+        if (!owner->finishDynamicInboxes(*protocols.front(), command, error))
         {
             return false;
         }
@@ -5241,8 +5156,7 @@ namespace llaminar2
                     endpoint.dynamic_begin_prefill_graph.reset();
                     endpoint.dynamic_begin_decode_graph.reset();
                     endpoint.prepared_context_restore_begin_graph.reset();
-                    endpoint.dynamic_snapshot_prefill_graph.reset();
-                    endpoint.dynamic_snapshot_decode_graph.reset();
+                    endpoint.dynamic_snapshot_graph.reset();
                     endpoint.prepared_context_restore_snapshot_graph.reset();
                     endpoint.dynamic_group_snapshot_graph.reset();
                     endpoint.dynamic_author_prefill_graph.reset();

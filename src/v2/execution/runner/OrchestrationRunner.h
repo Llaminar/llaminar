@@ -273,6 +273,8 @@ namespace llaminar2
         void clearCache() override;
         bool purgePrefixCache() override;
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
+        /** @return Existing prefix outcome and validated terminal MTP observations. */
+        RequestRuntimeSummary requestRuntimeSummary() const override;
         PrefixRuntimeStateSnapshot prefixStateProbe() const override;
         DeviceId primaryDeviceId() const override;
 
@@ -1224,6 +1226,18 @@ namespace llaminar2
          * any other durable placement data.
          */
         void resetUnderlyingRunnerRequestState(const char *reason);
+
+        /**
+         * @brief Retire orchestration-owned MTP continuation state.
+         *
+         * Resident continuation handles retain request-scoped backend events
+         * through shared MTP transaction leases. This transition must run
+         * after the participant has drained/reset the request and before that
+         * participant or its backend is destroyed. Keeping the complete
+         * continuation tuple behind one method prevents a host token, sampling
+         * policy, scheduler position, or device lease from surviving alone.
+         */
+        void retireMTPRequestContinuationState();
 
         // =====================================================================
         // Error Handling

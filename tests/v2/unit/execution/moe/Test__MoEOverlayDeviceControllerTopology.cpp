@@ -336,10 +336,10 @@ namespace llaminar2::test
         ASSERT_EQ(layout.groups.size(), 2u);
         EXPECT_EQ(
             layout.groups[0].collected_state_words,
-            2u * 48u * 256u);
+            2u * kMoEOverlayDeviceControllerDemandPhaseCount * 48u * 256u);
         EXPECT_EQ(
             layout.groups[1].collected_state_words,
-            4u * 48u * 256u);
+            4u * kMoEOverlayDeviceControllerDemandPhaseCount * 48u * 256u);
         EXPECT_EQ(
             layout.groups[0].owned_page_begin,
             layout.leader_owned_end);

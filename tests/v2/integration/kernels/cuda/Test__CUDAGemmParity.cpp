@@ -1835,9 +1835,8 @@ protected:
      * unions their persistent requirements.  The parity fixture must express
      * the same contract when one test executes grouped verifier rows and then
      * the real fused M=1 decode route as its byte oracle.  Collapsing those
-     * regimes to only their largest numeric M is invalid because CUDA M=1 uses
-     * projection side streams while grouped verifier execution deliberately
-     * remains on its graph stream.
+     * regimes to only their largest numeric M is invalid because CUDA M=1 and
+     * grouped verifier execution reserve different exact side-stream slices.
      *
      * @param kernels Fused projection kernels that share one workspace.
      * @param execution_rows Exact M values that this workspace must execute.
@@ -1881,8 +1880,15 @@ protected:
                 }
             }
 
-            // Projection fan-out is a property of this exact row regime.  In
-            // particular, only M=1 reserves disjoint concurrent-decode slots.
+            // Mirror the production fused-stage contract: grouped verifier
+            // rows declare exact side-stream KPAR capacity through their
+            // anchor kernel, while M=1 uses the shared decode helper below.
+            if (auto *anchor =
+                    dynamic_cast<IWorkspaceConsumer *>(kernels.front()))
+            {
+                anchor->appendFusedProjectionWorkspaceRequirements(
+                    regime_reqs, rows, Ns, K);
+            }
             addCudaConcurrentDecodeGemvSideStreamWorkspace(
                 regime_reqs,
                 gpu_device_,
@@ -6016,6 +6022,9 @@ TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats)
     const int N1 = 128;
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv deterministic("LLAMINAR_DETERMINISTIC", "1");
+    ASSERT_TRUE(debugEnv().gemm.deterministic);
+    ASSERT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
     PerfStatsCollector::reset();
 
     for (const auto &fmt : cudaSmallMNativeFormats())
@@ -6176,10 +6185,10 @@ TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats)
         llaminar::v2::kernels::KernelFactory::clearCacheFor(weights1.get());
     }
 
-    const auto records =
-        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_fused_projection_calls",
-                                      "kernel.cuda_native_vnni_small_m_concurrent_projection_groups"});
+    const auto records = PerfStatsCollector::snapshot(
+        {"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
     uint64_t total_count = 0;
+    uint64_t concurrent_count = 0;
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
@@ -6195,23 +6204,21 @@ TEST_F(Test__CUDAGemmParity, MTP_RuntimeM_FusedProjection_AllNativeFormats)
             EXPECT_LE(std::stoi(m_tag), kGroupedVerifierRuntimeRows.back());
             EXPECT_EQ(route_tag, "specialized")
                 << "CUDA verifier projections must use the grouped small-M native-VNNI route";
-        }
-        if (record.domain == "kernel" &&
-            record.name == "cuda_native_vnni_small_m_concurrent_projection_groups" &&
-            record.kind == PerfStatRecord::Kind::Counter)
-        {
-            total_count += record.count;
-            EXPECT_EQ(record.tags.at("k"), std::to_string(K));
-            EXPECT_EQ(record.tags.at("projections"), "2");
-            const std::string &m_tag = record.tags.at("m");
-            EXPECT_GE(std::stoi(m_tag), 2);
-            EXPECT_LE(std::stoi(m_tag), kGroupedVerifierRuntimeRows.back());
-            EXPECT_GE(std::stoi(record.tags.at("streams")), 2)
-                << "Concurrent CUDA verifier projection groups should use explicit side streams";
+            const std::string &schedule =
+                record.tags.at("projection_schedule");
+            EXPECT_TRUE(schedule == "concurrent" || schedule == "ordered")
+                << "Grouped verifier scheduling must publish one typed, "
+                   "capacity-derived policy";
+            if (schedule == "concurrent")
+                concurrent_count += record.count;
         }
     }
     EXPECT_EQ(total_count, cudaSmallMNativeFormats().size() * kGroupedVerifierRuntimeRows.size())
         << "Every CUDA native format and certified runtime-M verifier shape should use the grouped route";
+    EXPECT_EQ(concurrent_count, total_count)
+        << "The production fused-stage workspace contract must admit the "
+           "deterministic persistent side-stream schedule for every codebook "
+           "and certified verifier M";
 
     PerfStatsCollector::reset();
 }

@@ -73,6 +73,20 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
             self.assertIn("unapproved raw_stream", failures[0])
             self.assertIn("hostResultBoundary", failures[0])
 
+    def test_private_blas_lifecycle_cannot_hide_device_synchronization(self) -> None:
+        """All library/backend variants reject projection-owned handle lifetime."""
+        for library in ("cublas", "cublasLt", "hipblas", "hipblasLt"):
+            for operation in ("Create", "Destroy"):
+                with self.subTest(library=library, operation=operation):
+                    temporary, root = self.make_repo(
+                        f"void retireProjection() {{ {library}{operation}(handle); }}"
+                    )
+                    with temporary:
+                        failures = validate(root, ())
+                        self.assertEqual(len(failures), 1)
+                        self.assertIn("unapproved blas_lifetime", failures[0])
+                        self.assertIn("retireProjection", failures[0])
+
     def test_exact_reviewed_budget_passes(self) -> None:
         temporary, root = self.make_repo(
             """

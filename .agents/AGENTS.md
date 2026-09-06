@@ -284,6 +284,14 @@ can make every object appear dirty. If an existing tree names another
 executable, reconfigure it once with the active devcontainer path before
 building.
 
+CUDA builds use the canonical capture-reentry NCCL dependency installed by
+`scripts/docker/install-nccl.sh` in both development and release images.
+Outside those images, run `sudo bash scripts/docker/install-nccl.sh` before
+configuring. The runtime deliberately loads its distinct SONAME, not the
+distribution NCCL package, because retained parent recording requires the
+corrected stream-membership lifecycle. Do not substitute a system library to
+make dependency discovery pass.
+
 ```bash
 LLAMINAR_NINJA_BIN="$(command -v ninja)"
 
@@ -444,6 +452,14 @@ Unit phase automatically; add a focused Integration regression to preflight
 when a parity defect establishes a reusable backend lifecycle, graph,
 stream/event, collective, or movement invariant. Local reports and result
 directories are generated debris and must not be committed.
+
+HTTP needle and long-context certification also derives from the typed parity
+definitions: `ModelParityDefinition::e2e_certifiable` selects exact existing
+cells and their context profiles. Build `v2_model_parity_matrices`, then use
+`scripts/ci/run_model_parity_e2e.py --list` to inspect eligibility. Its non-list
+run uses the Release server and the mature HTTP harness; scripts and container
+jobs must never maintain a second model/topology matrix. Numerical parity and
+HTTP behavioral certificates are complementary gates, not substitutes.
 
 For a debugger attached directly to `llaminar2`, pass
 `--no-mpi-bootstrap`; otherwise it may attach to the MPI wrapper. Record any

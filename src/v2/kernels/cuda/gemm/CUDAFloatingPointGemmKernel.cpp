@@ -605,6 +605,7 @@ namespace llaminar2
             }
 
             // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
+            cublas_kernel_->bindWorkspace(effective_workspace);
             if (d_bias)
             {
                 CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);

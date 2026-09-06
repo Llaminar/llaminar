@@ -17,7 +17,6 @@
 
 #ifdef HAVE_ROCM
 #include "rocm/ROCmBackend.h"
-#include "../kernels/rocm/gemm/HipBLASGemmKernel.h" // For registerHipBLASGemmKernelFactory
 #endif
 
 #include <mutex>
@@ -57,8 +56,6 @@ namespace llaminar2
             g_rocm_backend = new ROCmBackend();
             LOG_DEBUG("[BackendManager] Initialized ROCm backend (" << g_rocm_backend->deviceCount() << " devices)");
 
-            // Register hipBLAS GEMM kernel factory for DeviceKernelCache
-            rocm::registerHipBLASGemmKernelFactory();
 #else
             g_rocm_backend = nullptr;
             LOG_DEBUG("[BackendManager] ROCm backend not available (HAVE_ROCM not defined)");

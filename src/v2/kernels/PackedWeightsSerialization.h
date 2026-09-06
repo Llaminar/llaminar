@@ -448,9 +448,17 @@ inline std::vector<uint8_t> serialize(const IPackedWeights& weights)
     return buffer;
 }
 
-/// Deserialize packed weights from a byte buffer.
-/// Returns nullptr on validation failure (bad magic, version, truncated data, etc.).
-inline std::unique_ptr<IPackedWeights> deserialize(const uint8_t* data, size_t size)
+/**
+ * @brief Deserialize a portable archive into final owned CPU execution storage.
+ * @param data Beginning of the complete wire record.
+ * @param size Readable wire bytes.
+ * @param placement First-touch policy applied before copying execution bytes.
+ * @return Owned weights, or nullptr for invalid wire metadata.
+ * @throws std::runtime_error When requested final placement cannot be certified.
+ */
+inline std::unique_ptr<IPackedWeights> deserialize(
+    const uint8_t* data, size_t size,
+    CPUWeightStoragePlacement placement = CPUWeightStoragePlacement::local())
 {
     constexpr size_t MIN_SIZE = sizeof(PackedWeightsHeader) + sizeof(PackedWeightsSectionTable);
 
@@ -530,7 +538,9 @@ inline std::unique_ptr<IPackedWeights> deserialize(const uint8_t* data, size_t s
     // Read native_interleaved (64-byte aligned).
     if (sections.interleaved_size > 0)
     {
-        packed.native_interleaved.resize_uninitialized(sections.interleaved_size);
+        // Establish the final CPU destination before copying the eager wire
+        // representation. Never migrate or repack it after engine publication.
+        packed.native_interleaved = placement.allocate<uint8_t>(sections.interleaved_size);
         std::memcpy(packed.native_interleaved.data(), src, sections.interleaved_size);
         src += sections.interleaved_size;
     }

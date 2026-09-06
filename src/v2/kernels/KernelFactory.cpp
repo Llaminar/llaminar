@@ -3353,7 +3353,8 @@ namespace llaminar
             std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::prepareExpertGemmLocal(
                 const llaminar2::TensorBase *tensor,
                 llaminar2::DeviceId target_device,
-                GemmPreparationKind prep_kind)
+                GemmPreparationKind prep_kind,
+                llaminar2::CPUWeightStoragePlacement placement)
             {
                 if (!tensor)
                     return nullptr;
@@ -3421,7 +3422,8 @@ namespace llaminar
                     tensor,
                     0,
                     -1,
-                    llaminar2::CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                    llaminar2::CPUProjectionNumericalPolicy::GPUAlignedExpert,
+                    placement);
                 if (!kernel)
                 {
                     LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Failed to create kernel for expert view");
@@ -3436,7 +3438,8 @@ namespace llaminar
             std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::prepareExpertGemmLocal(
                 std::shared_ptr<llaminar2::TensorBase> tensor,
                 llaminar2::DeviceId target_device,
-                GemmPreparationKind prep_kind)
+                GemmPreparationKind prep_kind,
+                llaminar2::CPUWeightStoragePlacement placement)
             {
                 if (!tensor)
                     return nullptr;
@@ -3462,14 +3465,15 @@ namespace llaminar
                     return std::make_shared<llaminar2::gemm::FloatingPointGemmKernel>(
                         std::shared_ptr<const llaminar2::TensorBase>(std::move(tensor)),
                         llaminar2::gemm::FloatingPointGemmKernel::NumericalPolicy::
-                            GPUAlignedExpert);
+                            GPUAlignedExpert,
+                        placement);
                 }
 
                 // Packed CPU kernels own their final representation. GPU expert
                 // preparation is rejected by the raw overload and must use the
                 // PreparedWeightStore-backed load pipeline.
                 return prepareExpertGemmLocal(
-                    tensor.get(), target_device, resolved_kind);
+                    tensor.get(), target_device, resolved_kind, placement);
             }
 
             std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::createExpertGemmFromTransferBlob(
@@ -3480,13 +3484,14 @@ namespace llaminar
 
             std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::createExpertGemmFromTransferBlob(
                 const uint8_t *data,
-                size_t size)
+                size_t size,
+                llaminar2::CPUWeightStoragePlacement placement)
             {
                 if (!data || size == 0)
                     return nullptr;
 
                 auto packed_weights = llaminar2::packed_weights_serialization::deserialize(
-                    data, size);
+                    data, size, placement);
                 if (!packed_weights)
                 {
                     LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "

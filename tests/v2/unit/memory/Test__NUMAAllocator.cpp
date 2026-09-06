@@ -9,6 +9,7 @@
  * - Array allocation with RAII
  * - NUMABuffer wrapper
  * - Statistics tracking
+ * - Typed final-weight placement rejects invalid identities before allocation
  *
  * @author David Sanftenberg
  * @date 2026-01-21
@@ -16,6 +17,8 @@
 
 #include <gtest/gtest.h>
 #include "memory/NUMAAllocator.h"
+#include "memory/CPUWeightStoragePlacement.h"
+#include "memory/NUMAPageQuery.h"
 #include "tensors/AlignedVector.h"
 
 #include <cstdlib>
@@ -26,8 +29,49 @@
 #include <numeric>
 
 #include <sched.h>
+#include <unistd.h>
 
 using namespace llaminar2;
+
+TEST(Test__NUMAAllocator, CPUWeightPlacementRejectsNegativeNodeBeforeAllocation)
+{
+    EXPECT_THROW(CPUWeightStoragePlacement::onNode(-1), std::invalid_argument);
+    EXPECT_THROW(CPUWeightStoragePlacement::onNode(-42), std::invalid_argument);
+    auto empty = CPUWeightStoragePlacement::local().allocate<uint8_t>(0);
+    EXPECT_TRUE(empty.empty());
+}
+
+TEST(Test__NUMAAllocator, BatchedNUMAObservationRequiresActualResolvedNode)
+{
+    uint8_t retained_page = 0xa5;
+    int resolutions = 0;
+    const auto resolve = [&](const void *address) {
+        EXPECT_EQ(address, &retained_page);
+        ++resolutions;
+        return 7; // Deliberately differs from both ordinary fixture nodes.
+    };
+    EXPECT_EQ(resolveObservedNUMANode(0, &retained_page, resolve), 0);
+    EXPECT_EQ(resolveObservedNUMANode(1, &retained_page, resolve), 1);
+    EXPECT_EQ(resolveObservedNUMANode(-EFAULT, &retained_page, resolve), -EFAULT);
+    EXPECT_EQ(resolveObservedNUMANode(-EACCES, &retained_page, resolve), -EACCES);
+    EXPECT_EQ(resolutions, 0);
+    EXPECT_EQ(resolveObservedNUMANode(-ENOENT, &retained_page, resolve), 7);
+    EXPECT_EQ(resolutions, 1);
+    EXPECT_EQ(resolveObservedNUMANode(-ENOENT, &retained_page,
+        [](const void *) { return -EFAULT; }), -EFAULT);
+    EXPECT_EQ(retained_page, 0xa5); // Completion never re-touches or repairs bytes.
+}
+
+TEST(Test__NUMAAllocator, PhysicalNodeLookupRejectsInaccessibleGuard)
+{
+    const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    auto guarded = AlignedVector<uint8_t>::pageMappedUninitialized(page);
+    guarded.front() = 0xa5;
+    const auto *guard = reinterpret_cast<const void *>(
+        reinterpret_cast<uintptr_t>(guarded.data()) - page);
+    EXPECT_EQ(NUMAAllocator::instance().getNUMANodeForAddress(guard), -1);
+    EXPECT_EQ(guarded.front(), 0xa5);
+}
 
 // ============================================================================
 // Singleton Tests

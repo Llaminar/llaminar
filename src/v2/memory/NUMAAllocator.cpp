@@ -4,12 +4,16 @@
  *
  * Uses an exact CPU-affinity scope, page revocation, first touch, and placement
  * certification so requested NUMA placement either succeeds or fails closed.
+ * Batched page-table observations are resolved through a fault-capable lookup
+ * when Linux reports a migration/non-present entry; unknown placement is never
+ * treated as the requested node. Certification does not move application bytes.
  *
  * @author David Sanftenberg
  * @date 2026-01-21
  */
 
 #include "NUMAAllocator.h"
+#include "NUMAPageQuery.h"
 #include "../utils/Logger.h"
 
 #include <cerrno>
@@ -452,12 +456,20 @@ namespace llaminar2
             }
             for (size_t index = 0; index < batch_pages; ++index)
             {
-                if (page_status[index] != numa_node)
+                // Linux's batched query ignores migration entries. Resolve only
+                // that incomplete observation through get_user_pages-backed
+                // MPOL_F_ADDR|MPOL_F_NODE: it joins kernel page migration rather
+                // than assuming placement, re-touching bytes, or polling/retrying.
+                const int observed_node = resolveObservedNUMANode(
+                    page_status[index], page_addresses[index],
+                    [this](const void *address) { return getNUMANodeForAddress(address); });
+                if (observed_node != numa_node)
                 {
                     const size_t offset =
                         (first_page + index) * PAGE_SIZE;
                     LOG_ERROR("NUMAAllocator: First-touch certification observed node "
-                              << page_status[index] << " instead of "
+                              << observed_node << " (batch status " << page_status[index]
+                              << ") instead of "
                               << numa_node << " at page offset " << offset);
                     return false;
                 }
@@ -530,20 +542,12 @@ namespace llaminar2
         if (numa_available_)
         {
             int node = -1;
-            // Use move_pages with NULL destination to query current node
-            void *pages[] = {const_cast<void *>(ptr)};
-            int status[1] = {-1};
-
-            if (move_pages(0, 1, pages, nullptr, status, 0) == 0)
-            {
-                node = status[0];
-                if (node < 0)
-                {
-                    // Negative values are errors (e.g., page not mapped)
-                    return -1;
-                }
+            // Query the physical page, not the VMA's preferred-node policy.
+            // The kernel takes a temporary page reference and resolves migration
+            // entries, unlike the non-faulting move_pages observation API.
+            if (get_mempolicy(&node, nullptr, 0, const_cast<void *>(ptr),
+                              MPOL_F_ADDR | MPOL_F_NODE) == 0 && node >= 0)
                 return node;
-            }
         }
 
         return -1; // Cannot determine

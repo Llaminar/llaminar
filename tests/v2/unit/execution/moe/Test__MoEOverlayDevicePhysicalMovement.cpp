@@ -1,6 +1,9 @@
 /**
  * @file Test__MoEOverlayDevicePhysicalMovement.cpp
  * @brief Device-free proof of command-authenticated physical MoE movement.
+ *
+ * Also verifies that fatal physical-progress diagnostics preserve immutable
+ * endpoint identity, distinguish projection roles, and never mutate receipts.
  */
 
 #include <gtest/gtest.h>
@@ -305,6 +308,40 @@ namespace llaminar2::test
             };
         }
     } // namespace
+
+    TEST(Test__MoEOverlayDevicePhysicalMovement,
+         ProjectionDiagnosticsPreserveExactPendingEndpointsAndReadiness)
+    {
+        MoEOverlayDevicePhysicalMovementBatch batch;
+        batch.transaction_id = 36u;
+        batch.packed_weight_bytes = 8192u;
+        batch.migrations.resize(2);
+        for (auto &migration : batch.migrations)
+        {
+            migration.layer_idx = 47;
+            migration.expert_id = 9;
+            migration.source.owner_world_rank = 1;
+            migration.source.owner_participant = 3;
+            migration.source.device = DeviceId::rocm(1);
+            migration.destination.owner_world_rank = 0;
+            migration.destination.owner_participant = 0;
+            migration.destination.device = DeviceId::cuda(0);
+        }
+        const std::array<std::uint8_t, 6> ready{1, 0, 1, 0, 1, 0};
+        const auto description = batch.describeProjectionReadiness(ready);
+        EXPECT_NE(description.find("transaction=36,payload_bytes=8192,projections_ready=3/6"), std::string::npos);
+        EXPECT_NE(description.find("migration=0,layer=47,expert=9,projection=up"), std::string::npos);
+        EXPECT_EQ(description.find("migration=0,layer=47,expert=9,projection=gate"), std::string::npos);
+        EXPECT_NE(description.find("migration=1,layer=47,expert=9,projection=gate"), std::string::npos);
+        EXPECT_NE(description.find("migration=1,layer=47,expert=9,projection=down"), std::string::npos);
+        EXPECT_NE(description.find("source=1:" + DeviceId::rocm(1).toString() + ":participant=3"), std::string::npos);
+        EXPECT_NE(description.find("destination=0:" + DeviceId::cuda(0).toString() + ":participant=0"), std::string::npos);
+        EXPECT_EQ(ready, (std::array<std::uint8_t, 6>{1, 0, 1, 0, 1, 0}));
+        const std::array<std::uint8_t, 6> complete{1, 1, 1, 1, 1, 1};
+        EXPECT_NE(batch.describeProjectionReadiness(complete).find("projections_ready=6/6,pending=[]"), std::string::npos);
+        EXPECT_THROW(batch.describeProjectionReadiness(std::span(ready).first(5)), std::invalid_argument);
+        EXPECT_THROW(batch.describeProjectionReadiness({}), std::invalid_argument);
+    }
 
     TEST(Test__MoEOverlayDevicePhysicalMovement,
          DurableCommandsBecomeOneClosedCycleInEndpointOrder)

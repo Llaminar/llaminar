@@ -9,6 +9,7 @@
  */
 
 #include "execution/moe/MoEExpertOverlayProfiler.h"
+#include "execution/moe/MoEOverlayRankBatchTelemetry.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -72,6 +73,93 @@ static MoEOverlayProfileEdge profileEdge(int source, int target)
         .source_participant = source,
         .target_participant = target,
     };
+}
+
+/**
+ * @brief Both transports retain all observations without a per-token timing map.
+ *
+ * Vary generation, logical step, sequence and payload size over 1024 exchanges.
+ * Only measured totals and ordered fingerprints may change; timing/counter row
+ * cardinality must not grow. Exercise both observing roles and wire directions.
+ */
+TEST_F(Test__MoEGraphNativeProfilingMetrics, RankBatchEvidenceIsBoundedAcrossRequestsAndTokens)
+{
+    constexpr uint64_t observations = 1024;
+    for (auto kind : {MoEOverlayRankBatchTransportKind::MPI,
+                      MoEOverlayRankBatchTransportKind::NodeLocalSharedRows})
+        for (auto role : {MoEOverlayRankBatchEndpoint::Source, MoEOverlayRankBatchEndpoint::Target})
+            for (auto direction : {MoEOverlayCollectiveDirection::Dispatch,
+                                   MoEOverlayCollectiveDirection::ReturnReduce})
+            {
+                PerfStatsCollector::reset();
+                auto key = makeMoEOverlayRankBatchKey(
+                    1, 0, ExpertHistogramSource::DecodeToken, 3, 1, 2, 0, 1, direction);
+                const MoEOverlayRankBatchTelemetry telemetry(key, kind, role);
+                const auto observe = [&](uint64_t step)
+                {
+                    key.generation_id = step + 1;
+                    key.step_id = 3 * step;
+                    key.sequence = step + 17;
+                    telemetry.recordTransaction(32 + step, 2);
+                    telemetry.recordTimings(10 + step, 20 + step, 30 + step);
+                    if (kind == MoEOverlayRankBatchTransportKind::MPI)
+                        telemetry.recordAsyncSendSubmission(8);
+                };
+                observe(0);
+                const auto initial_size = PerfStatsCollector::snapshot().size();
+                EXPECT_EQ(initial_size, kind == MoEOverlayRankBatchTransportKind::MPI ? 7u : 6u);
+                for (uint64_t step = 1; step < observations; ++step)
+                    observe(step);
+                const auto records = PerfStatsCollector::snapshot();
+                ASSERT_EQ(records.size(), initial_size);
+                for (const auto &record : records)
+                {
+                    EXPECT_EQ(record.count, observations) << record.name;
+                    EXPECT_FALSE(record.tags.contains("generation"));
+                    EXPECT_FALSE(record.tags.contains("logical_step"));
+                    EXPECT_FALSE(record.tags.contains("bytes"));
+                    EXPECT_EQ(record.tags.at("endpoint_role"),
+                        role == MoEOverlayRankBatchEndpoint::Source ? "source" : "target");
+                    if (record.name == "moe_overlay_rank_batch_payload_bytes")
+                        EXPECT_EQ(record.value, 32 * observations + observations * (observations - 1) / 2);
+                    if (record.name == "rank_batch_total")
+                    {
+                        EXPECT_EQ(record.total_ns, 30 * observations + observations * (observations - 1) / 2);
+                        EXPECT_EQ(record.min_ns, 30u);
+                        EXPECT_EQ(record.max_ns, 30u + observations - 1);
+                    }
+                    if (record.kind == PerfStatRecord::Kind::OrderedSequence)
+                    {
+                        EXPECT_EQ(record.sequence_word_count, 4 * observations);
+                        EXPECT_NE(record.sequence_digest_lo, 0u);
+                        EXPECT_NE(record.sequence_digest_hi, 0u);
+                    }
+                }
+                if (kind == MoEOverlayRankBatchTransportKind::NodeLocalSharedRows)
+                    EXPECT_THROW(telemetry.recordAsyncSendSubmission(8), std::logic_error);
+            }
+}
+
+/** @brief Equal aggregate counts must not hide a reordered protocol observation. */
+TEST_F(Test__MoEGraphNativeProfilingMetrics, RankBatchWitnessPreservesOrderWithoutTemporalTags)
+{
+    auto key = makeMTPMoEOverlayRankBatchKey(
+        7, 0, 15, 3, 1, 2, 0, 1, MoEOverlayCollectiveDirection::Dispatch);
+    for (auto role : {MoEOverlayRankBatchEndpoint::Source, MoEOverlayRankBatchEndpoint::Target})
+    {
+        MoEOverlayRankBatchTelemetry telemetry(key, MoEOverlayRankBatchTransportKind::MPI, role);
+        for (uint64_t step = 0; step < 2; ++step)
+        {
+            key.step_id = role == MoEOverlayRankBatchEndpoint::Source ? step : 1 - step;
+            telemetry.recordTransaction(64, 2);
+        }
+    }
+    const auto witnesses = PerfStatsCollector::snapshot({"forward_graph.moe_overlay_rank_batch_sequence"});
+    ASSERT_EQ(witnesses.size(), 2u);
+    EXPECT_EQ(witnesses[0].count, witnesses[1].count);
+    EXPECT_EQ(witnesses[0].sequence_word_count, witnesses[1].sequence_word_count);
+    EXPECT_NE(witnesses[0].sequence_digest_lo, witnesses[1].sequence_digest_lo);
+    EXPECT_NE(witnesses[0].sequence_digest_hi, witnesses[1].sequence_digest_hi);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

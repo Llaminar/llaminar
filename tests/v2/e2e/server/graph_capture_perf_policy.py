@@ -82,6 +82,16 @@ def _record_value(record: Mapping[str, Any]) -> float:
     return _numeric(record.get("value", record.get("count", 0.0)))
 
 
+def _device_owner(record: Mapping[str, Any]) -> str:
+    """Qualify process-local graph identity in an all-rank aggregate.
+
+    Unqualified records still support validation of one raw diagnostic file.
+    The E2E aggregate always supplies rank, verified against server membership.
+    """
+    device = str(record.get("device", ""))
+    return f"rank={record['rank']}/{device}" if "rank" in record else device
+
+
 def _has_collective_evidence(records: Iterable[Mapping[str, Any]]) -> bool:
     """Return true when runtime policy records prove collective graph nodes."""
 
@@ -145,6 +155,8 @@ def _has_segmented_execution(records: Iterable[Mapping[str, Any]]) -> bool:
     for record in records:
         name = str(record.get("name", ""))
         tags = record.get("tags") or {}
+        if name.startswith("retained_parent_"):
+            return True
         if tags.get("heterogeneous_segmented") == "true":
             return True
         if (
@@ -172,41 +184,51 @@ def _has_segmented_execution(records: Iterable[Mapping[str, Any]]) -> bool:
 def _missing_prefill_phases(
     records: Iterable[Mapping[str, Any]],
 ) -> tuple[str, ...]:
-    """Return required prefill graph lifecycle phases absent from PerfStats.
+    """Require capture/materialization then replay for each used prefill owner.
 
-    A full-tier GPU request matrix sends enough bucket-compatible prompts to
-    move a persistent prefill executable through warmup, capture, and replay.
-    Merely proving a decode graph exists would leave model admission outside
-    the graph-capture architecture and conceal repeated prefill warmup caused
-    by stale cache ownership.
+    Setup captures without launching a synthetic request. Requiring an eager
+    warmup would reject the installed production lifecycle. Unused materialized
+    buckets are allowed; every replay must have matching capture evidence.
     """
-
-    observed: set[str] = set()
+    captured: set[tuple[str, ...]] = set()
+    replayed: set[tuple[str, ...]] = set()
+    eager = False
     for record in records:
-        if record.get("name") != "prefill_graph_phase":
+        if record.get("name") != "prefill_graph_phase" or _record_value(record) <= 0:
             continue
         tags = record.get("tags") or {}
         phase = str(tags.get("capture_phase", ""))
-        if phase in {"warmup", "capture", "replay"} and _record_value(record) > 0.0:
-            observed.add(phase)
-
-    return tuple(
-        phase
-        for phase in ("warmup", "capture", "replay")
-        if phase not in observed
-    )
+        key = (_device_owner(record), *(str(tags.get(field, "")) for field in
+            ("bucket_seq_len", "domain_id", "participant_id", "placement_epoch", "topology_signature")))
+        if phase == "warmup":
+            eager = True
+        elif phase == "capture" or (phase == "materialized_without_launch" and tags.get("cache_phase") == "ready"):
+            captured.add(key)
+        elif phase == "replay":
+            replayed.add(key)
+    missing = []
+    if eager:
+        missing.append("retired eager warmup executed")
+    if not captured or replayed - captured:
+        missing.append("capture")
+    if not replayed:
+        missing.append("replay")
+    return tuple(missing)
 
 
 def _incomplete_graph_contexts(
     records: Iterable[Mapping[str, Any]],
+    *,
+    allow_retained_parent: bool = False,
 ) -> tuple[str, ...]:
     """Return GPU graph contexts that did not advance through their lifecycle.
 
-    ``decode_graph_phase`` is emitted once for each invocation and aggregated
-    by device, context, and phase. Transaction zero must prepare, capture,
-    instantiate, and launch one executable atomically. Every later invocation
-    must replay that executable. The retired eager ``warmup`` phase is therefore
-    always an ownership defect, not acceptable graph-planning evidence.
+    ``decode_graph_phase`` aggregates both setup captures and live submissions
+    by device, context, and phase. Count explicitly unlaunched materializations
+    separately: building two setup shapes is not two inference invocations.
+    Live policy admissions and capture-with-launch/replay phases establish the
+    execution obligation. The retired eager ``warmup`` phase is always an
+    ownership defect, not acceptable graph-planning evidence.
 
     A capture phase counts only when PerfStats also reports a non-empty
     instantiated full-graph executable for the same device and context. This
@@ -217,16 +239,36 @@ def _incomplete_graph_contexts(
     phase_counts: dict[tuple[str, str], dict[str, float]] = {}
     sidecar_path_counts: dict[tuple[str, str, str], dict[str, float]] = {}
     executable_contexts: set[tuple[str, str]] = set()
+    materialized_contexts: set[tuple[str, str]] = set()
+    materialized_capture_counts: dict[tuple[str, str], float] = {}
+    parent_counts: dict[tuple[str, str], dict[str, float]] = {}
+    runtime_invocations: dict[tuple[str, str], float] = {}
+    parent_metrics = {
+        "retained_parent_executable_nodes": "nodes",
+        "retained_parent_materialized_without_launch": "materialized",
+        "retained_parent_transaction_zero_launches": "initial",
+        "retained_parent_replays": "replay",
+    }
 
     for record in records:
         name = str(record.get("name", ""))
         tags = record.get("tags") or {}
-        device = str(record.get("device", ""))
+        device = _device_owner(record)
         context = str(tags.get("context", ""))
         if not context:
             continue
 
         key = (device, context)
+        if name in {"decode_capture_policy", "sidecar_decode_capture_policy"}:
+            runtime_invocations[key] = runtime_invocations.get(key, 0.0) + _record_value(record)
+        if name in parent_metrics and record.get("domain") == "forward_graph":
+            counts = parent_counts.setdefault(key, {})
+            # Graph-only compilation children are not executable evidence.
+            # Every physical parent also declares its nonempty child inventory.
+            value = _record_value(record)
+            if _numeric(tags.get("child_units")) > 0.0 and value > 0.0:
+                metric = parent_metrics[name]
+                counts[metric] = counts.get(metric, 0.0) + value
         if name == "decode_graph_phase":
             phase = str(tags.get("phase", ""))
             if phase in {"warmup", "capture", "replay"}:
@@ -247,12 +289,38 @@ def _incomplete_graph_contexts(
         elif (
             name == "full_graph_capture_executable_nodes"
             and tags.get("source") == "full_graph_capture"
-            and tags.get("type") == "captured_executable"
+            and tags.get("type") in {"captured_executable", "materialized_unlaunched_executable"}
             and _record_value(record) > 0.0
         ):
             executable_contexts.add(key)
+            if tags.get("type") == "materialized_unlaunched_executable":
+                materialized_contexts.add(key)
+                # value is the number of device nodes, not captures. Only the
+                # physical record's sample count can discharge setup phases.
+                materialized_capture_counts[key] = (
+                    materialized_capture_counts.get(key, 0.0)
+                    + max(0.0, _numeric(record.get("count", 0.0))))
 
     incomplete: list[str] = []
+    proven_parents: set[tuple[str, str]] = set()
+    if allow_retained_parent:
+        for key, counts in sorted(parent_counts.items()):
+            reasons = []
+            if counts.get("nodes", 0.0) <= 0.0:
+                reasons.append("retained parent has no context-matched executable nodes")
+            if counts.get("materialized", 0.0) + counts.get("initial", 0.0) <= 0.0:
+                reasons.append("retained parent has no materialization or transaction-zero launch")
+            if counts.get("replay", 0.0) > 0.0 and counts.get("initial", 0.0) <= 0.0:
+                reasons.append("retained parent replay has no transaction-zero launch")
+            # Capture counters aggregate several setup shapes. They are not
+            # inference calls: an unused materialized family needs no replay.
+            if (max(counts.get("initial", 0.0), runtime_invocations.get(key, 0.0)) > 1.0
+                    and counts.get("replay", 0.0) <= 0.0):
+                reasons.append("missing retained-parent replay after repeated execution")
+            if reasons:
+                incomplete.append(f"{key[0]}:{key[1]} ({'; '.join(reasons)})")
+            else:
+                proven_parents.add(key)
     for key, counts in sorted(phase_counts.items()):
         device, context = key
         total = sum(counts.values())
@@ -262,11 +330,21 @@ def _incomplete_graph_contexts(
         reasons: list[str] = []
         if warmup_count > 0.0:
             reasons.append("retired eager warmup phase was executed")
-        if total >= 1.0 and capture_count <= 0.0:
+        if allow_retained_parent and key in parent_counts:
+            # Parent lifecycle evidence was validated above, independently of
+            # the older full-graph counters. Eager execution is still forbidden.
+            if warmup_count > 0.0:
+                incomplete.append(f"{device}:{context} ({'; '.join(reasons)})")
+            continue
+        if total >= 1.0 and capture_count <= 0.0 and key not in materialized_contexts:
             reasons.append("missing transaction-zero capture")
         if capture_count > 0.0 and key not in executable_contexts:
             reasons.append("capture has no context-matched executable nodes")
-        if total >= 2.0 and replay_count <= 0.0:
+        initial_launches = max(0.0, capture_count - materialized_capture_counts.get(key, 0.0))
+        admitted = runtime_invocations.get(key, 0.0)
+        if admitted > 0.0 and initial_launches + replay_count <= 0.0:
+            reasons.append("missing launch after runtime admission")
+        if max(initial_launches + replay_count + warmup_count, admitted) >= 2.0 and replay_count <= 0.0:
             reasons.append("missing replay after repeated execution")
         if reasons:
             label = f"{device or 'unknown'}:{context}"
@@ -278,6 +356,12 @@ def _incomplete_graph_contexts(
         rebuild_count = counts.get("plain_after_build", 0.0)
         replay_count = counts.get("full_graph", 0.0)
         reasons = []
+        if counts.get("retained_parent", 0.0) > 0.0:
+            parent_key = (device, context)
+            if not allow_retained_parent or parent_key not in proven_parents:
+                reasons.append("sidecar has no matching certified retained parent")
+            else:
+                replay_count += parent_counts[parent_key].get("replay", 0.0)
         if rebuild_count > 1.0:
             reasons.append(
                 f"rebuilt graph {rebuild_count:g} times for one stable shape"
@@ -321,7 +405,10 @@ def validate_graph_capture_policy(
         else ()
     )
     prefill_lifecycle_complete = not missing_prefill_phases
-    incomplete_contexts = _incomplete_graph_contexts(records)
+    incomplete_contexts = _incomplete_graph_contexts(
+        records,
+        allow_retained_parent=heterogeneous_device_mix and has_collective_evidence,
+    )
 
     error: str | None = None
     if has_segmented_execution and not heterogeneous_device_mix:
@@ -347,7 +434,7 @@ def validate_graph_capture_policy(
     elif missing_prefill_phases:
         error = (
             "full-tier GPU prefill graph did not complete "
-            "warmup/capture/replay lifecycle; missing phases: "
+            "capture/materialization and replay lifecycle; missing phases: "
             + ", ".join(missing_prefill_phases)
         )
     elif incomplete_contexts:

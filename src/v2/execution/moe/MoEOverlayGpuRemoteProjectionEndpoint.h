@@ -9,13 +9,19 @@
  * storage on a named auxiliary stream. The MPI data plane and device lane
  * advance through non-blocking polls, so inference continues on the retained
  * old residency epoch until the complete candidate bank is published.
+ * The setup-owned staging slice retains the host allocation's exact GPU alias.
+ * TransferEngine alone selects backend-native background copies, consistently
+ * with other users of the shared maintenance stream pool and for every format.
  */
 
 #pragma once
+#include "transfer/BackgroundTransferProgressBinding.h"
+#include "transfer/MappedTransferProgressEpoch.h"
 
 #include "ExpertTierSourceReadiness.h"
 #include "MoEOverlayMPIRemoteProjectionTransport.h"
 #include "../../transfer/TransferEngine.h"
+#include "../../transfer/TransferCommandProgressWatch.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -35,7 +41,7 @@ namespace llaminar2
     enum class MoEOverlayGpuRemoteLaneProgress : std::uint8_t
     {
         Idle,    ///< The owner has not submitted a device chunk.
-        Pending, ///< Conversion or DMA is protected by the lane event.
+        Pending, ///< Conversion or copy is protected by the lane event.
         Ready,   ///< The event completed and staging/final bytes are ready.
         Failed,  ///< Submission or event observation failed.
     };
@@ -81,6 +87,8 @@ namespace llaminar2
             PersistentTransferStagingSlice staging;
             /** Exact participant/cycle stream shared across compatible work. */
             PersistentTransferExecutionLane execution;
+            /** Explicit completion authority; never changed after submission. */
+            BackgroundTransferProgressBinding progress;
             std::string lane_name;
             std::string perf_device;
         };
@@ -144,13 +152,13 @@ namespace llaminar2
             std::string *error = nullptr) noexcept;
 
         /**
-         * @brief Repack one source-GPU range and DMA final CPU bytes to pinned RAM.
+         * @brief Repack one source-GPU range and stream final CPU bytes to pinned RAM.
          * @param owner Exact current endpoint owner.
          * @param layout Valid GPU-to-CPU conversion layout.
          * @param source Live separated source arrays.
          * @param first_unit First CPU NativeVNNI unit in this network chunk.
          * @param unit_count Number of complete units in this chunk.
-         * @param error Optional launch/DMA diagnostic.
+         * @param error Optional launch/copy diagnostic.
          * @return True when a reusable event fences all submitted work.
          */
         bool submitGpuToCpuRepack(
@@ -162,11 +170,11 @@ namespace llaminar2
             std::string *error = nullptr) noexcept;
 
         /**
-         * @brief DMA one separated source-GPU blob range to pinned network RAM.
+         * @brief Stream one separated source-GPU blob range to pinned network RAM.
          * @param owner Exact current endpoint owner.
          * @param source Exact device range start.
          * @param bytes Bounded non-zero byte count.
-         * @param error Optional DMA diagnostic.
+         * @param error Optional copy diagnostic.
          * @return True when a reusable event fences the D2H operation.
          */
         bool submitGpuBlobRead(
@@ -176,7 +184,7 @@ namespace llaminar2
             std::string *error = nullptr) noexcept;
 
         /**
-         * @brief DMA arriving CPU bytes and repack them into a destination GPU slot.
+         * @brief Upload arriving CPU bytes and repack them into a destination GPU slot.
          * @param owner Exact current endpoint owner.
          * @param layout Valid CPU-to-GPU conversion layout.
          * @param destination Exact inactive separated destination arrays.
@@ -196,7 +204,7 @@ namespace llaminar2
             std::string *error = nullptr) noexcept;
 
         /**
-         * @brief DMA one authenticated MPI blob range into final GPU storage.
+         * @brief Copy one authenticated MPI blob range into final GPU storage.
          * @param owner Exact current endpoint owner.
          * @param destination Exact final separated-array range start.
          * @param payload Authenticated bounded MPI bytes.
@@ -269,6 +277,20 @@ namespace llaminar2
             std::size_t bytes,
             std::string *error) noexcept;
 
+        /**
+         * @brief Publish one raw-byte command to the graph-resident authority.
+         * @param kind Read or write role; repacking is not a raw-byte operation.
+         * @param address Exact stable GPU source or inactive destination.
+         * @param bytes Positive authenticated chunk size.
+         * @param error Receives publication/progression failures.
+         * @return True after command acceptance, never before copy completion.
+         */
+        bool publishBlobLocked(OperationKind kind, void *address,
+                               std::size_t bytes, std::string *error) noexcept;
+
+        /** @return The exact service receipt, or null for a native operation. */
+        [[nodiscard]] MappedTransferProgressSlot *serviceCommandLocked() noexcept;
+
         /** @brief Launch backend-specific GPU-to-CPU repack on the lane stream. */
         bool launchGpuToCpuLocked(
             const ExpertTierWeightDeviceLayout &layout,
@@ -302,6 +324,9 @@ namespace llaminar2
         void *completion_event_ = nullptr;
         std::uint8_t *device_chunk_ = nullptr;
         std::uint8_t *pinned_chunk_ = nullptr;
+        /** Permanent service identities retain staging through exact GPU receipts. */
+        MappedTransferProgressSlot service_read_;
+        MappedTransferProgressSlot service_write_;
 
         mutable std::mutex mutex_;
         const void *owner_ = nullptr;
@@ -310,11 +335,14 @@ namespace llaminar2
         OperationKind operation_kind_ = OperationKind::None;
         std::size_t operation_bytes_ = 0;
         bool source_readiness_bound_ = false;
+        TransferProducerDependency source_dependency_ = TransferProducerDependency::published();
         bool work_may_be_in_flight_ = false;
         bool fail_after_event_ = false;
         bool unfenced_work_ = false;
         std::string failure_;
         MoEOverlayGpuRemoteProjectionLaneStats stats_;
+        /** Observes one submitted chunk; never decides completion or admission. */
+        TransferCommandProgressWatch progress_watch_;
     };
 
     /**

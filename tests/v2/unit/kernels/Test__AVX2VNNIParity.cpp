@@ -752,6 +752,43 @@ TEST(CPUNativeVNNIVerifierPolicy, GeneratedRulesCoverAllPositiveThreadCounts)
  * catch both topology-specific rule gaps and integer-boundary failures without
  * multiplying the complete geometry matrix by thousands of redundant widths.
  */
+TEST(CPUNativeVNNIThreadTotality, PolicyCacheRetainsFullRuntimeRowIdentity)
+{
+    constexpr std::array<uint8_t, 18> codebooks{
+        0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21};
+#if LLAMINAR_COMPILED_WITH_AVX512
+    constexpr auto build = generated::CPUNativeVNNIBuildISA::AVX512;
+    constexpr std::array isas{ISALevel::AVX2, ISALevel::AVX512};
+#else
+    constexpr auto build = generated::CPUNativeVNNIBuildISA::AVX2;
+    constexpr std::array isas{ISALevel::AVX2};
+#endif
+    // Routed prefill can exceed the exact-overlay key's eight-bit row field.
+    // Alternate aliases in both directions and compare to the uncached oracle.
+    constexpr std::array rows{258, 2, 514, 2, 259, 3, 287, 31, 511, 255};
+    for (auto isa : isas)
+        for (auto codebook : codebooks)
+            for (int threads : {1, 28})
+                for (int k_tiles : {0, 4})
+                    for (int m : rows)
+                    {
+                        CPUNativeVNNIPackedWeights packed;
+                        packed.codebook_id = codebook;
+                        const auto runtime = isa == ISALevel::AVX512
+                            ? generated::CPUNativeVNNIRuntimeISA::AVX512
+                            : generated::CPUNativeVNNIRuntimeISA::AVX2;
+                        generated::CPUNativeVNNIVerifierRowsPolicy expected{};
+                        ASSERT_TRUE(generated::selectCPUNativeVNNIVerifierRowsGeneratedPolicy(
+                            build, runtime, threads, codebook, m, 512, 256, k_tiles, expected));
+                        const auto actual = selectVerifierRowsPolicy(
+                            packed, m, 512, 256, isa, threads, k_tiles);
+                        ASSERT_EQ(actual, verifierRowsPolicyFromGenerated(expected))
+                            << "codebook=" << int(codebook) << " rows=" << m
+                            << " threads=" << threads << " k_tiles=" << k_tiles;
+                    }
+}
+
+/** @test Generated dispatch is total over positive CPU worker counts. */
 TEST(CPUNativeVNNIThreadTotality, GeneratedSelectorsHaveNoPositiveThreadHoles)
 {
     using generated::CPUNativeVNNIBuildISA;

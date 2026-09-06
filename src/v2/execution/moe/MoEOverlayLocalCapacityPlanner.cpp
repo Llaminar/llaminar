@@ -133,7 +133,8 @@ namespace llaminar2
         MoEOverlayAuthorityExecutionKind authority_execution,
         std::size_t model_graph_identity_count,
         std::size_t model_graph_topology_variant_count,
-        std::size_t auxiliary_executable_count)
+        std::size_t auxiliary_executable_count,
+        std::size_t bounded_helper_executable_count)
     {
         if (model_layer_count <= 0)
         {
@@ -175,6 +176,7 @@ namespace llaminar2
                 .model_graph_topology_variant_count =
                     model_graph_topology_variant_count,
                 .auxiliary_executable_count = auxiliary_executable_count,
+                .bounded_helper_executable_count = bounded_helper_executable_count,
             },
             .compilation = {
                 .model_graph_identity_count = model_graph_identity_count,

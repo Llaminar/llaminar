@@ -559,6 +559,15 @@ function(discover_v2_parity_tests TARGET)
         return()
     endif()
 
+    # The same executable inventory serves numerical and tagged HTTP discovery.
+    # No runner or CI adapter maintains a second list of model binaries.
+    if("${TARGET}" MATCHES "^v2_integration_parity_.*_matrix$")
+        if(NOT TARGET v2_model_parity_matrices)
+            add_custom_target(v2_model_parity_matrices)
+        endif()
+        add_dependencies(v2_model_parity_matrices ${TARGET})
+    endif()
+
     cmake_parse_arguments(
         ARG
         ""
@@ -1685,14 +1694,28 @@ if(HAVE_CUDA AND HAVE_ROCM)
             "LLAMINAR_SKIP_CUDA_STARTUP=0"
             "LLAMINAR_SKIP_ROCM_STARTUP=1"
             "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0")
+    add_v2_test(V2_Integration_HardwareInventory_CPUNamedDomain
+        COMMAND
+            $<TARGET_FILE:v2_integration_hardware_inventory_backend_isolation>
+            --gtest_filter=Test__HardwareInventoryBackendIsolation.CpuNamedDomainBootstrapExcludesBothVendorsBeforeDiscovery
+        LABELS "V2;Integration;Backends;HardwareInventory;Isolation;CUDA;ROCm;PrimaryContext;NoModels"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+        ENVIRONMENT
+            "LLAMINAR_SKIP_CUDA_STARTUP=0"
+            "LLAMINAR_SKIP_ROCM_STARTUP=0"
+            "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0")
     # Release configurations deliberately omit Integration registrations.  A
     # post-registration property must therefore follow the same existence
     # contract as add_v2_test() instead of addressing a test that was elided.
     if(TEST V2_Integration_HardwareInventory_CUDAExcluded AND
-       TEST V2_Integration_HardwareInventory_ROCmExcluded)
+       TEST V2_Integration_HardwareInventory_ROCmExcluded AND
+       TEST V2_Integration_HardwareInventory_CPUNamedDomain)
         set_tests_properties(
             V2_Integration_HardwareInventory_CUDAExcluded
             V2_Integration_HardwareInventory_ROCmExcluded
+            V2_Integration_HardwareInventory_CPUNamedDomain
             PROPERTIES RUN_SERIAL TRUE)
     endif()
 endif()
@@ -2497,6 +2520,15 @@ add_test(NAME V2_Unit_ServerLongContextChecksSelfTest
 )
 set_tests_properties(V2_Unit_ServerLongContextChecksSelfTest PROPERTIES
     LABELS "V2;Unit;E2E;Server;LongContext;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_ModelParityE2E
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_model_parity_e2e.py
+)
+set_tests_properties(V2_Unit_ModelParityE2E PROPERTIES
+    LABELS "V2;Unit;Parity;E2E;Server;LongContext;Regression"
     TIMEOUT 30
 )
 
@@ -6086,15 +6118,24 @@ add_v2_test(V2_Integration_CuBLASGemm
     LABELS "V2;Integration;CUDA;cuBLAS;GEMM;FP32;FP16;BF16;DenseGEMM;KernelCorrectness"
     MPI_PROCS 1  # Tests GPU GEMM locally, no MPI needed
 )
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDAFloatingExpertRetirement
+        COMMAND $<TARGET_FILE:v2_test_cublas_gemm>
+            --gtest_filter=*FloatingExpertRetirementDoesNotWaitForUnrelatedStream:*ContextHandleCapturedConcurrentStreamsReplayExactly:*ContextHandlesKeepEachProjectionOnItsExactStream
+        LABELS "V2;Integration;CUDA;GEMM;FP16;BF16;FP32;ExpertOverlay;Lifecycle;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+    )
+endif()
 
-# Integration Test: GEMM kernel device context integration (Phase 4)
-# Tests CuBLASGemmKernel and HipBLASGemmKernel with device context vs own handle
-# Verifies backward compatibility and result parity between construction modes
+# Integration Test: one device-context BLAS ownership contract.
+# Ordinal-resolved and explicit-context construction borrow the same library.
 add_executable(v2_integration_gemm_kernel_context integration/kernels/Test__GemmKernelContextIntegration.cpp)
 target_link_libraries(v2_integration_gemm_kernel_context llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_GemmKernelContextIntegration
     COMMAND $<TARGET_FILE:v2_integration_gemm_kernel_context>
-    LABELS "V2;Integration;CUDA;ROCm;cuBLAS;hipBLAS;GEMM;DeviceContext;Phase4;GPUDeviceContextRefactor;BackwardCompatibility"
+    LABELS "V2;Integration;CUDA;ROCm;cuBLAS;hipBLAS;GEMM;DeviceContext;Lifecycle"
     MPI_PROCS 1  # Tests GPU GEMM locally, no MPI needed
 )
 
@@ -6108,6 +6149,16 @@ add_v2_test(V2_Integration_HipBLASGemm
     LABELS "V2;Integration;ROCm;hipBLAS;GEMM;FP32;FP16;DenseGEMM;KernelCorrectness;MI50"
     MPI_PROCS 1  # Tests GPU GEMM locally, no MPI needed
 )
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCmFloatingExpertRetirement
+        COMMAND $<TARGET_FILE:v2_test_hipblas_gemm>
+            --gtest_filter=*FloatingExpertRetirementDoesNotWaitForUnrelatedStream:*ContextHandleCapturedConcurrentStreamsReplayExactly:*SharedHipBLASHandleKeepsEachProjectionOnItsExactStream
+        LABELS "V2;Integration;ROCm;GEMM;FP16;BF16;FP32;ExpertOverlay;Lifecycle;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+    )
+endif()
 
 # Test: CUDA Basic Pipeline (Phase 1 - end-to-end KernelFactory + tensor transfer)
 # Tests KernelFactory dispatch to cuBLAS, tensor upload/download in GEMM context
@@ -6205,6 +6256,20 @@ add_v2_test(V2_Perf_CoherenceTransferOverhead
     LABELS "V2;Performance;Coherence;TransferOverhead;H2D;DeviceManagement;GPUMemory;ZeroCopy"
     MPI_PROCS 1  # Benchmarks run locally, no MPI needed
 )
+
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_perf_background_mapped_copy
+        performance/transfer/Perf__BackgroundMappedCopy.cpp)
+    target_link_libraries(v2_perf_background_mapped_copy
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    # Economy is an explicit performance run, never a ProductionParityPreflight gate.
+    add_v2_test(V2_Perf_BackgroundMappedCopy
+        COMMAND $<TARGET_FILE:v2_perf_background_mapped_copy>
+        LABELS "V2;Performance;CUDA;ROCm;TransferEngine;MappedHost;ExpertOverlay"
+        MPI_PROCS 1
+        TIMEOUT 60
+        NO_MODELS)
+endif()
 
 # Prefix-cache / MTP benchmark JSON smoke.
 # Keeps Phase 14 machine-readable benchmark acceptance counters covered without
@@ -6553,6 +6618,15 @@ add_v2_test(V2_Integration_CUDAConcurrentPrefillBiasGraphCapture
     MPI_PROCS 1
     NO_MODELS
     TIMEOUT 30
+)
+add_v2_test(V2_Integration_CUDAConcurrentMergedWorkspaceAllFormats
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
+            --gtest_filter=Test__CUDAGemmBatchInvariance.CapturedConcurrentDecodeMergedWorkspaceAllFormats
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ExplicitStream;ByteExact;AllFormats;Workspace;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 60
 )
 add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristic
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
@@ -7580,6 +7654,8 @@ if(ZLIB_FOUND)
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-27B-Q8_0.gguf")
     set(V2_PARITY_MODEL_QWEN36_DENSE
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.6-27B-Q4_K_S.gguf")
+    set(V2_PARITY_MODEL_QWEN38_DENSE
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.8-27B-IQ4_XS.gguf")
     set(V2_PARITY_MODEL_QWEN35_MOE_Q4
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf")
     set(V2_PARITY_MODEL_QWEN35_MOE_Q3
@@ -7591,6 +7667,8 @@ if(ZLIB_FOUND)
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00004-of-00004.gguf")
     set(V2_PARITY_MODEL_QWEN36_MOE
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf")
+    set(V2_PARITY_MODEL_ORNITH15_MOE
+        "${WORKSPACE_ROOT_PARITY}/models/Ornith-1.5-35B-Q4_K_M.gguf")
 
     # =========================================================================
     # Qwen2 Parity Test Matrix (integration/parity/qwen2/)
@@ -7942,30 +8020,30 @@ if(ZLIB_FOUND)
     message(STATUS "V2: Qwen3.5 NodePP parity tests enabled (requires mpirun -np 2+)")
 
     # =========================================================================
-    # Qwen3.6 Dense Prefix Cache / MTP PyTorch Parity Matrix
+    # Qwen3.8 Dense Prefix Cache / MTP PyTorch Parity Matrix
     # =========================================================================
-    # Dense Qwen3.6 GGUFs are encoded as qwen35 with trailing nextn MTP sidecar
+    # Dense Qwen3.8 GGUFs are encoded as qwen35 with trailing nextn MTP sidecar
     # tensors, so this matrix uses the Qwen3.5 PyTorch reference generator.
     # The harness regenerates metadata-only PyTorch references when absent.
     # =========================================================================
 
-    add_executable(v2_integration_parity_qwen36_single_device_matrix
-        integration/parity/qwen36/Test__Qwen36_SingleDevice_Parity.cpp
+    add_executable(v2_integration_parity_qwen38_single_device_matrix
+        integration/parity/qwen38/Test__Qwen38_SingleDevice_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen36_single_device_matrix
+    target_link_libraries(v2_integration_parity_qwen38_single_device_matrix
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen36_single_device_matrix PRIVATE
+    target_include_directories(v2_integration_parity_qwen38_single_device_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen36_single_device_matrix
-        TEST_PREFIX V2_Integration_Parity_Qwen36_SingleDevice
-        LABELS "V2;Integration;Parity;Qwen36;Dense;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
+    discover_v2_parity_tests(v2_integration_parity_qwen38_single_device_matrix
+        TEST_PREFIX V2_Integration_Parity_Qwen38_SingleDevice
+        LABELS "V2;Integration;Parity;Qwen38;Dense;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
         TIMEOUT 3600
-        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_DENSE}
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN38_DENSE}
     )
 
     add_executable(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp
@@ -8338,11 +8416,14 @@ if(ZLIB_FOUND)
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36moe_expert_overlay_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen36MoE_ExpertOverlay
-        LABELS "V2;Integration;Parity;Qwen36MoE;MixtureOfExperts;GatedDeltaNet;CUDA;ROCm;LocalTP;ExpertOverlay;Static;Dynamic;MTP;PrefixCache;PyTorch;GoldenReference;FullModel"
+        LABELS "V2;Integration;Parity;Qwen36MoE;MixtureOfExperts;GatedDeltaNet;CPU;CUDA;ROCm;LocalTP;NodeTP;ExpertOverlay;Static;Dynamic;MTP;PrefixCache;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
         TIMEOUT 3600
         PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,weight_loading,moe_rebalance,moe_overlay_residency,moe_placement,moe_overlay_controller"
         MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
+        CPU_MODEL_FILES ${V2_PARITY_MODEL_ORNITH15_MOE}
+        CUDA_MODEL_FILES ${V2_PARITY_MODEL_ORNITH15_MOE}
+        ROCM_MODEL_FILES ${V2_PARITY_MODEL_ORNITH15_MOE}
     )
 
     add_executable(v2_integration_parity_qwen36moe_single_device_matrix
@@ -8362,6 +8443,7 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
         TIMEOUT 3600
         MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
+        ROCM_MODEL_FILES ${V2_PARITY_MODEL_ORNITH15_MOE}
     )
 
     # =========================================================================
@@ -8457,6 +8539,7 @@ if(ZLIB_FOUND)
     # Compile implementation once for both model sizes. Object linkage retains
     # the common TEST/TEST_P registrars, which an unreferenced archive member
     # could otherwise drop. Only the tiny registration sources select a model.
+    if(NOT V2_PERF_TESTS_ONLY)
     add_library(v2_parity_qwen35moe_node_overlay OBJECT
         integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParitySupportPolicy.cpp
         integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParitySupportTopology.cpp
@@ -8492,6 +8575,7 @@ if(ZLIB_FOUND)
     target_precompile_headers(v2_parity_qwen35moe_node_overlay PRIVATE
         integration/parity/qwen35moe/node_overlay/NodeExpertOverlayParityFixture.h
     )
+    endif()
 
     add_executable(v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix
         integration/parity/qwen35moe/Test__Qwen35MoE_NodeExpertOverlay_Parity.cpp
@@ -8499,9 +8583,11 @@ if(ZLIB_FOUND)
     target_link_libraries(v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix
         v2_parity_qwen35moe_node_overlay
     )
+    if(NOT V2_PERF_TESTS_ONLY)
     target_precompile_headers(v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix
         REUSE_FROM v2_parity_qwen35moe_node_overlay
     )
+    endif()
     target_include_directories(v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -8602,9 +8688,11 @@ if(ZLIB_FOUND)
     target_link_libraries(v2_integration_parity_qwen35moe_122b_node_expert_overlay_matrix
         v2_parity_qwen35moe_node_overlay
     )
+    if(NOT V2_PERF_TESTS_ONLY)
     target_precompile_headers(v2_integration_parity_qwen35moe_122b_node_expert_overlay_matrix
         REUSE_FROM v2_parity_qwen35moe_node_overlay
     )
+    endif()
     target_include_directories(v2_integration_parity_qwen35moe_122b_node_expert_overlay_matrix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -10065,6 +10153,18 @@ add_v2_test(V2_Unit_CoherenceAuditLog
     COMMAND $<TARGET_FILE:v2_test_coherence_audit_log>
     LABELS "V2;Unit;Coherence;AuditLog;Debugging"
     MPI_PROCS 1
+)
+
+# Test: TransferEngine (unified data movement planning and execution)
+add_executable(v2_unit_transfer_command_progress_watch
+    unit/transfer/Test__TransferCommandProgressWatch.cpp)
+target_include_directories(v2_unit_transfer_command_progress_watch PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_unit_transfer_command_progress_watch GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_TransferCommandProgressWatch
+    COMMAND $<TARGET_FILE:v2_unit_transfer_command_progress_watch>
+    LABELS "V2;Unit;Transfer;Diagnostics;Lifecycle"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: TransferEngine (unified data movement planning and execution)
@@ -12481,6 +12581,8 @@ add_v2_test(V2_Integration_MoEOverlaySparseTransport_MPI
     COMMAND $<TARGET_FILE:v2_integration_moe_overlay_sparse_transport_mpi>
     LABELS "V2;Integration;MoE;Overlay;SparseCollective;MPI;MTP;DynamicDepth;Async;NoBlocking;PerfStats"
     MPI_PROCS 2
+    TIMEOUT 60
+    NO_MODELS
 )
 
 # Test: non-blocking two-phase ExpertOverlay residency votes over real MPI
@@ -14195,7 +14297,8 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 --gtest_brief=1
         LABELS "V2;Integration;CUDA;ROCm;TransferEngine;MoE;ExpertOverlay;MappedHost;GraphCapture;Parallel;ByteExact;NoBlocking"
         MPI_PROCS 1
-        # This is a nine-case, dual-backend 256-generation stress gate. Its
+        # This dual-backend gate stresses 256 generations and independent
+        # bidirectional progress across peer-held captured inference. Its
         # internal event deadlines remain 5/10 seconds; the outer aggregate
         # allowance must also cover cold CUDA/HIP context and graph teardown.
         TIMEOUT 60
@@ -14578,6 +14681,14 @@ if(HAVE_CUDA OR HAVE_ROCM)
         MPI_PROCS 1  # LOCAL TP runs within a single MPI rank
     )
     if(HAVE_CUDA)
+        add_v2_test(V2_Integration_CUDA_NCCLRetainedParentFragmentReentry
+            COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
+                --gtest_filter=Test__LocalTPNCCLGraphCapture.NCCLRetainedParentFragmentReentry
+            LABELS "V2;Integration;LocalTP;NCCL;CUDA;GraphCapture;RetainedParent"
+            MPI_PROCS 1
+            TIMEOUT 60
+            NO_MODELS
+        )
         add_v2_test(V2_Integration_CUDA_TPCanonicalRankOrderGraphCapture
             COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
                 --gtest_filter=Test__LocalTPNCCLGraphCapture.NCCLCanonicalRankOrderReduction_GraphCapturedRowZeroIsBatchInvariant
@@ -14780,11 +14891,9 @@ if(HAVE_CUDA AND HAVE_ROCM)
             "LLAMINAR_PERF_STATS_FILTER=moe_overlay_activation_epoch"
     )
     # A retained GPU parent can acknowledge a colocated CPU ticket before the
-    # following host protocol terminal observes it. Keep one exact backend-
-    # symmetric regression per native consumer in the parity preflight.
-    set(V2_CANONICAL_TICKET_ACK_PREFLIGHT_TESTS
-        V2_Integration_CanonicalRouteTicketAckRace_CUDA
-        V2_Integration_CanonicalRouteTicketAckRace_ROCm)
+    # following host protocol terminal observes it. Retain exact backend tests
+    # for focused iteration; preflight runs their full owning packet suite so
+    # the planner contract and retained endpoint graphs cannot silently rot.
     add_v2_test(V2_Integration_CanonicalRouteTicketAckRace_CUDA
         COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
                 --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.CPUCanonicalRouteTicketReusesSafelyOnCUDA
@@ -17151,6 +17260,7 @@ set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
     V2_Integration_RankInitializationLifecycle_MPI
     V2_Integration_OrchestrationRunner
     V2_Integration_MoEOverlayResidencyConsensus_MPI
+    V2_Integration_MoEOverlaySparseTransport_MPI
     V2_Integration_MoEGraphNative_PreparedExpertWeights_MVP
     V2_Integration_MoEOverlayActivationProgressLifecycle
     V2_Integration_MoEGroupedVerifierHistogramBoundaryLifecycle
@@ -17179,6 +17289,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
 endif()
 if(HAVE_CUDA)
     list(APPEND V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+    V2_Integration_CUDA_NCCLRetainedParentFragmentReentry
     V2_Integration_CUDA_TPCanonicalRankOrderGraphCapture
     V2_Integration_GDNLinkedStateReassembly_CUDA
     V2_Integration_GPUDeviceContext_CUDA
@@ -17187,6 +17298,8 @@ if(HAVE_CUDA)
     V2_Integration_CUDAEventSynchronization
     V2_Integration_CUDAGraphCapture
     V2_Integration_CUDAConcurrentPrefillBiasGraphCapture
+    V2_Integration_CUDAConcurrentMergedWorkspaceAllFormats
+    V2_Integration_CUDAFloatingExpertRetirement
     V2_Integration_CUDA_MoEAsyncHistogramCaptureLifecycle
     V2_Integration_CUDA_MoEDeviceResidentGroupedVerifierPublication
     V2_Integration_CUDA_MoEAsyncHistogramBorrowedStreamRetirement
@@ -17214,6 +17327,7 @@ if(HAVE_ROCM)
     V2_Integration_ROCm_MoEAsyncHistogramCaptureLifecycle
     V2_Integration_ROCm_MoEDeviceResidentGroupedVerifierPublication
     V2_Integration_ROCm_MoEAsyncHistogramBorrowedStreamRetirement
+    V2_Integration_ROCmFloatingExpertRetirement
     ${V2_ROCM_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
     V2_Integration_DeviceGenerationController_ROCm
     V2_Integration_HIPGraphCapture
@@ -17228,9 +17342,10 @@ if(HAVE_CUDA AND HAVE_ROCM)
         V2_Integration_MappedActivationEpoch_CUDA_ROCm
         V2_Integration_HeterogeneousGPUExpertBlobTransfer
         V2_Integration_MoEOverlayThreeTierMigration
-        ${V2_CANONICAL_TICKET_ACK_PREFLIGHT_TESTS}
+        V2_Integration_MappedActivationPacket_CUDA_ROCm
         V2_Integration_HardwareInventory_CUDAExcluded
         V2_Integration_HardwareInventory_ROCmExcluded
+        V2_Integration_HardwareInventory_CPUNamedDomain
         ${V2_DEVICE_CONTROLLER_FABRIC_PREFLIGHT_TEST})
 endif()
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_PARITY_PREFLIGHT_TESTS)

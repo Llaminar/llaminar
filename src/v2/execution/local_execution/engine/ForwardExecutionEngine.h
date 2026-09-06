@@ -319,18 +319,17 @@ namespace llaminar2
          * tiny publication, sampler, or maintenance graphs. An empty descriptor
          * means no branch is configured. A non-empty descriptor is cached as
          * part of the executable's immutable identity and must continue naming
-         * the same authority on every replay.
+         * the same authority on every replay, including hosted MTP replay.
+         * Authority belongs to the runner/device lifetime, not to a transient
+         * ForwardInput or a caller-reconstructed speculative geometry.
          *
-         * @param input Exact role and geometry of the forward graph family.
          * @param execution_device GPU that will own the native executable.
          * @return Empty or complete cache-private branch factory.
          */
         virtual GraphCaptureAuxiliaryBranchFactory
         forwardGraphAuxiliaryBranchFactory(
-            const ForwardInput &input,
             DeviceId execution_device)
         {
-            (void)input;
             (void)execution_device;
             return {};
         }
@@ -1072,10 +1071,10 @@ namespace llaminar2
          * @param sparse_params Root-authoritative generation/operation identity.
          * @param launch_dependency Exact pre-launch edge used to arm an
          *        external heterogeneous follower after native graph setup.
-         * @param auxiliary_branch_factory Exact cache-private background-work
-         *        authority captured by the retained forward executable. An
-         *        empty factory is valid only when the cache was materialized
-         *        without an auxiliary branch.
+         * @param host The same runner authority used during materialization.
+         *        The engine obtains its background branch policy directly and
+         *        authenticates it against the retained executable. Callers
+         *        cannot omit that policy or substitute an empty descriptor.
          * @param transaction_stream Exact external scheduler stream ordered
          *        before and after this retained replay through the cache-owned
          *        device event. It must be non-null and may not alias another
@@ -1091,8 +1090,7 @@ namespace llaminar2
                 &sparse_params,
             const DeviceGraphExecutor::GraphLaunchDependencyHook
                 &launch_dependency,
-            const GraphCaptureAuxiliaryBranchFactory
-                &auxiliary_branch_factory,
+            IForwardExecutionHost &host,
             void *transaction_stream,
             void **out_producer_stream,
             std::string *error = nullptr);
@@ -1381,13 +1379,22 @@ namespace llaminar2
             const LastExecutedForwardGraphState &state,
             std::string *error) const;
 
-        // ----- Cache HIT execution path -----
+        /**
+         * @brief Submit a cached graph under its complete immutable identity.
+         * @param input Request inputs or explicit setup-materialization intent.
+         * @param output Destination for the executed forward's published views.
+         * @param cache The exact graph and stable storage selected by signature.
+         * @param host Participant-local execution and publication services.
+         * @param signature Canonical cache identity, including verifier/condition role.
+         * @param start Start of this forward's host timing interval.
+         * @return True after the requested materialization or execution succeeds.
+         */
         bool executeCacheHit(
             const ForwardInput &input,
             ForwardOutput &output,
             ForwardGraphCache &cache,
             IForwardExecutionHost &host,
-            bool is_decode,
+            const ForwardGraphSignature &signature,
             std::chrono::high_resolution_clock::time_point start);
 
         /**
@@ -1398,12 +1405,17 @@ namespace llaminar2
          * records native units and local-TP capture waves only; it never prepares
          * live request state, executes manual segments, launches an executable,
          * or publishes output provenance.
+         * @param input Explicit setup inputs; no request-owned launch dependency.
+         * @param forward_cache Graph and permanent buffers belonging to signature.
+         * @param host Participant-local capture and ordering services.
+         * @param signature Exact graph role used for capture and replay attribution.
+         * @return True when the exact executable is retained without launching it.
          */
         bool materializeCachedExecutableWithoutLaunch(
             const ForwardInput &input,
             ForwardGraphCache &forward_cache,
             IForwardExecutionHost &host,
-            bool is_decode);
+            const ForwardGraphSignature &signature);
 
         // ----- Cache MISS execution path -----
         bool executeCacheMiss(

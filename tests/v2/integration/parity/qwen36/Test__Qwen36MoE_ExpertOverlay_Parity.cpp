@@ -1,6 +1,6 @@
 /**
  * @file Test__Qwen36MoE_ExpertOverlay_Parity.cpp
- * @brief Typed production parity matrix for homogeneous Qwen3.6 MoE overlays.
+ * @brief Typed production parity for Qwen3.6 MoE and Ornith fine-tune overlays.
  *
  * Each declaration names only a real model/reference pack and one physical
  * topology. The shared matrix expands Ordinal/Random placement,
@@ -16,6 +16,7 @@
 
 #include "../qwen35moe/Qwen35MoEParityTestBase.h"
 #include "Qwen36ModelParityDefinitions.h"
+#include "Ornith15ModelParityDefinitions.h"
 #include "Qwen36MoEParityTestBase.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
@@ -37,12 +38,13 @@ using namespace llaminar2::test::parity::qwen36;
 
 namespace
 {
-    /** @return Canonically expanded two-CUDA and two-ROCm overlay cases. */
+    /** @return Canonical two-GPU and two-socket CPU single-tier overlay cases. */
     const std::vector<ModelParityCase> &qwen36MoEExpertOverlayCases()
     {
         static const auto cases = []
         {
             const std::array definitions = {
+                qwen36MoECPU2NodeTPParityDefinition(),
                 qwen36MoEParityDefinition(
                     qwen36MoECuda2ExpertOverlayTopology(),
                     "pytorch_qwen36_moe_singledevice_cuda_snapshots",
@@ -54,7 +56,7 @@ namespace
             };
 
             std::vector<ModelParityCase> expanded;
-            for (const auto &definition : definitions)
+            for (const auto &definition : withOrnith15CertificationModels(definitions))
             {
                 auto definition_cases =
                     expandModelParityDefinition(definition);

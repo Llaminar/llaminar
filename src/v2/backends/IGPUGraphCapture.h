@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "GPUGraphMemoryContract.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -431,6 +433,21 @@ namespace llaminar2
         }
     };
 
+    /**
+     * @brief Three graph-only fragments decorating one final native executable.
+     *
+     * Open precedes every original root and the parallel worker. Close follows
+     * every original terminal, and the final frontier joins Close plus worker.
+     * The worker may wait for Close, so ordering it before the original body
+     * would deadlock. Sources are borrowed only during cold graph assembly.
+     */
+    struct GPUCapturedParallelBranch
+    {
+        const IGPUGraphCapture &open;
+        const IGPUGraphCapture &worker;
+        const IGPUGraphCapture &close;
+    };
+
     /// Abstract interface for GPU graph capture and replay.
     /// Abstracts over HIP Graphs (ROCm) and CUDA Graphs (NVIDIA).
     ///
@@ -569,6 +586,22 @@ namespace llaminar2
         }
 
         /**
+         * @brief Create a graph-only recording owned by this future timeline.
+         *
+         * Call before recording each retained capture unit, then seal the exact
+         * set with buildOrderedTimelineTransaction(). CUDA records directly into
+         * its final native graph because conditional handles cannot be cloned;
+         * HIP records independently clonable native children. Neither policy
+         * launches work or re-records a captured operation. Unsupported test
+         * doubles fail explicitly instead of selecting a different graph path.
+         * @return An unrecorded fragment on this owner's exact device and stream.
+         */
+        virtual std::unique_ptr<IGPUGraphCapture> createOrderedTimelineFragment()
+        {
+            return nullptr;
+        }
+
+        /**
          * @brief Build one retained native graph from fragments and timeline edges.
          *
          * Every step depends directly on the complete preceding frontier.
@@ -587,6 +620,26 @@ namespace llaminar2
         {
             (void)ordered_steps;
             (void)instrumentation;
+            return false;
+        }
+
+        /**
+         * @brief Decorate a sealed, uninstantiated graph with a parallel branch.
+         *
+         * Preserve the original graph in place, including non-clonable CUDA
+         * conditional handles. Only the three small branch fragments are
+         * cloned. This works identically for direct captures and assembled
+         * parents, performs no device execution, and adds no replay-time work
+         * on the host. An executable or an actively recorded graph is invalid.
+         * Failure invalidates the destination; callers must discard it.
+         *
+         * @param branch Exact open/worker/close graphs on this owner's device.
+         * @return true after all roots and terminals have the complete DAG.
+         */
+        [[nodiscard]] virtual bool appendParallelBranch(
+            const GPUCapturedParallelBranch &branch)
+        {
+            (void)branch;
             return false;
         }
 
@@ -718,13 +771,15 @@ namespace llaminar2
         virtual GraphUpdateResult tryUpdate() = 0;
 
         /**
-         * @brief Report whether this backend can update an instantiated executable in place.
+         * @brief Report whether this backend and graph kind admit executable updates.
          *
          * Graph recapture always produces a new graph object. Backends that return true may
          * attempt to transplant the new graph's parameters and topology into the existing
          * executable through tryUpdate(). Backends that return false require instantiate()
-         * to replace the executable directly. This is a static backend capability, not a
-         * transient runtime condition, so orchestration code can select one explicit
+         * to replace the executable directly. Native conditional timeline owners
+         * and their graph-only views prohibit updates even on a backend whose
+         * ordinary graphs support them. This is a declared construction-kind
+         * capability, not a transient runtime condition: orchestration selects one explicit
          * lifecycle without failed API calls, sticky-error clearing, or retry behavior.
          *
          * @return true when tryUpdate() is a supported active lifecycle operation.
@@ -735,11 +790,13 @@ namespace llaminar2
         virtual bool hasExecutable() const = 0;
 
         /**
-         * @brief Return setup-observed device bytes owned by this executable.
+         * @brief Return setup-observed shared-driver-pool growth at instantiation.
          *
          * The graph owner records this value directly around native
          * instantiation. PerfStats and log output are diagnostics, never the
-         * accounting authority. A graph without an executable reports zero;
+         * accounting authority. This is not per-executable ownership: the
+         * complete family reservation owns the opaque pool extent. A graph
+         * without an executable reports zero;
          * a live executable may also report zero when an existing driver pool
          * satisfies the allocation.
          */
@@ -747,6 +804,33 @@ namespace llaminar2
 
         /// @return Number of nodes in the last captured graph (0 if no capture done)
         virtual size_t nodeCount() const = 0;
+
+        /**
+         * @brief Enforce the admission class against immutable native metadata.
+         * @param executable_class Shape class declared by the graph owner/BOM.
+         * @param error Receives a precise mismatch diagnostic; cleared on success.
+         * @return False before instantiation when the cheaper helper contract
+         *         cannot represent this graph. No launch or device-memory query occurs.
+         */
+        [[nodiscard]] bool validateExecutableMemoryClass(
+            GPUGraphExecutableClass executable_class,
+            std::string *error = nullptr) const
+        {
+            if (error)
+                error->clear();
+            if (!GPUGraphMemoryContract::requiresBoundedFlatShape(executable_class))
+                return true;
+            if (nodeCount() == 0u ||
+                nodeCount() > GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes)
+            {
+                if (error)
+                    *error = "Bounded flat helper exceeds its native-node contract: nodes=" +
+                             std::to_string(nodeCount()) + " limit=" +
+                             std::to_string(GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes);
+                return false;
+            }
+            return validateFlatHelperNodeKinds(error);
+        }
 
         /**
          * @brief Recursively enumerate every kernel in the captured graph.
@@ -781,6 +865,20 @@ namespace llaminar2
         virtual const char *backendName() const = 0;
 
     protected:
+        /**
+         * @brief Require a flat native kernel/copy/memset-only graph.
+         * @param error Receives the first forbidden or unreadable native node.
+         * @return True only after inspecting every root node. Unknown backends
+         *         fail closed instead of claiming the bounded memory certificate.
+         */
+        [[nodiscard]] virtual bool validateFlatHelperNodeKinds(
+            std::string *error) const
+        {
+            if (error)
+                *error = "GPU backend cannot certify bounded flat helper node kinds";
+            return false;
+        }
+
         IGPUGraphCapture() = default;
         // Non-copyable
         IGPUGraphCapture(const IGPUGraphCapture &) = delete;

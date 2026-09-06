@@ -5,6 +5,8 @@
  * Tests the Phase 4 GPU Device Context Refactor additions to kernel base classes:
  * - setDeviceContext() / deviceContext() / hasDeviceContext()
  * - getStream() / getBlasHandle() helpers
+ * - context-owned BLAS submission scopes, rejecting incomplete state and
+ *   serializing host API mutation without scheduling or waiting for GPU work.
  *
  * These tests use mock contexts and don't require actual GPU hardware.
  *
@@ -13,6 +15,11 @@
  */
 
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <type_traits>
+#include <vector>
 #include "kernels/cuda/CUDAKernelBase.h"
 #include "kernels/rocm/ROCmKernelBase.h"
 #include "backends/IWorkerGPUContext.h"
@@ -139,6 +146,66 @@ TEST(Test__WorkerGPUContextSubmission, NestedSynchronousWorkExecutesInline)
 
     EXPECT_TRUE(ran);
     EXPECT_EQ(context.queuedSubmissionCount(), 0);
+}
+
+/** @brief Incomplete library ownership fails before any backend or queue submission. */
+TEST(Test__WorkerGPUContextSubmission, BlasScopeRejectsIncompleteContext)
+{
+    static_assert(!std::is_copy_constructible_v<GPUBlasSubmission>);
+    static_assert(!std::is_move_constructible_v<GPUBlasSubmission>);
+    MockGPUContext context(0, false);
+    EXPECT_THROW((void)context.acquireBlasSubmission(), std::logic_error);
+    context.setInitialized(true);
+    context.setMockBlasHandle(nullptr);
+    EXPECT_THROW((void)context.acquireBlasSubmission(), std::logic_error);
+    context.setMockBlasHandle(reinterpret_cast<void *>(1));
+    context.setMockBlasLtHandle(nullptr);
+    EXPECT_THROW((void)context.acquireBlasSubmission(), std::logic_error);
+    EXPECT_EQ(context.queuedSubmissionCount(), 0);
+}
+
+/** @brief Distinct adapters serialize handle mutation at their common context only. */
+TEST(Test__WorkerGPUContextSubmission, BlasScopesSerializeOneContextWithoutWorkerQueue)
+{
+    MockGPUContext context(0);
+    std::atomic<int> active{0};
+    std::atomic<int> overlaps{0};
+    std::atomic<int> calls{0};
+    std::vector<std::thread> submitters;
+    for (int thread = 0; thread < 8; ++thread)
+        submitters.emplace_back([&]
+        {
+            for (int call = 0; call < 256; ++call)
+            {
+                const auto submission = context.acquireBlasSubmission();
+                if (active.fetch_add(1) != 0)
+                    ++overlaps;
+                std::this_thread::yield();
+                --active;
+                ++calls;
+            }
+        });
+    for (auto &thread : submitters)
+        thread.join();
+    EXPECT_EQ(overlaps, 0);
+    EXPECT_EQ(calls, 2048);
+    EXPECT_EQ(context.queuedSubmissionCount(), 0);
+
+    // Different physical devices have independent submission locks. Holding
+    // one cannot prevent another device from scheduling its library work.
+    MockGPUContext other(1);
+    std::future<void> independent;
+    {
+        const auto first = context.acquireBlasSubmission();
+        independent = std::async(std::launch::async, [&]
+        {
+            const auto second = other.acquireBlasSubmission();
+            EXPECT_EQ(second.handle(), other.blasHandle());
+            EXPECT_EQ(second.ltHandle(), other.blasLtHandle());
+        });
+        EXPECT_EQ(independent.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    }
+    independent.get();
 }
 
 TEST(Test__WorkerGPUContextSubmission, ForeignSynchronousWorkUsesQueueAndPropagatesFailure)

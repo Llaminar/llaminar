@@ -270,7 +270,7 @@ TEST(Test__DeterministicMode, CudaMoEGroupedImmaPolicyIsMTotal)
     }
 }
 
-TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutes)
+TEST(Test__DeterministicMode, DebugEnvRetainsArithmeticInvariantCudaDecodeConcurrency)
 {
     ScopedEnv env({
         {"LLAMINAR_DETERMINISTIC", "1"},
@@ -292,7 +292,7 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutes)
     EXPECT_TRUE(env_snapshot.gemm.deterministic);
 
     EXPECT_FALSE(env_snapshot.gemm.cuda_concurrent_prefill);
-    EXPECT_FALSE(env_snapshot.gemm.cuda_concurrent_decode);
+    EXPECT_TRUE(env_snapshot.gemm.cuda_concurrent_decode);
     EXPECT_TRUE(env_snapshot.gemm.cuda_moe_router_q8);
     EXPECT_TRUE(env_snapshot.gemm.cuda_moe_reuse_router_q8_hidden);
 
@@ -343,7 +343,7 @@ TEST(Test__DeterministicMode, ConcurrentRoutesReturnToDefaultsWhenDeterminismIsC
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "1"},
         });
         EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_prefill);
-        EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_decode);
+        EXPECT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
         EXPECT_TRUE(debugEnv().gemm.cuda_moe_router_q8);
         EXPECT_TRUE(debugEnv().gemm.cuda_moe_reuse_router_q8_hidden);
         EXPECT_FALSE(debugEnv().rocm.concurrent_prefill);

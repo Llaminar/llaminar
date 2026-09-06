@@ -181,7 +181,11 @@ namespace llaminar2::test
             MoEOverlayNodeLocalDeviceControllerFabric &first_rank,
             MoEOverlayNodeLocalDeviceControllerFabric &second_rank,
             const MoEOverlayDeviceControllerTopology &resolved,
-            std::uint32_t layer_count)
+            std::uint32_t layer_count,
+            ExpertHistogramProductionSourceMask economy_sources =
+                kAllExpertHistogramProductionSources,
+            std::array<std::uint64_t, 3> phase_cost_multipliers = {1u, 1u, 1u},
+            std::uint64_t transfer_cost_ns = 1u)
         {
             std::uint32_t tier_count = 0u;
             for (const auto &participant : resolved.participants)
@@ -192,10 +196,11 @@ namespace llaminar2::test
             }
             auto service = std::make_shared<MoERoutedTierServiceProfile>();
             service->identity = "device-controller-test-service-v1";
-            service->production_topology =
-                ExpertHistogramProductionTopology::uniform(
-                    static_cast<int>(layer_count),
-                    kAllExpertHistogramProductionSources);
+            service->production_topology = ExpertHistogramProductionTopology(
+                std::vector<ExpertHistogramProductionSourceMask>(
+                    layer_count, kAllExpertHistogramProductionSources),
+                std::vector<ExpertHistogramProductionSourceMask>(
+                    layer_count, economy_sources));
             for (std::uint32_t tier = 0u; tier < tier_count; ++tier)
             {
                 for (std::uint32_t layer = 0u;
@@ -206,7 +211,10 @@ namespace llaminar2::test
                     service->costs.push_back({
                         .tier_index = static_cast<int>(tier),
                         .layer = static_cast<int>(layer),
-                        .nanoseconds_per_activation = {cost, cost, cost},
+                        .nanoseconds_per_activation = {
+                            economy_sources[0] ? cost * phase_cost_multipliers[0] : 0u,
+                            economy_sources[1] ? cost * phase_cost_multipliers[1] : 0u,
+                            economy_sources[2] ? cost * phase_cost_multipliers[2] : 0u},
                     });
                 }
             }
@@ -234,7 +242,7 @@ namespace llaminar2::test
                             .destination_participant =
                                 static_cast<int>(destination),
                             .layer = static_cast<int>(layer),
-                            .transfer_and_repack_ns = 1u,
+                            .transfer_and_repack_ns = transfer_cost_ns,
                             .inference_interference_ns = 0u,
                         });
                     }
@@ -800,19 +808,27 @@ namespace llaminar2::test
                  ++member)
             {
                 const std::uint32_t participant = group.participant_ids[member];
+                for (std::uint32_t phase = 0u;
+                     phase < kMoEOverlayDeviceControllerDemandPhaseCount; ++phase)
+                {
                 for (std::uint32_t layer = 0u; layer < input.num_layers; ++layer)
                 {
                     for (std::uint32_t expert = 0u;
                          expert < input.num_experts;
                          ++expert)
                     {
-                        words.push_back(input.collected_state[
+                        const auto word = input.collected_state[
                             (static_cast<std::size_t>(participant) *
                                  input.num_layers +
                              layer) *
                                 input.num_experts +
-                            expert]);
+                            expert];
+                        // Legacy synthetic policy input describes decode demand;
+                        // every plane still carries identical ownership metadata.
+                        words.push_back(phase == 0u ? word :
+                            word & ~moe_rebalance_policy::kCollectedStateActivationCountMask);
                     }
+                }
                 }
             }
             if (words.size() != group.collected_state_words)
@@ -1926,8 +1942,13 @@ namespace llaminar2::test
                                                 MoEOverlayDeviceControllerPolicyResult),
                                             leader->binding.device.ordinal)
                                       : nullptr;
+            // The publication rig uses the same finite retained author epoch
+            // as serving. Destroy its executable before releasing any embedded
+            // result pointer or stream at the terminal boundary.
+            std::unique_ptr<IGPUGraphCapture> author_graph;
             const auto cleanup = [&]
             {
+                author_graph.reset();
                 if (policy_device && leader)
                 {
                     leader->backend->free(
@@ -2070,11 +2091,19 @@ namespace llaminar2::test
             };
             const auto enqueue_snapshot = [](Endpoint &endpoint)
             {
-                return endpoint.kernel->packDeviceRebalanceHistograms(
-                    {.stream = endpoint.stream},
-                    endpoint.fixture->runtimeBinding().runtime_layers_device,
-                    endpoint.binding.participant_collected_state,
-                    endpoint.snapshot_config);
+                const auto plane_words = static_cast<std::size_t>(
+                    endpoint.snapshot_config.num_layers) * endpoint.snapshot_config.num_experts;
+                for (std::uint32_t phase = 0u;
+                     phase < kMoEOverlayDeviceControllerDemandPhaseCount; ++phase)
+                {
+                    if (!endpoint.kernel->packDeviceRebalanceHistograms(
+                            {.stream = endpoint.stream},
+                            endpoint.fixture->runtimeBinding().runtime_layers_device,
+                            endpoint.binding.participant_collected_state + phase * plane_words,
+                            endpoint.snapshot_config, nullptr, nullptr, 1u, 1u << phase))
+                        return false;
+                }
+                return true;
             };
             const auto enqueue_reader_acquire = [](Endpoint &endpoint,
                                                    std::uint32_t slot)
@@ -2156,6 +2185,28 @@ namespace llaminar2::test
             // live mapped-memory wait. Giving every producer its turn before
             // group-root waits makes that impossible without introducing a
             // host observation or serial synchronization.
+            bool captured = false;
+            auto &author_worker = GPUDeviceContextPool::instance().getContext(
+                leader->binding.device);
+            author_worker.submitAndWait([&]
+            {
+                author_graph = author_worker.createGraphCapture(leader->stream);
+                if (!author_graph || !author_graph->beginCapture())
+                    return;
+                const bool nodes = enqueue_action(*leader, author_action) &&
+                    enqueue_action(*leader, MoEOverlayDeviceControllerAction::PublishCommand) &&
+                    enqueue_action(*leader, MoEOverlayDeviceControllerAction::CompleteEmptyDynamicDecision);
+                // End capture even when a launch was rejected so its scope
+                // cannot leak into cleanup or another test on this worker.
+                const bool ended = author_graph->endCapture();
+                captured = nodes && ended && author_graph->instantiate();
+            });
+            if (!captured)
+            {
+                append_error("runtime apply could not capture its complete author epoch");
+                cleanup();
+                return false;
+            }
             bool submitted = enqueue_action(
                 *leader,
                 MoEOverlayDeviceControllerAction::BeginTransaction);
@@ -2177,16 +2228,7 @@ namespace llaminar2::test
                             PublishGroupSnapshot);
                 }
             }
-            submitted = submitted && enqueue_action(
-                *leader,
-                author_action);
-            submitted = submitted && enqueue_action(
-                *leader,
-                MoEOverlayDeviceControllerAction::PublishCommand);
-            submitted = submitted && enqueue_action(
-                *leader,
-                MoEOverlayDeviceControllerAction::
-                    CompleteEmptyDynamicDecision);
+            submitted = submitted && author_graph->launchOnStream(leader->stream);
 
             struct TransportResult
             {
@@ -2657,7 +2699,16 @@ namespace llaminar2::test
                         DeviceMoEOverlayEpochControl control{};
                         const auto *record =
                             endpoint.binding.local_participant_record;
+                        // The readiness kernel also runs on inference streams.
+                        // Its probe must leave maintenance-entry evidence intact
+                        // so a stalled publication can be diagnosed reliably.
+                        const bool maintenance_entry_preserved =
+                            record->observed_action == static_cast<std::uint32_t>(
+                                MoEOverlayDeviceControllerAction::AwaitRuntimeRetirement);
+                        if (!maintenance_entry_preserved)
+                            append_error("readiness probe overwrote maintenance action evidence");
                         const bool deferred =
+                            maintenance_entry_preserved &&
                             endpoint.fixture->copyEpochControl(&control) &&
                             control.bank_readers[0] == 1u &&
                             record->status_code == static_cast<std::uint32_t>(
@@ -3661,13 +3712,16 @@ namespace llaminar2::test
         };
     } // namespace
 
-    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
-         ParticipantInboxSkipsPreparedLifetimesOwnedBySiblingDevicesOnItsRank)
+    /** Prove immutable mapped staging and controller-certified reuse on one backend. */
+    void proveMappedParticipantInbox(DeviceType type)
     {
-        IBackend *const rocm = getROCmBackend();
-        if (!rocm || rocm->deviceCount() < 4)
+        IBackend *const backend = type == DeviceType::CUDA
+            ? getCUDABackend() : getROCmBackend();
+        if (!backend || !getCUDABackend() || !getROCmBackend() ||
+            getCUDABackend()->deviceCount() < 2 ||
+            getROCmBackend()->deviceCount() < 4)
         {
-            GTEST_SKIP() << "Requires four ROCm devices";
+            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
         }
 
         const auto resolved_topology = topology();
@@ -3677,15 +3731,21 @@ namespace llaminar2::test
         ASSERT_EQ(resolved_topology->participants[3].world_rank, 1);
         ASSERT_EQ(resolved_topology->participants[4].world_rank, 1);
 
+        const auto participant = type == DeviceType::CUDA ? 0u : 2u;
+        auto fabrics = makeControllerFabricPair(resolved_topology, policy_input);
+        auto &fabric = type == DeviceType::CUDA ? *fabrics.cuda_rank : *fabrics.rocm_rank;
+        const auto transport_binding = fabric.transportBinding(
+            resolved_topology->groupForParticipant(participant)->group_id);
+        MoEOverlayDeviceTransportProtocol protocol(transport_binding);
         MoEOverlayDeviceRuntimePublicationFixture fixture(
-            rocm,
-            resolved_topology->participants[2],
+            backend,
+            resolved_topology->participants[participant],
             *resolved_topology,
             policy_input);
         ScopedGPUStream consumer_stream(
-            resolved_topology->participants[2].device);
+            resolved_topology->participants[participant].device);
         MoEOverlayDevicePreparedArrivalInbox inbox({
-            .backend = rocm,
+            .backend = backend,
             .runtime_binding = fixture.runtimeBinding(),
             .command_capacity = policy_input.command_capacity,
             .consumer_stream = consumer_stream.get(),
@@ -3774,22 +3834,229 @@ namespace llaminar2::test
         }
 
         std::string error;
-        ASSERT_TRUE(inbox.enqueue(batch, prepared, &error)) << error;
-        const auto deadline = std::chrono::steady_clock::now() +
-            std::chrono::seconds(5);
-        bool ready = false;
-        while (!ready && std::chrono::steady_clock::now() < deadline)
-        {
-            ASSERT_TRUE(inbox.queryReady(&ready, &error)) << error;
-            if (!ready)
-                std::this_thread::yield();
-        }
-        ASSERT_TRUE(ready) << "sibling-only descriptor DMA did not complete";
-        EXPECT_TRUE(inbox.finishWave(&error)) << error;
+        ASSERT_TRUE(inbox.stage(batch, prepared, &error)) << error;
+        EXPECT_FALSE(inbox.stage(batch, prepared, &error))
+            << "An in-flight publication must be immutable";
+        EXPECT_FALSE(inbox.finishWave(protocol, command, &error))
+            << "Staging is not controller completion";
+        // This infrastructure test injects only a terminal device receipt;
+        // captured multi-device wave tests below prove its real GPU producer.
+        auto *controller = const_cast<MoEOverlayDeviceControllerSharedHeader *>(
+            transport_binding.controller);
+        __atomic_store_n(&controller->completed_transaction,
+                         command.header.transaction_id - 1u, __ATOMIC_RELEASE);
+        EXPECT_FALSE(inbox.finishWave(protocol, command, &error));
+        __atomic_store_n(&controller->completed_transaction,
+                         command.header.transaction_id, __ATOMIC_RELEASE);
+        auto wrong_command = command;
+        ++wrong_command.header.command_digest;
+        EXPECT_FALSE(inbox.finishWave(protocol, wrong_command, &error));
+        EXPECT_TRUE(inbox.finishWave(protocol, command, &error)) << error;
+        EXPECT_FALSE(inbox.finishWave(protocol, command, &error));
+        EXPECT_FALSE(inbox.stage(batch, prepared, &error))
+            << "A retired transaction cannot be staged again";
     }
 
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
-         DeviceAuthoredTwoCycleWaveAdvancesBothIndependentPlacementAxes)
+         CUDAMappedInboxRequiresExactControllerCompletionBeforeReuse)
+    {
+        proveMappedParticipantInbox(DeviceType::CUDA);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         ROCmMappedInboxSkipsSiblingLifetimesAndRequiresExactCompletion)
+    {
+        proveMappedParticipantInbox(DeviceType::ROCm);
+    }
+
+    /**
+     * @test A retained empty-completion/open pair cannot erase a slow follower's command.
+     *
+     * Setup supplies an already-sealed empty command, not a host completion.
+     * The real device kernels complete it and open the next phase before either
+     * transport worker runs. CUDA and ROCm each own the authority in turn. The
+     * same captured graph is replayed twenty times with changing transaction
+     * identities; no timing-dependent sleep is needed to force the interleaving.
+     */
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         CapturedEmptyCompletionRetainsCommandAcrossNextSnapshotOpen)
+    {
+        IBackend *const cuda = getCUDABackend();
+        IBackend *const rocm = getROCmBackend();
+        if (!cuda || !rocm || cuda->deviceCount() < 2 || rocm->deviceCount() < 4)
+            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
+
+        for (const DeviceType authority_type : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            SCOPED_TRACE(authority_type == DeviceType::CUDA ? "CUDA authority" : "ROCm authority");
+            const auto resolved = topology(authority_type);
+            const auto input = adversarialPolicyInput();
+            auto fabrics = makeControllerFabricPair(resolved, input);
+            auto &authority_fabric = authority_type == DeviceType::CUDA
+                                         ? *fabrics.cuda_rank : *fabrics.rocm_rank;
+            const auto binding = authority_fabric.participantBinding(
+                resolved->leader_participant_id);
+            const auto transports = allTransportBindings(*fabrics.cuda_rank, *fabrics.rocm_rank);
+            ASSERT_TRUE(binding.authority_leader);
+            ASSERT_FALSE(transports.empty());
+            IBackend *const backend = authority_type == DeviceType::CUDA ? cuda : rocm;
+            const int ordinal = binding.device.gpu_ordinal();
+            auto kernel = llaminar::v2::kernels::KernelFactory::createMoEKernel(binding.device);
+            ScopedGPUStream stream(binding.device);
+            const auto destroy_event = [backend, ordinal](void *event) {
+                if (event) backend->destroyEvent(event, ordinal);
+            };
+            std::unique_ptr<void, decltype(destroy_event)> terminal(
+                backend->createEvent(ordinal), destroy_event);
+            std::unique_ptr<IGPUGraphCapture> graph;
+            ASSERT_TRUE(kernel && stream.get() && terminal);
+            auto &worker = GPUDeviceContextPool::instance().getContext(binding.device);
+            bool captured = false;
+            worker.submitAndWait([&] {
+                graph = worker.createGraphCapture(stream.get());
+                if (!graph || !graph->beginCapture()) return;
+                const MoEKernelLaunchContext launch{.stream = stream.get()};
+                const bool nodes = kernel->runMoEOverlayDeviceControllerAction(launch, {
+                    .binding = binding.deviceBinding(),
+                    .action = MoEOverlayDeviceControllerAction::CompleteEmptyDynamicDecision,
+                }) && kernel->runMoEOverlayDeviceControllerAction(launch, {
+                    .binding = binding.deviceBinding(),
+                    .action = MoEOverlayDeviceControllerAction::BeginTransaction,
+                    .transaction_kind = MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
+                    .demand_phase = MoEOverlayDeviceDemandPhase::Decode,
+                });
+                const bool ended = graph->endCapture();
+                captured = nodes && ended && graph->instantiate();
+            });
+            ASSERT_TRUE(captured);
+
+            auto *controller = const_cast<MoEOverlayDeviceControllerSharedHeader *>(transports[0].controller);
+            auto *command = const_cast<MoEOverlayDeviceControllerCommandHeader *>(transports[0].command);
+            for (std::uint64_t iteration = 0u; iteration < 20u; ++iteration)
+            {
+                SCOPED_TRACE(iteration);
+                const auto transaction = 2u * iteration + 1u;
+                // Only fixture admission writes these pages, after the prior
+                // replay's terminal. Both completion and next-open are GPU-owned.
+                const MoEOverlayDeviceControllerCommandHeader sealed{
+                    .kind = static_cast<std::uint32_t>(MoEOverlayDeviceControllerTransactionKind::DynamicPlacement),
+                    .topology_fingerprint = resolved->topology_fingerprint,
+                    .transaction_id = transaction,
+                    .base_epoch = input.base_epoch,
+                    .candidate_epoch = input.base_epoch,
+                    .command_digest = moeOverlayCommandDigestSeed(0u),
+                    .demand_phase = static_cast<std::uint32_t>(MoEOverlayDeviceDemandPhase::Prefill),
+                };
+                *command = sealed;
+                controller->transaction_kind = sealed.kind;
+                controller->transaction_demand_phase = sealed.demand_phase;
+                controller->transaction_id = transaction;
+                controller->command_transaction = transaction;
+                controller->base_epoch = input.base_epoch;
+                controller->candidate_epoch = input.base_epoch;
+                std::atomic_ref(controller->state).store(
+                    static_cast<std::uint32_t>(MoEOverlayDeviceControllerState::PreparingFollowers),
+                    std::memory_order_release);
+                ASSERT_TRUE(graph->launchOnStream(stream.get()));
+                ASSERT_TRUE(backend->recordEvent(terminal.get(), ordinal, stream.get()));
+                ASSERT_TRUE(await(backend, terminal.get(), ordinal, std::chrono::seconds(5)));
+
+                ASSERT_EQ(controller->error_code, 0u);
+                EXPECT_EQ(controller->completed_transaction, transaction);
+                EXPECT_EQ(controller->transaction_id, transaction + 1u);
+                EXPECT_EQ(std::memcmp(command, &sealed, sizeof(sealed)), 0)
+                    << "Opening the next transaction mutated a still-readable command";
+                for (const auto &transport_binding : transports)
+                {
+                    MoEOverlayDeviceTransportProtocol transport(transport_binding);
+                    const auto acquired = transport.tryAcquire(transaction - 1u);
+                    ASSERT_EQ(acquired.status, MoEOverlayDeviceTransportAcquireStatus::Ready)
+                        << acquired.error;
+                    EXPECT_EQ(acquired.batch.header.transaction_id, transaction);
+                    EXPECT_TRUE(transport.transactionComplete(acquired.batch));
+                    EXPECT_FALSE(transport.allGroupsSnapshotted(transaction + 1u));
+                    std::uint64_t observed = 0u;
+                    auto kind = MoEOverlayDeviceControllerTransactionKind::Invalid;
+                    auto phase = MoEOverlayDeviceDemandPhase::Invalid;
+                    ASSERT_TRUE(transport.snapshotTransactionAfter(transaction, &observed, &kind, &phase));
+                    EXPECT_EQ(observed, transaction + 1u);
+                    EXPECT_EQ(phase, MoEOverlayDeviceDemandPhase::Decode);
+                }
+            }
+        }
+    }
+
+    /** Select movement/observation work independently of full-model geometry. */
+    enum class PricedPolicyGeometry
+    {
+        TwoAxisMovement,
+        FullModelObservation,
+        FullModelMovement,
+    };
+
+    /**
+     * Build a full 122B-shaped policy workload without loading model weights.
+     *
+     * Repeat the adversarial sixteen-expert distribution across all 256 experts
+     * and 49 layers. Expensive links reject every cycle for the observation
+     * proof; cheap links exercise full-size runtime-bank cloning and publication.
+     * All geometry-dependent oracle arrays are rebuilt from the same seed.
+     */
+    MoEOverlayDevicePlacementPolicyInput fullModelPolicyInput(
+        std::uint64_t transfer_cost_ns)
+    {
+        const auto seed = adversarialPolicyInput();
+        auto input = seed;
+        input.num_layers = 49u;
+        input.num_experts = 256u;
+        input.maximum_cycles_per_wave = 2u;
+        input.dynamic_maximum_cycles_per_layer = 2u;
+        const std::size_t plane = input.num_layers * input.num_experts;
+        input.collected_state.assign(input.participants.size() * plane, 0u);
+        input.payload_bytes_per_layer.assign(input.num_layers, 4096u);
+        auto &economy = *input.economy;
+        economy.phase_expert_demand.assign(
+            kMoEOverlayDeviceControllerDemandPhaseCount * plane, 0u);
+        economy.service_costs.resize(economy.tier_count * input.num_layers *
+                                    kMoEOverlayDeviceControllerEconomyServicePhaseCount);
+        economy.migration_costs.assign(input.participants.size() *
+            input.participants.size() * input.num_layers,
+            {.transfer_and_repack_ns = transfer_cost_ns,
+             .inference_interference_ns = 0u});
+        economy.last_moved_generation.assign(
+            plane, kMoEOverlayDeviceControllerNeverMovedGeneration);
+        for (std::uint32_t layer = 0u; layer < input.num_layers; ++layer)
+        {
+            for (std::uint32_t expert = 0u; expert < input.num_experts; ++expert)
+            {
+                std::uint64_t count = 0u;
+                for (std::size_t participant = 0u;
+                     participant < input.participants.size(); ++participant)
+                {
+                    const auto word = seed.collected_state[
+                        (participant * seed.num_layers + layer % seed.num_layers) *
+                        seed.num_experts + expert % seed.num_experts];
+                    input.collected_state[(participant * input.num_layers + layer) *
+                                          input.num_experts + expert] = word;
+                    count += moe_rebalance_policy::collectedStateActivationCount(word);
+                }
+                economy.phase_expert_demand[plane + layer * input.num_experts + expert] = count;
+            }
+            for (std::uint32_t tier = 0u; tier < economy.tier_count; ++tier)
+                for (std::uint32_t phase = 0u;
+                     phase < kMoEOverlayDeviceControllerEconomyServicePhaseCount; ++phase)
+                    economy.service_costs[(tier * input.num_layers + layer) *
+                        kMoEOverlayDeviceControllerEconomyServicePhaseCount + phase] =
+                        10u + tier * 90u;
+        }
+        return input;
+    }
+
+    /** Prove exact oracle pricing and bounded publication at the selected geometry. */
+    void proveTwoAxisWave(
+        ExpertHistogramProductionSourceMask economy_sources,
+        DeviceType continuation_type = DeviceType::CUDA,
+        PricedPolicyGeometry geometry = PricedPolicyGeometry::TwoAxisMovement)
     {
         IBackend *const cuda = getCUDABackend();
         IBackend *const rocm = getROCmBackend();
@@ -3799,15 +4066,49 @@ namespace llaminar2::test
             GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
         }
 
-        const auto resolved_topology = topology();
-        const auto policy_input = boundedTwoAxisPolicyInput();
+        const auto resolved_topology = topology(continuation_type);
+        const bool observation_only = geometry == PricedPolicyGeometry::FullModelObservation;
+        const std::uint64_t transfer_cost_ns = observation_only ? 1'000'000'000'000u : 1u;
+        auto policy_input = geometry != PricedPolicyGeometry::TwoAxisMovement
+            ? fullModelPolicyInput(transfer_cost_ns)
+            : boundedTwoAxisPolicyInput();
+        for (const auto &participant : resolved_topology->participants)
+        {
+            auto &metadata = policy_input.participants.at(participant.participant_id);
+            metadata.tier_index = participant.tier_idx;
+            metadata.tier_priority = resolved_topology->groupForParticipant(
+                participant.participant_id)->tier_priority;
+        }
+        // Deliberately unequal phase prices expose any decode/verifier alias.
+        // The CPU oracle retains positive costs for unused phases, but those
+        // phases have exactly zero demand and cannot influence its score.
+        constexpr std::array<std::uint64_t, 3> phase_prices{1u, 2u, 3u};
+        const auto source = economy_sources[0]
+            ? moe_runtime_abi::HistogramSource::Decode
+            : moe_runtime_abi::HistogramSource::GroupedVerifier;
+        auto &economy = policy_input.economy.value();
+        const auto plane_words = static_cast<std::size_t>(policy_input.num_layers) *
+            policy_input.num_experts;
+        for (std::size_t word = 0u; word < plane_words; ++word)
+        {
+            const auto count = economy.phase_expert_demand[plane_words + word];
+            economy.phase_expert_demand[plane_words + word] = 0u;
+            economy.phase_expert_demand[static_cast<std::size_t>(source) *
+                                           plane_words + word] = count;
+        }
+        for (std::size_t word = 0u; word < economy.service_costs.size(); ++word)
+            economy.service_costs[word] *= phase_prices[word % phase_prices.size()];
         const auto expected =
             MoEOverlayDevicePlacementPolicyReference::planDynamic(
                 policy_input);
-        ASSERT_EQ(expected.evidence.accepted_cycles, 2u);
-        ASSERT_GT(expected.evidence.promotions, 0u);
-        ASSERT_GT(expected.evidence.demotions, 0u);
-        ASSERT_GT(expected.evidence.same_priority_moves, 0u);
+        ASSERT_EQ(expected.evidence.accepted_cycles, observation_only ? 0u : 2u);
+        if (!observation_only)
+        {
+            ASSERT_GT(expected.evidence.promotions, 0u);
+            ASSERT_GT(expected.evidence.demotions, 0u);
+            if (geometry == PricedPolicyGeometry::TwoAxisMovement)
+                ASSERT_GT(expected.evidence.same_priority_moves, 0u);
+        }
 
         auto fabrics = makeControllerFabricPair(
             resolved_topology, policy_input);
@@ -3815,7 +4116,10 @@ namespace llaminar2::test
             *fabrics.cuda_rank,
             *fabrics.rocm_rank,
             *resolved_topology,
-            policy_input.num_layers);
+            policy_input.num_layers,
+            economy_sources,
+            phase_prices,
+            transfer_cost_ns);
         const auto participant_bindings = allParticipantBindings(
             *fabrics.cuda_rank, *fabrics.rocm_rank);
         const auto transport_bindings = allTransportBindings(
@@ -3844,7 +4148,8 @@ namespace llaminar2::test
                 *resolved_topology,
                 policy_input,
                 &binding->controller->admission_epoch,
-                binding->lifetime));
+                binding->lifetime,
+                source));
         }
 
         RuntimeCandidateApplyEvidence observed;
@@ -3858,9 +4163,24 @@ namespace llaminar2::test
             fixtures,
             &observed,
             &error,
-            RuntimeCandidateApplyOptions{.complete_epoch = true})) << error;
-        ASSERT_EQ(observed.policy.accepted_cycles, 2u);
+            RuntimeCandidateApplyOptions{
+                .complete_epoch = true,
+                .expect_no_movement = observation_only})) << error;
+        ASSERT_EQ(observed.policy.accepted_cycles, observation_only ? 0u : 2u);
+        ASSERT_EQ(observed.participant_records.size(), fixtures.size());
+        for (const auto &record : observed.participant_records)
+        {
+            EXPECT_NE(record.observed_action,
+                static_cast<std::uint32_t>(MoEOverlayDeviceControllerAction::Invalid));
+            EXPECT_EQ(record.observed_action_transaction,
+                      observed.controller.transaction_id)
+                << "Every participant must publish device-authored action-entry evidence";
+        }
         ASSERT_EQ(observed.commands.size(), expected.commands.size());
+        EXPECT_EQ(observed.policy.projected_service_gain_ns,
+                  expected.evidence.projected_service_gain_ns);
+        EXPECT_EQ(observed.policy.projected_net_benefit_ns,
+                  expected.evidence.projected_net_benefit_ns);
         EXPECT_EQ(
             observed.policy.command_digest,
             commandDigest(
@@ -3888,8 +4208,60 @@ namespace llaminar2::test
                 axis == MoEOverlayDeviceMovementAxis::ParticipantPlacement ||
                 axis == MoEOverlayDeviceMovementAxis::Combined;
         }
-        EXPECT_TRUE(advances_tier);
-        EXPECT_TRUE(advances_participant);
+        EXPECT_EQ(advances_tier, !observation_only);
+        // The repeated full-model seed can spend both bounded cycles on tier
+        // residency. Exact command bytes still prove the CPU oracle's selected
+        // objective; the dedicated two-axis geometry separately requires both.
+        if (geometry == PricedPolicyGeometry::TwoAxisMovement || observation_only)
+            EXPECT_EQ(advances_participant, !observation_only);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         DeviceAuthoredTwoCycleWaveAdvancesBothIndependentPlacementAxes)
+    {
+        proveTwoAxisWave(kAllExpertHistogramProductionSources);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         MTPPricedTwoAxisWaveDoesNotRequireOrdinaryDecodeCalibration)
+    {
+        // Serial catch-up is reachable, but only prefill and grouped verifier
+        // are recurring costs in the production dynamic-MTP serving regime.
+        proveTwoAxisWave({false, true, true});
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         ROCmAuthorityPricesMTPVerifierAndPublishesBothPlacementAxes)
+    {
+        proveTwoAxisWave({false, true, true}, DeviceType::ROCm);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         CUDAAuthorityCompletesFullModelUnprofitableMTPObservation)
+    {
+        proveTwoAxisWave({false, true, true}, DeviceType::CUDA,
+                        PricedPolicyGeometry::FullModelObservation);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         ROCmAuthorityCompletesFullModelUnprofitableMTPObservation)
+    {
+        proveTwoAxisWave({false, true, true}, DeviceType::ROCm,
+                        PricedPolicyGeometry::FullModelObservation);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         CUDAAuthorityPublishesFullModelMTPMovementBank)
+    {
+        proveTwoAxisWave({false, true, true}, DeviceType::CUDA,
+                        PricedPolicyGeometry::FullModelMovement);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         ROCmAuthorityPublishesFullModelMTPMovementBank)
+    {
+        proveTwoAxisWave({false, true, true}, DeviceType::ROCm,
+                        PricedPolicyGeometry::FullModelMovement);
     }
 
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
@@ -5587,7 +5959,12 @@ namespace llaminar2::test
             static_cast<std::uint32_t>(
                 MoEOverlayDeviceControllerError::InvalidCommand));
         EXPECT_EQ(collision.controller.current_durable_epoch, expected_epoch);
-        EXPECT_EQ(collision.controller.command_transaction, 0u);
+        // Opening a new snapshot preserves the last sealed publication for
+        // delayed readers. Invalid policy must neither erase that receipt nor
+        // publish the rejected transaction as a new transport command.
+        EXPECT_EQ(collision.controller.transaction_id, expected_transaction + 1u);
+        EXPECT_EQ(collision.controller.command_transaction, expected_transaction);
+        EXPECT_EQ(collision.command.transaction_id, expected_transaction);
         EXPECT_EQ(collision.transport_groups_acquired, 0u);
         EXPECT_EQ(collision.transport_groups_prepared, 0u);
         EXPECT_EQ(collision.transport_groups_published, 0u);

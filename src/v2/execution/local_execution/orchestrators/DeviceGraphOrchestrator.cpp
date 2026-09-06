@@ -12676,8 +12676,7 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::waitForPendingDeviceMoERebalanceMaintenance(
         void *consumer_stream,
         DeviceTimelineRole consumer_role,
-        const char *consumer_name,
-        bool acquire_overlay_epoch)
+        const char *consumer_name)
     {
         if (!state_.device_id.is_gpu())
             return true;
@@ -12758,11 +12757,7 @@ namespace llaminar2
                 "Atomic device MoE maintenance wait returned without either "
                 "succeeding or throwing");
         }
-        return !acquire_overlay_epoch ||
-               acquireMoEOverlayEpochForExternalTransaction(
-                   consumer_stream,
-                   consumer_role,
-                   consumer_name);
+        return true;
     }
 
     bool DeviceGraphOrchestrator::
@@ -17569,8 +17564,8 @@ namespace llaminar2
             LOG_DEBUG(
                 "[DeviceGraphOrchestrator] Serving graph family sealed without transfer-progress joins"
                 << " device=" << state_.device_id.toString()
-                << " background_dma_submissions="
-                << progress_stats.dma_submissions);
+                << " background_copy_submissions="
+                << progress_stats.copy_submissions);
         }
         serving_graph_family_lifecycle_ =
             ServingGraphFamilyLifecycle::Sealed;
@@ -20750,6 +20745,9 @@ namespace llaminar2
             node_name && node_name[0] != '\0'
                 ? std::string(node_name)
                 : std::string("mtp_terminal_hidden_rows_select");
+        // The same owner plan prices this selector as one bounded native
+        // helper. Capture verifies its physical nodes before instantiation.
+        graph->setExecutableMemoryClass(GPUGraphExecutableClass::BoundedFlatHelper);
         graph->addNode(
             stable_node_name,
             std::move(stage),
@@ -22761,7 +22759,7 @@ namespace llaminar2
             execution_semantics,
         std::optional<int> expected_transaction_draft_depth,
         int sparse_graph_depth,
-        std::string *error) const
+        std::string *error)
     {
         using RuntimeParams =
             IComputeStage::MoEOverlayCollectiveRuntimeParams;
@@ -22837,12 +22835,22 @@ namespace llaminar2
             params.placement_epoch =
                 binding.descriptor.placement_epoch;
         }
+        else if (state_.device_id.is_cpu())
+        {
+            // CPU NodeTP has no heterogeneous transaction follower, but its
+            // rank-batch stages still require an explicit operation identity.
+            // Issue once at the graph owner, not independently in every stage
+            // or cache variant. Corrections can revisit a token position.
+            const auto operation = moe_sparse_host_operation_sequence_.issue();
+            if (!operation)
+                return reject("CPU MTP sparse operation identity exhausted");
+            params.step_id = *operation;
+        }
 
         /*
-         * A process-local CPU/GPU overlay has no control-plane follower, but
-         * its manual sparse boundary still needs the typed histogram phase.
-         * The stage intentionally owns its monotonically increasing local
-         * step; generation merely proves that request admission occurred.
+         * Native GPU epochs retain their device-owned invocation identity;
+         * this host binding supplies only the admitted generation and phase.
+         * CPU execution instead consumes the host operation issued above.
          */
         if (!params.valid() || !params.hasExecutionSemantics())
         {
@@ -23155,7 +23163,7 @@ namespace llaminar2
             ctx,
             *params,
             launch_dependency,
-            GraphCaptureAuxiliaryBranchFactory{},
+            *this,
             mtp_device_generation_loop_graph_.stream.get(),
             &producer_stream,
             &retained_error);
@@ -25722,10 +25730,12 @@ namespace llaminar2
         const bool try_gpu_graph_capture =
             state_.device_id.is_gpu() &&
             debugEnv().execution.gpu_graphs;
+        const auto sidecar_epoch_ownership = moeOverlaySidecarEpochOwnership(
+            sidecar_role,
+            static_cast<bool>(moe_overlay_inference_transaction_coordinator_));
         const bool participates_in_overlay_graph_group =
-            !kv_cache_only &&
-            static_cast<bool>(
-                moe_overlay_inference_transaction_coordinator_);
+            sidecar_epoch_ownership ==
+            MoEOverlaySidecarEpochOwnership::GraphSequence;
         if (state_.device_id.is_gpu() && !try_gpu_graph_capture)
         {
             LOG_ERROR(
@@ -25778,9 +25788,20 @@ namespace llaminar2
             !waitForPendingDeviceMoERebalanceMaintenance(
                 sidecar_dynamic_stream,
                 DeviceTimelineRole::MTPSidecarGraph,
-                "mtp_sidecar_graph",
-                /*acquire_overlay_epoch=*/
-                    !participates_in_overlay_graph_group))
+                "mtp_sidecar_graph"))
+        {
+            return false;
+        }
+        // Only a full standalone sidecar reads movable experts here. KV-only
+        // work publishes shifted-KV readiness, not an ambient placement lease;
+        // coordinated full sidecars acquire after graph-sequence admission.
+        if (state_.device_id.is_gpu() &&
+            sidecar_epoch_ownership ==
+                MoEOverlaySidecarEpochOwnership::ExternalReader &&
+            !acquireMoEOverlayEpochForExternalTransaction(
+                sidecar_dynamic_stream,
+                DeviceTimelineRole::MTPSidecarGraph,
+                "mtp_sidecar_graph"))
         {
             return false;
         }
@@ -33398,8 +33419,17 @@ namespace llaminar2
                 }
                 const size_t tensor_rows = tensor->rows();
                 const size_t tensor_words = tensor->numel();
-                if (!tensor->deviceValid() || !tensor->gpu_data_ptr() ||
-                    tensor_rows == 0 || tensor_words == 0 ||
+                /*
+                 * These are captured producer outputs, so their host-side
+                 * coherence bit is deliberately still invalid while the
+                 * graph is being materialized.  The diagnostic node consumes
+                 * them after their producer in the same captured stream.  A
+                 * stable arena pointer and exact row geometry are therefore
+                 * the binding contract; requiring deviceValid() here rejects
+                 * correctly ordered first-use outputs such as MTP_FFN_OUTPUT.
+                 */
+                if (!tensor->gpu_data_ptr() || tensor_rows == 0 ||
+                    tensor_words == 0 ||
                     tensor_words % tensor_rows != 0 ||
                     tensor->size_bytes() != tensor_words * sizeof(uint32_t) ||
                     tensor_row < 0 ||
@@ -33531,7 +33561,7 @@ namespace llaminar2
             if (!diagnostic_geometry_valid)
             {
                 return fail(
-                    "captured MTP draft diagnostics found a non-FP32/INT32, non-resident, or malformed sidecar boundary");
+                    "captured MTP draft diagnostics found a non-FP32/INT32 or malformed sidecar boundary");
             }
         }
 
@@ -33548,6 +33578,7 @@ namespace llaminar2
             std::move(stage_params));
         auto *draft_stage = stage.get();
         auto graph = std::make_unique<ComputeGraph>();
+        graph->setExecutableMemoryClass(GPUGraphExecutableClass::BoundedFlatHelper);
         graph->addNode(
             "mtp_draft_token_publication_" + std::to_string(slot),
             std::move(stage),
@@ -33764,6 +33795,8 @@ namespace llaminar2
             std::make_unique<MTPVerifierPreparationStage>(params);
         auto *preparation_stage = stage.get();
         auto graph = std::make_unique<ComputeGraph>();
+        graph->setExecutableMemoryClass(
+            MTPGraphOwnerPlan::verifierPreparationExecutableClass(params.request_count));
         graph->addNode(
             "mtp_verifier_preparation_" +
                 std::to_string(*registry_index),
@@ -36610,7 +36643,6 @@ namespace llaminar2
         const PrefixStateSnapshot &checkpoint,
         const DeviceSpeculativeOutcomeHandle &outcome,
         int request_index,
-        int main_forward_token_count,
         bool allow_speculative_discard)
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
@@ -36634,11 +36666,6 @@ namespace llaminar2
             request_index < 0 || request_index >= outcome.request_count)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit received an invalid or foreign outcome handle");
-            return false;
-        }
-        if (main_forward_token_count <= 0)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Device-outcome initial MTP shifted-row commit requires verifier hidden rows to restore terminal hidden");
             return false;
         }
 
@@ -36735,14 +36762,14 @@ namespace llaminar2
         {
             return false;
         }
-        if (!refreshMTPTerminalHiddenState(
-                main_forward_token_count,
-                1,
-                outcome.stream))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to restore terminal hidden after device-outcome initial MTP shifted-row commit");
-            return false;
-        }
+        // The checkpoint row was scratch input for the just-submitted sidecar.
+        // Its read lease and shifted-KV completion event were published by
+        // executeMTPDepth0Batched; invalidating semantic currency does not drop
+        // those event edges or release storage. The suffix selects its own
+        // verifier rows, and captured accepted-state publication produces the
+        // sole final terminal row. A prefill refresh here used the wrong length
+        // owner and added a redundant captured copy between those transactions.
+        state_.mtp_terminal_hidden_publication.invalidate();
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -37286,14 +37313,12 @@ namespace llaminar2
         {
             return false;
         }
-        if (!refreshMTPTerminalHiddenState(
-                main_forward_token_count,
-                1,
-                outcome.stream))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to restore terminal hidden after device-outcome MTP shifted-row commit");
-            return false;
-        }
+        // These verifier rows were temporary KV-only inputs, not committed
+        // terminal state. The existing accepted-state graph selects from its
+        // device-owned accepted indices after consuming shifted-KV readiness.
+        // Retire the scratch generation so no unrelated reader can borrow it
+        // while preserving the persistent mailbox's read-completion event.
+        state_.mtp_terminal_hidden_publication.invalidate();
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -42131,8 +42156,21 @@ namespace llaminar2
         if (!waitForPendingDeviceMoERebalanceMaintenance(
                 execution_stream,
                 DeviceTimelineRole::MainForwardGraph,
-                "forward_graph",
-                /*acquire_overlay_epoch=*/false))
+                "forward_graph"))
+        {
+            return false;
+        }
+        /*
+         * A KV-only MTP sidecar still reads the preceding main terminal hidden
+         * row. It publishes shifted-KV completion, not a logits handoff. Join
+         * that read retirement before this graph can overwrite its source.
+         * This is a non-consuming observation: the next sidecar/cache mutation
+         * retains its own completion obligation. Keep it before the no-other-
+         * publications fast path, including budget-limited and forced tokens.
+         */
+        if (!waitForPendingShiftedMTPKVReadyForObservation(
+                execution_stream,
+                "forward_graph_previous_terminal_hidden_reader"))
         {
             return false;
         }
@@ -42231,7 +42269,6 @@ namespace llaminar2
 
     GraphCaptureAuxiliaryBranchFactory
     DeviceGraphOrchestrator::forwardGraphAuxiliaryBranchFactory(
-        const ForwardInput &input,
         DeviceId execution_device)
     {
         if (!moe_overlay_transfer_progress_epoch_)
@@ -42245,25 +42282,22 @@ namespace llaminar2
                 "ExpertOverlay transfer-progress branch received mismatched forward/device ownership");
         }
 
-        /*
-         * Movement is submitted as event-polled asynchronous DMA on dedicated
-         * background streams. Keep this graph hook empty: the maintenance
-         * service is the sole submission authority, and inference never joins
-         * movement events or inherits mapped-host transport state.
-         */
+        // CUDA must enter progress from the graph root, not from a native queue
+        // that future inference observers can occupy. The GPU closes this
+        // private interval at the inference terminal; partial commands survive
+        // without making inference wait for their payload to finish. ROCm's
+        // native SDMA authority intentionally returns an empty compute branch.
+        const auto factory = moe_overlay_transfer_progress_epoch_->graphBranchFactory();
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
-            "mapped_transfer_progress_forward_branch_omissions",
+            factory.valid() ? "mapped_transfer_progress_forward_branches"
+                            : "mapped_transfer_progress_native_sdma_intervals",
             1.0,
-            input.execution_phase == ForwardExecutionPhase::Prefill
-                ? "prefill"
-                : "decode",
+            "forward",
             state_.device_id.toString(),
-            {{"execution_role",
-              std::to_string(static_cast<int>(input.execution_role))},
-             {"authority", "maintenance_epoch"},
-             {"inference_join", "false"}});
-        return {};
+            {{"authority", "maintenance_epoch"},
+             {"command_completion_join", "false"}});
+        return factory;
     }
 
     bool DeviceGraphOrchestrator::prepareGraphBuildStateForMaterialization(
@@ -52112,8 +52146,7 @@ namespace llaminar2
                  !waitForPendingDeviceMoERebalanceMaintenance(
                      parent_stream,
                      DeviceTimelineRole::MTPSidecarGraph,
-                     "device_generation_parent_materialization",
-                     /*acquire_overlay_epoch=*/false)) ||
+                     "device_generation_parent_materialization")) ||
                 !prepareMoEOverlayEpochForInternalParent(
                     parent_stream,
                     "device_generation_parent_materialization"))
@@ -52254,8 +52287,7 @@ namespace llaminar2
                  !waitForPendingDeviceMoERebalanceMaintenance(
                      loop.stream.get(),
                      DeviceTimelineRole::MTPSidecarGraph,
-                     "hosted_device_generation_ticket_scheduler",
-                     /*acquire_overlay_epoch=*/false)))
+                     "hosted_device_generation_ticket_scheduler")))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation scheduler could not consume the first committed transaction");
                 return false;
@@ -52785,8 +52817,7 @@ namespace llaminar2
             !waitForPendingDeviceMoERebalanceMaintenance(
                 loop_stream,
                 DeviceTimelineRole::MTPSidecarGraph,
-                "device_generation_parent_loop",
-                /*acquire_overlay_epoch=*/false))
+                "device_generation_parent_loop"))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation loop could not join prior MoE maintenance");
             return false;
@@ -53223,8 +53254,36 @@ namespace llaminar2
                 record.top_k <= sampling_math::kMaxTopK;
             if (!record_available)
             {
-                LOG_WARN("[MTPFirstTransactionDiagnostic] unavailable on "
-                         << state_.device_id.toString());
+                std::ostringstream partial;
+                partial << "[MTPFirstTransactionDiagnostic] unavailable on "
+                        << state_.device_id.toString()
+                        << " valid=" << record.valid
+                        << " version=" << record.version
+                        << " transaction=" << record.transaction_count
+                        << " rows=" << record.comparison_row_count
+                        << " top_k=" << record.top_k
+                        << " draft_depth="
+                        << record.draft_diagnostic_depth
+                        << " draft_conditions=[";
+                const int retained_draft_depth = std::clamp(
+                    record.draft_diagnostic_depth,
+                    0,
+                    sampling_math::kSpeculativeBatchMaxRows);
+                for (int slot = 0; slot < retained_draft_depth; ++slot)
+                {
+                    if (slot != 0)
+                        partial << ',';
+                    partial << record.draft_condition_tokens[slot];
+                }
+                partial << "] draft_positions=[";
+                for (int slot = 0; slot < retained_draft_depth; ++slot)
+                {
+                    if (slot != 0)
+                        partial << ',';
+                    partial << record.draft_position_ids[slot];
+                }
+                partial << ']';
+                LOG_WARN(partial.str());
             }
             else
             {
@@ -57313,8 +57372,16 @@ namespace llaminar2
         }
 
         IBackend *backend = getBackendFor(state_.device_id);
-        void *stream = explicitGPUStreamForOperation(
-            "stageStochasticTargetTokenForDeviceSampling");
+        // A forced token replaces a sampled token at the same live-state
+        // boundary. Its consumers also read the current KV position and
+        // terminal hidden row; publishing on an unrelated stream can race the
+        // preceding forward even though the scalar itself is ready. Reuse the
+        // sampler's canonical event-aware boundary without consuming its logits
+        // handoff. Any output kind also covers diagnostic verifier successors.
+        void *stream = prepareMainLogitsDeviceConsumer(
+            "stageStochasticTargetTokenForDeviceSampling",
+            MainLogitsHandoffMode::Observe,
+            /*require_main_forward=*/false);
         if (!backend || !stream)
             return false;
 

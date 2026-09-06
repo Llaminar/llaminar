@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Unit tests for production parity campaign discovery and sharding."""
+"""Device-free production campaign discovery, staging and watchdog contracts.
+
+Synthetic artifacts cover the canonical matrix without loading models. Deadline
+transition proofs use a controlled clock; explicit process-group tests retain
+real children to verify cancellation and cleanup independently of that logic.
+"""
 
 from __future__ import annotations
 
@@ -1006,38 +1011,58 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertEqual(evidence.exact_gtest_case, case)
 
     def test_exact_cell_watch_renews_deadline_only_on_next_cell(self) -> None:
-        """Sequential cells may exceed both setup and one-cell budgets."""
+        """Cell transitions renew virtual time, independent of CPU scheduling.
+
+        A real sleeping child made this state-machine proof flaky under the
+        full parallel Unit gate: scheduler delays became fake cell timeouts.
+        The separate stuck-process test still exercises actual process-group
+        termination. Here only the observed cell transitions advance the clock.
+        """
 
         with tempfile.TemporaryDirectory() as raw_directory:
             first = Path(raw_directory) / "first" / "test_log.txt"
             second = Path(raw_directory) / "second" / "test_log.txt"
-            script = (
-                "from pathlib import Path; import time; "
-                f"a=Path({str(first)!r}); b=Path({str(second)!r}); "
-                "a.parent.mkdir(parents=True); a.write_text('started'); "
-                "time.sleep(0.3); "
-                "b.parent.mkdir(parents=True); b.write_text('started'); "
-                "time.sleep(0.3)"
-            )
-            evidence = campaigns.ProcessTerminationEvidence()
-            started = campaigns.time.monotonic()
+            first.parent.mkdir(parents=True)
+            first.write_text("started", encoding="utf-8")
+            clock = [0.0]
+            process = mock.Mock(spec=subprocess.Popen)
 
-            return_code = campaigns._run_process(
-                [sys.executable, "-c", script],
-                0.2,
-                exact_cell_watch=campaigns.ExactCellTimeoutWatch(
-                    timeout_seconds=0.5,
-                    progress_files=(
-                        ("MatrixSuite.ProductionParity/First", first),
-                        ("MatrixSuite.ProductionParity/Second", second),
+            def wait(timeout: float) -> int:
+                """Advance the synthetic child and publish its second cell."""
+
+                clock[0] = min(0.6, clock[0] + timeout)
+                if clock[0] >= 0.3 and not second.exists():
+                    second.parent.mkdir(parents=True)
+                    second.write_text("started", encoding="utf-8")
+                if clock[0] >= 0.6:
+                    return 0
+                raise subprocess.TimeoutExpired("virtual parity child", timeout)
+
+            process.wait.side_effect = wait
+            process.poll.side_effect = lambda: 0 if clock[0] >= 0.6 else None
+            evidence = campaigns.ProcessTerminationEvidence()
+            with (
+                mock.patch.object(campaigns.subprocess, "Popen", return_value=process),
+                mock.patch.object(campaigns.time, "monotonic", side_effect=lambda: clock[0]),
+                mock.patch.object(campaigns, "_terminate_process_group") as terminate,
+            ):
+                return_code = campaigns._run_process(
+                    ["virtual-parity-child"],
+                    0.2,
+                    exact_cell_watch=campaigns.ExactCellTimeoutWatch(
+                        timeout_seconds=0.5,
+                        progress_files=(
+                            ("MatrixSuite.ProductionParity/First", first),
+                            ("MatrixSuite.ProductionParity/Second", second),
+                        ),
+                        not_before_wall_time_ns=0,
                     ),
-                    not_before_wall_time_ns=campaigns.time.time_ns(),
-                ),
-                termination_evidence=evidence,
-            )
+                    termination_evidence=evidence,
+                )
+                terminate.assert_not_called()
 
         self.assertEqual(return_code, 0)
-        self.assertGreater(campaigns.time.monotonic() - started, 0.5)
+        self.assertGreater(clock[0], 0.5)
         self.assertEqual(
             evidence.kind,
             campaigns.ProcessTerminationKind.NONE,

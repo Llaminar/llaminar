@@ -21,12 +21,144 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
+#include "backends/NativeParallelGraphBranch.h"
 #include <algorithm>
+#include <memory>
 #include <set>
+#include <string>
 #include <thread>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::testing;
+
+namespace
+{
+    struct BranchGraphProbe;
+    /** @brief Stable, host-only identity for a native-node test double. */
+    struct BranchNodeProbe
+    {
+        BranchGraphProbe *owner;
+        std::string name;
+    };
+    /** @brief Preserve opaque node identities and the complete dependency DAG. */
+    struct BranchGraphProbe
+    {
+        std::string name;
+        std::vector<std::unique_ptr<BranchNodeProbe>> nodes;
+        std::set<std::pair<BranchNodeProbe *, BranchNodeProbe *>> edges;
+        std::vector<BranchGraphProbe *> cloned_sources;
+        int edge_error = 0;
+
+        /** @brief Append a stable node without touching any GPU runtime. */
+        BranchNodeProbe *add(const std::string &label)
+        {
+            nodes.push_back(std::make_unique<BranchNodeProbe>(this, label));
+            return nodes.back().get();
+        }
+    };
+    /** @brief Device-free implementation of the same API used by CUDA and HIP. */
+    struct BranchGraphProbeAPI
+    {
+        using Graph = BranchGraphProbe *;
+        using Node = BranchNodeProbe *;
+        using Error = int;
+        static constexpr Error success = 0;
+        static constexpr Error invalid = 1;
+        /** @brief Copy or size the owner's opaque node inventory. */
+        static Error nodes(Graph graph, Node *out, std::size_t *count)
+        {
+            if (out)
+                for (std::size_t i = 0; i < graph->nodes.size(); ++i)
+                    out[i] = graph->nodes[i].get();
+            *count = graph->nodes.size();
+            return success;
+        }
+        /** @brief Query the incoming frontier used to identify all roots. */
+        static Error dependencies(Node node, Node *, std::size_t *count)
+        {
+            *count = std::count_if(node->owner->edges.begin(), node->owner->edges.end(),
+                                  [node](auto edge) { return edge.second == node; });
+            return success;
+        }
+        /** @brief Query the outgoing frontier used to identify all terminals. */
+        static Error dependents(Node node, Node *, std::size_t *count)
+        {
+            *count = std::count_if(node->owner->edges.begin(), node->owner->edges.end(),
+                                  [node](auto edge) { return edge.first == node; });
+            return success;
+        }
+        /** @brief Record the exact graph clone request and its predecessors. */
+        static Error child(Node *out, Graph graph, const Node *deps, std::size_t count, Graph source)
+        {
+            *out = graph->add(source->name);
+            graph->cloned_sources.push_back(source);
+            for (std::size_t i = 0; i < count; ++i) graph->edges.emplace(deps[i], *out);
+            return success;
+        }
+        /** @brief Insert dependency edges or inject one exact native failure. */
+        static Error edges(Graph graph, const Node *from, const Node *to, std::size_t count)
+        {
+            if (graph->edge_error) return graph->edge_error;
+            for (std::size_t i = 0; i < count; ++i) graph->edges.emplace(from[i], to[i]);
+            return success;
+        }
+        /** @brief Join work retirement with the inference-owned Close. */
+        static Error empty(Node *out, Graph graph, const Node *deps, std::size_t count)
+        {
+            *out = graph->add("join");
+            for (std::size_t i = 0; i < count; ++i) graph->edges.emplace(deps[i], *out);
+            return success;
+        }
+    };
+}
+
+/** @test Every original root/terminal participates, without serializing worker before body. */
+TEST(NativeParallelGraphBranch, PreservesWholeFrontierWithoutCloningBody)
+{
+    BranchGraphProbe body{.name = "non_clonable_conditional_parent"};
+    BranchGraphProbe open{.name = "open"}, worker{.name = "worker"}, close{.name = "close"};
+    const auto a = body.add("root_a"), b = body.add("root_b");
+    const auto c = body.add("terminal_c"), d = body.add("terminal_d");
+    body.edges = {{a, c}, {b, c}, {a, d}};
+    const auto result = detail::appendNativeParallelBranch<BranchGraphProbeAPI>(
+        &body, {&open, &worker, &close});
+    ASSERT_EQ(result.error, 0) << result.operation;
+    ASSERT_EQ(body.nodes.size(), 8u);
+    EXPECT_EQ(body.cloned_sources, (std::vector<BranchGraphProbe *>{&open, &worker, &close}));
+    const auto o = body.nodes[4].get(), w = body.nodes[5].get();
+    const auto t = body.nodes[6].get(), j = body.nodes[7].get();
+    const std::set<std::pair<BranchNodeProbe *, BranchNodeProbe *>> expected{
+        {a, c}, {b, c}, {a, d}, {o, a}, {o, b}, {o, w}, {c, t}, {d, t}, {t, j}, {w, j}};
+    EXPECT_EQ(body.edges, expected);
+}
+
+/** @test A failed native edge insertion is returned exactly, never disguised as success. */
+TEST(NativeParallelGraphBranch, PropagatesNativeFailureBeforeWorkerInsertion)
+{
+    BranchGraphProbe body{.name = "body", .edge_error = 17};
+    BranchGraphProbe open{.name = "open"}, worker{.name = "worker"}, close{.name = "close"};
+    body.add("one");
+    const auto result = detail::appendNativeParallelBranch<BranchGraphProbeAPI>(
+        &body, {&open, &worker, &close});
+    EXPECT_EQ(result.error, 17);
+    EXPECT_STREQ(result.operation, "order body after Open");
+    EXPECT_EQ(body.cloned_sources, (std::vector<BranchGraphProbe *>{&open}));
+}
+
+/** @test Empty or cyclic bodies have no valid immutable entry/terminal frontier. */
+TEST(NativeParallelGraphBranch, RejectsMissingFrontierBeforeMutation)
+{
+    BranchGraphProbe body{.name = "body"};
+    BranchGraphProbe open{.name = "open"}, worker{.name = "worker"}, close{.name = "close"};
+    EXPECT_EQ(detail::appendNativeParallelBranch<BranchGraphProbeAPI>(
+        &body, {&open, &worker, &close}).error, BranchGraphProbeAPI::invalid);
+    const auto node = body.add("cycle");
+    body.edges.emplace(node, node);
+    EXPECT_EQ(detail::appendNativeParallelBranch<BranchGraphProbeAPI>(
+        &body, {&open, &worker, &close}).error, BranchGraphProbeAPI::invalid);
+    EXPECT_TRUE(body.cloned_sources.empty());
+}
 
 // =============================================================================
 // Test Fixture
@@ -57,6 +189,29 @@ TEST_F(ComputeGraphExecutionTest, EmptyGraph)
     EXPECT_TRUE(graph.allCompleted());
     EXPECT_TRUE(graph.getExecutionOrder().empty());
     EXPECT_TRUE(graph.getReadyNodes().empty());
+}
+
+/** @test Memory class is captured topology, preserved by reset and move. */
+TEST_F(ComputeGraphExecutionTest, ExecutableMemoryClassOwnsCaptureIdentity)
+{
+    ComputeGraph graph;
+    const auto original = graph.topologyGeneration();
+    EXPECT_EQ(graph.executableMemoryClass(), GPUGraphExecutableClass::General);
+    graph.setExecutableMemoryClass(GPUGraphExecutableClass::BoundedFlatHelper);
+    EXPECT_GT(graph.topologyGeneration(), original);
+    const auto declared = graph.topologyGeneration();
+    graph.setExecutableMemoryClass(GPUGraphExecutableClass::BoundedFlatHelper);
+    graph.reset();
+    EXPECT_EQ(graph.topologyGeneration(), declared);
+    ComputeGraph moved(std::move(graph));
+    EXPECT_EQ(moved.executableMemoryClass(), GPUGraphExecutableClass::BoundedFlatHelper);
+    EXPECT_EQ(moved.topologyGeneration(), declared);
+    EXPECT_THROW(moved.setExecutableMemoryClass(static_cast<GPUGraphExecutableClass>(99)),
+                 std::invalid_argument);
+    EXPECT_EQ(moved.topologyGeneration(), declared);
+    moved.clear();
+    EXPECT_EQ(moved.executableMemoryClass(), GPUGraphExecutableClass::General);
+    EXPECT_GT(moved.topologyGeneration(), declared);
 }
 
 TEST_F(ComputeGraphExecutionTest, SingleNode)

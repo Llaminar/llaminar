@@ -10,6 +10,7 @@
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
+#include "execution/moe/MoESparseRequestIdentity.h"
 #include "utils/MPIContext.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -596,7 +597,7 @@ namespace llaminar2::test
     }
 
     TEST_F(Test__MoEOverlaySparseTransport_MPI,
-           AsyncSendRingWrapsAcrossDepthTwoThreeAndDynamicMTPTransactions)
+           AsyncSendRingWrapsAcrossSidecarAndVerifierTransactions)
     {
         if (world_size_ != 2)
             GTEST_SKIP() << "Rank-batch protocol fixture requires exactly two MPI ranks";
@@ -607,7 +608,7 @@ namespace llaminar2::test
         constexpr int kDModel = 4;
         constexpr int kTopK = 1;
         constexpr size_t kSendSlots = 2;
-        constexpr int kRounds = 12;
+        constexpr int kRounds = 36;
         const std::vector<int> participant_ids{21};
 
         auto wire = std::make_shared<MoEOverlayRankBatchWireWorkspace>(
@@ -646,11 +647,17 @@ namespace llaminar2::test
         const std::array<MoEOverlayReturnRows *, 1>
             return_inbound_views{&return_inbound};
 
+        MoESparseHostOperationSequence operations;
+        constexpr std::array<int, 9> depths{0, 0, 0, 1, 2, 3, 15, 0, 0};
         for (int round = 0; round < kRounds; ++round)
         {
-            /* Alternating the selected depth is the dynamic-depth wire case. */
-            const int depth = (round % 2 == 0) ? 2 : 3;
-            const uint64_t step = 100u + static_cast<uint64_t>(round);
+            // The learned sidecar stays in namespace depth zero across every
+            // speculative row; only its host-issued operation changes. Mix
+            // verifier depths and repeated sidecars while wrapping send slots.
+            const int depth = depths[static_cast<std::size_t>(round) % depths.size()];
+            const auto operation = operations.issue();
+            ASSERT_TRUE(operation.has_value());
+            const uint64_t step = *operation;
             const int32_t row_id = 500 + round;
 
             dispatch_outbound.source_participant = 4;
@@ -740,6 +747,11 @@ namespace llaminar2::test
                     return_inbound.output_rows_fp32[3],
                     static_cast<float>(20003 + round * 10));
             }
+            const auto stale = rank_ == 1
+                ? transport.exchangeReturn(return_key, return_outbound_views, {})
+                : transport.exchangeReturn(return_key, {}, return_inbound_views);
+            EXPECT_FALSE(stale.ok);
+            EXPECT_NE(stale.error.find("stale"), std::string::npos);
         }
 
         uint64_t asynchronous_submissions = 0;
@@ -747,6 +759,9 @@ namespace llaminar2::test
                  {"moe_overlay_transport.rank_batch_async_send_submissions"}))
         {
             asynchronous_submissions += record.count;
+            EXPECT_FALSE(record.tags.contains("logical_step"));
+            EXPECT_FALSE(record.tags.contains("generation"));
+            EXPECT_FALSE(record.tags.contains("bytes"));
         }
         EXPECT_EQ(asynchronous_submissions, static_cast<uint64_t>(kRounds))
             << "Each rank owns exactly one asynchronous direction per round";

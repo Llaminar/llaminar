@@ -4069,6 +4069,28 @@ namespace llaminar2
                     addProgressSlots(destination_device, edge_slots);
                 }
             }
+            // Relay payload storage and service commands have different BOMs.
+            // CPU/remote lanes already own mapped staging, but must reserve
+            // their own command identities in the same CUDA progress authority.
+            const auto mapped_relay_slot_demand = progress_slot_demand;
+            for (const auto &[source, source_count] : participant_multiplicity)
+            {
+                for (const auto &[destination, destination_count] : participant_multiplicity)
+                {
+                    if (source.is_cpu() == destination.is_cpu())
+                        continue;
+                    const auto gpu = source.is_gpu() ? source : destination;
+                    if (!gpu.is_cuda())
+                        continue; // HIP uses the independently progressing SDMA mechanism.
+                    const auto count = parallelLaneCount(std::min(source_count, destination_count));
+                    addProgressSlots(gpu, count * kProjections.size() * 2u);
+                }
+            }
+            if (config.remote_projection_transport)
+                for (const auto &[device, count] : participant_multiplicity)
+                    if (device.is_cuda())
+                        addProgressSlots(device, parallelLaneCount(count) * kProjections.size() * 4u);
+
             for (const auto &[device, slot_capacity] : progress_slot_demand)
             {
                 /* The command directory scales with directed edges,
@@ -4076,8 +4098,11 @@ namespace llaminar2
                  * concurrency instead follows the configured migration-cycle
                  * budget. Commands beyond that bounded stream/event pool stay
                  * queued under their permanent slot identities. */
-                const std::size_t execution_lane_capacity = std::min(
-                    slot_capacity, config.maximum_concurrent_cycles);
+                const std::size_t execution_lane_capacity = std::min(slot_capacity,
+                    std::max(execution_lanes.at(device).size(),
+                        device.is_cuda()
+                            ? parallelLaneCount(participant_multiplicity.at(device)) * kProjections.size() * 2u
+                            : config.maximum_concurrent_cycles));
                 auto epoch = MappedTransferProgressEpoch::create({
                     .device = device,
                     .slot_capacity = slot_capacity,
@@ -4105,7 +4130,7 @@ namespace llaminar2
                 std::vector<std::shared_ptr<MappedHostTransferRegion>>>
                 mapped_relay_staging;
             std::map<DeviceId, std::size_t> mapped_relay_staging_cursor;
-            for (const auto &[device, slot_capacity] : progress_slot_demand)
+            for (const auto &[device, slot_capacity] : mapped_relay_slot_demand)
             {
                 mapped_relay_staging.emplace(
                     device,
@@ -4329,6 +4354,10 @@ namespace llaminar2
                                             staging_slices[lane_index],
                                         .execution = executionLane(
                                             gpu, lane_index),
+                                        .progress = gpu.is_cuda()
+                                            ? BackgroundTransferProgressBinding::graphService(
+                                                impl.transfer_progress_epochs.at(gpu))
+                                            : BackgroundTransferProgressBinding::nativeStream(),
                                         .lane_name =
                                             name_prefix + "_lane_" +
                                             std::to_string(lane_index),
@@ -4500,6 +4529,10 @@ namespace llaminar2
                                     .staging = staging_slices[lane_index],
                                     .execution = executionLane(
                                         device, lane_index),
+                                    .progress = device.is_cuda()
+                                        ? BackgroundTransferProgressBinding::graphService(
+                                            impl.transfer_progress_epochs.at(device))
+                                        : BackgroundTransferProgressBinding::nativeStream(),
                                     .lane_name =
                                         device.to_string() + "_" + role_name +
                                         "_" + projectionName(projection) +

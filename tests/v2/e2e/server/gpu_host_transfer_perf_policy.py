@@ -4,13 +4,19 @@
 GPU inference owns intermediate execution state on the device.  The host may
 observe only a compact serial-visible token result or the terminal response
 ledger produced after a complete device-owned generation request. Prefix-cache
-movement is the sole data-plane exception because RAM and disk are intentional
-cache tiers rather than execution-state mirrors. ROCm additionally permits one
+movement and explicitly declared heterogeneous activation collectives are
+data-plane boundaries, not execution-state mirrors. The shared activation
+channel additionally requires same-rank node-local mapped-region evidence;
+a CPU expert participant necessarily receives the activations it computes.
+ROCm additionally permits one
 strictly authenticated scheduler ticket per hosted transaction: 52 bytes for
 dynamic MTP and 60 bytes for homogeneous device-side MoE rebalancing. HIP
 graphs do not provide conditional nodes, so the host submits the
 already-captured branch named by this immutable control-plane snapshot without
 receiving mutable model state, verifier data, KV data, or draft tokens.
+CUDA permits the same generation ticket only at an explicitly heterogeneous
+boundary with same-rank/device retained-transaction evidence. Homogeneous CUDA
+still requires its native conditional parent; its rebalance ticket is forbidden.
 
 PerfStats includes both semantic operation records and legacy aggregate
 ``transfer/d2h`` byte counters.  The aggregates do not identify the caller, so
@@ -58,7 +64,7 @@ _FINAL_RESPONSE_OPERATIONS = frozenset(
     }
 )
 
-_ROCM_HOST_DISPATCH_OPERATIONS = {
+_CAPTURED_HOST_DISPATCH_OPERATIONS = {
     "device_generation_dispatch_ticket_d2h_submissions": (
         "mtp",
         str(DEVICE_GENERATION_DISPATCH_TICKET_BYTES),
@@ -94,6 +100,7 @@ class GPUHostTransferValidation:
     final_response_operations: tuple[str, ...]
     scheduler_dispatch_operations: tuple[str, ...]
     prefix_cache_operations: tuple[str, ...]
+    activation_collective_operations: tuple[str, ...]
     forbidden_operations: tuple[str, ...]
 
 
@@ -152,24 +159,32 @@ def _is_explicit_prefix_cache_tier_transfer(
     )
 
 
-def _is_authenticated_rocm_scheduler_ticket(
+def _is_authenticated_captured_scheduler_ticket(
     record: Mapping[str, Any],
+    *,
+    heterogeneous_ticket_owners: frozenset[tuple[object, str]] = frozenset(),
 ) -> bool:
-    """Accept only the reviewed HIP conditional-graph control snapshot.
+    """Accept only the reviewed captured-transaction control snapshot.
 
     The exact byte count deliberately belongs to the gate. A future ABI change
     must be reviewed here instead of silently expanding this narrow scheduler
-    boundary into a model-state readback. CUDA has native conditional graph
-    nodes and therefore may never emit this operation.
+    boundary into a model-state readback. CUDA's sole exception is a proven
+    heterogeneous captured transaction, never a homogeneous parent or a
+    host-authoritative rebalance controller.
     """
 
-    operation = _ROCM_HOST_DISPATCH_OPERATIONS.get(str(record.get("name", "")))
+    operation = _CAPTURED_HOST_DISPATCH_OPERATIONS.get(str(record.get("name", "")))
     if operation is None:
         return False
     expected_domain, expected_bytes = operation
     if str(record.get("domain", "")).lower() != expected_domain:
         return False
-    if not str(record.get("device", "")).lower().startswith("rocm:"):
+    device = str(record.get("device", "")).lower()
+    heterogeneous_generation = (
+        record.get("name") == "device_generation_dispatch_ticket_d2h_submissions"
+        and (record.get("rank"), device) in heterogeneous_ticket_owners
+    )
+    if not device.startswith("rocm:") and not heterogeneous_generation:
         return False
 
     tags = {
@@ -191,6 +206,8 @@ def _is_authenticated_rocm_scheduler_ticket(
 
 def validate_gpu_host_transfer_policy(
     records: Iterable[Mapping[str, Any]],
+    *,
+    device_kinds: frozenset[str] = frozenset(),
 ) -> GPUHostTransferValidation:
     """Reject every exercised intermediate GPU-to-host operation.
 
@@ -203,7 +220,36 @@ def validate_gpu_host_transfer_policy(
     final_response: set[str] = set()
     scheduler_dispatch: set[str] = set()
     prefix_cache: set[str] = set()
+    activation_collective: set[str] = set()
     forbidden: set[str] = set()
+    records = tuple(records)
+    # A heterogeneous CLI alone is insufficient: the exact emitting owner must
+    # have materialized the retained ticket-selected transaction family. Another
+    # rank/device's graph cannot authorize a CUDA host readback.
+    heterogeneous_ticket_owners = frozenset(
+        (record.get("rank"), str(record.get("device", "")).lower())
+        for record in records
+        if len(device_kinds) > 1 and "cuda" in device_kinds
+        and record.get("domain") == "mtp"
+        and record.get("name") == "device_generation_loop_graph_materializations"
+        and str(record.get("device", "")).lower().startswith("cuda:")
+        and _record_exercised(record)
+        and (record.get("tags") or {}).get("execution") ==
+            "hosted_captured_transactions_with_ticket_only_dispatch"
+        and _numeric((record.get("tags") or {}).get("fragments")) > 0
+    )
+    # Registration is runtime proof that the shared wire actually belongs to
+    # this process and node. A different rank's mapping cannot authorize DMA.
+    mapped_ranks = {
+        record.get("rank") for record in records
+        if record.get("domain") == "moe_overlay_activation_epoch"
+        and record.get("name") in {"mapped_regions_registered", "mapped_regions_allocated"}
+        and _record_exercised(record)
+        and (record.get("tags") or {}).get("scope") == "node_local"
+        and (record.get("tags") or {}).get("blocking") == "false"
+        and (record.get("tags") or {}).get("mapping") in {
+            "typed_external_host_pages", "backend_owned_mapped_host_pages"}
+    }
 
     for record in records:
         name = str(record.get("name", ""))
@@ -216,11 +262,26 @@ def validate_gpu_host_transfer_policy(
         if name in _FINAL_RESPONSE_OPERATIONS:
             final_response.add(name)
             continue
-        if _is_authenticated_rocm_scheduler_ticket(record):
+        if _is_authenticated_captured_scheduler_ticket(
+            record, heterogeneous_ticket_owners=heterogeneous_ticket_owners
+        ):
             scheduler_dispatch.add(name)
             continue
         if _is_explicit_prefix_cache_tier_transfer(record):
             prefix_cache.add(name)
+            continue
+        tags = record.get("tags") or {}
+        source_kind = str(record.get("device", "")).split(":", 1)[0].lower()
+        if (len(device_kinds) > 1 and source_kind in device_kinds
+                and source_kind in {"cuda", "rocm"}
+                and record.get("rank") in mapped_ranks
+                and record.get("domain") == "moe_overlay_activation_epoch"
+                and name == "shared_physical_dispatch_d2h_bytes"
+                and tags.get("host_blocking") == "false"
+                and tags.get("payload_layout") == "shared_physical_rows"
+                and tags.get("payload_path") == "shared_physical_mapped"
+                and tags.get("role") == "shared dispatch lane batch"):
+            activation_collective.add(name)
             continue
         forbidden.add(name)
 
@@ -230,8 +291,10 @@ def validate_gpu_host_transfer_policy(
         error = (
             "GPU inference performed intermediate device-to-host transfers; "
             "only compact final-response materialization and explicit "
-            "RAM/disk prefix-cache tier movement are permitted, plus ROCm's "
-            "exact authenticated immutable graph-dispatch ticket: "
+            "RAM/disk prefix-cache tier movement, certified node-local "
+            "heterogeneous activation collectives, and exact authenticated "
+            "immutable graph-dispatch tickets at a certified HIP or "
+            "heterogeneous captured boundary are permitted: "
             + ", ".join(forbidden_operations)
         )
 
@@ -240,5 +303,6 @@ def validate_gpu_host_transfer_policy(
         final_response_operations=tuple(sorted(final_response)),
         scheduler_dispatch_operations=tuple(sorted(scheduler_dispatch)),
         prefix_cache_operations=tuple(sorted(prefix_cache)),
+        activation_collective_operations=tuple(sorted(activation_collective)),
         forbidden_operations=forbidden_operations,
     )

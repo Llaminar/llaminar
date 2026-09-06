@@ -2189,6 +2189,15 @@ namespace llaminar2
                 {"kernel", "rocm_moe_grouped_prefill_batch_invariant_calls"},
                 {"kernel", "cuda_moe_grouped_prefill_active_expert_grid_calls"},
                 {"kernel", "cuda_moe_grouped_prefill_swiglu_path_calls"},
+                /*
+                 * Fused projection schedules are selected while the retained
+                 * graph family is captured.  Replays contain only CUDA graph
+                 * nodes, so there is no host callback that can republish this
+                 * evidence after warmup.  Keep these exact families without
+                 * retaining unrelated warmup kernel counters.
+                 */
+                {"kernel", "cuda_fused_projection_stream_pool_calls"},
+                {"kernel", "cuda_native_vnni_small_m_fused_projection_calls"},
             });
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();

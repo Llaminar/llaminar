@@ -1,12 +1,16 @@
 /**
  * @file Test__RuntimeInitPhase.cpp
  * @brief Unit tests for runtime initialization branch behavior.
+ *
+ * Bootstrap intent checks are pure typed-config tests: no vendor enumeration,
+ * model loading, environment mutation, or accelerator occupancy is permitted.
  */
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "app/RuntimeInitPhase.h"
+#include "app/MPIBootstrapPhase.h"
 #include "utils/NUMATopology.h"
 #include "mocks/MockOrchestrationRunner.h"
 
@@ -171,4 +175,105 @@ TEST(Test__RuntimeInitPhase, CpuOnlyOverlayRetainsRankLocalVisibility)
 
     EXPECT_FALSE(
         RuntimeInitPhase::requiresHostWideAcceleratorVisibility(config, 0));
+}
+
+TEST(Test__RuntimeInitPhase, BootstrapDoesNotConfuseMpiWithGpuOrCpuIntent)
+{
+    OrchestrationConfig config;
+    config.default_backend = CollectiveBackendType::MPI;
+    config.mpi_procs = 2;
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(config),
+              BootstrapDeviceIntent::Automatic);
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "arbitrary_name=localhost:0:cpu:0,localhost:1:cpu:0;scope=node_local;backend=mpi"));
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(config),
+              BootstrapDeviceIntent::CpuOnly);
+}
+
+TEST(Test__RuntimeInitPhase, BootstrapCpuIntentCoversDeviceMapTpAndTree)
+{
+    OrchestrationConfig shorthand;
+    shorthand.cpu_global_tp_all_local = true;
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(shorthand),
+              BootstrapDeviceIntent::CpuOnly);
+
+    OrchestrationConfig single;
+    single.device_for_this_rank = GlobalDeviceAddress::cpu(0);
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(single),
+              BootstrapDeviceIntent::CpuOnly);
+
+    OrchestrationConfig mapped;
+    mapped.device_map = {{0, GlobalDeviceAddress::cpu(0)},
+                         {1, GlobalDeviceAddress::cpu(1)}};
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(mapped),
+              BootstrapDeviceIntent::CpuOnly);
+
+    OrchestrationConfig tp;
+    tp.tp_degree = 2;
+    tp.tp_devices = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(tp),
+              BootstrapDeviceIntent::CpuOnly);
+
+    OrchestrationConfig tree;
+    tree.topology_tree.emplace();
+    tree.topology_tree->root.device = GlobalDeviceAddress::cpu(1);
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(tree),
+              BootstrapDeviceIntent::CpuOnly);
+    tree.topology_tree.reset();
+    tree.topology_string = "unresolved topology";
+    tree.device_for_this_rank = GlobalDeviceAddress::cpu(0);
+    EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(tree),
+              BootstrapDeviceIntent::Automatic);
+}
+
+TEST(Test__RuntimeInitPhase, BootstrapGpuExpertsOverrideCpuContinuationSymmetrically)
+{
+    for (const auto gpu : {GlobalDeviceAddress::cuda(0),
+                           GlobalDeviceAddress::rocm(0)})
+    {
+        OrchestrationConfig config;
+        config.device_for_this_rank = GlobalDeviceAddress::cpu(0);
+        config.moe_routed_expert_plan =
+            std::make_shared<MoERoutedExpertPlacementPlan>();
+        auto &overlay = *config.moe_routed_expert_plan;
+        overlay.enabled = true;
+        RoutedExpertDomain domain;
+        domain.name = "typed_participants_not_tier_names";
+        domain.participants = {GlobalDeviceAddress::cpu(1)};
+        overlay.domains.push_back(domain);
+        EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(config),
+                  BootstrapDeviceIntent::CpuOnly);
+        overlay.domains.front().participants.push_back(gpu);
+        EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(config),
+                  BootstrapDeviceIntent::Accelerator);
+
+        overlay.domains.front().participants.pop_back();
+        ExecutionDomainDefinition dense;
+        dense.participants = {gpu};
+        overlay.dense_domains.push_back(std::move(dense));
+        EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(config),
+                  BootstrapDeviceIntent::Accelerator);
+    }
+}
+
+TEST(Test__RuntimeInitPhase, BootstrapGpuDeclarationsAreNotOverriddenByCpuShorthand)
+{
+    for (const auto gpu : {GlobalDeviceAddress::cuda(0),
+                           GlobalDeviceAddress::rocm(0)})
+    {
+        OrchestrationConfig mapped;
+        mapped.cpu_global_tp_all_local = true;
+        mapped.device_map = {{1, gpu}};
+        EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(mapped),
+                  BootstrapDeviceIntent::Accelerator);
+        mapped.device_map.clear();
+        mapped.tp_devices = {gpu};
+        EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(mapped),
+                  BootstrapDeviceIntent::Accelerator);
+        mapped.tp_devices.clear();
+        mapped.topology_tree.emplace();
+        mapped.topology_tree->root.device = gpu;
+        EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(mapped),
+                  BootstrapDeviceIntent::Accelerator);
+    }
 }

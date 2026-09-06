@@ -38,6 +38,8 @@ namespace llaminar2
     class MoEOverlayNodeLocalDeviceControllerFabric;
     class MoEOverlayPhysicalResidencyFabric;
     class MoEOverlayEconomyCertificationController;
+    class MoEOverlayDeviceTransportProtocol;
+    struct MoEOverlayDeviceTransportCommandBatch;
 
     /** Terminal objective selected before controller workers enter quiescence. */
     enum class MoEOverlayDeviceControllerDrainIntent : std::uint8_t
@@ -527,7 +529,10 @@ namespace llaminar2
             bool *ready,
             std::string *error) noexcept;
         /** Mark participant inboxes reusable after one complete movement wave. */
-        [[nodiscard]] bool finishDynamicInboxes(std::string *error) noexcept;
+        [[nodiscard]] bool finishDynamicInboxes(
+            const MoEOverlayDeviceTransportProtocol &protocol,
+            const MoEOverlayDeviceTransportCommandBatch &command,
+            std::string *error) noexcept;
         /** Latch the first background failure and release mapped wait kernels. */
         void failDynamic(std::string message) noexcept;
 

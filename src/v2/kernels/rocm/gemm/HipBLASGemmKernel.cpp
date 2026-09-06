@@ -1,6 +1,11 @@
 /**
  * @file HipBLASGemmKernel.cpp
- * @brief hipBLAS GEMM kernel implementation for AMD GPUs
+ * @brief Context-borrowing hipBLAS projection views with atomic host submission.
+ *
+ * Device contexts retain the library through expert movement and graph replay.
+ * Projection destruction releases no device library. The context's scoped
+ * handle lock covers exact stream/workspace selection through asynchronous
+ * enqueue; it never waits for GPU completion.
  *
  * This file is compiled with hipcc to use HIP runtime APIs.
  *
@@ -23,6 +28,8 @@
 
 #include "HipBLASGemmKernel.h"
 #include "backends/IWorkerGPUContext.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include <stdexcept>
 #include <string>
@@ -41,9 +48,34 @@ namespace llaminar2
 
         namespace
         {
-            constexpr const char *kBiasMatmulWorkspace =
-                "hipblaslt_bias_matmul_workspace";
-            constexpr size_t kBiasMatmulWorkspaceBytes = 4 * 1024 * 1024;
+            constexpr auto kBiasMatmulWorkspace = floating_gemm_abi::kROCmBlasMatmulWorkspace;
+            constexpr auto kBiasMatmulWorkspaceBytes = floating_gemm_abi::kBlasMatmulWorkspaceBytes;
+
+            /**
+             * @brief Validate the backend before creating or borrowing any context.
+             * @param device_id Explicit ROCm device requested by the projection.
+             * @return Its persistent, initialized library authority.
+             * @throws std::invalid_argument If the device is not a ROCm device.
+             */
+            IWorkerGPUContext *projectionContext(const DeviceId &device_id)
+            {
+                if (!device_id.is_rocm())
+                    throw std::invalid_argument("hipBLAS GEMM requires a ROCm device");
+                return &GPUDeviceContextPool::instance().getContext(device_id);
+            }
+
+            /** @brief Bind the mutually exclusive BLAS/Lt region from this stage's arena. */
+            bool bindMatmulWorkspace(void *handle, DeviceWorkspaceManager *workspace)
+            {
+                if (!workspace ||
+                    workspace->getBufferSize(kBiasMatmulWorkspace) < kBiasMatmulWorkspaceBytes)
+                    throw std::logic_error("hipBLAS submission requires its declared arena workspace");
+                void *buffer = workspace->getBuffer(kBiasMatmulWorkspace);
+                if (!buffer)
+                    throw std::logic_error("hipBLAS arena workspace has not been materialized");
+                return hipblasSetWorkspace(static_cast<hipblasHandle_t>(handle),
+                                           buffer, kBiasMatmulWorkspaceBytes) == HIPBLAS_STATUS_SUCCESS;
+            }
         } // namespace
 
         // =====================================================================
@@ -94,189 +126,23 @@ namespace llaminar2
         // =====================================================================
 
         HipBLASGemmKernel::HipBLASGemmKernel(const DeviceId &device_id, Precision precision)
-            : device_id_(device_id), precision_(precision), owns_handle_(true)
+            : HipBLASGemmKernel(projectionContext(device_id), precision)
         {
-            if (device_id.type != DeviceType::ROCm)
-            {
-                throw std::runtime_error(
-                    "[HipBLASGemmKernel] Requires ROCm device, got: " + device_id.to_string());
-            }
-
-            // Set device
-            hipError_t hip_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.ordinal));
-            if (hip_err != hipSuccess)
-            {
-                throw std::runtime_error(
-                    std::string("[HipBLASGemmKernel] Failed to set HIP device ") +
-                    std::to_string(device_id_.ordinal) + ": " + hipGetErrorString(hip_err));
-            }
-
-            // Create hipBLAS handle
-            hipblasHandle_t temp_handle = nullptr;
-            hipblasStatus_t hipblas_err = hipblasCreate(&temp_handle);
-            if (hipblas_err != HIPBLAS_STATUS_SUCCESS)
-            {
-                throw std::runtime_error(
-                    std::string("[HipBLASGemmKernel] Failed to create hipBLAS handle: ") +
-                    std::to_string(static_cast<int>(hipblas_err)));
-            }
-            handle_ = static_cast<void *>(temp_handle);
-
-            // Disable atomic reductions for deterministic GEMM output.
-            // Atomic accumulation in rocBLAS/Tensile kernels produces
-            // nondeterministic FP reduction order.  Non-atomic paths are
-            // selected instead.
-            hipblasSetAtomicsMode(temp_handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
-
-            // Create hipBLASLt handle for fused operations (e.g., GEMM + bias)
-            hipblasLtHandle_t temp_lt_handle = nullptr;
-            hipblasStatus_t lt_err = hipblasLtCreate(&temp_lt_handle);
-            if (lt_err != HIPBLAS_STATUS_SUCCESS)
-            {
-                hipblasDestroy(temp_handle);
-                throw std::runtime_error(
-                    std::string("[HipBLASGemmKernel] Failed to create hipBLASLt handle: ") +
-                    std::to_string(static_cast<int>(lt_err)));
-            }
-            lt_handle_ = static_cast<void *>(temp_lt_handle);
-
-            // Note: hipBLAS doesn't have explicit Tensor Core mode like cuBLAS
-            // It will automatically use the best available math mode
-
-            HIP_LOG_DEBUG("[HipBLASGemmKernel] Created on device " << device_id_.to_string()
-                                                                   << " with precision "
-                                                                   << static_cast<int>(precision_)
-                                                                   << " (owns handle)");
         }
 
         HipBLASGemmKernel::HipBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision)
-            : precision_(precision), owns_handle_(false)
+            : precision_(precision)
         {
-            if (!ctx)
-            {
-                throw std::runtime_error(
-                    "[HipBLASGemmKernel] Device context is null");
-            }
-
-            if (!ctx->isInitialized())
-            {
-                throw std::runtime_error(
-                    "[HipBLASGemmKernel] Device context is not initialized");
-            }
-
-            // Store the device context (sets device_ctx_ in base class)
+            if (!ctx || !ctx->isInitialized())
+                throw std::invalid_argument("hipBLAS GEMM requires an initialized worker context");
             setDeviceContext(ctx);
             device_id_ = DeviceId::rocm(ctx->deviceOrdinal());
-
-            // Get hipBLAS handle from context via submitAndWait
-            // blasHandle() must be called from the worker thread per thread-safety model
-            void *blas_handle = nullptr;
-            std::exception_ptr eptr = nullptr;
-            ctx->submitAndWait([&]()
-                               {
-                try {
-                    blas_handle = ctx->blasHandle();
-                } catch (...) {
-                    eptr = std::current_exception();
-                } });
-            if (eptr)
-            {
-                std::rethrow_exception(eptr);
-            }
-            if (!blas_handle)
-            {
-                throw std::runtime_error(
-                    "[HipBLASGemmKernel] Device context has no hipBLAS handle");
-            }
-            handle_ = blas_handle;
-
-            // Get hipBLASLt handle from context (required for fused operations)
-            void *lt_handle_ptr = nullptr;
-            ctx->submitAndWait([&]()
-                               { lt_handle_ptr = ctx->blasLtHandle(); });
-            if (!lt_handle_ptr)
-            {
-                throw std::runtime_error(
-                    "[HipBLASGemmKernel] Device context has no hipBLASLt handle");
-            }
-            lt_handle_ = lt_handle_ptr;
-            owns_lt_handle_ = false;
-
-            HIP_LOG_DEBUG("[HipBLASGemmKernel] Created on device " << device_id_.to_string()
-                                                                   << " with precision "
-                                                                   << static_cast<int>(precision_)
-                                                                   << " (using context handle)");
+            const auto submission = ctx->acquireBlasSubmission();
         }
 
-        HipBLASGemmKernel::~HipBLASGemmKernel()
-        {
-            // Only destroy lt_handle_ if we own it
-            if (owns_lt_handle_ && lt_handle_)
-            {
-                hipblasLtDestroy(static_cast<hipblasLtHandle_t>(lt_handle_));
-                lt_handle_ = nullptr;
-            }
-            // Only destroy hipBLAS handle if we own it
-            if (owns_handle_ && handle_)
-            {
-                hipblasDestroy(static_cast<hipblasHandle_t>(handle_));
-                handle_ = nullptr;
-            }
-        }
-
-        // Move constructor
-        HipBLASGemmKernel::HipBLASGemmKernel(HipBLASGemmKernel &&other) noexcept
-            : ROCmKernelBase(std::move(other)),
-              handle_(other.handle_),
-              lt_handle_(other.lt_handle_),
-              device_id_(other.device_id_),
-              precision_(other.precision_),
-              owns_handle_(other.owns_handle_),
-              owns_lt_handle_(other.owns_lt_handle_)
-        {
-            other.handle_ = nullptr;
-            other.lt_handle_ = nullptr;
-            other.owns_handle_ = false;    // Moved-from object shouldn't destroy anything
-            other.owns_lt_handle_ = false; // Moved-from object shouldn't destroy anything
-        }
-
-        // Move assignment
-        HipBLASGemmKernel &HipBLASGemmKernel::operator=(HipBLASGemmKernel &&other) noexcept
-        {
-            if (this != &other)
-            {
-                // Destroy our resources if we own them
-                if (owns_lt_handle_ && lt_handle_)
-                {
-                    hipblasLtDestroy(static_cast<hipblasLtHandle_t>(lt_handle_));
-                }
-                if (owns_handle_ && handle_)
-                {
-                    hipblasDestroy(static_cast<hipblasHandle_t>(handle_));
-                }
-
-                // Move base class
-                ROCmKernelBase::operator=(std::move(other));
-
-                // Take ownership of other's resources
-                handle_ = other.handle_;
-                lt_handle_ = other.lt_handle_;
-                device_id_ = other.device_id_;
-                precision_ = other.precision_;
-                owns_handle_ = other.owns_handle_;
-                owns_lt_handle_ = other.owns_lt_handle_;
-
-                other.handle_ = nullptr;
-                other.lt_handle_ = nullptr;
-                other.owns_handle_ = false;
-                other.owns_lt_handle_ = false;
-            }
-            return *this;
-        }
-
-        // =====================================================================
-        // FP32 GEMM Implementation
-        // =====================================================================
+        HipBLASGemmKernel::~HipBLASGemmKernel() = default;
+        HipBLASGemmKernel::HipBLASGemmKernel(HipBLASGemmKernel &&) noexcept = default;
+        HipBLASGemmKernel &HipBLASGemmKernel::operator=(HipBLASGemmKernel &&) noexcept = default;
 
         bool HipBLASGemmKernel::execute(
             const float *d_A, const float *d_B, float *d_C,
@@ -308,7 +174,8 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
-            std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
+            const auto submission = device_ctx_->acquireBlasSubmission();
+            void *const handle_ = submission.handle();
             if (!handle_)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute] hipBLAS handle is null");
@@ -333,6 +200,9 @@ namespace llaminar2
                     << static_cast<int>(stream_status));
                 return false;
             }
+
+            if (!bindMatmulWorkspace(handle_, workspace_))
+                return false;
 
             // =========================================================================
             // Row-major to column-major conversion for hipBLAS
@@ -425,7 +295,8 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
-            std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
+            const auto submission = device_ctx_->acquireBlasSubmission();
+            void *const handle_ = submission.handle();
             if (!handle_)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_batched] hipBLAS handle is null");
@@ -459,6 +330,8 @@ namespace llaminar2
             hipblasOperation_t opA = transA ? HIPBLAS_OP_T : HIPBLAS_OP_N;
             hipblasOperation_t opB = transB ? HIPBLAS_OP_T : HIPBLAS_OP_N;
             int lda = K;
+            if (!bindMatmulWorkspace(handle_, workspace_))
+                return false;
             int ldb = transB ? K : N;
             int ldc = N;
 
@@ -513,7 +386,8 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
-            std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
+            const auto submission = device_ctx_->acquireBlasSubmission();
+            void *const lt_handle_ = submission.ltHandle();
             if (!lt_handle_)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_with_bias] hipBLASLt handle is null");
@@ -727,7 +601,8 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
-            std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
+            const auto submission = device_ctx_->acquireBlasSubmission();
+            void *const handle_ = submission.handle();
             if (!handle_)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_fp16] hipBLAS handle is null");
@@ -759,6 +634,9 @@ namespace llaminar2
             int lda = K;
             int ldb = transB ? K : N;
             int ldc = N;
+
+            if (!bindMatmulWorkspace(handle_, workspace_))
+                return false;
 
             // Convert alpha/beta to half precision
             hipblasHalf alpha_h = __float2half(alpha);
@@ -804,65 +682,27 @@ namespace llaminar2
             ROCmKernelBase::clearGPUStreamBinding();
         }
 
-        void registerHipBLASGemmKernelFactory()
-        {
-            DeviceKernelCache::registerFactory(
-                DeviceType::ROCm,
-                KernelType::BLAS_GEMM,
-                [](const DeviceId &device) -> std::unique_ptr<IDeviceKernel>
-                {
-                    return std::make_unique<HipBLASGemmKernel>(device);
-                });
-            HIP_LOG_DEBUG("[HipBLASGemmKernel] Registered factory for ROCm BLAS_GEMM");
-        }
 
 #else // !HAVE_ROCM
 
         // Stub implementations when ROCm is not available
 
         HipBLASGemmKernel::HipBLASGemmKernel(const DeviceId &device_id, Precision precision)
-            : device_id_(device_id), precision_(precision), owns_handle_(true)
+            : device_id_(device_id), precision_(precision)
         {
             throw std::runtime_error("[HipBLASGemmKernel] ROCm support not compiled");
         }
 
         HipBLASGemmKernel::HipBLASGemmKernel(IWorkerGPUContext * /*ctx*/, Precision precision)
-            : precision_(precision), owns_handle_(false)
+            : precision_(precision)
         {
             throw std::runtime_error("[HipBLASGemmKernel] ROCm support not compiled");
         }
 
         HipBLASGemmKernel::~HipBLASGemmKernel() {}
 
-        HipBLASGemmKernel::HipBLASGemmKernel(
-            HipBLASGemmKernel &&other) noexcept
-            : handle_(other.handle_),
-              lt_handle_(other.lt_handle_),
-              device_id_(other.device_id_),
-              precision_(other.precision_),
-              owns_handle_(other.owns_handle_),
-              owns_lt_handle_(other.owns_lt_handle_)
-        {
-            other.handle_ = nullptr;
-            other.lt_handle_ = nullptr;
-        }
-
-        HipBLASGemmKernel &HipBLASGemmKernel::operator=(
-            HipBLASGemmKernel &&other) noexcept
-        {
-            if (this != &other)
-            {
-                handle_ = other.handle_;
-                lt_handle_ = other.lt_handle_;
-                device_id_ = other.device_id_;
-                precision_ = other.precision_;
-                owns_handle_ = other.owns_handle_;
-                owns_lt_handle_ = other.owns_lt_handle_;
-                other.handle_ = nullptr;
-                other.lt_handle_ = nullptr;
-            }
-            return *this;
-        }
+        HipBLASGemmKernel::HipBLASGemmKernel(HipBLASGemmKernel &&) noexcept = default;
+        HipBLASGemmKernel &HipBLASGemmKernel::operator=(HipBLASGemmKernel &&) noexcept = default;
 
         bool HipBLASGemmKernel::execute(
             const float *, const float *, float *,
@@ -948,8 +788,6 @@ namespace llaminar2
         {
             return nullptr;
         }
-
-        void registerHipBLASGemmKernelFactory() {}
 
         void HipBLASGemmKernel::bindStream(ExplicitGPUStream) {}
         void HipBLASGemmKernel::clearStreamBinding() noexcept {}

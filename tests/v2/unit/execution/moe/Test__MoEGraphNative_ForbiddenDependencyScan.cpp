@@ -5889,7 +5889,8 @@ namespace llaminar2::test
             dgo.find("bool DeviceGraphOrchestrator::waitForPendingDeviceMoERebalanceMaintenance(");
         ASSERT_NE(wait_start, std::string::npos);
         const size_t wait_end =
-            dgo.find("bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph(",
+            dgo.find("bool DeviceGraphOrchestrator::\n"
+                     "        materializeDeviceMoERebalanceMaintenanceGraphForFamily()",
                      wait_start);
         ASSERT_NE(wait_end, std::string::npos);
         const std::string wait_body = dgo.substr(wait_start, wait_end - wait_start);
@@ -5914,6 +5915,8 @@ namespace llaminar2::test
             << "Steady-state maintenance publication must not synchronize a stream through the host.";
         EXPECT_EQ(wait_body.find("ensureOnHost("), std::string::npos)
             << "Maintenance publication ordering must not create a host mirror.";
+        EXPECT_EQ(wait_body.find("acquireMoEOverlayEpoch"), std::string::npos)
+            << "Maintenance observation must not acquire an ambient placement reader.";
 
         const size_t live_prepare_start =
             dgo.find("bool DeviceGraphOrchestrator::prepareLiveStateForForwardGraphExecution(");
@@ -5945,20 +5948,22 @@ namespace llaminar2::test
                       "waitForPendingDeviceMoERebalanceMaintenance(\n"
                       "                sidecar_dynamic_stream,\n"
                       "                DeviceTimelineRole::MTPSidecarGraph,\n"
-                      "                \"mtp_sidecar_graph\",\n"
-                      "                /*acquire_overlay_epoch=*/"),
+                      "                \"mtp_sidecar_graph\"))"),
                   std::string::npos)
             << "The MTP sidecar bypasses ForwardExecutionEngine and must queue the same event handoff explicitly.";
         EXPECT_NE(live_prepare.find(
                       "waitForPendingDeviceMoERebalanceMaintenance(\n"
                       "                execution_stream,\n"
                       "                DeviceTimelineRole::MainForwardGraph,\n"
-                      "                \"forward_graph\",\n"),
+                      "                \"forward_graph\"))"),
                   std::string::npos)
             << "The main graph must identify itself as an independent typed consumer.";
-        EXPECT_NE(live_prepare.find("/*acquire_overlay_epoch=*/"),
+        EXPECT_NE(live_prepare.find("moeOverlayForwardEpochSubmissionPolicy("),
                   std::string::npos)
             << "The main graph must make topology-wide epoch acquisition an explicit typed policy.";
+        EXPECT_NE(sidecar.find("moeOverlaySidecarEpochOwnership("),
+                  std::string::npos)
+            << "Sidecar expert ownership must be selected by its semantic role.";
 
         EXPECT_EQ(dgo.find("synchronizeGraphStableMoERuntimeBeforeDecodeCapture"),
                   std::string::npos)
@@ -10723,8 +10728,14 @@ namespace llaminar2::test
             std::string::npos)
             << "Executable-update support must be an explicit graph-backend capability.";
         EXPECT_NE(
-            cuda_capture.find("supportsExecutableUpdate() const noexcept override { return true; }"),
+            cuda_capture.find("supportsExecutableUpdate() const noexcept override"),
             std::string::npos);
+        const std::string cuda_implementation = readFile(
+            root / "src/v2/backends/cuda/CUDAGraphCapture.cu");
+        EXPECT_NE(cuda_implementation.find("if (!supportsExecutableUpdate())"),
+                  std::string::npos)
+            << "Native conditional timelines must reject updates before calling CUDA; "
+               "ordinary graph update support is covered by the backend integration suite.";
         EXPECT_NE(
             rocm_capture.find("supportsExecutableUpdate() const noexcept override { return false; }"),
             std::string::npos);

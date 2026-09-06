@@ -710,6 +710,7 @@ namespace llaminar2
                 .device = device,
                 .staging = staging[0],
                 .execution = execution,
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "cuda_shared_execution_first",
                 .perf_device = "cuda:0",
             });
@@ -717,6 +718,7 @@ namespace llaminar2
                 .device = device,
                 .staging = staging[1],
                 .execution = execution,
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "cuda_shared_execution_second",
                 .perf_device = "cuda:0",
             });
@@ -1167,6 +1169,7 @@ namespace llaminar2
                                      DeviceId::cuda(0),
                                      "cuda_tier_round_trip")
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "cuda_tier_round_trip",
                 .perf_device = "cuda:0",
             });
@@ -1327,6 +1330,7 @@ namespace llaminar2
                                          DeviceId::cuda(device_ordinal),
                                          "cuda_secondary_device_remote_projection")
                                      .front(),
+                    .progress = BackgroundTransferProgressBinding::nativeStream(),
                     .lane_name = "cuda_secondary_device_remote_projection",
                     .perf_device = "cuda:1",
                 });
@@ -1421,6 +1425,7 @@ namespace llaminar2
                                      DeviceId::cuda(0),
                                      "cuda_floating_tier_round_trip")
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "cuda_floating_tier_round_trip",
                 .perf_device = "cuda:0",
             });
@@ -1637,6 +1642,7 @@ namespace llaminar2
                                          DeviceId::cuda(0),
                                          "cuda_remote_q51_roundtrip")
                                      .front(),
+                    .progress = BackgroundTransferProgressBinding::nativeStream(),
                     .lane_name = "cuda_remote_q51_roundtrip",
                     .perf_device = "cuda:0",
                 });
@@ -1941,6 +1947,7 @@ namespace llaminar2
                                      DeviceId::cuda(0),
                                      "cuda_asymmetric_promotion_execution")
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "cuda_asymmetric_promotion_execution",
                 .perf_device = "cuda:0",
             });
@@ -2475,6 +2482,7 @@ namespace llaminar2
                                      DeviceId::cuda(0),
                                      "cuda_production_shadow_slot_q5k")
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "cuda_production_shadow_slot_q5k",
                 .perf_device = "cuda:0",
             });
@@ -2637,6 +2645,7 @@ namespace llaminar2
                                      DeviceId::cuda(0),
                                      "cuda_inference_overlap")
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "cuda_inference_overlap",
                 .perf_device = "cuda:0",
             });

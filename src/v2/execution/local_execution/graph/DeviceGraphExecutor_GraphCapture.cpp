@@ -2237,11 +2237,11 @@ namespace llaminar2
         }
         if (auxiliary_branch_factory.valid() &&
             (auxiliary_branch_factory.device != ctx->deviceId() ||
-             plan_policy != GraphReplayPlanPolicy::RequireFullGraph ||
-             retained_parent_requested))
+             (plan_policy != GraphReplayPlanPolicy::RequireFullGraph &&
+              !retained_parent_requested)))
         {
             LOG_ERROR(
-                "[DeviceGraphExecutor] A graph-owned auxiliary branch requires one full native executable on its exact device"
+                "[DeviceGraphExecutor] A graph-owned auxiliary branch requires one final native executable on its exact device"
                 << " branch_device="
                 << auxiliary_branch_factory.device.toString()
                 << " graph_device=" << ctx->deviceId().toString()
@@ -3575,7 +3575,7 @@ namespace llaminar2
             }
 
             /*
-             * Materialize branch-private events only after every ordinary
+             * Materialize branch-private graph sources only after every ordinary
              * stream/timing precondition has succeeded. From this point the
              * capture controller owns reset-on-failure, so a partial first-use
              * attempt cannot strand branch identity in an uninitialized cache.
@@ -3602,7 +3602,7 @@ namespace llaminar2
                     /*
                      * Hook objects are assembled before the cold-path factory
                      * is invoked so ordinary capture preconditions can fail
-                     * without allocating branch-private events.  Refresh both
+                     * without allocating branch-private sources. Refresh both
                      * hook views now that the cache owns its final branch;
                      * otherwise transaction zero captures the model alone and
                      * every later replay permanently omits maintenance work.

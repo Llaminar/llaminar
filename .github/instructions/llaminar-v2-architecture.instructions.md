@@ -61,6 +61,11 @@ creation happen before an execution mode starts inference.
 
 The executable normally self-bootstraps MPI. `MPIBootstrapPhase` establishes
 rank placement and the CPU/OpenMP environment used by production execution.
+Before inventory or the already-in-MPI early return, it derives device intent
+from the parsed typed declarations and installs CPU-only intent in the existing
+backend startup authority. Named CPU domains must not initialize unused GPU
+contexts. Both dense and routed accelerator endpoints prevent CPU-only
+classification; rank count and collective backend do not imply a compute type.
 Direct `--no-mpi-bootstrap` launches are reserved for tools that must attach to
 the actual process, such as a debugger or backend profiler.
 
@@ -296,6 +301,13 @@ snapshot callbacks, cancellation, and stage-failure publication. Diagnostics
 may materialize tensors on the host, but that behavior is outside the normal
 inference path.
 
+Serving logs consume `IOrchestrationRunner::requestRuntimeSummary()`: a value
+projected from existing request outcomes and the validated terminal ledger.
+Obtaining it must not inspect child runners, query device state, transfer data,
+or join maintenance. `prefixStateProbe()` is a separate explicit diagnostic
+that may synchronize live caches; ordinary HTTP/SSE logging must never invoke
+it, even when the corresponding log level is enabled.
+
 ## 6. Memory, coherence, and weights
 
 ### 6.1 Activation and workspace ownership
@@ -314,6 +326,19 @@ to overlap may share capacity according to the memory plan.
 state before runner construction. Initialization fails when the selected plan
 does not fit; allocation is not deferred to the hot path.
 
+`PhysicalMemoryAuthority` owns the canonical physical admission, reservation,
+materialization, and release ledger. Planners contribute typed BOMs, not live
+capacity arithmetic. Opaque native graph pools are admitted as complete retained
+families through `GPUGraphMemoryContract`; an individual pool-growth observation
+is diagnostic evidence, not bytes owned by the graph that triggered it.
+
+`MTPGraphOwnerPlan` supplies the same general/bounded-helper owner partition to
+ordinary and ExpertOverlay admission. `ComputeGraph` declares the executable
+memory class as captured topology. Before native instantiation, CUDA/HIP inspect
+the helper's actual node count and kinds; nested/control graphs cannot claim a
+small flat-helper reservation. Request reset preserves this class and graph
+identity. The guard adds no replay-time queries or ordering edges.
+
 ### 6.2 Weight lifecycle
 
 `ModelLoader` and `ModelContext` own GGUF metadata and raw model tensors.
@@ -328,6 +353,14 @@ providers, device slot pools, and transfer services. Rebalance changes are
 published through graph-visible maintenance/state rather than by rewriting
 ordinary stage ownership behind the graph.
 
+The device overlay controller separates the open transaction's phase intent
+from its last sealed command. Opening snapshot N+1 must retain command N and
+its publication word: an empty decision can finish before a remote transport
+worker acquires it. Every worker consumes N before joining snapshot N+1, so the
+existing topology-wide snapshot fan-in is the sole command-buffer reuse edge.
+Do not add a second acknowledgement, clear the command at transaction-open,
+or reconstruct a missed command from host-side policy state.
+
 ### 6.3 Coherence and transfers
 
 `TransferEngine` is the public authority for tensor movement and coherence
@@ -339,6 +372,68 @@ The executor may join a consumer stream to a published event. It may not
 allocate, upload, download, migrate, or guess a stream to repair a stage input
 while a graph is running. CPU consumers explicitly materialize host data;
 cross-device and cross-vendor transfers use a declared transfer plan.
+
+Background mapped expert copies use prepared `PersistentTransferExecutionLane`
+leases and `TransferEngine::enqueueBackgroundMappedCopy`. Its progress contract
+is symmetric; native mechanisms differ: CUDA uses bounded byte-copy kernels,
+whereas HIP explicitly requests no-compute DMA on registered device-visible
+aliases; an ordinary small HIP copy may silently use a compute blit. Exact host
+addresses and device aliases are retained for both directions; no backend
+retries another mechanism after failure. Function preparation belongs to lane setup: lazy module resolution
+must not synchronize a peer-held graph during submission. CUDA DMA queues can
+serialize otherwise independent streams behind a captured copy; HIP compute
+queues can do the same behind a held kernel. The backend owns this native
+distinction. Native-event completion remains the contract for those direct
+stream operations.
+
+`MappedTransferProgressEpoch` separates permanent topology slots from a bounded
+physical execution inbox. On CUDA, independently queued kernels can also be
+starved by future inference-event consumers. The epoch therefore supplies an
+`IGraphCaptureAuxiliaryBranch` to each retained inference graph: a private GPU
+word opens at the root and closes at the inference terminal. The copy worker
+retires at a bounded byte quantum before the graph joins it; it never waits for
+a whole maintenance command or a host acknowledgment. Device-only claims and
+partial byte cursors survive intervals and are shared with finite idle passes.
+A host enqueue cannot claim GPU execution. Host maintenance owns immutable IO
+commands and acquires exact generation receipts, not a shadow of GPU cursors.
+Graph caches retain private interval words, graph-only branch sources and the
+shared epoch authority.
+`IForwardExecutionHost` supplies that device-lifetime authority for both ordinary
+forward and hosted retained MTP replay. `ForwardExecutionEngine` resolves it
+directly on every submission; a hosted caller cannot supply a second factory
+or erase the captured branch with an empty descriptor. The cache still rejects
+changed/removed authority rather than recapturing or trusting its old owner.
+Resource construction and the small Open/worker/Close graph-only recordings run
+on the device-context worker. One typed attachment decorates the final sealed,
+uninstantiated native graph: direct capture and retained CPU-ticket composition
+use the same operation. The original body is preserved in place, including
+CUDA conditional-handle ownership. Open precedes every original root; every
+original terminal precedes Close; only the final join awaits both Close and the
+worker. The worker therefore progresses throughout external CPU waits, without
+per-child branches, paired capture-event state or per-replay host submissions.
+ROCm retains the independently progressing native SDMA implementation. Model
+teardown joins the final exact idle/setup event before releasing service storage;
+there is no model-lifetime persistent kernel that can obstruct reclamation.
+CUDA contiguous CPU expert weights and remote raw GPU blobs bind to that same
+epoch through `BackgroundTransferProgressBinding`; their exact generation
+receipt owns completion. Native conversion/copy lanes and HIP use
+`enqueueBackgroundStagingCopy` and exact native events. Their
+`PersistentTransferStagingSlice` retains
+one exclusive region of a shared mapped host slab plus its device scratch slab.
+No client sharing the maintenance stream pool may bypass native background
+submission with an ordinary DMA copy: that would reintroduce a physical queue
+dependency ahead of every otherwise-independent client on the same stream.
+Repack kernels keep their exact stream and terminal event; only TransferEngine
+selects the physical copy mechanism, independently of expert tensor format.
+
+CPU canonical-route ingress is a captured acquire/materialize/acknowledge DAG.
+One thread acquires the CPU publication, then parallel row tiles copy its
+immutable contributions, and the exact-stream terminal acknowledges reuse.
+Never park a payload-sized grid awaiting a CPU publication: independent
+maintenance and its event markers must remain runnable while the producer works.
+Route metadata is shared per row rather than re-read from mapped host memory
+for each contribution element. CPU ownership lasts until publication; the
+ticket and payload remain immutable until the GPU acknowledgement.
 
 ## 7. Parallel execution
 

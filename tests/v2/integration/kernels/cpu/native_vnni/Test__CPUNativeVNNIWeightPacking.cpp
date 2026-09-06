@@ -13,10 +13,17 @@
  * partial 64-column output chunk, complete 256-value superblocks, and a trailing
  * 32-value block.  A packing regression therefore cannot hide behind the common
  * aligned full-matrix case.
+ * Final-storage tests additionally certify every physical page on each available
+ * NUMA node, byte-identical packing/archive adoption, floating-point ownership,
+ * and restoration of the caller's affinity. No post-pack migration is permitted.
  */
 
 #include <gtest/gtest.h>
 #include <omp.h>
+#include <numa.h>
+#include <numaif.h>
+#include <sched.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -26,8 +33,13 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <thread>
+#include <barrier>
 
 #include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/KernelFactory.h"
+#include "kernels/PackedWeightsSerialization.h"
 #include "tensors/FP16Utils.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "tensors/TensorClasses.h"
@@ -35,6 +47,7 @@
 
 namespace llaminar2::cpu::native_vnni::test
 {
+    using KernelFactory = llaminar::v2::kernels::KernelFactory;
     namespace
     {
         /**
@@ -318,5 +331,163 @@ namespace llaminar2::cpu::native_vnni::test
         // makes a future encoding-policy change update the independent oracle
         // deliberately rather than silently shrinking its coverage.
         EXPECT_EQ(expanded_formats, 15u);
+    }
+    namespace
+    {
+        /**
+         * @brief Independently query every final page and the caller's affinity.
+         * @param data First byte of a dedicated execution allocation.
+         * @param bytes Live execution byte count, including the final partial page.
+         * @param node Required physical NUMA node.
+         * @param before Exact caller affinity captured before preparation.
+         */
+        void expectFinalPlacement(const void *data, size_t bytes, int node,
+                                  const cpu_set_t &before)
+        {
+            ASSERT_NE(data, nullptr);
+            ASSERT_GT(bytes, 0u);
+            const auto page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % page_size, 0u);
+            std::vector<void *> pages;
+            for (size_t offset = 0; offset < bytes; offset += page_size)
+                pages.push_back(const_cast<uint8_t *>(static_cast<const uint8_t *>(data)) + offset);
+            std::vector<int> nodes(pages.size(), -1);
+            ASSERT_EQ(move_pages(0, pages.size(), pages.data(), nullptr, nodes.data(), 0), 0);
+            for (size_t index = 0; index < nodes.size(); ++index)
+                ASSERT_EQ(nodes[index], node) << "page " << index;
+            cpu_set_t after{};
+            ASSERT_EQ(sched_getaffinity(0, sizeof(after), &after), 0);
+            EXPECT_TRUE(CPU_EQUAL(&before, &after));
+        }
+    }
+
+    TEST(CPUNativeVNNIWeightPacking, FinalNUMAStorageCoversEveryCodebookAndArchive)
+    {
+        if (numa_available() < 0)
+            GTEST_SKIP() << "NUMA page-query support is unavailable";
+        ScopedOMPThreadCount workers(4);
+        cpu_set_t before{};
+        ASSERT_EQ(sched_getaffinity(0, sizeof(before), &before), 0);
+        for (int node = 0; node <= numa_max_node(); ++node)
+        {
+            if (!numa_bitmask_isbitset(numa_all_nodes_ptr, node))
+                continue;
+            SCOPED_TRACE(node);
+            const auto placement = CPUWeightStoragePlacement::onNode(node);
+            for (const auto &format : native_vnni_formats::kAllSourceFormats)
+            {
+                SCOPED_TRACE(std::string(format.quant_type));
+                auto source = createSourceTensor(format.quant_type, {67, 544});
+                CPUNativeVNNIPackedWeights reference;
+                ASSERT_TRUE(packWeightsCPUNativeVNNI(source.get(), reference));
+                auto engine = KernelFactory::prepareExpertGemmLocal(
+                    source.get(), DeviceId::cpu(), KernelFactory::GemmPreparationKind::AUTO, placement);
+                auto *native = dynamic_cast<CPUNativeVNNIGemmKernel *>(engine.get());
+                ASSERT_NE(native, nullptr);
+                const auto &packed = native->packedWeights();
+                EXPECT_EQ(packed.native_interleaved.storageKind(),
+                          AlignedVector<uint8_t>::StorageKind::AnonymousPageMapping);
+                expectIdenticalBytes(reference.native_interleaved, packed.native_interleaved,
+                                     "NUMA preparation changed native bytes");
+                expectFinalPlacement(packed.native_interleaved.data(),
+                                     packed.native_interleaved.size(), node, before);
+
+                // The archive path must establish placement before its one copy,
+                // not allocate arbitrary heap pages and attempt migration later.
+                CPUPackedWeights wire_owner(std::move(reference));
+                const auto blob = packed_weights_serialization::serialize(wire_owner);
+                ASSERT_FALSE(blob.empty());
+                auto received = KernelFactory::createExpertGemmFromTransferBlob(
+                    blob.data(), blob.size(), placement);
+                auto *received_native = dynamic_cast<CPUNativeVNNIGemmKernel *>(received.get());
+                ASSERT_NE(received_native, nullptr);
+                const auto &arrived = received_native->packedWeights().native_interleaved;
+                expectIdenticalBytes(packed.native_interleaved, arrived, "archive changed native bytes");
+                expectFinalPlacement(arrived.data(), arrived.size(), node, before);
+            }
+        }
+    }
+
+    TEST(CPUNativeVNNIWeightPacking, FinalNUMAStoragePreservesAllFloatingPointFormats)
+    {
+        if (numa_available() < 0)
+            GTEST_SKIP() << "NUMA page-query support is unavailable";
+        cpu_set_t before{};
+        ASSERT_EQ(sched_getaffinity(0, sizeof(before), &before), 0);
+        using Factory = llaminar2::test::TestTensorFactory;
+        for (int node = 0; node <= numa_max_node(); ++node)
+        {
+            if (!numa_bitmask_isbitset(numa_all_nodes_ptr, node))
+                continue;
+            for (auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+            {
+                SCOPED_TRACE(node);
+                SCOPED_TRACE(static_cast<int>(type));
+                std::shared_ptr<TensorBase> source;
+                if (type == TensorType::FP16) source = Factory::createFP16Random({67, 544});
+                if (type == TensorType::BF16) source = Factory::createBF16Random({67, 544});
+                if (type == TensorType::FP32) source = Factory::createFP32Random({67, 544});
+                ASSERT_NE(source, nullptr);
+                std::vector<uint8_t> expected(source->size_bytes());
+                std::memcpy(expected.data(), source->raw_data(), expected.size());
+                auto engine = KernelFactory::prepareExpertGemmLocal(
+                    source, DeviceId::cpu(), KernelFactory::GemmPreparationKind::AUTO,
+                    CPUWeightStoragePlacement::onNode(node));
+                ASSERT_NE(engine, nullptr);
+                ContiguousFloatingPointWeightDescriptor final{};
+                ASSERT_TRUE(engine->exportContiguousFloatingPointWeights(final));
+                ASSERT_TRUE(final.valid());
+                EXPECT_EQ(final.type, type);
+                EXPECT_NE(final.data, source->raw_data());
+                source.reset(); // The independent execution owner survives loader retirement.
+                ASSERT_EQ(final.bytes, expected.size());
+                EXPECT_EQ(std::memcmp(final.data, expected.data(), final.bytes), 0);
+                expectFinalPlacement(final.data, final.bytes, node, before);
+            }
+        }
+    }
+
+    TEST(CPUNativeVNNIWeightPacking, FinalNUMAStorageConcurrentHugePageCandidates)
+    {
+        if (numa_available() < 0)
+            GTEST_SKIP() << "NUMA page-query support is unavailable";
+        // Model-sized projections cross the allocator's transparent-huge-page
+        // threshold. Concurrent faults exercise a different page lifecycle from
+        // the small all-codebook fixtures above. All owners remain live until
+        // their round completes, then are retired together before the next round.
+        constexpr int workers = 8;
+        std::barrier round(workers);
+        std::vector<std::jthread> threads;
+        for (int worker = 0; worker < workers; ++worker)
+        {
+            threads.emplace_back([&, worker] {
+                const int node = worker % (numa_max_node() + 1);
+                for (int iteration = 0; iteration < 16; ++iteration)
+                {
+                    round.arrive_and_wait();
+                    AlignedVector<uint8_t> storage;
+                    EXPECT_NO_THROW({
+                        storage = CPUWeightStoragePlacement::onNode(node)
+                            .allocate<uint8_t>(4 * 1024 * 1024 + worker * 4096);
+                        EXPECT_NE(storage.data(), nullptr);
+                    });
+                    round.arrive_and_wait();
+                }
+            });
+        }
+    }
+
+    TEST(CPUNativeVNNIWeightPacking, FinalNUMAStorageRejectsUnavailableNodeBeforePublication)
+    {
+        if (numa_available() < 0)
+            GTEST_SKIP() << "NUMA page-query support is unavailable";
+        cpu_set_t before{}, after{};
+        ASSERT_EQ(sched_getaffinity(0, sizeof(before), &before), 0);
+        auto source = createSourceTensor("Q8_0", {67, 544});
+        EXPECT_THROW(KernelFactory::prepareExpertGemmLocal(
+            source.get(), DeviceId::cpu(), KernelFactory::GemmPreparationKind::AUTO,
+            CPUWeightStoragePlacement::onNode(numa_max_node() + 1)), std::runtime_error);
+        ASSERT_EQ(sched_getaffinity(0, sizeof(after), &after), 0);
+        EXPECT_TRUE(CPU_EQUAL(&before, &after));
     }
 } // namespace llaminar2::cpu::native_vnni::test

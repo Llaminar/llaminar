@@ -1,6 +1,6 @@
 /**
  * @file Test__Qwen36MoE_SingleDevice_Parity.cpp
- * @brief Single-device Qwen3.6 MoE parity tests (CPU, CUDA, ROCm)
+ * @brief Single-device Qwen3.6 MoE and Ornith fine-tune production parity.
  *
  * The shared typed matrix expands MTP off, fixed depths 1/2/3/15, and dynamic
  * depth while every case proves fresh, full, and partial prefix restore. Qwen3.6
@@ -14,6 +14,7 @@
 
 #include "../qwen35moe/Qwen35MoEParityTestBase.h"
 #include "Qwen36ModelParityDefinitions.h"
+#include "Ornith15ModelParityDefinitions.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
 
@@ -56,7 +57,7 @@ namespace
                     qwen36MoESingleDeviceThresholds()),
             };
             std::vector<ModelParityCase> expanded;
-            for (const auto &definition : definitions)
+            for (const auto &definition : withOrnith15CertificationModels(definitions))
             {
                 auto definition_cases =
                     expandModelParityDefinition(definition);

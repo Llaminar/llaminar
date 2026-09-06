@@ -160,11 +160,14 @@ class CheckRunner:
     def __init__(self, tag: str) -> None:
         self.tag = tag
         self.failures: list[str] = []
+        self.results: list[dict[str, Any]] = []
 
     def pass_(self, name: str, detail: str) -> None:
+        self.results.append({"name": name, "passed": True, "detail": detail})
         print(f"PASS [{self.tag}] {name}: {detail}", flush=True)
 
     def fail(self, name: str, detail: str) -> None:
+        self.results.append({"name": name, "passed": False, "detail": detail})
         self.failures.append(f"{name}: {detail}")
         print(f"FAIL [{self.tag}] {name}: {detail}", flush=True)
 
@@ -611,9 +614,12 @@ def build_multi_needle_prompt(
                 break
         if not inserted:
             code = deterministic_code("LCJSON-FILL", index)
-            lines.append(
-                f"Ledger item {index:04d}: filler code {code}; phase stable; checksum {7000 + index}."
-            )
+            # The shared record-count policy is calibrated for audit records.
+            # A shorter multi-needle-only filler used the same count but fell
+            # below the mandatory prompt-token floor (3587 vs 4096 on Qwen3.8).
+            # Use the same distractor geometry as single-needle recall; never
+            # weaken the server-reported token-length assertion.
+            lines.append(make_audit_record(index, code, "LCJSON-FILL"))
     lines.extend(
         [
             "Return exactly one minified JSON object and no prose.",
@@ -1084,6 +1090,20 @@ def main(argv: list[str]) -> int:
     runner.run("cache-reset probe", lambda: run_cache_reset_probe(args, sentinels))
     runner.run("valid near-boundary context", lambda: run_valid_boundary(args, settings))
     runner.run("oversized context rejection", lambda: run_oversized_boundary(args))
+
+    # A shell exit code alone cannot prove the full helper actually ran.
+    # Preserve per-scenario positive and negative evidence for certification.
+    artifact_dir = os.environ.get("LLAMINAR_E2E_LONG_CONTEXT_ARTIFACT_DIR")
+    if artifact_dir:
+        path = pathlib.Path(artifact_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "long_context_results.json").write_text(json.dumps({
+            "schema": 1, "tier": args.tier, "context_length": args.context_length,
+            "minimum_prompt_tokens": args.min_prompt_tokens,
+            "generation_tokens": args.long_max_tokens,
+            "complete": len(runner.results) == 8,
+            "results": runner.results,
+        }, indent=2) + "\n", encoding="utf-8")
 
     if runner.failures:
         print(f"FAIL [{args.tag}] summary: {len(runner.failures)} check(s) failed", flush=True)

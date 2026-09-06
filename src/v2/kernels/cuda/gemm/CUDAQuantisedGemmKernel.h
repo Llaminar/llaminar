@@ -349,6 +349,27 @@ namespace llaminar2
                 int m, int n = 0, int k = 0) const override;
 
             /**
+             * @brief Add compact-decode scratch for concurrent grouped projections.
+             *
+             * MTP verifier rows preserve the canonical M=1 reduction order for
+             * every row. Projections assigned to distinct persistent streams
+             * therefore need disjoint K-partial storage, just as ordinary M=1
+             * fused decode does. This declaration reserves only the widest
+             * projection assigned to each side stream; stream zero continues
+             * to use the ordinary `GEMV_KPAR_PARTIALS` arena.
+             *
+             * @param requirements Aggregate fused-stage workspace contract.
+             * @param m Captured grouped-verifier row capacity.
+             * @param projection_columns Ordered output width of each projection.
+             * @param k Shared input width.
+             */
+            void appendFusedProjectionWorkspaceRequirements(
+                WorkspaceRequirements &requirements,
+                int m,
+                std::span<const int> projection_columns,
+                int k) const override;
+
+            /**
              * @brief Bind workspace manager for managed mode
              *
              * After binding, the kernel uses pre-allocated buffers from the

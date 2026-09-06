@@ -1,6 +1,10 @@
 /**
  * @file Test__MoEOverlayDeviceTransportProtocol.cpp
  * @brief Device-free proof of the device-authority/host-transport boundary.
+ *
+ * Synthetic mapped records exercise authentication and publication ordering
+ * without starting a device. Diagnostic action-entry observations must never
+ * stand in for the dedicated preparation, commit, or completion receipts.
  */
 
 #include <gtest/gtest.h>
@@ -166,6 +170,70 @@ namespace llaminar2
         };
     } // namespace
 
+    /**
+     * A follower timeout must identify a remote participant's missing receipt.
+     * Action-entry words are observation only: describing them cannot advance
+     * either group's dedicated preparation receipt.
+     */
+    TEST(MoEOverlayDeviceTransportProtocol,
+         LifecycleDiagnosticIncludesRemoteParticipantsWithoutAdvancingThem)
+    {
+        Fixture fixture;
+        auto follower_group = fixture.groups[0];
+        follower_group.group_id = 1u;
+        auto follower_participants = fixture.participant_records;
+        for (auto &participant : follower_participants)
+        {
+            participant.group_id = 1u;
+            participant.participant_id += 2u;
+            participant.observed_action = static_cast<std::uint32_t>(
+                MoEOverlayDeviceControllerAction::AcknowledgePrepared);
+            participant.observed_action_transaction = 28u;
+            participant.prepared_transaction = 28u;
+        }
+        fixture.participant_records[0].observed_action =
+            static_cast<std::uint32_t>(
+                MoEOverlayDeviceControllerAction::ApplyRuntimeCandidate);
+        fixture.participant_records[0].observed_action_transaction = 28u;
+        fixture.participant_records[0].prepared_transaction = 27u;
+        fixture.layout.group_count = 2u;
+        fixture.layout.participant_count = 4u;
+        fixture.transport.group_id = 1u;
+        fixture.binding.group_id = 1;
+        fixture.binding.root_world_rank = 1;
+        fixture.binding.group_record_count = 2u;
+        fixture.binding.group_records[1] = &follower_group;
+        fixture.binding.topology_participant_records[1] =
+            follower_participants.data();
+        fixture.binding.topology_participant_record_counts[1] =
+            follower_participants.size();
+        fixture.binding.participant_records = follower_participants.data();
+        ASSERT_TRUE(fixture.binding.valid());
+        MoEOverlayDeviceTransportProtocol transport(fixture.binding);
+
+        const auto description = transport.describeLifecycle();
+        EXPECT_NE(description.find("participants=[group=0{0:status="),
+                  std::string::npos) << description;
+        EXPECT_NE(description.find("group=1{2:status="), std::string::npos)
+            << description;
+        EXPECT_NE(description.find("entry_transaction=28,snapshot=0,prepared=27"),
+                  std::string::npos) << description;
+        EXPECT_NE(description.find("entry_transaction=28,snapshot=0,prepared=28"),
+                  std::string::npos) << description;
+        EXPECT_EQ(fixture.participant_records[0].prepared_transaction, 27u);
+        EXPECT_EQ(follower_participants[0].prepared_transaction, 28u);
+        EXPECT_EQ(fixture.groups[0].prepared_transaction, 0u);
+        EXPECT_EQ(follower_group.prepared_transaction, 0u);
+
+        // Missing topology lanes are rejected before diagnostic traversal.
+        fixture.binding.topology_participant_records[0] = nullptr;
+        EXPECT_THROW(
+            MoEOverlayDeviceTransportProtocol{fixture.binding},
+            std::invalid_argument);
+        fixture.groups[0].topology_fingerprint = 0u;
+        EXPECT_EQ(transport.describeLifecycle(), "group=1,binding=invalid");
+    }
+
     TEST(MoEOverlayDeviceTransportProtocol,
          PhysicalEdgesCannotAdvanceBeforeDeviceAuthoredPhases)
     {
@@ -187,6 +255,20 @@ namespace llaminar2
         EXPECT_EQ(acquired.batch.header.transaction_id, transaction);
         EXPECT_FALSE(transport.commitRequested(acquired.batch));
         EXPECT_FALSE(transport.preparationReady(acquired.batch));
+
+        // A started (or apparently completed) action is diagnostic evidence,
+        // not permission to consume an unpublished runtime or reuse its inbox.
+        for (auto &participant : fixture.participant_records)
+        {
+            participant.observed_action = static_cast<std::uint32_t>(
+                MoEOverlayDeviceControllerAction::CompleteDynamicRetirement);
+            participant.observed_action_transaction = transaction;
+        }
+        EXPECT_FALSE(transport.preparationReady(acquired.batch));
+        EXPECT_FALSE(transport.commitRequested(acquired.batch));
+        EXPECT_FALSE(transport.transactionComplete(acquired.batch));
+        EXPECT_NE(transport.describeLifecycle().find("entered_action="),
+                  std::string::npos);
 
         std::string error;
         ASSERT_TRUE(transport.publishPrepared(acquired.batch, &error)) << error;
@@ -296,6 +378,59 @@ namespace llaminar2
         EXPECT_TRUE(transport.allGroupsPublished(acquired.batch));
         EXPECT_TRUE(transport.allGroupsRetired(acquired.batch));
         EXPECT_TRUE(transport.transactionComplete(acquired.batch));
+    }
+
+    /**
+     * Completion does not imply that every transport worker acquired an empty
+     * command. Opening the next snapshot must preserve that immutable command
+     * while publishing the next transaction's independent phase intent.
+     */
+    TEST(MoEOverlayDeviceTransportProtocol,
+         NextSnapshotRetainsUnacquiredEmptyCommandAndIndependentPhase)
+    {
+        Fixture fixture;
+        MoEOverlayDeviceTransportProtocol transport(fixture.binding);
+        const auto first = fixture.device.beginTransaction(
+            MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
+            MoEOverlayDeviceDemandPhase::Prefill);
+        ASSERT_TRUE(first.has_value());
+        ASSERT_TRUE(fixture.device.publishGroupSnapshot(0u, *first, 0x9911u, 64u));
+        ASSERT_TRUE(fixture.device.publishCommand(
+            *first, 0u, moeOverlayCommandDigestSeed(0u), 0u, 0u, 0u, 0u));
+        const auto sealed = fixture.command;
+
+        // Complete the CPU specification without acquiring the host transport
+        // view. The captured device empty-policy path reaches the same terminal
+        // receipt directly, so a slow host is allowed to arrive after it.
+        ASSERT_TRUE(fixture.device.acknowledgePrepared(0u, *first));
+        ASSERT_TRUE(fixture.device.beginCommit(*first));
+        ASSERT_TRUE(fixture.device.acknowledgePublished(0u, *first));
+        ASSERT_TRUE(fixture.device.publishAdmission(*first));
+        ASSERT_TRUE(fixture.device.beginDynamicRetirement(*first));
+        ASSERT_TRUE(fixture.device.acknowledgeRetired(0u, *first, 7u));
+        ASSERT_TRUE(fixture.device.completeDynamicRetirement(*first));
+        const auto next = fixture.device.beginTransaction(
+            MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
+            MoEOverlayDeviceDemandPhase::Decode);
+        ASSERT_TRUE(next.has_value());
+        ASSERT_FALSE(fixture.device.allSnapshotsReady(*next));
+
+        const auto acquired = transport.tryAcquire(0u);
+        ASSERT_EQ(acquired.status, MoEOverlayDeviceTransportAcquireStatus::Ready)
+            << acquired.error;
+        EXPECT_EQ(acquired.batch.header.transaction_id, *first);
+        EXPECT_EQ(acquired.batch.header.demand_phase, sealed.demand_phase);
+        EXPECT_EQ(acquired.batch.header.command_digest, sealed.command_digest);
+        EXPECT_TRUE(transport.transactionComplete(acquired.batch));
+
+        std::uint64_t observed = 0u;
+        auto kind = MoEOverlayDeviceControllerTransactionKind::Invalid;
+        auto phase = MoEOverlayDeviceDemandPhase::Invalid;
+        ASSERT_TRUE(transport.snapshotTransactionAfter(*first, &observed, &kind, &phase));
+        EXPECT_EQ(observed, *next);
+        EXPECT_EQ(phase, MoEOverlayDeviceDemandPhase::Decode);
+        EXPECT_EQ(transport.tryAcquire(*first).status,
+                  MoEOverlayDeviceTransportAcquireStatus::Waiting);
     }
 
     TEST(MoEOverlayDeviceTransportProtocol,

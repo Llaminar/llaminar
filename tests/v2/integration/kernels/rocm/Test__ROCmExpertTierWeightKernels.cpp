@@ -611,6 +611,7 @@ namespace llaminar2
                 .device = device,
                 .staging = staging[0],
                 .execution = execution,
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "rocm_shared_execution_first",
                 .perf_device = "rocm:0",
             });
@@ -618,6 +619,7 @@ namespace llaminar2
                 .device = device,
                 .staging = staging[1],
                 .execution = execution,
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "rocm_shared_execution_second",
                 .perf_device = "rocm:0",
             });
@@ -1051,6 +1053,7 @@ namespace llaminar2
                                      DeviceId::rocm(0),
                                      "rocm_tier_round_trip")
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "rocm_tier_round_trip",
                 .perf_device = "rocm:0",
             });
@@ -1381,6 +1384,7 @@ namespace llaminar2
                                          DeviceId::rocm(device_ordinal),
                                          "rocm_secondary_device_remote_projection")
                                      .front(),
+                    .progress = BackgroundTransferProgressBinding::nativeStream(),
                     .lane_name = "rocm_secondary_device_remote_projection",
                     .perf_device = "rocm:1",
                 });
@@ -1475,6 +1479,7 @@ namespace llaminar2
                                      DeviceId::rocm(0),
                                      "rocm_floating_tier_round_trip")
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "rocm_floating_tier_round_trip",
                 .perf_device = "rocm:0",
             });
@@ -1688,6 +1693,7 @@ namespace llaminar2
                                          DeviceId::rocm(0),
                                          "rocm_remote_q51_roundtrip")
                                      .front(),
+                    .progress = BackgroundTransferProgressBinding::nativeStream(),
                     .lane_name = "rocm_remote_q51_roundtrip",
                     .perf_device = "rocm:0",
                 });
@@ -1954,6 +1960,7 @@ namespace llaminar2
                                      DeviceId::rocm(0),
                                      "rocm_asymmetric_promotion_execution")
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "rocm_asymmetric_promotion_execution",
                 .perf_device = "rocm:0",
             });
@@ -2379,6 +2386,7 @@ namespace llaminar2
                                      DeviceId::rocm(0),
                                      "rocm_inference_overlap")
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "rocm_inference_overlap",
                 .perf_device = "rocm:0",
             });

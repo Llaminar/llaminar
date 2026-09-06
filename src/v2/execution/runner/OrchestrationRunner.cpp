@@ -3302,6 +3302,42 @@ namespace llaminar2
                     "[PhysicalMemoryAuthority] ready-for-inference attestation:\n"
                     << physical_memory_authority_
                            ->rankAttestationSummary());
+                if (PerfStatsCollector::isDomainEnabled("physical_memory"))
+                {
+                    // Export the authority's own typed proof, not a new RSS or
+                    // model-file-size budget. Lazy owner pools need not be
+                    // fully materialized, but every live byte must remain
+                    // inside its admitted/reserved owner envelope.
+                    for (const auto &bom : physical_memory_authority_
+                                               ->admission()->plan().resources())
+                    {
+                        if (bom.resource().world_rank !=
+                            physical_memory_authority_->worldRank())
+                            continue;
+                        PerfStatsCollector::addCounter(
+                            "physical_memory", "resource_admission", 1.0,
+                            "initialized", bom.resource().device.toString(),
+                            {{"rank", std::to_string(bom.resource().world_rank)},
+                             {"incremental_bytes", std::to_string(bom.incrementalBytes())},
+                             {"available_bytes", std::to_string(bom.resource().admission_available_bytes)},
+                             {"owner_count", std::to_string(PhysicalMemoryBOM::ownerCount())}});
+                    }
+                    const auto attestation =
+                        physical_memory_authority_->rankAttestation();
+                    for (const auto &row : attestation)
+                    {
+                        PerfStatsCollector::addCounter(
+                            "physical_memory", "owner_attestation", 1.0,
+                            "initialized", row.identity.device.toString(),
+                            {{"rank", std::to_string(row.identity.world_rank)},
+                             {"owner", std::string(toString(row.owner))},
+                             {"planned_new_bytes", std::to_string(row.planned_new_bytes)},
+                             {"planned_resident_bytes", std::to_string(row.planned_resident_bytes)},
+                             {"materialized_new_bytes", std::to_string(row.materialized_new_bytes)},
+                             {"committed_new_bytes", std::to_string(row.committed_new_bytes)},
+                             {"adopted_resident_bytes", std::to_string(row.adopted_resident_bytes)}});
+                    }
+                }
             }
 
             initialized_ = true;
@@ -3486,6 +3522,16 @@ namespace llaminar2
                 }
             }
         }
+
+        /*
+         * The participant reset above drains its current MTP producer and
+         * relinquishes the runner-owned transaction lease. Release the outer
+         * orchestration lease while that participant's backend is still alive:
+         * DeviceResidentMTPTransactionState owns the exact CUDA/HIP event
+         * deleter, so carrying it across runner_.reset() would ask a retired
+         * runtime generation to destroy the event during member teardown.
+         */
+        retireMTPRequestContinuationState();
 
         /*
          * Release participant-local runners directly. Every GPU runner's RAII
@@ -3783,9 +3829,10 @@ namespace llaminar2
          */
         const auto buckets = overlay_schedule.enabled()
                                  ? overlay_schedule.bucket_rows
-                                 : prefillGraphBucketsAtOrBelowCapacity(
+                                 : rawPrefillGraphBucketsForResidentCapacity(
                                        exec.prefill_graph_bucket_sizes,
-                                       plan_.runtime.resident_graph_rows);
+                                       plan_.runtime.resident_graph_rows,
+                                       exec.prefill_graph_min_seq);
         const bool long_bucketed_prefill =
             exec.gpu_graphs &&
             exec.prefill_graph_buckets &&
@@ -14454,7 +14501,6 @@ namespace llaminar2
                                     verifier_base_checkpoint,
                                     outcome_handle,
                                     /*request_index=*/0,
-                                    /*main_forward_token_count=*/max_state_commit_rows,
                                     /*allow_speculative_discard=*/true);
                         }
                         if (!initial_shifted_commit_ok)
@@ -14888,7 +14934,6 @@ namespace llaminar2
                                     verifier_base_checkpoint,
                                     outcome_handle,
                                     /*request_index=*/0,
-                                    /*main_forward_token_count=*/max_state_commit_rows,
                                     /*allow_speculative_discard=*/true);
                         }
                         if (!initial_shifted_commit_ok)
@@ -16727,14 +16772,7 @@ namespace llaminar2
                 "clearCache() could not publish a fresh graph-native MoE "
                 "overlay collective generation");
         }
-        prefill_logits_ready_ = false;
-        ready_mtp_condition_.reset();
-        pending_mtp_condition_token_.reset();
-        pending_mtp_condition_params_.reset();
-        pending_mtp_condition_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_resident_state_.reset();
-        prelaunched_mtp_first_sidecar_params_.reset();
-        decode_transaction_planning_position_.reset();
+        retireMTPRequestContinuationState();
         device_generation_admission_.reset();
         device_generation_terminal_ledger_authoritative_ = false;
         device_generation_embedded_moe_maintenance_pending_ack_ = false;
@@ -16791,6 +16829,78 @@ namespace llaminar2
     {
         if (runner_)
             runner_->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+    }
+
+    RequestRuntimeSummary OrchestrationRunner::requestRuntimeSummary() const
+    {
+        // Every input is already owned by this request authority or surfaced
+        // in its validated terminal result. Never walk child/device state here.
+        RequestRuntimeSummary summary;
+        const MTPRuntimeConfig mtp = activeMTPRequestConfig();
+        summary.mtp_request.current_depth =
+            device_generation_terminal_ledger_authoritative_
+                ? mtp_stats_.current_depth
+                : (mtp_depth_controller_
+                       ? mtp_depth_controller_->currentDepth()
+                       : std::max(0, mtp.draft_tokens));
+        summary.mtp_request.min_depth =
+            mtp_depth_controller_ ? mtp_depth_controller_->minDepth()
+                                  : std::max(0, mtp.draft_tokens);
+        summary.mtp_request.max_depth =
+            mtp_depth_controller_ ? mtp_depth_controller_->maxDepth()
+                                  : std::max(0, mtp.draft_tokens);
+        summary.prefix_request = prefix_request_summary_;
+        summary.mtp_request.enabled = mtp.enabled;
+        summary.mtp_request.bypassed = mtp_bypassed_;
+        summary.mtp_request.bypass_reason = mtp_bypass_reason_;
+        summary.mtp_request.verify_mode = mtpVerifyModeToString(mtp.verify_mode);
+        summary.mtp_request.stochastic_verify =
+            mtp.verify_mode == MTPVerifyMode::SpeculativeSampling;
+        summary.mtp_request.adaptive_depth_enabled =
+            mtp.depth_policy.mode != MTPDepthPolicyMode::Fixed;
+        summary.mtp_request.depth_policy_mode =
+            mtpDepthPolicyModeToString(mtp.depth_policy.mode);
+        summary.mtp_request.depth_policy_updates = mtp_stats_.depth_policy_updates;
+        if (device_generation_terminal_ledger_authoritative_)
+        {
+            /*
+             * Native generation owns every adaptive transition after admission.
+             * The terminal ledger currently exports aggregate transition counts,
+             * not a host-readable per-window decision enum.  Reporting the
+             * dormant host controller's reason beside the device-selected depth
+             * would manufacture a mixed-authority diagnostic.
+             */
+            summary.mtp_request.last_depth_policy_reason =
+                "device_terminal_ledger";
+        }
+        else if (mtp_depth_controller_)
+        {
+            summary.mtp_request.last_depth_policy_reason =
+                toString(mtp_depth_controller_->lastDecision().reason);
+        }
+        summary.mtp_request.draft_steps = mtp_stats_.draft_steps;
+        summary.mtp_request.accepted_tokens = mtp_stats_.accepted_tokens;
+        summary.mtp_request.rejected_tokens = mtp_stats_.rejected_tokens;
+        summary.mtp_request.rollbacks = mtp_stats_.rollbacks;
+        const uint64_t mtp_total_tokens = mtp_stats_.accepted_tokens + mtp_stats_.rejected_tokens;
+        summary.mtp_request.acceptance_rate =
+            mtp_total_tokens > 0
+                ? static_cast<double>(mtp_stats_.accepted_tokens) / static_cast<double>(mtp_total_tokens)
+                : 0.0;
+        summary.mtp_request.stochastic_accept_tests = mtp_stats_.stochastic_accept_tests;
+        summary.mtp_request.stochastic_accepts = mtp_stats_.stochastic_accepts;
+        summary.mtp_request.stochastic_residual_samples =
+            mtp_stats_.stochastic_residual_samples;
+        summary.mtp_request.stochastic_terminal_samples =
+            mtp_stats_.stochastic_terminal_samples;
+        summary.mtp_request.stochastic_acceptance_rate =
+            mtp_stats_.stochastic_accept_tests > 0
+                ? static_cast<double>(mtp_stats_.stochastic_accepts) /
+                      static_cast<double>(mtp_stats_.stochastic_accept_tests)
+                : 0.0;
+        summary.mtp_verifier_runs = mtp_stats_.verifier_runs;
+        summary.mtp_verifier_token_count = mtp_stats_.verifier_token_count;
+        return summary;
     }
 
     PrefixRuntimeStateSnapshot OrchestrationRunner::prefixStateProbe() const
@@ -16860,76 +16970,18 @@ namespace llaminar2
         snapshot.mtp_depth_policy_demotions = mtp_stats_.depth_policy_demotions;
         snapshot.mtp_depth_policy_observe_recommendations =
             mtp_stats_.depth_policy_observe_recommendations;
-        snapshot.mtp_current_depth =
-            device_generation_terminal_ledger_authoritative_
-                ? mtp_stats_.current_depth
-                : (mtp_depth_controller_
-                       ? mtp_depth_controller_->currentDepth()
-                       : std::max(0, mtp.draft_tokens));
-        snapshot.mtp_min_depth =
-            mtp_depth_controller_ ? mtp_depth_controller_->minDepth()
-                                  : std::max(0, mtp.draft_tokens);
-        snapshot.mtp_max_depth =
-            mtp_depth_controller_ ? mtp_depth_controller_->maxDepth()
-                                  : std::max(0, mtp.draft_tokens);
+        const auto request_summary = requestRuntimeSummary();
+        snapshot.mtp_current_depth = request_summary.mtp_request.current_depth;
+        snapshot.mtp_min_depth = request_summary.mtp_request.min_depth;
+        snapshot.mtp_max_depth = request_summary.mtp_request.max_depth;
         snapshot.prefill_chunk_schedules = prefill_chunk_stats_.schedules;
         snapshot.prefill_chunk_successful_schedules = prefill_chunk_stats_.successful_schedules;
         snapshot.prefill_chunks = prefill_chunk_stats_.chunks;
         snapshot.prefill_chunk_real_tokens = prefill_chunk_stats_.real_tokens;
         snapshot.prefill_chunk_padded_tokens = prefill_chunk_stats_.padded_tokens;
         snapshot.prefill_chunk_failures = prefill_chunk_stats_.failures;
-        snapshot.prefix_request = prefix_request_summary_;
-        snapshot.mtp_request.enabled = mtp.enabled;
-        snapshot.mtp_request.bypassed = mtp_bypassed_;
-        snapshot.mtp_request.bypass_reason = mtp_bypass_reason_;
-        snapshot.mtp_request.verify_mode = mtpVerifyModeToString(mtp.verify_mode);
-        snapshot.mtp_request.stochastic_verify =
-            mtp.verify_mode == MTPVerifyMode::SpeculativeSampling;
-        snapshot.mtp_request.adaptive_depth_enabled =
-            mtp.depth_policy.mode != MTPDepthPolicyMode::Fixed;
-        snapshot.mtp_request.depth_policy_mode =
-            mtpDepthPolicyModeToString(mtp.depth_policy.mode);
-        snapshot.mtp_request.current_depth = snapshot.mtp_current_depth;
-        snapshot.mtp_request.min_depth = snapshot.mtp_min_depth;
-        snapshot.mtp_request.max_depth = snapshot.mtp_max_depth;
-        snapshot.mtp_request.depth_policy_updates = mtp_stats_.depth_policy_updates;
-        if (device_generation_terminal_ledger_authoritative_)
-        {
-            /*
-             * Native generation owns every adaptive transition after admission.
-             * The terminal ledger currently exports aggregate transition counts,
-             * not a host-readable per-window decision enum.  Reporting the
-             * dormant host controller's reason beside the device-selected depth
-             * would manufacture a mixed-authority diagnostic.
-             */
-            snapshot.mtp_request.last_depth_policy_reason =
-                "device_terminal_ledger";
-        }
-        else if (mtp_depth_controller_)
-        {
-            snapshot.mtp_request.last_depth_policy_reason =
-                toString(mtp_depth_controller_->lastDecision().reason);
-        }
-        snapshot.mtp_request.draft_steps = mtp_stats_.draft_steps;
-        snapshot.mtp_request.accepted_tokens = mtp_stats_.accepted_tokens;
-        snapshot.mtp_request.rejected_tokens = mtp_stats_.rejected_tokens;
-        snapshot.mtp_request.rollbacks = mtp_stats_.rollbacks;
-        const uint64_t mtp_total_tokens = mtp_stats_.accepted_tokens + mtp_stats_.rejected_tokens;
-        snapshot.mtp_request.acceptance_rate =
-            mtp_total_tokens > 0
-                ? static_cast<double>(mtp_stats_.accepted_tokens) / static_cast<double>(mtp_total_tokens)
-                : 0.0;
-        snapshot.mtp_request.stochastic_accept_tests = mtp_stats_.stochastic_accept_tests;
-        snapshot.mtp_request.stochastic_accepts = mtp_stats_.stochastic_accepts;
-        snapshot.mtp_request.stochastic_residual_samples =
-            mtp_stats_.stochastic_residual_samples;
-        snapshot.mtp_request.stochastic_terminal_samples =
-            mtp_stats_.stochastic_terminal_samples;
-        snapshot.mtp_request.stochastic_acceptance_rate =
-            mtp_stats_.stochastic_accept_tests > 0
-                ? static_cast<double>(mtp_stats_.stochastic_accepts) /
-                      static_cast<double>(mtp_stats_.stochastic_accept_tests)
-                : 0.0;
+        snapshot.prefix_request = request_summary.prefix_request;
+        snapshot.mtp_request = request_summary.mtp_request;
         if (snapshot.architecture.empty() && model_ctx_)
         {
             snapshot.architecture = model_ctx_->architecture();
@@ -18208,7 +18260,7 @@ namespace llaminar2
                     const std::size_t auxiliary_executable_slot_count =
                         activation_graph_family_count +
                         mtp_graph_owner_plan
-                            .auxiliaryExecutableSlotCount();
+                            .generalAuxiliaryExecutableSlotCount();
                     /*
                      * Heterogeneous compilation records one child per
                      * authenticated layer frontier, then imports those children
@@ -18226,7 +18278,8 @@ namespace llaminar2
                                     ->authority_execution,
                                 model_graph_identity_count,
                                 model_graph_topology_variant_count,
-                                auxiliary_executable_slot_count);
+                                auxiliary_executable_slot_count,
+                                mtp_graph_owner_plan.boundedHelperExecutableSlotCount());
                     std::optional<MoEOverlayLocalCapacityPlannerResult>
                         local_capacity;
                     std::string local_capacity_error;
@@ -23079,10 +23132,17 @@ namespace llaminar2
         }
 
         const auto &execution = debugEnv().execution;
+        // Setup and request scheduling use the same raw-prompt ladder as
+        // ForwardExecutionEngine preflight. Merely clipping to arena capacity
+        // admitted a 64-row graph for a 39-token HTTP request even though the
+        // padded-bucket floor was 256, leaving an admitted input bank stranded
+        // when preflight rejected execution. Exact verifier/decode geometries
+        // remain independent of this raw-prompt coalescing policy.
         const std::vector<int> buckets =
-            prefillGraphBucketsAtOrBelowCapacity(
+            rawPrefillGraphBucketsForResidentCapacity(
                 execution.prefill_graph_bucket_sizes,
-                plan_.runtime.resident_graph_rows);
+                plan_.runtime.resident_graph_rows,
+                execution.prefill_graph_min_seq);
         ServingGraphFamilyMaterializationPlan family_plan{
             .prefill_bucket_rows = buckets,
             .prefill_pad_token_id = execution.prefill_graph_pad_token_id,
@@ -24793,6 +24853,25 @@ namespace llaminar2
                   << (reason && reason[0] ? std::string(" for ") + reason : std::string{}));
         runner_->resetInferenceState(
             InferenceStateResetRequest::requestBoundary(reason));
+    }
+
+    void OrchestrationRunner::retireMTPRequestContinuationState()
+    {
+        /*
+         * Clear lease-bearing values before their host companions. Although no
+         * caller can observe this synchronous transition halfway through, this
+         * order makes the performance-critical backend event lifetime explicit
+         * to readers and to custom shared-pointer deleters.
+         */
+        ready_mtp_condition_.reset();
+        pending_mtp_condition_resident_state_.reset();
+        prelaunched_mtp_first_sidecar_resident_state_.reset();
+
+        pending_mtp_condition_token_.reset();
+        pending_mtp_condition_params_.reset();
+        prelaunched_mtp_first_sidecar_params_.reset();
+        prefill_logits_ready_ = false;
+        decode_transaction_planning_position_.reset();
     }
 
     /**

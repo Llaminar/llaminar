@@ -1202,9 +1202,21 @@ namespace llaminar2::cpu::native_vnni
      * intentionally change a runtime regime from reusing a decision certified
      * for another regime.
      */
+    struct VerifierRowsPolicyGeometryKey
+    {
+        uint8_t codebook = 0;
+        int rows = 0;
+        int n = 0;
+        int k = 0;
+
+        /** @brief Compare full runtime dimensions, never truncated overlay bits. */
+        bool operator==(const VerifierRowsPolicyGeometryKey &) const = default;
+    };
+
+    /** @brief Thread-local decision authenticated against the complete geometry. */
     struct VerifierRowsPolicyCacheEntry
     {
-        uint64_t geometry_key = 0;
+        VerifierRowsPolicyGeometryKey geometry_key{};
         int threads = 0;
         int k_tiles = 0;
         generated::CPUNativeVNNIRuntimeISA runtime_isa =
@@ -1214,7 +1226,7 @@ namespace llaminar2::cpu::native_vnni
 
         /** Return true only for the complete certified runtime identity. */
         bool matches(
-            uint64_t expected_geometry_key,
+            const VerifierRowsPolicyGeometryKey &expected_geometry_key,
             int expected_threads,
             int expected_k_tiles,
             generated::CPUNativeVNNIRuntimeISA expected_runtime_isa) const
@@ -1230,21 +1242,25 @@ namespace llaminar2::cpu::native_vnni
      * @brief Hash one grouped-policy identity into the allocation-free cache.
      */
     inline size_t verifierRowsPolicyCacheIndex(
-        uint64_t geometry_key,
+        const VerifierRowsPolicyGeometryKey &geometry,
         int threads,
         int k_tiles,
         generated::CPUNativeVNNIRuntimeISA runtime_isa)
     {
         /*
-         * The generated ABI already packs N, K, M, and codebook into distinct
-         * byte ranges. Folding those ranges is both cheaper and better suited
-         * to this tiny direct-mapped table than a general-purpose avalanche
-         * hash with multiple 64-bit multiplications. Thread count and ISA are
-         * folded into the same low byte because each is part of cache identity.
+         * The generated overlay key is only a cheap hash here: its eight-bit
+         * M field cannot authenticate runtime prefill rows. Full dimensions
+         * above decide equality, so hash collisions only evict a cache entry.
+         * Fold high row bits too, keeping neighboring large-prefill geometries
+         * useful without allocation or a general-purpose hash table.
          */
+        const uint64_t geometry_key =
+            generated::packCPUNativeVNNIVerifierRowsPolicyKey(
+                geometry.codebook, geometry.rows, geometry.n, geometry.k);
         const uint64_t folded =
             geometry_key ^ (geometry_key >> 24) ^ (geometry_key >> 48) ^
             (geometry_key >> 56) ^
+            (static_cast<uint64_t>(static_cast<uint32_t>(geometry.rows)) >> 8) ^
             (static_cast<uint64_t>(static_cast<uint32_t>(threads)) << 1) ^
             (static_cast<uint64_t>(static_cast<uint32_t>(k_tiles)) << 9) ^
             (static_cast<uint64_t>(runtime_isa) << 7);
@@ -1315,9 +1331,8 @@ namespace llaminar2::cpu::native_vnni
                 "CPU NativeVNNI verifier rows require AVX2 or AVX512");
         }
 
-        const uint64_t geometry_key =
-            generated::packCPUNativeVNNIVerifierRowsPolicyKey(
-                packed.codebook_id, M, N, K);
+        const VerifierRowsPolicyGeometryKey geometry_key{
+            .codebook = packed.codebook_id, .rows = M, .n = N, .k = K};
         constexpr size_t cache_capacity = 256;
         static thread_local VerifierRowsPolicyCacheEntry most_recent;
         static thread_local std::array<

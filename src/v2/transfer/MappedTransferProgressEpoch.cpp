@@ -1,13 +1,14 @@
 /**
  * @file MappedTransferProgressEpoch.cpp
- * @brief Event-polled asynchronous DMA implementation for expert movement.
+ * @brief Event-polled asynchronous copy implementation for expert movement.
  *
  * Setup owns permanent topology command identities and a separately bounded
  * pool of background stream/event execution lanes. Maintenance
  * release-publishes a bounded device region, the exact GPU worker assigns it to
- * a free lane and enqueues a TransferEngine DMA, and a later non-blocking event
- * query release-publishes host completion. Inference graphs never capture,
- * launch, join, or wait for this maintenance scheduler.
+ * a free lane and enqueues a TransferEngine copy, and a later non-blocking event
+ * query acquires completion. CUDA also owns graph-bounded copy branches whose
+ * GPU cursor survives intervals: graph retirement never waits for a complete
+ * maintenance command. ROCm retains native asynchronous SDMA progress.
  */
 
 #include "MappedTransferProgressEpoch.h"
@@ -16,10 +17,12 @@
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <limits>
@@ -29,6 +32,111 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief One cache-owned CUDA interval with an explicit fork/close/join DAG.
+     *
+     * Only the primary graph opens/closes its private word. The worker holds no
+     * host lifetime ticket and releases partial claims before its terminal edge.
+     * Epoch storage outlives every captured pointer because the branch retains
+     * the epoch; the graph cache retires executables before releasing the branch.
+     */
+    class MappedTransferProgressEpoch::CapturedBranch final
+        : public IGraphCaptureAuxiliaryBranch
+    {
+    public:
+        /** @brief Prepare graph-only Open, worker and Close on the resource owner. */
+        explicit CapturedBranch(std::shared_ptr<MappedTransferProgressEpoch> epoch)
+            : epoch_(std::move(epoch))
+        {
+            auto &context = *epoch_->context_;
+            context.submitAndWait([&]
+            {
+                TransferEngine transfers;
+                interval_ = transfers.allocateDeviceTransferBuffer(sizeof(std::uint32_t), device());
+                // All source fragments are cold, graph-only recordings. They
+                // share one setup stream and consume no runtime queue at replay.
+                void *stream = context.getOrCreateAuxiliaryStream(
+                    epoch_->config_.name + "_captured_progress",
+                    GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance);
+                if (!stream)
+                    throw std::runtime_error("Mapped transfer branch has no setup stream");
+                for (std::size_t index = 0u; index < fragments_.size(); ++index)
+                {
+                    fragments_[index] = context.createGraphCapture(stream);
+                    if (!fragments_[index])
+                        throw std::runtime_error("Mapped transfer branch fragment allocation failed");
+                    ScopedBackendGraphCapture capture(
+                        context, *fragments_[index], "mapped transfer branch fragment");
+                    if (!capture.begin())
+                        throw std::runtime_error("Mapped transfer branch fragment recording failed");
+                    if (index == 1u)
+                        transfers.enqueueMappedTransferService(*epoch_->service_inbox_,
+                            *epoch_->service_cursors_, epoch_->maximumBytes(), interval_.get(),
+                            MappedTransferServiceRun::CapturedInterval, stream);
+                    else
+                        transfers.enqueueMappedTransferInterval(*interval_,
+                            index == 0u ? MappedTransferInterval::Open : MappedTransferInterval::Closed,
+                            stream);
+                    capture.finish();
+                }
+            });
+        }
+
+        /** @brief Retire sources only after the cache destroyed their native clones. */
+        ~CapturedBranch() override
+        {
+            epoch_->context_->submitAndWait([&]
+            {
+                for (auto &fragment : fragments_) fragment.reset();
+                interval_.reset();
+            });
+        }
+        /** @copydoc IGraphCaptureAuxiliaryBranch::authorityIdentity */
+        const void *authorityIdentity() const noexcept override { return epoch_.get(); }
+        /** @copydoc IGraphCaptureAuxiliaryBranch::device */
+        DeviceId device() const noexcept override { return epoch_->device(); }
+        /** @copydoc IGraphCaptureAuxiliaryBranch::name */
+        std::string_view name() const noexcept override { return epoch_->config_.name; }
+
+        /** @brief Decorate the final native body once, including all external waits. */
+        bool attach(IGPUGraphCapture &graph) noexcept override
+        {
+            if (state_ != AttachmentState::Prepared || isGraphCaptureActive())
+                return false;
+            try
+            {
+                if (!graph.appendParallelBranch({
+                        .open = *fragments_[0],
+                        .worker = *fragments_[1],
+                        .close = *fragments_[2]}))
+                    return false;
+                state_ = AttachmentState::Attached;
+                return true;
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR("[MappedTransferProgressEpoch] Parallel attachment failed: " << error.what());
+                return false;
+            }
+        }
+
+    private:
+        /** One cold attachment replaces paired, cross-thread capture flags/events. */
+        enum class AttachmentState { Prepared, Attached };
+        std::shared_ptr<MappedTransferProgressEpoch> epoch_;
+        std::shared_ptr<DeviceTransferBuffer> interval_;
+        std::array<std::unique_ptr<IGPUGraphCapture>, 3> fragments_;
+        AttachmentState state_ = AttachmentState::Prepared;
+    };
+
+    GraphCaptureAuxiliaryBranchFactory MappedTransferProgressEpoch::graphBranchFactory()
+    {
+        if (!config_.device.is_cuda()) return {};
+        return {.authority_identity = this, .device = device(),
+            .create = [epoch = shared_from_this()]
+            { return std::make_unique<CapturedBranch>(epoch); }};
+    }
+
     namespace
     {
         /** @return Stable human-readable completion error. */
@@ -108,7 +216,7 @@ namespace llaminar2
         {
             LOG_ERROR(
                 "[MappedTransferProgressSlot] Destroyed with an outstanding "
-                "DMA command at slot "
+                "copy command at slot "
                 << index_);
             std::terminate();
         }
@@ -142,6 +250,8 @@ namespace llaminar2
         pending_generation_ =
             std::exchange(other.pending_generation_, 0u);
         pending_ = std::exchange(other.pending_, false);
+        completed_generation_ = std::exchange(other.completed_generation_, 0u);
+        completed_device_nanoseconds_ = std::exchange(other.completed_device_nanoseconds_, std::nullopt);
     }
 
     bool MappedTransferProgressSlot::valid() const noexcept
@@ -153,7 +263,8 @@ namespace llaminar2
         const void *source,
         std::size_t source_capacity,
         std::size_t source_offset,
-        std::size_t bytes)
+        std::size_t bytes,
+        TransferProducerDependency dependency)
     {
         if (!valid())
             throw std::logic_error(
@@ -168,7 +279,7 @@ namespace llaminar2
         const std::uint64_t generation = ++next_generation_;
         pending_generation_ = epoch_->publish(
             index_, generation, MappedTransferDirection::DeviceToHost,
-            source, source_capacity, source_offset, bytes);
+            source, source_capacity, source_offset, bytes, dependency);
         pending_ = true;
         return pending_generation_;
     }
@@ -215,10 +326,29 @@ namespace llaminar2
             index_, pending_generation_, expected_bytes, error);
         if (result != MappedTransferProgress::Pending)
         {
+            if (result == MappedTransferProgress::Ready)
+            {
+                completed_generation_ = pending_generation_;
+                const auto measured = epoch_->completion(index_).device_active_nanoseconds;
+                completed_device_nanoseconds_ = measured
+                    ? std::optional<std::uint64_t>{measured} : std::nullopt;
+            }
+            else
+            {
+                completed_generation_ = 0u;
+                completed_device_nanoseconds_.reset();
+            }
             pending_ = false;
             pending_generation_ = 0u;
         }
         return result;
+    }
+
+    std::optional<std::uint64_t> MappedTransferProgressSlot::completedDeviceNanoseconds() const
+    {
+        if (!valid() || pending_ || !completed_generation_)
+            throw std::logic_error("Transfer timing requires an acquired successful completion");
+        return completed_device_nanoseconds_;
     }
 
     std::shared_ptr<MappedTransferProgressEpoch>
@@ -285,12 +415,19 @@ namespace llaminar2
                 context_->submitAndWait(
                     [this]
                     {
+                        // Teardown retains cursors until the last finite idle
+                        // pass retires, including a pass overtaken by a graph.
+                        if (idle_service_ == IdleServiceSubmission::InFlight)
+                        {
+                            context_->synchronizeEvent(execution_lanes_.front().terminal_event);
+                            idle_service_ = IdleServiceSubmission::Quiescent;
+                        }
                         for (const SlotRuntime &runtime : slot_runtimes_)
                         {
                             if (runtime.lifecycle == SlotLifecycle::InFlight)
                             {
                                 LOG_ERROR(
-                                    "[MappedTransferProgressEpoch] Teardown reached a live DMA on "
+                                    "[MappedTransferProgressEpoch] Teardown reached a live copy on "
                                     << config_.device.toString());
                                 std::terminate();
                             }
@@ -322,6 +459,8 @@ namespace llaminar2
                              * instance; this epoch owns only their identity. */
                             lane.stream = nullptr;
                         }
+                        service_cursors_.reset();
+                        service_inbox_.reset();
                     });
             }
         }
@@ -377,6 +516,32 @@ namespace llaminar2
                 }
             });
 
+        if (config_.device.is_cuda())
+        {
+            context_->submitAndWait([this]
+            {
+                // Map physical concurrency, never the permanent topology directory.
+                TransferEngine transfers;
+                const auto capacity = config_.execution_lane_capacity;
+                constexpr auto record_bytes = sizeof(MappedTransferProgressCommand) +
+                                              sizeof(MappedTransferProgressCompletion);
+                if (capacity > std::numeric_limits<std::size_t>::max() / record_bytes)
+                    throw std::overflow_error("Mapped transfer physical inbox extent overflowed");
+                const DeviceId devices[] = {config_.device};
+                service_inbox_ = transfers.allocateMappedHostRegion(capacity * record_bytes, devices);
+                service_cursors_ = transfers.allocateMappedTransferServiceCursors(
+                    capacity, config_.device, executionStream());
+                auto *const setup_event = execution_lanes_.front().terminal_event;
+                if (!context_->recordEventChecked(setup_event, executionStream()))
+                    throw std::runtime_error("Mapped transfer service setup event publication failed");
+                // CUDA capture cannot import an uncaptured event dependency.
+                // Cold construction returns only a ready service: join this
+                // exact initialization once, then reuse the event for idle
+                // submissions. No setup event is embedded in captured graphs.
+                context_->synchronizeEvent(setup_event);
+            });
+        }
+
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
             "mapped_transfer_progress_epochs_materialized",
@@ -391,7 +556,7 @@ namespace llaminar2
               std::to_string(config_.execution_streams.size())},
              {"maximum_bytes", std::to_string(config_.maximum_bytes)},
              {"stream_class", "background_maintenance"},
-             {"copy_mechanism", "async_dma"},
+             {"copy_mechanism", config_.device.is_cuda() ? "graph_bounded_service" : "native_sdma"},
              {"scope", "node_local"},
              {"blocking", "false"}});
     }
@@ -403,10 +568,10 @@ namespace llaminar2
     {
         if (!mapped_region || !mapped_region->isBound() ||
             !mapped_region->hasDevice(config_.device) ||
-            !mapped_region->contains(0u, config_.maximum_bytes))
+            mapped_region->sizeBytes() == 0u)
         {
             throw std::invalid_argument(
-                "Mapped transfer-progress slot requires a sufficiently large region registered to its exact GPU");
+                "Mapped transfer-progress slot requires a nonempty bounded region registered to its exact GPU");
         }
 
         std::lock_guard<std::mutex> lock(reservation_mutex_);
@@ -506,7 +671,8 @@ namespace llaminar2
         const void *device_region,
         std::size_t device_capacity,
         std::size_t device_offset,
-        std::size_t bytes)
+        std::size_t bytes,
+        TransferProducerDependency dependency)
     {
         if (generation == 0u || !device_region || bytes == 0u ||
             bytes > config_.maximum_bytes ||
@@ -535,6 +701,9 @@ namespace llaminar2
                 throw std::logic_error(
                     "Mapped transfer-progress publication contradicts its permanent slot direction or lifecycle");
             }
+            if (!runtime.mapped_region->contains(0u, bytes))
+                throw std::invalid_argument(
+                    "Mapped transfer-progress command exceeds its exclusive mapped slot extent");
 
             MappedTransferProgressCommand &entry = command(index);
             const std::uint64_t completed =
@@ -584,18 +753,17 @@ namespace llaminar2
 
             runtime.launched_generation = 0u;
             runtime.execution_lane_index = static_cast<std::size_t>(-1);
+            runtime.progress_watch.published(steadyNanoseconds());
+            runtime.dependency = dependency;
             runtime.lifecycle = SlotLifecycle::Published;
             previous_outstanding = outstanding_commands_.fetch_add(
                 1u, std::memory_order_acq_rel);
         }
         if (previous_outstanding == 0u)
         {
-            active_batch_started_ns_.store(
-                steadyNanoseconds(), std::memory_order_release);
-            last_pending_warning_ns_.store(0u, std::memory_order_release);
             /* A batch boundary occurs for every reusable transfer generation.
              * Keep this per-buffer traffic at TRACE so stress campaigns do
-             * not turn observability into part of the DMA critical path. */
+             * not turn observability into part of the copy critical path. */
             LOG_TRACE(
                 "[MappedTransferProgressEpoch] Command batch became active"
                 << " device=" << config_.device.toString()
@@ -639,23 +807,17 @@ namespace llaminar2
                 .load(std::memory_order_acquire);
         if (completed < generation)
         {
-            constexpr std::uint64_t kPendingWarningIntervalNs =
-                5'000'000'000ull;
-            const std::uint64_t started = active_batch_started_ns_.load(
-                std::memory_order_acquire);
-            const std::uint64_t now = steadyNanoseconds();
-            std::uint64_t last = last_pending_warning_ns_.load(
-                std::memory_order_acquire);
-            if (started != 0u && now >= started + kPendingWarningIntervalNs &&
-                (last == 0u || now >= last + kPendingWarningIntervalNs) &&
-                last_pending_warning_ns_.compare_exchange_strong(
-                    last, now, std::memory_order_acq_rel,
-                    std::memory_order_acquire))
+            // Each slot owns its publication timestamp. A busy queue's lifetime
+            // must not be reported as the latency of a newly submitted command.
+            std::lock_guard<std::mutex> lock(reservation_mutex_);
+            SlotRuntime &runtime = slot_runtimes_[index];
+            const auto now_ns = steadyNanoseconds();
+            if (const auto age = runtime.progress_watch.pending(now_ns))
             {
-                std::lock_guard<std::mutex> lock(reservation_mutex_);
-                const SlotRuntime &runtime = slot_runtimes_[index];
+                const auto query_age =
+                    runtime.progress_watch.incompleteEventQueryAge(now_ns);
                 LOG_WARN(
-                    "[MappedTransferProgressEpoch] DMA command remains pending"
+                    "[MappedTransferProgressEpoch] copy command remains pending"
                     << " device=" << config_.device.toString()
                     << " authority=" << config_.name
                     << " slot=" << index
@@ -663,6 +825,11 @@ namespace llaminar2
                     << " direction=" << directionName(runtime.direction)
                     << " requested_generation=" << generation
                     << " completed_generation=" << completed
+                    << " command_pending_ns=" << *age
+                    << " native_not_ready_queries="
+                    << runtime.progress_watch.incompleteEventQueries()
+                    << " last_native_not_ready_age_ns="
+                    << (query_age ? std::to_string(*query_age) : "never_queried")
                     << " bytes=" << command(index).bytes
                     << " lifecycle="
                     << static_cast<unsigned>(runtime.lifecycle)
@@ -674,8 +841,8 @@ namespace llaminar2
                     << commands_published_.load(std::memory_order_relaxed)
                     << " completed="
                     << commands_completed_.load(std::memory_order_relaxed)
-                    << " dma_submissions="
-                    << dma_submissions_.load(std::memory_order_relaxed));
+                    << " copy_submissions="
+                    << copy_submissions_.load(std::memory_order_relaxed));
             }
             return MappedTransferProgress::Pending;
         }
@@ -706,10 +873,7 @@ namespace llaminar2
         };
         if (!lifecycle_valid || completed != generation)
         {
-            const bool batch_drained = finish();
-            if (batch_drained)
-                active_batch_started_ns_.store(
-                    0u, std::memory_order_release);
+            (void)finish();
             command_failures_.fetch_add(1u, std::memory_order_relaxed);
             if (error)
             {
@@ -725,15 +889,12 @@ namespace llaminar2
         if (transfer_error != MappedTransferProgressError::None ||
             result.completed_bytes != expected_bytes)
         {
-            const bool batch_drained = finish();
-            if (batch_drained)
-                active_batch_started_ns_.store(
-                    0u, std::memory_order_release);
+            (void)finish();
             command_failures_.fetch_add(1u, std::memory_order_relaxed);
             if (error)
             {
                 *error = std::string(
-                             "Mapped transfer-progress DMA command failed: ") +
+                             "Mapped transfer-progress copy command failed: ") +
                          progressErrorName(transfer_error);
             }
             return MappedTransferProgress::Failed;
@@ -745,7 +906,6 @@ namespace llaminar2
             result.completed_bytes, std::memory_order_relaxed);
         if (batch_drained)
         {
-            active_batch_started_ns_.store(0u, std::memory_order_release);
             /* Completion is generation-frequency traffic, not a rare
              * lifecycle summary. TRACE preserves diagnosis without making a
              * 256-generation integration proof sensitive to log formatting. */
@@ -792,7 +952,7 @@ namespace llaminar2
         try
         {
             /* This wait covers only the bounded CPU enqueue callback. It never
-             * waits for DMA or inference work on the device. */
+             * waits for copy or inference work on the device. */
             context_->submitAndWait(
                 [this, &submitted]
                 { submitted = launchOutstandingProgress(); });
@@ -844,7 +1004,7 @@ namespace llaminar2
         if (!context_ || !context_->ownsCurrentThread())
         {
             LOG_ERROR(
-                "[MappedTransferProgressEpoch] DMA submission is not on the exact device worker for "
+                "[MappedTransferProgressEpoch] copy submission is not on the exact device worker for "
                 << config_.device.toString());
             return false;
         }
@@ -854,9 +1014,20 @@ namespace llaminar2
         std::uint64_t submissions = 0u;
         TransferEngine transfer_engine;
         const auto begin = std::chrono::steady_clock::now();
+        // One timestamp per bounded worker pass is sufficient to distinguish
+        // actual native not-ready results from delayed host service. Logging
+        // consumes this observation without adding driver calls or GPU waits.
+        const auto observation_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                begin.time_since_epoch()).count());
 
         constexpr std::size_t no_index = static_cast<std::size_t>(-1);
         std::lock_guard<std::mutex> lock(reservation_mutex_);
+        auto *service_commands = service_inbox_
+            ? static_cast<MappedTransferProgressCommand *>(service_inbox_->mutableHostData()) : nullptr;
+        auto *service_completions = service_inbox_
+            ? reinterpret_cast<MappedTransferProgressCompletion *>(
+                service_commands + execution_lanes_.size()) : nullptr;
 
         /* Completion belongs to the execution lane, not the permanent command
          * slot. Query every busy lane once, then publish the matching slot's
@@ -897,10 +1068,21 @@ namespace llaminar2
             }
 
             bool ready = false;
-            if (!context_->queryEventChecked(lane.terminal_event, ready))
+            if (service_completions)
+            {
+                const auto completed = std::atomic_ref<std::uint64_t>(
+                    service_completions[lane_index].completed_generation).load(std::memory_order_acquire);
+                if (completed > lane.service_generation)
+                {
+                    LOG_ERROR("[MappedTransferProgressEpoch] Device service skipped an inbox generation");
+                    return false;
+                }
+                ready = completed == lane.service_generation;
+            }
+            else if (!context_->queryEventChecked(lane.terminal_event, ready))
             {
                 LOG_ERROR(
-                    "[MappedTransferProgressEpoch] DMA event query failed"
+                    "[MappedTransferProgressEpoch] copy event query failed"
                     << " device=" << config_.device.toString()
                     << " lane=" << lane_index
                     << " slot=" << slot_index
@@ -910,15 +1092,20 @@ namespace llaminar2
             }
             if (!ready)
             {
+                if (!service_completions)
+                    runtime.progress_watch.observedIncompleteEvent(observation_ns);
                 in_flight_observations_.fetch_add(
                     1u, std::memory_order_relaxed);
                 continue;
             }
 
             MappedTransferProgressCompletion &result = completion(slot_index);
-            result.completed_bytes = command(slot_index).bytes;
-            result.error = static_cast<std::uint32_t>(
-                MappedTransferProgressError::None);
+            result.completed_bytes = service_completions
+                ? service_completions[lane_index].completed_bytes : command(slot_index).bytes;
+            result.error = service_completions ? service_completions[lane_index].error
+                : static_cast<std::uint32_t>(MappedTransferProgressError::None);
+            result.device_active_nanoseconds = service_completions
+                ? service_completions[lane_index].device_active_nanoseconds : 0u;
             std::atomic_ref<std::uint64_t>(result.completed_generation)
                 .store(runtime.launched_generation, std::memory_order_release);
             runtime.execution_lane_index = no_index;
@@ -932,6 +1119,25 @@ namespace llaminar2
             SlotRuntime &runtime = slot_runtimes_[index];
             if (runtime.lifecycle != SlotLifecycle::Published)
                 continue;
+
+            // Source admission is independent of the service's native stream.
+            // Never publish readable addresses to a resident worker until the
+            // exact producer completed. Other independent slots still progress.
+            if (auto *producer = runtime.dependency.event())
+            {
+                bool producer_ready = false;
+                if (!context_->queryEventChecked(producer, producer_ready))
+                {
+                    LOG_ERROR("[MappedTransferProgressEpoch] Source producer event query failed"
+                              << " device=" << config_.device.toString()
+                              << " slot=" << index);
+                    all_ok = false;
+                    continue;
+                }
+                if (!producer_ready)
+                    continue;
+                runtime.dependency = TransferProducerDependency::published();
+            }
 
             MappedTransferProgressCommand &entry = command(index);
             const std::uint64_t generation =
@@ -998,36 +1204,54 @@ namespace llaminar2
             {
                 const std::size_t bytes =
                     static_cast<std::size_t>(entry.bytes);
-                if (runtime.direction ==
-                    MappedTransferDirection::DeviceToHost)
+                if (service_commands)
                 {
-                    transfer_engine.enqueuePersistentDeviceRegionToMappedHost(
-                        reinterpret_cast<const void *>(
-                            static_cast<std::uintptr_t>(entry.source_address)),
-                        bytes, 0u, *runtime.mapped_region, 0u, bytes,
-                        config_.device, lane.stream);
+                    if (lane.service_generation == std::numeric_limits<std::uint64_t>::max())
+                        throw std::overflow_error("Mapped transfer physical inbox generation overflowed");
+                    const auto inbox_generation = ++lane.service_generation;
+                    auto &inbox = service_commands[lane_index];
+                    const auto mapped = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(
+                        runtime.mapped_region->deviceAlias(config_.device)));
+                    inbox.generation_magic = mappedTransferProgressGenerationMagic(inbox_generation);
+                    inbox.generation_version = mappedTransferProgressGenerationVersion(inbox_generation);
+                    inbox.source_address = runtime.direction == MappedTransferDirection::HostToDevice
+                        ? mapped : entry.source_address;
+                    inbox.destination_address = runtime.direction == MappedTransferDirection::DeviceToHost
+                        ? mapped : entry.destination_address;
+                    inbox.bytes = entry.bytes;
+                    inbox.source_complement = ~inbox.source_address;
+                    inbox.destination_complement = ~inbox.destination_address;
+                    inbox.bytes_complement = ~inbox.bytes;
+                    // The GPU claims execution. CPU publication reserves only
+                    // immutable physical IO storage, never a queued-worker lock.
+                    std::atomic_ref<std::uint64_t>(inbox.generation)
+                        .store(inbox_generation, std::memory_order_release);
+                    ++submissions;
+                    continue;
                 }
-                else
-                {
-                    transfer_engine.enqueueMappedHostToPersistentDeviceRegion(
-                        *runtime.mapped_region, 0u,
-                        reinterpret_cast<void *>(
-                            static_cast<std::uintptr_t>(
-                                entry.destination_address)),
-                        bytes, 0u, bytes, config_.device, lane.stream);
-                }
+                // The typed lease includes setup-time function preparation.
+                // The backend avoids the native queue that can be occupied by
+                // peer-held inference. Terminal events and slot lifecycle remain
+                // exactly the same in both directions and on both backends.
+                const auto address = runtime.direction == MappedTransferDirection::DeviceToHost
+                    ? entry.source_address : entry.destination_address;
+                transfer_engine.enqueueBackgroundMappedCopy(
+                    config_.execution_streams[lane_index % config_.execution_streams.size()],
+                    runtime.direction,
+                    reinterpret_cast<void *>(static_cast<std::uintptr_t>(address)),
+                    bytes, 0u, *runtime.mapped_region, 0u, bytes);
                 if (!context_->recordEventChecked(
                         lane.terminal_event, lane.stream))
                 {
                     throw std::runtime_error(
-                        "could not record the exact DMA completion event");
+                        "could not record the exact copy completion event");
                 }
                 ++submissions;
             }
             catch (const std::exception &exception)
             {
                 LOG_ERROR(
-                    "[MappedTransferProgressEpoch] DMA enqueue failed"
+                    "[MappedTransferProgressEpoch] copy enqueue failed"
                     << " device=" << config_.device.toString()
                     << " slot=" << index
                     << " label=" << slot_labels_[index]
@@ -1039,7 +1263,7 @@ namespace llaminar2
             catch (...)
             {
                 LOG_ERROR(
-                    "[MappedTransferProgressEpoch] DMA enqueue threw a non-standard exception"
+                    "[MappedTransferProgressEpoch] copy enqueue threw a non-standard exception"
                     << " device=" << config_.device.toString()
                     << " slot=" << index
                     << " label=" << slot_labels_[index]);
@@ -1048,12 +1272,43 @@ namespace llaminar2
             }
         }
 
+        if (service_commands && observed_work)
+        {
+            // An idle pass and captured branches share the same GPU claims. A
+            // queued idle pass cannot exclude an already resident graph worker.
+            try
+            {
+                if (idle_service_ == IdleServiceSubmission::InFlight)
+                {
+                    bool ready = false;
+                    if (!context_->queryEventChecked(execution_lanes_.front().terminal_event, ready))
+                        throw std::runtime_error("Mapped transfer idle completion query failed");
+                    if (ready) idle_service_ = IdleServiceSubmission::Quiescent;
+                }
+                if (idle_service_ == IdleServiceSubmission::Quiescent &&
+                    std::any_of(execution_lanes_.begin(), execution_lanes_.end(),
+                        [](const ExecutionLaneRuntime &lane) { return lane.busy(); }))
+                {
+                    transfer_engine.enqueueMappedTransferService(*service_inbox_, *service_cursors_,
+                        maximumBytes(), nullptr, MappedTransferServiceRun::PublishedPass, executionStream());
+                    idle_service_ = IdleServiceSubmission::InFlight;
+                    if (!context_->recordEventChecked(execution_lanes_.front().terminal_event, executionStream()))
+                        throw std::runtime_error("Mapped transfer idle terminal publication failed");
+                }
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR("[MappedTransferProgressEpoch] Idle service submission failed: " << error.what());
+                all_ok = false;
+            }
+        }
+
         if (submissions != 0u)
         {
-            dma_submissions_.fetch_add(submissions, std::memory_order_relaxed);
+            copy_submissions_.fetch_add(submissions, std::memory_order_relaxed);
             PerfStatsCollector::addCounter(
                 "moe_overlay_residency",
-                "mapped_transfer_progress_epoch_dma_submissions",
+                "mapped_transfer_progress_epoch_copy_submissions",
                 static_cast<double>(submissions),
                 "maintenance",
                 config_.perf_device,
@@ -1063,7 +1318,7 @@ namespace llaminar2
                  {"execution_stream_capacity",
                   std::to_string(config_.execution_streams.size())},
                  {"stream_class", "background_maintenance"},
-                 {"copy_mechanism", "async_dma"},
+                 {"copy_mechanism", config_.device.is_cuda() ? "graph_bounded_service" : "native_sdma"},
                  {"inference_wait", "false"},
                  {"blocking", "false"}});
             if (PerfStatsCollector::isDomainEnabled(
@@ -1071,7 +1326,7 @@ namespace llaminar2
             {
                 PerfStatsCollector::recordTimingNs(
                     "moe_overlay_residency",
-                    "mapped_transfer_progress_epoch_dma_enqueue_host_time",
+                    "mapped_transfer_progress_epoch_copy_enqueue_host_time",
                     static_cast<std::uint64_t>(
                         std::max<std::int64_t>(
                             1,
@@ -1118,7 +1373,7 @@ namespace llaminar2
                 std::memory_order_relaxed),
             .bytes_completed = bytes_completed_.load(
                 std::memory_order_relaxed),
-            .dma_submissions = dma_submissions_.load(
+            .copy_submissions = copy_submissions_.load(
                 std::memory_order_relaxed),
             .idle_submission_skips = idle_submission_skips_.load(
                 std::memory_order_relaxed),

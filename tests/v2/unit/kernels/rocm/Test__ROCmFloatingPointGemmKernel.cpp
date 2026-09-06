@@ -1,9 +1,11 @@
 /**
  * @file Test__ROCmFloatingPointGemmKernel.cpp
- * @brief Unit tests for ROCm floating-point GEMM kernel using hipBLAS
+ * @brief Hardware integration proofs for floating GEMM and projection lifetime.
  *
  * Tests the ROCmFloatingPointGemmKernel which wraps hipBLAS for FP32/FP16/BF16
  * GEMM operations on AMD GPUs (MI50, MI100, MI250, etc.)
+ * Retiring expert adapters must leave context-owned library resources alive
+ * and must never drain unrelated inference streams.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -30,6 +32,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <future>
 #include <random>
 #include <string>
 #include <thread>
@@ -42,6 +45,19 @@ using namespace llaminar2::rocm;
 
 namespace
 {
+    /** @brief Materialize the kernel's exact declared scratch before test execution. */
+    std::unique_ptr<DeviceWorkspaceManager> bindDeclaredWorkspace(
+        IWorkspaceConsumer &kernel, DeviceId device, int m = 1, int n = 1, int k = 1)
+    {
+        const auto requirements = kernel.getWorkspaceRequirements(m, n, k);
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            device, requirements.total_bytes_with_alignment());
+        if (!workspace->allocate(requirements))
+            throw std::runtime_error("Could not materialize declared test hipBLAS workspace");
+        kernel.bindWorkspace(workspace.get());
+        return workspace;
+    }
+
     /** @brief Test-only gate that keeps one HIP stream occupied. */
     class HostBlockedHipStream final
     {
@@ -93,10 +109,9 @@ namespace
         /** @brief Release the gate before destroying its stream. */
         ~HostBlockedHipStream()
         {
-            release_.store(true, std::memory_order_release);
+            release();
             if (stream_)
             {
-                (void)hipStreamSynchronize(stream_);
                 (void)hipStreamDestroy(stream_);
             }
         }
@@ -106,6 +121,14 @@ namespace
 
         /** @return Exact non-default stream held behind the host gate. */
         [[nodiscard]] hipStream_t get() const noexcept { return stream_; }
+
+        /** @brief Release the adversarial work before joining a retirement thread. */
+        void release() noexcept
+        {
+            release_.store(true, std::memory_order_release);
+            if (stream_)
+                (void)hipStreamSynchronize(stream_);
+        }
 
     private:
         hipStream_t stream_ = nullptr;
@@ -259,6 +282,121 @@ protected:
 // HipBLASGemmKernel Tests (Low-level)
 // ============================================================================
 
+/**
+ * @brief Floating expert retirement must not wait for unrelated HIP execution.
+ *
+ * Retain the allocation independently, as an overlay slab does, and destroy
+ * only FP16/BF16/FP32 projection views while an unrelated stream is parked.
+ * Always release that stream before joining the destructor thread, so a
+ * regression reports a bounded failure rather than hanging the integration gate.
+ */
+TEST_F(Test__ROCmFloatingPointGemmKernel,
+       FloatingExpertRetirementDoesNotWaitForUnrelatedStream)
+{
+    using Adapter = ROCmFloatingPointGemmKernel;
+    void *weights = nullptr;
+    ASSERT_EQ(hipSuccess, hipMalloc(&weights, 16 * 16 * sizeof(float)));
+    std::vector<std::unique_ptr<Adapter>> projections;
+    for (const auto precision : {Adapter::Precision::FP16,
+                                 Adapter::Precision::BF16,
+                                 Adapter::Precision::FP32})
+        projections.push_back(std::make_unique<Adapter>(
+            weights, 16, 16, 0, precision, std::shared_ptr<void>{}));
+
+    HostBlockedHipStream blocked;
+    std::promise<void> retired;
+    auto completion = retired.get_future();
+    std::thread retirement([&]
+    {
+        (void)hipSetDevice(0);
+        projections.clear();
+        retired.set_value();
+    });
+    const auto status = completion.wait_for(std::chrono::seconds(2));
+    blocked.release();
+    retirement.join();
+    EXPECT_EQ(status, std::future_status::ready)
+        << "Expert retirement waited for unrelated device work (private BLAS teardown)";
+    ASSERT_EQ(hipSuccess, hipFree(weights));
+}
+
+/** @brief A shared context handle captures independent stream/workspace pairs exactly. */
+TEST_F(Test__ROCmFloatingPointGemmKernel, ContextHandleCapturedConcurrentStreamsReplayExactly)
+{
+    constexpr int M = 8, N = 64, K = 128;
+    HipBLASGemmKernel primary(DeviceId::rocm(rocm_device_id_));
+    auto primary_workspace = bindDeclaredWorkspace(primary, DeviceId::rocm(rocm_device_id_));
+    primary.bindStream(ExplicitGPUStream{stream_});
+    std::mt19937 rng(0x5345);
+    std::uniform_real_distribution<float> distribution(-0.2f, 0.2f);
+    std::vector<float> a(M * K), b(N * K);
+    for (auto &value : a) value = distribution(rng);
+    for (auto &value : b) value = distribution(rng);
+    float *d_a = nullptr, *d_b = nullptr, *d_c0 = nullptr, *d_c1 = nullptr;
+    ASSERT_EQ(hipSuccess, hipMalloc(&d_a, a.size() * sizeof(float)));
+    ASSERT_EQ(hipSuccess, hipMalloc(&d_b, b.size() * sizeof(float)));
+    ASSERT_EQ(hipSuccess, hipMalloc(&d_c0, M * N * sizeof(float)));
+    ASSERT_EQ(hipSuccess, hipMalloc(&d_c1, M * N * sizeof(float)));
+    ASSERT_EQ(hipSuccess, hipMemcpyAsync(d_a, a.data(), a.size() * sizeof(float), hipMemcpyHostToDevice, stream_));
+    ASSERT_EQ(hipSuccess, hipMemcpyAsync(d_b, b.data(), b.size() * sizeof(float), hipMemcpyHostToDevice, stream_));
+    ASSERT_EQ(hipSuccess, hipStreamSynchronize(stream_));
+    hipStream_t side = nullptr;
+    hipEvent_t fork = nullptr, join = nullptr;
+    ASSERT_EQ(hipSuccess, hipStreamCreateWithFlags(&side, hipStreamNonBlocking));
+    ASSERT_EQ(hipSuccess, hipEventCreateWithFlags(&fork, hipEventDisableTiming));
+    ASSERT_EQ(hipSuccess, hipEventCreateWithFlags(&join, hipEventDisableTiming));
+    HipBLASGemmKernel secondary(DeviceId::rocm(rocm_device_id_));
+    const auto requirements = secondary.getWorkspaceRequirements(M, N, K);
+    DeviceWorkspaceManager side_workspace(DeviceId::rocm(0), requirements.total_bytes_with_alignment());
+    ASSERT_TRUE(side_workspace.allocate(requirements));
+    secondary.bindWorkspace(&side_workspace);
+    secondary.bindStream(ExplicitGPUStream{side});
+
+    // Warm the identical library path once before recording. Save its exact
+    // result, then prove replay has not mixed either stream's mutable bindings.
+    ASSERT_TRUE(primary.execute(d_a, d_b, d_c0, M, N, K, false, false));
+    ASSERT_TRUE(secondary.execute(d_a, d_b, d_c1, M, N, K, false, false));
+    ASSERT_EQ(hipSuccess, hipStreamSynchronize(stream_));
+    ASSERT_EQ(hipSuccess, hipStreamSynchronize(side));
+    std::vector<float> expected(M * N), actual(M * N);
+    ASSERT_EQ(hipSuccess, hipMemcpy(expected.data(), d_c0, expected.size() * sizeof(float), hipMemcpyDeviceToHost));
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t executable = nullptr;
+    ASSERT_EQ(hipSuccess, hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal));
+    ASSERT_EQ(hipSuccess, hipEventRecord(fork, stream_));
+    ASSERT_EQ(hipSuccess, hipStreamWaitEvent(side, fork, 0));
+    ASSERT_TRUE(primary.execute(d_a, d_b, d_c0, M, N, K, false, false));
+    ASSERT_TRUE(secondary.execute(d_a, d_b, d_c1, M, N, K, false, false));
+    ASSERT_EQ(hipSuccess, hipEventRecord(join, side));
+    ASSERT_EQ(hipSuccess, hipStreamWaitEvent(stream_, join, 0));
+    ASSERT_EQ(hipSuccess, hipStreamEndCapture(stream_, &graph));
+    ASSERT_EQ(hipSuccess, hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        ASSERT_EQ(hipSuccess, hipMemsetAsync(d_c0, 0x7f, expected.size() * sizeof(float), stream_));
+        ASSERT_EQ(hipSuccess, hipMemsetAsync(d_c1, 0x7f, expected.size() * sizeof(float), stream_));
+        ASSERT_EQ(hipSuccess, hipGraphLaunch(executable, stream_));
+        ASSERT_EQ(hipSuccess, hipStreamSynchronize(stream_));
+        for (auto *output : {d_c0, d_c1})
+        {
+            ASSERT_EQ(hipSuccess, hipMemcpy(actual.data(), output, actual.size() * sizeof(float), hipMemcpyDeviceToHost));
+            EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)))
+                << "replay=" << replay;
+        }
+    }
+    ASSERT_EQ(hipSuccess, hipGraphExecDestroy(executable));
+    ASSERT_EQ(hipSuccess, hipGraphDestroy(graph));
+    ASSERT_EQ(hipSuccess, hipEventDestroy(join));
+    ASSERT_EQ(hipSuccess, hipEventDestroy(fork));
+    ASSERT_EQ(hipSuccess, hipStreamDestroy(side));
+    ASSERT_EQ(hipSuccess, hipFree(d_c1));
+    ASSERT_EQ(hipSuccess, hipFree(d_c0));
+    ASSERT_EQ(hipSuccess, hipFree(d_b));
+    ASSERT_EQ(hipSuccess, hipFree(d_a));
+}
+
+
 TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_SmallMatrix)
 {
     // Small 4x4 matrix test
@@ -283,6 +421,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_SmallMatrix)
     float *d_C = allocate_and_copy_to_gpu(h_C);
 
     HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
+    auto workspace = bindDeclaredWorkspace(kernel, DeviceId::rocm(rocm_device_id_));
     kernel.bindStream(ExplicitGPUStream{stream_});
     ASSERT_TRUE(kernel.execute(d_A, d_B, d_C, M, N, K, false, true));
 
@@ -324,6 +463,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Qwen05B_Sizes)
     float *d_C = allocate_and_copy_to_gpu(h_C);
 
     HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
+    auto workspace = bindDeclaredWorkspace(kernel, DeviceId::rocm(rocm_device_id_));
     kernel.bindStream(ExplicitGPUStream{stream_});
     ASSERT_TRUE(kernel.execute(d_A, d_B, d_C, M, N, K, false, true));
 
@@ -365,6 +505,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Qwen14B_Sizes)
     float *d_C = allocate_and_copy_to_gpu(h_C);
 
     HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
+    auto workspace = bindDeclaredWorkspace(kernel, DeviceId::rocm(rocm_device_id_));
     kernel.bindStream(ExplicitGPUStream{stream_});
     ASSERT_TRUE(kernel.execute(d_A, d_B, d_C, M, N, K, false, true));
 
@@ -403,6 +544,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Performance)
     float *d_C = allocate_and_copy_to_gpu(h_C);
 
     HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
+    auto workspace = bindDeclaredWorkspace(kernel, DeviceId::rocm(rocm_device_id_));
     kernel.bindStream(ExplicitGPUStream{stream_});
 
     // Warmup
@@ -463,6 +605,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, TensorInterface_Basic)
 
     // Create kernel
     ROCmFloatingPointGemmKernel kernel(weights.get(), rocm_device_id_);
+    auto workspace = bindDeclaredWorkspace(kernel, DeviceId::rocm(rocm_device_id_), M, N, K);
     kernel.setGPUStream(stream_);
 
     // Create input/output tensors
@@ -495,7 +638,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, TensorInterface_Basic)
 /**
  * @brief Prove one cached hipBLAS handle cannot leak another kernel's stream.
  *
- * Both wrappers intentionally share `DeviceKernelCache`'s hipBLAS object. The
+ * Both wrappers intentionally borrow the same context-owned hipBLAS handle. The
  * second wrapper binds a stream parked behind a test-only host gate before the
  * first wrapper submits. Correct code carries the first wrapper's exact stream
  * into the locked bind-and-submit transaction, so its result is observable
@@ -554,6 +697,9 @@ TEST_F(
         weights_b.get(), rocm_device_id_);
     EXPECT_FALSE(kernel_a.multiply_tensor(input.get(), output.get()))
         << "An unbound floating GEMM must not inherit a cached handle stream";
+
+    auto workspace_a = bindDeclaredWorkspace(kernel_a, device, M, N, K);
+    auto workspace_b = bindDeclaredWorkspace(kernel_b, device, M, N, K);
 
     HostBlockedHipStream blocked;
     kernel_a.setGPUStream(stream_);
@@ -969,6 +1115,10 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDec
         ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
         alpha_kernel.setGPUStream(stream);
         beta_kernel.setGPUStream(stream);
+        // Weight upload has a published producer event; join it to the exact
+        // consumer stream instead of relying on library setup to drain the GPU.
+        TransferEngine::requireDeviceInput(weights_alpha.get(), DeviceId::rocm(rocm_device_id_), stream);
+        TransferEngine::requireDeviceInput(weights_beta.get(), DeviceId::rocm(rocm_device_id_), stream);
 
         for (int M : verifier_rows)
         {
@@ -982,9 +1132,12 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDec
                 std::vector<size_t>{static_cast<size_t>(M), N});
             auto output_beta = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{static_cast<size_t>(M), N});
-            ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-            ASSERT_TRUE(output_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-            ASSERT_TRUE(output_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+            ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    input.get(), DeviceId::rocm(rocm_device_id_), stream));
+            ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    output_alpha.get(), DeviceId::rocm(rocm_device_id_), stream));
+            ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    output_beta.get(), DeviceId::rocm(rocm_device_id_), stream));
 
             std::vector<ITensorGemm::TensorProjectionDesc> grouped_projections = {
                 {&alpha_kernel, output_alpha.get(), static_cast<int>(N), nullptr, "alpha_grouped"},
@@ -1009,9 +1162,12 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDec
                     std::vector<size_t>{size_t{1}, N});
                 auto beta_serial = std::make_unique<FP32Tensor>(
                     std::vector<size_t>{size_t{1}, N});
-                ASSERT_TRUE(row_input->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-                ASSERT_TRUE(alpha_serial->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-                ASSERT_TRUE(beta_serial->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+                ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    row_input.get(), DeviceId::rocm(rocm_device_id_), stream));
+                ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    alpha_serial.get(), DeviceId::rocm(rocm_device_id_), stream));
+                ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    beta_serial.get(), DeviceId::rocm(rocm_device_id_), stream));
 
                 ASSERT_TRUE(alpha_kernel.multiply_tensor(
                     row_input.get(), alpha_serial.get(), 1, static_cast<int>(N), static_cast<int>(K),
@@ -1134,6 +1290,9 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FloatingSwiGLUDownVerifierRowsM234Matc
         hipStream_t stream = nullptr;
         ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
         down_kernel.setGPUStream(stream);
+        // Weight upload has a published producer event; join it to the exact
+        // consumer stream instead of relying on library setup to drain the GPU.
+        TransferEngine::requireDeviceInput(weights_down.get(), DeviceId::rocm(rocm_device_id_), stream);
 
         for (int M : verifier_rows)
         {
@@ -1150,9 +1309,12 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FloatingSwiGLUDownVerifierRowsM234Matc
 
             auto grouped_down = std::make_unique<FP32Tensor>(
                 std::vector<size_t>{static_cast<size_t>(M), N});
-            ASSERT_TRUE(gate->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-            ASSERT_TRUE(up->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-            ASSERT_TRUE(grouped_down->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+            ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    gate.get(), DeviceId::rocm(rocm_device_id_), stream));
+            ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    up.get(), DeviceId::rocm(rocm_device_id_), stream));
+            ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    grouped_down.get(), DeviceId::rocm(rocm_device_id_), stream));
 
             ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                 gate.get(), up.get(), grouped_down.get(),
@@ -1178,9 +1340,12 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FloatingSwiGLUDownVerifierRowsM234Matc
                     K * sizeof(float));
                 auto serial_down = std::make_unique<FP32Tensor>(
                     std::vector<size_t>{size_t{1}, N});
-                ASSERT_TRUE(gate_row->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-                ASSERT_TRUE(up_row->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
-                ASSERT_TRUE(serial_down->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+                ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    gate_row.get(), DeviceId::rocm(rocm_device_id_), stream));
+                ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    up_row.get(), DeviceId::rocm(rocm_device_id_), stream));
+                ASSERT_NO_THROW(TransferEngine::prepareDeviceInput(
+                    serial_down.get(), DeviceId::rocm(rocm_device_id_), stream));
 
                 ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu(
                     gate_row.get(), up_row.get(), serial_down.get(),

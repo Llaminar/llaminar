@@ -14,6 +14,7 @@
 
 #include "../../execution/local_execution/graph/GraphSchema.h"
 #include "../qwen35/Qwen35Schema.h"
+#include "../qwen/QwenThinkingPolicy.h"
 #include <string>
 
 namespace llaminar2
@@ -45,10 +46,10 @@ namespace llaminar2
             return params;
         }
 
+        /** @brief Return the shared Qwen continuation with its paragraph boundary. */
         std::string getStopThinkingPrompt() const override
         {
-            return "Considering the limited time by the user, I have to give the "
-                   "solution based on the thinking directly now.\n</think>\n\n";
+            return qwenStopThinkingPrompt();
         }
 
         WeightShardingConfig getWeightShardingConfig() const override

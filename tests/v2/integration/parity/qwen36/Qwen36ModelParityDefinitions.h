@@ -192,6 +192,31 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
+     * @return One CPU ExpertOverlay tier spanning two sockets and two ranks.
+     *
+     * Dense tensor parallelism and routed expert ownership share the node
+     * domain. Dynamic movement corrects participant skew within that tier;
+     * there is no second priority and therefore no promotion/demotion axis.
+     */
+    inline ModelParityTopologyDefinition qwen36MoECPU2NodeTPTopology()
+    {
+        return {
+            .test_id = "NodeTP_2xMPI_CPU_ExpertOverlay",
+            .kind = ModelParityTopologyKind::NodeTensorParallel,
+            .participants = {
+                {GlobalDeviceAddress::cpu(0), 0},
+                {GlobalDeviceAddress::cpu(1), 1},
+            },
+            .collective = Collective::MPI,
+            .mpi_ranks = 2,
+            .expert_overlay_plan = qwen35moe::qwen35MoESingleDomainOverlayPlan(
+                "qwen36_moe_cpu_node_tp", ExecutionDomainScope::NODE_LOCAL,
+                CollectiveBackendType::MPI,
+                {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)}),
+        };
+    }
+
+    /**
      * @brief Return short-request economics that force a real Dynamic epoch.
      *
      * The controller still evaluates the production payoff model and moves
@@ -261,6 +286,24 @@ namespace llaminar2::test::parity::qwen36
         definition.collective_evidence_source =
             ParityCollectiveEvidenceSource::PostCollectiveSnapshot;
         definition.tp_allreduce_precision_override = "schema";
+        if (definition.topology.kind == ModelParityTopologyKind::SingleDevice &&
+            definition.topology.participants.size() == 1 &&
+            !definition.topology.participants.front().address.isCPU())
+            definition.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth}};
+        return definition;
+    }
+    /** @return Full CPU two-socket matrix with one Dynamic/adaptive HTTP tag. */
+    inline ModelParityDefinition qwen36MoECPU2NodeTPParityDefinition()
+    {
+        auto definition = qwen36MoEParityDefinition(
+            qwen36MoECPU2NodeTPTopology(),
+            "pytorch_qwen36_moe_singledevice_cpu_snapshots",
+            qwen36MoEExpertOverlayThresholds());
+        definition.e2e_certifiable = {{
+            .mtp = ModelParityMTP::DynamicDepth,
+            .owner_order = RoutedExpertOwnerOrder::Ordinal,
+            .movement = ModelParityExpertMovement::Dynamic,
+        }};
         return definition;
     }
 } // namespace llaminar2::test::parity::qwen36

@@ -17,6 +17,7 @@
 #include <map>
 
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/AlignedWorkspaceSlices.h"
 #include "execution/moe/MoERuntimePointerWorkspaceOwners.h"
 #include "backends/BackendManager.h"
 #include "kernels/common/DeviceResidentRouterGateCache.h"
@@ -24,6 +25,46 @@
 #include "utils/PerfStatsCollector.h"
 
 using namespace llaminar2;
+
+/** @brief Exercise all stream counts against non-divisible merged envelopes. */
+TEST(Test__AlignedWorkspaceSlices, MergedCapacityPreservesAlignmentAndIsolation)
+{
+    alignas(256) std::byte storage[8192];
+    for (size_t alignment : {size_t{4}, size_t{16}, size_t{256}})
+        for (size_t count = 1; count <= 8; ++count)
+            for (size_t bytes = 2048; bytes <= sizeof(storage); bytes += 17)
+            {
+                AlignedWorkspaceSlices slices(bytes, count, alignment);
+                EXPECT_EQ(slices.strideBytes() % alignment, 0u);
+                EXPECT_LE(slices.strideBytes() * count, bytes);
+                EXPECT_LT(bytes - slices.strideBytes() * count, count * alignment);
+                for (size_t index = 0; index < count; ++index)
+                {
+                    const auto view = slices.slice(storage, index, 1u);
+                    EXPECT_EQ(view.data(), storage + index * slices.strideBytes());
+                    EXPECT_EQ(view.size(), slices.strideBytes());
+                    EXPECT_EQ(reinterpret_cast<uintptr_t>(view.data()) % alignment, 0u);
+                }
+            }
+}
+
+/** @brief Reject invalid geometry without allocation or wraparound arithmetic. */
+TEST(Test__AlignedWorkspaceSlices, RejectsInvalidGeometryAndPayload)
+{
+    alignas(256) std::byte storage[4096];
+    EXPECT_THROW((AlignedWorkspaceSlices{4096, 0, 4}), std::invalid_argument);
+    EXPECT_THROW((AlignedWorkspaceSlices{4096, 3, 0}), std::invalid_argument);
+    EXPECT_THROW((AlignedWorkspaceSlices{4096, 3, 3}), std::invalid_argument);
+    EXPECT_THROW((AlignedWorkspaceSlices{3, 3, 4}), std::invalid_argument);
+    const AlignedWorkspaceSlices slices(sizeof(storage), 3, alignof(float));
+    EXPECT_THROW(slices.slice(nullptr, 0, 4), std::invalid_argument);
+    EXPECT_THROW(slices.slice(storage + 1, 0, 4), std::invalid_argument);
+    EXPECT_THROW(slices.slice(storage, 3, 4), std::invalid_argument);
+    EXPECT_THROW(slices.slice(storage, 0, 0), std::invalid_argument);
+    EXPECT_THROW(slices.slice(storage, 0, slices.strideBytes() + 1), std::invalid_argument);
+    const AlignedWorkspaceSlices enormous(SIZE_MAX, SIZE_MAX / 256, 256);
+    EXPECT_EQ(enormous.strideBytes(), 256u);
+}
 
 namespace
 {

@@ -2804,6 +2804,25 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
          {"policy_source", "tensor_core_imma_prefill"}});
     PerfStatsCollector::addCounter(
         "kernel",
+        "cuda_fused_projection_stream_pool_calls",
+        1.0,
+        "gemm",
+        "cuda:0",
+        {{"mode", "decode"},
+         {"m", "1"},
+         {"projections", "3"},
+         {"streams", "3"}});
+    PerfStatsCollector::addCounter(
+        "kernel",
+        "cuda_native_vnni_small_m_fused_projection_calls",
+        1.0,
+        "gemm",
+        "cuda:0",
+        {{"m", "4"},
+         {"projections", "2"},
+         {"projection_schedule", "concurrent"}});
+    PerfStatsCollector::addCounter(
+        "kernel",
         "unrelated_warmup_kernel",
         1.0,
         "warmup",
@@ -2847,6 +2866,12 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
     EXPECT_TRUE(has_record(
         "kernel", "cuda_moe_grouped_prefill_swiglu_path_calls"))
         << "A captured CUDA MoE graph must retain its persistent IMMA policy identity";
+    EXPECT_TRUE(has_record(
+        "kernel", "cuda_fused_projection_stream_pool_calls"))
+        << "M=1 retained graphs must preserve their fused side-stream schedule evidence";
+    EXPECT_TRUE(has_record(
+        "kernel", "cuda_native_vnni_small_m_fused_projection_calls"))
+        << "Grouped verifier graphs must preserve their fused side-stream schedule evidence";
     EXPECT_FALSE(has_record("kernel", "unrelated_warmup_kernel"))
         << "Retaining one immutable kernel route must not retain the whole noisy domain";
     EXPECT_FALSE(has_record("mtp", "draft_steps"))

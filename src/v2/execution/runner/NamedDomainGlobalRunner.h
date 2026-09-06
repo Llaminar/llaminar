@@ -118,6 +118,8 @@ namespace llaminar2
         int currentPosition() const override;
         void clearCache() override;
         bool purgePrefixCache() override;
+        /** @return Nonintrusive request observations from the common owner. */
+        RequestRuntimeSummary requestRuntimeSummary() const override;
         PrefixRuntimeStateSnapshot prefixStateProbe() const override;
         DeviceId primaryDeviceId() const override;
         const float *lastLogits() const override;

@@ -136,6 +136,12 @@ namespace llaminar2
         // Public API Implementation
         // =========================================================================
 
+        /**
+         * @brief Load the canonical capture-reentry NCCL once with local symbols.
+         * @param library_path Explicit test/deployment library, or null for the
+         *        installed canonical SONAME. Failure never selects another DSO.
+         * @return Whether all required NCCL entrypoints were resolved.
+         */
         bool load(const char *library_path)
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -146,44 +152,28 @@ namespace llaminar2
                 return true;
             }
 
-            // Default library names to try
-            const char *lib_paths[] = {
-                library_path,   // User-specified path (may be nullptr)
-                "libnccl.so.2", // Standard versioned name
-                "libnccl.so",   // Unversioned
-                "/lib/x86_64-linux-gnu/libnccl.so.2",
-                "/usr/lib/x86_64-linux-gnu/libnccl.so.2",
-                "/usr/local/cuda/lib64/libnccl.so.2",
-                nullptr // Sentinel
-            };
+            // The distinct SONAME is deliberate: an unpatched system library
+            // fails when a retained parent resumes capture with the same ID.
+            // Resolve exactly one dependency; never hide a missing installation
+            // by loading the incompatible distribution package instead.
+            const char *path = library_path ? library_path : "libllaminar_nccl.so.2";
 
             // Clear any previous dlerror
             dlerror();
 
-            for (const char *path : lib_paths)
-            {
-                if (!path)
-                    continue;
+            LOG_DEBUG("NCCL Dynamic Loader: Trying to load '" << path << "'");
 
-                LOG_DEBUG("NCCL Dynamic Loader: Trying to load '" << path << "'");
-
-                // RTLD_NOW: Resolve all symbols immediately (fail fast)
-                // RTLD_LOCAL: Don't add symbols to global namespace (avoid RCCL conflicts)
-                g_library_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-                if (g_library_handle)
-                {
-                    LOG_INFO("NCCL Dynamic Loader: Successfully loaded '" << path << "'");
-                    break;
-                }
-                else
-                {
-                    LOG_DEBUG("NCCL Dynamic Loader: Failed to load '" << path << "': " << dlerror());
-                }
-            }
+            // Resolve immediately, but never export NCCL symbols into RCCL's
+            // namespace. The two vendors intentionally use identical names.
+            g_library_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            if (g_library_handle)
+                LOG_INFO("NCCL Dynamic Loader: Successfully loaded '" << path << "'");
+            else
+                LOG_DEBUG("NCCL Dynamic Loader: Failed to load '" << path << "': " << dlerror());
 
             if (!g_library_handle)
             {
-                g_last_error = "Failed to load NCCL library from any known path";
+                g_last_error = std::string("Failed to load canonical NCCL library: ") + path;
                 LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
                 return false;
             }

@@ -183,4 +183,21 @@ namespace llaminar2
         double stochastic_acceptance_rate = 0.0;
     };
 
+    /**
+     * @brief Completed request observations safe for ordinary serving logs.
+     *
+     * The runner projects these values from its existing prefix outcome and
+     * validated terminal MTP ledger. Reading this value must not query a GPU,
+     * traverse child runners, join maintenance, or inspect KV/GDN payloads.
+     * It deliberately cannot carry live device positions or cache contents;
+     * those belong to the separate, explicit diagnostic probe interface.
+     */
+    struct RequestRuntimeSummary
+    {
+        PrefixCacheRequestSummary prefix_request;
+        MTPRequestSummary mtp_request;
+        uint64_t mtp_verifier_runs = 0;
+        uint64_t mtp_verifier_token_count = 0;
+    };
+
 } // namespace llaminar2

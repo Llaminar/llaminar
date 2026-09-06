@@ -49,6 +49,28 @@ namespace llaminar2::test
         }
     } // namespace
 
+    /** @brief KV-only sidecars cannot pin placement before main admission. */
+    TEST(MoEOverlayEpochLeaseLifecycle, SidecarResidencyFollowsExpertAccess)
+    {
+        using Owner = MoEOverlaySidecarEpochOwnership;
+        for (const bool coordinated : {false, true})
+        {
+            EXPECT_EQ(moeOverlaySidecarEpochOwnership(
+                          MTPSidecarCaptureRole::KVOnly, coordinated),
+                      Owner::NoExpertAccess);
+            for (const auto role : {MTPSidecarCaptureRole::Full,
+                                    MTPSidecarCaptureRole::Chained})
+            {
+                EXPECT_EQ(moeOverlaySidecarEpochOwnership(role, coordinated),
+                          coordinated ? Owner::GraphSequence
+                                      : Owner::ExternalReader);
+            }
+        }
+        EXPECT_THROW(moeOverlaySidecarEpochOwnership(
+                         static_cast<MTPSidecarCaptureRole>(255), true),
+                     std::logic_error);
+    }
+
     /**
      * @brief A failed enqueue leaves the last complete semantic owner unchanged.
      */

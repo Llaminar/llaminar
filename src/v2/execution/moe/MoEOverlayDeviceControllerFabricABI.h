@@ -25,15 +25,16 @@ namespace llaminar2
 
     /** Version of every fixed-width fabric record in this header. */
     inline constexpr std::uint32_t kMoEOverlayDeviceControllerFabricVersion =
-        14u;
+        17u;
 
-    /** Number of durable demand histories consumed by Dynamic placement. */
+    /** Snapshot and durable history planes: decode, prefill, grouped verifier. */
     inline constexpr std::uint32_t
-        kMoEOverlayDeviceControllerDemandPhaseCount = 2u;
+        kMoEOverlayDeviceControllerDemandPhaseCount = 3u;
 
     /** Decode, real prefill, and grouped-verifier service-cost planes. */
     inline constexpr std::uint32_t
-        kMoEOverlayDeviceControllerEconomyServicePhaseCount = 3u;
+        kMoEOverlayDeviceControllerEconomyServicePhaseCount =
+            kMoEOverlayDeviceControllerDemandPhaseCount;
 
     /** Service-profile plane matching `ExpertHistogramSource::DecodeToken`. */
     inline constexpr std::uint32_t
@@ -301,7 +302,13 @@ namespace llaminar2
         std::uint64_t snapshot_transaction = 0u;
         std::uint32_t status_code = static_cast<std::uint32_t>(
             MoEOverlayDeviceControllerError::None);
-        std::uint32_t reserved0 = 0u;
+        /**
+         * Last entered maintenance action, for failure diagnosis only. Concurrent
+         * inference retirement-readiness probes must not overwrite this lane.
+         * Zero means no authenticated maintenance action has entered.
+         * Never use this observation to authorize a lifecycle transition.
+         */
+        std::uint32_t observed_action = 0u;
         /** Complete inactive runtime bank installed but not admission-visible. */
         std::uint64_t prepared_transaction = 0u;
         /** Local RCU selector and runtime metadata publish completion. */
@@ -312,7 +319,9 @@ namespace llaminar2
         std::uint64_t retired_epoch = 0u;
         /** Current-batch LLEP transient state restored on this participant. */
         std::uint64_t restored_transaction = 0u;
-        std::uint64_t reserved[4] = {};
+        /** Controller transaction observed at action entry; diagnostic-only. */
+        std::uint64_t observed_action_transaction = 0u;
+        std::uint64_t reserved[3] = {};
     };
 
     /** Host transport worker lifecycle for one device-controller group. */

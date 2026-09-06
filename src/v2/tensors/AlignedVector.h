@@ -8,6 +8,11 @@
  * - Aligned loads (_mm512_load_ps) - faster than unaligned loads
  * - Cache line optimization - avoid cache line splits
  *
+ * Dedicated NUMA mappings retain inaccessible virtual guards on both sides.
+ * Guards prevent huge-page sharing across independent first-touch owners while
+ * large payloads remain huge-page aligned and eligible. Physical accounting is
+ * the page-rounded payload extent; unfaultable guards consume no physical RAM.
+ *
  * Performance impact:
  * - BF16/FP16 conversion: 15% faster with streaming stores
  * - Large tensor operations: 5-20% better cache utilization
@@ -290,6 +295,8 @@ namespace llaminar2
          * capacity is released with `munmap` rather than `free`.  This is the
          * required owner for buffers whose placement will subsequently be
          * established and certified by NUMA first touch.
+         * Virtual guards isolate each mapping from neighbouring NUMA owners;
+         * they are retained and retired with the vector but are not payload RAM.
          *
          * @param element_count Logical number of elements in the mapping.
          * @return A page-aligned vector whose elements remain uninitialized.
@@ -665,7 +672,7 @@ namespace llaminar2
          * @param n Element capacity.
          * @param minimum_alignment Required power-of-two address alignment.
          * @param storage_kind Heap or dedicated anonymous mapping authority.
-         * @param allocation_bytes Receives the exact releasable byte extent.
+         * @param allocation_bytes Receives physical payload capacity, excluding virtual guards.
          * @return Uninitialized aligned storage.
          */
         static T *allocate_raw(
@@ -695,15 +702,44 @@ namespace llaminar2
             else
             {
 #ifdef __linux__
-                ptr = ::mmap(
+                // Guard VMAs prevent adjacent independent NUMA owners from
+                // merging into one transparent huge page. Without guards, a
+                // neighbour's first touch can place our pages on its node and
+                // its MADV_DONTNEED can split a huge PTE during certification.
+                // Align large payloads to preserve huge-page coverage, but bill
+                // only page-rounded payload bytes: guards have no physical RAM.
+                const size_t page = runtimePageSize();
+                constexpr size_t huge_page = 2 * 1024 * 1024;
+                const size_t mapping_alignment = aligned_bytes >= huge_page ? huge_page : page;
+                if (aligned_bytes > std::numeric_limits<size_t>::max() - mapping_alignment - 2 * page)
+                    throw std::bad_alloc();
+                const size_t reserved_bytes = aligned_bytes + mapping_alignment + 2 * page;
+                void *reservation = ::mmap(
                     nullptr,
-                    aligned_bytes,
-                    PROT_READ | PROT_WRITE,
+                    reserved_bytes,
+                    PROT_NONE,
                     MAP_PRIVATE | MAP_ANONYMOUS,
                     -1,
                     0);
-                if (ptr == MAP_FAILED)
+                if (reservation == MAP_FAILED)
                     throw std::bad_alloc();
+                const uintptr_t base = reinterpret_cast<uintptr_t>(reservation);
+                const uintptr_t payload = (base + page + mapping_alignment - 1) &
+                    ~(static_cast<uintptr_t>(mapping_alignment) - 1);
+                ptr = reinterpret_cast<void *>(payload);
+                if (::mprotect(ptr, aligned_bytes, PROT_READ | PROT_WRITE) != 0)
+                {
+                    ::munmap(reservation, reserved_bytes);
+                    throw std::bad_alloc();
+                }
+                // Keep exactly one inaccessible page on either side. Their
+                // extent is derived on release, so moves need no extra owner.
+                const size_t leading = payload - page - base;
+                const uintptr_t end = payload + aligned_bytes + page;
+                const size_t trailing = base + reserved_bytes - end;
+                if ((leading && ::munmap(reservation, leading) != 0) ||
+                    (trailing && ::munmap(reinterpret_cast<void *>(end), trailing) != 0))
+                    std::terminate();
 #else
                 (void)aligned_bytes;
                 throw std::runtime_error(
@@ -727,7 +763,7 @@ namespace llaminar2
         /**
          * @brief Release storage through the authority that created it.
          * @param ptr Allocation base.
-         * @param allocation_bytes Exact releasable byte extent.
+         * @param allocation_bytes Physical payload capacity; anonymous owners also release both guards.
          * @param storage_kind Heap or anonymous-mapping owner.
          */
         static void release_raw(
@@ -743,8 +779,12 @@ namespace llaminar2
                 return;
             }
 #ifdef __linux__
+            const size_t page = runtimePageSize();
+            // The mapped owner includes two inaccessible virtual guards;
+            // allocation_bytes continues to describe physical payload capacity.
+            auto *mapping = reinterpret_cast<std::uint8_t *>(ptr) - page;
             if (allocation_bytes == 0 ||
-                ::munmap(ptr, allocation_bytes) != 0)
+                ::munmap(mapping, allocation_bytes + 2 * page) != 0)
             {
                 std::terminate();
             }

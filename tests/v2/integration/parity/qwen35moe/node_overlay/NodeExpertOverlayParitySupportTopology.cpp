@@ -289,28 +289,39 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     const std::array<Qwen122OverlayTopologySpec, 9> &
     qwen122OverlayTopologySpecs()
     {
+        // Certification is a subset of this canonical topology inventory, not
+        // a second table in the HTTP runner. Adaptive MTP and Dynamic movement
+        // run together; ordinal placement fixes the initial owner-map policy.
+        static const std::vector<ModelParityE2ESelection> dynamic_certification{{
+            .mtp = ModelParityMTP::DynamicDepth,
+            .owner_order = RoutedExpertOwnerOrder::Ordinal,
+            .movement = ModelParityExpertMovement::Dynamic,
+            // Real 122B weight preparation and retained graph materialization
+            // receive their own readiness budget, not a longer request timeout.
+            .profile = {.readiness_timeout_seconds = 180},
+        }};
         static const std::array<Qwen122OverlayTopologySpec, 9> specs{{
             {"CUDA2_ROCm4_2xMPI_NodeExpertOverlay", 2, 4, 0, 2,
              Qwen122ContinuationBackend::CUDA,
-             ModelParityDynamicSpeedupWitness::Disabled},
+             ModelParityDynamicSpeedupWitness::Disabled, dynamic_certification},
             {"ROCm1_CPU2_2xMPI_NodeExpertOverlay", 0, 1, 2, 2,
              Qwen122ContinuationBackend::ROCm,
              ModelParityDynamicSpeedupWitness::Disabled},
             {"ROCm2_CPU2_2xMPI_NodeExpertOverlay", 0, 2, 2, 2,
              Qwen122ContinuationBackend::ROCm,
-             ModelParityDynamicSpeedupWitness::Disabled},
+             ModelParityDynamicSpeedupWitness::Disabled, dynamic_certification},
             {"ROCm3_CPU2_2xMPI_NodeExpertOverlay", 0, 3, 2, 2,
              Qwen122ContinuationBackend::ROCm,
              ModelParityDynamicSpeedupWitness::Disabled},
             {"ROCm4_CPU2_2xMPI_NodeExpertOverlay", 0, 4, 2, 2,
              Qwen122ContinuationBackend::ROCm,
-             ModelParityDynamicSpeedupWitness::Random},
+             ModelParityDynamicSpeedupWitness::Random, dynamic_certification},
             {"CUDA1_CPU2_2xMPI_NodeExpertOverlay", 1, 0, 2, 2,
              Qwen122ContinuationBackend::CUDA,
              ModelParityDynamicSpeedupWitness::Disabled},
             {"CUDA2_CPU2_2xMPI_NodeExpertOverlay", 2, 0, 2, 2,
              Qwen122ContinuationBackend::CUDA,
-             ModelParityDynamicSpeedupWitness::Random},
+             ModelParityDynamicSpeedupWitness::Random, dynamic_certification},
             {"ROCm1_CPU1_1xMPI_RankExpertOverlay", 0, 1, 1, 1,
              Qwen122ContinuationBackend::ROCm,
              ModelParityDynamicSpeedupWitness::Disabled},
@@ -934,6 +945,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         definition.features.mtp = ModelParityAxisProfile::Standard;
         definition.features.dynamic_speedup_witness =
             spec.dynamic_speedup_witness;
+        definition.e2e_certifiable = spec.e2e_certifiable;
         definition.features.mtp_kl_threshold_overrides = {
             {
                 .policy = ModelParityMTP::Depth15,

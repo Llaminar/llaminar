@@ -2275,6 +2275,7 @@ namespace llaminar2::test
                                      "grouped_cpu_promotion_" +
                                          std::to_string(identity))
                                  .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
                 .lane_name = "grouped_cpu_promotion_" +
                              std::to_string(identity),
                 .perf_device = device.to_string(),

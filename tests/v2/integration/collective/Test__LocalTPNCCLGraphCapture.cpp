@@ -2450,4 +2450,139 @@ TEST(Test__LocalTPNCCLGraphCapture,
         << "M=3 verifier row zero must be byte-identical to M=1 decode";
 }
 
+/**
+ * @test Production NCCL rejoins each recording of the same retained parent.
+ *
+ * CUDA reuses a graph's capture ID across begin/end recording sessions. NCCL
+ * must not mistake that ID for proof that its cached internal stream is still
+ * capturing. Exercise three sessions, a native conditional, and repeated
+ * execution with changed inputs; independent child graphs miss this defect.
+ */
+TEST(Test__LocalTPNCCLGraphCapture, NCCLRetainedParentFragmentReentry)
+{
+    auto *backend = getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    if (backend->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two CUDA participants";
+    auto context = createLocalTPContext(
+        {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+        {}, CollectiveBackendType::NCCL);
+    ASSERT_NE(context, nullptr);
+    constexpr size_t count = 257u;
+    std::array<float *, 2> inputs{}, outputs{};
+    std::array<cudaStream_t, 2> streams{};
+    std::array<std::unique_ptr<CUDAGraphCapture>, 2> parents;
+    for (int rank = 0; rank < 2; ++rank)
+    {
+        allocateAndUpload(rank, std::vector<float>(count, float(rank + 1)), &inputs[rank]);
+        allocateAndUpload(rank, std::vector<float>(count, 0.0f), &outputs[rank]);
+        ASSERT_EQ(cudaSetDevice(rank), cudaSuccess);
+        ASSERT_EQ(cudaStreamCreateWithFlags(&streams[rank], cudaStreamNonBlocking), cudaSuccess);
+        parents[rank] = std::make_unique<CUDAGraphCapture>(streams[rank], rank);
+    }
+    Barrier boundary(2);
+    std::atomic<bool> failed{false};
+    const auto record = [&](int rank) {
+        EXPECT_EQ(cudaSetDevice(rank), cudaSuccess);
+        std::array<std::unique_ptr<IGPUGraphCapture>, 3> fragments;
+        std::array<GPUOrderedTimelineStep, 3> steps;
+        for (size_t part = 0; part < fragments.size(); ++part)
+        {
+            fragments[part] = parents[rank]->createOrderedTimelineFragment();
+            const bool began = fragments[part] && fragments[part]->beginCapture();
+            if (!began) failed.store(true);
+            // Both participants must enter/leave each collective together,
+            // including the error path. No one skips a peer's rendezvous.
+            boundary.arriveAndWait();
+            const bool admitted = !failed.load();
+            boundary.arriveAndWait();
+            if (admitted)
+            {
+                const bool reduced = context->reduceRawOnStream(
+                    inputs[rank], outputs[rank], count,
+                    CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM,
+                    0, rank, streams[rank], "retained_fragment_reduce");
+                EXPECT_TRUE(reduced) << "fragment=" << part << " rank=" << rank;
+                if (!reduced) failed.store(true);
+            }
+            boundary.arriveAndWait();
+            // Include the conditional shape that forbids cloning fragments.
+            if (began && !failed.load())
+            {
+                cudaGraph_t graph{};
+                cudaStreamCaptureStatus status{};
+                const cudaGraphNode_t *dependencies = nullptr;
+                size_t dependency_count = 0u;
+                EXPECT_EQ(cudaStreamGetCaptureInfo(streams[rank], &status, nullptr,
+                    &graph, &dependencies, nullptr, &dependency_count), cudaSuccess);
+                cudaGraphConditionalHandle handle{};
+                EXPECT_EQ(cudaGraphConditionalHandleCreate(&handle, graph, 1u,
+                    cudaGraphCondAssignDefault), cudaSuccess);
+                cudaGraphNodeParams params{};
+                params.type = cudaGraphNodeTypeConditional;
+                params.conditional.handle = handle;
+                params.conditional.type = cudaGraphCondTypeIf;
+                params.conditional.size = 1u;
+                cudaGraphNode_t branch{};
+                EXPECT_EQ(cudaGraphAddNode(&branch, graph, dependencies, nullptr,
+                    dependency_count, &params), cudaSuccess);
+                cudaGraphNode_t body{};
+                EXPECT_EQ(cudaGraphAddEmptyNode(&body,
+                    params.conditional.phGraph_out[0], nullptr, 0u), cudaSuccess);
+                EXPECT_EQ(cudaStreamUpdateCaptureDependencies(streams[rank], &branch,
+                    nullptr, 1u, cudaStreamSetCaptureDependencies), cudaSuccess);
+            }
+            if (began && !fragments[part]->endCapture()) failed.store(true);
+            boundary.arriveAndWait();
+            if (failed.load()) break;
+            steps[part] = {.name = "NCCL fragment",
+                .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+                .capture = fragments[part].get()};
+        }
+        if (!failed.load())
+        {
+            EXPECT_TRUE(parents[rank]->buildOrderedTimelineTransaction(steps));
+            EXPECT_TRUE(parents[rank]->instantiate());
+        }
+    };
+    std::thread first(record, 0), second(record, 1);
+    first.join();
+    second.join();
+    if (!failed.load())
+    {
+        for (int replay = 0; replay < 5; ++replay)
+        {
+            // Replays use fresh values, not capture-time contents. Submit both
+            // participants before waiting for terminal test-only completion.
+            std::array<std::vector<float>, 2> values{
+                std::vector<float>(count, float(replay + 1)),
+                std::vector<float>(count, float(replay + 2))};
+            for (int rank = 0; rank < 2; ++rank)
+            {
+                ASSERT_EQ(cudaSetDevice(rank), cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(inputs[rank], values[rank].data(),
+                    count * sizeof(float), cudaMemcpyHostToDevice, streams[rank]), cudaSuccess);
+                ASSERT_TRUE(parents[rank]->launch());
+            }
+            for (int rank = 0; rank < 2; ++rank)
+            {
+                ASSERT_EQ(cudaSetDevice(rank), cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(streams[rank]), cudaSuccess);
+            }
+            std::vector<float> actual(count);
+            downloadDeviceVector(0, outputs[0], &actual);
+            for (const float value : actual) EXPECT_EQ(value, float(2 * replay + 3));
+        }
+    }
+    EXPECT_FALSE(failed.load());
+    for (int rank = 0; rank < 2; ++rank)
+    {
+        ASSERT_EQ(cudaSetDevice(rank), cudaSuccess);
+        parents[rank].reset();
+        freeDevicePtr(rank, inputs[rank]);
+        freeDevicePtr(rank, outputs[rank]);
+        EXPECT_EQ(cudaStreamDestroy(streams[rank]), cudaSuccess);
+    }
+}
+
 #endif // HAVE_CUDA

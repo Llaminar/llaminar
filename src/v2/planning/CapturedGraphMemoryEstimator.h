@@ -39,6 +39,8 @@ namespace llaminar2
         std::size_t model_graph_topology_variant_count = 0u;
         /** Retained helper/control executables outside complete forwards. */
         std::size_t auxiliary_executable_count = 0u;
+        /** Separately certified flat helpers; excluded from the general count. */
+        std::size_t bounded_helper_executable_count = 0u;
 
         /**
          * @brief Return whether the declaration has one unambiguous shape.
@@ -97,7 +99,12 @@ namespace llaminar2
                 throw std::overflow_error(
                     "Captured graph total resident executable count overflows size_t");
             }
-            return model_executables + auxiliary_executable_count;
+            const auto general = model_executables + auxiliary_executable_count;
+            if (bounded_helper_executable_count >
+                std::numeric_limits<std::size_t>::max() - general)
+                throw std::overflow_error(
+                    "Captured graph bounded-helper owner count overflows size_t");
+            return general + bounded_helper_executable_count;
         }
     };
 
@@ -171,12 +178,20 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Captured graph executable inventory has mismatched graph identities and topology variants");
         }
-        const std::size_t bytes_per_executable =
-            GPUGraphMemoryContract::reservationBytesPerExecutable(device);
-        return captured_graph_memory_detail::checkedMultiply(
-            inventory.residentExecutableCount(),
-            bytes_per_executable,
+        const auto total_count = inventory.residentExecutableCount();
+        const auto general_bytes = captured_graph_memory_detail::checkedMultiply(
+            total_count - inventory.bounded_helper_executable_count,
+            GPUGraphMemoryContract::reservationBytesPerExecutable(device),
             "Captured graph resident memory reservation overflows size_t");
+        const auto helper_bytes = captured_graph_memory_detail::checkedMultiply(
+            inventory.bounded_helper_executable_count,
+            GPUGraphMemoryContract::reservationBytesPerExecutable(
+                device, GPUGraphExecutableClass::BoundedFlatHelper),
+            "Captured graph helper memory reservation overflows size_t");
+        if (helper_bytes > std::numeric_limits<std::size_t>::max() - general_bytes)
+            throw std::overflow_error(
+                "Captured graph family memory reservation overflows size_t");
+        return general_bytes + helper_bytes;
     }
 
     /**

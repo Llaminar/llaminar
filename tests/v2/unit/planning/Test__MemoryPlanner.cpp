@@ -221,6 +221,44 @@ namespace
 
 } // anonymous namespace
 
+/**
+ * @brief A weight shard does not imply a rank-local collective allocation.
+ *
+ * Node/global TP can install one device on each rank. The weight geometry is
+ * still sharded, but no LocalTP context exists on that rank. Exercise the same
+ * metadata-only admission contract on CPU, CUDA and ROCm without using devices.
+ */
+TEST(Test__MemoryPlanner, DistributedTPDoesNotInventLocalCollective)
+{
+    const auto profile = createMoEOverlayProfile();
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        auto config = overlayDeviceConfig(device);
+        config.total_shards = 2;
+        config.shard_index = 0;
+        const auto plan = MemoryPlanner::plan(profile, {config});
+        ASSERT_EQ(plan.devices.size(), 1u);
+        EXPECT_EQ(plan.devices.front().collective_bytes(), 0u);
+        EXPECT_GT(plan.devices.front().weight_bytes(), 0u);
+        EXPECT_GT(plan.devices.front().activation_bytes(), 0u);
+    }
+}
+
+/** A present-but-unresolved local collective is not the absent NodeTP case. */
+TEST(Test__MemoryPlanner, UnresolvedLocalCollectiveStillFailsAdmission)
+{
+    const auto profile = createMoEOverlayProfile();
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        auto config = overlayDeviceConfig(device);
+        config.total_shards = 2;
+        config.local_tp_backend = CollectiveBackendType::AUTO;
+        EXPECT_THROW((void)MemoryPlanner::plan(profile, {config}), std::invalid_argument);
+    }
+}
+
 TEST(Test__MemoryPlanner, SingleGPU_Fits)
 {
     auto profile = createTestProfile();
@@ -820,6 +858,8 @@ TEST(Test__MemoryPlanner,
     EXPECT_EQ(owner_plan.draftPublicationGraphSlots(), 15u);
     EXPECT_EQ(owner_plan.verifierPreparationGraphSlots(), 32u);
     EXPECT_EQ(owner_plan.controllerGraphSlots(), 4u);
+    EXPECT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 82u);
+    EXPECT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), 25u);
     EXPECT_EQ(
         cfg.captured_serving_graphs.mtp_graph_owners
             .auxiliaryExecutableSlotCount(),
@@ -840,7 +880,9 @@ TEST(Test__MemoryPlanner,
                     /*two prefill + decode + prefix bridge + three MTP forwards=*/7u,
                 .model_graph_topology_variant_count = 1u,
                 .auxiliary_executable_count =
-                    owner_plan.auxiliaryExecutableSlotCount(),
+                    owner_plan.generalAuxiliaryExecutableSlotCount(),
+                .bounded_helper_executable_count =
+                    owner_plan.boundedHelperExecutableSlotCount(),
             }));
     EXPECT_GT(
         plan.devices.front().captured_graph_bytes(),
@@ -880,6 +922,40 @@ TEST(Test__MemoryPlanner,
                     kAuxiliaryExecutables,
             }))
         << "Prepared diagnostic and lean graphs coexist and must not share one driver-memory charge.";
+}
+
+/** @test Helper classification changes bytes, never physical owner cardinality. */
+TEST(Test__MemoryPlanner, BoundedHelperFamilySharesBackendAdmissionContract)
+{
+    const CapturedGraphExecutableInventory inventory{
+        .model_graph_identity_count = 7u,
+        .model_graph_topology_variant_count = 1u,
+        .auxiliary_executable_count = 25u,
+        .bounded_helper_executable_count = 82u,
+    };
+    EXPECT_EQ(inventory.residentExecutableCount(), 114u);
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        const auto general = GPUGraphMemoryContract::reservationBytesPerExecutable(device);
+        const auto helper = GPUGraphMemoryContract::reservationBytesPerExecutable(
+            device, GPUGraphExecutableClass::BoundedFlatHelper);
+        EXPECT_EQ(estimateCapturedGraphExecutableBytes(device, inventory),
+                  32u * general + 82u * helper);
+        if (device.is_cuda())
+            EXPECT_EQ(114u * general - estimateCapturedGraphExecutableBytes(device, inventory),
+                      1640u * 1024u * 1024u);
+        else
+            EXPECT_EQ(estimateCapturedGraphExecutableBytes(device, inventory), 114u * general);
+    }
+    EXPECT_THROW((void)GPUGraphMemoryContract::reservationBytesPerExecutable(
+        DeviceId::cpu(), GPUGraphExecutableClass::BoundedFlatHelper), std::invalid_argument);
+    EXPECT_THROW((void)GPUGraphMemoryContract::requiresBoundedFlatShape(
+        static_cast<GPUGraphExecutableClass>(99)), std::invalid_argument);
+    auto overflowing = inventory;
+    overflowing.bounded_helper_executable_count = std::numeric_limits<size_t>::max();
+    EXPECT_THROW((void)overflowing.residentExecutableCount(), std::overflow_error);
+    EXPECT_THROW((void)estimateCapturedGraphExecutableBytes(DeviceId::cuda(0), overflowing),
+                 std::overflow_error);
 }
 
 /**
@@ -1371,7 +1447,7 @@ TEST(Test__MemoryPlanner,
         CollectiveMemoryEstimator::localTP(
             config.max_seq_len,
             profile.d_model,
-            config.local_tp_backend)
+            config.local_tp_backend.value())
             .perDeviceBytes());
 }
 

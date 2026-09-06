@@ -601,6 +601,11 @@ namespace llaminar2
         return !inner_ || inner_->purgePrefixCache();
     }
 
+    RequestRuntimeSummary NamedDomainGlobalRunner::requestRuntimeSummary() const
+    {
+        return inner_ ? inner_->requestRuntimeSummary() : RequestRuntimeSummary{};
+    }
+
     PrefixRuntimeStateSnapshot NamedDomainGlobalRunner::prefixStateProbe() const
     {
         return inner_ ? inner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};

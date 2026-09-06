@@ -11,6 +11,7 @@
  */
 
 #include "MoEOverlayRankBatchTransport.h"
+#include "MoEOverlayRankBatchTelemetry.h"
 
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "interfaces/IMPIContext.h"
@@ -456,131 +457,6 @@ namespace llaminar2
                 return false;
             }
             return true;
-        }
-
-        /** @brief Publish one always-available transaction witness after MPI completion. */
-        void recordTransaction(
-            const MoEOverlayRankBatchKey &key,
-            size_t bytes,
-            size_t participant_count,
-            const char *endpoint_role)
-        {
-            if (!PerfStatsCollector::isDomainEnabled("forward_graph"))
-                return;
-            const char *const name =
-                key.direction == MoEOverlayCollectiveDirection::Dispatch
-                    ? "moe_overlay_rank_batch_dispatch_transactions"
-                    : "moe_overlay_rank_batch_return_transactions";
-            PerfStatsCollector::addCounter(
-                "forward_graph",
-                name,
-                1.0,
-                "moe_overlay",
-                "mpi",
-                {{"bytes", std::to_string(bytes)},
-                 {"domain_ordinal", std::to_string(key.domain_ordinal)},
-                 {"endpoint_role", endpoint_role},
-                 {"generation", std::to_string(key.generation_id)},
-                 {"layer", std::to_string(key.layer_idx)},
-                 {"logical_step", std::to_string(key.step_id)},
-                 {"participant_count", std::to_string(participant_count)},
-                 {"source_world_rank", std::to_string(key.source_world_rank)},
-                 {"target_world_rank", std::to_string(key.target_world_rank)},
-                 {"tier", std::to_string(key.tier_idx)}});
-        }
-
-        /**
-         * @brief Publish allocation-free wire/codec attribution for one exchange.
-         *
-         * A receive-side wait deliberately includes the time until the peer has
-         * produced its packet.  In particular, the continuation rank's return
-         * wait is the exact remote-service critical path: remote decode,
-         * participant-local expert work, return encoding, and wire delivery.
-         */
-        void recordTransportTiming(
-            const MoEOverlayRankBatchKey &key,
-            size_t bytes,
-            const char *endpoint_role,
-            uint64_t codec_ns,
-            uint64_t wait_ns,
-            uint64_t total_ns)
-        {
-            if (!PerfStatsCollector::isDomainEnabled(
-                    "moe_overlay_transport"))
-            {
-                return;
-            }
-            const PerfStatsCollector::Tags tags{
-                {"bytes", std::to_string(bytes)},
-                {"direction", llaminar2::toString(key.direction)},
-                {"domain_ordinal", std::to_string(key.domain_ordinal)},
-                {"endpoint_role", endpoint_role},
-                {"generation", std::to_string(key.generation_id)},
-                {"layer", std::to_string(key.layer_idx)},
-                {"logical_step", std::to_string(key.step_id)},
-                {"participant_count", "rank_batch"},
-                {"source_world_rank", std::to_string(key.source_world_rank)},
-                {"target_world_rank", std::to_string(key.target_world_rank)},
-                {"tier", std::to_string(key.tier_idx)}};
-            const char *const phase =
-                key.histogram_source == ExpertHistogramSource::PrefillChunk
-                    ? "prefill"
-                    : (key.histogram_source ==
-                               ExpertHistogramSource::GroupedVerifier
-                           ? "grouped_verifier"
-                           : "decode");
-            PerfStatsCollector::recordTimingNs(
-                "moe_overlay_transport",
-                "rank_batch_total",
-                total_ns,
-                phase,
-                "mpi",
-                tags);
-            PerfStatsCollector::recordTimingNs(
-                "moe_overlay_transport",
-                "rank_batch_codec",
-                codec_ns,
-                phase,
-                "mpi",
-                tags);
-            PerfStatsCollector::recordTimingNs(
-                "moe_overlay_transport",
-                "rank_batch_wire_wait",
-                wait_ns,
-                phase,
-                "mpi",
-                tags);
-        }
-
-        /** @brief Prove that one envelope used the fixed-slot asynchronous send path. */
-        void recordAsyncSendSubmission(
-            const MoEOverlayRankBatchKey &key,
-            size_t bytes,
-            size_t slot_count,
-            const char *endpoint_role)
-        {
-            if (!PerfStatsCollector::isDomainEnabled(
-                    "moe_overlay_transport"))
-            {
-                return;
-            }
-            PerfStatsCollector::addCounter(
-                "moe_overlay_transport",
-                "rank_batch_async_send_submissions",
-                1.0,
-                key.histogram_source == ExpertHistogramSource::PrefillChunk
-                    ? "prefill"
-                    : (key.histogram_source ==
-                               ExpertHistogramSource::GroupedVerifier
-                           ? "grouped_verifier"
-                           : "decode"),
-                "mpi",
-                {{"bytes", std::to_string(bytes)},
-                 {"direction", llaminar2::toString(key.direction)},
-                 {"endpoint_role", endpoint_role},
-                 {"layer", std::to_string(key.layer_idx)},
-                 {"logical_step", std::to_string(key.step_id)},
-                 {"slots", std::to_string(slot_count)}});
         }
 
         /** @brief RAII guard that releases one transport's fixed buffers after exchange. */
@@ -1664,6 +1540,11 @@ namespace llaminar2
                                          ? Clock::now()
                                          : Clock::time_point{};
             const int rank = config_.mpi_ctx->rank();
+            const MoEOverlayRankBatchTelemetry telemetry(
+                key, MoEOverlayRankBatchTransportKind::MPI,
+                rank == config_.source_world_rank
+                    ? MoEOverlayRankBatchEndpoint::Source
+                    : MoEOverlayRankBatchEndpoint::Target);
             size_t payload_bytes = 0;
             uint64_t codec_ns = 0;
             uint64_t wait_ns = 0;
@@ -1737,11 +1618,7 @@ namespace llaminar2
                     config_.target_world_rank,
                     kDispatchTag);
                 slot->in_flight = slot->request != MPI_REQUEST_NULL;
-                recordAsyncSendSubmission(
-                    key,
-                    payload_bytes,
-                    dispatch_send_slots_.size(),
-                    "source");
+                telemetry.recordAsyncSendSubmission(dispatch_send_slots_.size());
                 if (timing_enabled)
                 {
                     codec_ns = static_cast<uint64_t>(
@@ -1749,11 +1626,8 @@ namespace llaminar2
                             codec_end - codec_begin)
                             .count());
                 }
-                recordTransaction(
-                    key,
-                    payload_bytes,
-                    config_.workspace->participantIds().size(),
-                    "source");
+                telemetry.recordTransaction(
+                    payload_bytes, config_.workspace->participantIds().size());
             }
             else
             {
@@ -1822,18 +1696,12 @@ namespace llaminar2
                             wait_end - wait_begin)
                             .count());
                 }
-                recordTransaction(
-                    key,
-                    payload_bytes,
-                    config_.workspace->participantIds().size(),
-                    "target");
+                telemetry.recordTransaction(
+                    payload_bytes, config_.workspace->participantIds().size());
             }
             if (timing_enabled)
             {
-                recordTransportTiming(
-                    key,
-                    payload_bytes,
-                    rank == config_.source_world_rank ? "source" : "target",
+                telemetry.recordTimings(
                     codec_ns,
                     wait_ns,
                     static_cast<uint64_t>(
@@ -1896,6 +1764,11 @@ namespace llaminar2
                                          ? Clock::now()
                                          : Clock::time_point{};
             const int rank = config_.mpi_ctx->rank();
+            const MoEOverlayRankBatchTelemetry telemetry(
+                key, MoEOverlayRankBatchTransportKind::MPI,
+                rank == config_.source_world_rank
+                    ? MoEOverlayRankBatchEndpoint::Source
+                    : MoEOverlayRankBatchEndpoint::Target);
             size_t payload_bytes = 0;
             uint64_t codec_ns = 0;
             uint64_t wait_ns = 0;
@@ -1944,11 +1817,7 @@ namespace llaminar2
                     config_.source_world_rank,
                     kReturnTag);
                 slot->in_flight = slot->request != MPI_REQUEST_NULL;
-                recordAsyncSendSubmission(
-                    key,
-                    payload_bytes,
-                    return_send_slots_.size(),
-                    "target");
+                telemetry.recordAsyncSendSubmission(return_send_slots_.size());
                 if (timing_enabled)
                 {
                     codec_ns = static_cast<uint64_t>(
@@ -1956,11 +1825,8 @@ namespace llaminar2
                             codec_end - codec_begin)
                             .count());
                 }
-                recordTransaction(
-                    key,
-                    payload_bytes,
-                    config_.workspace->participantIds().size(),
-                    "target");
+                telemetry.recordTransaction(
+                    payload_bytes, config_.workspace->participantIds().size());
             }
             else
             {
@@ -2034,18 +1900,12 @@ namespace llaminar2
                             wait_end - wait_begin)
                             .count());
                 }
-                recordTransaction(
-                    key,
-                    payload_bytes,
-                    config_.workspace->participantIds().size(),
-                    "source");
+                telemetry.recordTransaction(
+                    payload_bytes, config_.workspace->participantIds().size());
             }
             if (timing_enabled)
             {
-                recordTransportTiming(
-                    key,
-                    payload_bytes,
-                    rank == config_.target_world_rank ? "target" : "source",
+                telemetry.recordTimings(
                     codec_ns,
                     wait_ns,
                     static_cast<uint64_t>(

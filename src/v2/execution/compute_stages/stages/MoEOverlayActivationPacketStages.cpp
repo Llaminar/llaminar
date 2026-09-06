@@ -737,6 +737,7 @@ namespace llaminar2
 
         const bool partial = event_backend_ || event_device_ordinal_ >= 0 ||
                              producer_ready_event_ || !lane_streams_.empty() ||
+                             !admission_ready_events_.empty() ||
                              std::any_of(
                                  shared_dispatch_payload_groups_.begin(),
                                  shared_dispatch_payload_groups_.end(),
@@ -783,6 +784,15 @@ namespace llaminar2
                         "could not create outbound lane stream");
                 }
                 lane_streams_.push_back(lane_stream);
+                if (stage_ordinal_ == 0u)
+                {
+                    void *const event =
+                        event_backend_->createEvent(event_device_ordinal_);
+                    if (!event)
+                        throw std::runtime_error(
+                            "could not create lane epoch-admission event");
+                    admission_ready_events_.push_back(event);
+                }
             }
             producer_ready_event_ =
                 event_backend_->createEvent(event_device_ordinal_);
@@ -819,6 +829,11 @@ namespace llaminar2
         return event_backend_ && event_device_ordinal_ >= 0 &&
                producer_ready_event_ &&
                lane_streams_.size() == lanes_.size() &&
+               admission_ready_events_.size() ==
+                   (stage_ordinal_ == 0u ? lanes_.size() : 0u) &&
+               std::all_of(admission_ready_events_.begin(),
+                           admission_ready_events_.end(),
+                           [](const void *event) { return event != nullptr; }) &&
                lane_shared_dispatch_payload_groups_.size() == lanes_.size() &&
                std::all_of(
                    lane_streams_.begin(),
@@ -840,6 +855,8 @@ namespace llaminar2
                 event_backend_->destroyEvent(
                     producer_ready_event_, event_device_ordinal_);
             }
+            for (void *const event : admission_ready_events_)
+                event_backend_->destroyEvent(event, event_device_ordinal_);
             for (auto &group : shared_dispatch_payload_groups_)
             {
                 if (group.ready_event)
@@ -854,6 +871,7 @@ namespace llaminar2
             group.ready_event = nullptr;
         /* Auxiliary streams remain owned by IWorkerGPUContext. */
         lane_streams_.clear();
+        admission_ready_events_.clear();
         event_backend_ = nullptr;
         event_device_ordinal_ = -1;
     }
@@ -864,6 +882,32 @@ namespace llaminar2
         if (index >= lane_streams_.size())
             throw std::out_of_range("MoE overlay activation lane stream index");
         return lane_streams_[index];
+    }
+
+    bool MoEOverlayActivationLaneBatchState::publishEpochAdmission(
+        std::size_t index)
+    {
+        if (stage_ordinal_ != 0u)
+            return true;
+        if (!persistentResourcesReady() || index >= admission_ready_events_.size())
+            return false;
+        return GPUDeviceContextPool::instance().getContext(device_)
+            .recordEventChecked(admission_ready_events_[index], laneStream(index));
+    }
+
+    bool MoEOverlayActivationLaneBatchState::joinEpochAdmissions(void *stream)
+    {
+        if (!stream)
+            return false;
+        if (stage_ordinal_ != 0u)
+            return true;
+        if (!persistentResourcesReady())
+            return false;
+        auto &context = GPUDeviceContextPool::instance().getContext(device_);
+        for (void *const event : admission_ready_events_)
+            if (!context.waitEventChecked(event, stream))
+                return false;
+        return true;
     }
 
     bool MoEOverlayActivationLaneBatchState::laneUsesSharedDispatchPayload(
@@ -2294,7 +2338,8 @@ namespace llaminar2
                             transaction.modelLayerIndex(),
                     };
                     if (!moe_kernel_->packMoEOverlayActivationDispatch(
-                            packetLaunchContext(lane_stream), launch))
+                            packetLaunchContext(lane_stream), launch) ||
+                        !transaction.publishEpochAdmission(lane_index))
                     {
                         return false;
                     }
@@ -2361,6 +2406,13 @@ namespace llaminar2
                      * directly, which remains valid even when a manual CPU
                      * transaction separates two native executables. */
                 }
+                // Return bank timelines restart for each scheduler admission.
+                // Join the new private grants before the main graph can observe
+                // a prior generation's still-live return. This joins metadata
+                // only, once per transaction; the copies queued after these
+                // events and all remote expert computation remain overlapped.
+                if (!transaction.joinEpochAdmissions(stream))
+                    return false;
                 PerfStatsCollector::addCounter(
                     "forward_graph",
                     "moe_overlay_async_lane_forks",

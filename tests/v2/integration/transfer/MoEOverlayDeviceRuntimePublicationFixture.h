@@ -3,10 +3,10 @@
  * @brief Real-device fixture for topology-controller runtime publication.
  *
  * The fixture presents the same model-owned runtime table, device RCU arena,
- * transfer-prepared descriptor inbox, and exact transfer stream used by the
- * production publication protocol. Setup may wait for initialization; epoch
- * movement uses a persistent pinned host buffer, asynchronous DMA, and one
- * polled event so it never synchronizes an inference or maintenance stream.
+ * mapped immutable descriptor inbox used by the production publication protocol.
+ * Setup may wait for initialization. A fixture-owned transfer event represents
+ * completion of synthetic physical weights, not a second descriptor upload;
+ * captured candidate kernels read the mapped descriptors after that receipt.
  */
 
 #pragma once
@@ -20,8 +20,10 @@
 #include "execution/moe/MoEOverlayDevicePlacementPolicy.h"
 #include "execution/moe/MoEOverlayDeviceTransportProtocol.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "transfer/TransferEngine.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -52,7 +54,9 @@ namespace llaminar2::test
             const MoEOverlayDeviceControllerTopology &topology,
             const MoEOverlayDevicePlacementPolicyInput &input,
             const std::uint64_t *external_admission_epoch = nullptr,
-            std::shared_ptr<const void> external_admission_lifetime = {})
+            std::shared_ptr<const void> external_admission_lifetime = {},
+            moe_runtime_abi::HistogramSource demand_source =
+                moe_runtime_abi::HistogramSource::Decode)
             : backend_(backend),
               participant_(participant),
               topology_(&topology),
@@ -82,15 +86,18 @@ namespace llaminar2::test
                 dummy_scales_ = backend_->allocate(64u, ordinal);
                 runtime_layers_ = static_cast<DeviceMoELayerRuntime *>(
                     backend_->allocate(runtime_bytes, ordinal));
-                prepared_arrivals_ = static_cast<
-                    DeviceMoEExpertDescriptor *>(
-                    backend_->allocate(arrival_bytes, ordinal));
+                const std::array<DeviceId, 1u> devices{participant.device};
+                mapped_arrivals_ =
+                    TransferEngine::instance().allocateMappedHostRegion(
+                        arrival_bytes, devices);
+                prepared_arrivals_ = static_cast<DeviceMoEExpertDescriptor *>(
+                    mapped_arrivals_->deviceAlias(participant.device));
                 apply_status_ = static_cast<
                     MoEOverlayDeviceRuntimeApplyStatus *>(
                     backend_->allocate(sizeof(*apply_status_), ordinal));
                 arrival_staging_ = static_cast<
                     DeviceMoEExpertDescriptor *>(
-                    backend_->allocatePinned(arrival_bytes, ordinal));
+                    mapped_arrivals_->mutableHostData());
                 transfer_stream_ = backend_->createStream(ordinal);
                 transfer_event_ = backend_->createEvent(ordinal);
                 epoch_arena_ = std::make_shared<DeviceMoEOverlayEpochArena>(
@@ -123,18 +130,36 @@ namespace llaminar2::test
                 {
                     initializeLayer(
                         host_layers[layer], *group, input, layer);
+                    // Move the synthetic demand to the actual production phase
+                    // under test before publishing the immutable fixture state.
+                    for (std::uint32_t expert = 0u; expert < input.num_experts; ++expert)
+                    {
+                        auto &runtime = host_layers[layer];
+                        const auto count = runtime.decode_histogram[expert];
+                        if (demand_source == moe_runtime_abi::HistogramSource::GroupedVerifier)
+                        {
+                            runtime.grouped_verifier_histogram[expert] = count;
+                            runtime.grouped_verifier_local_histogram[expert] = count;
+                        }
+                        else if (demand_source == moe_runtime_abi::HistogramSource::Prefill)
+                        {
+                            runtime.prefill_histogram[expert] = count;
+                            runtime.prefill_local_histogram[expert] = count;
+                        }
+                        else if (demand_source != moe_runtime_abi::HistogramSource::Decode)
+                            throw std::invalid_argument("Unknown synthetic histogram source");
+                        if (demand_source != moe_runtime_abi::HistogramSource::Decode)
+                        {
+                            runtime.decode_histogram[expert] = 0u;
+                            runtime.decode_local_histogram[expert] = 0u;
+                        }
+                    }
                 }
 
                 if (!backend_->hostToDeviceOnStream(
                         runtime_layers_,
                         host_layers.data(),
                         runtime_bytes,
-                        ordinal,
-                        transfer_stream_) ||
-                    !backend_->memset(
-                        prepared_arrivals_,
-                        0,
-                        arrival_bytes,
                         ordinal,
                         transfer_stream_) ||
                     !backend_->memset(
@@ -320,7 +345,7 @@ namespace llaminar2::test
         }
 
         /**
-         * @brief Enqueue exact destination arrivals without waiting.
+         * @brief Stage mapped arrivals and submit synthetic physical completion.
          * @param batch Authenticated immutable controller command.
          * @param error Optional transfer-submission diagnostic.
          * @param omitted_ordinal Optional adversarial lane left empty while its
@@ -367,19 +392,12 @@ namespace llaminar2::test
                     static_cast<std::int32_t>(entry.expert));
             }
             const int ordinal = participant_.device.ordinal;
-            if (!backend_->hostToDeviceOnStream(
-                    prepared_arrivals_,
-                    arrival_staging_,
-                    static_cast<std::size_t>(arrival_capacity_) *
-                        sizeof(DeviceMoEExpertDescriptor),
-                    ordinal,
-                    transfer_stream_) ||
-                !backend_->recordEvent(
+            if (!backend_->recordEvent(
                     transfer_event_, ordinal, transfer_stream_))
             {
                 if (error)
                     *error =
-                        "arrival inbox asynchronous upload was rejected";
+                        "synthetic physical completion event was rejected";
                 return false;
             }
             arrival_in_flight_ = true;
@@ -402,7 +420,7 @@ namespace llaminar2::test
         }
 
         /**
-         * @brief Join the exact prepared-arrival DMA from a maintenance stream.
+         * @brief Join synthetic weight-transfer completion from maintenance.
          *
          * The background worker must have submitted @ref enqueuePreparedArrivals
          * before this call, but the transfer need not be complete. This method
@@ -666,12 +684,9 @@ namespace llaminar2::test
                 backend_->destroyEvent(transfer_event_, ordinal);
             if (transfer_stream_)
                 backend_->destroyStream(transfer_stream_, ordinal);
-            if (arrival_staging_)
-                backend_->freePinned(arrival_staging_, ordinal);
             if (apply_status_)
                 backend_->free(apply_status_, ordinal);
-            if (prepared_arrivals_)
-                backend_->free(prepared_arrivals_, ordinal);
+            mapped_arrivals_.reset();
             if (runtime_layers_)
                 backend_->free(runtime_layers_, ordinal);
             if (dummy_scales_)
@@ -695,6 +710,7 @@ namespace llaminar2::test
         void *dummy_payload_ = nullptr;
         void *dummy_scales_ = nullptr;
         DeviceMoELayerRuntime *runtime_layers_ = nullptr;
+        std::shared_ptr<MappedHostTransferRegion> mapped_arrivals_;
         DeviceMoEExpertDescriptor *prepared_arrivals_ = nullptr;
         MoEOverlayDeviceRuntimeApplyStatus *apply_status_ = nullptr;
         DeviceMoEExpertDescriptor *arrival_staging_ = nullptr;

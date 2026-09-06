@@ -442,6 +442,7 @@ namespace llaminar2::test
                         .device = gpu_device,
                         .staging = remote_staging[projection],
                         .execution = remote_execution[projection],
+                        .progress = BackgroundTransferProgressBinding::nativeStream(),
                         .lane_name = "rocm1_mpi_q8_demotion_" +
                                      std::to_string(projection),
                         .perf_device = "rocm:1",
@@ -454,6 +455,7 @@ namespace llaminar2::test
                             kProjectionCount + projection],
                         .execution = remote_execution[
                             kProjectionCount + projection],
+                        .progress = BackgroundTransferProgressBinding::nativeStream(),
                         .lane_name = "rocm1_mpi_q8_promotion_" +
                                      std::to_string(projection),
                         .perf_device = "rocm:1",

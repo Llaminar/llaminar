@@ -1220,6 +1220,8 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         int mpi_ranks;
         Qwen122ContinuationBackend continuation;
         ModelParityDynamicSpeedupWitness dynamic_speedup_witness;
+        /// Exact HTTP certification opt-ins; empty keeps mathematical coverage only.
+        std::vector<ModelParityE2ESelection> e2e_certifiable = {};
     };
 
     /** @return Every unique 122B ExpertOverlay topology in the production matrix. */

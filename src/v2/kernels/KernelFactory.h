@@ -69,6 +69,8 @@
 
 #pragma once
 
+#include "memory/CPUWeightStoragePlacement.h"
+
 #include "../backends/DeviceType.h"            // Shared DeviceType enum
 #include "../backends/DeviceId.h"              // Type-safe device identification
 #include "../execution/config/RuntimeConfig.h" // ActivationPrecision
@@ -1382,13 +1384,15 @@ namespace llaminar
                  * @param tensor Borrowed quantized expert view (2D slice of a 3D parent).
                  * @param target_device Target device for preparation
                  * @param prep_kind Preparation kind (AUTO resolves to CPU_PACKED for CPU)
+                 * @param placement Final CPU storage first-touch policy, applied before packing.
                  * @return Caller-owned prepared engine, or nullptr when the
                  *         format cannot safely use borrowed source ownership.
                  */
                 static std::shared_ptr<llaminar2::ITensorGemm> prepareExpertGemmLocal(
                     const llaminar2::TensorBase *tensor,
                     llaminar2::DeviceId target_device,
-                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
+                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO,
+                    llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
 
                 /**
                  * @brief Prepare a caller-owned expert GEMM with explicit source lifetime.
@@ -1401,12 +1405,14 @@ namespace llaminar
                  * @param tensor Shared expert view (2D slice of a 3D parent).
                  * @param target_device Exact preparation device.
                  * @param prep_kind Requested preparation representation.
+                 * @param placement Final CPU storage first-touch policy, applied before copying.
                  * @return Prepared engine with a complete source-lifetime contract.
                  */
                 static std::shared_ptr<llaminar2::ITensorGemm> prepareExpertGemmLocal(
                     std::shared_ptr<llaminar2::TensorBase> tensor,
                     llaminar2::DeviceId target_device,
-                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
+                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO,
+                    llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
 
                 /**
                  * @brief Create a GEMM engine from a transferred (pre-packed) weight blob.
@@ -1432,11 +1438,13 @@ namespace llaminar
                  *
                  * @param data First byte of one complete packed-weight wire record.
                  * @param size Number of readable bytes beginning at `data`.
+                 * @param placement Final CPU storage placement before archive bytes are copied.
                  * @return Caller-owned prepared GEMM engine, or `nullptr` on failure.
                  */
                 static std::shared_ptr<llaminar2::ITensorGemm> createExpertGemmFromTransferBlob(
                     const uint8_t *data,
-                    size_t size);
+                    size_t size,
+                    llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
 
                 /**
                  * @brief Consume final CPU packed storage into a prepared GEMM engine.

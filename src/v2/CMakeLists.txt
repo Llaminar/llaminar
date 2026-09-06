@@ -548,17 +548,7 @@ if(HAVE_CUDA)
     # =========================================================================
     # NCCL provides optimized multi-GPU and multi-node collective operations.
     # Used by NCCLBackend for AllReduce, AllGather, etc. in tensor parallelism.
-    find_path(NCCL_INCLUDE_DIR nccl.h
-        HINTS
-            ${CUDAToolkit_INCLUDE_DIRS}
-            ${CUDA_TOOLKIT_ROOT_DIR}/include
-        PATHS
-            /usr/include
-            /usr/local/include
-            /opt/nccl/include
-            /usr/local/cuda/include
-    )
-    find_library(NCCL_LIBRARY nccl
+    find_library(LLAMINAR_NCCL_LIBRARY llaminar_nccl
         HINTS
             ${CUDAToolkit_LIBRARY_DIR}
             ${CUDA_TOOLKIT_ROOT_DIR}/lib64
@@ -571,31 +561,27 @@ if(HAVE_CUDA)
             /usr/local/cuda/lib64
     )
     
-    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+    if(LLAMINAR_NCCL_LIBRARY)
+        set(NCCL_LIBRARY "${LLAMINAR_NCCL_LIBRARY}")
         set(HAVE_NCCL ON CACHE BOOL "NCCL library found")
         add_compile_definitions(HAVE_NCCL)
         message(STATUS "V2: NCCL found")
-        message(STATUS "V2:   Include: ${NCCL_INCLUDE_DIR}")
         message(STATUS "V2:   Library: ${NCCL_LIBRARY}")
         
         # CRITICAL: NCCL is now loaded dynamically via dlopen() in NCCLDynamicLoader.cpp
         # to avoid symbol conflicts with RCCL, which exports identical symbol names.
-        # We only need the headers for NCCLBackendCUDA.cu (it doesn't actually link NCCL anymore).
-        # NCCLDynamicLoader loads NCCL at runtime with RTLD_LOCAL to isolate symbols.
-        target_include_directories(cuda_backend PUBLIC ${NCCL_INCLUDE_DIR})
+        # NCCLDynamicLoader owns the isolated ABI declarations and loads NCCL
+        # with RTLD_LOCAL. No consumer includes nccl.h; exporting the vendor's
+        # include directory would leak its conflicting global names to RCCL.
         target_compile_definitions(cuda_backend PUBLIC HAVE_NCCL)
         # Link dl for dlopen/dlsym
         target_link_libraries(cuda_backend PUBLIC ${CMAKE_DL_LIBS})
         message(STATUS "V2: NCCL will be loaded dynamically (dlopen) from cuda_backend for symbol isolation")
     else()
-        set(HAVE_NCCL OFF CACHE BOOL "NCCL library not found")
-        message(WARNING "V2: NCCL not found - NCCLBackend will be disabled")
-        if(NOT NCCL_INCLUDE_DIR)
-            message(WARNING "V2:   nccl.h not found in standard paths")
-        endif()
-        if(NOT NCCL_LIBRARY)
-            message(WARNING "V2:   libnccl.so not found in standard paths")
-        endif()
+        message(FATAL_ERROR
+            "V2: CUDA requires the capture-reentry NCCL dependency. "
+            "Run sudo bash scripts/docker/install-nccl.sh, or rebuild the devcontainer. "
+            "System libnccl is not an equivalent capture implementation.")
     endif()
 endif()
 
@@ -2097,15 +2083,8 @@ if(HAVE_CUDA)
     )
     message(STATUS "V2: Linked CUDA runtime, cuBLAS, and cuBLASLt")
     
-    # NOTE: NCCL is linked to cuda_backend (not llaminar2_core) to isolate symbols
-    # from RCCL. Both export identical symbols and would conflict if in same library.
-    # If HAVE_NCCL is set, cuda_backend already has NCCL linked via HAVE_NCCL check above
-    if(HAVE_NCCL)
-        # Only include headers for compilation - the library is linked via cuda_backend
-        target_include_directories(llaminar2_core PUBLIC ${NCCL_INCLUDE_DIR})
-        # DO NOT link NCCL library here - it comes via cuda_backend to prevent symbol conflicts
-        message(STATUS "V2: NCCL headers available (library linked via cuda_backend)")
-    endif()
+    # NCCL is exclusively dlopened by cuda_backend; neither its global headers
+    # nor a link dependency belong on llaminar2_core's public interface.
 endif()
 
 # =============================================================================
