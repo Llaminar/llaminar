@@ -11,6 +11,8 @@
  */
 #pragma once
 
+#include "kernels/common/DeviceRowRange.h"
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -73,7 +75,7 @@ __device__ __forceinline__ float tinyProjectionWeight(Weight value)
 template<class Weight, int RowsPerCTA>
 __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
     const float *const *activations, const float *const *weights,
-    float *const *outputs, int m, int n, int k)
+    float *const *outputs, int m, int n, int k, DeviceRowRange row_range)
 {
     static_assert(RowsPerCTA == 2 || RowsPerCTA == 4 || RowsPerCTA == 8);
     constexpr int warp_width = 32;
@@ -86,6 +88,11 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
     const int lane = static_cast<int>(threadIdx.x) % warp_width;
     const int column = static_cast<int>(threadIdx.x) / warp_width;
     const int first_row = static_cast<int>(blockIdx.y) * RowsPerCTA;
+    // Whole inactive CTAs retire before operand loads or barriers. Partial
+    // tiles retain neutral lanes and the exact established reduction tree.
+    const int active_rows = row_range.activeRows();
+    if (first_row >= active_rows)
+        return;
     const int first_column = static_cast<int>(blockIdx.x) * columns_per_cta;
     const float *a = activations[blockIdx.z];
     const Weight *b = reinterpret_cast<const Weight *>(weights[blockIdx.z]);
@@ -102,7 +109,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
         // still stage neutral storage so every warp can obey the same barriers.
         #pragma unroll
         for (int row = 0; row < RowsPerCTA; ++row)
-            activation_tile[row][threadIdx.x] = first_row + row < m && load_k < static_cast<unsigned int>(k)
+            activation_tile[row][threadIdx.x] = first_row + row < active_rows && load_k < static_cast<unsigned int>(k)
                 ? a[static_cast<size_t>(first_row + row) * k + load_k] : 0.0f;
         #pragma unroll
         for (int col = 0; col < columns_per_cta; ++col)
@@ -142,7 +149,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
         #pragma unroll
         for (int stride = warp_width / 2; stride > 0; stride >>= 1)
             result += __shfl_down_sync(0xffffffffu, result, stride);
-        if (lane == 0 && first_row + row < m && first_column + column < n)
+        if (lane == 0 && first_row + row < active_rows && first_column + column < n)
             c[static_cast<size_t>(first_row + row) * n + first_column + column] = result;
     }
 }

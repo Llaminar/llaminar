@@ -1,3 +1,11 @@
+/**
+ * @file MTPDepthController.cpp
+ * @brief Deterministic rolling-window MTP depth decisions for host execution.
+ *
+ * Configuration resolves automatic thresholds before any window is evaluated.
+ * GPU callers seal the same topology-bound values into the device ABI instead
+ * of consulting this host controller for live device-owned decisions.
+ */
 #include "MTPDepthController.h"
 
 #include <algorithm>
@@ -199,6 +207,10 @@ namespace llaminar2
         MTPVerifyMode verify_mode)
     {
         verify_mode_ = verify_mode;
+        // Standalone CPU callers have no GPU domain. Orchestration supplies an
+        // already-resolved profile value; explicit values are never replaced.
+        config.demote_zero_accept_rate = config.demote_zero_accept_rate.value_or(
+            defaultMTPZeroAcceptDemotionRate(MTPDepthDefaultsProfile::Portable));
         if (configured_draft_tokens < 1)
             throw std::invalid_argument("configured MTP draft tokens must be > 0");
 
@@ -253,7 +265,7 @@ namespace llaminar2
                 return value >= 0.0 && value <= 1.0;
             };
             if (!rate_valid(config.promote_full_accept_rate) ||
-                !rate_valid(config.demote_zero_accept_rate) ||
+                !rate_valid(*config.demote_zero_accept_rate) ||
                 !rate_valid(config.demote_acceptance_rate))
             {
                 throw std::invalid_argument("MTP depth policy thresholds must be in [0, 1]");
@@ -384,7 +396,7 @@ namespace llaminar2
             return false;
 
         const bool demote_ready =
-            zero_accept_rate >= config_.demote_zero_accept_rate ||
+            zero_accept_rate >= *config_.demote_zero_accept_rate ||
             (current_depth_ > std::max(config_.min_depth, 1) &&
              acceptance_rate < config_.demote_acceptance_rate);
         if (!demote_ready)
@@ -478,7 +490,7 @@ namespace llaminar2
 
         const bool zero_accept_demote =
             current_depth_ > config_.min_depth &&
-            decision.zero_accept_rate >= config_.demote_zero_accept_rate;
+            decision.zero_accept_rate >= *config_.demote_zero_accept_rate;
         const bool low_accept_demote =
             current_depth_ > std::max(config_.min_depth, 1) &&
             decision.acceptance_rate < config_.demote_acceptance_rate;
@@ -486,8 +498,8 @@ namespace llaminar2
             current_depth_ < config_.max_depth &&
             nextUnrejectedDepthAbove(current_depth_) == current_depth_;
         const double catastrophic_zero_accept_rate =
-            config_.demote_zero_accept_rate +
-            (1.0 - config_.demote_zero_accept_rate) * 0.5;
+            *config_.demote_zero_accept_rate +
+            (1.0 - *config_.demote_zero_accept_rate) * 0.5;
         const bool generated_best_depth_grace =
             isGeneratedBestDepth(config_, verify_mode_, current_depth_) &&
             (zero_accept_demote || low_accept_demote) &&

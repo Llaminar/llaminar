@@ -575,7 +575,7 @@ def _normalization_key(
 
     return (
         corpus.runtime_key_for(row),
-        SurfaceKey(row.source_format, row.execution_mode),
+        SurfaceKey.from_observation(row),
         row.shape_group_id,
     )
 

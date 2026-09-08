@@ -10,6 +10,7 @@
  * The separate performance test never enters production preflight.
  */
 #include <gtest/gtest.h>
+#include "kernels/common/FloatingPointVerifierLaunch.h"
 #include "kernels/cuda/gemm/CUDATinyProjectionSharedKernel.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -26,10 +27,6 @@
 extern "C" bool cudaFp32_stage_batched_projection_pointers(
     const float **, const float **, float **, const float *const *,
     const float *const *, float *const *, int, int, void *);
-extern "C" bool cudaFp32_tiny_batched_projection(
-    const float *const *, const float *const *, float *const *, int, int, int, int, int, void *);
-extern "C" bool cudaFp32x16_tiny_batched_projection(
-    const float *const *, const float *const *, float *const *, int, int, int, int, int, int, void *);
 
 namespace
 {
@@ -290,7 +287,7 @@ private:
         checked(cudaGetLastError());
         checked(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
         kernel<<<dim3((n+7)/8,(m+RowsPerCTA-1)/RowsPerCTA,2),256,0,stream>>>(
-            aa.data,bb.data,cc.data,m,n,k);
+            aa.data,bb.data,cc.data,m,n,k, llaminar2::DeviceRowRange::fullyActive(m));
         const auto launch_status = cudaGetLastError();
         checked(cudaStreamEndCapture(stream,&graph));
         checked(launch_status);

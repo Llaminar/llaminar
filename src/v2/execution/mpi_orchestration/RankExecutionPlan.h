@@ -574,6 +574,8 @@ namespace llaminar2
             ss << "    mtp.draft_tokens: " << runtime.mtp.draft_tokens << "\n";
             ss << "    mtp.verify_mode: " << mtpVerifyModeToString(runtime.mtp.verify_mode) << "\n";
             ss << "    mtp.depth_policy: " << mtpDepthPolicyModeToString(runtime.mtp.depth_policy.mode) << "\n";
+            ss << "    mtp.depth_defaults_profile: " << mtpDepthDefaultsProfileToString(runtime.mtp.depth_defaults_profile) << "\n";
+            ss << "    mtp.depth_demote_zero_accept_effective: " << resolveMTPZeroAcceptDemotionRate(runtime.mtp) << "\n";
             ss << "}";
             return ss.str();
         }

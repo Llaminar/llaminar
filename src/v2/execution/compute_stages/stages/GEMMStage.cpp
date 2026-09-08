@@ -1,6 +1,6 @@
-/**
- * @file GEMMStage.cpp
+/** @file GEMMStage.cpp
  * @brief Implementation of GEMMStage
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #include "GEMMStage.h"
@@ -461,6 +461,9 @@ namespace llaminar2
         if (params_.gate_input && !gate_base)
             return false;
 
+        // Nested tensor adapters inherit this geometry while retaining their
+        // backend-specific serial arithmetic policy. No device count is read here.
+        auto verifier_rows = gemm->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
         bool success = false;
         if (params_.gate_input)
         {

@@ -743,7 +743,7 @@ namespace llaminar2
             }
             else if (key == "depth_demote_zero_accept")
             {
-                config.mtp.depth_policy.demote_zero_accept_rate = std::stod(value);
+                config.mtp.depth_policy.demote_zero_accept_rate = parseMTPZeroAcceptDemotionRate(value);
             }
             else if (key == "depth_demote_acceptance")
             {
@@ -2788,17 +2788,12 @@ namespace llaminar2
         spec.add({
             .long_name = "--mtp-depth-demote-zero-accept",
             .category = "MTP",
-            .value_label = "<f>",
-            .description = "Zero-accept-rate threshold for adaptive MTP depth demotion",
+            .value_label = "<auto|f>",
+            .description = "Zero-accept demotion threshold (default auto: continuation-card profile; explicit [0,1] overrides)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    c.mtp.depth_policy.demote_zero_accept_rate = std::stod(v);
-                    if (c.mtp.depth_policy.demote_zero_accept_rate < 0.0 ||
-                        c.mtp.depth_policy.demote_zero_accept_rate > 1.0)
-                    {
-                        throw std::invalid_argument("--mtp-depth-demote-zero-accept must be in [0, 1]");
-                    }
+                    c.mtp.depth_policy.demote_zero_accept_rate = parseMTPZeroAcceptDemotionRate(v);
                 }),
         });
         spec.add({

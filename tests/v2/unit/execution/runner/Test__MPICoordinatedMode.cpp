@@ -1322,7 +1322,7 @@ namespace
             root.mpi->broadcasts()[0].int_data,
             ElementsAre(static_cast<int32_t>(
                 OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)));
-        ASSERT_EQ(root.mpi->broadcasts()[1].int_data.size(), 22u);
+        ASSERT_EQ(root.mpi->broadcasts()[1].int_data.size(), 23u);
 
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32(
@@ -1369,7 +1369,7 @@ namespace
         EXPECT_DOUBLE_EQ(
             installed.depth_policy.promote_full_accept_rate,
             policy.depth_policy.promote_full_accept_rate);
-        EXPECT_DOUBLE_EQ(
+        EXPECT_EQ(
             installed.depth_policy.demote_zero_accept_rate,
             policy.depth_policy.demote_zero_accept_rate);
         EXPECT_DOUBLE_EQ(
@@ -1399,6 +1399,57 @@ namespace
         EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
     }
 
+    /** @brief Automatic intent and explicit zero survive root/follower admission. */
+    TEST_F(Test__MPICoordinatedMode, TypedMTPRequestPolicyPreservesAutomaticThreshold)
+    {
+        for (const auto threshold : {std::optional<double>{}, std::optional<double>{0.0},
+                                    std::optional<double>{0.30}})
+        {
+            auto root = createRunner(/*mpi_rank=*/0, /*mpi_world_size=*/2,
+                                     /*retained_mtp_draft_capacity=*/15);
+            root.runner->setMPICoordinatedMode(true);
+            MTPRequestPolicy policy;
+            policy.enabled = true;
+            policy.draft_tokens = 15;
+            policy.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+            policy.depth_policy.demote_zero_accept_rate = threshold;
+            ASSERT_TRUE(root.runner->configureMTPRequestPolicy(policy));
+            ASSERT_EQ(root.mpi->broadcasts().size(), 2u);
+            auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+            scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)});
+            scripted->scriptInt32(root.mpi->broadcasts()[1].int_data);
+            scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
+            auto worker = createWorkerRunner(scripted, /*retained_mtp_draft_capacity=*/15);
+            worker.runner->runMPIWorkerLoop();
+            EXPECT_EQ(worker.runner->mtpRequestPolicy().depth_policy.demote_zero_accept_rate, threshold);
+            EXPECT_EQ(scripted->scriptPosition(), scripted->scriptSize());
+        }
+    }
+
+    /** @brief An automatic threshold cannot hide stale explicit wire bytes. */
+    TEST_F(Test__MPICoordinatedMode, TypedMTPRequestPolicyRejectsMalformedAutomaticThreshold)
+    {
+        auto root = createRunner(/*mpi_rank=*/0, /*mpi_world_size=*/2,
+                                 /*retained_mtp_draft_capacity=*/15);
+        root.runner->setMPICoordinatedMode(true);
+        MTPRequestPolicy policy;
+        policy.enabled = true;
+        policy.draft_tokens = 15;
+        policy.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        ASSERT_TRUE(root.runner->configureMTPRequestPolicy(policy));
+        for (const std::size_t offset : {18u, 22u})
+        {
+            auto malformed = root.mpi->broadcasts()[1].int_data;
+            malformed[offset] = 2;
+            auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+            scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)});
+            scripted->scriptInt32(malformed);
+            auto worker = createWorkerRunner(scripted, /*retained_mtp_draft_capacity=*/15);
+            EXPECT_THROW(worker.runner->runMPIWorkerLoop(), std::runtime_error);
+            EXPECT_FALSE(worker.runner->mtpRequestPolicy().enabled);
+        }
+    }
+
     /**
      * @brief A malformed policy frame is terminal for a coordinated follower.
      *
@@ -1414,7 +1465,7 @@ namespace
         scripted->scriptInt32(
             {static_cast<int32_t>(
                 OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)});
-        std::vector<int32_t> malformed(22u, 0);
+        std::vector<int32_t> malformed(23u, 0);
         malformed[0] = 99;
         scripted->scriptInt32(malformed);
 

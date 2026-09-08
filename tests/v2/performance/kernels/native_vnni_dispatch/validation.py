@@ -9,12 +9,75 @@ from .candidate_registry import CandidateRegistry
 from .corpus import ObservationCorpus, RuntimeKey, SurfaceKey, runtime_key
 from .format_registry import FORMAT_SPECS, runtime_aliases
 from .schema import ExecutionMode, SemanticContract
+from .shape_manifest import NativeVNNIShapeManifest
 
 
 # Fifteen speculative drafts plus the terminal target row is the default
 # certification envelope. M=31 catches implementations that accidentally bake
 # that graph default into a kernel or trainer admission check.
 CANONICAL_VERIFIER_M = frozenset((*range(2, 17), 31))
+
+
+def require_exact_overlay_scope(
+    corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    *,
+    shape_names: tuple[str, ...],
+    m_values: tuple[int, ...],
+    execution_modes: tuple[ExecutionMode, ...],
+    contract: SemanticContract,
+    active_rows: tuple[int, ...] | None = None,
+) -> None:
+    """Prove an explicitly declared additive refresh, including every format.
+
+    A partial refresh must not infer its intended coverage from surviving CSV
+    rows: a missing shape, depth, mode or entire codebook would then disappear
+    silently. Resolve geometry through the shared production manifest and
+    compare its Cartesian surface inventory with authenticated observations.
+    Candidate reachability remains the backend registry's responsibility.
+    Unmeasured keys outside this declaration retain their installed decisions;
+    this gate is not a generic-policy or full-matrix certificate.
+    """
+
+    for name, values in (("shapes", shape_names), ("M", m_values),
+                         ("modes", execution_modes)):
+        if not values or len(set(values)) != len(values):
+            raise ValueError(f"exact refresh {name} must be nonempty and unique")
+    if any(m < (2 if contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE else 1)
+           for m in m_values):
+        raise ValueError("exact refresh M is outside its semantic contract")
+    shapes = tuple(manifest.by_name(name) for name in shape_names)
+    if any(not shape.exact_overlay for shape in shapes):
+        raise ValueError("exact refresh only accepts production overlay shapes")
+    expected = {
+        (shape.name, shape.n, shape.k, m, spec.label, mode, active)
+        for shape in shapes for m in m_values for spec in FORMAT_SPECS
+        for mode in execution_modes
+        for active in ((None,) if active_rows is None else active_rows)
+    }
+    if active_rows is not None and (
+        not active_rows or len(set(active_rows)) != len(active_rows)
+        or any(type(active) is not int or not 1 <= active <= min(m_values)
+               for active in active_rows)
+    ):
+        raise ValueError("exact refresh active rows must be unique positive prefixes within every M")
+    actual = {
+        (row.shape_name, row.aggregate_n, row.k, row.m, row.source_format,
+         row.execution_mode, row.active_rows)
+        for row in corpus
+    }
+    if actual != expected:
+        raise ValueError(
+            "exact refresh surface inventory is incomplete or out of scope: "
+            f"missing={sorted(expected - actual, key=repr)[:8]} "
+            f"unexpected={sorted(actual - expected, key=repr)[:8]}"
+        )
+    if {row.semantic_contract for row in corpus} != {contract}:
+        raise ValueError("exact refresh mixes arithmetic contracts")
+    if len({(row.backend, row.architecture_class) for row in corpus}) != 1:
+        raise ValueError("exact refresh must target one backend architecture")
+    require_canonical_alias_coverage(corpus)
+    require_candidate_matrix_complete(corpus)
 
 
 def require_canonical_alias_coverage(
@@ -31,11 +94,12 @@ def require_canonical_alias_coverage(
         expected_aliases = set(runtime_aliases(key.backend.value, key.runtime_codebook_id))
         expected_modes = {key.execution_mode}
         expected = {
-            SurfaceKey(alias, mode)
+            SurfaceKey(alias, mode, occupancy)
             for alias in expected_aliases
             for mode in expected_modes
+            for occupancy in {row.active_rows or 0 for row in rows}
         }
-        actual = {SurfaceKey(row.source_format, row.execution_mode) for row in rows}
+        actual = {SurfaceKey.from_observation(row) for row in rows}
         missing = sorted(expected - actual)
         if missing:
             failures.append((key, missing))
@@ -107,10 +171,10 @@ def require_candidate_matrix_complete(corpus: ObservationCorpus) -> None:
     failures = []
     for key in corpus.runtime_keys():
         rows = corpus.rows_for_runtime_key(key)
-        surfaces = {SurfaceKey(row.source_format, row.execution_mode) for row in rows}
+        surfaces = {SurfaceKey.from_observation(row) for row in rows}
         candidates = {row.effective_candidate_id for row in rows}
         present = {
-            (row.effective_candidate_id, SurfaceKey(row.source_format, row.execution_mode))
+            (row.effective_candidate_id, SurfaceKey.from_observation(row))
             for row in rows
         }
         for candidate in candidates:

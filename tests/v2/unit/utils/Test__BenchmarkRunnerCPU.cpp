@@ -6,6 +6,7 @@
  * - setSkipLogitsGatherDecode must NOT be enabled on CPU devices
  * - CPU decode samples from host logits as the CPU implementation
  * - GPU decode must fail hard when device sampling fails
+ * - Exported hardware defaults and explicit policy intent match the runtime
  */
 
 #include <gtest/gtest.h>
@@ -2722,6 +2723,22 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_TRUE(saw_mixed_moe_kernel_route);
     EXPECT_FALSE(saw_filtered_mtp);
     PerfStatsCollector::reset();
+}
+
+TEST(Test__BenchmarkRunnerCPU, ExportsResolvedMTPHardwareDefaultsAndOverrideProvenance)
+{
+    BenchmarkResult result;
+    OrchestrationConfig config;
+    config.mtp.depth_defaults_profile = MTPDepthDefaultsProfile::ROCmMI50;
+    auto doc = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
+    EXPECT_EQ(doc.at("config").at("mtp_depth_defaults_profile"), "rocm-mi50");
+    EXPECT_EQ(doc.at("config").at("mtp_depth_demote_zero_accept"), 0.45);
+    EXPECT_EQ(doc.at("config").at("mtp_depth_demote_zero_accept_source"), "hardware_default");
+    config.mtp.depth_policy.demote_zero_accept_rate = 0.30;
+    doc = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
+    EXPECT_EQ(doc.at("config").at("mtp_depth_defaults_profile"), "rocm-mi50");
+    EXPECT_EQ(doc.at("config").at("mtp_depth_demote_zero_accept"), 0.30);
+    EXPECT_EQ(doc.at("config").at("mtp_depth_demote_zero_accept_source"), "explicit");
 }
 
 TEST(Test__BenchmarkRunnerCPU, RuntimeDebugParsesBenchmarkIterationOverrides)

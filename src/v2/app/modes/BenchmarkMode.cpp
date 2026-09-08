@@ -1,6 +1,10 @@
 /**
  * @file BenchmarkMode.cpp
- * @brief Benchmark mode (--benchmark)
+ * @brief Release benchmark entry point sharing production readiness and policy.
+ *
+ * The orchestration runner owns model preparation and topology-resolved runtime
+ * defaults. This mode drives the requested workload and exports that resolved
+ * configuration without adding benchmark-only calibration or device policy.
  */
 
 #include "app/modes/BenchmarkMode.h"
@@ -254,7 +258,9 @@ namespace llaminar2
                 MoEExpertOverlayProfiler::flush();
                 return shutdownAndFinalize(false, "failed to write benchmark JSON");
             }
-            json_out << benchmarkResultToJsonString(result, &ctx.config) << '\n';
+            // The runner exposes the topology-resolved startup configuration;
+            // raw CLI intent cannot attest which hardware defaults ran.
+            json_out << benchmarkResultToJsonString(result, &runner->config()) << '\n';
             if (!json_out)
             {
                 LOG_ERROR("Failed to write benchmark JSON output path: "

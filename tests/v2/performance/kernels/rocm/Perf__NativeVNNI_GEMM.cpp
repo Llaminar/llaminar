@@ -96,22 +96,6 @@ extern "C"
         uint8_t codebook_id,
         int device_id, void *stream);
 
-    bool rocmGemv_native_vnni_small_m_batched_fp32(
-        const int8_t *d_A_int8,
-        const uint8_t *const *d_payloads,
-        const uint16_t *const *d_block_scales,
-        const uint16_t *const *d_block_mins,
-        const uint32_t *const *d_block_emins,
-        const float *const *d_biases,
-        float *const *d_outputs,
-        const float *d_scale_A_blockwise,
-        float *const *d_partials,
-        const int *Ns,
-        int num_projections,
-        int M, int K,
-        uint8_t codebook_id,
-        int device_id,
-        void *stream);
 
     bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
         const int8_t *d_A_int8,

@@ -121,7 +121,7 @@ def _aggregate_surface(rows: list[NativeVNNIObservation]) -> CandidateSurfaceTim
     first = rows[0]
     return CandidateSurfaceTiming(
         candidate_id=first.effective_candidate_id,
-        surface=SurfaceKey(first.source_format, first.execution_mode),
+        surface=SurfaceKey.from_observation(first),
         median_us=statistics.median(row.median_us for row in rows),
         p95_us=max(row.p95_us for row in rows),
         cv=max(row.cv for row in rows),
@@ -175,7 +175,7 @@ def build_exact_winner(
         if row.candidate_id != row.effective_candidate_id:
             continue
         candidate = row.effective_candidate_id
-        surface = SurfaceKey(row.source_format, row.execution_mode)
+        surface = SurfaceKey.from_observation(row)
         grouped[(candidate, surface)].append(row)
         exemplars.setdefault(candidate, row)
 

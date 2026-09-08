@@ -17,6 +17,9 @@
  * candidate with its exact-reference candidate, preserving pair identity for
  * simultaneous confidence-bound analysis. Serial row replay exists only inside
  * this performance oracle; production execution remains one grouped launch.
+ * Device-counted evidence retains the physical graph geometry while publishing
+ * a live prefix before capture. Its occupancy is recorded in both CSV artifacts
+ * so the shared exact oracle cannot hide shallow regressions behind full-M wins.
  */
 
 #include <gtest/gtest.h>
@@ -408,6 +411,7 @@ namespace
         int warmups = kDefaultWarmups;
         int samples = kDefaultSamples;
         int timed_replay_cap = kDefaultTimedReplayCap;
+        std::optional<int> active_rows; ///< Exact-only device-counted occupancy; absent means full M.
         int max_cases = std::numeric_limits<int>::max();
         std::set<std::string> formats;
         std::set<std::string> shapes;
@@ -756,6 +760,13 @@ namespace
             "LLAMINAR_CUDA_NVNNI_DECODE_CANDIDATES");
         config.m_values = envCsvInts(
             "LLAMINAR_CUDA_NVNNI_DECODE_M", config.m_values);
+        if (!envString("LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS").empty())
+        {
+            config.active_rows = envPositiveInt("LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS", 1);
+            for (int m : config.m_values)
+                if (m < 2 || *config.active_rows > m)
+                    throw std::runtime_error("device-counted occupancy must fit every grouped physical M");
+        }
 
         const auto execution_modes = envCsvSet(
             "LLAMINAR_CUDA_NVNNI_DECODE_EXECUTION_MODES");
@@ -794,7 +805,7 @@ namespace
         }
         if (!paired.empty())
         {
-            if (!config.formats.empty() || !config.shapes.empty() ||
+            if (config.active_rows || !config.formats.empty() || !config.shapes.empty() ||
                 !config.candidate_families.empty() ||
                 !config.candidate_ids.empty() ||
                 !envString("LLAMINAR_CUDA_NVNNI_DECODE_M").empty() ||
@@ -1666,6 +1677,7 @@ namespace
         trainer::FP32Evidence comparison;
         size_t repeat_byte_mismatches = 0;
         bool numerical_correctness = false;
+        bool inactive_rows_untouched = true; ///< Poison proof outside the live prefix, never timed.
         trainer::TimingEvidence timing;
         std::vector<double> samples;
         std::vector<size_t> sample_measurement_orders;
@@ -1715,7 +1727,8 @@ namespace
         int timed_replay_cap,
         uint64_t cell_order_seed,
         const std::vector<std::string> &profiler_request_ids,
-        DeviceId device)
+        DeviceId device,
+        std::optional<int> active_rows = std::nullopt)
     {
         InterleavedCandidateBatch result;
         if (!kernel || !input || !serial.valid || candidates.empty() ||
@@ -1786,7 +1799,19 @@ namespace
             return fail("tensor_prepare");
         TransferEngine::requireDeviceInput(
             input, device, reinterpret_cast<void *>(stream));
-        const std::vector<const TensorBase *> capture_inputs = {input};
+        auto active_count = active_rows ? TestTensorFactory::createINT32({1}) : nullptr;
+        std::vector<const TensorBase *> capture_inputs = {input};
+        if (active_count)
+        {
+            // Initial request data is prepared once, outside every captured or
+            // timed region. Production kernels receive the pointer, not a host
+            // guess about the number of rows that will be live during replay.
+            active_count->mutable_typed_data()[0] = *active_rows;
+            if (!active_count->ensureOnDevice(device, stream))
+                return fail("active_count_prepare");
+            TransferEngine::requireDeviceInput(active_count.get(), device, stream);
+            capture_inputs.push_back(active_count.get());
+        }
         const std::vector<TensorBase *> capture_outputs = {output.get()};
         if (cudaEventCreate(&start) != cudaSuccess ||
             cudaEventCreate(&stop) != cudaSuccess)
@@ -1796,6 +1821,10 @@ namespace
 
         const auto run_once = [&]() -> bool
         {
+            auto row_scope = active_count
+                ? kernel->beginVerifierDecodeEquivalentScope(DeviceRowRange::deviceCounted(
+                    m, static_cast<const int32_t *>(active_count->gpu_data_ptr())))
+                : nullptr;
             if (m >= 2)
             {
                 std::vector<ITensorGemm::TensorProjectionDesc> projections = {
@@ -1833,6 +1862,9 @@ namespace
         prepared.reserve(candidates.size());
         for (const Candidate &candidate : candidates)
         {
+            if (cudaMemsetAsync(output->gpu_data_ptr(), 0xa5,
+                    static_cast<size_t>(m) * n * sizeof(float), stream) != cudaSuccess)
+                return fail("output_poison");
             PreparedCandidate state;
             state.candidate = &candidate;
             state.evidence.explicit_stream_ok = stream != nullptr;
@@ -1927,11 +1959,15 @@ namespace
             current.evidence.repeat_byte_mismatches =
                 trainer::nativeByteMismatchCount(
                     first_output, repeated_output);
+            const size_t live_elements = static_cast<size_t>(active_rows.value_or(m)) * n;
+            current.evidence.inactive_rows_untouched = std::all_of(
+                repeated_output.begin() + live_elements, repeated_output.end(),
+                [](float value) { return std::bit_cast<uint32_t>(value) == 0xa5a5a5a5u; });
             current.evidence.comparison = trainer::compareFP32(
-                repeated_output,
-                serial.output,
-                static_cast<size_t>(m) * static_cast<size_t>(n));
+                repeated_output.data(), live_elements,
+                serial.output.data(), serial.output.size(), static_cast<size_t>(n));
             current.evidence.numerical_correctness =
+                current.evidence.inactive_rows_untouched &&
                 current.evidence.comparison.nonfinite_count == 0 &&
                 current.evidence.comparison.cosine >= 0.999;
 
@@ -2460,6 +2496,7 @@ namespace
         Candidate candidate;
         ExecutionMode mode = ExecutionMode::Eager;
         int m = 0;
+        std::optional<int> active_rows; ///< Occupancy surface; never part of host dispatch geometry.
         size_t measurement_order = 0;
         uint64_t measurement_order_seed = 0;
         uint8_t source_codebook = 0;
@@ -2490,7 +2527,7 @@ namespace
             const double latency = row.candidate_evidence.samples[index];
             std::fprintf(
                 file,
-                "cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%zu,%llu,%s,%zu,%llu,%zu,%d,%.9f,%a\n",
+                "cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%zu,%llu,%s,%zu,%llu,%zu,%d,%.9f,%a,%s\n",
                 row.format->name.c_str(),
                 static_cast<unsigned>(row.source_codebook),
                 static_cast<unsigned>(row.execution_codebook),
@@ -2509,7 +2546,8 @@ namespace
                 index,
                 row.candidate_evidence.timed_replays,
                 latency,
-                latency);
+                latency,
+                row.active_rows ? std::to_string(*row.active_rows).c_str() : "");
         }
     }
 
@@ -2524,7 +2562,7 @@ namespace
             file,
             "cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%zu,%llu,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%zu,%d,%zu,"
             "%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,%zu,%.17g,%.17g,%.17g,%.17g,%s,%s,%s,"
-            "1,%d,1,1,%d,%s,%s,%d,%d,%d,%s,1,%d,%d,%d,%d,%zu,%zu,%zu,%d,%d,%d\n",
+            "1,%d,1,1,%d,%s,%s,%d,%d,%d,%s,1,%d,%d,%d,%d,%zu,%zu,%zu,%d,%d,%d,%s,%d\n",
             row.format->name.c_str(),
             static_cast<unsigned>(row.source_codebook),
             static_cast<unsigned>(row.execution_codebook),
@@ -2582,7 +2620,9 @@ namespace
             evidence.fused_dynamic_shared_bytes,
             evidence.fused_resources.maximum_threads,
             evidence.fused_resources.active_blocks_per_sm,
-            evidence.fused_threads);
+            evidence.fused_threads,
+            row.active_rows ? std::to_string(*row.active_rows).c_str() : "",
+            evidence.inactive_rows_untouched ? 1 : 0);
     }
 
     /** CUDA-only performance fixture. */
@@ -2631,11 +2671,11 @@ namespace
             "observed_tile_n,observed_cpt,observed_effective_kb,serial_m1_candidate_id,serial_route_counter_ok,"
             "numerical_correctness,correctness_pass,is_winner,compiler_registers,compiler_local_bytes,"
             "compiler_static_shared_bytes,launch_dynamic_shared_bytes,compiler_max_threads,"
-            "launch_active_blocks_per_sm,launch_threads\n");
+            "launch_active_blocks_per_sm,launch_threads,active_rows,inactive_rows_untouched\n");
         std::fprintf(
             timing,
             "backend,phase,source_format,source_codebook,execution_codebook,shape,execution_mode,m,n,k,"
-            "candidate_id,measurement_order,measurement_order_seed,measurement_protocol,sample_measurement_order,sample_order_seed,sample_index,timed_replays,latency_us,latency_us_hex\n");
+            "candidate_id,measurement_order,measurement_order_seed,measurement_protocol,sample_measurement_order,sample_order_seed,sample_index,timed_replays,latency_us,latency_us_hex,active_rows\n");
 
         int executed_cases = 0;
         int isolated_profile_launches = 0;
@@ -2722,7 +2762,7 @@ namespace
                             prepared.kernel,
                             input.get(),
                             mode,
-                            m,
+                            config.active_rows.value_or(m),
                             shape.N,
                             shape.K,
                             matrix_desc.codebook_id,
@@ -2787,7 +2827,7 @@ namespace
                                 config.timed_replay_cap,
                                 order_seed,
                                 profiler_request_ids,
-                                device_);
+                                device_, config.active_rows);
                         ASSERT_TRUE(batch.valid)
                             << format.name << " " << shape.name << " M=" << m
                             << " mode=" << executionModeName(mode)
@@ -2825,6 +2865,7 @@ namespace
                                 .candidate = candidate,
                                 .mode = mode,
                                 .m = m,
+                                .active_rows = config.active_rows,
                                 .measurement_order = measurement_order,
                                 .measurement_order_seed = order_seed,
                                 .source_codebook = source_info->codebook_id,

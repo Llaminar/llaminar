@@ -1,6 +1,6 @@
-/**
- * @file FusedGateUpGEMMStage.cpp
+/** @file FusedGateUpGEMMStage.cpp
  * @brief Implementation of FusedGateUpGEMMStage
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #include "FusedGateUpGEMMStage.h"
@@ -309,6 +309,7 @@ namespace llaminar2
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {gate_gemm, output_gate, params_.n_gate, params_.bias_gate, "gate"},
             {up_gemm, output_up, params_.n_up, params_.bias_up, "up"}};
+        auto verifier_rows = gate_gemm->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
         const bool success = gate_gemm->multiply_fused_verifier_rows_decode_equivalent(
             input,
             projections,

@@ -375,6 +375,7 @@ namespace llaminar2
          * kernel layer. Unsupported grouped implementations fail closed here;
          * production stage execution must never replay verifier rows one at a time.
          */
+        auto verifier_rows = anchorKernel()->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
         const bool success = anchorKernel()->multiply_fused_verifier_rows_decode_equivalent(
             input_base,
             cached_projections_,

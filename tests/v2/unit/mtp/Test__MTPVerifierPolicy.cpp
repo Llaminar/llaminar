@@ -1,9 +1,151 @@
+/**
+ * @file Test__MTPVerifierPolicy.cpp
+ * @brief Device-free proof of verifier policy and captured/live row separation.
+ *
+ * These tests exercise the metadata arithmetic used by captured GPU kernels,
+ * including shrinking, growing, empty, and tiled logical extents. No device
+ * count is read by host policy and no accelerator is required.
+ */
 #include <gtest/gtest.h>
 
 #include "execution/mtp/MTPVerifierPolicy.h"
+#include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/DeviceRowWorkGrid.h"
+#include "tensors/TensorKernels.h"
+#include <algorithm>
+#include <limits>
+#include <vector>
 
 namespace llaminar2
 {
+
+/** @brief Bounded grids cover every live row exactly once without consulting its owner. */
+TEST(Test__MTPVerifierPolicy, CountedWorkerGridCoversEveryLiveTile)
+{
+    const std::int32_t owner = -1; // An invalid value proves planning does not read it.
+    for (int capacity : {1, 3, 16, 17, 31, 65})
+        for (int tile_width : {1, 2, 4, 8})
+            for (int independent : {1, 13, 64, 816, 13056})
+            {
+                const auto rows = DeviceRowRange::deviceCounted(capacity, &owner);
+                const int workers = deviceRowWorkerGroups(rows, tile_width, independent, 720);
+                const int physical = 1 + (capacity - 1) / tile_width;
+                ASSERT_GE(workers, 1);
+                ASSERT_LE(workers, physical);
+                EXPECT_GE(workers * independent, std::min(720, physical * independent));
+                for (int live = 0; live <= capacity; ++live)
+                {
+                    std::vector<int> visits(capacity);
+                    for (int worker = 0; worker < workers; ++worker)
+                        for (int first = worker * tile_width; first < live; first += workers * tile_width)
+                            for (int row = first; row < std::min(first + tile_width, live); ++row)
+                                ++visits[row];
+                    for (int row = 0; row < capacity; ++row)
+                        ASSERT_EQ(visits[row], row < live ? 1 : 0);
+                }
+                EXPECT_EQ(deviceRowWorkerGroups(DeviceRowRange::fullyActive(capacity),
+                    tile_width, independent, 720), physical);
+            }
+}
+
+/** @brief Rejected and extreme metadata cannot produce an empty or overflowing launch. */
+TEST(Test__MTPVerifierPolicy, CountedWorkerGridValidatesGeometry)
+{
+    const std::int32_t owner = 0;
+    const auto rows = DeviceRowRange::deviceCounted(16, &owner);
+    EXPECT_EQ(deviceRowWorkerGroups(rows, 4, 13056, 720), 1);
+    EXPECT_EQ(deviceRowWorkerGroups(rows, 4, 1, 720), 4);
+    EXPECT_THROW((void)deviceRowWorkerGroups(rows, 0, 1, 1), std::invalid_argument);
+    EXPECT_THROW((void)deviceRowWorkerGroups(rows, 1, 0, 1), std::invalid_argument);
+    EXPECT_THROW((void)deviceRowWorkerGroups(rows, 1, 1, -1), std::invalid_argument);
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+    EXPECT_EQ(deviceRowWorkerGroups(rows, 1, maximum, maximum), 1);
+    EXPECT_EQ(deviceRowWorkerGroups(rows, 1, 1, maximum), 16);
+}
+
+TEST(Test__MTPVerifierPolicy, VerifierRecordingScopesRestoreGeometry)
+{
+    using Scope = ITensorGemm::VerifierKernelModeScope;
+    const std::int32_t owner = 0; // Borrow address only, never a host live count.
+    EXPECT_EQ(Scope::rowsFor(16), nullptr);
+    {
+        Scope outer(DeviceRowRange::deviceCounted(16, &owner));
+        EXPECT_EQ(Scope::rowsFor(16)->countOwner(), &owner);
+        EXPECT_THROW((void)Scope::rowsFor(3), std::logic_error);
+        {
+            Scope inherited;
+            EXPECT_EQ(Scope::rowsFor(16)->countOwner(), &owner);
+        }
+        try
+        {
+            Scope independent(DeviceRowRange::fullyActive(3));
+            EXPECT_EQ(Scope::rowsFor(3)->countOwner(), nullptr);
+            throw std::runtime_error("adversarial launch failure");
+        }
+        catch (const std::runtime_error &) {}
+        EXPECT_EQ(Scope::rowsFor(16)->countOwner(), &owner);
+    }
+    EXPECT_EQ(Scope::rowsFor(3), nullptr);
+}
+
+TEST(Test__MTPVerifierPolicy, DeviceRowsRetainCapacityAcrossDepthChanges)
+{
+    const std::int32_t owner = 0; // Address identity only: never dereferenced.
+    const auto rows = DeviceRowRange::deviceCounted(16, &owner);
+    for (int active : {3, 2, 16, 1, 0, 15, 3})
+    {
+        EXPECT_EQ(rows.activeRowsFor(active), active);
+        EXPECT_EQ(rows.physicalRows(), 16);
+        EXPECT_EQ(rows.capacity(), 16);
+        EXPECT_EQ(rows.countOwner(), &owner);
+    }
+}
+
+TEST(Test__MTPVerifierPolicy, DeviceRowSlicesPreserveScratchStrideAndCountOwner)
+{
+    const std::int32_t owner = 0;
+    for (int capacity : {1, 2, 3, 15, 16, 17, 31, 64})
+    {
+        const auto matrix = DeviceRowRange::deviceCounted(capacity, &owner);
+        for (int tile_width : {1, 2, 4, 8, 16})
+        {
+            for (int active = 0; active <= capacity; ++active)
+            {
+                int covered = 0;
+                for (int first = 0; first < capacity; first += tile_width)
+                {
+                    const int width = std::min(tile_width, capacity - first);
+                    const auto tile = matrix.slice(first, width);
+                    const int expected = std::clamp(active - first, 0, width);
+                    EXPECT_EQ(tile.activeRowsFor(active), expected);
+                    EXPECT_EQ(tile.physicalRows(), width);
+                    EXPECT_EQ(tile.capacity(), capacity);
+                    EXPECT_EQ(tile.countOwner(), &owner);
+                    covered += tile.activeRowsFor(active);
+                    // A nested slice keeps coordinates in the original matrix.
+                    EXPECT_EQ(tile.slice(width - 1, 1).activeRowsFor(active),
+                              active > first + width - 1 ? 1 : 0);
+                }
+                EXPECT_EQ(covered, active);
+            }
+        }
+    }
+}
+
+TEST(Test__MTPVerifierPolicy, DeviceRowsRejectInvalidGeometryAndPublication)
+{
+    EXPECT_THROW((void)DeviceRowRange::fullyActive(0), std::invalid_argument);
+    EXPECT_THROW((void)DeviceRowRange::fullyActive(-1), std::invalid_argument);
+    EXPECT_THROW((void)DeviceRowRange::deviceCounted(16, nullptr), std::invalid_argument);
+    const auto rows = DeviceRowRange::fullyActive(16);
+    EXPECT_EQ(rows.countOwner(), nullptr);
+    EXPECT_EQ(rows.activeRowsFor(-1), -1);
+    EXPECT_EQ(rows.activeRowsFor(17), -1);
+    EXPECT_THROW((void)rows.slice(-1, 1), std::out_of_range);
+    EXPECT_THROW((void)rows.slice(0, 0), std::out_of_range);
+    EXPECT_THROW((void)rows.slice(16, 1), std::out_of_range);
+    EXPECT_THROW((void)rows.slice(1, std::numeric_limits<int>::max()), std::out_of_range);
+}
 
 TEST(Test__MTPVerifierPolicy, PhysicalRowBucketsBoundTheCapturedGraphFamily)
 {

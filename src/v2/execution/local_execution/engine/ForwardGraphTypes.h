@@ -222,7 +222,7 @@ namespace llaminar2
         bool uses_device_token_ids = false; ///< True when embedding reads token IDs from a stable device buffer.
         bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
         ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows; ///< Position geometry captured by this graph.
-        bool uses_device_sequence_lengths = false; ///< True when stages derive request geometry from a stable device row.
+        const int32_t *device_sequence_lengths = nullptr; ///< Exact borrowed row-count owner embedded by captured stages.
         uint64_t device_prefill_chunk_capture_identity = 0; ///< Non-zero when a captured device chunk materializer precedes model roots.
         uint64_t shifted_mtp_prefill_capture_identity = 0; ///< Non-zero only when this capture embeds shifted MTP KV prefill.
         uint64_t mtp_main_terminal_hidden_capture_identity = 0; ///< Non-zero when main decode publishes its MTP terminal row in-graph.
@@ -238,6 +238,12 @@ namespace llaminar2
         uint64_t moe_placement_epoch = 0;
         /** Semantic diagnostic-node topology embedded in the native graph. */
         uint64_t snapshot_configuration_identity = 1;
+
+        /** @return Whether this graph embeds a device-owned request-length source. */
+        [[nodiscard]] bool usesDeviceSequenceLengths() const noexcept
+        {
+            return device_sequence_lengths != nullptr;
+        }
 
         bool operator==(const ForwardGraphSignature &other) const
         {
@@ -257,7 +263,7 @@ namespace llaminar2
                    uses_device_token_ids == other.uses_device_token_ids &&
                    uses_device_position_ids == other.uses_device_position_ids &&
                    position_policy == other.position_policy &&
-                   uses_device_sequence_lengths == other.uses_device_sequence_lengths &&
+                   device_sequence_lengths == other.device_sequence_lengths &&
                    device_prefill_chunk_capture_identity ==
                        other.device_prefill_chunk_capture_identity &&
                    shifted_mtp_prefill_capture_identity ==
@@ -361,7 +367,7 @@ namespace llaminar2
             h ^= (std::hash<bool>{}(sig.uses_device_position_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint8_t>{}(static_cast<uint8_t>(sig.position_policy)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
-            h ^= (std::hash<bool>{}(sig.uses_device_sequence_lengths) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<const int32_t *>{}(sig.device_sequence_lengths) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(
                       sig.device_prefill_chunk_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));

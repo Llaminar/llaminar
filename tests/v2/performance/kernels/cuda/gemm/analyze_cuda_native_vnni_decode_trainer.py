@@ -16,6 +16,9 @@ execution. Exact grouped overlays precede total geometry/M rules in production.
 An exact-only refresh may retain an authenticated installed Auto policy. That
 transaction replaces only measured M1 tables: generic and grouped selectors are
 retained verbatim, without fitting or claiming a new generic certificate.
+Grouped exact refreshes likewise replace only their declared measured keys;
+the complete M1 arithmetic and every generic rule remain immutable. A separate
+retention receipt binds the old include, measured delta, and resulting bytes.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -127,6 +131,7 @@ from native_vnni_dispatch.validation import (  # noqa: E402
     CANONICAL_VERIFIER_M,
     require_candidate_matrix_complete,
     require_canonical_alias_coverage,
+    require_exact_overlay_scope,
     require_verifier_m_matrix,
 )
 
@@ -513,6 +518,143 @@ def refresh_exact_m1_dispatch(
     # This suffix contains both the complete Auto tree and grouped program;
     # retaining the bytes proves that neither was silently fitted or changed.
     return header + generated[fresh_start:-len(terminal)] + base_include[tail_start:]
+
+
+def _grouped_literal_tables(body: str) -> dict[tuple[int, int], str]:
+    """Index only this emitter's sorted literal tables, rejecting other C++.
+
+    This is an emitter composition boundary, not a permissive C++ parser.
+    Preserving complete original row strings keeps unrelated policy evidence
+    unchanged. Duplicates, reordered keys, foreign codebooks and statements in
+    the table body are fatal rather than silently dropped during a refresh.
+    """
+
+    block = re.compile(
+        r"    if constexpr \(CB == (\d+)\)\n    \{\n"
+        r"        static constexpr GeneratedGroupedDispatchEntry kTable\[\] = \{\n"
+        r"(?P<rows>.*?)"
+        r"        \};\n        if \(exact_key_representable &&\n"
+        r"            findGeneratedGroupedDispatchEntry\(kTable, key, tuning\)\)\n"
+        r"            return true;\n    \}\n", re.DOTALL,
+    )
+    row_pattern = re.compile(
+        r"            \{0x([0-9a-f]{16})ULL, "
+        r"\{GeneratedGroupedKernel::(?:Dp4aRows|TensorCoreMma16), "
+        r"(?:2|4|8|16|32|64)\}\}, // [^\n]+\n"
+    )
+    rows: dict[tuple[int, int], str] = {}
+    blocks = tuple(block.finditer(body))
+    if not blocks or "".join(match.group(0) for match in blocks) != body:
+        raise ValueError("retained grouped table body is not canonical")
+    codebooks = [int(match.group(1)) for match in blocks]
+    supported = {spec.gpu_execution_codebook_id for spec in FORMAT_SPECS}
+    if codebooks != sorted(set(codebooks)) or not set(codebooks) <= supported:
+        raise ValueError("retained grouped codebooks are not unique and sorted")
+    for match in blocks:
+        codebook = int(match.group(1))
+        keys = []
+        for line in match.group("rows").splitlines(keepends=True):
+            parsed = row_pattern.fullmatch(line)
+            if parsed is None:
+                raise ValueError("retained grouped row is not a canonical literal")
+            key = int(parsed.group(1), 16)
+            if ((key >> 56) & 0x7f) < 2 or not (key & 0xfffffff) or not (
+                (key >> 28) & 0xffffff
+            ):
+                raise ValueError("retained grouped key is outside the runtime ABI")
+            keys.append(key)
+            rows[(codebook, key)] = line
+        if not keys or keys != sorted(set(keys)):
+            raise ValueError("retained grouped keys must be nonempty and sorted")
+    return rows
+
+
+def retain_grouped_exact_dispatch(
+    base_include: str,
+    entries: list[GroupedEntry],
+    *,
+    corpus_digest: str,
+    registry_digest: str,
+) -> tuple[str, dict[str, object]]:
+    """Merge a measured grouped delta without touching M1 or generic code.
+
+    Callers must first prove declared all-format scope and candidate coverage
+    against the shared corpus and registry. The separate receipt distinguishes
+    retained policy from new evidence; it never recertifies the base. Requiring
+    the emitter-owned ABI and complete generic suffix prevents a partial or
+    hand-written selector from being smuggled through this composition step.
+    """
+
+    keys = [(entry.codebook, pack_shape_key(
+        entry.execution_mode, entry.m, entry.n, entry.k)) for entry in entries]
+    if not keys or len(set(keys)) != len(keys):
+        raise ValueError("grouped refresh requires nonempty, unique exact keys")
+    for entry in entries:
+        if not (2 <= entry.m <= 127 and 0 < entry.n <= 0xfffffff
+                and 0 < entry.k <= 0xffffff):
+            raise ValueError("grouped refresh key is outside the runtime ABI")
+        config = _grouped_config(entry.candidate_id)
+        if (config["kernel"], config["grouped_rows"]) != (entry.kernel, entry.grouped_rows):
+            raise ValueError("grouped refresh launch disagrees with its registry ID")
+    generated = generate_include(
+        [], [], grouped_entries=entries, corpus_digest=corpus_digest,
+        registry_digest=registry_digest, profile=MeasurementProfile.PRODUCTION,
+        exact_only=True,
+    )
+    marker = "#define LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2 1"
+    generic = "\n    const long long work_items ="
+    terminal = "    return false;\n}\n"
+    for source in (base_include, generated):
+        if source.count(marker) != 1:
+            raise ValueError("grouped refresh requires one generated grouped selector")
+    base_start = base_include.index(marker)
+    fresh_start = generated.index(marker)
+    base_grouped = base_include[base_start:]
+    fresh_grouped = generated[fresh_start:]
+    table_marker = "    if constexpr (CB == "
+    base_tables = base_grouped.index(table_marker)
+    fresh_tables = fresh_grouped.index(table_marker)
+    if base_grouped[:base_tables] != fresh_grouped[:fresh_tables]:
+        raise ValueError("grouped refresh cannot change the installed selector ABI")
+    if base_grouped.count(generic) != 1 or not base_grouped.endswith(terminal):
+        raise ValueError("grouped refresh requires the complete retained generic suffix")
+    if not fresh_grouped.endswith(terminal):
+        raise ValueError("generated grouped exact-only termination changed")
+    suffix_start = base_grouped.index(generic)
+    retained = _grouped_literal_tables(base_grouped[base_tables:suffix_start])
+    refreshed = _grouped_literal_tables(fresh_grouped[fresh_tables:-len(terminal)])
+    combined = retained | refreshed
+    blocks = []
+    for codebook in sorted({key[0] for key in combined}):
+        blocks.append(
+            f"    if constexpr (CB == {codebook})\n    {{\n"
+            "        static constexpr GeneratedGroupedDispatchEntry kTable[] = {\n"
+            + "".join(combined[key] for key in sorted(combined) if key[0] == codebook)
+            + "        };\n        if (exact_key_representable &&\n"
+            "            findGeneratedGroupedDispatchEntry(kTable, key, tuning))\n"
+            "            return true;\n    }\n"
+        )
+    prefix = base_include[:base_start + base_tables]
+    # Scope old whole-policy claims to the retained input. The retained M1
+    # program and both Auto policies are not regenerated or refitted here.
+    prefix = prefix.replace("// Common policy digest:", "// Retained base policy digest:")
+    prefix = prefix.replace("// Common corpus digest:", "// Retained base corpus digest:")
+    encoded = prefix + "".join(blocks) + base_grouped[suffix_start:]
+    digest = lambda value: "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return encoded, {
+        "schema": "cuda-decode-grouped-additive-exact-overlay-v1",
+        "base_sha256": digest(base_include),
+        "measured_delta_sha256": digest(generated),
+        "output_sha256": digest(encoded),
+        "corpus_digest": corpus_digest,
+        "registry_digest": registry_digest,
+        "base_keys": len(retained), "refreshed_keys": len(refreshed),
+        "replaced_keys": len(retained.keys() & refreshed.keys()),
+        "retained_keys": len(retained.keys() - refreshed.keys()),
+        "output_keys": len(combined),
+        "base_evidence": "retained installed policy; not remeasured",
+        "retained_program": "complete M1 arithmetic and both generic selectors",
+    }
 
 
 def validate_grouped_generic_totality(
@@ -2188,6 +2330,17 @@ def main() -> int:
         "--retain-auto-include", type=Path,
         help="Installed generated include paired with --retain-auto-policy-json",
     )
+    parser.add_argument("--retain-grouped-base-include", type=Path,
+                        help="Refresh declared grouped exact keys, preserving M1 and both Auto selectors")
+    parser.add_argument("--retention-receipt", type=Path,
+                        help="Required separate provenance receipt for a grouped exact refresh")
+    parser.add_argument("--exact-refresh-shapes", nargs="+", default=[],
+                        help="Declared additive scope; names must resolve in the shared production manifest")
+    parser.add_argument("--exact-refresh-m", nargs="+", type=int, default=[])
+    parser.add_argument("--exact-refresh-active-rows", nargs="+", type=int,
+                        help="Declared device-counted occupancies; all share one physical-M exact key")
+    parser.add_argument("--exact-refresh-modes", nargs="+", default=[],
+                        choices=[mode.value for mode in ExecutionMode])
     parser.add_argument(
         "--certify-generic",
         action="store_true",
@@ -2332,6 +2485,26 @@ def main() -> int:
     parser.add_argument("--sealed-driver-runtime", default="")
     parser.add_argument("--sealed-serial-m1-policy-hash", default="")
     args = parser.parse_args()
+
+    retain_grouped = args.retain_grouped_base_include is not None
+    scope_supplied = bool(args.exact_refresh_shapes or args.exact_refresh_m
+                          or args.exact_refresh_modes or args.exact_refresh_active_rows)
+    if retain_grouped != (args.retention_receipt is not None) or scope_supplied != retain_grouped:
+        parser.error("grouped exact retention requires an include, separate receipt, and declared scope")
+    if retain_grouped:
+        if (not args.exact_only or args.profile != MeasurementProfile.PRODUCTION.value
+                or not args.exact_refresh_shapes or not args.exact_refresh_m
+                or not args.exact_refresh_modes):
+            parser.error("grouped exact retention requires --exact-only --profile production and all scope axes")
+        if (args.retain_auto_policy_json or args.retain_auto_include
+                or args.certified_m1_include or args.verifier_input
+                or args.require_complete or args.require_fast_m1_complete
+                or args.freeze_generic or args.certify_generic or args.policy_json):
+            parser.error("grouped exact retention cannot fit, certify, or refresh M1 policy")
+        if args.retention_receipt.resolve() in {
+            args.output.resolve(), args.retain_grouped_base_include.resolve(),
+        }:
+            parser.error("retention receipt must not overwrite an include")
 
     retain_auto = args.retain_auto_policy_json is not None
     if retain_auto != (args.retain_auto_include is not None):
@@ -2731,6 +2904,20 @@ def main() -> int:
         context.serial_m1_policy_hash,
         exact=exact,
     )
+    retention = None
+    if retain_grouped:
+        manifest = load_shape_manifest(args.shape_manifest)
+        require_exact_overlay_scope(
+            corpus, manifest, shape_names=tuple(args.exact_refresh_shapes),
+            m_values=tuple(args.exact_refresh_m),
+            execution_modes=tuple(ExecutionMode(mode) for mode in args.exact_refresh_modes),
+            contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+            active_rows=(tuple(args.exact_refresh_active_rows)
+                         if args.exact_refresh_active_rows is not None else None),
+        )
+        _require_shape_reachable_candidate_coverage(corpus)
+        if len(grouped_entries) != len(corpus.runtime_keys()):
+            raise ValueError("grouped exact refresh has an unrepresented runtime key")
     if args.exact_only:
         generic_rules = []
     elif certified_replay:
@@ -2775,7 +2962,24 @@ def main() -> int:
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    if certified_replay:
+    if retain_grouped:
+        generated, retention = retain_grouped_exact_dispatch(
+            args.retain_grouped_base_include.read_text(encoding="utf-8"),
+            grouped_entries, corpus_digest=corpus.digest(),
+            registry_digest=candidate_registry_digest(),
+        )
+        retention.update({
+            "shape_manifest_digest": manifest.digest(),
+            "shape_names": args.exact_refresh_shapes,
+            "m_values": args.exact_refresh_m,
+            "active_rows": args.exact_refresh_active_rows,
+            "execution_modes": args.exact_refresh_modes,
+            "source_formats": [spec.label for spec in FORMAT_SPECS],
+            "serial_m1_policy_hash": context.serial_m1_policy_hash,
+            "base_include": str(args.retain_grouped_base_include.resolve()),
+            "output_include": str(args.output.resolve()),
+        })
+    elif certified_replay:
         manifest = load_shape_manifest(args.shape_manifest)
         measurement_plan = load_gpu_measurement_plan(
             args.measurement_plan,
@@ -2832,6 +3036,9 @@ def main() -> int:
             exact_only=args.exact_only,
         )
     args.output.write_text(generated, encoding="utf-8")
+    if retention is not None:
+        args.retention_receipt.parent.mkdir(parents=True, exist_ok=True)
+        args.retention_receipt.write_text(json.dumps(retention, indent=2) + "\n", encoding="utf-8")
     if args.summary:
         args.summary.parent.mkdir(parents=True, exist_ok=True)
         write_summary(args.summary, entries, exact)
@@ -2844,7 +3051,7 @@ def main() -> int:
     )
     print(
         f"adapted {len(corpus)} strong observations; selected {len(entries)} "
-        f"Fast M=1 exact entries and certified {verifier_count} verifier keys "
+        f"Fast M=1 exact entries and validated {verifier_count} verifier keys "
         f"-> {args.output}"
     )
     return 0

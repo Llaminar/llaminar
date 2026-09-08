@@ -1,9 +1,11 @@
-/**
- * @file GEMMStage.h
+/** @file GEMMStage.h
  * @brief GEMM stage: C = alpha * A * B + beta * C
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #pragma once
+
+#include "kernels/common/DeviceRowRange.h"
 
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
@@ -132,6 +134,8 @@ namespace llaminar2
              * serial-decode numerical contract.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
+            std::optional<DeviceRowRange> verifier_row_range;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution

@@ -17,6 +17,7 @@
 #include "../kernels/GDNDeviceStateBinding.h"
 #include "../kernels/attention/AttentionExecutionPolicy.h"
 #include "../kernels/common/DeviceNativeVNNIMatrixDesc.h"
+#include "../kernels/common/DeviceRowRange.h"
 #include "NativeVnniFormatInfo.h"
 #include "TensorType.h"
 #include "BlockStructures.h"
@@ -24,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -413,12 +415,48 @@ namespace llaminar2
          * kernel mode override return a token from
          * beginVerifierDecodeEquivalentScope(); callers keep it alive while
          * running verifier row work and then let destruction restore the
-         * previous backend mode.  CPU and backends without such a mode may
-         * return nullptr.
+         * previous backend mode. Row geometry is immutable recording metadata:
+         * it borrows the controller's device count, never reads that count on
+         * the host, and is copied into each captured kernel's arguments. Nested
+         * adapter scopes inherit it; an explicit geometry replaces it only for
+         * that scope. Destruction restores the enclosing capture transaction.
          */
         struct VerifierKernelModeScope
         {
-            virtual ~VerifierKernelModeScope() = default;
+            /** @brief Bind optional physical/live geometry for this recording scope. */
+            explicit VerifierKernelModeScope(
+                std::optional<DeviceRowRange> rows = std::nullopt)
+                : previous_rows_(current_rows_)
+            {
+                if (rows)
+                    current_rows_ = rows;
+            }
+
+            /** @brief Restore metadata even when a nested launch throws. */
+            virtual ~VerifierKernelModeScope() { current_rows_ = previous_rows_; }
+
+            VerifierKernelModeScope(const VerifierKernelModeScope &) = delete;
+            VerifierKernelModeScope &operator=(const VerifierKernelModeScope &) = delete;
+
+            /**
+             * @brief Resolve borrowed launch metadata without reading device state.
+             * @param physical_rows Matrix width used by this launch and its scratch.
+             * @return The enclosing geometry, or null for fully active work.
+             * @throws std::logic_error If a caller tries to reuse another matrix's extent.
+             *
+             * This is host recording context, not a live execution-state mirror.
+             * GPU bridges copy the descriptor by value before this scope ends.
+             */
+            [[nodiscard]] static const DeviceRowRange *rowsFor(int physical_rows)
+            {
+                if (current_rows_ && current_rows_->physicalRows() != physical_rows)
+                    throw std::logic_error("Verifier launch row geometry disagrees with physical matrix");
+                return current_rows_ ? &*current_rows_ : nullptr;
+            }
+
+        private:
+            std::optional<DeviceRowRange> previous_rows_; ///< Enclosing recording metadata.
+            inline static thread_local std::optional<DeviceRowRange> current_rows_;
         };
 
         /**
@@ -478,9 +516,10 @@ namespace llaminar2
          * whether CUDA, ROCm, or CPU implements the mode with generated policy
          * switches, deterministic reductions, or no-op scalar code.
          */
-        virtual std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope()
+        virtual std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope(
+            std::optional<DeviceRowRange> rows = std::nullopt)
         {
-            return nullptr;
+            return std::make_unique<VerifierKernelModeScope>(rows);
         }
 
         /**

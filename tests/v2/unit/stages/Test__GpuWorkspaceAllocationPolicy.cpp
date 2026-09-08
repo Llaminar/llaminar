@@ -13795,14 +13795,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CachedForwardReplayRefreshesResidentPos
               std::string::npos)
         << "Perf tags should expose whether a cached graph used resident positions.";
 
-    EXPECT_NE(compact_forward_types.find("booluses_device_sequence_lengths=false"),
+    EXPECT_NE(compact_forward_types.find("constint32_t*device_sequence_lengths=nullptr"),
               std::string::npos)
         << "Forward graph signatures must distinguish request-length-owned row-selection graphs.";
-    EXPECT_NE(compact_forward_types.find("uses_device_sequence_lengths==other.uses_device_sequence_lengths"),
+    EXPECT_NE(compact_forward_types.find("device_sequence_lengths==other.device_sequence_lengths"),
               std::string::npos);
-    EXPECT_NE(compact_forward_types.find("std::hash<bool>{}(sig.uses_device_sequence_lengths)"),
+    EXPECT_NE(compact_forward_types.find("std::hash<constint32_t*>{}(sig.device_sequence_lengths)"),
               std::string::npos);
-    EXPECT_NE(compact_forward_engine.find("input.sequence_lengths_device!=nullptr"),
+    EXPECT_NE(compact_forward_engine.find(".device_sequence_lengths=effective_input.sequence_lengths_device"),
               std::string::npos)
         << "The cache signature and perf tags must record resident request-length ownership.";
 
@@ -16308,7 +16308,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_NE(verifier_exporter.find("!signature.uses_device_position_ids"),
               std::string::npos);
     EXPECT_NE(
-        verifier_exporter.find("!signature.uses_device_sequence_lengths"),
+        verifier_exporter.find("!signature.usesDeviceSequenceLengths()"),
         std::string::npos);
     EXPECT_NE(
         verifier_exporter.find("bindMTPVerifierForwardGraphPair("),

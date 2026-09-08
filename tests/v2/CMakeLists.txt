@@ -6582,6 +6582,33 @@ endif()
 # Tests CUDAFloatingPointGemmKernel and CUDAQuantisedGemmKernel through KernelFactory
 # with cosine similarity metrics against CPU reference kernels
 add_executable(v2_integration_cuda_gemm_parity integration/kernels/cuda/Test__CUDAGemmParity.cpp)
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_device_counted_verifier_rows
+        integration/kernels/cuda/Test__CUDADeviceCountedVerifierRows.cpp)
+    target_link_libraries(v2_integration_cuda_device_counted_verifier_rows
+        llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Integration_CUDA_DeviceCountedVerifierRows
+        COMMAND $<TARGET_FILE:v2_integration_cuda_device_counted_verifier_rows>
+                --gtest_filter=*CUDADeviceCountedVerifierRows.*
+                --gtest_brief=1
+        LABELS "V2;Integration;CUDA;GEMM;MTP;GraphCapture;AllFormats;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+    )
+    # Release intentionally omits Integration targets. Share fixture source,
+    # not an executable dependency on a target absent from the Perf build.
+    add_executable(v2_perf_cuda_device_counted_verifier_rows
+        integration/kernels/cuda/Test__CUDADeviceCountedVerifierRows.cpp)
+    target_link_libraries(v2_perf_cuda_device_counted_verifier_rows
+        llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Perf_CUDA_DeviceCountedVerifierRows
+        COMMAND $<TARGET_FILE:v2_perf_cuda_device_counted_verifier_rows>
+                --gtest_filter=CUDADeviceCountedVerifierRowsEconomy.*
+        LABELS "V2;Perf;CUDA;GEMM;MTP;GraphCapture;Economy"
+        MPI_PROCS 1
+        NO_MODELS
+    )
+endif()
 target_link_libraries(v2_integration_cuda_gemm_parity llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_CUDAGemmParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
@@ -9264,6 +9291,15 @@ target_link_libraries(v2_test_prefix_mtp_config llaminar2_core GTest::gtest GTes
 add_v2_test(V2_Unit_PrefixMTPConfig
     COMMAND $<TARGET_FILE:v2_test_prefix_mtp_config>
     LABELS "V2;Unit;Config;PrefixCache;MTP;CLI;YAML"
+    MPI_PROCS 1
+)
+
+# Test: Topology-bound MTP hardware defaults (device-free, full Unit gate)
+add_executable(v2_test_mtp_hardware_defaults unit/mtp/Test__MTPHardwareDefaults.cpp)
+target_link_libraries(v2_test_mtp_hardware_defaults llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MTPHardwareDefaults
+    COMMAND $<TARGET_FILE:v2_test_mtp_hardware_defaults>
+    LABELS "V2;Unit;Config;MTP;Topology;CLI;YAML"
     MPI_PROCS 1
 )
 
@@ -12918,6 +12954,31 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;GEMM;Prefill;GraphBucket;BatchInvariant;MTotality;AllFormats;NativeVNNI;ByteExact;Regression"
         MPI_PROCS 1
     )
+    add_executable(v2_integration_rocm_device_counted_verifier_rows
+        integration/kernels/rocm/Test__ROCmDeviceCountedVerifierRows.cpp)
+    target_link_libraries(v2_integration_rocm_device_counted_verifier_rows
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_ROCm_DeviceCountedVerifierRows
+        COMMAND $<TARGET_FILE:v2_integration_rocm_device_counted_verifier_rows>
+                --gtest_filter=*ROCmDeviceCountedVerifierRows.*
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;GEMM;MTP;GraphCapture;AllFormats;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+    )
+    # Capacity attribution reuses the functional byte oracle but stays outside
+    # production preflight, exactly like the CUDA economy registration.
+    add_executable(v2_perf_rocm_device_counted_verifier_rows
+        integration/kernels/rocm/Test__ROCmDeviceCountedVerifierRows.cpp)
+    target_link_libraries(v2_perf_rocm_device_counted_verifier_rows
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Perf_ROCm_DeviceCountedVerifierRows
+        COMMAND $<TARGET_FILE:v2_perf_rocm_device_counted_verifier_rows>
+                --gtest_filter=ROCmDeviceCountedVerifierRowsEconomy.*
+        LABELS "V2;Perf;ROCm;GEMM;MTP;GraphCapture;Economy"
+        MPI_PROCS 1
+        NO_MODELS
+    )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_MoEAllCodegroups
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
                 --gtest_filter=Test__ROCmQuantisedGemmSmallM.ROCmMoERoutedVerifierRuntimeM_AllNativeCodegroupsMatchSerialDecode
@@ -13004,6 +13065,7 @@ if(HAVE_ROCM)
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;NativeVNNI;Regression"
         MPI_PROCS 1
+        NO_MODELS
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_NativeVNNIRuntimeM
         COMMAND $<TARGET_FILE:v2_integration_rocm_native_vnni_gemv>
@@ -17018,6 +17080,7 @@ target_link_libraries(v2_test_shmem_spin_backend
 )
 add_v2_test(V2_Unit_ShmemSpinBackend
     COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
+        --gtest_filter=-ShmemSpinEconomyMPITest.*
     LABELS "V2;Unit;Collective;ShmemSpin;Allreduce"
     MPI_PROCS 2
     TIMEOUT 30
@@ -17025,6 +17088,7 @@ add_v2_test(V2_Unit_ShmemSpinBackend
 )
 add_v2_test(V2_Unit_ShmemSpinBackend_NP4
     COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
+        --gtest_filter=-ShmemSpinEconomyMPITest.*
     LABELS "V2;Unit;Collective;ShmemSpin;Allreduce"
     MPI_PROCS 4
     TIMEOUT 30
@@ -17032,6 +17096,7 @@ add_v2_test(V2_Unit_ShmemSpinBackend_NP4
 )
 add_v2_test(V2_Unit_ShmemSpinBackend_NP8
     COMMAND $<TARGET_FILE:v2_test_shmem_spin_backend>
+        --gtest_filter=-ShmemSpinEconomyMPITest.*
     LABELS "V2;Unit;Collective;ShmemSpin;Allreduce"
     MPI_PROCS 8
     TIMEOUT 30
@@ -17045,6 +17110,23 @@ if(TEST V2_Unit_ShmemSpinBackend)
         PROPERTIES
             RUN_SERIAL TRUE
     )
+endif()
+
+# Keep the unchanged competitive timing assertions outside correctness gates.
+# A separate registration shares fixture code without duplicating its lifecycle.
+add_executable(v2_perf_shmem_spin_prefill_sequence unit/collective/Test__ShmemSpinBackend.cpp)
+target_include_directories(v2_perf_shmem_spin_prefill_sequence PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(v2_perf_shmem_spin_prefill_sequence llaminar2_core GTest::gtest MPI::MPI_CXX)
+add_v2_test(V2_Perf_ShmemSpinPrefillSequence
+    COMMAND $<TARGET_FILE:v2_perf_shmem_spin_prefill_sequence>
+        --gtest_filter=ShmemSpinEconomyMPITest.*
+    LABELS "V2;Perf;CPU;Collective;ShmemSpin;Allreduce"
+    MPI_PROCS 2
+    TIMEOUT 30
+    RESOURCE_LOCK "ShmemSpin"
+)
+if(TEST V2_Perf_ShmemSpinPrefillSequence)
+    set_tests_properties(V2_Perf_ShmemSpinPrefillSequence PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 # Performance: measured latency/bandwidth crossover for exact CPU MoE rooted
@@ -17467,6 +17549,7 @@ if(HAVE_CUDA)
     V2_Integration_CUDARequestBatchResidentKVAttention
     V2_Integration_CUDA_NativeVNNI_PrefillBucketMInvariantAllFormats
     V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks
+    V2_Integration_CUDA_DeviceCountedVerifierRows
     V2_Integration_CUDAFloatingExpertRetirement
     V2_Integration_CUDA_MoEAsyncHistogramCaptureLifecycle
     V2_Integration_CUDA_MoEDeviceResidentGroupedVerifierPublication
@@ -17481,6 +17564,8 @@ if(HAVE_CUDA)
 endif()
 if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+    V2_Integration_ROCm_DeviceCountedVerifierRows
+    V2_Integration_GroupedVerifierRows_ROCm_AllFormats
     V2_Integration_ROCm_TPCanonicalRankOrderGraphCapture
     V2_Integration_GroupedVerifierRows_ROCm_Qwen35GDNOutputProjection
     V2_Integration_ROCm_TPCapturedEpochTransactionGraphCapture

@@ -14,6 +14,8 @@
  * after stochastic verification.  Byte equivalence and captured replay are
  * owned by the corresponding ROCm integration sweep; this file owns economy
  * and provides a clean single-kernel attachment point for rocprof.
+ * Device-counted cases hold the live prefix fixed while varying the retained
+ * capture capacity, separating useful recurrence from inactive-row overhead.
  */
 
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
@@ -22,11 +24,13 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <algorithm>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -64,14 +68,17 @@ namespace
     class DeviceFloatBuffer
     {
     public:
-        explicit DeviceFloatBuffer(size_t count) : count_(count)
+        /** @brief Allocate and initialize on the fixture's exact producer stream. */
+        DeviceFloatBuffer(size_t count, hipStream_t producer_stream) : count_(count)
         {
+            if (!producer_stream)
+                throw std::invalid_argument("DeviceFloatBuffer requires an explicit stream");
             checkHip(
                 hipMalloc(reinterpret_cast<void **>(&data_), count_ * sizeof(float)),
                 "hipMalloc(DeviceFloatBuffer)");
             checkHip(
-                hipMemset(data_, 0, count_ * sizeof(float)),
-                "hipMemset(DeviceFloatBuffer)");
+                hipMemsetAsync(data_, 0, count_ * sizeof(float), producer_stream),
+                "hipMemsetAsync(DeviceFloatBuffer)");
         }
 
         ~DeviceFloatBuffer()
@@ -94,14 +101,20 @@ namespace
     class DeviceIntScalar
     {
     public:
-        explicit DeviceIntScalar(int value)
+        /** @brief Publish immutable input before any timed/captured execution. */
+        DeviceIntScalar(int value, hipStream_t producer_stream)
         {
+            if (!producer_stream)
+                throw std::invalid_argument("DeviceIntScalar requires an explicit stream");
             checkHip(
                 hipMalloc(reinterpret_cast<void **>(&data_), sizeof(int)),
                 "hipMalloc(DeviceIntScalar)");
             checkHip(
-                hipMemcpy(data_, &value, sizeof(int), hipMemcpyHostToDevice),
-                "hipMemcpy(DeviceIntScalar)");
+                hipMemcpyAsync(data_, &value, sizeof(int), hipMemcpyHostToDevice, producer_stream),
+                "hipMemcpyAsync(DeviceIntScalar)");
+            // Initialization owns this stack value until its transfer completes.
+            // No publication or host wait occurs inside the measured replay.
+            checkHip(hipStreamSynchronize(producer_stream), "initialize immutable scalar");
         }
 
         ~DeviceIntScalar()
@@ -150,6 +163,52 @@ namespace
         hipEvent_t stop = nullptr;
     };
 
+    /** @brief Retain one exact launch graph until all timed replays finish. */
+    class RetainedHipGraph
+    {
+    public:
+        /** @brief Begin with no runtime resources; record() owns materialization. */
+        RetainedHipGraph() = default;
+        /** @brief Release only after the timing fixture has joined its terminal event. */
+        ~RetainedHipGraph()
+        {
+            if (executable_) (void)hipGraphExecDestroy(executable_);
+            if (graph_) (void)hipGraphDestroy(graph_);
+        }
+        RetainedHipGraph(const RetainedHipGraph &) = delete;
+        RetainedHipGraph &operator=(const RetainedHipGraph &) = delete;
+
+        /** @brief Record exactly one production operation, ending capture on errors too. */
+        template <typename Launch>
+        void record(hipStream_t stream, Launch &&launch)
+        {
+            if (!stream || graph_ || executable_)
+                throw std::invalid_argument("RetainedHipGraph requires a fresh graph and explicit stream");
+            checkHip(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "begin GDN capture");
+            bool launched = false;
+            try { launched = launch(); }
+            catch (...)
+            {
+                (void)hipStreamEndCapture(stream, &graph_);
+                throw;
+            }
+            checkHip(hipStreamEndCapture(stream, &graph_), "end GDN capture");
+            if (!launched) throw std::runtime_error("captured GDN operation failed");
+            checkHip(hipGraphInstantiate(&executable_, graph_, nullptr, nullptr, 0), "instantiate GDN capture");
+        }
+
+        /** @brief Submit immutable captured work to its explicit measurement stream. */
+        void replay(hipStream_t stream) const
+        {
+            if (!stream || !executable_)
+                throw std::invalid_argument("RetainedHipGraph replay requires an executable and stream");
+            checkHip(hipGraphLaunch(executable_, stream), "replay GDN capture");
+        }
+    private:
+        hipGraph_t graph_ = nullptr;
+        hipGraphExec_t executable_ = nullptr;
+    };
+
     /**
      * @brief Persistent Qwen3.6-sized storage for recurrence and publication.
      *
@@ -159,10 +218,11 @@ namespace
      * retains sixteen rows so it also proves economy through the supported
      * DFlash-style verifier range.
      */
-    class GdnBenchmarkFixture
+    template <int HeadCount>
+    class GdnBenchmarkStorage
     {
     public:
-        static constexpr int kHeads = 32;
+        static constexpr int kHeads = HeadCount;
         static constexpr int kKeyWidth = 128;
         static constexpr int kValueWidth = 128;
         static constexpr int kMaxRows = 16;
@@ -172,19 +232,19 @@ namespace
         static constexpr int kQkRowFloats = kHeads * kKeyWidth;
         static constexpr int kValueRowFloats = kHeads * kValueWidth;
 
-        GdnBenchmarkFixture()
-            : q(static_cast<size_t>(kMaxRows) * kQkRowFloats),
-              k(static_cast<size_t>(kMaxRows) * kQkRowFloats),
-              v(static_cast<size_t>(kMaxRows) * kValueRowFloats),
-              alpha(static_cast<size_t>(kMaxRows) * kHeads),
-              beta(static_cast<size_t>(kMaxRows) * kHeads),
-              a_log(kHeads),
-              dt_bias(kHeads),
-              output(static_cast<size_t>(kMaxRows) * kValueRowFloats),
-              scalar_state(kStateFloats),
-              grouped_state(kStateFloats),
-              snapshots(static_cast<size_t>(kMaxRows) * kStateFloats),
-              accepted_row(kPublicationRows - 1)
+        GdnBenchmarkStorage()
+            : q(static_cast<size_t>(kMaxRows) * kQkRowFloats, timing.stream),
+              k(static_cast<size_t>(kMaxRows) * kQkRowFloats, timing.stream),
+              v(static_cast<size_t>(kMaxRows) * kValueRowFloats, timing.stream),
+              alpha(static_cast<size_t>(kMaxRows) * kHeads, timing.stream),
+              beta(static_cast<size_t>(kMaxRows) * kHeads, timing.stream),
+              a_log(kHeads, timing.stream),
+              dt_bias(kHeads, timing.stream),
+              output(static_cast<size_t>(kMaxRows) * kValueRowFloats, timing.stream),
+              scalar_state(kStateFloats, timing.stream),
+              grouped_state(kStateFloats, timing.stream),
+              snapshots(static_cast<size_t>(kMaxRows) * kStateFloats, timing.stream),
+              accepted_row(kPublicationRows - 1, timing.stream)
         {}
 
         /** @brief Launch one scalar recurrence row on the benchmark stream. */
@@ -237,6 +297,46 @@ namespace
                 timing.stream);
             if (!launched)
                 throw std::runtime_error("rocmGDN_chunk_forward launch failed");
+        }
+
+        /**
+         * @brief Measure one device-counted recurrence at fixed physical capacity.
+         * @param physical_rows Captured row/snapshot stride, never inferred from live data.
+         * @param live_rows Immutable device-published prefix for this diagnostic point.
+         * @param profile_once Select one replay without warmup for isolated attribution.
+         * @return Median microseconds from unprofiled complete graph replays, or the
+         *         one diagnostic profiler replay when explicitly requested.
+         *
+         * Initial state and speculative output state are distinct, as in production.
+         * Every replay therefore starts with the same state and writes the same
+         * snapshots. Count upload, allocation, and graph construction are not timed.
+         */
+        double timeDeviceCountedUs(int physical_rows, int live_rows, bool profile_once = false)
+        {
+            if (physical_rows < 1 || physical_rows > kMaxRows ||
+                live_rows < 0 || live_rows > physical_rows)
+                throw std::invalid_argument("invalid counted GDN capacity/prefix");
+            DeviceIntScalar count(live_rows, timing.stream);
+            RetainedHipGraph graph;
+            graph.record(timing.stream, [&] {
+                return rocmGDN_chunk_forward_batched_effective(
+                    q.get(), k.get(), v.get(), alpha.get(), beta.get(),
+                    a_log.get(), dt_bias.get(), output.get(),
+                    scalar_state.get(), grouped_state.get(),
+                    physical_rows, 1, physical_rows,
+                    kHeads, kKeyWidth, kValueWidth, true, count.get(),
+                    snapshots.get(), kStateFloats, physical_rows, 0, timing.stream);
+            });
+            std::vector<double> samples;
+            const int sample_count = profile_once ? 1 : 31;
+            samples.reserve(sample_count);
+            for (int sample = 0; sample < sample_count; ++sample)
+                samples.push_back(timeAverageUs(
+                    !profile_once && sample == 0 ? 20 : 0,
+                    profile_once ? 1 : 10,
+                    [&] { graph.replay(timing.stream); }));
+            std::sort(samples.begin(), samples.end());
+            return samples[samples.size() / 2];
         }
 
         /** @brief Publish the device-selected accepted recurrent-state row. */
@@ -312,6 +412,8 @@ namespace
         DeviceIntScalar accepted_row;
     };
 
+    using GdnBenchmarkFixture = GdnBenchmarkStorage<32>;
+
     /**
      * @brief Exact Qwen3.6-35B-A3B prefill recurrence fixture.
      *
@@ -334,15 +436,15 @@ namespace
         static constexpr int kValueRowFloats = kHeads * kValueWidth;
 
         GdnPrefillBenchmarkFixture()
-            : q(static_cast<size_t>(kRows) * kQkRowFloats),
-              k(static_cast<size_t>(kRows) * kQkRowFloats),
-              v(static_cast<size_t>(kRows) * kValueRowFloats),
-              alpha(static_cast<size_t>(kRows) * kHeads),
-              beta(static_cast<size_t>(kRows) * kHeads),
-              a_log(kHeads),
-              dt_bias(kHeads),
-              output(static_cast<size_t>(kRows) * kValueRowFloats),
-              state(kStateFloats)
+            : q(static_cast<size_t>(kRows) * kQkRowFloats, timing.stream),
+              k(static_cast<size_t>(kRows) * kQkRowFloats, timing.stream),
+              v(static_cast<size_t>(kRows) * kValueRowFloats, timing.stream),
+              alpha(static_cast<size_t>(kRows) * kHeads, timing.stream),
+              beta(static_cast<size_t>(kRows) * kHeads, timing.stream),
+              a_log(kHeads, timing.stream),
+              dt_bias(kHeads, timing.stream),
+              output(static_cast<size_t>(kRows) * kValueRowFloats, timing.stream),
+              state(kStateFloats, timing.stream)
         {}
 
         /** @brief Launch the exact production prefill recurrence once. */
@@ -410,6 +512,33 @@ namespace
         DeviceFloatBuffer state;
     };
 } // namespace
+
+/** @brief Isolate Qwen3.8-27B's 48-head recurrence capacity tax without model setup. */
+TEST(Perf__ROCmGatedDeltaNetVerifierRows, Qwen38DeviceCountedCapacity)
+{
+    GdnBenchmarkStorage<48> fixture;
+    std::cout << "backend,case,physical_rows,live_rows,heads,d_k,d_v,median_us\n";
+    for (int live : {2, 3})
+        for (int capacity : {3, 4, 8, 16, 3})
+        {
+            const double elapsed = fixture.timeDeviceCountedUs(capacity, live);
+            EXPECT_GT(elapsed, 0.0);
+            std::cout << "rocm,gdn_counted," << capacity << ',' << live
+                      << ",48,128,128," << elapsed << '\n';
+        }
+}
+
+/** @brief Attach rocprof to exactly one declared captured recurrence shape. */
+TEST(Perf__ROCmGatedDeltaNetVerifierRows, Qwen38DeviceCountedProfiler)
+{
+    const int capacity = static_cast<int>(positiveEnv("LLAMINAR_ROCM_GDN_PROFILE_CAPACITY", 16));
+    const int live = static_cast<int>(positiveEnv("LLAMINAR_ROCM_GDN_PROFILE_LIVE_ROWS", 3));
+    GdnBenchmarkStorage<48> fixture;
+    const double elapsed = fixture.timeDeviceCountedUs(capacity, live, true);
+    EXPECT_GT(elapsed, 0.0);
+    std::cout << "rocm,gdn_counted_profile," << capacity << ',' << live
+              << ",48,128,128," << elapsed << '\n';
+}
 
 /** @brief Gate the exact 425-row Qwen3.6 production prefill recurrence. */
 TEST(Perf__ROCmGatedDeltaNetVerifierRows, Qwen36ProductionPrefillM425)

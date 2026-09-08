@@ -1,6 +1,6 @@
-/**
- * @file GDNProjectionStage.cpp
+/** @file GDNProjectionStage.cpp
  * @brief Implementation of GDN 4-projection stage
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #include "GDNProjectionStage.h"
@@ -416,6 +416,7 @@ namespace llaminar2
 
         if (params_.force_decode_equivalent_verifier_prefill && M > 1)
         {
+            auto verifier_rows = gemm_qkv->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
             /**
              * Group verifier projections only when the prepared GEMM engines
              * can legally share one fused decode path.  The verifier rows must

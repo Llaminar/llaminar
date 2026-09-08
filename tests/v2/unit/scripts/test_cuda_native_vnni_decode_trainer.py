@@ -503,7 +503,7 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
                     "m",
                     "n",
                     "k",
-                ))
+                )) + (row.get("active_rows", ""),)
                 grouped.setdefault(key, []).append(row)
             for group_index, group_rows in enumerate(grouped.values(), start=1):
                 for measurement_order, row in enumerate(group_rows):
@@ -733,6 +733,119 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
                 base, [fresh, fresh], corpus_digest="sha256:new",
                 registry_digest="sha256:registry", manifest=manifest,
             )
+
+    def test_grouped_exact_refresh_preserves_other_keys_and_programs(self) -> None:
+        """An additive row-reuse change cannot refit Auto or alter M1 math."""
+
+        module = self.load_analyzer_module()
+        old = module.GroupedEntry(
+            codebook=0, execution_mode=ExecutionMode.GRAPH_CAPTURED,
+            m=16, n=512, k=1024, kernel="dp4a_rows", grouped_rows=16,
+            candidate_id="cuda.nvnni.decode.verifier.inherit_serial_m1.r16",
+            shape_name="fixture", max_surface_regret=0.0, max_cv=0.0,
+        )
+        retained = dataclasses.replace(old, m=3)
+        rule = GenericDispatchRule(
+            domain=GenericDomain(
+                backend=Backend.CUDA, architecture_class="sm_86",
+                semantic_contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+                operation_kind="NativeVNNIDecodeProjection", bundle_signature="single",
+                prepared_family_id="NativeVNNI_cuda_CB0", packing_abi="native-vnni-cuda-cb0-v1",
+                runtime_codebook_id=0, execution_mode=ExecutionMode.GRAPH_CAPTURED,
+                m=16, aspect_bucket=AspectBucket.BALANCED, all_aspects=True,
+            ), predicates=(), candidate_id=old.candidate_id,
+            arithmetic_fingerprint="sha256:fixture", development_shape_groups=("a",),
+            development_max_regret=0.0, development_p95_regret=0.0,
+            development_mean_regret=0.0,
+        )
+        base = module.generate_include(
+            [], [rule], grouped_entries=[retained, old],
+            corpus_digest="sha256:old", registry_digest="sha256:registry",
+            profile=MeasurementProfile.PRODUCTION,
+        )
+        fresh = dataclasses.replace(
+            old, grouped_rows=8,
+            candidate_id="cuda.nvnni.decode.verifier.inherit_serial_m1.r8",
+        )
+        added = dataclasses.replace(fresh, codebook=4)
+        with mock.patch.object(module, "fit_generic_policy", side_effect=AssertionError("unexpected fit")):
+            result, receipt = module.retain_grouped_exact_dispatch(
+                base, [fresh, added], corpus_digest="sha256:new", registry_digest="sha256:registry",
+            )
+        marker = "#define LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2 1"
+        self.assertEqual(result[result.index("#pragma once"):result.index(marker)],
+                         base[base.index("#pragma once"):base.index(marker)])
+        generic = "\n    const long long work_items ="
+        self.assertEqual(result[result.rindex(generic):], base[base.rindex(generic):])
+        self.assertIn(module._grouped_entry_line(retained), result)
+        self.assertNotIn(module._grouped_entry_line(old), result)
+        self.assertEqual((receipt["replaced_keys"], receipt["retained_keys"], receipt["output_keys"]),
+                         (1, 1, 3))
+        self.assertEqual(receipt["output_sha256"], "sha256:" + hashlib.sha256(result.encode()).hexdigest())
+        again, second = module.retain_grouped_exact_dispatch(
+            result, [fresh, added], corpus_digest="sha256:new", registry_digest="sha256:registry",
+        )
+        self.assertEqual(result, again)
+        self.assertEqual(second["replaced_keys"], 2)
+        source = "\n".join((
+            "enum class NativeGemvShape { WIDE, KPAR, DIRECT, ROWPAR, FUSED_KPAR };",
+            result, "int main() { GeneratedGroupedTuning t{};",
+            "if (!selectGeneratedGroupedTuning<0>(true,16,512,1024,t) || t.grouped_rows!=8) return 1;",
+            "if (!selectGeneratedGroupedTuning<0>(true,3,512,1024,t) || t.grouped_rows!=16) return 2;",
+            "if (!selectGeneratedGroupedTuning<4>(true,16,512,1024,t) || t.grouped_rows!=8) return 3;",
+            "return 0; }",
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            binary = str(Path(directory) / "grouped-refresh")
+            compiled = subprocess.run(["g++", "-std=c++20", "-x", "c++", "-", "-o", binary],
+                                      input=source, text=True, capture_output=True, check=False)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            self.assertEqual(subprocess.run([binary], check=False).returncode, 0)
+        for malformed in (
+            base.replace("GeneratedGroupedKernel kernel", "GeneratedGroupedKernel changed"),
+            base.replace(generic, "\n    const long long changed ="),
+            base.replace(module._grouped_entry_line(old), "            doSomething();"),
+            base.replace(module._grouped_entry_line(old), module._grouped_entry_line(retained)),
+        ):
+            with self.assertRaises(ValueError):
+                module.retain_grouped_exact_dispatch(
+                    malformed, [fresh], corpus_digest="sha256:new", registry_digest="sha256:registry")
+        for bad in ([fresh, fresh], [dataclasses.replace(fresh, m=128)],
+                    [dataclasses.replace(fresh, grouped_rows=4)]):
+            with self.assertRaises(ValueError):
+                module.retain_grouped_exact_dispatch(
+                    base, bad, corpus_digest="sha256:new", registry_digest="sha256:registry")
+
+    def test_grouped_exact_refresh_rejects_ambiguous_cli_scope(self) -> None:
+        """Partial publication requires a complete declared scope and receipt."""
+
+        for arguments in (
+            ["--retain-grouped-base-include", "/dev/null"],
+            ["--exact-refresh-m", "16"],
+            ["--retention-receipt", "/dev/null"],
+            ["--retain-grouped-base-include", "/dev/null", "--retention-receipt", "/dev/null",
+             "--exact-refresh-shapes", "Qwen36_FFN_GateUp", "--exact-refresh-m", "16",
+             "--exact-refresh-modes", "graph_captured"],
+        ):
+            result, _, _ = self.run_analyzer([
+                self.row("cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32", "eager", 20.0)
+            ], *arguments)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_counted_occupancy_is_distinct_and_requires_inactive_proof(self) -> None:
+        """Identical physical M at two live counts remains two evidence surfaces."""
+
+        serial = "cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32"
+        rows = [dict(self.row(serial, "graph_captured", 20.0, m=16),
+                     active_rows=active, inactive_rows_untouched=1) for active in (3, 16)]
+        result, generated, _ = self.run_analyzer(rows, "--exact-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("M=16", generated)
+        for invalid in (dict(rows[0], active_rows=17),
+                        dict(rows[0], inactive_rows_untouched=0),
+                        {key: value for key, value in rows[0].items() if key != "inactive_rows_untouched"}):
+            result, _, _ = self.run_analyzer([invalid], "--exact-only")
+            self.assertNotEqual(result.returncode, 0)
 
     def test_exact_auto_refresh_requires_complete_authenticated_inputs(self) -> None:
         """A missing base, quick profile, or omitted matrix gate fails early."""

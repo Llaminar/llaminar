@@ -1,3 +1,11 @@
+/**
+ * @file Test__PrefixMTPConfig.cpp
+ * @brief Device-free coverage of prefix/MTP configuration and request admission.
+ *
+ * Parser round trips retain user intent independently of topology-selected
+ * defaults. Runtime/device-policy checks prove capacity and threshold values
+ * are sealed consistently without touching models or accelerator state.
+ */
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -119,7 +127,8 @@ TEST(Test__PrefixMTPConfig, PrefixRestoreDefaultsToBoundedTieredStorage)
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 8);
     EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows, 3);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 1.0);
-    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.30);
+    EXPECT_FALSE(config.mtp.depth_policy.demote_zero_accept_rate.has_value());
+    EXPECT_DOUBLE_EQ(resolveMTPZeroAcceptDemotionRate(config.mtp), 0.30);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);
 }
 
@@ -275,7 +284,8 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 2);
     EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows, 3);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 0.70);
-    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.25);
+    ASSERT_TRUE(config.mtp.depth_policy.demote_zero_accept_rate.has_value());
+    EXPECT_DOUBLE_EQ(*config.mtp.depth_policy.demote_zero_accept_rate, 0.25);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.60);
 }
 
@@ -817,7 +827,8 @@ mtp:
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 3);
     EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows, 4);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 0.8);
-    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.2);
+    ASSERT_TRUE(config.mtp.depth_policy.demote_zero_accept_rate.has_value());
+    EXPECT_DOUBLE_EQ(*config.mtp.depth_policy.demote_zero_accept_rate, 0.2);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);
 }
 

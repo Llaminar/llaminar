@@ -178,6 +178,7 @@ namespace llaminar2
             BufferId input_buffer_id = BufferId::NORMALIZED;
             bool compute_all_positions = false;
             bool use_prefill_replay_row_offset = true;
+            std::optional<DeviceRowRange> verifier_rows; ///< Only identity row layouts borrow the source count.
         };
 
         /**
@@ -190,7 +191,8 @@ namespace llaminar2
             const GraphConfig &config,
             const ActivationBuffers &buffers,
             TensorBase *lm_head_input,
-            int total_tokens)
+            int total_tokens,
+            std::optional<DeviceRowRange> verifier_rows)
         {
             const TensorBase *normalized = buffers.normalized;
             const TensorBase *compact_rows = buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
@@ -216,6 +218,7 @@ namespace llaminar2
             {
                 layout.seq_len = total_tokens;
                 layout.input_buffer_id = BufferId::NORMALIZED;
+                layout.verifier_rows = verifier_rows;
                 layout.compute_all_positions =
                     config.compute_all_position_logits ||
                     config.live_mtp_request_batch_condition;
@@ -2139,7 +2142,8 @@ namespace llaminar2
                   << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
         const LMHeadInputLayout lm_layout =
-            describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+            describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens,
+                projectionVerifierRows(device, input.seq_len, input.batch_size, input.sequence_lengths_device));
 
         LMHeadStage::Params lm_params;
         // Feed LM head from final RMSNorm, bucket one-row scratch, or compact
@@ -2163,6 +2167,7 @@ namespace llaminar2
             use_column_parallel,
             lm_layout.compute_all_positions);
         lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+        lm_params.verifier_row_range = lm_layout.verifier_rows;
         lm_params.compute_all_positions = lm_layout.compute_all_positions;
         lm_params.force_decode_equivalent_verifier_prefill =
             shouldForceDecodeEquivalentLMHeadVerifierPrefill(
@@ -2486,7 +2491,8 @@ namespace llaminar2
                       << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
             const LMHeadInputLayout lm_layout =
-                describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+                describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens,
+                    projectionVerifierRows(device, input.seq_len, input.batch_size, input.sequence_lengths_device));
 
             LMHeadStage::Params lm_params;
             lm_params.hidden_states = lm_head_input;
@@ -2507,6 +2513,7 @@ namespace llaminar2
                 use_column_parallel,
                 lm_layout.compute_all_positions);
             lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+            lm_params.verifier_row_range = lm_layout.verifier_rows;
             lm_params.compute_all_positions = lm_layout.compute_all_positions;
             lm_params.force_decode_equivalent_verifier_prefill =
                 shouldForceDecodeEquivalentLMHeadVerifierPrefill(
@@ -2895,7 +2902,8 @@ namespace llaminar2
                           << use_column_parallel << " vocab_size=" << lm_head_vocab_size);
 
                 const LMHeadInputLayout lm_layout =
-                    describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+                    describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens,
+                        projectionVerifierRows(stage_device, input.seq_len, input.batch_size, input.sequence_lengths_device));
 
                 LMHeadStage::Params lm_params;
                 lm_params.hidden_states = lm_head_input;
@@ -2916,6 +2924,7 @@ namespace llaminar2
                     use_column_parallel,
                     lm_layout.compute_all_positions);
                 lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+                lm_params.verifier_row_range = lm_layout.verifier_rows;
                 lm_params.compute_all_positions = lm_layout.compute_all_positions;
                 lm_params.force_decode_equivalent_verifier_prefill =
                     shouldForceDecodeEquivalentLMHeadVerifierPrefill(
@@ -3363,6 +3372,17 @@ namespace llaminar2
     // buildAttentionGraph is pure virtual - implemented by QwenStandardGraph, Qwen35Graph
     // =============================================================================
 
+    std::optional<DeviceRowRange> QwenGraphBase::projectionVerifierRows(
+        DeviceId device, int seq_len, int batch_size, const int32_t *lengths) const
+    {
+        // CPU owns its actual row count on the host. Ragged multi-request
+        // matrices cannot borrow lengths[0] as a whole-matrix prefix count.
+        if (!device.is_gpu() || batch_size != 1 || !lengths ||
+            !config_.usesMTPGroupedDecodeEquivalentRows())
+            return std::nullopt;
+        return DeviceRowRange::deviceCounted(seq_len, lengths);
+    }
+
     ComputeGraph QwenGraphBase::buildFFNGraph(
         const LayerWeights &layer,
         ActivationBuffers &buffers,
@@ -3380,7 +3400,6 @@ namespace llaminar2
                 "[QwenGraphBase::buildFFNGraph] GPU graph construction "
                 "requires an explicit non-null device-state publication stream");
         }
-        (void)sequence_lengths_device;
         (void)absolute_position_ids_device;
         ComputeGraph graph;
         const std::string prefix = ffnGraphStagePrefix(layer_idx);
@@ -3453,6 +3472,8 @@ namespace llaminar2
             gate_up_params.output_up_buffer_id = buffers.idFor(BufferId::UP_PROJ);
             gate_up_params.force_decode_equivalent_verifier_prefill =
                 force_decode_equivalent_ffn_verifier_prefill;
+            gate_up_params.verifier_row_range = projectionVerifierRows(
+                device, seq_len, batch_size, sequence_lengths_device);
 
             graph.addNode(prefix + "gate_up_proj",
                           ComputeStageFactory::createFusedGateUpGEMM(gate_up_params),
@@ -3491,6 +3512,8 @@ namespace llaminar2
                 .c_buffer_id = buffers.idFor(BufferId::ATTN_PROJ),
                 .force_decode_equivalent_verifier_prefill =
                     force_decode_equivalent_ffn_verifier_prefill,
+                .verifier_row_range = projectionVerifierRows(
+                    device, seq_len, batch_size, sequence_lengths_device),
                 .prepared_ref = preparedRefForGraphWeight(down_proj_binding, device),
                 .prepared_store = prepared_weight_store_};
 
@@ -4842,7 +4865,8 @@ namespace llaminar2
         int total_tokens,
         DeviceId device,
         const std::string &dependency,
-        const std::string &wo_node_suffix)
+        const std::string &wo_node_suffix,
+        std::optional<DeviceRowRange> verifier_rows)
     {
         if (!wo_weight)
             return dependency;
@@ -4879,6 +4903,7 @@ namespace llaminar2
                           .a_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT),
                           .c_buffer_id = buffers.idFor(BufferId::ATTN_PROJ),
                           .force_decode_equivalent_verifier_prefill = force_decode_equivalent_wo_verifier_prefill,
+                          .verifier_row_range = verifier_rows,
                           .prepared_ref = preparedRefForGraphWeight(wo_binding, device),
                           .prepared_store = prepared_weight_store_,
                       }),

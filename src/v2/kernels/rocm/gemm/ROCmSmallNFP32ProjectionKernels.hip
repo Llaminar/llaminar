@@ -10,6 +10,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include "kernels/common/FloatingPointVerifierLaunch.h"
+
 #include <cstdio>
 #include <cstdint>
 
@@ -167,12 +169,13 @@ namespace
             float *const *__restrict__ d_C_array,
             int M,
             int N,
-            int K)
+            int K,
+            llaminar2::DeviceRowRange row_range)
     {
         const int n = static_cast<int>(blockIdx.x);
         const int m = static_cast<int>(blockIdx.y);
         const int batch = static_cast<int>(blockIdx.z);
-        if (m >= M || n >= N)
+        if (m >= row_range.activeRows() || n >= N)
             return;
 
         const float *A = d_A_array[batch];
@@ -220,12 +223,13 @@ namespace
             int M,
             int N,
             int K,
-            int weight_dtype)
+            int weight_dtype,
+            llaminar2::DeviceRowRange row_range)
     {
         const int n = static_cast<int>(blockIdx.x);
         const int m = static_cast<int>(blockIdx.y);
         const int batch = static_cast<int>(blockIdx.z);
-        if (m >= M || n >= N)
+        if (m >= row_range.activeRows() || n >= N)
             return;
 
         const float *A = d_A_array[batch];
@@ -280,11 +284,12 @@ namespace
             int M,
             int N,
             int K,
-            int weight_dtype)
+            int weight_dtype,
+            llaminar2::DeviceRowRange row_range)
     {
         const int n = static_cast<int>(blockIdx.x);
         const int m = static_cast<int>(blockIdx.y);
-        if (m >= M || n >= N)
+        if (m >= row_range.activeRows() || n >= N)
             return;
 
         float sum = 0.0f;
@@ -393,8 +398,12 @@ extern "C" bool rocmFp32_small_n_batched_projection(
     int K,
     int batch_count,
     int device_id,
-    void *stream)
+    void *stream,
+    const llaminar2::DeviceRowRange *row_range)
 {
+    if (row_range && row_range->physicalRows() != M)
+        return false;
+    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
     if (!d_A_array || !d_B_array || !d_C_array ||
         M <= 0 ||
         N <= 0 || N > SMALL_N_FP32_MAX_N ||
@@ -437,7 +446,8 @@ extern "C" bool rocmFp32_small_n_batched_projection(
         d_C_array,
         M,
         N,
-        K);
+        K,
+        rows);
 
     return complete_kernel_launch(hip_stream, "rocmFp32_small_n_batched_projection");
 }
@@ -452,8 +462,12 @@ extern "C" bool rocmFp32x16_batched_projection(
     int batch_count,
     int weight_dtype,
     int device_id,
-    void *stream)
+    void *stream,
+    const llaminar2::DeviceRowRange *row_range)
 {
+    if (row_range && row_range->physicalRows() != M)
+        return false;
+    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
     if (!d_A_array || !d_B_array || !d_C_array ||
         M <= 0 ||
         N <= 0 ||
@@ -500,7 +514,8 @@ extern "C" bool rocmFp32x16_batched_projection(
         M,
         N,
         K,
-        weight_dtype);
+        weight_dtype,
+        rows);
 
     return complete_kernel_launch(hip_stream, "rocmFp32x16_batched_projection");
 }
@@ -515,8 +530,12 @@ extern "C" bool rocmFloating_swiglu_down_projection(
     int K,
     int weight_dtype,
     int device_id,
-    void *stream)
+    void *stream,
+    const llaminar2::DeviceRowRange *row_range)
 {
+    if (row_range && row_range->physicalRows() != M)
+        return false;
+    const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
     if (!d_gate || !d_up || !d_weights || !d_output ||
         M <= 0 ||
         N <= 0 ||
@@ -565,7 +584,8 @@ extern "C" bool rocmFloating_swiglu_down_projection(
         M,
         N,
         K,
-        weight_dtype);
+        weight_dtype,
+        rows);
 
     return complete_kernel_launch(hip_stream, "rocmFloating_swiglu_down_projection");
 }

@@ -72,6 +72,7 @@
  */
 
 #include "ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "ROCmQuantisedGemmWorkspaceContract.h"
 #include "transfer/TransferEngine.h"
 #include "../ROCmKernelBase.h"
@@ -397,37 +398,6 @@ namespace llaminar2
                 uint8_t codebook_id,
                 int device_id, void *stream);
 
-            /** Execute verifier GEMV with distinct decoder and math policy. */
-            bool rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
-                const int8_t *d_A_int8,
-                const uint8_t *d_payload,
-                const void *d_block_scales,
-                const void *d_block_mins,
-                const void *d_block_emins,
-                float *d_C_fp32,
-                const float *d_scale_A_blockwise,
-                const int32_t *d_sum_A_blockwise,
-                float *d_partial_fp32,
-                int M, int N, int K,
-                uint8_t codebook_id,
-                uint8_t arithmetic_policy_codebook_id,
-                int device_id, void *stream);
-
-            bool rocmGemv_native_vnni_small_m_batched_fp32(
-                const int8_t *d_A_int8,
-                const uint8_t *const *d_payloads,
-                const uint16_t *const *d_block_scales,
-                const uint16_t *const *d_block_mins,
-                const uint32_t *const *d_block_emins,
-                const float *const *d_biases,
-                float *const *d_outputs,
-                const float *d_scale_A_blockwise, // [M × blocks_per_row]
-                float *const *d_partials,         // per-projection [KB_MAX × M × N]
-                const int *Ns,
-                int num_projections,
-                int M, int K,
-                uint8_t codebook_id,
-                int device_id, void *stream);
 
             bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
                 const int8_t *d_A_int8,
@@ -446,40 +416,7 @@ namespace llaminar2
                 uint8_t codebook_id,
                 int device_id, void *stream);
 
-            bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy(
-                const int8_t *d_A_int8,
-                const uint8_t *const *d_payloads,
-                const uint16_t *const *d_block_scales,
-                const uint16_t *const *d_block_mins,
-                const uint32_t *const *d_block_emins,
-                const float *const *d_biases,
-                float *const *d_outputs,
-                const float *d_scale_A_blockwise, // [M × blocks_per_row]
-                const int32_t *d_sum_A_blockwise, // [M × blocks_per_row], nullable
-                float *const *d_partials,         // per-projection [KB_MAX × M × N]
-                const int *Ns,
-                int num_projections,
-                int M, int K,
-                uint8_t codebook_id,
-                int device_id, void *stream,
-                int policy_kb,
-                int policy_target_waves);
 
-            bool rocmGemv_native_vnni_small_m_batched_mixed_fp32(
-                const int8_t *d_A_int8,
-                const uint8_t *const *d_payloads,
-                const uint16_t *const *d_block_scales,
-                const uint16_t *const *d_block_mins,
-                const uint32_t *const *d_block_emins,
-                const float *const *d_biases,
-                float *const *d_outputs,
-                const float *d_scale_A_blockwise, // [M × blocks_per_row]
-                float *const *d_partials,         // per-projection [KB_MAX × M × N]
-                const int *Ns,
-                const uint8_t *codebook_ids,
-                int num_projections,
-                int M, int K,
-                int device_id, void *stream);
 
             bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums(
                 const int8_t *d_A_int8,
@@ -498,24 +435,6 @@ namespace llaminar2
                 int M, int K,
                 int device_id, void *stream);
 
-            bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy(
-                const int8_t *d_A_int8,
-                const uint8_t *const *d_payloads,
-                const uint16_t *const *d_block_scales,
-                const uint16_t *const *d_block_mins,
-                const uint32_t *const *d_block_emins,
-                const float *const *d_biases,
-                float *const *d_outputs,
-                const float *d_scale_A_blockwise, // [M × blocks_per_row]
-                const int32_t *d_sum_A_blockwise, // [M × blocks_per_row], nullable
-                float *const *d_partials,         // per-projection [KB_MAX × M × N]
-                const int *Ns,
-                const uint8_t *codebook_ids,
-                int num_projections,
-                int M, int K,
-                int device_id, void *stream,
-                int policy_kb,
-                int policy_target_waves);
 
             void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
             void rocmGemv_native_vnni_set_decode_equivalent_m1_config(int enabled);
@@ -1399,7 +1318,8 @@ namespace llaminar2
         class ScopedNativeVNNIDecodeEquivalentDispatch final : public ITensorGemm::VerifierKernelModeScope
         {
         public:
-            ScopedNativeVNNIDecodeEquivalentDispatch()
+            explicit ScopedNativeVNNIDecodeEquivalentDispatch(std::optional<DeviceRowRange> rows)
+                : VerifierKernelModeScope(rows)
             {
                 previous_ = g_rocm_native_vnni_decode_equivalent_scope;
                 g_rocm_native_vnni_decode_equivalent_scope = true;
@@ -1447,9 +1367,10 @@ namespace llaminar2
         };
 
         std::unique_ptr<ITensorGemm::VerifierKernelModeScope>
-        ROCmQuantisedGemmKernel::beginVerifierDecodeEquivalentScope()
+        ROCmQuantisedGemmKernel::beginVerifierDecodeEquivalentScope(
+            std::optional<DeviceRowRange> rows)
         {
-            return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>();
+            return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>(rows);
         }
 
         std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
@@ -2703,7 +2624,8 @@ namespace llaminar2
                             requireNativeVNNIArithmeticPolicyCodebook(
                                 impl_->native_vnni_codebook_id,
                                 impl_->native_source_identity),
-                            rocm_device_id_, gpu_stream_))
+                            rocm_device_id_, gpu_stream_,
+                            VerifierKernelModeScope::rowsFor(m)))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI small-M verifier GEMV failed");
                         return false;
@@ -4382,7 +4304,11 @@ namespace llaminar2
                     {
                         const size_t required_projection_floats =
                             static_cast<size_t>(std::max(1, expected_kb)) *
-                            static_cast<size_t>(m) *
+                            // The launch reuses one physical tile for wider M;
+                            // match the declared arena instead of pricing all
+                            // logical rows as simultaneously resident partials.
+                            static_cast<size_t>(std::min(
+                                m, kDefaultNativeVNNIVerifierRowCapacity)) *
                             static_cast<size_t>(Ns[i]);
                         const size_t next_offset = partial_offset_floats + required_projection_floats;
                         if (!batched_partial_base ||
@@ -4485,7 +4411,8 @@ namespace llaminar2
                                   rocm_device_id_,
                                   gpu_stream_,
                                   policy_kb,
-                                  policy_target_waves)
+                                  policy_target_waves,
+                            VerifierKernelModeScope::rowsFor(m))
                             : rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy(
                                   impl_->d_A_int8,
                                   group_payloads.data(),
@@ -4504,7 +4431,8 @@ namespace llaminar2
                                   rocm_device_id_,
                                   gpu_stream_,
                                   policy_kb,
-                                  policy_target_waves);
+                                  policy_target_waves,
+                            VerifierKernelModeScope::rowsFor(m));
                     };
 
                     bool gemv_ok = true;
@@ -5028,7 +4956,8 @@ namespace llaminar2
                             requireNativeVNNIArithmeticPolicyCodebook(
                                 rocm_kernel->impl_->native_vnni_codebook_id,
                                 rocm_kernel->impl_->native_source_identity),
-                            rocm_device_id_, gpu_stream_))
+                            rocm_device_id_, gpu_stream_,
+                            VerifierKernelModeScope::rowsFor(m)))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M verifier GEMV failed for projection "
                                   << i);
@@ -6284,7 +6213,8 @@ namespace llaminar2
                             requireNativeVNNIArithmeticPolicyCodebook(
                                 impl_->native_vnni_codebook_id,
                                 impl_->native_source_identity),
-                            rocm_device_id_, gpu_stream_))
+                            rocm_device_id_, gpu_stream_,
+                            VerifierKernelModeScope::rowsFor(m)))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
                                   "Native-VNNI fused SwiGLU small-M verifier GEMV failed");

@@ -397,6 +397,13 @@ def _profile_environment(request: ProfilerRequest, raw_dir: Path) -> dict[str, s
     environment = os.environ.copy()
     environment["LLAMINAR_NATIVE_VNNI_PROFILE_REQUEST_ID"] = request.request_id
     environment["LLAMINAR_PERF_STATS_JSON"] = "1"
+    # A stale shell setting must not turn an ordinary full-row request into a
+    # different physical launch. Counted occupancy belongs to the request.
+    environment.pop("LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS", None)
+    if request.active_rows is not None:
+        if request.backend != Backend.CUDA:
+            raise ValueError("this backend profiler trainer has no device-counted row surface")
+        environment["LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS"] = str(request.active_rows)
     if request.backend == Backend.CUDA:
         environment.update({
             "LLAMINAR_CUDA_NVNNI_DECODE_FORMATS": request.source_format,
@@ -524,6 +531,7 @@ def _gpu_process_batch_key(request: ProfilerRequest) -> tuple[object, ...]:
         request.prepared_family_id,
         request.packing_abi,
         request.runtime_codebook_id,
+        request.active_rows,
     )
 
 
@@ -821,6 +829,8 @@ def _cuda_batch_environment(
     """Build one exact-plan CUDA environment without Cartesian aliases."""
 
     first = batch.requests[0]
+    if any(request.active_rows != first.active_rows for request in batch.requests):
+        raise ValueError("one CUDA profiler process must retain one active-row occupancy")
     environment = _profile_environment(first, batch_raw_dir)
     environment.pop("LLAMINAR_NATIVE_VNNI_PROFILE_REQUEST_ID", None)
     environment["LLAMINAR_NATIVE_VNNI_PROFILE_BATCH_PATH"] = str(

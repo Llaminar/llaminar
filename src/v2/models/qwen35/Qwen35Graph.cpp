@@ -1215,6 +1215,8 @@ namespace llaminar2
         proj_params.n_b = n_v_heads; // Beta is per-value-head
         proj_params.force_decode_equivalent_verifier_prefill =
             force_decode_equivalent_gdn_verifier_prefill;
+        proj_params.verifier_row_range = projectionVerifierRows(
+            device, seq_len, batch_size, sequence_lengths_device);
 
         proj_params.input_buffer_id = BufferId::NORMALIZED;
         proj_params.output_qkv_buffer_id = BufferId::GDN_QKV;
@@ -1530,7 +1532,8 @@ namespace llaminar2
             graph, prefix, buffers, gdn_layer->ssm_out, layer_bindings.ssm_out,
             total_tokens, device,
             gated_norm_ready,
-            "gdn_out_proj");
+            "gdn_out_proj",
+            projectionVerifierRows(device, seq_len, batch_size, sequence_lengths_device));
         const std::string local_projection_ready =
             maybeAddGDNDiagnosticCheckpoint(
                 graph,
@@ -1793,6 +1796,8 @@ namespace llaminar2
                               .output_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
                               .output_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
                               .force_decode_equivalent_verifier_prefill = force_decode_equivalent_qkv_verifier_prefill,
+                              .verifier_row_range = projectionVerifierRows(
+                                  device, seq_len, batch_size, sequence_lengths_device),
                               .prepared_ref_q = preparedRefForGraphWeight(wq_binding, device),
                               .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
                               .prepared_ref_v = preparedRefForGraphWeight(wv_binding, device),
@@ -1907,7 +1912,8 @@ namespace llaminar2
         const std::string wo_projection = addWoProjection(
             graph, prefix, buffers, layer.wo, wo_binding,
             total_tokens, device,
-            prefix + "attn_output_gate");
+            prefix + "attn_output_gate", "wo_proj",
+            projectionVerifierRows(device, seq_len, batch_size, sequence_lengths_device));
         std::string terminal = addWoAllreduce(
             graph, prefix, buffers, layer.wo,
             total_tokens, layer_idx, device, wo_projection);

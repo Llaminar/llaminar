@@ -11,6 +11,7 @@
  */
 
 #include "execution/moe/ExpertTierWeightStream.h"
+#include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
 #include "execution/moe/ExpertTierWeightTransferLane.h"
 #include "execution/moe/GpuExpertSlotPool.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
@@ -120,27 +121,6 @@ extern "C"
         CUDARowMajorWeights **rm_slot);
 
     /** Grouped physical decoder plus independent source arithmetic identity. */
-    bool cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
-        const std::int8_t *d_A_int8,
-        const std::uint8_t *d_payload,
-        const std::uint16_t *d_scales,
-        const std::uint16_t *d_mins,
-        const std::uint32_t *d_emins,
-        float *d_C_fp32,
-        const float *d_scales_A_block,
-        int M,
-        int N,
-        int K,
-        float alpha,
-        float beta,
-        const float *d_C_existing,
-        const float *d_bias,
-        std::uint8_t codebook_id,
-        std::uint8_t arithmetic_policy_codebook_id,
-        int cuda_device_id,
-        void *stream,
-        CUDAGemvContext *gemv_ctx,
-        CUDARowMajorWeights **rm_slot);
 
     /** Production dense-prefill NativeVNNI kernel used by promotion parity. */
     bool cudaNativeVNNIPrefill_fp32(

@@ -1,6 +1,10 @@
 /**
  * @file Test__ROCmQuantisedGemmSmallM.cpp
- * @brief Focused ROCm small-M GEMM regressions for MTP verifier decode.
+ * @brief ROCm small-M arithmetic and persistent fused-workspace regressions.
+ *
+ * Verifier tests use the public serial decode byte oracle. Fused fixtures
+ * declare the same simultaneous projection workspace as production stages;
+ * wide M cases also prove that the fixed scratch tile can be reused safely.
  */
 
 #include <gtest/gtest.h>
@@ -541,14 +545,27 @@ namespace
             << " expected=" << expected[max_index];
     }
 
+    /**
+     * @brief Bind the production workspace BOM for scalar or fused projections.
+     * @param kernel Kernel whose declared buffers are installed.
+     * @param M Physical activation rows.
+     * @param N Anchor projection width.
+     * @param K Reduction width.
+     * @param fused_columns Optional complete simultaneous projection inventory.
+     * @return Allocated owner, or null if allocation fails.
+     */
     std::unique_ptr<DeviceWorkspaceManager> bindWorkspace(
         ROCmQuantisedGemmKernel &kernel,
         int M,
         int N,
-        int K)
+        int K,
+        std::span<const int> fused_columns = {})
     {
-        const WorkspaceRequirements requirements =
+        WorkspaceRequirements requirements =
             kernel.getWorkspaceRequirements(M, N, K);
+        if (!fused_columns.empty())
+            kernel.appendFusedProjectionWorkspaceRequirements(
+                requirements, M, fused_columns, K);
         auto workspace = std::make_unique<DeviceWorkspaceManager>(
             DeviceId::rocm(0),
             requirements.total_bytes_with_alignment() + 64 * 1024 * 1024);
@@ -2560,7 +2577,8 @@ namespace
         v_kernel.setGPUStream(stream);
 #endif
 
-        auto q_workspace = bindWorkspace(q_kernel, M, Nq, K);
+        const std::array<int, 3> fused_columns{Nq, Nk, Nv};
+        auto q_workspace = bindWorkspace(q_kernel, M, Nq, K, fused_columns);
         auto k_workspace = bindWorkspace(k_kernel, M, Nk, K);
         auto v_workspace = bindWorkspace(v_kernel, M, Nv, K);
         ASSERT_NE(q_workspace, nullptr);

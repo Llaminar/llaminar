@@ -1090,20 +1090,29 @@ TEST(Test__ForwardGraphSignature, DifferentPositionPolicyNotEqual)
 
 TEST(Test__ForwardGraphSignature, DifferentDeviceSequenceLengthSourceNotEqual)
 {
+    const int32_t first_owner = 3, second_owner = 3;
     ForwardGraphSignature external_rows{
         .seq_len = 16,
         .batch_size = 2,
         .all_position_logits = true,
         .all_position_logit_rows = 2,
-        .uses_device_sequence_lengths = false};
+        .device_sequence_lengths = nullptr};
     ForwardGraphSignature resident_request_lengths = external_rows;
-    resident_request_lengths.uses_device_sequence_lengths = true;
+    resident_request_lengths.device_sequence_lengths = &first_owner;
 
     EXPECT_NE(external_rows, resident_request_lengths)
         << "Verifier-row and request-length-owned graphs must never share a cached executable";
     EXPECT_NE(
         ForwardGraphSignatureHash{}(external_rows),
         ForwardGraphSignatureHash{}(resident_request_lengths));
+
+    auto rebound = resident_request_lengths;
+    rebound.device_sequence_lengths = &second_owner;
+    EXPECT_TRUE(rebound.usesDeviceSequenceLengths());
+    EXPECT_NE(rebound, resident_request_lengths)
+        << "Equal current counts do not make different captured owners interchangeable";
+    EXPECT_NE(ForwardGraphSignatureHash{}(rebound),
+              ForwardGraphSignatureHash{}(resident_request_lengths));
 }
 
 TEST(Test__ForwardGraphSignature,
@@ -1116,7 +1125,7 @@ TEST(Test__ForwardGraphSignature,
         .execution_role = ForwardExecutionRole::MainInference,
         .decode = false,
         .uses_device_token_ids = true,
-        .uses_device_sequence_lengths = true,
+        .device_sequence_lengths = reinterpret_cast<const int32_t *>(uintptr_t{0x1000}),
         .shifted_mtp_prefill_capture_identity = UINT64_C(0x1234)};
     ForwardGraphSignature rebound = first;
     rebound.shifted_mtp_prefill_capture_identity = UINT64_C(0x5678);
@@ -1478,7 +1487,7 @@ TEST(Test__ForwardGraphSignature, ReplayWorkloadGeometryIsExactAndTotal)
         .uses_device_token_ids = true,
         .uses_device_position_ids = true,
         .position_policy = ForwardPositionPolicy::ExplicitRows,
-        .uses_device_sequence_lengths = true,
+        .device_sequence_lengths = reinterpret_cast<const int32_t *>(uintptr_t{0x1000}),
         .moe_placement_epoch = 17,
     };
 

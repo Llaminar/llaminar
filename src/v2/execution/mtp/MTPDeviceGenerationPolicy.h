@@ -87,7 +87,7 @@ namespace llaminar2
         policy.promote_full_accept_rate_ppm =
             rate_to_ppm(mtp.depth_policy.promote_full_accept_rate);
         policy.demote_zero_accept_rate_ppm =
-            rate_to_ppm(mtp.depth_policy.demote_zero_accept_rate);
+            rate_to_ppm(resolveMTPZeroAcceptDemotionRate(mtp));
         policy.demote_acceptance_rate_ppm =
             rate_to_ppm(mtp.depth_policy.demote_acceptance_rate);
         return policy;

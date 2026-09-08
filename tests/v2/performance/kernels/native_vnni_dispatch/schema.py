@@ -279,10 +279,21 @@ class NativeVNNIObservation:
     launch_k_tiles: int = 0
     launch_n_block_chunks: int = 0
     adaptive_timing_evidence: dict[str, Any] = field(default_factory=dict)
+    # A device-counted captured matrix retains physical M while publishing a
+    # smaller live prefix. This is an evidence surface, never a host-visible
+    # runtime dispatch feature. None preserves legacy fully-active evidence.
+    active_rows: int | None = None
 
     def validate(self) -> None:
         """Reject malformed, ambiguous, or runtime-inexpressible observations."""
 
+        if self.active_rows is not None:
+            if type(self.active_rows) is not int or not 1 <= self.active_rows <= self.m:
+                raise ValueError("active_rows must be a positive prefix within physical M")
+            if self.semantic_contract != SemanticContract.VERIFIER_SERIAL_M1_BITWISE:
+                raise ValueError("active_rows requires the grouped verifier contract")
+            if self.generic_eligible:
+                raise ValueError("device-counted evidence is exact-only, not a generic fitting surface")
         if self.schema_version != SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported schema_version={self.schema_version}; expected {SCHEMA_VERSION}"
@@ -394,6 +405,8 @@ class NativeVNNIObservation:
             result.pop("launch_n_block_chunks")
         if not self.adaptive_timing_evidence:
             result.pop("adaptive_timing_evidence")
+        if self.active_rows is None:
+            result.pop("active_rows")
         return result
 
     def digest(self) -> str:
@@ -446,6 +459,7 @@ class NativeVNNIObservation:
             "launch_k_tiles",
             "launch_n_block_chunks",
             "adaptive_timing_evidence",
+            "active_rows",
         }
         missing = [
             name
@@ -575,6 +589,8 @@ class NativeVNNIObservation:
                 raw.get("launch_n_block_chunks") or 0
             ),
             adaptive_timing_evidence=adaptive_timing_evidence,
+            active_rows=(None if raw.get("active_rows") in (None, "")
+                         else int(raw["active_rows"])),
         )
         observation.validate()
         return observation

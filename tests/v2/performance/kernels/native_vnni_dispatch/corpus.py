@@ -390,10 +390,23 @@ class GenericDomain:
 
 @dataclass(frozen=True, order=True)
 class SurfaceKey:
-    """Source alias observed within one mode-specific policy-v2 runtime key."""
+    """Evidence variant that must share one runtime-visible dispatch choice.
+
+    Active rows are deliberately absent from RuntimeKey: the GPU owns that
+    value during replay. The exact oracle must choose one economical candidate
+    across all measured occupancies instead of averaging away a shallow-row
+    regression. Zero denotes the legacy fully-active, non-counted surface.
+    """
 
     source_format: str
     execution_mode: ExecutionMode
+    active_rows: int = 0
+
+    @classmethod
+    def from_observation(cls, row: NativeVNNIObservation) -> "SurfaceKey":
+        """Keep pointer-free and device-counted occupancy evidence distinct."""
+
+        return cls(row.source_format, row.execution_mode, row.active_rows or 0)
 
 
 def runtime_key(observation: NativeVNNIObservation) -> RuntimeKey:
@@ -765,5 +778,5 @@ def observed_surfaces(rows: Iterable[NativeVNNIObservation]) -> frozenset[Surfac
     """Return alias/mode surfaces present in a runtime-key row set."""
 
     return frozenset(
-        SurfaceKey(row.source_format, row.execution_mode) for row in rows
+        SurfaceKey.from_observation(row) for row in rows
     )

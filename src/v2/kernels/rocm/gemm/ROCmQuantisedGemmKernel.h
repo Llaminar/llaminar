@@ -415,7 +415,8 @@ namespace llaminar2
             // ITensorGemm interface - Primary entry points
             // =========================================================================
 
-            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope() override;
+            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope(
+                std::optional<DeviceRowRange> rows = std::nullopt) override;
             std::unique_ptr<OutputPartitionEquivalenceScope>
             beginOutputPartitionEquivalenceScope(
                 int actual_output_columns,

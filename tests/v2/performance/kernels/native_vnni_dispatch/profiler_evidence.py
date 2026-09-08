@@ -1005,6 +1005,7 @@ class ProfilerRequest:
     observed_candidate_id: str
     profile_protocol: str
     target_launches_per_profiler_pass: int
+    active_rows: int | None = None
 
     @property
     def profile_required(self) -> bool:
@@ -1032,11 +1033,18 @@ class ProfilerRequest:
         result["execution_mode"] = self.execution_mode.value
         result["projection_n_vector"] = list(self.projection_n_vector)
         result["prepared_resources"] = list(self.prepared_resources)
+        if self.active_rows is None:
+            result.pop("active_rows")
         return result
 
     def validate(self) -> None:
         """Reject requests that cannot identify one production launch."""
 
+        if self.active_rows is not None and (
+            type(self.active_rows) is not int or not 1 <= self.active_rows <= self.m
+            or self.semantic_contract != SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+        ):
+            raise ValueError("profiler active_rows must fit the grouped physical M")
         for name in (
             "request_id",
             "run_id",
@@ -1098,10 +1106,22 @@ class ProfilerRequest:
             raise ValueError("shape-resolved formulas are not physical profiler requests")
 
     @classmethod
+    def validate_mapping_fields(cls, raw: Mapping[str, Any]) -> None:
+        """Share the record schema with the allocation-free resume reader.
+
+        Historical full-row receipts omit occupancy, preserving their original
+        digests. Both readers must accept that omission but reject unknown fields.
+        """
+        expected_fields = set(cls.__dataclass_fields__) - {"active_rows"}
+        if "active_rows" in raw:
+            expected_fields.add("active_rows")
+        _require_exact_keys(raw, expected_fields, "profiler request")
+
+    @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ProfilerRequest":
         """Parse one exact request record from a JSON manifest."""
 
-        _require_exact_keys(raw, cls.__dataclass_fields__, "profiler request")
+        cls.validate_mapping_fields(raw)
         result = cls(
             request_id=str(raw["request_id"]),
             observation_digest=str(raw["observation_digest"]),
@@ -1152,6 +1172,7 @@ class ProfilerRequest:
             target_launches_per_profiler_pass=int(
                 raw["target_launches_per_profiler_pass"]
             ),
+            active_rows=raw.get("active_rows"),
         )
         result.validate()
         return result
@@ -1234,6 +1255,7 @@ def profiler_request_for_observation(
         observed_candidate_id=observation.observed_candidate_id,
         profile_protocol=PROFILE_PROTOCOL,
         target_launches_per_profiler_pass=1,
+        active_rows=observation.active_rows,
     )
     result.validate()
     return result
@@ -1486,6 +1508,7 @@ def _profiler_contest_key(row: NativeVNNIObservation) -> tuple[object, ...]:
         row.projection_n_vector,
         row.aggregate_n,
         row.k,
+        *((row.active_rows,) if row.active_rows is not None else ()),
     )
 
 
@@ -1775,7 +1798,10 @@ def _select_profiler_strata(
     """Reduce complete workload groups to selected and capability witnesses."""
 
     launchable, never_launchable = _group_profiler_observation_rows(rows)
-    launchable_candidates = frozenset(key[:-5] for key in launchable)
+    launchable_candidates = frozenset(
+        key[:-len(_profiled_workload_key(rows[0]))]
+        for key, rows in launchable.items()
+    )
     contests: dict[
         tuple[object, ...],
         dict[tuple[object, ...], NativeVNNIObservation],
@@ -1892,14 +1918,12 @@ def _group_profiler_observation_rows(
                 row.threading_or_stream_mode,
             )
             physical_keys[candidate_identity] = physical_key
-        if row.supported and row.forced_route_ok and row.generic_eligible:
+        if row.supported and row.forced_route_ok and (
+            row.generic_eligible or row.active_rows is not None
+        ):
             launch_key = (
                 *physical_key,
-                row.execution_mode,
-                row.m,
-                row.projection_n_vector,
-                row.aggregate_n,
-                row.k,
+                *_profiled_workload_key(row),
             )
             launchable.setdefault(launch_key, []).append(row)
         else:
@@ -2250,11 +2274,7 @@ def read_profiler_request_coverage_keys(
     required_launch_owners: dict[tuple[object, ...], str] = {}
     covered_keys: set[tuple[object, ...]] = set()
     for record in raw["requests"]:
-        _require_exact_keys(
-            record,
-            ProfilerRequest.__dataclass_fields__,
-            "profiler request",
-        )
+        ProfilerRequest.validate_mapping_fields(record)
         request_id = str(record["request_id"])
         observation_digest = str(record["observation_digest"])
         _required_text("request_id", request_id)
@@ -3091,6 +3111,24 @@ def _profiled_anchor(request: ProfilerRequest) -> tuple[object, ...]:
         request.projection_n_vector,
         request.aggregate_n,
         request.k,
+        *((request.active_rows,) if request.active_rows is not None else ()),
+    )
+
+
+def _profiled_workload_key(
+    value: NativeVNNIObservation | ProfilerRequest,
+) -> tuple[object, ...]:
+    """Bind physical geometry and device-counted occupancy as one workload.
+
+    Omit the optional suffix for historical full-row evidence so existing
+    immutable profiler obligations retain their exact identity. Counted rows
+    must never deduplicate against another occupancy or pointer-free launch.
+    """
+
+    return (
+        value.execution_mode, value.m, value.projection_n_vector,
+        value.aggregate_n, value.k,
+        *((value.active_rows,) if value.active_rows is not None else ()),
     )
 
 
@@ -3109,8 +3147,7 @@ def _profiled_exact_launch_key(
 
     return (
         *_profiled_physical_candidate_key(request),
-        request.execution_mode,
-        *_profiled_anchor(request),
+        *_profiled_workload_key(request),
     )
 
 
@@ -3516,6 +3553,7 @@ def _raw_exact_profiler_launch_key(
         tuple(int(value) for value in raw["projection_n_vector"]),
         int(raw["aggregate_n"]),
         int(raw["k"]),
+        *((int(raw["active_rows"]),) if raw.get("active_rows") is not None else ()),
     )
 
 

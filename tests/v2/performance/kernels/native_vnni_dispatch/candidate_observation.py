@@ -21,6 +21,7 @@ OPTIONAL_OBSERVATION_COLUMNS = frozenset({
     "launch_k_tiles",
     "launch_n_block_chunks",
     "adaptive_timing_evidence",
+    "active_rows",
 })
 
 

@@ -137,7 +137,7 @@ namespace llaminar2
     namespace
     {
         /** Wire version for one root-authored request-selectable MTP policy. */
-        constexpr std::int32_t kMTPRequestPolicyWireVersion = 1;
+        constexpr std::int32_t kMTPRequestPolicyWireVersion = 2;
 
         /**
          * Fixed-width MPI payload for @ref MTPRequestPolicy.
@@ -147,7 +147,7 @@ namespace llaminar2
          * would let rank-local adaptive controllers make different decisions
          * at a threshold boundary.
          */
-        using MTPRequestPolicyWire = std::array<std::int32_t, 22>;
+        using MTPRequestPolicyWire = std::array<std::int32_t, 23>;
 
         /** @brief Store one double without changing any payload bits. */
         void encodeMTPPolicyDouble(
@@ -201,13 +201,16 @@ namespace llaminar2
                 &wire,
                 16u);
             encodeMTPPolicyDouble(
-                policy.depth_policy.demote_zero_accept_rate,
+                policy.depth_policy.demote_zero_accept_rate.value_or(0.0),
                 &wire,
                 18u);
             encodeMTPPolicyDouble(
                 policy.depth_policy.demote_acceptance_rate,
                 &wire,
                 20u);
+            // Preserve automatic intent separately from numeric zero. The
+            // topology profile is retained locally, never authored by a request.
+            wire[22] = policy.depth_policy.demote_zero_accept_rate ? 1 : 0;
             return wire;
         }
 
@@ -230,7 +233,8 @@ namespace llaminar2
             }
             if ((wire[1] != 0 && wire[1] != 1) ||
                 (wire[4] != 0 && wire[4] != 1) ||
-                (wire[15] != 0 && wire[15] != 1))
+                (wire[15] != 0 && wire[15] != 1) ||
+                (wire[22] != 0 && wire[22] != 1))
             {
                 if (error)
                     *error = "MTP request-policy wire contains a non-boolean flag";
@@ -258,8 +262,14 @@ namespace llaminar2
             policy.depth_policy.use_generated_policy = wire[15] != 0;
             policy.depth_policy.promote_full_accept_rate =
                 decodeMTPPolicyDouble(wire, 16u);
-            policy.depth_policy.demote_zero_accept_rate =
-                decodeMTPPolicyDouble(wire, 18u);
+            if (wire[22] != 0)
+                policy.depth_policy.demote_zero_accept_rate = decodeMTPPolicyDouble(wire, 18u);
+            else if (wire[18] != 0 || wire[19] != 0)
+            {
+                if (error)
+                    *error = "automatic MTP threshold carries an explicit payload";
+                return std::nullopt;
+            }
             policy.depth_policy.demote_acceptance_rate =
                 decodeMTPPolicyDouble(wire, 20u);
             return policy;
@@ -7497,7 +7507,7 @@ namespace llaminar2
         {
             if (!mtp_depth_controller_)
             {
-                MTPDepthPolicyConfig depth_policy = mtp.depth_policy;
+                MTPDepthPolicyConfig depth_policy = resolveMTPDepthPolicyConfig(mtp);
                 const DeviceId primary_device = runner_->primaryDeviceId();
                 if (primary_device.is_cuda())
                     depth_policy.backend = MTPDepthPolicyBackend::CUDA;
@@ -17331,6 +17341,14 @@ namespace llaminar2
         }
 
         plan_ = std::move(preliminary_plan);
+        // Configuration diagnostics reflect the plan-selected profile without
+        // replacing the user's automatic/explicit threshold intent.
+        config_.mtp.depth_defaults_profile = plan_.runtime.mtp.depth_defaults_profile;
+        LOG_INFO("[MTPDefaults] continuation_profile="
+                 << mtpDepthDefaultsProfileToString(config_.mtp.depth_defaults_profile)
+                 << " zero_accept_demote=" << resolveMTPZeroAcceptDemotionRate(config_.mtp)
+                 << " source=" << (config_.mtp.depth_policy.demote_zero_accept_rate
+                                       ? "explicit" : "hardware_default"));
 
         auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
             config_.moe_routed_expert_plan,

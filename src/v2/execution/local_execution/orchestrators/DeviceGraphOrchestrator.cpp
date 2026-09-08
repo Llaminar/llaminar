@@ -23508,7 +23508,7 @@ namespace llaminar2
                 request_count * padded_seq_len ||
             !signature.uses_device_token_ids ||
             !signature.uses_device_position_ids ||
-            !signature.uses_device_sequence_lengths ||
+            !signature.usesDeviceSequenceLengths() ||
             signature.mtp_verifier_outcome_graph_mode !=
                 expected_outcome_mode ||
             signature.is_bucketed_prefill)
@@ -23570,7 +23570,7 @@ namespace llaminar2
             !signature.uses_device_token_ids ||
             !signature.uses_device_position_ids ||
             signature.position_policy != ForwardPositionPolicy::ExplicitRows ||
-            !signature.uses_device_sequence_lengths ||
+            !signature.usesDeviceSequenceLengths() ||
             signature.is_bucketed_prefill)
         {
             const char *control_policy_name =
@@ -23615,7 +23615,7 @@ namespace llaminar2
                 << ",position_policy="
                 << static_cast<int>(signature.position_policy)
                 << ",uses_device_sequence_lengths="
-                << signature.uses_device_sequence_lengths
+                << signature.usesDeviceSequenceLengths()
                 << ",is_bucketed_prefill="
                 << signature.is_bucketed_prefill
                 << ",outcome_graph_mode="
@@ -24443,7 +24443,7 @@ namespace llaminar2
                     signature.all_position_logit_rows !=
                         request_count *
                             physical_verifier_rows_per_request ||
-                    !signature.uses_device_sequence_lengths ||
+                    !signature.usesDeviceSequenceLengths() ||
                     signature.mtp_verifier_outcome_graph_mode !=
                         expected_outcome_mode ||
                     !append_hosted_semantic(

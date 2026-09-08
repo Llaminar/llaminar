@@ -363,6 +363,14 @@ precision requests fail as unimplemented. KV-cache precision and expert weight
 formats are independent settings; their support does not imply support for
 another model activation dtype.
 
+MTP hardware defaults are selected once by `ExecutionPlanBuilder` from the
+complete continuation domain and canonical device inventory. Their numeric
+source is `execution/config/MTPDepthDefaults.h`. Preserve automatic versus
+explicit request intent through CLI/YAML and MPI; never infer an override by
+comparing its value with an old default. Other expert tiers cannot select the
+continuation policy. Request admission resolves the profile into the existing
+device-controller ABI without changing MTP enablement, mode, or graph capacity.
+
 ## Benchmarking
 
 Use a Release binary and a fixed model, device, prompt bytes, decode length,

@@ -16,7 +16,11 @@
  *   - Epoch composition across allreduce, gather, and broadcast
  *   - Delegation of remaining collective semantics to the general backend
  *   - Stress test (1000 consecutive allreduces)
- *   - Full Qwen3.6-35B prefill-sequence latency distribution
+ *   - Full Qwen3.6-35B prefill-sequence value and epoch correctness
+ *
+ * The separately selected ShmemSpinEconomyMPITest suite measures the latency
+ * distribution against MPI. CTest registers it as Perf, never as Unit or
+ * production preflight: competing compilation or tests invalidate its timing.
  */
 
 #include <gtest/gtest.h>
@@ -1304,6 +1308,38 @@ TEST_F(ShmemSpinMPITest, MultiChunkAllreduceRemainsOnSharedMemoryPath)
     }
 }
 
+/** @brief Preserve full-sequence arithmetic coverage independently of timing. */
+TEST_F(ShmemSpinMPITest, Qwen36PrefillSequencePreservesValues)
+{
+    if (size_ != 2)
+        GTEST_SKIP() << "The production sequence models two CPU participants";
+
+    constexpr size_t count = 434u * 2048u;
+    constexpr int repetitions = 121;
+    std::vector<float> data(count);
+    for (int repetition = 0; repetition < repetitions; ++repetition)
+    {
+        // Vary successive publications so an old epoch cannot satisfy this
+        // check merely by returning the previous reduction's identical bytes.
+        const float offset = static_cast<float>(repetition);
+        std::fill(data.begin(), data.end(), static_cast<float>(rank_ + 1) + offset);
+        ASSERT_TRUE(backend_->allreduce(
+            data.data(), count, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+        const float expected = rank_sum_ + static_cast<float>(size_) * offset;
+        EXPECT_TRUE(std::all_of(data.begin(), data.end(),
+                                [expected](float value) { return value == expected; }))
+            << "Full-buffer mismatch at prefill reduction " << repetition;
+    }
+}
+
+/**
+ * @brief Isolate competitive measurements from the functional Unit inventory.
+ *
+ * Reuses the same backend/rank lifecycle as the functional tests. The CMake
+ * Perf registration selects this suite exclusively and runs it serially.
+ */
+class ShmemSpinEconomyMPITest : public ShmemSpinMPITest {};
+
 /**
  * @brief Guard the complete Qwen3.6-35B prefill collective sequence against
  *        latency tails and MPI delegation.
@@ -1321,7 +1357,7 @@ TEST_F(ShmemSpinMPITest, MultiChunkAllreduceRemainsOnSharedMemoryPath)
  * completes. Buffer initialization and the one initial alignment barrier remain
  * outside every timed interval.
  */
-TEST_F(ShmemSpinMPITest, Qwen36PrefillSequenceHasBoundedTailAndBeatsMPI)
+TEST_F(ShmemSpinEconomyMPITest, Qwen36PrefillSequenceHasBoundedTailAndBeatsMPI)
 {
     if (size_ != 2)
         GTEST_SKIP() << "Dual-socket economy contract requires exactly two ranks";

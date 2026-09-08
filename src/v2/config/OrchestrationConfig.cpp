@@ -1330,7 +1330,8 @@ namespace llaminar2
                     return value >= 0.0 && value <= 1.0;
                 };
                 if (!valid_rate(depth_policy.promote_full_accept_rate) ||
-                    !valid_rate(depth_policy.demote_zero_accept_rate) ||
+                    (depth_policy.demote_zero_accept_rate &&
+                     !valid_rate(*depth_policy.demote_zero_accept_rate)) ||
                     !valid_rate(depth_policy.demote_acceptance_rate))
                 {
                     errors.push_back("MTP depth policy thresholds must be in [0, 1]");
@@ -1528,7 +1529,12 @@ namespace llaminar2
         oss << "    depth_generated_policy: "
             << (mtp.depth_policy.use_generated_policy ? "true" : "false") << "\n";
         oss << "    depth_promote_full_accept: " << mtp.depth_policy.promote_full_accept_rate << "\n";
-        oss << "    depth_demote_zero_accept: " << mtp.depth_policy.demote_zero_accept_rate << "\n";
+        oss << "    depth_demote_zero_accept: ";
+        if (mtp.depth_policy.demote_zero_accept_rate)
+            oss << *mtp.depth_policy.demote_zero_accept_rate;
+        else
+            oss << "auto";
+        oss << "\n";
         oss << "    depth_demote_acceptance: " << mtp.depth_policy.demote_acceptance_rate << "\n";
         oss << "    require_terminal_hidden_for_full_hit: "
             << (mtp.require_terminal_hidden_for_full_hit ? "true" : "false") << "\n";

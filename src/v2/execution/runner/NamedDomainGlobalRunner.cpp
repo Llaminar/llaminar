@@ -2,6 +2,11 @@
  * @file NamedDomainGlobalRunner.cpp
  * @brief Implementation of NamedDomainGlobalRunner
  *
+ * Converts named-domain topology into stage-local runners and a coordinated
+ * global execution lifecycle. Runtime policy comes from the canonical rank
+ * plan so model loading, graph admission, and request execution cannot derive
+ * independent hardware defaults from a rank-local primary device.
+ *
  * @author David Sanftenberg
  * @date May 2026
  */
@@ -252,6 +257,7 @@ namespace llaminar2
             GlobalPPRankPlan rank_plan = GlobalPPRankPlanBuilder::build(topology, my_rank);
             RankExecutionPlan lifecycle_plan = plan_builder_->buildPlanForRank(
                 config_, model_config, cluster_inventory, my_rank);
+            config_.mtp.depth_defaults_profile = lifecycle_plan.runtime.mtp.depth_defaults_profile;
 
             // ----------------------------------------------------------
             // Step 8: Model loading + stage runner construction
@@ -263,22 +269,9 @@ namespace llaminar2
                 return setError("NamedDomainGlobalRunner: model_path is required for full initialization");
             }
 
-            // Build InferenceRunnerConfig base
-            auto runtime_cfg = RuntimeConfig::fromOrchestrationConfig(
-                config_.max_seq_len,
-                config_.batch_size,
-                config_.activation_precision,
-                config_.kv_cache_precision,
-                config_.fused_attention_backend,
-                config_.routed_expert_compute_policy,
-                config_.moe_hot_expert_cache,
-                config_.moe_routed_prefill,
-                config_.moe_rebalance,
-                config_.prefix_cache,
-                config_.mtp,
-                config_.tp_allreduce_precision_override);
-            runtime_cfg.routed_expert_owner_order =
-                config_.routed_expert_owner_order;
+            // Planning already parsed runtime intent and selected domain-owned
+            // defaults. Stage construction consumes that same immutable value.
+            const auto &runtime_cfg = lifecycle_plan.runtime;
             InferenceRunnerConfig base_runner_cfg;
             base_runner_cfg.max_seq_len = runtime_cfg.max_seq_len;
             base_runner_cfg.batch_size = runtime_cfg.batch_size;

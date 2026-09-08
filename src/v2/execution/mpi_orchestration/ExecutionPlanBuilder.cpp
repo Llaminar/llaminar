@@ -13,9 +13,11 @@
  */
 
 #include "ExecutionPlanBuilder.h"
+#include "../moe/MoERoutedExpertPlacementPlan.h"
 #include "../../utils/Logger.h"
 #include "../../backends/ComputeBackend.h"
 #include <algorithm>
+#include <cctype>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -23,6 +25,82 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Classify only card identities with measured MTP defaults.
+         * @param device Startup inventory, never a hot-path backend query.
+         * @return Portable for CPU, unknown cards, or ambiguous marketing names.
+         */
+        MTPDepthDefaultsProfile mtpProfileForCard(const DeviceInfo &device)
+        {
+            std::string name = device.name;
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c) { return std::toupper(c); });
+            if (device.type == DeviceType::CUDA && name.ends_with("RTX 3090"))
+                return MTPDepthDefaultsProfile::CUDARTX3090;
+            // HIP reports "AMD Instinct MI60 / MI50" on the measured MI50.
+            // Its 60-CU inventory disambiguates that shared marketing string;
+            // the MI60 and other gfx906 cards must not inherit this result.
+            if (device.type == DeviceType::ROCm &&
+                name.find("MI50") != std::string::npos && device.compute_units == 60)
+                return MTPDepthDefaultsProfile::ROCmMI50;
+            return MTPDepthDefaultsProfile::Portable;
+        }
+
+        /**
+         * @brief Resolve a profile only when every domain participant agrees.
+         * @param devices Complete continuation membership, including remote GPUs.
+         * @param ranks Aligned inventory owners, or empty for address-only lookup.
+         * @param inventory Canonical gathered hardware inventory.
+         * @return One measured card profile, or Portable for uncharacterized mixes.
+         * @throws std::invalid_argument for malformed participant/owner geometry.
+         *
+         * Never classify from the first GPU or include unrelated expert tiers.
+         * Missing identity is uncharacterized hardware, not evidence that the
+         * rest of a domain is homogeneous. Placement validation separately owns
+         * missing-device rejection.
+         */
+        MTPDepthDefaultsProfile mtpProfileForDomain(
+            const std::vector<GlobalDeviceAddress> &devices,
+            const std::vector<int> &ranks,
+            const ClusterInventory &inventory)
+        {
+            if (!ranks.empty() && ranks.size() != devices.size())
+                throw std::invalid_argument("MTP default domain has mismatched device/rank membership");
+            std::optional<MTPDepthDefaultsProfile> common;
+            for (std::size_t index = 0; index < devices.size(); ++index)
+            {
+                const auto &address = devices[index];
+                if (!address.isGPU())
+                    return MTPDepthDefaultsProfile::Portable;
+                bool found = false;
+                for (const auto &rank : inventory.ranks)
+                {
+                    if ((!ranks.empty() && ranks[index] != rank.rank) ||
+                        (!address.isLocal() && address.hostname != rank.hostname))
+                        continue;
+                    for (const auto &device : rank.gpus)
+                    {
+                        if (device.type != address.device_type ||
+                            device.local_device_id != address.device_ordinal ||
+                            (device.numa_node >= 0 && address.numa_node >= 0 &&
+                             device.numa_node != address.numa_node))
+                            continue;
+                        const auto profile = mtpProfileForCard(device);
+                        if (profile == MTPDepthDefaultsProfile::Portable ||
+                            (common && *common != profile))
+                            return MTPDepthDefaultsProfile::Portable;
+                        common = profile;
+                        found = true;
+                    }
+                }
+                if (!found)
+                    return MTPDepthDefaultsProfile::Portable;
+            }
+            return common.value_or(MTPDepthDefaultsProfile::Portable);
+        }
+    }
 
     // =========================================================================
     // Factory Function
@@ -59,6 +137,38 @@ namespace llaminar2
                 plans.push_back(buildPlanWithDomains(
                     rank, config, model_config, cluster_inventory, domains, pp_stages));
             }
+
+            // One immutable profile follows the continuation authority even on
+            // ranks that host only sparse expert endpoints of another vendor.
+            const ResolvedDomain *continuation = nullptr;
+            if (config.moe_routed_expert_plan && config.moe_routed_expert_plan->enabled)
+            {
+                const auto &name = config.moe_routed_expert_plan->continuation_domain;
+                const auto found = std::find_if(domains.begin(), domains.end(),
+                    [&](const ResolvedDomain &domain) { return domain.name == name; });
+                if (found == domains.end())
+                    throw std::invalid_argument("MTP defaults cannot resolve the overlay continuation domain");
+                continuation = &*found;
+            }
+            else if (!pp_stages.empty() && std::all_of(
+                         pp_stages.begin(), pp_stages.end(),
+                         [&](const ResolvedPPStage &stage)
+                         { return stage.domain_name == pp_stages.front().domain_name; }))
+            {
+                // Unused declarations are not model participants. A single
+                // execution domain may coexist with other named definitions.
+                const auto found = std::find_if(domains.begin(), domains.end(),
+                    [&](const ResolvedDomain &domain)
+                    { return domain.name == pp_stages.front().domain_name; });
+                if (found != domains.end())
+                    continuation = &*found;
+            }
+            const auto profile = continuation
+                ? mtpProfileForDomain(continuation->devices,
+                                      continuation->device_ranks, cluster_inventory)
+                : MTPDepthDefaultsProfile::Portable;
+            for (auto &plan : plans)
+                plan.runtime.mtp.depth_defaults_profile = profile;
         }
         else
         {
@@ -67,6 +177,16 @@ namespace llaminar2
             {
                 plans.push_back(buildSimplePlan(
                     rank, config, model_config, cluster_inventory));
+                auto &plan = plans.back();
+                plan.runtime.mtp.depth_defaults_profile = MTPDepthDefaultsProfile::Portable;
+                if (!plan.usesPipelineParallel() && !plan.usesLocalPP() && !plan.usesGlobalTP())
+                {
+                    const auto devices = plan.local_tp_devices.empty()
+                        ? std::vector<GlobalDeviceAddress>{plan.primary_device}
+                        : plan.local_tp_devices;
+                    plan.runtime.mtp.depth_defaults_profile = mtpProfileForDomain(
+                        devices, std::vector<int>(devices.size(), rank), cluster_inventory);
+                }
             }
         }
 
@@ -201,9 +321,16 @@ namespace llaminar2
             // Find ranks for each device
             std::set<int> rank_set;
             std::vector<std::string> missing_devices;
-            for (const auto &device : domain.devices)
+            if (!canonical.ranks.empty() && canonical.ranks.size() != domain.devices.size())
+                throw std::invalid_argument("Execution domain '" + domain.name + "' needs one owner rank per participant");
+            for (std::size_t index = 0; index < domain.devices.size(); ++index)
             {
-                int rank = findRankForDevice(device, cluster_inventory);
+                const auto &device = domain.devices[index];
+                // Local ordinals may repeat on different MPI ranks. An explicit
+                // owner is authoritative, not a hint to the discovery heuristic.
+                const int required_rank = canonical.ranks.empty()
+                    ? canonical.owner_rank.value_or(-1) : canonical.ranks[index];
+                int rank = findRankForDevice(device, cluster_inventory, required_rank);
                 domain.device_ranks.push_back(rank);
                 if (rank >= 0)
                 {
@@ -334,10 +461,13 @@ namespace llaminar2
 
     int ExecutionPlanBuilder::findRankForDevice(
         const GlobalDeviceAddress &device,
-        const ClusterInventory &cluster_inventory)
+        const ClusterInventory &cluster_inventory,
+        int required_rank)
     {
         for (const auto &rank_inv : cluster_inventory.ranks)
         {
+            if (required_rank >= 0 && rank_inv.rank != required_rank)
+                continue;
             // Match hostname
             if (!device.isLocal() && rank_inv.hostname != device.hostname)
             {

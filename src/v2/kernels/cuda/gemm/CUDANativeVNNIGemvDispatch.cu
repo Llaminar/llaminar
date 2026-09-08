@@ -10,6 +10,7 @@
  */
 
 #include "CUDANativeVNNIGemvShard.h"
+#include "CUDAGroupedVerifierLaunch.h"
 #include "tensors/NativeVnniFormatInfo.h"
 
 #include <cuda.h>
@@ -426,7 +427,13 @@ bool cudaNativeVNNIGemvTuned_small_m_fp32(
         rm_slot);
 }
 
-/** Route grouped CUDA decode with source-format arithmetic identity. */
+/**
+ * @brief Route grouped CUDA decode with source-format arithmetic identity.
+ * @see CUDAGroupedVerifierLaunch.h for the canonical operand/count contract.
+ *
+ * The dispatcher forwards immutable launch metadata; it never reads the live
+ * device count or changes the selected physical codebook shard.
+ */
 bool cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
@@ -447,7 +454,8 @@ bool cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
     int cuda_device_id,
     void *stream,
     CUDAGemvContext *gemv_ctx,
-    CUDARowMajorWeights **rm_slot)
+    CUDARowMajorWeights **rm_slot,
+    const llaminar2::DeviceRowRange *row_range)
 {
     LLAMINAR_ROUTE_CUDA_NVNNI_SHARD(
         cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy,
@@ -471,7 +479,8 @@ bool cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
         cuda_device_id,
         stream,
         gemv_ctx,
-        rm_slot);
+        rm_slot,
+        row_range);
 }
 
 bool cudaNativeVNNIInitIQGridTables_tuned()

@@ -1184,7 +1184,7 @@ namespace
         DeviceId device,
         int seq_len,
         uint64_t moe_placement_epoch = 0,
-        bool uses_device_sequence_lengths = false)
+        const int32_t *device_sequence_lengths = nullptr)
     {
         ForwardGraphSignature signature;
         signature.seq_len = seq_len;
@@ -1200,8 +1200,7 @@ namespace
         signature.pp_has_lm_head = false;
         signature.is_bucketed_prefill = true;
         signature.bucket_seq_len = seq_len;
-        signature.uses_device_sequence_lengths =
-            uses_device_sequence_lengths;
+        signature.device_sequence_lengths = device_sequence_lengths;
         signature.moe_placement_epoch = moe_placement_epoch;
         return signature;
     }
@@ -2136,7 +2135,7 @@ namespace
             device_,
             kLargeBucketSeqLen,
             host_->placement_epoch,
-            /*uses_device_sequence_lengths=*/true);
+            input.sequence_lengths_device);
         auto device_chunk_signature = signature;
         device_chunk_signature.uses_device_token_ids = true;
         device_chunk_signature.uses_device_position_ids = true;
@@ -2372,11 +2371,6 @@ namespace
         ASSERT_EQ(plan63.chunk.bucket_seq_len, kExactBucketSeqLen);
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(
-            device_,
-            kExactBucketSeqLen,
-            host_->placement_epoch,
-            /*uses_device_sequence_lengths=*/true);
         const auto key = prefillGraphKey(
             device_,
             kExactBucketSeqLen,
@@ -2386,6 +2380,11 @@ namespace
             host_->topology_signature);
 
         ASSERT_TRUE(runResidentPrefillChunk(input61, plan61, output));
+        // Admission creates the stable owner. Cache assertions must name that
+        // exact address, not the pre-admission null slot or a presence flag.
+        const auto signature = bucketedPrefillSignature(
+            device_, kExactBucketSeqLen, host_->placement_epoch,
+            host_->residentRequestLengthDevice());
         EXPECT_EQ(host_->build_calls, 1);
         EXPECT_EQ(host_->last_build_seq_len, kExactBucketSeqLen);
         EXPECT_EQ(host_->last_build_real_seq_len, kExactBucketSeqLen - 3);
@@ -2618,14 +2617,12 @@ namespace
         input63.device = device_;
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(
-            device_,
-            kMinimumPhysicalBucket,
-            /*moe_placement_epoch=*/0,
-            /*uses_device_sequence_lengths=*/true);
         const auto key = prefillGraphKey(device_, kMinimumPhysicalBucket);
 
         ASSERT_TRUE(executeResidentPrefill(input61, output));
+        const auto signature = bucketedPrefillSignature(
+            device_, kMinimumPhysicalBucket, /*moe_placement_epoch=*/0,
+            host_->residentRequestLengthDevice());
         EXPECT_EQ(host_->build_calls, 1);
         EXPECT_EQ(host_->last_build_seq_len, kMinimumPhysicalBucket);
         EXPECT_EQ(host_->last_build_real_seq_len, kExactBucketSeqLen - 3);

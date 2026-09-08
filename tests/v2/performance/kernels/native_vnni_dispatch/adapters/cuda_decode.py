@@ -76,8 +76,8 @@ REQUIRED_TIMING_COLUMNS = frozenset({
     "latency_us_hex",
 })
 
-RawTimingKey = tuple[str, int, int, str, str, int, int, int, str, int, int]
-MeasurementGroupKey = tuple[str, int, int, str, str, int, int, int]
+RawTimingKey = tuple[str, int, int, str, str, int, int, int, str, int, int, int]
+MeasurementGroupKey = tuple[str, int, int, str, str, int, int, int, int]
 
 
 # Fork workers inherit the immutable adapter context and timing index through
@@ -140,6 +140,7 @@ def _timing_key(raw: Mapping[str, str]) -> RawTimingKey:
         raw["candidate_id"].strip().lower(),
         int(raw["measurement_order"]),
         int(raw["measurement_order_seed"]),
+        int(raw.get("active_rows") or 0),
     )
 
 
@@ -155,6 +156,7 @@ def _measurement_group_key(raw: Mapping[str, str]) -> MeasurementGroupKey:
         int(raw["m"]),
         int(raw["n"]),
         int(raw["k"]),
+        int(raw.get("active_rows") or 0),
     )
 
 
@@ -547,17 +549,21 @@ def _trial_set_hash_values(
     m: int,
     n: int,
     k: int,
+    active_rows: int | None = None,
 ) -> str:
     """Hash one reused deterministic trial identity exactly once."""
 
-    return _sha256({
+    identity = {
         "version": CUDA_DECODE_TRIAL_SET_VERSION,
         "source_format": source_format,
         "shape": shape,
         "m": m,
         "n": n,
         "k": k,
-    })
+    }
+    if active_rows is not None:
+        identity["active_rows"] = active_rows
+    return _sha256(identity)
 
 
 def _trial_set_hash(raw: Mapping[str, str]) -> str:
@@ -569,6 +575,7 @@ def _trial_set_hash(raw: Mapping[str, str]) -> str:
         int(raw["m"]),
         int(raw["n"]),
         int(raw["k"]),
+        int(raw["active_rows"]) if raw.get("active_rows") else None,
     )
 
 
@@ -618,6 +625,12 @@ def adapt_cuda_decode_row(
     n = int(raw["n"])
     k = int(raw["k"])
     contract = _semantic_contract(m)
+    active_rows = int(raw["active_rows"]) if raw.get("active_rows") else None
+    if active_rows is not None:
+        if contract != SemanticContract.VERIFIER_SERIAL_M1_BITWISE or not 1 <= active_rows <= m:
+            raise ValueError("active_rows must fit the grouped physical M")
+        if not _parse_bool("inactive_rows_untouched", raw.get("inactive_rows_untouched", "")):
+            raise ValueError("device-counted candidate overwrote inactive rows")
     execution_mode = _execution_mode(raw["execution_mode"])
     measurement_order = int(raw["measurement_order"])
     measurement_order_seed = int(raw["measurement_order_seed"])
@@ -808,7 +821,8 @@ def adapt_cuda_decode_row(
         config_json=candidate.config_json,
         supported=supported,
         graph_capture_ok=graph_capture_ok,
-        generic_eligible=True,
+        generic_eligible=active_rows is None,
+        active_rows=active_rows,
         arithmetic_fingerprint=candidate.arithmetic_fingerprint,
         serial_m1_policy_id=CUDA_DECODE_SERIAL_POLICY_ID,
         serial_m1_policy_hash=context.serial_m1_policy_hash,

@@ -2,7 +2,7 @@
 
 ## Verdict
 
-**September 8 additive packed-prefill candidate (final gate running):** the
+**September 8 additive packed-prefill candidate (affected gate green):** the
 canonical exact-overlay tournaments cover M512 at both large FFN geometries
 and five auxiliary projections, across all 21 source formats: **147/147 cells**.
 They refresh 112 pooled runtime keys, changing 45 physical launch choices while
@@ -41,9 +41,12 @@ timing labels. Expanded staging regression coverage passes every supported
 staged output tile for the five affected packed codebooks, ragged outputs and
 canonical partial buffers, with twenty retained replays. The shared generator's
 32 Unit tests pass, including CUDA/ROCm additive retention and malformed-base
-rejection. The complete Unit/preflight/twelve-cell model gate is running under
-`/tmp/qwen38-staged-prefill-proof.{json,log}`; do not yet cite its predecessors
-as certification for the new dispatch rows. The short canonical model prompt
+rejection. The complete affected gate passes 638 Unit registrations, 112
+preflight integrations, twelve model cells and 106 validated CSV artifacts
+in 581.568 seconds: `/tmp/qwen38-staged-prefill-proof.{json,log}`. Ten MTP cells
+certify native/ticket generation; the two MTP-off cells certify captured
+forwards, not the complete ordinary generation loop. This is not a claim that
+the entire production campaign is green. The short canonical model prompt
 is complemented by full-buffer M512 tournament byte proofs and the clean
 512-token model output comparison; it is not a new M512 HF checkpoint pack.
 

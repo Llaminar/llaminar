@@ -16,6 +16,7 @@
  */
 
 #include "CUDAFloatingPointGemmKernel.h"
+#include "kernels/common/FloatingPointVerifierLaunch.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "CuBLASGemmKernel.h"
 #include "backends/ComputeBackend.h" // DeviceManager
@@ -42,38 +43,6 @@ extern "C"
         const float *const *h_B_ptrs,
         float *const *h_C_ptrs,
         int batch_count,
-        int device_id,
-        void *stream);
-    bool cudaFp32_tiny_batched_projection(
-        const float *const *d_A_array,
-        const float *const *d_B_array,
-        float *const *d_C_array,
-        int M,
-        int N,
-        int K,
-        int batch_count,
-        int device_id,
-        void *stream);
-    bool cudaFp32x16_tiny_batched_projection(
-        const float *const *d_A_array,
-        const float *const *d_B_array,
-        float *const *d_C_array,
-        int M,
-        int N,
-        int K,
-        int batch_count,
-        int weight_dtype,
-        int device_id,
-        void *stream);
-    bool cudaFloating_swiglu_down_projection(
-        const float *d_gate,
-        const float *d_up,
-        const void *d_weights,
-        float *d_output,
-        int M,
-        int N,
-        int K,
-        int weight_dtype,
         int device_id,
         void *stream);
 }
@@ -480,7 +449,8 @@ namespace llaminar2
                     1,
                     weight_dtype,
                     cuda_device_id_,
-                    gpu_stream_);
+                    gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m));
                 if (success && d_mapped_output)
                 {
                     success = cudaQuantGemm_copyDeviceToDeviceAsync(
@@ -576,7 +546,8 @@ namespace llaminar2
                     k,
                     1,
                     cuda_device_id_,
-                    gpu_stream_);
+                    gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m));
                 if (success && d_mapped_output)
                 {
                     success = cudaQuantGemm_copyDeviceToDeviceAsync(
@@ -923,7 +894,8 @@ namespace llaminar2
                     k,
                     batch_count,
                     cuda_device_id_,
-                    gpu_stream_);
+                    gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m));
                 used_tiny_fp32 = success;
             }
             else
@@ -1185,7 +1157,8 @@ namespace llaminar2
                                                          k,
                                                          static_cast<int>(group_count),
                                                          cuda_device_id_,
-                                                         gpu_stream_)
+                                                         gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m))
                                                    : cudaFp32x16_tiny_batched_projection(
                                                          d_A_array,
                                                          d_B_array,
@@ -1196,7 +1169,8 @@ namespace llaminar2
                                                          static_cast<int>(group_count),
                                                          weight_dtype,
                                                          cuda_device_id_,
-                                                         gpu_stream_);
+                                                         gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m));
                     if (!projection_ok)
                     {
                         LOG_ERROR("[CUDAFloatingPointGemmKernel] floating grouped verifier projection kernel failed"
@@ -1421,7 +1395,8 @@ namespace llaminar2
                 k,
                 weight_dtype,
                 cuda_device_id_,
-                gpu_stream_);
+                gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m));
 
             if (success && d_mapped_output)
             {

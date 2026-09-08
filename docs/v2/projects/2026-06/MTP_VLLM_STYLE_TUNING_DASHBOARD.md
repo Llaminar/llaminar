@@ -8,14 +8,92 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 ## Current State
 
+September 8 hardware-defaults follow-on is verified: RTX3090 automatically
+retains 0.30 and MI50 selects 0.45, based on complete continuation membership,
+with explicit request overrides preserved. Fresh clean Release decode is
+**68.091/41.103 tok/s CUDA/ROCm**, with all five token arrays per backend
+matching the accepted receipts. **639 Unit + 115 preflight + twelve parity
+cells + 106 CSV artifacts** pass in **600.305 seconds**. An auxiliary two-card
+dry-run check exposed an existing planning-only retirement seal error; normal
+inference retirement passes, and that separate issue remains open. See the
+[hardware-defaults handoff](../2026-09/2026-09-08-mtp-hardware-defaults.md).
+
+September 8 accepted dynamic-depth result: **CUDA 68.166 tok/s (97.39% of
+best fixed)** and **ROCm 41.013 tok/s (92.77% of best tested fixed)**, with
+capacity 15, initial depth 2, real depth updates and identical tokens across
+all five measured requests. CUDA completed fixed depths 1–15; ROCm completed
+1–9 before the user stopped the slower deeper sweep (10 interrupted; 11–15
+not measured). Depth 2 wins both completed inventories at 69.991/44.208 tok/s.
+At that earlier tuning checkpoint, ROCm required
+`--mtp-depth-demote-zero-accept 0.45` and global defaults had not yet changed;
+the automatic-profile follow-on above supersedes that requirement. Its affected
+gate passed **638 Unit + 115
+preflight + twelve parity cells + 106 CSV artifacts** in **613.462 seconds**.
+This tuning goal is accepted, not a claim that the entire production or HTTP
+E2E campaign is green. No benchmark remains running. Reproduction and evidence:
+[September 8 handoff](../2026-09/2026-09-08-dynamic-mtp-device-row-range.md).
+
+### Investigation history
+
+September 8 dynamic-depth follow-up: refreshed fixed-2/dynamic-15 measurements
+are **69.555/24.318 CUDA** and **43.724/12.684 ROCm tok/s**, with all output IDs
+identical within each backend. The typed row contract now reaches raw CUDA
+grouped kernels and ROCm single/fused/mixed-decoder kernels. Captured regressions
+pass 21 CUDA / 63 ROCm format cases, wider grouped/float checks pass, and all
+638 rebuilt Unit tests pass. CUDA's public verifier scope now owns its raw
+arithmetic selector too. Both new registrations pass twenty repeats (1,680
+format/launch cases); the rebuilt 115-registration preflight passes in 444.75s.
+The subsequent ROCm mixed-decoder register-lifetime cleanup passes focused checks:
+it retains eight scalar-to-vector spills, with no off-chip scratch/spills.
+The row contract now reaches public tensor adapters and Qwen FFN, QKV/GDN,
+attention-output and identity-layout LM-head stages. Captured tests pass 64
+CUDA and 106 ROCm cases, including FP16/BF16/FP32 projection and SwiGLU.
+The gates are rebuilt for this interface revision. The first Unit pass was
+637/638: a competitive collective timing assertion ran during compilation.
+Its unchanged isolated Perf registration now passes; Unit keeps full-sequence
+arithmetic coverage. The canonical gate now passes **638 Unit, 115 preflight,
+twelve Qwen3.8 CUDA/ROCm cells, and 106 CSV artifacts** in 596.888 seconds:
+`/tmp/qwen38-device-rows-proof-v2.{json,log}`. End-to-end economy certification
+remains pending. Clean Release fixed-2/dynamic-15 is now **69.842/56.839 CUDA**
+and **45.319/34.135 ROCm tok/s**: dynamic improved 2.337x/2.691x but reaches only
+81.38%/75.32% of fixed 2. All five repeats preserve output IDs. A controlled
+same-decision capacity pair confirms a remaining verifier-width cost; an
+explicit Perf-only FFN reuse probe is measuring CUDA's capacity-selected
+register footprint. The occupancy-aware all-format CUDA exact refresh now
+measures **69.991 fixed-2 / 68.166 dynamic-15 tok/s**, dynamic +19.93% and
+97.39% of fixed 2, with identical tokens and controller counters. All 1,050
+counted-row observations pass; the rebuilt affected gate passes **638 Unit +
+115 preflight + twelve cells + 106 CSV artifacts** in 594.741 seconds:
+`/tmp/qwen38-counted-policy-proof.{json,log}`. CUDA's full fixed-depth 1–15
+inventory now passes: depth 2 is fastest, confirming dynamic reaches **97.39%
+of the best fixed depth**. The latest ROCm fused-row candidate reaches 36.073
+dynamic versus 44.277 fixed-2 tok/s (previously 34.135/45.319). All 72 fused
+specializations are spill-free and 128 focused captured-row cases pass, including
+all-format column tails/bias. The rebuilt affected gate passes **638 Unit + 115
+preflight + twelve model cells + 106 CSV artifacts** in **613.462 seconds**:
+`/tmp/qwen38-rocm-grid-v21-proof.{json,log}`. Default ROCm dynamic is
+still below the performance target, and the ROCm fixed-depth inventory
+and remaining capacity-cost tuning are open. Isolated probes identify excess
+inactive fused-projection workgroups, not GDN recurrence, as a material cost.
+A bounded device-side row grid removes most of that microbenchmark capacity tax;
+the remaining work separates controller demotion cost from verifier overhead.
+Three-repeat screening identifies the zero-accept demotion threshold: 45%
+instead of 30% keeps dynamic near depth 2, with 113 rather than 139 verifier
+passes/request and about 41.15 tok/s. Compilation overlapped the screen, so a
+quiet confirmation was required before acceptance. It subsequently passed as
+recorded above; the user ended the deeper ROCm inventory after depth 9. No
+default changed. Activation quantization
+and ragged/compacted row layouts are not claimed to be count-admitted. See the
+[bounded implementation record](../2026-09/2026-09-08-dynamic-mtp-device-row-range.md).
+
 September 8 WIP checkpoint: additive packed-prefill exact dispatch finishes its
 clean bracket at **1186.524 prefill / 46.485 decode tok/s**, with unchanged
 tokens and weight/workspace bytes. Pinned llama.cpp confirmation is
 **1204.301 / 45.757**: decode leads, prefill still trails. All 147 format/shape
-cells and 45 isolated zero-spill launch profiles pass. Full Unit is **638/638**;
-the 112 preflight integrations and twelve model cells are still in progress:
-`/tmp/qwen38-staged-prefill-proof.{json,log}`. The final gate is not yet claimed
-green. Dynamic's physical verifier-width fix and its per-backend >=90% target
+cells and 45 isolated zero-spill launch profiles pass. The affected gate passes
+**638 Unit + 112 preflight + twelve model cells + 106 CSV artifacts** in
+581.568 seconds: `/tmp/qwen38-staged-prefill-proof.{json,log}`.
+This is not the entire production campaign. Dynamic's physical verifier-width fix and its per-backend >=90% target
 remain pending. See the
 [phase investigation](../2026-09/2026-09-07-cuda-mtp-off-phase-comparison.md).
 

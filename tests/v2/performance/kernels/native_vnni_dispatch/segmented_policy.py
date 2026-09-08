@@ -3362,7 +3362,7 @@ def _surface_candidate_timings(
     all_surfaces: set[SurfaceKey] = set()
     identity_rows: dict[SurfaceKey, NativeVNNIObservation] = {}
     for row in rows:
-        surface = SurfaceKey(row.source_format, row.execution_mode)
+        surface = SurfaceKey.from_observation(row)
         all_surfaces.add(surface)
         identity_rows.setdefault(surface, row)
         if not row.generic_eligible:

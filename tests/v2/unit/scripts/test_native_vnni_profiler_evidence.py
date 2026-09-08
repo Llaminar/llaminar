@@ -96,6 +96,7 @@ from native_vnni_dispatch.profiler_reparse import (  # noqa: E402
     upgrade_cuda_evidence,
 )
 from native_vnni_dispatch.profiler_evidence import (  # noqa: E402
+    ProfilerRequest,
     EXPECTED_PROFILER_TOOL,
     LEGACY_PROFILER_REQUEST_SCHEMA_VERSION,
     PROFILER_COLLECTOR_VERSION,
@@ -614,6 +615,36 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         self.assertNotEqual(
             request.observation_digest, changed_request.observation_digest
         )
+
+    def test_device_counted_occupancy_owns_distinct_profile_requests(self) -> None:
+        """A full-row receipt or stale environment cannot certify shallow work."""
+
+        base = dataclasses.replace(cuda_observation(
+            candidate_id="cuda.nvnni.decode.verifier.inherit_serial_m1.r8"),
+            m=16, semantic_contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+            generic_eligible=False)
+        rows = tuple(dataclasses.replace(base, active_rows=active) for active in (3, 16))
+        manifest = build_profiler_request_manifest(ObservationCorpus(rows))
+        self.assertEqual(len(manifest.requests), 2)
+        self.assertEqual({request.active_rows for request in manifest.requests}, {3, 16})
+        self.assertEqual(len(_build_gpu_process_batches(manifest.requests, maximum_size=20)), 2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.json"
+            write_profiler_request_manifest(path, manifest)
+            raw_keys = profiler_evidence.read_profiler_request_coverage_keys(path)
+        self.assertEqual(raw_keys, profiler_evidence._covered_profiler_launch_keys((manifest,)))
+        self.assertEqual(len(raw_keys), 2)
+        for request in manifest.requests:
+            self.assertEqual(ProfilerRequest.from_mapping(request.canonical_mapping()), request)
+            with mock.patch.dict(os.environ, {"LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS": "99"}):
+                environment = _profile_environment(request, Path("/tmp/unused-counted-profile"))
+            self.assertEqual(environment["LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS"], str(request.active_rows))
+        legacy = profiler_request_for_observation(cuda_observation())
+        self.assertNotIn("active_rows", legacy.canonical_mapping())
+        self.assertEqual(ProfilerRequest.from_mapping(legacy.canonical_mapping()), legacy)
+        with mock.patch.dict(os.environ, {"LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS": "99"}):
+            self.assertNotIn("LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS",
+                             _profile_environment(legacy, Path("/tmp/unused-counted-profile")))
 
     def test_parallel_request_build_is_byte_identical_to_serial(self) -> None:
         """Forked conversion preserves exact request order and contents."""

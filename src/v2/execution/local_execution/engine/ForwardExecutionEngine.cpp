@@ -1005,7 +1005,7 @@ namespace llaminar2
                 {"all_position_logit_rows", std::to_string(signature.all_position_logit_rows)},
                 {"uses_device_token_ids", boolTag(signature.uses_device_token_ids)},
                 {"uses_device_position_ids", boolTag(signature.uses_device_position_ids)},
-                {"uses_device_sequence_lengths", boolTag(signature.uses_device_sequence_lengths)},
+                {"uses_device_sequence_lengths", boolTag(signature.usesDeviceSequenceLengths())},
                 {"moe_placement_epoch", std::to_string(signature.moe_placement_epoch)}};
         }
 
@@ -2049,8 +2049,7 @@ namespace llaminar2
                 .uses_device_token_ids = input.token_ids_device != nullptr,
                 .uses_device_position_ids = input.position_ids_device != nullptr,
                 .position_policy = effective_input.position_policy,
-                .uses_device_sequence_lengths =
-                    input.sequence_lengths_device != nullptr,
+                .device_sequence_lengths = effective_input.sequence_lengths_device,
                 .device_prefill_chunk_capture_identity =
                     effective_input.device_prefill_chunk
                         ? effective_input.device_prefill_chunk->capture_identity
@@ -2119,7 +2118,7 @@ namespace llaminar2
                 << " position_policy="
                 << static_cast<int>(forward_signature.position_policy)
                 << " device_lengths="
-                << boolTag(forward_signature.uses_device_sequence_lengths)
+                << boolTag(forward_signature.usesDeviceSequenceLengths())
                 << " chunk_identity="
                 << forward_signature.device_prefill_chunk_capture_identity
                 << " shifted_mtp_identity="
@@ -2180,7 +2179,7 @@ namespace llaminar2
                     << " device_lengths="
                     << boolTag(
                            forward_signature
-                               .uses_device_sequence_lengths)
+                               .usesDeviceSequenceLengths())
                     << " chunk_identity="
                     << forward_signature
                            .device_prefill_chunk_capture_identity
@@ -2216,7 +2215,7 @@ namespace llaminar2
                 << boolTag(forward_signature.uses_device_position_ids)
                 << " device_lengths="
                 << boolTag(
-                       forward_signature.uses_device_sequence_lengths)
+                       forward_signature.usesDeviceSequenceLengths())
                 << " placement_epoch="
                 << forward_signature.moe_placement_epoch);
         }

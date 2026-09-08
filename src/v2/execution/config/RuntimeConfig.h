@@ -15,6 +15,7 @@
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "RoutedExpertPolicy.h"
+#include "MTPDepthDefaults.h"
 #include "../moe/DeviceMoERebalancePolicyShared.h"
 #include <algorithm>
 #include <cctype>
@@ -575,6 +576,7 @@ namespace llaminar2
         MoE,
     };
 
+    /** @brief Request-selected depth policy, retaining automatic threshold intent. */
     struct MTPDepthPolicyConfig
     {
         MTPDepthPolicyMode mode = MTPDepthPolicyMode::Fixed;
@@ -597,7 +599,14 @@ namespace llaminar2
          */
         bool use_generated_policy = true;
         double promote_full_accept_rate = 1.0;
-        double demote_zero_accept_rate = 0.30;
+        /**
+         * @brief Explicit demotion threshold, or automatic hardware default.
+         *
+         * An absent value is distinct from explicitly requesting 0.30. Keep
+         * this intent through CLI/YAML round trips and request coordination;
+         * topology-bound admission, not the parser, resolves the number.
+         */
+        std::optional<double> demote_zero_accept_rate;
         /**
          * @brief Draft-token acceptance rate below which dynamic depth demotes.
          *
@@ -610,6 +619,25 @@ namespace llaminar2
          */
         double demote_acceptance_rate = 0.55;
     };
+
+    /**
+     * @brief Parse automatic intent or one finite explicit demotion probability.
+     * @param value CLI/YAML scalar, either "auto" or a number in [0, 1].
+     * @return Empty for automatic hardware defaults; otherwise the exact value.
+     * @throws std::invalid_argument for malformed or out-of-range input.
+     */
+    [[nodiscard]] inline std::optional<double> parseMTPZeroAcceptDemotionRate(
+        const std::string &value)
+    {
+        const auto normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "auto")
+            return std::nullopt;
+        std::size_t consumed = 0;
+        const double rate = std::stod(normalized, &consumed);
+        if (consumed != normalized.size() || !std::isfinite(rate) || rate < 0.0 || rate > 1.0)
+            throw std::invalid_argument("MTP zero-accept demotion threshold must be auto or in [0, 1]");
+        return rate;
+    }
 
     /**
      * @brief Resolve the effective initial MTP draft depth.
@@ -887,6 +915,14 @@ namespace llaminar2
         bool enabled = false;
         int draft_tokens = 1;
         /**
+         * @brief Immutable hardware default selected by continuation planning.
+         *
+         * Request policy does not carry this field: replacing a request cannot
+         * replace its physical domain or import another device's defaults.
+         */
+        MTPDepthDefaultsProfile depth_defaults_profile =
+            MTPDepthDefaultsProfile::Portable;
+        /**
          * @brief Retained graph/arena draft capacity, or zero to derive it.
          *
          * This is deliberately independent of the selected execution depth.
@@ -939,6 +975,31 @@ namespace llaminar2
         bool require_terminal_hidden_for_full_hit = true;
         MTPDepthPolicyConfig depth_policy;
     };
+
+    /**
+     * @brief Resolve the single effective zero-accept threshold at admission.
+     * @param config Runtime policy with its topology-owned hardware profile.
+     * @return Explicit request value when present, otherwise the profile value.
+     */
+    [[nodiscard]] inline double resolveMTPZeroAcceptDemotionRate(
+        const MTPRuntimeConfig &config)
+    {
+        return config.depth_policy.demote_zero_accept_rate.value_or(
+            defaultMTPZeroAcceptDemotionRate(config.depth_defaults_profile));
+    }
+
+    /**
+     * @brief Resolve request defaults for the existing host/controller interface.
+     * @param config Topology-bound runtime view of the admitted request.
+     * @return Policy with a concrete demotion threshold and unchanged other fields.
+     */
+    [[nodiscard]] inline MTPDepthPolicyConfig resolveMTPDepthPolicyConfig(
+        const MTPRuntimeConfig &config)
+    {
+        auto policy = config.depth_policy;
+        policy.demote_zero_accept_rate = resolveMTPZeroAcceptDemotionRate(config);
+        return policy;
+    }
 
     /**
      * @brief Resolve the largest depth the execution policy may select.
@@ -1166,7 +1227,8 @@ namespace llaminar2
             const auto probability = [](double value)
             { return value >= 0.0 && value <= 1.0; };
             if (!probability(depth.promote_full_accept_rate) ||
-                !probability(depth.demote_zero_accept_rate) ||
+                (depth.demote_zero_accept_rate &&
+                 !probability(*depth.demote_zero_accept_rate)) ||
                 !probability(depth.demote_acceptance_rate))
             {
                 return "MTP request adaptive thresholds must be in [0, 1]";

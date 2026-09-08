@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include "kernels/common/DeviceRowRange.h"
+
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
@@ -105,6 +107,8 @@ namespace llaminar2
              * are not production substitutes.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
+            std::optional<DeviceRowRange> verifier_row_range;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution

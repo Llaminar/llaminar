@@ -156,6 +156,8 @@ namespace llaminar2
                               .output_k_buffer_id = BufferId::K_PROJ,
                               .output_v_buffer_id = BufferId::V_PROJ,
                               .force_decode_equivalent_verifier_prefill = force_decode_equivalent_qkv_verifier_prefill,
+                              .verifier_row_range = projectionVerifierRows(
+                                  device, seq_len, batch_size, sequence_lengths_device),
                               .prepared_ref_q = preparedRefForGraphWeight(layer_bindings.wq, device),
                               .prepared_ref_k = preparedRefForGraphWeight(layer_bindings.wk, device),
                               .prepared_ref_v = preparedRefForGraphWeight(layer_bindings.wv, device),
@@ -216,7 +218,8 @@ namespace llaminar2
         // Stage 5: publish the local Wo partial, then reconstruct TP output.
         const std::string wo_projection = addWoProjection(
             graph, prefix, buffers, layer.wo, layer_bindings.wo,
-            total_tokens, device, attn_node);
+            total_tokens, device, attn_node, "wo_proj",
+            projectionVerifierRows(device, seq_len, batch_size, sequence_lengths_device));
         const std::string terminal = addWoAllreduce(
             graph, prefix, buffers, layer.wo,
             total_tokens, layer_idx, device, wo_projection);

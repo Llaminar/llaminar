@@ -354,6 +354,20 @@ namespace llaminar2
 
     protected:
         /**
+         * @brief Borrow the device count for a contiguous single-request verifier.
+         * @param device Participant owning the activations and count.
+         * @param seq_len Physical rows per request in the retained graph.
+         * @param batch_size Number of independently padded requests.
+         * @param lengths Stable device request lengths, already in capture identity.
+         * @return Counted geometry for one GPU request; otherwise the existing
+         *         full physical extent. Independently padded multi-request
+         *         matrices are not one contiguous live prefix.
+         */
+        std::optional<DeviceRowRange> projectionVerifierRows(
+            DeviceId device, int seq_len, int batch_size,
+            const int32_t *lengths) const;
+
+        /**
          * @brief Resolve the semantic node prefix for one FFN subgraph.
          *
          * Ordinary transformer layers use their model-layer identity. Model
@@ -1141,6 +1155,7 @@ namespace llaminar2
          * @param device Participant that owns the projection.
          * @param dependency Node that publishes @c buffers.attn_output.
          * @param wo_node_suffix Stable suffix for the projection node.
+         * @param verifier_rows Immutable physical/live verifier row geometry.
          * @return Projection node, or @p dependency when no weight exists.
          */
         std::string addWoProjection(
@@ -1152,7 +1167,8 @@ namespace llaminar2
             int total_tokens,
             DeviceId device,
             const std::string &dependency,
-            const std::string &wo_node_suffix = "wo_proj");
+            const std::string &wo_node_suffix = "wo_proj",
+            std::optional<DeviceRowRange> verifier_rows = std::nullopt);
 
         /**
          * @brief Reconstruct a row-parallel attention projection with TP sum.

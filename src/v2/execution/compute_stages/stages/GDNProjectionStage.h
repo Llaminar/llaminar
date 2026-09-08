@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include "kernels/common/DeviceRowRange.h"
+
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
@@ -100,6 +102,8 @@ namespace llaminar2
              * back to hidden row-wise replay.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
+            std::optional<DeviceRowRange> verifier_row_range;
         };
 
         static_assert(StageParamsRequired<Params>);

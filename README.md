@@ -102,6 +102,15 @@ MOE_PREFIX_FLAGS=("${PREFIX_FLAGS[@]}" --prefix-cache-moe-policy placement-finge
 MTP_FLAGS=(--mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed --mtp-verify-mode greedy)
 ```
 
+For adaptive MTP, use `--mtp-depth-policy dynamic` with the desired
+`--mtp-max-draft-tokens` capacity. Automatic controller defaults are selected
+from the single device or the complete homogeneous continuation domain's card
+identity, independently of other expert tiers. Explicit thresholds override
+these defaults; `--mtp-depth-demote-zero-accept auto` restores automatic
+selection. The resolved execution plan and benchmark JSON report the selected
+profile and effective threshold. Selecting a profile does not enable MTP or
+change the requested mode, depth bounds, or memory capacity.
+
 #### CPU Cross-socket TP/EP
 
 ```bash

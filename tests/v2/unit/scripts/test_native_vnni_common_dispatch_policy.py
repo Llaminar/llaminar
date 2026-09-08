@@ -137,8 +137,10 @@ from native_vnni_dispatch.splits import (  # noqa: E402
 import native_vnni_dispatch.segmented_policy as segmented_policy  # noqa: E402
 from native_vnni_dispatch.validation import (  # noqa: E402
     require_candidate_matrix_complete,
+    require_exact_overlay_scope,
     require_verifier_m_matrix,
 )
+from native_vnni_dispatch.shape_manifest import load_shape_manifest  # noqa: E402
 from native_vnni_dispatch.adapters.rocm_moe import (  # noqa: E402
     ROCmMoEAdapterContext,
     adapt_rocm_moe_csv,
@@ -6280,6 +6282,68 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             require_verifier_m_matrix(corpus)
         with self.assertRaisesRegex(ValueError, "candidate matrix"):
             require_candidate_matrix_complete(corpus)
+
+    def test_exact_refresh_requires_declared_all_format_scope(self) -> None:
+        """A missing whole codebook or depth cannot shrink an additive plan."""
+
+        manifest = load_shape_manifest()
+        shape = next(shape for shape in manifest.shapes if shape.exact_overlay)
+        scope = dict(
+            shape_names=(shape.name,), m_values=(3, 16),
+            execution_modes=(ExecutionMode.GRAPH_CAPTURED,),
+            contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+        )
+        for backend in Backend:
+            rows = [observation(
+                source_format=spec.label, n=shape.n, k=shape.k, m=m,
+                shape_name=shape.name, backend=backend,
+            ) for spec in FORMAT_SPECS for m in scope["m_values"]]
+            require_exact_overlay_scope(ObservationCorpus(rows), manifest, **scope)
+            for incomplete in (
+                [row for row in rows if row.source_format != "Q8_0"],
+                [row for row in rows if row.m != 16],
+                rows + [dataclasses.replace(rows[0], m=7)],
+                [observation(source_format=row.source_format, n=shape.n + 32,
+                             k=shape.k, m=row.m, shape_name=shape.name, backend=backend)
+                 for row in rows],
+            ):
+                with self.assertRaisesRegex(ValueError, "surface inventory"):
+                    require_exact_overlay_scope(ObservationCorpus(incomplete), manifest, **scope)
+            for invalid in (
+                dict(scope, m_values=()), dict(scope, m_values=(3, 3)),
+                dict(scope, m_values=(1,)), dict(scope, shape_names=()),
+            ):
+                with self.assertRaises(ValueError):
+                    require_exact_overlay_scope(ObservationCorpus(rows), manifest, **invalid)
+
+    def test_counted_row_oracle_preserves_each_occupancy_surface(self) -> None:
+        """Full-batch wins cannot hide a slower partially filled retained graph."""
+
+        rows = [dataclasses.replace(observation(
+            candidate=candidate, latency_us=latency, m=16,
+            generic_eligible=False,
+        ), active_rows=active) for candidate, active, latency in (
+            ("candidate.tc", 16, 210.0), ("candidate.tc", 3, 182.0),
+            ("candidate.rows8", 16, 222.0), ("candidate.rows8", 3, 77.0),
+        )]
+        corpus = ObservationCorpus(rows)
+        self.assertEqual(len(corpus.runtime_keys()), 1)
+        winner = build_exact_winner(rows, current_serial_m1_hash=SERIAL_HASH)
+        self.assertEqual(winner.candidate_id, "candidate.rows8")
+        self.assertEqual({surface.surface.active_rows for surface in winner.surfaces}, {3, 16})
+        with self.assertRaisesRegex(ValueError, "candidate matrix"):
+            require_candidate_matrix_complete(ObservationCorpus(rows[:-1]))
+        legacy = observation()
+        self.assertNotIn("active_rows", legacy.canonical_mapping())
+        self.assertEqual(NativeVNNIObservation.from_mapping(legacy.canonical_mapping()), legacy)
+        counted = rows[0]
+        self.assertEqual(NativeVNNIObservation.from_mapping(counted.canonical_mapping()), counted)
+        self.assertNotEqual(counted.digest(), dataclasses.replace(counted, active_rows=3).digest())
+        for invalid in (0, 17, True):
+            with self.assertRaisesRegex(ValueError, "active_rows"):
+                dataclasses.replace(counted, active_rows=invalid).validate()
+        with self.assertRaisesRegex(ValueError, "exact-only"):
+            dataclasses.replace(counted, generic_eligible=True).validate()
 
 
     def test_cpp_predicates_match_python_for_every_axis_and_boundary(self) -> None:

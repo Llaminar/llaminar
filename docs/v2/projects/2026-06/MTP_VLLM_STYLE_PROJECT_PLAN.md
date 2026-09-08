@@ -4,12 +4,54 @@
 
 ### Dynamic-depth economy (CUDA and ROCm)
 
+September 8 follow-on: the user requested promotion to card-aware production
+defaults. Single-device and homogeneous continuation plans now select typed
+RTX3090/MI50 profiles, with automatic versus explicit threshold intent retained
+through request admission and MPI. Fresh verification passes **639 Unit + 115
+preflight + twelve parity cells + 106 CSV artifacts** in **600.305 seconds**.
+Clean automatic-default Release decode is **68.091 CUDA / 41.103 ROCm tok/s**,
+with all five token arrays unchanged per backend. Normal inference retires
+cleanly; a separate pre-existing dry-run retention-seal error is recorded for
+follow-up, not called green. See the
+[hardware-defaults handoff](../2026-09/2026-09-08-mtp-hardware-defaults.md).
+
+September 8 accepted handoff: CUDA dynamic capacity 15 is **68.166 tok/s**, or
+**97.39%** of its best fixed depth (depth 2, 69.991 tok/s; full 1–15 inventory).
+ROCm dynamic is **41.013 tok/s**, or **92.77%** of the best tested fixed depth
+(depth 2, 44.208 tok/s; depths 1–9 completed). The user accepted these results
+and stopped the slower deeper ROCm sweep: depth 10 was interrupted, not failed,
+and 11–15 were not measured in this final sweep. ROCm uses the explicit
+`--mtp-depth-demote-zero-accept 0.45` override; CUDA uses the existing defaults.
+At that earlier tuning checkpoint no global policy default had changed; the
+automatic-profile follow-on above supersedes the manual override. Both retain
+dynamic bounds 1–15 and initial
+depth 2, with real depth updates and identical per-backend output IDs across
+all five measured requests in every completed case. The final gate passes
+**638 Unit + 115 preflight + twelve Qwen3.8 cells + 106 CSV artifacts** in
+**613.462 seconds**. This closes the accepted dynamic-depth tuning goal, not
+the full production/E2E campaign or the deferred external-baseline prefill gap.
+See the [reproduction and evidence handoff](../2026-09/2026-09-08-dynamic-mtp-device-row-range.md).
+The following entries preserve the investigation chronology.
+
+September 8 implementation follow-up and refreshed baselines are in the
+[device-row-range investigation](../2026-09/2026-09-08-dynamic-mtp-device-row-range.md).
+Raw CUDA grouped and ROCm single/fused/mixed-decoder row admission is
+implemented. All 638 Unit tests, the focused all-format regressions and twenty
+repetitions per backend pass; the rebuilt 115-registration preflight passes.
+Subsequent ROCm mixed-decoder register-lifetime cleanup passes focused checks.
+The count now reaches public projection/SwiGLU adapters, including native
+FP16/BF16/FP32 fixed-order kernels, and Qwen FFN/QKV/GDN/output/identity-LM-head
+stage parameters. New adapter/capture tests pass 64 CUDA and 106 ROCm cases.
+Full gates are rebuilding for this interface revision. Physical-width
+quantization, non-prefix row layouts and unchanged general BLAS work are not
+claimed to be count-admitted. The per-backend 90% real-model proof is pending.
+
 The September 7 user direction is to finish the current MTP-off decode slice,
 then tune dynamic-depth MTP on **CUDA and ROCm independently** until delivered
 decode throughput is at least **90% of that backend's best fixed MTP depth**
 on the existing Qwen3.8-27B comparison prompt. This is a new follow-on acceptance
-criterion, not a result already measured and not a replacement for the active
-MTP-off comparison goal. "Fixed" here describes speculative depth, not MoE
+criterion, not a result already measured at that point. It became the active goal; the
+remaining MTP-off prefill gap is deferred. "Fixed" describes speculative depth, not MoE
 expert-residency policy.
 
 Latest September 8 WIP checkpoint: CUDA ordinary decode retains its lead at
@@ -18,9 +60,10 @@ prefill installation improves approximately 3–4% in two control/candidate
 brackets, ending at 1186.524 tok/s versus the external 1204.301 confirmation.
 It adds no persistent memory and does not alter the dynamic-width design below.
 All 147 all-format exact-shape cells and 45 isolated spill checks pass; full
-Unit is 638/638, while preflight and the twelve model cells are still running
-in `/tmp/qwen38-staged-prefill-proof.{json,log}`. This is a WIP checkpoint,
-not a completed final certification. Fixed-depth/dynamic measurements must be
+Unit is 638/638, preflight is 112/112, and all twelve affected model cells pass
+with 106 validated CSV artifacts in 581.568 seconds:
+`/tmp/qwen38-staged-prefill-proof.{json,log}`. This certifies the affected slice,
+not the entire production campaign or the dynamic economy target. Fixed-depth/dynamic measurements must be
 refreshed after the attention change before any 90% certification.
 
 - Reuse the exact 512-token prompt, GGUF, FP32 activations, KV precision,
@@ -30,7 +73,8 @@ refreshed after the attention change before any 90% certification.
   Do not add VRAM beyond an explicitly approved scope.
 - Establish healthy fixed-depth 1/2/3 baselines first, then measure every fixed
   depth through dynamic's supported ceiling (currently 15) before calling one
-  the best. Reconfirm the winner and dynamic in interleaved, warmed Release
+  the best. The final user-directed stop limits ROCm's accepted comparison to
+  the best **tested** depth (1–9); CUDA completed 1–15. Reconfirm the winner and dynamic in interleaved, warmed Release
   measurements; record all repeats and the common emitted-token denominator.
   Startup/capture cost is separate, but controller exploration during the
   measured request remains in its decode time. Do not discard a slow prefix
@@ -78,6 +122,44 @@ inventory is also pending;
 depth 2 is a healthy comparator, not yet the certified best fixed depth.
 Receipts: `/tmp/qwen38-dynamic90-{cuda,rocm}-{fixed2,dynamic}.{json,log}` and
 `/tmp/qwen38-dynamic90-{cuda,rocm}-envelope2-diagnostic.{json,log}`.
+
+September 8 device-counted projection implementation now passes the complete
+affected gate: **638 Unit, 115 preflight integrations, twelve Qwen3.8 CUDA/ROCm
+cells, and 106 validated CSV artifacts** in 596.888 seconds. Clean Release
+fixed-2/dynamic-15 is **69.842/56.839 CUDA** and **45.319/34.135 ROCm tok/s**.
+This is a 2.337x/2.691x dynamic improvement over the immediate baseline, with
+identical output IDs across all five repeats. It is still only 81.38%/75.32% of
+fixed 2; the >=90% goal and complete fixed-depth search are not certified.
+
+Controlled same-decision capacity pairs retain an execution-width cost. The
+CUDA FFN probe identifies a concrete component: capacity-selected row reuse 16
+has 80 registers and about 41% achieved occupancy; reuse 8 has 40 registers and
+about 82%, with zero measured spills in both. Release timing wins at both
+three and sixteen live rows. The shared exact refresh now includes 1,050
+byte-checked observations across every format and five live occupancies;
+offline occupancy participates in worst-surface selection, not runtime host
+dispatch. The installed 32-key delta retains the entire M1/Auto programs and
+44,000 other exact keys. Clean CUDA fixed-2/dynamic-15 is now
+**69.991/68.166 tok/s**, or **97.39%** of fixed 2, with unchanged tokens and
+controller counters. The rebuilt affected gate passes **638 Unit + 115
+preflight + twelve cells + 106 validated CSV artifacts** in 594.741 seconds:
+`/tmp/qwen38-counted-policy-proof.{json,log}`. No controller threshold
+change is installed. CUDA's complete fixed-depth 1–15 sweep now passes, with
+depth 2 fastest, so its dynamic result meets the target against the **best**
+fixed depth. ROCm tuning and its fixed-depth inventory remain open. Isolated
+ROCm probes rule out GDN recurrence as the dominant capacity penalty and expose
+excess inactive fused-projection workgroups. The bounded fused-row candidate
+now has zero spills across all 72 specializations and passes 128 focused
+captured-format checks. Clean default-policy ROCm dynamic improves to 36.073
+tok/s, but fixed-2 drops to 44.277 and the performance target remains open.
+Controller-threshold screening identifies early zero-accept demotion as a
+separate cost; screening results are not accepted defaults or clean final
+measurements. The rebuilt aggregate gate passes **638 Unit + 115 preflight +
+twelve Qwen3.8 cells + 106 validated CSV artifacts** in **613.462 seconds**
+(`/tmp/qwen38-rocm-grid-v21-proof.{json,log}`). The quiet controller confirmation
+subsequently passed; the accepted handoff above records the final measurements
+and the user-directed ROCm inventory limit. See the
+[bounded implementation/evidence record](../2026-09/2026-09-08-dynamic-mtp-device-row-range.md).
 
 The original MTP-off external-baseline goal remains open. Prefill sweeps and
 generic fitting stay stopped; retained exact overlays and installed Auto for

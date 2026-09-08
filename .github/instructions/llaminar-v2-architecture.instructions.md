@@ -93,6 +93,16 @@ configuration, MTP configuration, and routed-MoE policy. It is copied into the
 rank plan and then into `InferenceRunnerConfig`; downstream execution should
 not reparse user strings.
 
+MTP automatic thresholds retain explicit/automatic intent until admission.
+`ExecutionPlanBuilder` selects an immutable `MTPDepthDefaultsProfile` from all
+participants of the continuation domain, using the gathered card inventory and
+exact rank ownership. A heterogeneous expert tier does not change that domain's
+profile; a mixed or uncharacterized continuation uses the portable defaults.
+The retained runtime owns the hardware profile, while `MTPRequestPolicy` owns
+only request intent. `MTPDeviceGenerationPolicy` seals their effective values
+into the existing integer device ABI; no host-side depth controller or hardware
+query is introduced into GPU inference.
+
 ### 2.3 Topology status
 
 Named domains are the installed interface for cross-rank PP and global or

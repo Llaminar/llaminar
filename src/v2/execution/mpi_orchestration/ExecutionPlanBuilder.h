@@ -138,11 +138,16 @@ namespace llaminar2
             const ClusterInventory &cluster_inventory);
 
         /**
-         * @brief Find which rank owns a device
+         * @brief Find an inventory owner, honoring an explicitly declared rank.
+         * @param device Resolved physical participant address.
+         * @param cluster_inventory Canonical gathered hardware inventory.
+         * @param required_rank Exact declared owner, or -1 for inventory discovery.
+         * @return Matching rank or -1 when the required physical participant is absent.
          */
         int findRankForDevice(
             const GlobalDeviceAddress &device,
-            const ClusterInventory &cluster_inventory);
+            const ClusterInventory &cluster_inventory,
+            int required_rank = -1);
 
         // =====================================================================
         // PP Stage Resolution

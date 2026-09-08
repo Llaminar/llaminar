@@ -17,6 +17,7 @@
  */
 
 #include "ROCmFloatingPointGemmKernel.h"
+#include "kernels/common/FloatingPointVerifierLaunch.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "HipBLASGemmKernel.h"
 #include "backends/ComputeBackend.h"   // DeviceManager
@@ -34,16 +35,6 @@
 #include <atomic>
 #include <hip/hip_runtime.h>
 
-extern "C" bool rocmFp32_small_n_batched_projection(
-    const float *const *d_A_array,
-    const float *const *d_B_array,
-    float *const *d_C_array,
-    int M,
-    int N,
-    int K,
-    int batch_count,
-    int device_id,
-    void *stream);
 
 extern "C" bool rocmFp32_stage_batched_projection_pointers(
     const float **d_A_array,
@@ -56,29 +47,7 @@ extern "C" bool rocmFp32_stage_batched_projection_pointers(
     int device_id,
     void *stream);
 
-extern "C" bool rocmFp32x16_batched_projection(
-    const float *const *d_A_array,
-    const float *const *d_B_array,
-    float *const *d_C_array,
-    int M,
-    int N,
-    int K,
-    int batch_count,
-    int weight_dtype,
-    int device_id,
-    void *stream);
 
-extern "C" bool rocmFloating_swiglu_down_projection(
-    const float *d_gate,
-    const float *d_up,
-    const void *d_weights,
-    float *d_output,
-    int M,
-    int N,
-    int K,
-    int weight_dtype,
-    int device_id,
-    void *stream);
 
 namespace llaminar2
 {
@@ -457,7 +426,8 @@ namespace llaminar2
                     1,
                     weight_dtype,
                     rocm_device_id_,
-                    gpu_stream_);
+                    gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m));
                 if (success && d_mapped_output)
                 {
                     const hipError_t copy_status = hipMemcpyAsync(
@@ -535,7 +505,8 @@ namespace llaminar2
                     k,
                     1,
                     rocm_device_id_,
-                    gpu_stream_);
+                    gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m));
                 if (!success)
                 {
                     LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Small-N FP32 single projection failed"
@@ -866,7 +837,8 @@ namespace llaminar2
                             k,
                             batch_count,
                             rocm_device_id_,
-                            gpu_stream_))
+                            gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m)))
                     {
                         LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Small-N FP32 batched projection failed"
                                   << " group_size=" << batch_count
@@ -1102,7 +1074,8 @@ namespace llaminar2
                             static_cast<int>(group_count),
                             weight_dtype,
                             rocm_device_id_,
-                            gpu_stream_))
+                            gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m)))
                     {
                         LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection kernel failed"
                                   << " dtype=" << dtype_tag
@@ -1311,7 +1284,8 @@ namespace llaminar2
                 k,
                 weight_dtype,
                 rocm_device_id_,
-                gpu_stream_);
+                gpu_stream_,
+                    VerifierKernelModeScope::rowsFor(m));
 
             if (success && d_mapped_output)
             {

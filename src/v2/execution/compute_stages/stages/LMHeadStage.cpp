@@ -1,6 +1,6 @@
-/**
- * @file LMHeadStage.cpp
+/** @file LMHeadStage.cpp
  * @brief Implementation of LMHeadStage
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #include "LMHeadStage.h"
@@ -229,6 +229,7 @@ namespace llaminar2
 
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {lm_gemm, logits, params_.vocab_size, params_.bias_tensor, "lm_head"}};
+        auto verifier_rows = lm_gemm->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
         const bool success = lm_gemm->multiply_fused_verifier_rows_decode_equivalent(
             hidden_states,
             projections,

@@ -28,6 +28,7 @@
  */
 
 #include "CUDAQuantisedGemmKernel.h"
+#include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
 #include "CUDADeviceWorkspace.h"
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/BackendManager.h"
@@ -205,27 +206,6 @@ namespace llaminar2
                 CUDAGemvContext *gemv_ctx,
                 CUDARowMajorWeights **rm_slot);
 
-            /** Execute grouped physical bytes under source arithmetic policy. */
-            bool cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
-                const int8_t *d_A_int8,
-                const uint8_t *d_payload,
-                const uint16_t *d_scales,
-                const uint16_t *d_mins,
-                const uint32_t *d_emins,
-                float *d_C_fp32,
-                const float *d_scales_A_block,
-                int M,
-                int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                uint8_t codebook_id,
-                uint8_t arithmetic_policy_codebook_id,
-                int cuda_device_id,
-                void *stream,
-                CUDAGemvContext *gemv_ctx,
-                CUDARowMajorWeights **rm_slot);
-
             void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled);
             int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
             void cudaNativeVNNIGemvTuned_setSerialPartitionN(int n);
@@ -361,23 +341,29 @@ namespace llaminar2
         /**
          * @brief Mark CUDA NativeVNNI calls as publication-sensitive verifier work.
          *
-         * The important distinction is subtle: this scope is about grouped
-         * runtime-M verifier entry points. Plain serial M=1 decode always uses
-         * the canonical direct GEMV helper, so verifier wrappers use this marker
-         * to force a rowwise outer loop while each row still enters the exact
-         * same M=1 reduction contract as ordinary decode.
+         * One scope binds both the tensor-adapter route and the raw generated
+         * M1 arithmetic selector. A caller may launch a fused bundle or a raw
+         * grouped operation without relying on a second, hidden helper scope.
+         * Nested scopes restore both selectors together. They affect graph
+         * recording only; device replay retains the chosen ordered kernels.
          */
         class ScopedNativeVNNIDecodeEquivalentDispatch final : public ITensorGemm::VerifierKernelModeScope
         {
         public:
-            ScopedNativeVNNIDecodeEquivalentDispatch()
-                : previous_scope_(g_cuda_native_vnni_verifier_scope_active)
+            /** @brief Atomically bind the adapter/raw launch policy for this scope. */
+            explicit ScopedNativeVNNIDecodeEquivalentDispatch(std::optional<DeviceRowRange> rows)
+                : VerifierKernelModeScope(rows),
+                  previous_scope_(g_cuda_native_vnni_verifier_scope_active),
+                  previous_policy_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
             {
                 g_cuda_native_vnni_verifier_scope_active = true;
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
             }
 
+            /** @brief Restore the enclosing capture policy, including raw dispatch. */
             ~ScopedNativeVNNIDecodeEquivalentDispatch()
             {
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_policy_);
                 g_cuda_native_vnni_verifier_scope_active = previous_scope_;
             }
 
@@ -386,6 +372,7 @@ namespace llaminar2
 
         private:
             bool previous_scope_ = false;
+            int previous_policy_ = 0; ///< Enclosing generated-policy selector.
         };
 
         /**
@@ -1576,9 +1563,10 @@ namespace llaminar2
         }
 
         std::unique_ptr<ITensorGemm::VerifierKernelModeScope>
-        CUDAQuantisedGemmKernel::beginVerifierDecodeEquivalentScope()
+        CUDAQuantisedGemmKernel::beginVerifierDecodeEquivalentScope(
+            std::optional<DeviceRowRange> rows)
         {
-            return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>();
+            return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>(rows);
         }
 
         std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
@@ -4015,7 +4003,8 @@ namespace llaminar2
                     cuda_device_id_,
                     stream_handle,
                     impl_->gemv_ctx,
-                    rowmajor_slot);
+                    rowmajor_slot,
+                    VerifierKernelModeScope::rowsFor(m));
             };
 
             /*
@@ -4024,16 +4013,8 @@ namespace llaminar2
              * M=1 decode. The scope changes dispatch identity only; both paths
              * use the same ordered publication implementation.
              */
-            bool ok = false;
-            if (explicitSmallMVerifierScopeActive())
-            {
-                ScopedNativeVNNIGemvDecodeEquivalentM1Config decode_equivalent_m1_scope;
-                ok = launch_small_m();
-            }
-            else
-            {
-                ok = launch_small_m();
-            }
+            // The public verifier scope owns both adapter and raw policy.
+            const bool ok = launch_small_m();
             if (!ok)
             {
                 if (cudaNativeVNNIGemvSweep_isActive())

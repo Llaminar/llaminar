@@ -1,6 +1,10 @@
 /**
  * @file BenchmarkRunner.cpp
  * @brief Implementation of benchmark runner for prefill/decode performance
+ *
+ * Measures warmed production requests and exports tokens, runtime-path evidence,
+ * and the runner-resolved configuration. Profiling remains separate from clean
+ * timing; hardware default selection belongs to execution planning, not here.
  * @author David Sanftenberg
  * @date 2025
  */
@@ -918,6 +922,10 @@ namespace llaminar2
                 {"mtp_max_draft_tokens", config->mtp.depth_policy.max_depth},
                 {"mtp_depth_window", config->mtp.depth_policy.window_size},
                 {"mtp_depth_generated_policy", config->mtp.depth_policy.use_generated_policy},
+                {"mtp_depth_defaults_profile", mtpDepthDefaultsProfileToString(config->mtp.depth_defaults_profile)},
+                {"mtp_depth_demote_zero_accept", resolveMTPZeroAcceptDemotionRate(config->mtp)},
+                {"mtp_depth_demote_zero_accept_source",
+                 config->mtp.depth_policy.demote_zero_accept_rate ? "explicit" : "hardware_default"},
                 {"mtp_depth_promote_windows",
                  config->mtp.depth_policy.promote_consecutive_windows},
                 {"sampling",

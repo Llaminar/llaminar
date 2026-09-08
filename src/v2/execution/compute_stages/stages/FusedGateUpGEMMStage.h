@@ -1,9 +1,11 @@
-/**
- * @file FusedGateUpGEMMStage.h
+/** @file FusedGateUpGEMMStage.h
  * @brief Fused Gate/Up projection stage for FFN
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #pragma once
+
+#include "kernels/common/DeviceRowRange.h"
 
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
@@ -87,6 +89,8 @@ namespace llaminar2
              * replay.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
+            std::optional<DeviceRowRange> verifier_row_range;
         };
 
         explicit FusedGateUpGEMMStage(Params params);

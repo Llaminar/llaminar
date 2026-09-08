@@ -14,6 +14,7 @@
 
 #include "CUDADeviceWorkspace.h"
 #include "CUDACanonicalKpartFold.h"
+#include "kernels/common/DeviceRowRange.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -79,7 +80,7 @@
         const uint16_t *, const uint32_t *, float *, const float *,     \
         int, int, int, float, float, const float *, const float *,      \
         uint8_t, uint8_t, int, void *, CUDAGemvContext *,               \
-        CUDARowMajorWeights **);                                        \
+        CUDARowMajorWeights **, const llaminar2::DeviceRowRange *);    \
     extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
         cudaNativeVNNIInitIQGridTables_tuned, INDEX)();                 \
     extern "C" void LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
