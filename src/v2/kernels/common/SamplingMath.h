@@ -1,6 +1,12 @@
 /**
  * @file SamplingMath.h
- * @brief Shared CPU/CUDA/ROCm stochastic sampling math.
+ * @brief Shared CPU/CUDA/ROCm sampling and device-generation transitions.
+ *
+ * Request admission supplies immutable policy; the resident controller owns
+ * budgets, response publication and completion thereafter. These host/device
+ * helpers give both GPU compilers and device-free state-machine tests the same
+ * arithmetic and lifecycle, without a second host ledger or backend-specific
+ * interpretation of a sampled token.
  */
 #pragma once
 
@@ -477,30 +483,37 @@ namespace llaminar2::sampling_math
     }
 
     /**
-     * @brief Device-side MTP depth policy mode admitted before generation.
+     * @brief Explicit generation algorithm admitted before captured execution.
+     *
+     * Ordinary is a distinct algorithm, not fixed-depth MTP with zero drafts.
+     * Its tag fits the existing controller policy word; no new arena storage
+     * or per-request allocation is required.
      */
-    enum class DeviceGenerationDepthPolicyMode : int
+    enum class DeviceGenerationPolicyMode : int
     {
         Fixed = 0,
         Observe = 1,
         Dynamic = 2,
+        Ordinary = 3,
+        /** Consume exactly one admitted token without invoking a sampler. */
+        ForwardOnly = 4,
     };
 
     /**
-     * @brief Fixed-width request policy consumed by the resident depth controller.
+     * @brief Fixed-width request policy consumed by the resident generation controller.
      *
      * Floating-point policy thresholds are converted to parts-per-million by
      * request admission. Device transitions can consequently compare integer
      * counters with a fixed arithmetic order on CUDA and ROCm, and CPU tests can
      * prove the same decisions without backend-specific floating-point drift.
      */
-    struct DeviceGenerationDepthPolicy
+    struct DeviceGenerationPolicy
     {
         static constexpr int kRateScale = 1'000'000;
         static constexpr int kMaximumSupportedDraftDepth = 15;
 
-        DeviceGenerationDepthPolicyMode mode =
-            DeviceGenerationDepthPolicyMode::Fixed;
+        DeviceGenerationPolicyMode mode =
+            DeviceGenerationPolicyMode::Fixed;
         int initial_depth = 1;
         int minimum_depth = 1;
         int maximum_depth = 1;
@@ -515,11 +528,11 @@ namespace llaminar2::sampling_math
         /**
          * @brief Construct a hard-pinned policy for tests and fixed-depth lanes.
          */
-        LLAMINAR_SAMPLING_HD static DeviceGenerationDepthPolicy fixed(
+        LLAMINAR_SAMPLING_HD static DeviceGenerationPolicy fixed(
             int depth)
         {
-            DeviceGenerationDepthPolicy policy;
-            policy.mode = DeviceGenerationDepthPolicyMode::Fixed;
+            DeviceGenerationPolicy policy;
+            policy.mode = DeviceGenerationPolicyMode::Fixed;
             policy.initial_depth = depth;
             policy.minimum_depth = depth;
             policy.maximum_depth = depth;
@@ -527,14 +540,76 @@ namespace llaminar2::sampling_math
         }
 
         /**
+         * @brief Admit ordinary sampling without any draft or verifier capacity.
+         * @return Canonical ordinary policy; fixed(0) remains invalid.
+         *
+         * All speculative-only fields are zero so cache identity cannot vary
+         * with irrelevant MTP defaults. The distinct mode is what permits this
+         * policy, never the mere presence of a zero draft count.
+         */
+        LLAMINAR_SAMPLING_HD static DeviceGenerationPolicy ordinary()
+        {
+            DeviceGenerationPolicy policy;
+            policy.mode = DeviceGenerationPolicyMode::Ordinary;
+            policy.initial_depth = 0;
+            policy.minimum_depth = 0;
+            policy.maximum_depth = 0;
+            policy.window_size = 0;
+            policy.minimum_samples = 0;
+            policy.cooldown_steps = 0;
+            policy.promote_consecutive_windows = 0;
+            policy.promote_full_accept_rate_ppm = 0;
+            policy.demote_zero_accept_rate_ppm = 0;
+            policy.demote_acceptance_rate_ppm = 0;
+            return policy;
+        }
+
+        /** @return Whether this policy selects the non-speculative algorithm. */
+        LLAMINAR_SAMPLING_HD bool isOrdinary() const
+        {
+            return mode == DeviceGenerationPolicyMode::Ordinary;
+        }
+
+        /**
+         * @brief Reuse the ordinary model program for a forward-only call.
+         * @return Explicit no-response operation, not zero-budget generation.
+         *
+         * Prefix restore and forced-token admission need the same model body
+         * without advancing the sampler. The operation occupies the existing
+         * policy word and requires no parallel controller or extra executable.
+         */
+        LLAMINAR_SAMPLING_HD static DeviceGenerationPolicy forwardOnly()
+        {
+            auto policy = ordinary();
+            policy.mode = DeviceGenerationPolicyMode::ForwardOnly;
+            return policy;
+        }
+
+        /** @return Whether the admitted operation has no sampling/response work. */
+        LLAMINAR_SAMPLING_HD bool isForwardOnly() const
+        {
+            return mode == DeviceGenerationPolicyMode::ForwardOnly;
+        }
+
+        /**
          * @brief Validate all fields without consulting host configuration.
          */
         LLAMINAR_SAMPLING_HD bool valid() const
         {
+            if (isOrdinary() || isForwardOnly())
+            {
+                return initial_depth == 0 && minimum_depth == 0 &&
+                       maximum_depth == 0 && window_size == 0 &&
+                       minimum_samples == 0 && cooldown_steps == 0 &&
+                       promote_consecutive_windows == 0 &&
+                       promote_full_accept_rate_ppm == 0 &&
+                       demote_zero_accept_rate_ppm == 0 &&
+                       demote_acceptance_rate_ppm == 0;
+            }
             const bool mode_valid =
-                mode == DeviceGenerationDepthPolicyMode::Fixed ||
-                mode == DeviceGenerationDepthPolicyMode::Observe ||
-                mode == DeviceGenerationDepthPolicyMode::Dynamic;
+                mode == DeviceGenerationPolicyMode::Fixed ||
+                mode == DeviceGenerationPolicyMode::Observe ||
+                mode == DeviceGenerationPolicyMode::Dynamic;
             const bool rates_valid =
                 promote_full_accept_rate_ppm >= 0 &&
                 promote_full_accept_rate_ppm <= kRateScale &&
@@ -549,7 +624,7 @@ namespace llaminar2::sampling_math
                    initial_depth <= maximum_depth && window_size > 0 &&
                    minimum_samples > 0 && cooldown_steps >= 0 &&
                    promote_consecutive_windows > 0 && rates_valid &&
-                   (mode != DeviceGenerationDepthPolicyMode::Fixed ||
+                   (mode != DeviceGenerationPolicyMode::Fixed ||
                     (minimum_depth == maximum_depth &&
                      initial_depth == minimum_depth));
         }
@@ -674,6 +749,23 @@ namespace llaminar2::sampling_math
     }
 
     /**
+     * @brief Validate operation, response budget and initial frontier together.
+     * @param policy Explicit model-forward or generation operation.
+     * @param max_new_tokens Response budget; zero only for ForwardOnly.
+     * @param disposition Ownership of the initial condition token.
+     * @return Whether admission has an unambiguous device-side lifecycle.
+     */
+    LLAMINAR_SAMPLING_HD bool valid_device_generation_admission(
+        const DeviceGenerationPolicy &policy, int max_new_tokens,
+        DeviceGenerationLeadingRowDisposition disposition)
+    {
+        return policy.valid() && valid_device_generation_leading_row_disposition(disposition) &&
+            (policy.isForwardOnly()
+                ? max_new_tokens == 0 && disposition == DeviceGenerationLeadingRowDisposition::AlreadyEmitted
+                : max_new_tokens > 0);
+    }
+
+    /**
      * @brief Fatal validation failures reported by the generation controller.
      *
      * The controller never repairs or truncates malformed production output.
@@ -697,6 +789,8 @@ namespace llaminar2::sampling_math
         InvalidDepthSelector = 11,
         InvalidMaintenanceState = 12,
         InvalidVerifierTransactionIdentity = 13,
+        InvalidOrdinarySample = 14,
+        InvalidOrdinaryTransition = 15,
     };
 
     /**
@@ -1002,7 +1096,7 @@ namespace llaminar2::sampling_math
      * @param max_new_tokens Number of response tokens requested by the caller.
      * @param response_capacity Number of token slots in the persistent response
      *        row.  It must cover the complete request budget.
-     * @param depth_policy Immutable fixed/dynamic policy admitted for this request.
+     * @param depth_policy Immutable ordinary or speculative request policy.
      * @param control Writable row with @ref kDeviceGenerationControlCount words.
      * @param initial_leading_row_disposition Whether verifier row zero is a new
      *        response token or an already-emitted correction carried from the
@@ -1012,7 +1106,7 @@ namespace llaminar2::sampling_math
     LLAMINAR_SAMPLING_HD bool initialize_device_generation_control(
         int max_new_tokens,
         int response_capacity,
-        const DeviceGenerationDepthPolicy &depth_policy,
+        const DeviceGenerationPolicy &depth_policy,
         int *control,
         DeviceGenerationLeadingRowDisposition
             initial_leading_row_disposition =
@@ -1024,7 +1118,7 @@ namespace llaminar2::sampling_math
         for (int i = 0; i < kDeviceGenerationControlCount; ++i)
             control[i] = 0;
 
-        if (max_new_tokens <= 0 ||
+        if (max_new_tokens < 0 ||
             response_capacity <= 0 ||
             max_new_tokens > response_capacity)
         {
@@ -1041,7 +1135,8 @@ namespace llaminar2::sampling_math
         const int initial_leading_committed_output_count =
             device_generation_leading_committed_output_count(
                 initial_leading_row_disposition);
-        if (initial_leading_committed_output_count < 0)
+        if (!valid_device_generation_admission(
+                depth_policy, max_new_tokens, initial_leading_row_disposition))
         {
             control[kDeviceGenerationControlErrorCode] =
                 static_cast<int>(DeviceGenerationError::InvalidInitialization);
@@ -1055,7 +1150,8 @@ namespace llaminar2::sampling_math
         control[kDeviceGenerationControlCurrentDraftDepth] =
             depth_policy.initial_depth;
         control[kDeviceGenerationControlActiveVerifierRowCount] =
-            depth_policy.initial_depth + 1;
+            depth_policy.isOrdinary() || depth_policy.isForwardOnly()
+                ? 0 : depth_policy.initial_depth + 1;
         control[kDeviceGenerationControlMinimumDraftDepth] =
             depth_policy.minimum_depth;
         control[kDeviceGenerationControlMaximumDraftDepth] =
@@ -1080,6 +1176,274 @@ namespace llaminar2::sampling_math
             depth_policy.cooldown_steps;
         control[kDeviceGenerationControlDepthLastRecommendedDepth] =
             depth_policy.initial_depth;
+        return true;
+    }
+
+    /**
+     * @brief Close exactly one forward-only model invocation without sampling.
+     * @param control Canonical resident controller row ordered after model writes.
+     * @return True on first completion or absorbing terminal replay.
+     *
+     * The model owns KV/GDN writes. This small terminal records their one-row
+     * commit and consumes the pending condition. No token or response storage
+     * is accessed, so stale sampler scratch cannot influence prefix restoration.
+     */
+    LLAMINAR_SAMPLING_HD bool complete_device_generation_forward(int *control)
+    {
+        if (!control || control[kDeviceGenerationControlOk] == 0)
+            return false;
+        if (control[kDeviceGenerationControlDepthPolicyMode] !=
+                static_cast<int>(DeviceGenerationPolicyMode::ForwardOnly))
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinaryTransition);
+        if (control[kDeviceGenerationControlRequestComplete] != 0)
+            return true;
+        if (control[kDeviceGenerationControlNextLeadingCommittedOutputCount] != 1 ||
+            control[kDeviceGenerationControlRemainingTokenCount] != 0 ||
+            control[kDeviceGenerationControlResponseTokenCount] != 0 ||
+            control[kDeviceGenerationControlTransactionCount] != 0 ||
+            control[kDeviceGenerationControlPublishedStateCommitCount] != 0 ||
+            control[kDeviceGenerationControlCurrentDraftDepth] != 0 ||
+            control[kDeviceGenerationControlActiveVerifierRowCount] != 0)
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinaryTransition);
+        control[kDeviceGenerationControlPublishedStateCommitCount] = 1;
+        control[kDeviceGenerationControlTransactionCount] = 1;
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount] = 0;
+        control[kDeviceGenerationControlRequestComplete] = 1;
+        return true;
+    }
+
+    /**
+     * @brief Captured producer of an ordinary sample and its state-commit cost.
+     *
+     * PrefillLogits samples the already-computed prompt frontier without
+     * consuming it again. DecodeLogits follows one ordinary forward consuming
+     * the previously emitted condition token. Keeping those edges explicit
+     * prevents a one-token request from advancing KV or a continuation from
+     * emitting the prefill sample twice.
+     */
+    enum class OrdinaryGenerationSampleSource : int
+    {
+        PrefillLogits = 0,
+        DecodeLogits = 1,
+    };
+
+    /**
+     * @brief Borrowed live-sequence rows consumed by an ordinary generation parent.
+     *
+     * Every pointer names an existing arena row with one INT32 per request.
+     * The descriptor owns no memory and carries no host copy of live token
+     * counts or positions. Stream ownership belongs to IBackend's enqueue API,
+     * not to this arithmetic/geometry contract.
+     */
+    struct OrdinaryGenerationFrontier
+    {
+        int32_t *cached_tokens = nullptr; ///< Live model position, not a response-count mirror.
+        int32_t *next_condition_tokens = nullptr; ///< Last emitted condition, or -1 after forward-only consumption.
+        int32_t *stopped_flags = nullptr; ///< Model stop state consumed by subsequent admission.
+        int32_t *publication_ok_flags = nullptr; ///< First-failure validity of this live sequence publication.
+        int request_capacity = 0; ///< Physical entries in each borrowed arena row.
+        int context_capacity = 0; ///< Exact admitted KV/model position capacity.
+
+        /** @return Whether the immutable view covers every admitted request. */
+        LLAMINAR_SAMPLING_HD bool validFor(int requests) const
+        {
+            return requests > 0 && requests <= request_capacity && context_capacity > 0 &&
+                   cached_tokens && next_condition_tokens && stopped_flags && publication_ok_flags;
+        }
+    };
+
+    /**
+     * @brief One complete response-and-sequence publication on its producer stream.
+     *
+     * The frontier borrows the existing logical-state allocation. It is not a
+     * second owner or ledger. Its four rows may have a larger physical request
+     * capacity than the active request count; control/response retain independent
+     * strides. A valid publication always binds both response and live state.
+     */
+    struct OrdinaryGenerationPublication
+    {
+        int request_count = 0;
+        const int32_t *sampled_tokens = nullptr;
+        const int32_t *stopped_flags = nullptr;
+        OrdinaryGenerationSampleSource source = OrdinaryGenerationSampleSource::PrefillLogits;
+        int32_t *response_tokens = nullptr;
+        int response_token_stride = 0;
+        int *control = nullptr;
+        int control_stride = 0;
+        OrdinaryGenerationFrontier frontier;
+
+        /** @return Whether all immutable bindings describe a complete publication. */
+        LLAMINAR_SAMPLING_HD bool valid() const
+        {
+            return request_count > 0 && sampled_tokens && stopped_flags &&
+                   response_tokens && response_token_stride > 0 && control &&
+                   control_stride >= kDeviceGenerationControlCount &&
+                   frontier.validFor(request_count) &&
+                   (source == OrdinaryGenerationSampleSource::PrefillLogits ||
+                    source == OrdinaryGenerationSampleSource::DecodeLogits);
+        }
+    };
+
+    /**
+     * @brief Append one ordinary sample to the shared resident response ledger.
+     *
+     * One lane per request invokes this after the sampler and, for DecodeLogits,
+     * its main forward. The same stream/event edge publishes the response and
+     * committed-row count. A terminal request is absorbing: replay cannot append
+     * a duplicate token. This is response publication, not a sampler or a KV
+     * writer; those producers retain their own device-owned storage.
+     *
+     * @param sampled_token Device sampler's output, including an EOS token.
+     * @param model_stopped Result of the admitted stop-token policy.
+     * @param source Exact retained graph producer of this sample.
+     * @param response_tokens Persistent response row owned by this controller.
+     * @param response_capacity Physical number of INT32 slots in that row.
+     * @param control Request-local row of kDeviceGenerationControlCount words.
+     * @return Whether the transition is valid, including a terminal no-op.
+     */
+    LLAMINAR_SAMPLING_HD bool append_ordinary_sample_to_device_generation(
+        int sampled_token,
+        bool model_stopped,
+        OrdinaryGenerationSampleSource source,
+        int32_t *response_tokens,
+        int response_capacity,
+        int *control)
+    {
+        if (!control)
+            return false;
+        if (control[kDeviceGenerationControlOk] == 0)
+            return false; // Preserve the first fatal result on a later replay.
+        if (control[kDeviceGenerationControlDepthPolicyMode] !=
+                static_cast<int>(DeviceGenerationPolicyMode::Ordinary) ||
+            control[kDeviceGenerationControlCurrentDraftDepth] != 0 ||
+            control[kDeviceGenerationControlActiveVerifierRowCount] != 0)
+        {
+            return fail_device_generation_control(
+                control, DeviceGenerationError::InvalidOrdinaryTransition);
+        }
+        if (control[kDeviceGenerationControlRequestComplete] != 0)
+            return true;
+
+        const int count = control[kDeviceGenerationControlResponseTokenCount];
+        const int remaining = control[kDeviceGenerationControlRemainingTokenCount];
+        const int transactions = control[kDeviceGenerationControlTransactionCount];
+        const int published = control[kDeviceGenerationControlPublishedStateCommitCount];
+        const int leading = control[kDeviceGenerationControlNextLeadingCommittedOutputCount];
+        const bool from_prefill = source == OrdinaryGenerationSampleSource::PrefillLogits;
+        const bool from_decode = source == OrdinaryGenerationSampleSource::DecodeLogits;
+        // Only admission with an un-emitted frontier can sample prefill logits.
+        // Every following sample consumes exactly one pending condition row.
+        const bool legal_source = from_prefill
+            ? transactions == 0 && leading == 0
+            : from_decode && leading == 1;
+        if (!legal_source || count < 0 || transactions != count ||
+            published < 0 || published > count || count - published > 1)
+        {
+            return fail_device_generation_control(
+                control, DeviceGenerationError::InvalidOrdinaryTransition);
+        }
+        if (!response_tokens || response_capacity <= 0 || sampled_token < 0)
+        {
+            return fail_device_generation_control(
+                control, DeviceGenerationError::InvalidOrdinarySample);
+        }
+        if (remaining <= 0)
+            return fail_device_generation_control(
+                control, DeviceGenerationError::ResponseBudgetExceeded);
+        // Subtraction avoids overflow for a malformed INT_MAX-sized ledger.
+        if (count >= response_capacity || remaining > response_capacity - count)
+            return fail_device_generation_control(
+                control, DeviceGenerationError::ResponseCapacityExceeded);
+
+        response_tokens[count] = sampled_token;
+        control[kDeviceGenerationControlResponseTokenCount] = count + 1;
+        control[kDeviceGenerationControlRemainingTokenCount] = remaining - 1;
+        control[kDeviceGenerationControlTransactionCount] = transactions + 1;
+        control[kDeviceGenerationControlPublishedStateCommitCount] =
+            published + (from_decode ? 1 : 0);
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount] = 1;
+        control[kDeviceGenerationControlModelStopped] = model_stopped ? 1 : 0;
+        control[kDeviceGenerationControlRequestComplete] =
+            model_stopped || remaining == 1 ? 1 : 0;
+        control[kDeviceGenerationControlLastTransactionEmittedTokenCount] = 1;
+        return true;
+    }
+
+    /**
+     * @brief Commit one ordinary request's response and live continuation together.
+     *
+     * One GPU lane (or one CPU owner) calls this after its forward and sampler.
+     * Every fallible check precedes the response append and frontier mutation.
+     * On failure the controller preserves its first diagnostic and invalidates
+     * the frontier; cached position and next-token bytes are not partially
+     * advanced. Terminal replay is absorbing, including poisoned sampler bytes.
+     *
+     * ForwardOnly consumes a previously emitted condition without reading any
+     * sampler output. It clears that condition, leaving the newly computed
+     * logits as the next legal sampling frontier. PrefillLogits consumes no KV
+     * row; DecodeLogits consumes exactly one. No host state reconstructs either
+     * transition, and no speculative acceptance fields represent ordinary work.
+     *
+     * @param publication Immutable, complete persistent buffer view.
+     * @param request Independent row owned exclusively by this caller.
+     * @return True for a committed or absorbing terminal transition.
+     */
+    LLAMINAR_SAMPLING_HD bool publish_ordinary_generation_request(
+        const OrdinaryGenerationPublication &publication, size_t request)
+    {
+        if (!publication.valid() || request >= static_cast<size_t>(publication.request_count))
+            return false;
+        int *const control = publication.control + request * publication.control_stride;
+        const auto &frontier = publication.frontier;
+        if (control[kDeviceGenerationControlOk] == 0)
+            return false;
+        if (control[kDeviceGenerationControlRequestComplete] != 0)
+            return true;
+
+        const int position = frontier.cached_tokens[request];
+        const bool decode = publication.source == OrdinaryGenerationSampleSource::DecodeLogits;
+        // Subtract before incrementing: malformed INT_MAX positions cannot wrap.
+        // The sampler may already write directly into the next-token/stop rows.
+        // The control ledger, not their pre-publication contents, owns whether
+        // a condition was consumed. This permits reuse without staging copies.
+        if (frontier.publication_ok_flags[request] != 1 ||
+            position < 0 || position > frontier.context_capacity ||
+            (decode && position == frontier.context_capacity))
+        {
+            frontier.publication_ok_flags[request] = 0;
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinaryTransition);
+        }
+        if (control[kDeviceGenerationControlDepthPolicyMode] ==
+            static_cast<int>(DeviceGenerationPolicyMode::ForwardOnly))
+        {
+            if (!decode || !complete_device_generation_forward(control))
+            {
+                frontier.publication_ok_flags[request] = 0;
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinaryTransition);
+            }
+            frontier.cached_tokens[request] = position + 1;
+            frontier.next_condition_tokens[request] = -1;
+            return true;
+        }
+
+        const int stopped = publication.stopped_flags[request];
+        if (stopped != 0 && stopped != 1)
+        {
+            frontier.publication_ok_flags[request] = 0;
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinarySample);
+        }
+        const int sampled = publication.sampled_tokens[request];
+        if (!append_ordinary_sample_to_device_generation(
+                sampled, stopped != 0, publication.source,
+                publication.response_tokens + request * publication.response_token_stride,
+                publication.response_token_stride, control))
+        {
+            frontier.publication_ok_flags[request] = 0;
+            return false;
+        }
+        frontier.cached_tokens[request] = position + (decode ? 1 : 0);
+        frontier.next_condition_tokens[request] = sampled;
+        frontier.stopped_flags[request] = stopped;
         return true;
     }
 
@@ -1164,12 +1528,12 @@ namespace llaminar2::sampling_math
     {
         if (numerator < 0 || denominator <= 0 ||
             threshold_ppm < 0 ||
-            threshold_ppm > DeviceGenerationDepthPolicy::kRateScale)
+            threshold_ppm > DeviceGenerationPolicy::kRateScale)
         {
             return false;
         }
         return static_cast<int64_t>(numerator) *
-                   DeviceGenerationDepthPolicy::kRateScale >=
+                   DeviceGenerationPolicy::kRateScale >=
                static_cast<int64_t>(denominator) * threshold_ppm;
     }
 
@@ -1200,16 +1564,16 @@ namespace llaminar2::sampling_math
         const int maximum =
             control[kDeviceGenerationControlMaximumDraftDepth];
         if (current < minimum || current > maximum || minimum <= 0 ||
-            maximum > DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth ||
-            (mode != static_cast<int>(DeviceGenerationDepthPolicyMode::Fixed) &&
-             mode != static_cast<int>(DeviceGenerationDepthPolicyMode::Observe) &&
-             mode != static_cast<int>(DeviceGenerationDepthPolicyMode::Dynamic)))
+            maximum > DeviceGenerationPolicy::kMaximumSupportedDraftDepth ||
+            (mode != static_cast<int>(DeviceGenerationPolicyMode::Fixed) &&
+             mode != static_cast<int>(DeviceGenerationPolicyMode::Observe) &&
+             mode != static_cast<int>(DeviceGenerationPolicyMode::Dynamic)))
         {
             return fail_device_generation_control(
                 control,
                 DeviceGenerationError::InvalidDepthPolicy);
         }
-        if (mode == static_cast<int>(DeviceGenerationDepthPolicyMode::Fixed) ||
+        if (mode == static_cast<int>(DeviceGenerationPolicyMode::Fixed) ||
             budget_limited)
         {
             return true;
@@ -1311,7 +1675,7 @@ namespace llaminar2::sampling_math
             recommended;
         ++control[kDeviceGenerationControlDepthEvaluatedWindows];
 
-        if (mode == static_cast<int>(DeviceGenerationDepthPolicyMode::Dynamic) &&
+        if (mode == static_cast<int>(DeviceGenerationPolicyMode::Dynamic) &&
             recommended != current)
         {
             control[kDeviceGenerationControlCurrentDraftDepth] = recommended;
@@ -1377,6 +1741,12 @@ namespace llaminar2::sampling_math
             return false;
         if (control[kDeviceGenerationControlRequestComplete] != 0)
             return true;
+        if (control[kDeviceGenerationControlDepthPolicyMode] ==
+            static_cast<int>(DeviceGenerationPolicyMode::Ordinary))
+        {
+            return fail_device_generation_control(
+                control, DeviceGenerationError::InvalidDepthPolicy);
+        }
         if (compact_meta[kSpecBatchMetaOk] == 0)
             return fail_device_generation_control(
                 control,

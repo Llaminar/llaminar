@@ -11,6 +11,7 @@ import shutil
 import statistics
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -26,7 +27,9 @@ from native_vnni_dispatch.dense_production_overlay import (  # noqa: E402
     DenseOverlayKey,
     collect_dense_overlay_entries,
     render_dense_overlay,
+    retain_dense_overlay_base,
     validate_dense_overlay_totality,
+    write_dense_overlay,
 )
 from native_vnni_dispatch.prefill_matrix import (  # noqa: E402
     GPU_PREFILL_M_BUCKETS,
@@ -45,6 +48,10 @@ from native_vnni_dispatch.production_dense_prefill_sweep import (  # noqa: E402
     ROCM_Q6_FULL_TILE_CANDIDATE_IDS,
     ROCM_Q6_SPILLING_CHECKED_CANDIDATE_IDS,
     ROCM_TIMING_COLUMNS,
+    _cuda_candidate_id,
+    _cuda_candidate_is_spill_free,
+    _read_aggregate_rows,
+    _read_timing_rows,
     _batch_environment,
     _batch_paths,
     _cell_environment,
@@ -83,6 +90,12 @@ def _test_provenance(
 
 
 def _cuda_launch(candidate: str) -> dict[str, object]:
+    """Encode synthetic evidence with the same independent physical axes."""
+    base, separator, stage_text = candidate.partition(":stage")
+    staging = int(stage_text) if separator else 0
+    if staging not in (0, 1, 2, 3):
+        raise ValueError(f"unexpected staging policy {candidate}")
+    candidate = base
     if candidate == "AUTO":
         return {
             "tile": "AUTO",
@@ -92,6 +105,7 @@ def _cuda_launch(candidate: str) -> dict[str, object]:
             "tile_id": -1,
             "strategy": "AUTO",
             "requested_k_partitions": 0,
+            "staging_schedule": staging,
         }
     strategy, remainder = candidate.split(":", maxsplit=1)
     if strategy == "STD":
@@ -104,6 +118,7 @@ def _cuda_launch(candidate: str) -> dict[str, object]:
             "tile_id": tile_id,
             "strategy": strategy,
             "requested_k_partitions": 1,
+            "staging_schedule": staging,
         }
     if strategy == "KPART":
         tile_id = int(remainder.removeprefix("t"))
@@ -112,12 +127,14 @@ def _cuda_launch(candidate: str) -> dict[str, object]:
             "tile_id": tile_id,
             "strategy": strategy,
             "requested_k_partitions": 0,
+            "staging_schedule": staging,
         }
     return {
         "tile": "BK256_128x128",
         "tile_id": -2,
         "strategy": strategy,
         "requested_k_partitions": 1,
+        "staging_schedule": staging,
     }
 
 
@@ -168,6 +185,7 @@ def _write_cell(
                     "n": cell.shape.n,
                     "k": cell.shape.k,
                     **launch,
+                    "observed_staging_schedule": launch["staging_schedule"],
                     "tiles": 1,
                     "min_us": f"{min(samples):.3f}",
                     "mean_us": f"{mean:.3f}",
@@ -375,13 +393,13 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
 
     def test_candidate_inventories_keep_only_byte_eligible_cuda_routes(self) -> None:
         self.assertEqual(dense_prefill_candidate_ids("cuda"), CUDA_CANDIDATE_IDS)
-        self.assertEqual(len(CUDA_CANDIDATE_IDS), 14)
-        self.assertEqual(len(CUDA_GENERIC_CANDIDATE_IDS), 13)
+        self.assertEqual(len(CUDA_CANDIDATE_IDS), 44)
+        self.assertEqual(len(CUDA_GENERIC_CANDIDATE_IDS), 43)
         self.assertFalse(any(candidate.startswith("SK1") for candidate in CUDA_CANDIDATE_IDS))
         self.assertFalse(any(candidate.startswith("SK2") for candidate in CUDA_CANDIDATE_IDS))
         self.assertEqual(
             sum(candidate.startswith("KPART:") for candidate in CUDA_CANDIDATE_IDS),
-            len(CUDA_TILE_NAMES),
+            len(CUDA_TILE_NAMES) + 3 * 5,
         )
         q6_cuda = next(spec for spec in FORMAT_SPECS if spec.label == "Q6_K")
         self.assertEqual(
@@ -454,6 +472,92 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
                 )
                 self.assertEqual(result.sample_count, result.candidate_count * 3)
                 self.assertEqual(result.winner_min_us, 10.0)
+
+    def test_cuda_staging_is_distinct_in_aggregate_and_every_timing_sample(self) -> None:
+        """A faster copy schedule cannot inherit the register schedule's receipt."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cell, paths = _write_cell(Path(tmp), "cuda")
+            aggregate = _read_aggregate_rows(paths.aggregate, cell)
+            samples = _read_timing_rows(paths.timing, cell, 3)
+            candidates = ("STD:t0:full", *(f"STD:t0:full:stage{s}" for s in (1, 2, 3)))
+            self.assertEqual(len({samples[c] for c in candidates}), 4)
+            for staging, candidate in enumerate(candidates):
+                self.assertEqual(int(aggregate[candidate]["observed_staging_schedule"]), staging)
+                self.assertEqual(_cuda_candidate_id(aggregate[candidate], "test"), candidate)
+
+    def test_cuda_staging_parser_rejects_unknown_and_non_bk64_schedules(self) -> None:
+        for strategy, invalid, message in (
+            ("STD:t0:full", -1, "invalid CUDA staging"),
+            ("STD:t0:full", 4, "invalid CUDA staging"),
+            ("KPART:t0", 255, "invalid CUDA staging"),
+            ("AUTO", 1, "malformed AUTO"),
+            ("BK256:full", 3, "malformed BK256"),
+        ):
+            with self.subTest(strategy=strategy, staging=invalid):
+                row = {key: str(value) for key, value in _cuda_launch(strategy).items()}
+                row["staging_schedule"] = str(invalid)
+                with self.assertRaisesRegex(ValueError, message):
+                    _cuda_candidate_id(row, "test")
+
+    def test_cuda_staging_inventory_rejects_unsupported_and_spilling_symbols(self) -> None:
+        """All formats get their physical copy-width and exact-resource gate."""
+        from native_vnni_dispatch.format_registry import CODEBOOK_PAYLOAD_BYTES
+
+        for codebook, payload_bytes in CODEBOOK_PAYLOAD_BYTES.items():
+            for tile in range(6):
+                for staging in (1, 2, 3):
+                    for canonical in (False, True):
+                        candidate = f"KPART:t{tile}" if canonical else f"STD:t{tile}:full"
+                        candidate += f":stage{staging}"
+                        expected = payload_bytes in (16, 20) and tile != 1
+                        if codebook in (5, 7) and tile == 2 and staging in (2, 3) and not canonical:
+                            expected = False
+                        with self.subTest(codebook=codebook, candidate=candidate):
+                            self.assertEqual(_cuda_candidate_is_spill_free(codebook, candidate), expected)
+
+    def test_cuda_observed_staging_must_equal_the_forced_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cell, paths = _write_cell(Path(tmp), "cuda")
+            with paths.aggregate.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            target = next(row for row in rows if row["staging_schedule"] == "2")
+            target["observed_staging_schedule"] = "1"
+            with paths.aggregate.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CUDA_AGGREGATE_COLUMNS)
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, "forced CUDA staging did not execute"):
+                validate_production_dense_prefill_cell(paths.aggregate, paths.timing, cell, bench_runs=3)
+
+    def test_old_cuda_csv_without_staging_identity_is_not_resumable(self) -> None:
+        for kind in ("aggregate", "timing"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                cell, paths = _write_cell(Path(tmp), "cuda")
+                path = getattr(paths, kind)
+                with path.open(newline="", encoding="utf-8") as handle:
+                    reader = csv.DictReader(handle)
+                    columns = tuple(name for name in reader.fieldnames if "staging" not in name)
+                    rows = list(reader)
+                with path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(rows)
+                with self.assertRaisesRegex(ValueError, "CSV header mismatch"):
+                    validate_production_dense_prefill_cell(paths.aggregate, paths.timing, cell, bench_runs=3)
+
+    def test_cuda_overlay_emits_typed_staging_without_changing_other_axes(self) -> None:
+        for staging, name in enumerate(("RegisterDecode", "AsyncPayload", "AsyncWeightOperands", "AsyncAllOperands")):
+            entry = DenseOverlayEntry(
+                backend="cuda", key=DenseOverlayKey(execution_codebook=4, m=512, n=512, k=2048),
+                source_formats=("IQ4_NL", "IQ4_XS"), shape_names=("35BMoE_Expert_GateUp",),
+                candidate_id="KPART:t2" + (f":stage{staging}" if staging else ""),
+                launch=(2, 4, 0, 1, staging), geometric_mean_regret=0.0,
+                maximum_alias_regret=0.0, geometric_mean_speedup_vs_auto=1.1,
+            )
+            with self.subTest(staging=staging):
+                rendered = render_dense_overlay((entry,))
+                self.assertIn(f"{{2, false, true, prefill::PrefillStagingSchedule::{name}}}", rendered)
+                self.assertIn('#include "CUDANativeVNNIPrefillSchedule.h"', rendered)
 
     def test_one_non_winning_byte_mismatch_invalidates_the_entire_cell(self) -> None:
         """Every timed regime must be decode-equivalent, not only the winner."""
@@ -889,6 +993,98 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             )
             self.assertTrue(entries)
 
+    def test_additive_overlay_preserves_unmeasured_rows_and_selector_on_both_backends(self) -> None:
+        """A focused refresh must neither erase old coverage nor rewrite its ABI."""
+
+        for backend in ("cuda", "rocm"):
+            with self.subTest(backend=backend):
+                first = DenseOverlayEntry(
+                    backend, DenseOverlayKey(4, 512, 5120, 17408),
+                    ("IQ4_NL", "IQ4_XS"), ("Qwen36_FFN_DownProjection",),
+                    "STD:t5:full" if backend == "cuda" else "N64/MT16/MB1",
+                    (5, 1, 0, 0, 0) if backend == "cuda" else (64, 16, 1, 0, 0),
+                    0.0, 0.0, 1.0,
+                )
+                last = replace(first, key=replace(first.key, m=1024))
+                base = render_dense_overlay((first, last))
+                if backend == "cuda":
+                    # Preserve the installed representation with an omitted,
+                    # explicitly defaulted staging field; do not normalize it.
+                    base = base.replace(", prefill::PrefillStagingSchedule::RegisterDecode", "")
+                updated = replace(first, launch=(4, 1, 0, 0, 3) if backend == "cuda"
+                                  else (128, 32, 1, 2, 1))
+                added = replace(updated, key=replace(first.key, m=4096))
+                output, receipt = retain_dense_overlay_base(base, (updated, added))
+                base_rows = [row for row in base.splitlines() if row.startswith("        {4,")]
+                new_rows = [row for row in output.splitlines() if row.startswith("        {4,")]
+                self.assertEqual(len(new_rows), 3)
+                self.assertEqual(new_rows[1], base_rows[1])
+                self.assertNotEqual(new_rows[0], base_rows[0])
+                self.assertEqual(receipt["replaced_keys"], 1)
+                self.assertEqual(receipt["retained_keys"], 1)
+                self.assertEqual(receipt["refreshed_keys"], 2)
+                self.assertEqual(receipt["output_keys"], 3)
+                self.assertEqual(output.split("    inline int compare", 1)[1],
+                                 base.split("    inline int compare", 1)[1])
+                self.assertIn("not remeasured", receipt["base_evidence"])
+                self.assertEqual(retain_dense_overlay_base(base, (updated, added)),
+                                 (output, receipt))
+
+    def test_additive_overlay_rejects_changed_abi_and_malformed_base(self) -> None:
+        """Retention accepts exact generated syntax, never arbitrary C++ text."""
+
+        first = DenseOverlayEntry(
+            "cuda", DenseOverlayKey(4, 512, 5120, 17408), (), (),
+            "STD:t5:full", (5, 1, 0, 0, 0), 0.0, 0.0, 1.0,
+        )
+        second = replace(first, key=replace(first.key, m=1024))
+        base = render_dense_overlay((first, second))
+        rows = [row for row in base.splitlines(keepends=True) if row.startswith("        {4,")]
+        malformed = (
+            base.replace("return true;", "return false;"),
+            base.replace(rows[0], rows[0] + rows[0]),
+            base.replace("".join(rows), "".join(reversed(rows))),
+            base.replace("{4, 512,", "{4, 0,"),
+            base.replace("{4, 512,", "{256, 512,"),
+            base.replace("{4, 512,", "{4, 2147483648,"),
+            base.replace("PrefillStagingSchedule::RegisterDecode}", "PrefillStagingSchedule::Unknown}"),
+            base.replace(rows[0], "        /* extra executable text */\n" + rows[0]),
+            base.replace("".join(rows), ""),
+        )
+        for candidate in malformed:
+            with self.subTest(candidate=candidate[:80]), self.assertRaises(ValueError):
+                retain_dense_overlay_base(candidate, (first,))
+        with self.assertRaises(ValueError):
+            retain_dense_overlay_base(base, (first, first))
+        rocm = replace(first, backend="rocm", launch=(64, 16, 1, 0, 0))
+        with self.assertRaises(ValueError):
+            retain_dense_overlay_base(base, (rocm,))
+
+    def test_additive_overlay_publication_requires_a_distinct_receipt(self) -> None:
+        """A failed retention request cannot overwrite the installed include."""
+
+        entry = DenseOverlayEntry(
+            "cuda", DenseOverlayKey(4, 512, 5120, 17408), (), (),
+            "STD:t5:full", (5, 1, 0, 0, 0), 0.0, 0.0, 1.0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "base.inc"
+            base.write_text(render_dense_overlay((entry,)))
+            before = base.read_bytes()
+            receipt = root / "retention.json"
+            for args in ({"base_include": base}, {"retention_receipt": receipt},
+                         {"base_include": base, "retention_receipt": base}):
+                with self.assertRaises(ValueError):
+                    write_dense_overlay(base, (entry,), **args)
+                self.assertEqual(base.read_bytes(), before)
+            output = root / "candidate.inc"
+            write_dense_overlay(output, (entry,), base_include=base,
+                                retention_receipt=receipt)
+            self.assertEqual(output.read_bytes(), before)
+            self.assertEqual(base.read_bytes(), before)
+            self.assertEqual(json.loads(receipt.read_text())["replaced_keys"], 1)
+
     def test_cuda_overlay_honors_geometry_without_canonical_kpart(self) -> None:
         """One-partition shapes must not invent absent KPART timing rows."""
 
@@ -941,7 +1137,7 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             self.assertEqual(entry.key.execution_codebook, 4)
             self.assertEqual(entry.source_formats, ("IQ4_NL", "IQ4_XS"))
             self.assertEqual(entry.candidate_id, "AUTO")
-            self.assertEqual(entry.launch, (2, 1, 0, 0))
+            self.assertEqual(entry.launch, (2, 1, 0, 0, 0))
             rendered = render_dense_overlay(entries)
             self.assertIn("selectCUDADensePrefillOverlay", rendered)
             self.assertNotIn("AUTO", rendered)
@@ -1032,7 +1228,7 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
                 source_formats=(cell.source_format.label,),
                 shape_names=(cell.shape.name,),
                 candidate_id=f"STD:t{tile_id}:full",
-                launch=(tile_id, 1, 0, 0),
+                launch=(tile_id, 1, 0, 0, 0),
                 geometric_mean_regret=0.0,
                 maximum_alias_regret=0.0,
                 geometric_mean_speedup_vs_auto=1.0,

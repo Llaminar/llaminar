@@ -5,6 +5,9 @@
  * Converts CLI and YAML requests into orchestration configuration. Unsupported
  * model activation modes fail at input admission through the same production
  * policy used by configuration validation and parity-matrix discovery.
+ * CLI environment publications also refresh the canonical startup snapshot:
+ * early logging must not give direct launches different kernel policy from
+ * self-launched MPI children that inherit the same options through environ.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -15,6 +18,7 @@
 #include "ParallelismTreeParser.h"          // For --topology parsing
 #include "execution/config/RuntimeConfig.h" // For parseFusedAttentionBackend
 #include "utils/Logger.h"
+#include "utils/DebugEnv.h"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -1352,7 +1356,16 @@ namespace llaminar2
                 {
                     c.deterministic = true;
                     c.temperature = 0.0f;
-                    setenv("LLAMINAR_DETERMINISTIC", "1", 1);
+                    if (setenv("LLAMINAR_DETERMINISTIC", "1", 1) != 0)
+                        throw std::runtime_error(
+                            "Could not publish --deterministic startup policy");
+                    // Logging and splash output may already have read DebugEnv.
+                    // Publish through its canonical reload before any device or
+                    // model initialization. Updating environ alone only fixes a
+                    // newly exec'd MPI child, leaving direct/profiler execution
+                    // with stale CUDA and ROCm policy. Re-parsing after MPI_Init
+                    // is intentionally idempotent; no inference is active here.
+                    mutableDebugEnv().reload();
                 }),
         });
 

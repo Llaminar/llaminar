@@ -638,6 +638,24 @@ def adapt_cuda_decode_row(
     if _raw_candidate_config(raw) != candidate.config_json:
         raise ValueError("CUDA requested configuration disagrees with registry")
 
+    if candidate.config_json["family"] == "fused_kpar":
+        # These are queried for the exact compiled symbol before capture/timing.
+        # Old evidence has no fused family, so absence is never grandfathered in.
+        columns = int(candidate.config_json["tile_n"])
+        partitions = int(candidate.config_json["exact_kb"])
+        threads = columns * partitions
+        if (
+            partitions > k // 32
+            or int(raw["compiler_local_bytes"]) != 0
+            or int(raw["compiler_registers"]) <= 0
+            or int(raw["compiler_static_shared_bytes"]) < 0
+            or int(raw["launch_dynamic_shared_bytes"]) != threads * 4
+            or int(raw["compiler_max_threads"]) < threads
+            or int(raw["launch_threads"]) != threads
+            or int(raw["launch_active_blocks_per_sm"]) <= 0
+        ):
+            raise ValueError("CUDA fused KPAR compiler/launch resource admission failed")
+
     source_format = raw["source_format"].strip().upper()
     spec = format_spec(source_format)
     if int(raw["source_codebook"]) != spec.source_codebook_id:
@@ -674,7 +692,7 @@ def adapt_cuda_decode_row(
             and observed_tile_n == int(serial_config["tile_n"])
             and observed_cpt == int(serial_config["cpt"])
             and (
-                observed_path != "kpar"
+                observed_path not in {"kpar", "fused_kpar"}
                 or observed_kb == int(serial_config["exact_kb"])
             )
         )
@@ -687,7 +705,7 @@ def adapt_cuda_decode_row(
     )
     requested_kb_ok = (
         contract != SemanticContract.FAST
-        or observed_path != "kpar"
+        or observed_path not in {"kpar", "fused_kpar"}
         or observed_kb == int(requested_config["exact_kb"])
     )
     forced_route_ok = (

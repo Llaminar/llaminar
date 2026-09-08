@@ -57,6 +57,19 @@ heuristic, model-shape override, CSV parser, or installation path.
 
 ## Use The Turnkey Transaction
 
+When the user explicitly requests an **exact-only refresh**, do not run the
+generic fitting transaction below. Retain the installed Auto rules for unseen
+shapes. The CUDA analyzer accepts `--exact-only --require-fast-m1-complete
+--profile production --retain-auto-policy-json <base-policy.json>
+--retain-auto-include <installed.inc>` alongside the normal strong timing and
+measurement-provenance inputs. This authenticates the base, updates only shared
+production-shape M1 exact tables, and preserves the complete Auto/grouped code
+verbatim. It does not create a new generic certificate. Keep the immutable base
+artifacts and validate the refreshed M1 arithmetic with the all-format grouped
+byte gate, affected model parity, isolated resources/profiling, and matched
+Release benchmarks before accepting it. Bare `--exact-only` remains a staging
+artifact with no generic coverage and must not replace production dispatch.
+
 Run one backend end to end:
 
 ```bash
@@ -345,6 +358,19 @@ missing requests from the enlarged sealed/grouped observation surface, profile
 only that delta, and compose atomically. Never re-profile unchanged M=1
 development launches merely because the final corpus has a different filename.
 
+Nsight byte prefixes are decimal: `Kbyte` means 1,000 bytes, not 1,024.
+Collectors export explicit base units; retained scaled CSVs use the same
+canonical parser. For completed older CUDA batch evidence, use
+`native_vnni_dispatch.profiler_reparse --requests <requests.json>
+--source-evidence <evidence.json> --raw-directory <raw-dir>
+--upgrade-in-place`. It authenticates and reparses saved batches without GPU
+work, preserves a versioned original and lineage receipt, and rejects changes
+outside byte-valued metrics. Never edit counter JSON or relaunch timing to fix
+display units. Finish or explicitly recover an old live journal before this
+completed-manifest upgrade; the command will not truncate it. An unavailable
+spill metric is not a zero-spill result: retain separate exact-kernel resource
+and dynamic-spill evidence when the economical collection pass omits it.
+
 CUDA and ROCm collectors amortize profiler injection, device-context creation,
 and fixture preparation across bounded exact-request batches. The collector
 writes an authenticated TSV plan; the trainer claims every row once and opens
@@ -550,6 +576,20 @@ workers even when its in-memory cache starts empty; changing timing labels,
 descriptors, holdouts, or requested points must produce a new immutable surface.
 Publish misses from their owning GPU worker and consume completion order; parent
 serialization or ordered draining can strand accelerators behind one slow fit.
+
+Inventory preparation must preserve the historical point order and framed JSON
+digest when reusing encoded runtime/string fragments or flattened sort keys.
+Prove equality against an independent original encoder, including every runtime
+discriminator and escaped/Unicode strings. Memoized structural lookup hashes
+belong only to their Python process: omit them from pickle and verify dictionary
+reconstruction under another interpreter hash seed. Measure preparation apart
+from GPU fitting; unchanged semantic evidence must remain a cache hit.
+
+CV fitting-label reuse belongs to one scorer lane and one active immutable
+cost/held-geometry/prediction scope. Reuse labels across feature/placement
+alternatives, never their evaluated decisions. Prove exact uncached CV results,
+storage invalidation, mutable-map rejection from retention, and joined lane
+cleanup; see the ownership contract in [pipeline internals](references/pipeline.md#fit-internals).
 
 Large CPU common-observation checkpoints are parsed in deterministic byte-range
 process partitions and reduced in source order. Keep the measured 8-worker
@@ -776,6 +816,23 @@ observed route/counters. Unsupported combinations need explicit typed records,
 not missing rows. Do not serialize a combinatorially projected formula corpus;
 retain measured cells and evaluate formulas during fitting.
 
+CUDA `fused_kpar` is a distinct physical publication family with the same
+exact-KB arithmetic fingerprint as global KPAR. Its CTA width and partition
+count must pass `CUDACanonicalKpartFoldPlan` admission without clamping. The
+trainer authenticates compiler resources before timing, and grouped verifier
+rows inherit the frozen KB through their own economical grouped producer.
+Never interpret the historical `force_two_phase` CSV field as a launch count:
+it authenticates ordered partials; the candidate family owns physical storage
+and dispatch count. Changing the registry requires a new or authenticated
+expanded corpus, not relabeling old measurements.
+
+Literal global and fused KPAR counts are exact-overlay candidates, not total
+generic leaves. Project both families through `cuda_shape_resolved.py`; each
+formula must resolve to a directly measured physical candidate and respect its
+CTA capacity. Emitters must reject literal-count generic leaves, never append
+an admission condition absent from the certified tree. Verify Python/C++
+resolver agreement at small K and physical-capacity boundaries before fitting.
+
 Before timing any CUDA or ROCm candidate, query the exact compiled template
 specialization's static resources through the backend runtime. A non-zero CUDA
 local-memory allocation or ROCm private/scratch allocation disqualifies that
@@ -860,6 +917,16 @@ generic policy and each forced candidate retains its physical identity.
 Production keeps overlay lookup enabled. A corpus row in which `AUTO` resolves
 through an installed exact cell is invalid evidence and must fail
 authentication.
+
+For a focused dense refresh, retain unrelated installed exact rows with the
+generator's paired `--retain-base-include` and `--retention-receipt` options.
+The base must be an immutable copy of the installed include. The generator
+authenticates its selector ABI and sorted literal keys, replaces only the
+newly measured plan's keys, and preserves every other row byte-for-byte. The
+receipt identifies retained policy separately from fresh measurements; the
+summary CSV describes only the latter. This does not recertify old timing or
+change Auto on unseen geometry. See the additive recipe in
+[pipeline internals](references/pipeline.md#additive-dense-gpu-prefill).
 
 For routed production MoE prefill, use the same backend-neutral resumable
 transaction for CUDA and ROCm. One worker owns each physical device; every cell

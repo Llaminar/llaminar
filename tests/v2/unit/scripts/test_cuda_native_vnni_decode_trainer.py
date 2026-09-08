@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -20,6 +22,7 @@ if str(KERNEL_PERF_ROOT) not in sys.path:
     sys.path.insert(0, str(KERNEL_PERF_ROOT))
 
 from native_vnni_dispatch.corpus import GenericDomain  # noqa: E402
+from native_vnni_dispatch.cuda_shape_resolved import resolve_cuda_formula_kb  # noqa: E402
 from native_vnni_dispatch.format_registry import FORMAT_SPECS  # noqa: E402
 from native_vnni_dispatch.measurement_plan import (  # noqa: E402
     load_gpu_measurement_plan,
@@ -86,6 +89,30 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_fused_kpar_registry_and_emission_are_exact(self) -> None:
+        """Only physically legal fused families can enter generated policy."""
+
+        module = self.load_analyzer_module()
+        registry = module.cuda_native_vnni_gemv_registry()
+        for columns in (16, 32):
+            for partitions in range(1, 1024 // columns + 1):
+                candidate_id = (
+                    f"cuda.nvnni.decode.fast_m1.fused_kpar.tn{columns}.cpt1.kb{partitions}"
+                )
+                candidate = registry.resolve(candidate_id)
+                old = registry.resolve(
+                    f"cuda.nvnni.decode.fast_m1.kpar.tn32.cpt1.kb{partitions}"
+                )
+                self.assertEqual(candidate.arithmetic_fingerprint, old.arithmetic_fingerprint)
+                self.assertNotEqual(candidate.schedule_signature, old.schedule_signature)
+                config = module._fast_config(candidate_id)
+                self.assertEqual(module._shape_enum(config["family"]), "NativeGemvShape::FUSED_KPAR")
+                self.assertEqual(module._tuning_literal(config), f"{{{columns}, 1, 0, 0, 0, 1, {partitions}}}")
+            with self.assertRaises(ValueError):
+                registry.resolve(
+                    f"cuda.nvnni.decode.fast_m1.fused_kpar.tn{columns}.cpt1.kb{1024 // columns + 1}"
+                )
+
     def test_freeze_cli_reports_missing_input_without_obsolete_state(self) -> None:
         """The current freeze parser must not inspect retired M1 input flags."""
 
@@ -117,6 +144,140 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
             result.stderr,
         )
         self.assertNotIn("AttributeError", result.stderr)
+
+    def test_fused_kpar_generated_selector_preserves_exact_kb(self) -> None:
+        """Exact KB wins its key; total formulas own all other legal geometry."""
+
+        module = self.load_analyzer_module()
+        domain = GenericDomain(
+            backend=Backend.CUDA, architecture_class="sm86-test",
+            semantic_contract=SemanticContract.FAST,
+            operation_kind="NativeVNNIDecodeProjection", bundle_signature="single",
+            prepared_family_id="NativeVNNI_cuda_CB0", packing_abi="native-vnni-cuda-cb0-v1",
+            runtime_codebook_id=0, execution_mode=ExecutionMode.GRAPH_CAPTURED,
+            m=1, aspect_bucket=AspectBucket.BALANCED,
+        )
+        candidate_id = "cuda.nvnni.decode.fast_m1.fused_kpar.tn16.cpt1.kb6"
+        rule = GenericDispatchRule(
+            domain=domain, predicates=(), candidate_id=candidate_id,
+            arithmetic_fingerprint=module.cuda_native_vnni_gemv_registry().resolve(
+                candidate_id).arithmetic_fingerprint,
+            development_shape_groups=("a", "b"), development_max_regret=0.01,
+            development_p95_regret=0.01, development_mean_regret=0.01,
+        )
+        for physical in ("kpar.tn32", "fused_kpar.tn16"):
+            with self.assertRaisesRegex(ValueError, "literal KPAR counts"):
+                module.generate_include(
+                    [], [dataclasses.replace(
+                        rule, candidate_id=f"cuda.nvnni.decode.fast_m1.{physical}.cpt1.kb6"
+                    )], corpus_digest="sha256:test-corpus",
+                    registry_digest="sha256:test-registry", profile=MeasurementProfile.QUICK,
+                )
+        exact = module.FastEntry(
+            codebook=0, execution_mode=ExecutionMode.GRAPH_CAPTURED,
+            n=1024, k=1024, family="fused_kpar", tile_n=16, cpt=1,
+            target_waves=0, min_kgroups_per_cta=0, max_kb=0,
+            force_two_phase=1, exact_kb=6, candidate_id=candidate_id,
+            shape_name="exact-proof", max_surface_regret=0.0, max_cv=0.0,
+        )
+        formula = module.cuda_native_vnni_gemv_registry().resolve(
+            "cuda.nvnni.decode.fast_m1.fused_kpar_formula.tn16.cpt1.bpp1"
+        )
+        rules = [dataclasses.replace(
+            rule, domain=dataclasses.replace(domain, aspect_bucket=aspect),
+            candidate_id=formula.candidate_id,
+            arithmetic_fingerprint=formula.arithmetic_fingerprint,
+        ) for aspect in AspectBucket]
+        generated = module.generate_include(
+            [exact], rules, corpus_digest="sha256:test-corpus", registry_digest="sha256:test-registry",
+            profile=MeasurementProfile.QUICK,
+        )
+        source = "\n".join((
+            "enum class NativeGemvShape { WIDE, KPAR, DIRECT, ROWPAR, FUSED_KPAR };",
+            generated,
+            "int main() {",
+            "  NativeGemvShape s{}; GeneratedDispatchTuning t{};",
+            "  if (!selectGeneratedDispatch<0>(true, 1, 1024, 1024, s, t)) return 1;",
+            "  if (s != NativeGemvShape::FUSED_KPAR || t.exact_kb != 6 || t.tile_n != 16) return 2;",
+            "  const int ns[] = {1, 15, 16, 31, 32, 127, 128, 1023, 1024, 1048576};",
+            "  const int ks[] = {32, 64, 96, 128, 992, 1024, 1056, 2016, 2048, 2080, 1048576};",
+            "  for (int n : ns) for (int k : ks) {",
+            "    if (!selectGeneratedDispatch<0>(true, 1, n, k, s, t)) return 3;",
+            "    int expected = k / 32 < 64 ? k / 32 : 64;",
+            "    if (n == 1024 && k == 1024) expected = 6;",
+            "    if (s != NativeGemvShape::FUSED_KPAR || t.exact_kb != expected || t.tile_n != 16) return 4;",
+            "  }",
+            "  if (selectGeneratedDispatch<0>(false, 1, 128, 128, s, t)) return 5;",
+            "  return 0;",
+            "}",
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            binary = str(Path(directory) / "fused-selector")
+            compile_result = subprocess.run(
+                ["g++", "-std=c++20", "-x", "c++", "-", "-o", binary], input=source,
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            self.assertEqual(subprocess.run([binary], check=False).returncode, 0)
+
+    def test_every_cuda_formula_emits_the_same_total_cpp_resolver(self) -> None:
+        """All recipes and CTA widths agree across small/prime/capacity K.
+
+        This executes the actual emitted assignments, not a second C++ copy of
+        the formula. Python supplies independently resolved expected counts.
+        Neither implementation may turn an unseen point into a dispatch hole.
+        """
+
+        module = self.load_analyzer_module()
+        formulas = [entry for entry in module.cuda_native_vnni_gemv_registry().entries
+                    if entry.config_json.get("family") in {"kpar_formula", "fused_kpar_formula"}]
+        ns = (1, 15, 16, 31, 32, 193, 1024, 248320, 2147483647)
+        ks = (32, 96, 128, 992, 1024, 1056, 2016, 2048, 2080, 2656, 1048576)
+        source = [
+            "enum class NativeGemvShape { WIDE, KPAR, DIRECT, ROWPAR, FUSED_KPAR };",
+            module.generate_include(
+                [], [], corpus_digest="sha256:test", registry_digest="sha256:test",
+                profile=MeasurementProfile.QUICK,
+            ),
+            "bool resolve(int i, int n, int k, GeneratedDispatchTuning& tuning) {",
+            "switch (i) {",
+        ]
+        for index, formula in enumerate(formulas):
+            source += [f"case {index}: {{", *module._resolved_tuning_lines(formula.config_json),
+                       "return true; }"]
+        source += ["default: return false; } }", "int main() {",
+                   f"const int ns[] = {{{','.join(map(str, ns))}}};",
+                   f"const int ks[] = {{{','.join(map(str, ks))}}};",
+                   "const int expected[] = {" + ",".join(
+                       str(resolve_cuda_formula_kb(formula, n, k))
+                       for formula in formulas for n in ns for k in ks
+                   ) + "};",
+                   "const int columns[] = {" + ",".join(
+                       str(formula.config_json["tile_n"]) for formula in formulas
+                   ) + "};",
+                   "const int cpts[] = {" + ",".join(
+                       str(formula.config_json["cpt"]) for formula in formulas
+                   ) + "};",
+                   "const int limits[] = {" + ",".join(
+                       str(formula.config_json["max_kb"]) for formula in formulas
+                   ) + "};",
+                   "int point = 0;",
+                   f"for (int i=0; i<{len(formulas)}; ++i) for(int n: ns) for(int k: ks) {{",
+                   "GeneratedDispatchTuning tuning{};",
+                   "if (!resolve(i, n, k, tuning)) return 1;",
+                   "if (tuning.exact_kb != expected[point++]) return 2;",
+                   "if (tuning.tile_n != columns[i] || tuning.cpt != cpts[i]) return 3;",
+                   "if (tuning.exact_kb <= 0 || tuning.exact_kb > k/32 ||",
+                   "    tuning.exact_kb > limits[i]) return 4;",
+                   "} return 0; }"]
+        with tempfile.TemporaryDirectory() as directory:
+            binary = str(Path(directory) / "all-fused-formulas")
+            compilation = subprocess.run(
+                ["g++", "-std=c++20", "-x", "c++", "-", "-o", binary],
+                input="\n".join(source), text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(compilation.returncode, 0, compilation.stderr)
+            self.assertEqual(subprocess.run([binary], check=False).returncode, 0)
 
     def test_economical_kblock_geometry_is_cached_by_k(self) -> None:
         """Coverage validation must not recompute one K geometry per row."""
@@ -484,6 +645,107 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("canonical alias/mode coverage is incomplete", result.stderr)
+
+    def test_exact_refresh_preserves_auto_and_grouped_program(self) -> None:
+        """Refresh actual production keys without fitting or changing misses."""
+
+        module = self.load_analyzer_module()
+        manifest = load_shape_manifest()
+        shape = next(shape for shape in manifest.shapes if shape.exact_overlay)
+        old = module.FastEntry(
+            codebook=0, execution_mode=ExecutionMode.GRAPH_CAPTURED,
+            n=shape.n, k=shape.k, family="direct", tile_n=32, cpt=1,
+            target_waves=0, min_kgroups_per_cta=0, max_kb=0,
+            force_two_phase=0, exact_kb=0,
+            candidate_id="cuda.nvnni.decode.fast_m1.direct.tn32.cpt1",
+            shape_name=shape.name, max_surface_regret=0.0, max_cv=0.0,
+        )
+        rule = GenericDispatchRule(
+            domain=GenericDomain(
+                backend=Backend.CUDA, architecture_class="sm_86",
+                semantic_contract=SemanticContract.FAST,
+                operation_kind="NativeVNNIDecodeProjection", bundle_signature="single",
+                prepared_family_id="NativeVNNI_cuda_CB0", packing_abi="native-vnni-cuda-cb0-v1",
+                runtime_codebook_id=0, execution_mode=ExecutionMode.GRAPH_CAPTURED,
+                m=1, aspect_bucket=AspectBucket.BALANCED, all_aspects=True,
+            ), predicates=(), candidate_id=old.candidate_id,
+            arithmetic_fingerprint="sha256:fixture", development_shape_groups=("a",),
+            development_max_regret=0.0, development_p95_regret=0.0,
+            development_mean_regret=0.0,
+        )
+        base = module.generate_include(
+            [old], [dataclasses.replace(
+                rule, domain=dataclasses.replace(rule.domain, aspect_bucket=aspect)
+            ) for aspect in AspectBucket], grouped_entries=[module.GroupedEntry(
+                codebook=0, execution_mode=ExecutionMode.GRAPH_CAPTURED,
+                m=2, n=shape.n, k=shape.k, kernel="dp4a_rows", grouped_rows=2,
+                candidate_id="cuda.nvnni.verifier.dp4a_rows.r2",
+                shape_name=shape.name, max_surface_regret=0.0, max_cv=0.0,
+            )], corpus_digest="sha256:old", registry_digest="sha256:registry",
+            profile=MeasurementProfile.PRODUCTION,
+        )
+        fresh = dataclasses.replace(
+            old, family="wide", tile_n=128,
+            candidate_id="cuda.nvnni.decode.fast_m1.wide.tn128.cpt1",
+            shape_name="synthetic-alias-of-production",
+        )
+        synthetic = dataclasses.replace(fresh, n=123, k=456, shape_name="fit-only")
+        with mock.patch.object(module, "fit_generic_policy", side_effect=AssertionError("unexpected fit")):
+            result = module.refresh_exact_m1_dispatch(
+                base, [fresh, synthetic], corpus_digest="sha256:new",
+                registry_digest="sha256:registry", manifest=manifest,
+            )
+        generic = "\n    const long long work_items ="
+        self.assertEqual(result[result.index(generic):], base[base.index(generic):])
+        self.assertIn(shape.name, result)
+        self.assertNotIn("synthetic-alias-of-production", result)
+        self.assertNotIn("fit-only", result)
+        self.assertIn("Exact refresh corpus digest: sha256:new", result)
+        source = "\n".join((
+            "enum class NativeGemvShape { WIDE, KPAR, DIRECT, ROWPAR, FUSED_KPAR };",
+            result, "int main() { NativeGemvShape s{}; GeneratedDispatchTuning t{};",
+            f"if (!selectGeneratedDispatch<0>(true, 1, {shape.n}, {shape.k}, s, t)) return 1;",
+            "if (s != NativeGemvShape::WIDE || t.tile_n != 128) return 2;",
+            "if (!selectGeneratedDispatch<0>(true, 1, 123, 456, s, t)) return 3;",
+            "if (s != NativeGemvShape::DIRECT || t.tile_n != 32) return 4;",
+            "return 0; }",
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            binary = str(Path(directory) / "refresh")
+            compiled = subprocess.run(
+                ["g++", "-std=c++20", "-x", "c++", "-", "-o", binary],
+                input=source, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            self.assertEqual(subprocess.run([binary], check=False).returncode, 0)
+        for malformed in (
+            base.replace("int cpt = 0;", "int cpt = 1;"),
+            base.replace("#define LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2 1", ""),
+            base.replace(generic, "\n    const long long changed ="),
+        ):
+            with self.assertRaises(ValueError):
+                module.refresh_exact_m1_dispatch(
+                    malformed, [fresh], corpus_digest="sha256:new",
+                    registry_digest="sha256:registry", manifest=manifest,
+                )
+        with self.assertRaisesRegex(ValueError, "unique production keys"):
+            module.refresh_exact_m1_dispatch(
+                base, [fresh, fresh], corpus_digest="sha256:new",
+                registry_digest="sha256:registry", manifest=manifest,
+            )
+
+    def test_exact_auto_refresh_requires_complete_authenticated_inputs(self) -> None:
+        """A missing base, quick profile, or omitted matrix gate fails early."""
+
+        for arguments in (
+            ["--retain-auto-include", "/dev/null"],
+            ["--retain-auto-policy-json", "/dev/null", "--retain-auto-include", "/dev/null"],
+        ):
+            result, _, _ = self.run_analyzer([
+                self.row("cuda.nvnni.decode.fast_m1.kpar.tn256.cpt4.kb32", "eager", 20.0)
+            ], "--exact-only", *arguments)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("retaining Auto requires", result.stderr)
 
     def test_legacy_weak_csv_is_rejected(self) -> None:
         """A missing exact-KB or repeat-stability proof invalidates the corpus."""
@@ -853,7 +1115,8 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
         self.assertNotIn("split.partition(fast)", source)
         self.assertIn("shape.exact_overlay", source)
         self.assertIn("filtering exact overlays changed", source)
-        self.assertIn('conditions.append(f"k / 32 >=', source)
+        # Runtime exact/formula tests above prove small-K coverage. A hidden
+        # literal-KB guard would invalidate the generic partition certificate.
         self.assertIn("resolveGeneratedTargetBlocksKBlocks", source)
         self.assertIn("resolveGeneratedCanonicalTargetBlocksKBlocks", source)
         self.assertIn("resolveGeneratedBlocksPerPartitionKBlocks", source)

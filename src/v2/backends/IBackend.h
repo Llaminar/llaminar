@@ -212,7 +212,8 @@ namespace llaminar2
 
     namespace sampling_math
     {
-        struct DeviceGenerationDepthPolicy;
+        struct DeviceGenerationPolicy;
+        struct OrdinaryGenerationPublication;
         enum class DeviceGenerationLeadingRowDisposition : int32_t;
     }
 
@@ -2898,7 +2899,7 @@ namespace llaminar2
         virtual bool enqueueInitializeDeviceGeneration(
             int request_count,
             int max_new_tokens,
-            const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+            const sampling_math::DeviceGenerationPolicy &depth_policy,
             sampling_math::DeviceGenerationLeadingRowDisposition
                 initial_leading_row_disposition,
             int response_token_stride,
@@ -2916,6 +2917,35 @@ namespace llaminar2
             (void)response_tokens_device;
             (void)control_stride;
             (void)control_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Publish an ordinary response and its live sequence frontier together.
+         * @param publication Persistent sampler, response, controller and logical-state bindings.
+         * @param device_id Backend-local device owning every binding.
+         * @param stream Exact non-null producer stream, ordered after sampling.
+         * @return Whether the allocation-free, capturable operation was enqueued.
+         *
+         * Only one lane owns each request's transition. This operation neither
+         * samples logits nor transfers tokens to the host. Invalid device-side
+         * state poisons the shared controller and invalidates the logical
+         * frontier without partially advancing position or next-token bytes.
+         * Both outputs borrow existing arena storage; no host mirror or extra
+         * ledger is allocated. Prefill sampling advances no model position;
+         * decode publication advances exactly one consumed condition row.
+         * An explicitly admitted ForwardOnly operation completes its one model
+         * commit here without reading sampler scratch or writing the response.
+         * Its captured sampler branch must be skipped by the resident budget;
+         * zero-budget ordinary generation remains invalid.
+         */
+        virtual bool enqueuePublishOrdinaryGenerationSample(
+            const sampling_math::OrdinaryGenerationPublication &publication,
+            int device_id, void *stream)
+        {
+            (void)publication;
             (void)device_id;
             (void)stream;
             return false;

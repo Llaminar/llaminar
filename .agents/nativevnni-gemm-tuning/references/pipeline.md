@@ -113,7 +113,60 @@ certification. The stable fit input names are
 
 ## Backend Artifacts
 
+### Additive dense GPU prefill
+
+After a filtered `production_dense_prefill_sweep` plan has completed and passed
+`combine`, generate its exact delta while retaining the previous include:
+
+```bash
+PYTHONPATH=tests/v2/performance/kernels python3 -m \
+  native_vnni_dispatch.dense_production_overlay \
+  --backend <cuda|rocm> --work-dir <complete-work-dir> \
+  --retain-base-include <immutable-installed-base.inc> \
+  --retention-receipt <result-dir>/retention.json \
+  --output <candidate.inc> --summary-csv <result-dir>/fresh-winners.csv
+```
+
+The runtime selector and unrelated base rows are preserved byte-for-byte;
+changed ABI, duplicate/unsorted keys and noncanonical row syntax fail before
+publication. CUDA rows with the explicit struct-default staging field omitted
+remain unchanged when outside the delta. The receipt binds base, measured delta
+and final include bytes and their key cardinalities. It is published after the
+include and must match its output digest; interruption is not certification.
+Keep the immutable source alongside the new plan and timing evidence. Retained
+rows are not relabeled as fresh measurements, and generic rules never enter this
+operation. Validate installed route selection, all-format byte equivalence,
+isolated resources/spills and matched Release throughput before accepting the
+candidate; a successful source merge alone is not promotion.
+
 ### CUDA decode and grouped verifier
+
+An explicitly requested exact-only refresh is independent of generic training.
+Use the CUDA analyzer's paired `--retain-auto-policy-json` and
+`--retain-auto-include` options with the production exact-only/completeness
+flags. The emitter rejects a changed selector ABI, absent generic/grouped
+sections, duplicate keys, or an unauthenticated base. It scopes old certificate
+provenance to the retained policy and emits new exact-corpus provenance
+separately; it must never relabel the changed full include as the old sealed IR.
+Only shared production geometries receive exact precedence. M1 changes still
+require grouped arithmetic and model-level regression gates; retaining grouped
+launch code does not prove its behavior under a newly inherited partition.
+
+The registry distinguishes global `kpar` from CTA-local `fused_kpar` while
+sharing their exact-KB arithmetic fingerprint. The analyzer emits a distinct
+physical family, and the runtime's canonical-M1 query exports the same ordered
+partition count to grouped DP4A and tensor-core consumers. Fused candidates
+carry compiler/occupancy admission fields in raw aggregate evidence; a missing
+resource proof or spilled specialization is not eligible for timing/install.
+The profiler surrogate derives task grids and partial-storage volume from the
+current runtime geometry, never from a differently shaped profiling anchor.
+
+Both publication families use nominal shape-resolved recipes for generic
+fitting. Literal counts remain physical exact-overlay evidence only. The
+projection preserves the exact timing/output witness and resolves the recipe
+to a legal concrete count before dispatch. A generated leaf may not add a
+hidden K-admission predicate: that would invalidate the common tree's totality
+proof. Profiler requests name the physical witness, never the virtual recipe.
 
 - development M1 aggregate/timing;
 - paired development requests/evidence/certificates;
@@ -161,6 +214,25 @@ execution mode, shape geometry, and M/work bucket. Generic model selection uses
 shape-group CV to prevent rows from one geometry leaking across folds. Exact
 overlays are selected from measured seen-shape winners after generic policy
 certification.
+
+Prediction-cache point inventories retain one canonical order and a length-framed
+JSON digest. Reuse the existing flattened runtime sort key and standard-encoder
+value fragments rather than serializing every runtime field for every candidate.
+An independent historical-encoder regression owns byte compatibility, including
+all runtime discriminators and JSON escaping. Runtime/domain structural hash
+caches accelerate local lookups only; pickle carries value fields without the
+process-salted cache so equal keys remain interchangeable across interpreters.
+
+Compact CV label views belong to the scorer lane, not a process-global cache.
+Keep at most one active source-cost tuple, held-out geometry set and read-only
+prediction surface; retain only demanded profiler-influence variants within
+that scope. Identity includes the prediction inventory and backing array, so
+rebinding a diagnostic surface invalidates retained views. Mutable mappings
+must be materialized afresh; writable production arrays are a hard error.
+Feature policy and boundary placement are label-invariant but still require
+independent tree evaluation. Measured regret fields and final CV results must
+equal the uncached oracle. Join the lane's executor tasks before releasing its
+views and scorer, including partially initialized worker failure paths.
 
 GPU scorers accelerate exact candidate-primary key calculation, complete beam
 search, and grouped held-out evaluation. Each worker owns one vendor runtime,
@@ -214,6 +286,7 @@ CV and sealed evaluation, so they cannot improve either coverage or quota.
 | Shape inventory changed | Select a new digest generation and collect missing required evidence. |
 | Build/route/candidate registry changed | Reject incompatible timing or create an authenticated migration/expansion plan. |
 | Profiler feature experiment changed | Re-export/remine the same profiler evidence from its compact timing witness; recover a missing older witness from the digest-bearing feature table; do not retime kernels. |
+| Nsight SI byte units were decoded as IEC | Use the offline `profiler_reparse` transaction on completed CUDA batch evidence. Authenticate original raw reports and stream membership, change only byte-valued metric interpretation, retain the original manifest and lineage, and never repeat hardware measurements. |
 | Fewer than 99% of domains pass strict p95/UCB | Refit from the same corpus or generate a focused authenticated refinement plan for the typed over-budget domains. |
 | Up to 1% of domains exceed strict p95/UCB | Retain explicit diagnostics and real total generic trees; continue only when every structural gate passes. |
 | New real candidate wins | Keep it, expand generic evidence/model capacity, and recertify. |

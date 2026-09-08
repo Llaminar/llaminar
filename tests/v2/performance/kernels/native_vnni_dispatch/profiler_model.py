@@ -71,7 +71,7 @@ PROFILER_CATALOG_NORMALIZATION_VERSION = (
     "native-vnni-profiler-extra-trees-v18-stratified-static-totality"
 )
 PROFILER_SURROGATE_VERSION = (
-    "native-vnni-profiler-xgboost-cuda-hist-v21-vectorized-targets"
+    "native-vnni-profiler-xgboost-cuda-hist-v22-cuda-partition-ownership"
 )
 PROFILER_XGBOOST_VERSION = "3.1.3"
 PROFILER_GPU_HIST_TARGET_PROJECTIONS = 4
@@ -2168,6 +2168,60 @@ def _cpu_parallelism_width(architecture_class: str) -> int | None:
     return None
 
 
+def _cuda_decode_schedule_features(
+    key: RuntimeKey,
+    candidate_features: Mapping[str, float | str],
+) -> dict[str, float]:
+    """Derive M1 task ownership from launch geometry, never measured timings.
+
+    Global KPAR schedules one CTA per column tile and partition. Fused KPAR
+    puts all partitions of a smaller column tile into one CTA, removing the
+    global partial round trip and separate reducer. Expose that structural
+    distinction at unseen geometry instead of copying an anchor's grid size.
+    """
+
+    family = candidate_features.get("config.family")
+    if key.backend != Backend.CUDA or key.m != 1 or family not in {
+        "wide", "direct", "kpar", "fused_kpar",
+    }:
+        return {}
+    columns = _flattened_positive_integer(candidate_features, "config.tile_n")
+    cpt = _flattened_positive_integer(candidate_features, "config.cpt")
+    if columns is None or cpt is None:
+        raise ValueError("CUDA decode schedule omits its column geometry")
+    ordered = family in {"kpar", "fused_kpar"}
+    partitions = (
+        _flattened_positive_integer(candidate_features, "config.exact_kb")
+        if ordered else 1
+    )
+    if partitions is None or key.k % 32 != 0 or partitions > key.k // 32:
+        raise ValueError("CUDA decode schedule has an invalid exact K partition")
+    fused = family == "fused_kpar"
+    if fused and (columns not in (16, 32) or cpt != 1 or columns * partitions > 1024):
+        raise ValueError("CUDA fused KPAR schedule exceeds compiled geometry")
+    column_tiles = (key.aggregate_n + columns - 1) // columns
+    producer_tasks = column_tiles * (partitions if family == "kpar" else 1)
+    partition_blocks = (key.k // 32 + partitions - 1) // partitions
+    return {
+        "schedule.cuda_decode.producer_tasks": float(producer_tasks),
+        "schedule.cuda_decode.threads_per_cta": float(
+            columns * partitions if fused else columns // cpt
+        ),
+        "schedule.cuda_decode.k_partitions": float(partitions),
+        "schedule.cuda_decode.k_blocks_per_partition": float(partition_blocks),
+        "schedule.cuda_decode.column_utilization": key.aggregate_n / float(column_tiles * columns),
+        "schedule.cuda_decode.partition_utilization": (key.k // 32) / float(partitions * partition_blocks),
+        "schedule.cuda_decode.macs_per_producer": key.aggregate_n * key.k / float(producer_tasks),
+        "schedule.cuda_decode.global_partial_bytes": float(
+            4 * partitions * key.aggregate_n if family == "kpar" else 0
+        ),
+        "schedule.cuda_decode.shared_partial_bytes_per_cta": float(
+            4 * columns * partitions if fused else 0
+        ),
+        "schedule.cuda_decode.separate_reducer": float(family == "kpar"),
+    }
+
+
 def _cpu_decode_schedule_features(
     key: RuntimeKey,
     candidate_features: Mapping[str, float | str],
@@ -2688,6 +2742,7 @@ def _model_record(
     )
     record: dict[str, float | str] = {
         **runtime,
+        **_cuda_decode_schedule_features(key, descriptor.features),
         **_cpu_decode_schedule_features(key, descriptor.features),
         **_cpu_verifier_schedule_features(key, descriptor.features),
         **_cpu_prefill_schedule_features(key, descriptor.features),

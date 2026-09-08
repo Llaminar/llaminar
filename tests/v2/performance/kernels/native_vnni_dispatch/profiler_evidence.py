@@ -86,7 +86,7 @@ PROFILER_TIMING_STRATUM_FRACTION = 0.05
 PROFILER_EVIDENCE_SCHEMA_VERSION = "native-vnni-profiler-evidence-v1"
 PROFILER_METRIC_SET_VERSION = "native-vnni-profiler-metrics-v1"
 PROFILER_COLLECTOR_VERSION = (
-    "native-vnni-isolated-profiler-v7-rocm-exact-process-batches"
+    "native-vnni-isolated-profiler-v8-ncu-si-byte-units"
 )
 SUPPORTED_PROFILER_COLLECTOR_VERSIONS = frozenset({
     "native-vnni-isolated-profiler-v1",
@@ -95,6 +95,7 @@ SUPPORTED_PROFILER_COLLECTOR_VERSIONS = frozenset({
     "native-vnni-isolated-profiler-v4-direct-per-tid-gpu-batched",
     "native-vnni-isolated-profiler-v5-direct-per-tid-gpu-stream-batched",
     "native-vnni-isolated-profiler-v6-rocm-instruction-work",
+    "native-vnni-isolated-profiler-v7-rocm-exact-process-batches",
     PROFILER_COLLECTOR_VERSION,
 })
 PROFILE_PROTOCOL = "isolated-production-candidate-launch-v1"
@@ -928,6 +929,7 @@ def _registry_for_observation(
     registry, candidate = matches[0]
     if candidate.config_json.get("family") in {
         "kpar_formula",
+        "fused_kpar_formula",
         "clamped_kb_formula",
     }:
         raise ValueError(
@@ -1090,7 +1092,9 @@ class ProfilerRequest:
             raise ValueError("prepared_resources must identify registry resources")
         if self.candidate_id.strip().upper() == "AUTO":
             raise ValueError("AUTO is not a physical profiler candidate")
-        if self.config_json.get("family") == "kpar_formula":
+        if self.config_json.get("family") in {
+            "kpar_formula", "fused_kpar_formula", "clamped_kb_formula",
+        }:
             raise ValueError("shape-resolved formulas are not physical profiler requests")
 
     @classmethod

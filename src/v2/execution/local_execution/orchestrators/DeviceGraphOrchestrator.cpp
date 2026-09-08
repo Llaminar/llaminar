@@ -148,7 +148,7 @@ namespace llaminar2
                 resolveMTPDeviceGenerationDepthPolicy(mtp);
             const bool dynamic_depth =
                 depth_policy.mode ==
-                sampling_math::DeviceGenerationDepthPolicyMode::Dynamic;
+                sampling_math::DeviceGenerationPolicyMode::Dynamic;
             const int draft_depth =
                 dynamic_depth ? depth_policy.maximum_depth
                               : depth_policy.initial_depth;
@@ -6442,7 +6442,7 @@ namespace llaminar2
         device_resident_logical_state_access_epoch_.clear();
         device_resident_logical_sequence_state_storage_.clear();
         device_generation_storage_.clear();
-        active_device_generation_depth_policy_.reset();
+        active_device_generation_admission_.reset();
         device_generation_state_ready_ = {};
         last_device_generation_dispatch_ticket_.reset();
         hosted_device_generation_cursor_.reset();
@@ -22642,12 +22642,12 @@ namespace llaminar2
             *control_policy == MTPVerifierPreparationControlPolicy::
                                    DeviceGenerationControlled &&
             request_count == 1 &&
-            active_device_generation_depth_policy_.has_value() &&
-            active_device_generation_depth_policy_->mode ==
-                sampling_math::DeviceGenerationDepthPolicyMode::Dynamic;
+            active_device_generation_admission_.has_value() &&
+            active_device_generation_admission_->depth_policy.mode ==
+                sampling_math::DeviceGenerationPolicyMode::Dynamic;
         if (*control_policy == MTPVerifierPreparationControlPolicy::
                                    DeviceGenerationControlled &&
-            !active_device_generation_depth_policy_)
+            !active_device_generation_admission_)
         {
             if (error)
                 *error =
@@ -23627,7 +23627,7 @@ namespace llaminar2
 
         if (key.control_policy == MTPVerifierPreparationControlPolicy::
                                       DeviceGenerationControlled &&
-            !active_device_generation_depth_policy_)
+            !active_device_generation_admission_)
         {
             return fail(
                 "grouped-verifier pairing has no admitted MTP depth policy");
@@ -23635,8 +23635,8 @@ namespace llaminar2
         const bool dynamic_depth =
             key.control_policy == MTPVerifierPreparationControlPolicy::
                                       DeviceGenerationControlled
-                ? active_device_generation_depth_policy_->mode ==
-                      sampling_math::DeviceGenerationDepthPolicyMode::Dynamic
+                ? active_device_generation_admission_->depth_policy.mode ==
+                      sampling_math::DeviceGenerationPolicyMode::Dynamic
                 : graph_builder_ &&
                       graph_builder_->config().mtp.depth_policy.mode ==
                           MTPDepthPolicyMode::Dynamic;
@@ -23990,15 +23990,15 @@ namespace llaminar2
         }
 
         const uint64_t generation = workspaceGeneration(state_.device_id);
-        if (!active_device_generation_depth_policy_)
+        if (!active_device_generation_admission_)
         {
             return fail(
                 "device-generation parent graph has no admitted MTP depth policy");
         }
-        const DeviceGenerationDepthPolicy depth_policy =
-            *active_device_generation_depth_policy_;
+        const DeviceGenerationPolicy depth_policy =
+            active_device_generation_admission_->depth_policy;
         const bool dynamic_depth =
-            depth_policy.mode == DeviceGenerationDepthPolicyMode::Dynamic;
+            depth_policy.mode == DeviceGenerationPolicyMode::Dynamic;
         const int minimum_draft_depth =
             dynamic_depth ? depth_policy.minimum_depth : draft_depth;
         const int maximum_draft_depth =
@@ -24132,10 +24132,10 @@ namespace llaminar2
         mtp_device_generation_loop_fragment_scratch_.clear();
         mtp_device_generation_loop_hosted_fragment_scratch_.clear();
         std::array<size_t,
-                   DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth + 1>
+                   DeviceGenerationPolicy::kMaximumSupportedDraftDepth + 1>
             branch_offsets{};
         std::array<size_t,
-                   DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth + 1>
+                   DeviceGenerationPolicy::kMaximumSupportedDraftDepth + 1>
             branch_fragment_counts{};
         int assembling_depth = 0;
         const uint32_t *maintenance_due_device = nullptr;
@@ -51929,13 +51929,13 @@ namespace llaminar2
         }
 
         if (device_generation_storage_.active_request_count != 0 ||
-            active_device_generation_depth_policy_)
+            active_device_generation_admission_)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation admission attempted before the prior request crossed reset"
                       << " active_requests="
                       << device_generation_storage_.active_request_count
                       << " active_policy="
-                      << active_device_generation_depth_policy_.has_value());
+                      << active_device_generation_admission_.has_value());
             return false;
         }
         if (mtp_device_generation_loop_graph_.launched)
@@ -51975,7 +51975,7 @@ namespace llaminar2
 
         device_generation_storage_.active_request_count =
             request.request_count;
-        active_device_generation_depth_policy_ = depth_policy;
+        active_device_generation_admission_ = request;
         if (!mtp_committed_verifier_identity_dev_ ||
             !backend->memset(
                 mtp_committed_verifier_identity_dev_,
@@ -52012,7 +52012,7 @@ namespace llaminar2
                 DeviceGenerationStatePublicationKind::Admission))
         {
             device_generation_storage_.active_request_count = 0;
-            active_device_generation_depth_policy_.reset();
+            active_device_generation_admission_.reset();
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize and publish the device-generation controller");
             return false;
         }
@@ -52073,16 +52073,16 @@ namespace llaminar2
             return false;
         }
 
-        if (!active_device_generation_depth_policy_)
+        if (!active_device_generation_admission_)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation materialization has no admitted depth policy");
             return false;
         }
         const auto &configured_depth_policy =
-            *active_device_generation_depth_policy_;
+            active_device_generation_admission_->depth_policy;
         const DeviceGenerationLoopTopology configured_topology =
             configured_depth_policy.mode ==
-                    sampling_math::DeviceGenerationDepthPolicyMode::Dynamic
+                    sampling_math::DeviceGenerationPolicyMode::Dynamic
                 ? DeviceGenerationLoopTopology::DynamicDepth
                 : DeviceGenerationLoopTopology::FixedDepth;
         if (topology != configured_topology)
@@ -52891,6 +52891,8 @@ namespace llaminar2
         const int request_count =
             device_generation_storage_.active_request_count;
         if (!out_result || !state_.device_id.is_gpu() || request_count <= 0 ||
+            !active_device_generation_admission_ ||
+            active_device_generation_admission_->request_count != request_count ||
             !device_generation_storage_.validFor(request_count) ||
             !device_generation_terminal_host_scratch_ ||
             !device_generation_terminal_host_scratch_->canServe(
@@ -53457,81 +53459,22 @@ namespace llaminar2
             const int error_code =
                 control[kDeviceGenerationControlErrorCode];
 
-            const bool recognized_depth_policy =
-                depth_policy_mode ==
-                    static_cast<int>(DeviceGenerationDepthPolicyMode::Fixed) ||
-                depth_policy_mode ==
-                    static_cast<int>(DeviceGenerationDepthPolicyMode::Observe) ||
-                depth_policy_mode ==
-                    static_cast<int>(DeviceGenerationDepthPolicyMode::Dynamic);
-
-            const bool valid_control =
-                control[kDeviceGenerationControlOk] == 1 &&
-                request_complete == 1 &&
-                error_code ==
-                    static_cast<int>(DeviceGenerationError::None) &&
-                response_count >= 0 &&
-                response_count <=
-                    device_generation_storage_.response_token_stride &&
-                remaining_count >= 0 &&
-                (model_stopped == 0 || model_stopped == 1) &&
-                (model_stopped != 0 || remaining_count == 0) &&
-                transaction_count > 0 &&
-                (next_leading_count == 0 || next_leading_count == 1) &&
-                (model_stopped == 0 || next_leading_count == 0) &&
-                transaction_budget == 0 &&
-                accepted_count >= 0 &&
-                rejected_count >= 0 &&
-                rejected_count <= transaction_count &&
-                consumed_rows >= accepted_count &&
-                published_state_commits >= 0 &&
-                published_state_commits <= response_count + 1 &&
-                recognized_depth_policy && minimum_draft_depth > 0 &&
-                maximum_draft_depth >= minimum_draft_depth &&
-                final_draft_depth >= minimum_draft_depth &&
-                final_draft_depth <= maximum_draft_depth &&
-                depth_window_size > 0 && depth_minimum_samples > 0 &&
-                depth_window_verifier_runs >= 0 &&
-                depth_window_verifier_runs <
-                    std::max(depth_window_size, depth_minimum_samples) &&
-                depth_window_attempted_tokens >= 0 &&
-                attempted_draft_tokens >=
-                    transaction_count * minimum_draft_depth &&
-                attempted_draft_tokens <=
-                    transaction_count * maximum_draft_depth &&
-                verifier_tokens ==
-                    attempted_draft_tokens + transaction_count &&
-                last_transaction_draft_depth >= minimum_draft_depth &&
-                last_transaction_draft_depth <= maximum_draft_depth &&
-                last_transaction_emitted_token_count > 0 &&
-                last_transaction_emitted_token_count <= response_count &&
-                current_batch_llep_movement_layers >= 0 &&
-                current_batch_llep_non_owner_assignment_layers >= 0 &&
-                (!llep_evidence_source.valid() ||
-                 (current_batch_llep_movement_layers <=
-                      llep_evidence_source.layer_count &&
-                  current_batch_llep_non_owner_assignment_layers <=
-                      llep_evidence_source.layer_count)) &&
-                (llep_evidence_source.valid() ||
-                 (current_batch_llep_movement_layers == 0 &&
-                  current_batch_llep_non_owner_assignment_layers == 0)) &&
-                (request_index == 0 ||
-                 (current_batch_llep_movement_layers == 0 &&
-                  current_batch_llep_non_owner_assignment_layers == 0)) &&
-                depth_evaluated_windows >= 0 && depth_updates >= 0 &&
-                depth_updates <= depth_evaluated_windows &&
-                depth_promotions >= 0 &&
-                depth_demotions >= 0 &&
-                depth_updates == depth_promotions + depth_demotions &&
-                (depth_policy_mode ==
-                         static_cast<int>(
-                             DeviceGenerationDepthPolicyMode::Dynamic) ||
-                 depth_updates == 0);
-            if (!valid_control)
+            // One shared contract owns both algorithms. Authentication uses
+            // the original admission, not policy bytes copied from this result.
+            const DeviceGenerationTerminalError terminal_error =
+                validateDeviceGenerationTerminal(
+                    std::span<const int, kDeviceGenerationControlCount>(
+                        control, kDeviceGenerationControlCount),
+                    *active_device_generation_admission_,
+                    device_generation_storage_.response_token_stride,
+                    request_index,
+                    llep_evidence_source.valid() ? llep_evidence_source.layer_count : 0);
+            if (terminal_error != DeviceGenerationTerminalError::None)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Terminal device-generation controller is invalid"
                           << " device=" << state_.device_id.toString()
                           << " request=" << request_index
+                          << " terminal_contract_error=" << static_cast<int>(terminal_error)
                           << " ok="
                           << control[kDeviceGenerationControlOk]
                           << " complete=" << request_complete
@@ -53710,7 +53653,7 @@ namespace llaminar2
             return false;
         }
         device_generation_storage_.active_request_count = 0;
-        active_device_generation_depth_policy_.reset();
+        active_device_generation_admission_.reset();
         last_device_generation_dispatch_ticket_.reset();
         *out_result = std::move(parsed);
         PerfStatsCollector::addCounter(
@@ -53978,7 +53921,7 @@ namespace llaminar2
                     consumer_name);
             }
             device_generation_storage_.active_request_count = 0;
-            active_device_generation_depth_policy_.reset();
+            active_device_generation_admission_.reset();
             last_device_generation_dispatch_ticket_.reset();
             hosted_device_generation_cursor_.reset();
             mtp_device_generation_loop_graph_.hosted_advance.reset();

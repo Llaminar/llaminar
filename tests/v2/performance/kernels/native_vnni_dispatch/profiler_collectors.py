@@ -1161,7 +1161,13 @@ NCU_COMPUTE_PIPE_METRIC_IDS = (
 
 
 def _convert_ncu_value(metric_id: str, value: float, unit: str) -> float:
-    """Convert Nsight display units to the canonical metric schema."""
+    """Convert Nsight SI display units without confusing Kbyte with KiB.
+
+    Nsight uses decimal prefixes even for memory resources. Preserve explicit
+    IEC spellings for imported diagnostic CSVs, and strip per-block/per-thread
+    suffixes before interpreting the unit. Missing metrics remain missing; a
+    unit conversion cannot manufacture a zero-spill certificate.
+    """
 
     normalized = unit.strip().lower()
     if metric_id == "gpu.duration_ns":
@@ -1173,10 +1179,16 @@ def _convert_ncu_value(metric_id: str, value: float, unit: str) -> float:
             return value * 1.0e9
         return value
     if metric_id.endswith("_bytes") or "memory_bytes" in metric_id:
-        if "kbyte" in normalized or normalized in {"kb", "kib"}:
-            return value * 1024.0
-        if "mbyte" in normalized or normalized in {"mb", "mib"}:
-            return value * 1024.0 * 1024.0
+        base = normalized.split("/", 1)[0].strip()
+        scales = {
+            "kbyte": 1.0e3, "kbytes": 1.0e3, "kb": 1.0e3,
+            "mbyte": 1.0e6, "mbytes": 1.0e6, "mb": 1.0e6,
+            "gbyte": 1.0e9, "gbytes": 1.0e9, "gb": 1.0e9,
+            "kib": 1024.0, "kibyte": 1024.0, "kibytes": 1024.0,
+            "mib": 1024.0 ** 2, "mibyte": 1024.0 ** 2,
+            "gib": 1024.0 ** 3, "gibyte": 1024.0 ** 3,
+        }
+        return value * scales.get(base, 1.0)
     return value
 
 
@@ -2159,6 +2171,8 @@ def _collect_cuda(
         "--page",
         "raw",
         "--csv",
+        "--print-units",
+        "base",
     )
     exported = _run_command(
         export_command,
@@ -2308,6 +2322,8 @@ def _collect_cuda_batch(
         "--page",
         "raw",
         "--csv",
+        "--print-units",
+        "base",
     )
     exported = _run_command(
         export_command,

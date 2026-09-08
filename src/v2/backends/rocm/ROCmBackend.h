@@ -594,7 +594,7 @@ namespace llaminar2
         bool enqueueInitializeDeviceGeneration(
             int request_count,
             int max_new_tokens,
-            const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+            const sampling_math::DeviceGenerationPolicy &depth_policy,
             sampling_math::DeviceGenerationLeadingRowDisposition
                 initial_leading_row_disposition,
             int response_token_stride,
@@ -603,6 +603,10 @@ namespace llaminar2
             void *control_device,
             int device_id,
             void *stream) override;
+        /** @copydoc IBackend::enqueuePublishOrdinaryGenerationSample */
+        bool enqueuePublishOrdinaryGenerationSample(
+            const sampling_math::OrdinaryGenerationPublication &publication,
+            int device_id, void *stream) override;
         bool enqueueInitializeDeviceGenerationDispatchTicket(
             uint64_t session_epoch,
             uint64_t workspace_generation,

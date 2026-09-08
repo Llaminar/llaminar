@@ -3,7 +3,9 @@
  * @brief C++ implementation of CUDA Flash Attention kernel methods
  *
  * Implements ITensorAttention interface by delegating to CUDA kernels
- * defined in CUDAFlashAttentionKernels.cu.
+ * defined in CUDAFlashAttentionKernels.cu. Decode uses a capacity-stable KV
+ * split envelope and the same ordered scalar/grouped reduction in every
+ * determinism mode; determinism does not serialize a whole attention head.
  *
  * @author David Sanftenberg
  */
@@ -347,6 +349,8 @@ namespace llaminar2
          * changes graph topology as decode advances and forces recapture.  The
          * caller therefore supplies the stable cache capacity.  Device kernels
          * derive the active split prefix from the live device-owned KV count.
+         * Scalar and grouped rows use this same envelope and ordered reducer;
+         * the deterministic CLI policy must not replace it with one split.
          *
          * The grid is `(n_heads, split_envelope, batch)`. With
          * `__launch_bounds__(256, 4)` and 61 registers per thread, the selected
@@ -361,9 +365,6 @@ namespace llaminar2
             int n_heads,
             int device_idx)
         {
-            if (debugEnv().gemm.deterministic)
-                return 1;
-
             if (kv_capacity <= 1 || n_heads <= 0)
                 return 1;
 

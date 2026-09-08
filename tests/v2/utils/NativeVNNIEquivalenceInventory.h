@@ -19,7 +19,9 @@
  * CPU, CUDA, and ROCm integration tests consume this exact inventory for every
  * loader-supported quantized format. Host-only planner tests separately prove
  * that positive values above the largest graph bucket remain accepted and
- * overflow-safe.
+ * overflow-safe. Non-power-of-two K surfaces also exercise odd partition
+ * boundaries and short final partitions, so an optimized boundary cursor
+ * cannot change the serial FP32 fold at an interior or border tile.
  */
 
 #pragma once
@@ -205,6 +207,22 @@ namespace llaminar2::test
                 512,
                 nativeVNNIPrefillBucketCasesForRows(
                     {17, 31, 33}),
+            },
+            {
+                // 56 quantization blocks give odd three-block spans and a
+                // short final partition for several canonical GPU schedules.
+                "ragged_partition_n2049_k1792",
+                2049,
+                1792,
+                nativeVNNIPrefillBucketCasesForRows({17, 33, 65, 129}),
+            },
+            {
+                // A second N selects different serial partitions, including
+                // five-block spans, while retaining the same source formats.
+                "ragged_partition_n4097_k1792",
+                4097,
+                1792,
+                nativeVNNIPrefillBucketCasesForRows({17, 33, 65, 129}),
             },
         };
     }

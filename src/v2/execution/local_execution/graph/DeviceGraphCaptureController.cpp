@@ -4933,7 +4933,14 @@ namespace llaminar2
                 const auto native_record_begin =
                     PerfStatsCollector::Clock::now();
 
-                seg.capture = recording_parent
+                // Source-definition ownership is a compile-time program policy,
+                // not a retry after native composition fails. Shared-timeline
+                // views preserve embedded conditional handles in their final
+                // graph. A cloning parent instead needs independent definitions
+                // that its lowerer can validate and import before instantiation.
+                seg.capture = recording_parent &&
+                    segment_cache.graph_replay_plan_policy !=
+                        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireCloneableParentComposition
                     ? recording_parent->createOrderedTimelineFragment()
                     : gpu_ctx->createGraphCapture(capture_stream);
                 if (!seg.capture)

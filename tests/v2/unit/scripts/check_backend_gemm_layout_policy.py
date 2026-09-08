@@ -125,7 +125,10 @@ def find_violations(repo_root: pathlib.Path) -> list[str]:
                         f"{path.relative_to(repo_root)}: retired GEMM "
                         f"entrypoint {entrypoint} is forbidden"
                     )
-            if path.name == "CUDANativeVNNIPrefillKernels.cu":
+            if path.name in {
+                "CUDANativeVNNIPrefillKernels.cu",
+                "CUDANativeVNNIPrefillDevice.cuh",
+            }:
                 for token in NATIVE_VNNI_PREFILL_FORBIDDEN_REDUCTIONS:
                     if token in source:
                         violations.append(
@@ -248,6 +251,14 @@ def run_self_test() -> int:
             encoding="utf-8",
         )
 
+        # Moving the canonical tile into a reusable device header must not
+        # move its reduction arithmetic outside the architecture gate.
+        unsafe_prefill_header = unsafe_prefill.with_name("CUDANativeVNNIPrefillDevice.cuh")
+        unsafe_prefill_header.write_text(
+            "void bad(float *p) { atomicAdd(p, 1.0f); }\n",
+            encoding="utf-8",
+        )
+
         unsafe_rocm_decode = (
             root
             / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip"
@@ -312,9 +323,9 @@ def run_self_test() -> int:
         )
 
         violations = find_violations(root)
-        if len(violations) != 14:
+        if len(violations) != 15:
             print(
-                f"expected fourteen ownership violations, found {len(violations)}",
+                f"expected fifteen ownership violations, found {len(violations)}",
                 file=sys.stderr,
             )
             for violation in violations:

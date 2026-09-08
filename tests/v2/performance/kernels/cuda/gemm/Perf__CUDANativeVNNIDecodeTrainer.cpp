@@ -30,6 +30,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+#include "kernels/cuda/gemm/CUDACanonicalKpartFold.h"
 #include "kernels/KernelFactory.h"
 #include "transfer/TransferEngine.h"
 #include "utils/PerfStatsCollector.h"
@@ -346,6 +347,7 @@ namespace
         Direct = 2,
         InheritSerialM1 = 4,
         TensorCoreMma16 = 5,
+        FusedKPar = 6,
     };
 
     /** One normalized forceable candidate from the common registry. */
@@ -387,6 +389,8 @@ namespace
                 return "wide";
             case CandidateFamily::KPar:
                 return "kpar";
+            case CandidateFamily::FusedKPar:
+                return "fused_kpar";
             case CandidateFamily::Direct:
                 return "direct";
             case CandidateFamily::InheritSerialM1:
@@ -982,6 +986,21 @@ namespace
             for (const int kb : exactKBlocksForSweep(config, k_groups))
                 add_kpar(tile_n, cpt, kb);
         }
+        for (const int columns : {16, 32})
+        {
+            for (const int kb : exactKBlocksForSweep(config, k_groups))
+            {
+                // Match the immutable production admission contract, including
+                // the native block limit. A failed plan is not a clamp to KB1.
+                const auto plan = CUDACanonicalKpartFoldPlan::create(
+                    static_cast<CUDACanonicalKpartColumns>(columns), kb, k_groups * 32);
+                if (!plan) continue;
+                add(Candidate{
+                    "cuda.nvnni.decode.fast_m1.fused_kpar.tn" +
+                        std::to_string(columns) + ".cpt1.kb" + std::to_string(kb),
+                    CandidateFamily::FusedKPar, columns, 1, 0, 0, 0, 1, kb});
+            }
+        }
         return result;
     }
 
@@ -1033,6 +1052,9 @@ namespace
                     continue;
                 for (const Candidate &base : base_candidates)
                 {
+                    // The joint diagnostic registry does not publish fused
+                    // families yet. Ordinary inherited grouped candidates do.
+                    if (base.family == CandidateFamily::FusedKPar) continue;
                     Candidate joint = base;
                     joint.family = CandidateFamily::InheritSerialM1;
                     joint.serial_m1_family = base.family;
@@ -1650,6 +1672,9 @@ namespace
         std::vector<uint64_t> sample_order_seeds;
         int timed_replays = 0;
         double effective_bandwidth_gbs = 0.0;
+        CUDACanonicalKpartFoldResources fused_resources{};
+        int fused_threads = 0;
+        size_t fused_dynamic_shared_bytes = 0;
     };
 
     /** Complete result for one sample-interleaved broad candidate matrix. */
@@ -1814,6 +1839,21 @@ namespace
             state.evidence.workspace_ok = true;
             state.evidence.graph_capture_ok =
                 mode == ExecutionMode::Eager;
+
+            if (candidate.family == CandidateFamily::FusedKPar)
+            {
+                const auto plan = CUDACanonicalKpartFoldPlan::create(
+                    static_cast<CUDACanonicalKpartColumns>(candidate.tile_n),
+                    candidate.exact_kb, k);
+                auto &resources = state.evidence.fused_resources;
+                if (!plan || !cudaNativeVNNIGemvTuned_fusedKpar_resources(
+                        codebook, *plan, resources) || resources.local_bytes != 0 ||
+                    resources.maximum_threads < plan->threads() ||
+                    resources.active_blocks_per_sm <= 0)
+                    return fail(candidate.id + ":compiler_resource_admission");
+                state.evidence.fused_threads = plan->threads();
+                state.evidence.fused_dynamic_shared_bytes = plan->sharedBytes();
+            }
 
             if (mode == ExecutionMode::GraphCaptured)
             {
@@ -2484,7 +2524,7 @@ namespace
             file,
             "cuda,decode,%s,%u,%u,%s,%s,%d,%d,%d,%s,%zu,%llu,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%zu,%d,%zu,"
             "%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,%zu,%.17g,%.17g,%.17g,%.17g,%s,%s,%s,"
-            "1,%d,1,1,%d,%s,%s,%d,%d,%d,%s,1,%d,%d,%d\n",
+            "1,%d,1,1,%d,%s,%s,%d,%d,%d,%s,1,%d,%d,%d,%d,%zu,%zu,%zu,%d,%d,%d\n",
             row.format->name.c_str(),
             static_cast<unsigned>(row.source_codebook),
             static_cast<unsigned>(row.execution_codebook),
@@ -2535,7 +2575,14 @@ namespace
             row.serial.route.candidate_id.c_str(),
             evidence.numerical_correctness ? 1 : 0,
             row.correctness_pass ? 1 : 0,
-            row.is_winner ? 1 : 0);
+            row.is_winner ? 1 : 0,
+            evidence.fused_resources.registers_per_thread,
+            evidence.fused_resources.local_bytes,
+            evidence.fused_resources.static_shared_bytes,
+            evidence.fused_dynamic_shared_bytes,
+            evidence.fused_resources.maximum_threads,
+            evidence.fused_resources.active_blocks_per_sm,
+            evidence.fused_threads);
     }
 
     /** CUDA-only performance fixture. */
@@ -2582,7 +2629,9 @@ namespace
             "grouped_output_digest,serial_output_digest,timing_sample_digest,supported,graph_capture_ok,"
             "workspace_ok,explicit_stream_ok,route_counter_ok,observed_candidate_id,observed_path,"
             "observed_tile_n,observed_cpt,observed_effective_kb,serial_m1_candidate_id,serial_route_counter_ok,"
-            "numerical_correctness,correctness_pass,is_winner\n");
+            "numerical_correctness,correctness_pass,is_winner,compiler_registers,compiler_local_bytes,"
+            "compiler_static_shared_bytes,launch_dynamic_shared_bytes,compiler_max_threads,"
+            "launch_active_blocks_per_sm,launch_threads\n");
         std::fprintf(
             timing,
             "backend,phase,source_format,source_codebook,execution_codebook,shape,execution_mode,m,n,k,"

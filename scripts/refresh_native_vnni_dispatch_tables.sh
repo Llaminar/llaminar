@@ -2172,6 +2172,9 @@ rocm_execution_modes="${LLAMINAR_NATIVE_VNNI_REFRESH_ROCM_EXECUTION_MODES:-eager
 cuda_execution_modes="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_EXECUTION_MODES:-eager,graph_captured}"
 rocm_quick_variants="kb1,kb2,kb4,kb8,kb16,kb32,kb64,inherit_serial_m1"
 cuda_quick_candidates="cuda.nvnni.decode.fast_m1.wide.tn128.cpt1,cuda.nvnni.decode.fast_m1.direct.tn128.cpt1,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb1,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb8,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb32,cuda.nvnni.decode.fast_m1.kpar.tn128.cpt1.kb64,cuda.nvnni.decode.verifier.inherit_serial_m1.r2,cuda.nvnni.decode.verifier.inherit_serial_m1.r4,cuda.nvnni.decode.verifier.inherit_serial_m1.r8,cuda.nvnni.decode.verifier.inherit_serial_m1.r16,cuda.nvnni.decode.verifier.inherit_serial_m1.r32,cuda.nvnni.decode.verifier.tensor_core_mma16"
+# Cover both physical fold widths in diagnostic refreshes too. KB remains an
+# exact arithmetic choice; the full production sweep owns the complete axis.
+cuda_quick_candidates+=",cuda.nvnni.decode.fast_m1.fused_kpar.tn16.cpt1.kb1,cuda.nvnni.decode.fast_m1.fused_kpar.tn32.cpt1.kb1,cuda.nvnni.decode.fast_m1.fused_kpar.tn16.cpt1.kb8,cuda.nvnni.decode.fast_m1.fused_kpar.tn32.cpt1.kb8"
 case "${profile}" in
   quick)
     cuda_max_cases="${LLAMINAR_NATIVE_VNNI_REFRESH_CUDA_MAX_CASES:-24}"
@@ -2607,6 +2610,19 @@ collect_backend_profiler_evidence() {
     reuse_this_evidence=0
   fi
 
+  upgrade_completed_cuda_profiler_units() {
+    # CUDA's SI byte normalization is independent of timing/build identity.
+    # Reparse saved raw batches before mixing generations or fitting features;
+    # never replay candidate kernels to repair display-unit interpretation.
+    if [[ "${selected_backend}" == "cuda" ]]; then
+      run_cmd \
+        "PYTHONPATH=${profiler_python_root}" \
+        python3 -m native_vnni_dispatch.profiler_reparse \
+        --requests "$1" --source-evidence "$2" --raw-directory "$3" \
+        --upgrade-in-place
+    fi
+  }
+
   materialize_profiler_observation_witnesses() {
     local mode="$1"
     local -a witness_source=()
@@ -2637,6 +2653,8 @@ collect_backend_profiler_evidence() {
 
   export_and_diagnose_profiler_features() {
     local diagnostic_report="${feature_table%_features.csv}_signal_diagnostics.json"
+    upgrade_completed_cuda_profiler_units \
+      "${request_manifest}" "${evidence_manifest}" "${raw_directory}"
     run_cmd \
       "PYTHONPATH=${profiler_python_root}" \
       python3 -m native_vnni_dispatch.profiler_evidence \
@@ -2728,6 +2746,9 @@ collect_backend_profiler_evidence() {
       --evidence "${evidence_manifest}"
     materialize_profiler_observation_witnesses reuse
 
+    upgrade_completed_cuda_profiler_units \
+      "${request_manifest}" "${evidence_manifest}" "${raw_directory}"
+
     # A previous invocation may have completed a content-addressed delta but
     # been interrupted before the atomic canonical composition. Discover and
     # authenticate those durable transactions before deriving another delta.
@@ -2787,6 +2808,8 @@ collect_backend_profiler_evidence() {
           --evidence "${retained_evidence}" \
           --output "${retained_witness}"
       fi
+      upgrade_completed_cuda_profiler_units \
+        "${retained_request}" "${retained_evidence}" "${raw_directory}.delta-${retained_tag}"
       retained_delta_requests+=("${retained_request}")
       retained_delta_evidence+=("${retained_evidence}")
       retained_delta_witnesses+=("${retained_witness}")

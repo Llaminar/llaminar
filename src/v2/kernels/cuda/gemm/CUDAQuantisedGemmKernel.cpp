@@ -90,7 +90,7 @@ namespace llaminar2
                 const float *d_A_fp32,       // [M x K]
                 int8_t *d_A_int8,            // [M x K] output
                 float *d_scales_A_blockwise, // [M x (K/32)] output
-                int32_t *d_sums_A_blockwise, // [M x (K/32)] output
+                int32_t *d_sums_A_blockwise, // [(K/32) x M] block-major output
                 int M, int K,
                 int cuda_device_id,
                 void *stream = nullptr);

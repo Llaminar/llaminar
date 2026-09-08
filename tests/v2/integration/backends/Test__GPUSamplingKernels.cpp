@@ -380,7 +380,7 @@ namespace
             EXPECT_TRUE(initialize_device_generation_control(
                 /*max_new_tokens=*/8,
                 /*response_capacity=*/8,
-                DeviceGenerationDepthPolicy::fixed(row_count),
+                DeviceGenerationPolicy::fixed(row_count),
                 control.data()));
             control[kDeviceGenerationControlTransactionCommitBudget] = 2;
             control[kDeviceGenerationControlNextLeadingCommittedOutputCount] =
@@ -673,7 +673,7 @@ namespace
             ASSERT_TRUE(initialize_device_generation_control(
                 max_new_tokens,
                 response_token_stride,
-                DeviceGenerationDepthPolicy::fixed(
+                DeviceGenerationPolicy::fixed(
                     verifier_row_capacity - 1),
                 control));
             ASSERT_EQ(
@@ -921,7 +921,7 @@ namespace
 
                 EXPECT_FALSE(backend_->enqueueInitializeDeviceGeneration(
                     request_count, max_new_tokens,
-                    DeviceGenerationDepthPolicy::fixed(
+                    DeviceGenerationPolicy::fixed(
                         verifier_row_capacity - 1),
                     DeviceGenerationLeadingRowDisposition::PendingResponse,
                     response_token_stride,
@@ -956,7 +956,7 @@ namespace
                 ASSERT_TRUE(capture->beginCapture());
                 ASSERT_TRUE(backend_->enqueueInitializeDeviceGeneration(
                     request_count, max_new_tokens,
-                    DeviceGenerationDepthPolicy::fixed(
+                    DeviceGenerationPolicy::fixed(
                         verifier_row_capacity - 1),
                     DeviceGenerationLeadingRowDisposition::PendingResponse,
                     response_token_stride,
@@ -1266,7 +1266,7 @@ namespace
         ASSERT_TRUE(backend_->enqueueInitializeDeviceGeneration(
             request_count,
             max_new_tokens,
-            DeviceGenerationDepthPolicy::fixed(
+            DeviceGenerationPolicy::fixed(
                 verifier_row_capacity - 1),
             DeviceGenerationLeadingRowDisposition::PendingResponse,
             response_token_stride,
@@ -1584,7 +1584,7 @@ namespace
                 ASSERT_TRUE(backend_->enqueueInitializeDeviceGeneration(
                     request_count,
                     /*max_new_tokens=*/6,
-                    DeviceGenerationDepthPolicy::fixed(verifier_rows - 1),
+                    DeviceGenerationPolicy::fixed(verifier_rows - 1),
                     DeviceGenerationLeadingRowDisposition::PendingResponse,
                     response_stride,
                     d_response,
@@ -1787,7 +1787,7 @@ namespace
                     ASSERT_TRUE(backend_->enqueueInitializeDeviceGeneration(
                         request_count,
                         max_new_tokens,
-                        DeviceGenerationDepthPolicy::fixed(
+                        DeviceGenerationPolicy::fixed(
                             verifier_row_capacity - 1),
                         DeviceGenerationLeadingRowDisposition::PendingResponse,
                         response_token_stride,
@@ -1944,8 +1944,8 @@ namespace
         constexpr int control_stride = kDeviceGenerationControlCount;
         constexpr uint64_t seed = 0xA57E5EED1234ull;
 
-        DeviceGenerationDepthPolicy depth_policy;
-        depth_policy.mode = DeviceGenerationDepthPolicyMode::Dynamic;
+        DeviceGenerationPolicy depth_policy;
+        depth_policy.mode = DeviceGenerationPolicyMode::Dynamic;
         depth_policy.initial_depth = comparison_rows;
         depth_policy.minimum_depth = 1;
         depth_policy.maximum_depth = configured_max_comparison_rows;
@@ -2258,7 +2258,7 @@ namespace
         ASSERT_TRUE(initialize_device_generation_control(
             /*max_new_tokens=*/output_capacity,
             /*response_capacity=*/output_capacity,
-            DeviceGenerationDepthPolicy::fixed(stale_controller_depth),
+            DeviceGenerationPolicy::fixed(stale_controller_depth),
             generation_control.data()));
         generation_control[
             kDeviceGenerationControlTransactionCommitBudget] = sample_rows;
@@ -2539,7 +2539,7 @@ namespace
             ASSERT_TRUE(backend_->enqueueInitializeDeviceGeneration(
                 request_count,
                 max_new_tokens,
-                DeviceGenerationDepthPolicy::fixed(1),
+                DeviceGenerationPolicy::fixed(1),
                 DeviceGenerationLeadingRowDisposition::PendingResponse,
                 response_token_stride,
                 d_response,
@@ -4181,7 +4181,7 @@ namespace
                 ASSERT_TRUE(initialize_device_generation_control(
                     /*max_new_tokens=*/32,
                     /*response_capacity=*/32,
-                    DeviceGenerationDepthPolicy::fixed(
+                    DeviceGenerationPolicy::fixed(
                         depths[static_cast<size_t>(request)]),
                     row));
             }
@@ -4612,7 +4612,7 @@ namespace
                         sampling_math::initialize_device_generation_control(
                             /*max_new_tokens=*/max_seq_len,
                             /*response_capacity=*/max_seq_len,
-                            sampling_math::DeviceGenerationDepthPolicy::fixed(
+                            sampling_math::DeviceGenerationPolicy::fixed(
                                 width - 1),
                             generation_control.data()));
                 };
@@ -16664,7 +16664,7 @@ namespace
                     ASSERT_TRUE(initialize_device_generation_control(
                         /*max_new_tokens=*/kOutputCapacity,
                         /*response_capacity=*/kOutputCapacity,
-                        DeviceGenerationDepthPolicy::fixed(depth),
+                        DeviceGenerationPolicy::fixed(depth),
                         generation_control.data()));
                     generation_control[
                         kDeviceGenerationControlTransactionCommitBudget] =
@@ -18077,12 +18077,12 @@ namespace
         constexpr uint64_t session_epoch = 0x123456789ABCDEF0ull;
         constexpr uint64_t workspace_generation = 0x0FEDCBA987654321ull;
         std::array<int, kDeviceGenerationControlCount> control{};
-        DeviceGenerationDepthPolicy policy;
-        policy.mode = DeviceGenerationDepthPolicyMode::Dynamic;
+        DeviceGenerationPolicy policy;
+        policy.mode = DeviceGenerationPolicyMode::Dynamic;
         policy.initial_depth = 2;
         policy.minimum_depth = 1;
         policy.maximum_depth =
-            DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth;
+            DeviceGenerationPolicy::kMaximumSupportedDraftDepth;
         ASSERT_TRUE(policy.valid());
         ASSERT_TRUE(initialize_device_generation_control(
             /*max_new_tokens=*/64,

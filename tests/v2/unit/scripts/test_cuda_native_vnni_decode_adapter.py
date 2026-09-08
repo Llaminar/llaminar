@@ -138,6 +138,51 @@ class CUDANativeVNNIDecodeAdapterTest(unittest.TestCase):
         })
         return row
 
+    @classmethod
+    def fused_row(cls) -> dict[str, str]:
+        """Describe one exact compiled CTA-local publication and its resources."""
+
+        row = cls.fast_row()
+        candidate = "cuda.nvnni.decode.fast_m1.fused_kpar.tn16.cpt1.kb8"
+        row.update({
+            "candidate_id": candidate, "family": "fused_kpar",
+            "tile_n": "16", "cpt": "1", "observed_candidate_id": candidate,
+            "observed_path": "fused_kpar", "observed_tile_n": "16", "observed_cpt": "1",
+            "serial_m1_candidate_id": candidate, "compiler_registers": "38",
+            "compiler_local_bytes": "0", "compiler_static_shared_bytes": "0",
+            "launch_dynamic_shared_bytes": "512", "compiler_max_threads": "1024",
+            "launch_active_blocks_per_sm": "8", "launch_threads": "128",
+        })
+        return row
+
+    def test_fused_kpar_resource_and_identity_admission(self) -> None:
+        """Neither spilled kernels nor a substituted reduction tree are evidence."""
+
+        row = self.fused_row()
+        observation = adapt_cuda_decode_row(row, self.context())
+        self.assertTrue(candidate_is_eligible(observation))
+        for field, value in (
+            ("compiler_local_bytes", "4"), ("compiler_registers", "0"),
+            ("launch_dynamic_shared_bytes", "256"), ("compiler_max_threads", "64"),
+            ("launch_active_blocks_per_sm", "0"), ("launch_threads", "64"),
+        ):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                adapt_cuda_decode_row({**row, field: value}, self.context())
+        changed = {**row, "observed_effective_kb": "4", "correctness_pass": "0"}
+        self.assertFalse(candidate_is_eligible(adapt_cuda_decode_row(changed, self.context())))
+
+    def test_grouped_inherits_exact_fused_kpar_partition(self) -> None:
+        """A grouped physical producer may change, but its serial KB may not."""
+
+        row = self.verifier_row()
+        row.update({
+            "serial_m1_candidate_id": "cuda.nvnni.decode.fast_m1.fused_kpar.tn16.cpt1.kb8",
+            "observed_path": "fused_kpar", "observed_tile_n": "16", "observed_cpt": "1",
+        })
+        self.assertTrue(candidate_is_eligible(adapt_cuda_decode_row(row, self.context())))
+        row.update({"observed_effective_kb": "4", "correctness_pass": "0"})
+        self.assertFalse(candidate_is_eligible(adapt_cuda_decode_row(row, self.context())))
+
     def test_fast_m1_preserves_exact_kpart_identity(self) -> None:
         observation = adapt_cuda_decode_row(self.fast_row(), self.context())
         self.assertEqual(observation.runtime_codebook_id, 19)

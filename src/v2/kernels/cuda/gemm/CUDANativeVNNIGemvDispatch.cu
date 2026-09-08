@@ -12,6 +12,9 @@
 #include "CUDANativeVNNIGemvShard.h"
 #include "tensors/NativeVnniFormatInfo.h"
 
+#include <cuda.h>
+#include <cuda_runtime.h>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -105,6 +108,50 @@ constexpr int shardIndexForCodebook(uint8_t codebook_id)
 
 extern "C"
 {
+/**
+ * @brief Validate capture-safe stream ownership once, then route the exact candidate.
+ * @details The full buffer/epilogue contract is declared in CUDACanonicalKpartFold.h.
+ */
+bool cudaNativeVNNIGemvTuned_fusedKpar_fp32(
+    const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
+    const uint16_t *secondary, const uint32_t *extended_minima, float *output,
+    const float *activation_scales, int n, float alpha, float beta,
+    const float *existing, const float *bias, uint8_t codebook_id, int device,
+    void *raw_stream, const llaminar2::CUDACanonicalKpartFoldPlan &plan)
+{
+    const auto stream = static_cast<cudaStream_t>(raw_stream);
+    if (!stream || stream == cudaStreamLegacy || stream == cudaStreamPerThread ||
+        !activations || !payload || !scales || !output || !activation_scales ||
+        n <= 0 || device < 0 || (beta != 0.0f && !existing) ||
+        reinterpret_cast<uintptr_t>(activations) % alignof(int4) != 0)
+        return false;
+    int current_device = -1;
+    CUcontext current_context = nullptr, stream_context = nullptr;
+    // cudaStreamGetDevice invalidates active capture. These driver metadata
+    // queries are capture-safe and prove stronger, exact context ownership.
+    // Nothing is downloaded, synchronized, or remembered in a shadow cache.
+    if (cudaGetDevice(&current_device) != cudaSuccess || current_device != device ||
+        cuCtxGetCurrent(&current_context) != CUDA_SUCCESS || !current_context ||
+        cuStreamGetCtx(stream, &stream_context) != CUDA_SUCCESS ||
+        stream_context != current_context)
+        return false;
+    LLAMINAR_ROUTE_CUDA_NVNNI_SHARD(
+        cudaNativeVNNIGemvTuned_fusedKpar_fp32, false,
+        activations, payload, scales, secondary, extended_minima, output,
+        activation_scales, n, alpha, beta, existing, bias, codebook_id,
+        device, stream, plan);
+}
+
+/** @brief Route the header-declared resource query to its one template owner. */
+bool cudaNativeVNNIGemvTuned_fusedKpar_resources(
+    uint8_t codebook_id, const llaminar2::CUDACanonicalKpartFoldPlan &plan,
+    llaminar2::CUDACanonicalKpartFoldResources &resources)
+{
+    LLAMINAR_ROUTE_CUDA_NVNNI_SHARD(
+        cudaNativeVNNIGemvTuned_fusedKpar_resources, false,
+        codebook_id, plan, resources);
+}
+
 bool cudaNativeVNNIGemvTuned_supportsCodebook(uint8_t codebook_id)
 {
     return shardIndexForCodebook(codebook_id) >= 0;

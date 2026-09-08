@@ -565,7 +565,7 @@ TEST(Test__PrefixMTPConfig,
     EXPECT_TRUE(device.valid());
     EXPECT_EQ(
         device.mode,
-        sampling_math::DeviceGenerationDepthPolicyMode::Dynamic);
+        sampling_math::DeviceGenerationPolicyMode::Dynamic);
     EXPECT_EQ(device.minimum_depth, 1);
     EXPECT_EQ(device.maximum_depth, 15);
     EXPECT_EQ(device.initial_depth, 7);

@@ -34,6 +34,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/compute_stages/ComputeStageUtils.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"        // Direct-kernel test coherence
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h" // For workspace binding
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
@@ -51,6 +52,7 @@
 #include "../../../utils/TestModelHelper.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
+#include "backends/cuda/CUDAGraphCapture.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -2345,6 +2347,8 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillHeuristicAllFormatsMatchesCPU)
  * oracle row in one device-resident matrix, followed by one D2H. This prevents
  * exact-M and bucket-M implementations from agreeing while both drift from
  * serial decode, and proves interior rows rather than sampling only a boundary.
+ * Captured replays overwrite poisoned outputs before the final comparison;
+ * the new ragged-K witnesses exercise odd and short final partition spans.
  */
 TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets)
 {
@@ -2632,6 +2636,29 @@ TEST_F(Test__CUDAGemmParity, NativeVNNIPrefillActiveRowsAllFormatsByteExactAcros
                     bk256_narrow_seen |= selection.tile_id == -3;
                     bk256_wide_seen |= selection.tile_id == -2;
                 }
+
+                // Retain the production executable while checking its outputs.
+                // Poisoning inside the graph makes each replay prove complete
+                // publication rather than inheriting the preceding warmup.
+                CUDAGraphCapture replay(stream, gpu_device_.cuda_ordinal());
+                ScopedBackendGraphCapture recording(
+                    replay, "all-format prefill partition replay");
+                ASSERT_TRUE(recording.begin());
+                for (const auto &[rows, output] : {
+                         std::pair{test_case.active_rows, exact_output.get()},
+                         std::pair{test_case.bucket_rows, bucket_output.get()}})
+                {
+                    ASSERT_EQ(cudaMemsetAsync(
+                        output->gpu_data_ptr(), 0xff,
+                        static_cast<size_t>(rows) * N * sizeof(float), stream),
+                        cudaSuccess);
+                    ASSERT_TRUE(cuda_kernel->multiply_tensor(
+                        input.get(), output, rows, N, K, true, 1.0f, 0.0f));
+                }
+                recording.finish();
+                ASSERT_TRUE(replay.instantiate());
+                ASSERT_TRUE(replay.launch());
+                ASSERT_TRUE(replay.launch());
 
                 const size_t active_values =
                     static_cast<size_t>(test_case.active_rows) * N;
@@ -7622,12 +7649,13 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
 }
 
 /**
- * @brief Prove the generated WIDE/DIRECT verifier family for every codebook.
+ * @brief Prove each generated LM-head verifier schedule for every codebook.
  *
  * The compact all-format sweep above is exhaustive over verifier M, but its
  * `N=384, K=512` geometry selects KPAR. Qwen LM heads are extremely wide and
- * select the single-partition WIDE or DIRECT serial-M1 families instead. The
- * grouped launcher must preserve that one-accumulator expression tree while
+ * often select single-partition WIDE or DIRECT serial-M1 families instead;
+ * measured exact overlays may also select global or fused KPAR. The
+ * grouped launcher must preserve the selected accumulator tree while
  * reusing each packed-weight traversal across sixteen verifier rows. The
  * grouped policy may choose its separately certified tensor-core kernel when
  * that kernel is byte-gated against the same serial-M1 contract.
@@ -7635,8 +7663,10 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedRuntimeM_AllNativeFormatsMatch
  * `N=248320, K=1024` is a production Qwen vocabulary projection and is an
  * exact generated-policy overlay for every supported codebook. This test keeps
  * M-totality in the compact suite and crosses it with the physical M=16 policy
- * bucket here. PerfStats proves that the real grouped entry point inherited the
- * generated WIDE/DIRECT route; byte comparison against independent public-M1
+ * bucket here. The canonical M1 schedule is the partition authority, not a
+ * hardcoded expectation about yesterday's winning physical kernel. PerfStats
+ * proves that the real grouped entry point inherited the selected partition
+ * count; byte comparison against independent public-M1
  * launches proves the route did not replace serial arithmetic with a merely
  * close approximation.
  */
@@ -7646,8 +7676,10 @@ TEST_F(Test__CUDAGemmParity,
     constexpr int M = 16;
     constexpr int N = 248320;
     constexpr int K = 1024;
-    constexpr int wide_shape_id = 0;
-    constexpr int direct_shape_id = 2;
+    int sm_count = 0;
+    ASSERT_EQ(cudaDeviceGetAttribute(
+                  &sm_count, cudaDevAttrMultiProcessorCount,
+                  gpu_device_.cuda_ordinal()), cudaSuccess);
 
     ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
     size_t inherited_wide_direct_routes = 0;
@@ -7658,38 +7690,25 @@ TEST_F(Test__CUDAGemmParity,
         auto weights = format.create(N, K);
         ASSERT_NE(weights, nullptr)
             << "Failed to create " << format.name
-            << " Qwen LM-head WIDE/DIRECT weights";
+            << " Qwen LM-head weights";
 
         auto *kernel = getPreparedKernel(weights.get(), gpu_device_);
         ASSERT_NE(kernel, nullptr) << format.name << " CUDA kernel";
         ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K))
-            << format.name << " WIDE/DIRECT verifier workspace";
+            << format.name << " LM-head verifier workspace";
 
         DeviceNativeVNNIMatrixDesc desc;
         ASSERT_TRUE(kernel->exportNativeVNNIMatrixDesc(desc))
             << format.name << " must export a native-VNNI descriptor";
 
-        int shape_id = -1;
-        int tile_n = 0;
-        int cpt = 0;
-        int exact_kb = -1;
-        ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
-            desc.codebook_id,
-            /*graph_captured=*/1,
-            /*m=*/1,
-            N,
-            K,
-            &shape_id,
-            &tile_n,
-            &cpt,
-            &exact_kb))
+        int uses_ordered_reducer = 0;
+        int canonical_k_partitions = 0;
+        ASSERT_TRUE(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+            desc.codebook_id, N, K, sm_count,
+            &uses_ordered_reducer, &canonical_k_partitions))
             << format.name << " generated serial-M1 LM-head policy";
-        ASSERT_TRUE(shape_id == wide_shape_id || shape_id == direct_shape_id)
-            << format.name << " expected WIDE/DIRECT route, shape_id="
-            << shape_id << " tile_n=" << tile_n << " cpt=" << cpt;
-        ASSERT_EQ(exact_kb, 0)
-            << format.name
-            << " single-partition WIDE/DIRECT policy must not encode KPAR";
+        ASSERT_GT(canonical_k_partitions, 0) << format.name;
+        ASSERT_LE(canonical_k_partitions, K / 32) << format.name;
 
         const auto input = randomFP32(static_cast<size_t>(M) * K);
         std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
@@ -7704,7 +7723,7 @@ TEST_F(Test__CUDAGemmParity,
             K,
             gpu_device_,
             workspace_.get()))
-            << format.name << " grouped WIDE/DIRECT verifier projection";
+            << format.name << " grouped LM-head verifier projection";
 
         bool observed_grouped_route = false;
         for (const auto &record :
@@ -7732,14 +7751,26 @@ TEST_F(Test__CUDAGemmParity,
             observed_grouped_route = true;
             EXPECT_EQ(tag("semantic_contract"), "verifier_serial_m1_bitwise")
                 << format.name;
-            EXPECT_EQ(tag("effective_kb"), "1") << format.name;
+            EXPECT_EQ(tag("effective_kb"), std::to_string(canonical_k_partitions))
+                << format.name;
             EXPECT_EQ(tag("rowmajor_available"), "false") << format.name;
 
             const std::string route = tag("route");
             if (route == "wide" || route == "direct")
             {
                 ++inherited_wide_direct_routes;
+                EXPECT_EQ(uses_ordered_reducer, 0) << format.name;
+                EXPECT_EQ(canonical_k_partitions, 1) << format.name;
                 EXPECT_EQ(tag("force_two_phase"), "0") << format.name;
+            }
+            else if (route == "kpar" || route == "fused_kpar")
+            {
+                // The route tag names the inherited serial-M1 family.
+                // Fused M1 publishes partials inside one CTA; its grouped
+                // DP4A implementation owns global partials but must inherit
+                // exactly the same partition tree and rounded publication.
+                EXPECT_EQ(uses_ordered_reducer, 1) << format.name;
+                EXPECT_EQ(tag("force_two_phase"), "1") << format.name;
             }
             else if (route == "tensor_core")
             {
@@ -7755,7 +7786,7 @@ TEST_F(Test__CUDAGemmParity,
         }
         ASSERT_TRUE(observed_grouped_route)
             << format.name
-            << " did not publish grouped WIDE/DIRECT production dispatch evidence\n"
+            << " did not publish grouped LM-head production dispatch evidence\n"
             << PerfStatsCollector::summaryString(
                    {"kernel.cuda_native_vnni_gemv_dispatch"}, 20);
 
@@ -7774,7 +7805,7 @@ TEST_F(Test__CUDAGemmParity,
 
             expectBitwiseEqualFloatRow(
                 (std::string(format.name) +
-                 " WIDE/DIRECT grouped LM-head M=16 row=" +
+                 " grouped LM-head M=16 row=" +
                  std::to_string(row))
                     .c_str(),
                 grouped.data() + static_cast<size_t>(row) * N,
@@ -7785,7 +7816,7 @@ TEST_F(Test__CUDAGemmParity,
         cleanupWorkspaceIfNeeded(kernel);
         EXPECT_FALSE(kernel->hasDynamicStateActive())
             << format.name
-            << " WIDE/DIRECT sweep leaked CUDA dynamic state";
+            << " LM-head sweep leaked CUDA dynamic state";
         llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
     }
 

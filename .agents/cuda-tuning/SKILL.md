@@ -456,7 +456,10 @@ unless the user explicitly asks for a temporary experiment. The durable path is:
    only by authenticating the original canonical observation corpus against
    the request and evidence manifests; it contains untouched pipeline timing
    plus separate per-dispatch Nsight metrics.
-   The default CUDA decode family set is `wide,kpar,direct`.  The perf harness
+   The CUDA M1 decode family set is `wide,kpar,direct,fused_kpar`. The latter
+   retains the exact KPAR tree but publishes through CTA-local storage; its
+   resource admission and grouped inheritance belong to the common tuning
+   contract. The perf harness
    uses the production VRAM-pool preparation path, which does not own ROWPAR's
    optional row-major auxiliary weight view; do not add `rowpar` back to the
    standard refresh unless the trainer has an explicit row-major-owner mode and

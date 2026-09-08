@@ -8,6 +8,173 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 ## Current State
 
+September 8 WIP checkpoint: additive packed-prefill exact dispatch finishes its
+clean bracket at **1186.524 prefill / 46.485 decode tok/s**, with unchanged
+tokens and weight/workspace bytes. Pinned llama.cpp confirmation is
+**1204.301 / 45.757**: decode leads, prefill still trails. All 147 format/shape
+cells and 45 isolated zero-spill launch profiles pass. Full Unit is **638/638**;
+the 112 preflight integrations and twelve model cells are still in progress:
+`/tmp/qwen38-staged-prefill-proof.{json,log}`. The final gate is not yet claimed
+green. Dynamic's physical verifier-width fix and its per-backend >=90% target
+remain pending. See the
+[phase investigation](../2026-09/2026-09-07-cuda-mtp-off-phase-comparison.md).
+
+September 8 floating-prefill follow-up: shared-operand projection dispatch
+improves clean CUDA prefill by about 2.3% in a control/retest bracket, ending at
+**1146.532 prefill / 46.495 decode tok/s**, with identical tokens and unchanged
+weight/workspace bytes. A refreshed same-pinned llama.cpp run gives
+**1208.976 / 45.787**: decode still leads, prefill still trails. All native
+floating formats have byte/resource and boundary-economy evidence; the complete
+affected gate passes **638 Unit + 112 preflight + twelve model cells + 106 CSVs**
+in 576.680 seconds: `/tmp/qwen38-tiny-shared-proof.{json,log}`.
+This does not change dynamic-depth execution; its maximum-width verifier
+remains the pending target. See the September 8 section of the
+[phase investigation](../2026-09/2026-09-07-cuda-mtp-off-phase-comparison.md).
+
+September 8 parallel-attention checkpoint: deterministic mode now retains the
+normal ordered KV-split policy on CUDA and ROCm, including removal of HIP's
+device-side single-split override. Clean CUDA MTP-off decode is **46.576 tok/s**
+(43.977 before), ahead of the pinned llama.cpp 45.689 comparison; prefill is
+1126.644 and still trails. ROCm's refreshed MTP-off baseline is **30.804 tok/s**.
+No weight/activation precision or attention workspace increase. Deterministic
+and normal parallel serial/grouped outputs are byte-identical in 288 captured
+configurations per vendor; old single-split vs new model tokens first differ
+at index 231, so do not claim old/new output byte identity.
+
+The consolidated ROCm request-cache tests pass 20 repeats and now join the
+preflight label alongside ROCm grouped/context attention. The expanded gate
+passes **638 Unit + 112 preflight + all twelve Qwen3.8 CUDA/ROCm cells**, with
+106 CSV artifacts in 574.176 seconds:
+`/tmp/qwen38-parallel-deterministic-proof.{json,log}`.
+The full ROCm attention binary is 59/61: two legacy real-Qwen2 fixture setup
+failures lack a PhysicalMemoryAuthority and remain explicitly open outside
+this model-free preflight. Dynamic physical verifier width is **not fixed yet**.
+Re-establish fixed-depth winners after the attention change before certifying
+the dynamic >=90% objective; the measurements below predate that change.
+
+September 8: fixed-depth 1/2/3 now measures **64.193/67.226/65.640 tok/s CUDA**
+and **33.436/38.418/38.041 ROCm**, with identical tokens within each backend.
+Depth 2 leads this neighborhood; the complete depth-through-15 search is pending.
+The startup parser now refreshes the canonical kernel-policy snapshot after
+`--deterministic`: a reproducing Unit passes twenty repeats and all 181 parser
+tests pass. Corrected direct profiles match canonical output tokens. They expose
+the next ordinary decode target: deterministic mode forces attention to one KV
+split on both vendors. CUDA attention measures 1.956 ms/token in the matched
+trace, not the earlier unmatched 0.428 ms. Full Unit/preflight/model validation
+of startup publication passed: 638 Unit registrations, 109 preflight integrations,
+and all twelve CUDA/ROCm model cells with 106 validated CSV artifacts in 491.887 s.
+At that earlier checkpoint, neither attention parallelism nor dynamic
+execution-width selection had changed.
+
+**Starting after the green attention decode slice:** tune dynamic-depth MTP on
+CUDA and ROCm to **at least 90% of each backend's best fixed-depth decode** for
+the same Qwen3.8-27B / exact 512-token prompt. Initial fixed-2/dynamic-15
+measurements are **67.226/23.950 tok/s CUDA** and **38.418/13.990 ROCm**:
+dynamic delivers only 35.6% and 36.4% respectively. A diagnostic ceiling of 2
+recovers 65.367 CUDA / 37.176 ROCm with unchanged tokens and adaptive counters.
+This isolates a large capacity-dependent execution tax, not a finished fix;
+the production solution must retain depth 15. September 8 normal-bootstrap
+captured-event evidence localizes 99.6% of the ROCm capacity-dependent loop
+increase to its verifier: 121 identical-count replays take 51.506 ms each at
+physical M3 versus 144.917 ms at M16. Outputs and adaptive counters match.
+Best-fixed-depth inventory, per-kernel attribution and implementation remain
+pending; do not tune controller thresholds around this execution-width tax.
+The [project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md#dynamic-depth-economy-cuda-and-rocm)
+defines the matched Release bracket, fixed-depth search through 15, unchanged
+precision/memory constraints, controller-cost evidence and correctness gates.
+
+September 7 23:40 UTC, attention decode spill cleanup: **638 Unit,
+109 preflight, twelve CUDA/ROCm Qwen3.8 cells and 106 CSVs pass** in
+489.473 seconds. The final linked FP16 decoder has zero stack/local bytes and
+zero measured spills; Release model speed is unchanged within noise at
+1123.878/43.977 tok/s. The ordinary full-generation binding and original
+llama.cpp throughput target remain open. The maximum-width dynamic verifier
+tail is the source-audit lead for the measured capacity tax; exact kernel
+attribution and the production fix are still pending.
+
+September 7 22:28 UTC, ordinary live-frontier publication: **638 Unit,
+108 preflight and all twelve CUDA/ROCm Qwen3.8 cells pass**, with 106 validated
+CSVs, in 827.206 seconds including the Unit rebuild. Both backends share the
+response/position/next-condition transition and pass captured aliasing and
+twenty-reset proofs; isolated profiles show zero scratch/spills. The ordinary
+model loop is not yet connected and both off cells still report no complete
+generation-loop certificate. Reuse the existing sampler/logical-state buffers
+for the pending production binding. Last retained Release throughput remains
+1117.762/43.930 tok/s against pinned llama.cpp's 1152.615/45.689; the goal stays
+open. See the [current phase investigation](../2026-09/2026-09-07-cuda-mtp-off-phase-comparison.md)
+for the fresh receipt, per-cell timings, scope limits and lifecycle map.
+
+September 7, ordinary entry/terminal composition: CUDA can now place its
+captured prefill sample before the first WHILE predicate. One immutable
+admission and shared validator authenticate ordinary/MTP terminal accounting;
+the seven pure controller tests and focused native-prologue proof pass. The
+fresh selected gate is **635/635 Unit, 96/96 preflight, 6/6 CUDA Qwen3.8 cells
+and 53 CSV artifacts**, in 379.455 seconds. One stale source-count assertion
+in the first prerequisite run was replaced by explicit lowering boundaries and
+the prologue-to-predicate edge. Ordinary model-loop wiring and a new throughput
+measurement are not complete; the off cell still truthfully reports no
+generation-loop certificate. See `qwen38-ordinary-contract-proof-v2` in the
+tuning receipt for the durable run identity and per-cell timings.
+
+September 7, ordinary controller foundation: a typed ordinary generation policy
+now shares the existing 44-byte admission ABI and 46-word resident ledger.
+All **635 Unit, 96 preflight and six CUDA Qwen3.8 cells pass**, with 53 validated
+CSV artifacts, in 397.622 seconds. Captured CUDA/ROCm publication/reset tests
+pass; isolated publication profiles show zero spills on both backends.
+This does **not** yet replace the model's host-per-token loop or
+change the last measured throughput. See the current tuning receipt below for
+the exact first-sample, pending-condition and EOS lifecycle.
+
+September 7, MTP-off follow-up: retained source confirms **1075.182 / 42.475
+tok/s** prefill/after-prefill decode, unchanged output bytes and VRAM. The
+exhaustive Q5 unpack primitive joins Unit; **634/634 Unit, 96/96 preflight,
+6/6 CUDA Qwen3.8 cells and 53 CSV artifacts pass** in 392.645 seconds. Slower
+CTA-local reduction and balanced-unpack prototypes were removed. Attribution
+also exposed a structural gap: ordinary decode captures each forward but
+still submits/samples through the host per token; complete device-owned
+generation is wired only for MTP. Existing MTP-off math/capture certificates
+do not prove that stricter full-generation contract. The
+[tuning receipt](../2026-09/2026-09-06-cuda-qwen38-mtp-off-tuning.md)
+maps the current/target lifecycle and records rejected experiments. The
+llama.cpp target remains unmet; no precision, weight, workspace or generated
+dispatch-policy change was used to improve the numbers.
+
+September 6, MTP-off focus: the user has made non-speculative CUDA Qwen3.8
+prefill/decode the active comparison target. A BK64 partition-boundary cursor
+improves unprofiled Release prefill **957.946 -> 1065.861 tok/s (+11.27%)**;
+after-prefill decode is unchanged at **42.426 tok/s**, versus llama.cpp
+**1175.520 / 45.664 tok/s**. All 256 output IDs and physical workspace bytes
+are unchanged. IQ1_M retains its original economical register schedule after
+rejecting a spill-free but slower one-CTA variant. **Unit 633/633, preflight
+96/96, and all six CUDA Qwen3.8 cells with 53 validated CSV artifacts pass**;
+the selected aggregate completes in 380.84 seconds using cached model/reference
+data. This is a green correctness slice, not a completed performance goal.
+Next attribute Q5 projection instructions and ordered-reducer publication;
+do not change arithmetic, precision, weights or workspace to close the gap.
+See the
+[MTP-off tuning receipt](../2026-09/2026-09-06-cuda-qwen38-mtp-off-tuning.md).
+
+September 6, CUDA Qwen3.8 tuning: small floating projections now preserve the
+fixed reduction with one block barrier for decode and no block barriers for
+prefill. The first Release sample improves 512-token prefill **930.700 ->
+957.651 tok/s**, while MTP3 decode is effectively unchanged at **63.701 tok/s**.
+Final-source confirmation gives 948.547/63.507 tok/s; the prefill gain is 1.9–2.9%,
+not a fixed best-case result. Outputs and workspace bytes are unchanged. All
+1,076 isolated byte-oracle cases, Unit 633/633 and preflight 94/94 pass. Fresh
+llama.cpp measures 981.901/70.600 tok/s. Its output diverges at token 77 and it
+accepts more drafts, so the remaining decode gap needs transaction/acceptance
+attribution as well as kernel timing. The external goal is still open. See the
+[focused tuning receipt](../2026-09/2026-09-06-cuda-qwen38-tiny-projection-tuning.md)
+for profiles, exact commands, rejected candidates and remaining work. The fresh
+canonical CUDA parity matrix passes all six MTP cells and all 53 CSV artifacts;
+MTP3 draft-head cosines are 0.999910/0.999922. A separate Release 512-prompt /
+256-output serial run matches every MTP3 output token in all repetitions:
+42.587 tok/s serial versus 63.507 with MTP3. No mathematical defect was exposed;
+the short-prompt HF comparisons and longer token witness remain distinct proofs.
+Earlier
+campaign progress below is historical; the September certification dashboard
+records thirteen individually green E2E cells with their repeat gate paused.
+
 September 6, 13:40 UTC: **A, final-parent attachment; R, aggregate.** CUDA2/CPU2
 fails setup because its one retained parent cannot use the former direct-capture
 fork/join interface. The shared CUDA/HIP native-DAG attachment removes those

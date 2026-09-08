@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-from .format_registry import FORMAT_SPECS, NativeVNNIFormatSpec, registry_digest
+from .format_registry import CODEBOOK_PAYLOAD_BYTES, FORMAT_SPECS, NativeVNNIFormatSpec, registry_digest
 from .corpus_provenance import (
     TRAINER_PROVENANCE_SCHEMA,
     mapping_digest as _mapping_digest,
@@ -65,6 +65,7 @@ CUDA_AGGREGATE_COLUMNS = (
     "auxiliary_threads_per_block",
     "auxiliary_max_threads_per_block",
     "auxiliary_max_active_blocks_per_sm",
+    "staging_schedule", "observed_staging_schedule",
 )
 
 ROCM_AGGREGATE_COLUMNS = (
@@ -82,6 +83,7 @@ CUDA_TIMING_COLUMNS = (
     "backend", "phase", "format", "codebook", "shape", "m", "n", "k",
     "tile", "tile_id", "strategy", "requested_k_partitions", "sample_index",
     "timed_replays", "latency_us", "latency_us_hex",
+    "staging_schedule",
 )
 
 ROCM_TIMING_COLUMNS = (
@@ -103,6 +105,10 @@ CUDA_CANDIDATE_IDS = (
     "AUTO",
     *(f"STD:t{tile}:full" for tile in range(len(CUDA_TILE_NAMES))),
     *(f"KPART:t{tile}" for tile in range(len(CUDA_TILE_NAMES))),
+    *(f"STD:t{tile}:full:stage{staging}"
+      for staging in (1, 2, 3) for tile in (0, 2, 3, 4, 5)),
+    *(f"KPART:t{tile}:stage{staging}"
+      for staging in (1, 2, 3) for tile in (0, 2, 3, 4, 5)),
     "BK256:full",
 )
 
@@ -113,11 +119,26 @@ def _cuda_candidate_is_spill_free(
     execution_codebook: int,
     candidate: str,
 ) -> bool:
-    """Mirror the compiled no-spill specialization inventory exactly."""
+    """Mirror the structurally implemented, compiler-proven no-spill inventory.
+
+    The native trainer re-queries these exact symbols before timing. Any drift
+    changes the complete candidate set and fails the immutable plan, rather than
+    silently changing a candidate's staging or accepting a partial tournament.
+    """
 
     if not candidate.startswith(("STD:", "KPART:")):
         return True
     tile_id = int(candidate.split(":")[1].removeprefix("t"))
+    if ":stage" in candidate:
+        staging = int(candidate.rsplit(":stage", 1)[1])
+        if staging not in (1, 2, 3):
+            return False
+        if CODEBOOK_PAYLOAD_BYTES.get(execution_codebook) not in (16, 20) or tile_id == 1:
+            return False
+        # Exact production-module resource inventory: these asymmetric direct
+        # symbols spill eight bytes; canonical publication and other tiles do not.
+        if execution_codebook in (5, 7) and tile_id == 2 and staging in (2, 3) and candidate.startswith("STD:"):
+            return False
     if execution_codebook in {10, 17}:
         return tile_id not in {1, 4, 5}
     if execution_codebook in {8, 9, 13, 14} and candidate.startswith("STD:"):
@@ -451,11 +472,15 @@ def _cuda_candidate_id(row: Mapping[str, str], context: str) -> str:
     """Reconstruct one CUDA candidate ID from launchable policy fields."""
 
     strategy = row["strategy"].strip().upper()
+    staging = int(row["staging_schedule"])
+    if staging not in (0, 1, 2, 3):
+        raise ValueError(f"{context}: invalid CUDA staging schedule")
+    suffix = f":stage{staging}" if staging else ""
     tile_id = int(row["tile_id"])
     requested_k_partitions = int(row["requested_k_partitions"])
     tile = row["tile"].strip()
     if strategy == "AUTO":
-        if tile_id != -1 or requested_k_partitions != 0 or tile != "AUTO":
+        if tile_id != -1 or requested_k_partitions != 0 or tile != "AUTO" or staging:
             raise ValueError(f"{context}: malformed AUTO candidate")
         return "AUTO"
     if strategy == "STD":
@@ -463,15 +488,15 @@ def _cuda_candidate_id(row: Mapping[str, str], context: str) -> str:
             raise ValueError(f"{context}: invalid CUDA tile ID")
         if tile != CUDA_TILE_NAMES[tile_id] or requested_k_partitions != 1:
             raise ValueError(f"{context}: CUDA tile metadata disagrees")
-        return f"{strategy}:t{tile_id}:full"
+        return f"{strategy}:t{tile_id}:full{suffix}"
     if strategy == "KPART":
         if tile_id not in range(len(CUDA_TILE_NAMES)):
             raise ValueError(f"{context}: invalid CUDA KPART tile ID")
         if tile != CUDA_TILE_NAMES[tile_id] or requested_k_partitions != 0:
             raise ValueError(f"{context}: malformed canonical KPART candidate")
-        return f"KPART:t{tile_id}"
+        return f"KPART:t{tile_id}{suffix}"
     if strategy == "BK256":
-        if tile_id != -2 or tile != "BK256_128x128":
+        if tile_id != -2 or tile != "BK256_128x128" or staging:
             raise ValueError(f"{context}: malformed BK256 candidate")
         if requested_k_partitions != 1:
             raise ValueError(f"{context}: BK256 must own the complete K walk")
@@ -566,6 +591,8 @@ def _read_aggregate_rows(
                 if not math.isfinite(value) or value <= 0.0:
                     raise ValueError(f"{context}: invalid {field}")
             if cell.backend == "cuda":
+                if int(row["observed_staging_schedule"]) != int(row["staging_schedule"]):
+                    raise ValueError(f"{context}: forced CUDA staging did not execute")
                 canonical_kpart_availability.add(_explicit_bool(
                     "canonical_kpart_available",
                     row["canonical_kpart_available"],

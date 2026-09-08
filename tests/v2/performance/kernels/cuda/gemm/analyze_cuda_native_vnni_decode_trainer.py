@@ -12,6 +12,10 @@ separate policy axes. Grouped verifier M=2..16 and M=31 rows inherit the
 complete frozen M=1 arithmetic identity, including its exact K-partition
 count, while independently selecting DP4A row reuse or integer tensor-core
 execution. Exact grouped overlays precede total geometry/M rules in production.
+
+An exact-only refresh may retain an authenticated installed Auto policy. That
+transaction replaces only measured M1 tables: generic and grouped selectors are
+retained verbatim, without fitting or claiming a new generic certificate.
 """
 
 from __future__ import annotations
@@ -217,9 +221,9 @@ def _fast_config(candidate_id: str) -> dict[str, object]:
         raise ValueError(f"{candidate_id} is not a Fast CUDA decode candidate")
     config = candidate.config_json
     family = str(config["family"])
-    if family not in {"wide", "direct", "kpar", "kpar_formula"}:
+    if family not in {"wide", "direct", "kpar", "fused_kpar", "kpar_formula", "fused_kpar_formula"}:
         raise ValueError(f"unsupported CUDA generated family {family!r}")
-    if family == "kpar" and int(config["exact_kb"]) <= 0:
+    if family in {"kpar", "fused_kpar"} and int(config["exact_kb"]) <= 0:
         raise ValueError("CUDA KPAR policy must publish an exact positive KB")
     return config
 
@@ -430,6 +434,85 @@ def append_grouped_dispatch(
         + "\n\n"
         + grouped_include[marker_offset:]
     )
+
+
+def refresh_exact_m1_dispatch(
+    base_include: str,
+    entries: list[FastEntry],
+    *,
+    corpus_digest: str,
+    registry_digest: str,
+    manifest: NativeVNNIShapeManifest,
+) -> str:
+    """Replace exact M1 tables while preserving the installed Auto program.
+
+    This is an emitter-owned composition boundary, like grouped publication
+    above, not a runtime fallback. Require the unchanged generated ABI and a
+    complete retained M1/grouped program before composing. The caller must
+    authenticate the base policy/include pair and validate the timing corpus.
+    New arithmetic still requires grouped byte-equivalence integration tests.
+    """
+
+    # Production shape identity belongs to the shared manifest. Synthetic fit
+    # neighbors must never accidentally acquire exact runtime precedence.
+    production_names = {
+        (shape.n, shape.k): shape.name
+        for shape in reversed(manifest.shapes)
+        if shape.exact_overlay
+    }
+    entries = [
+        replace(entry, shape_name=production_names[(entry.n, entry.k)])
+        for entry in entries if (entry.n, entry.k) in production_names
+    ]
+    keys = {(entry.codebook, entry.execution_mode, entry.n, entry.k) for entry in entries}
+    if not entries or len(keys) != len(entries):
+        raise ValueError("exact refresh requires nonempty, unique production keys")
+    generated = generate_include(
+        entries, [], corpus_digest=corpus_digest,
+        registry_digest=registry_digest, profile=MeasurementProfile.PRODUCTION,
+        exact_only=True,
+    )
+    function = "template <uint8_t CB>\ninline bool selectGeneratedDispatch("
+    generic = "\n    const long long work_items ="
+    grouped = "#define LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2 1"
+    if base_include.count(function) != 1 or generated.count(function) != 1:
+        raise ValueError("exact refresh requires one generated M1 selector")
+    if base_include.count(grouped) != 1:
+        raise ValueError("exact refresh requires the retained grouped selector")
+    base_start = base_include.index(function)
+    fresh_start = generated.index(function)
+    base_abi = base_include[base_include.index("#pragma once"):base_start]
+    fresh_abi = generated[generated.index("#pragma once"):fresh_start]
+    if base_abi != fresh_abi:
+        raise ValueError("exact refresh cannot change the installed selector ABI")
+    grouped_start = base_include.index(grouped)
+    base_m1 = base_include[base_start:grouped_start]
+    if base_m1.count(generic) != 1:
+        raise ValueError("exact refresh requires one retained M1 generic section")
+    tail_start = base_start + base_m1.index(generic)
+    terminal = "    return false;\n}\n"
+    if not generated.endswith(terminal):
+        raise ValueError("exact-only generated M1 termination changed")
+
+    # Keep old provenance explicitly scoped to the retained policy. In
+    # particular, the old full-policy digest must not certify new exact rows.
+    header = base_include[:base_start].replace(
+        "// Common policy digest:", "// Retained base policy digest:"
+    ).replace("// Common corpus digest:", "// Retained base corpus digest:")
+    header = header.replace(
+        "// Decisions: common alias-robust, mode-specific exact oracle + frozen development policy with generic-only sealed certification.",
+        "// Decisions: refreshed measured exact M1 entries + unchanged installed Auto/grouped selectors.",
+    )
+    header = (
+        f"// Exact refresh corpus digest: {corpus_digest}\n"
+        f"// Exact refresh registry digest: {registry_digest}\n"
+        f"// Exact refresh shape manifest digest: {manifest.digest()}\n"
+        "// Retained generic certificate does not certify the refreshed exact entries.\n"
+        + header
+    )
+    # This suffix contains both the complete Auto tree and grouped program;
+    # retaining the bytes proves that neither was silently fitted or changed.
+    return header + generated[fresh_start:-len(terminal)] + base_include[tail_start:]
 
 
 def validate_grouped_generic_totality(
@@ -1154,7 +1237,7 @@ def _require_shape_reachable_candidate_coverage(
             # configuration mapping for every runtime key made this otherwise
             # linear completeness check dominate large retained-corpus replays.
             config = dict(candidate.config_items)
-            if config.get("family") == "kpar_formula":
+            if config.get("family") in {"kpar_formula", "fused_kpar_formula"}:
                 continue
             candidates.append((
                 candidate.effective_candidate_id,
@@ -1234,7 +1317,9 @@ def _shape_enum(family: str) -> str:
         "wide": "NativeGemvShape::WIDE",
         "direct": "NativeGemvShape::DIRECT",
         "kpar": "NativeGemvShape::KPAR",
+        "fused_kpar": "NativeGemvShape::FUSED_KPAR",
         "kpar_formula": "NativeGemvShape::KPAR",
+        "fused_kpar_formula": "NativeGemvShape::FUSED_KPAR",
     }[family]
 
 
@@ -1346,7 +1431,7 @@ def _grouped_m_upper_bounds(
 def _resolved_tuning_lines(config: dict[str, object]) -> list[str]:
     """Render a concrete tuning assignment for a static or formula candidate."""
 
-    if config["family"] != "kpar_formula":
+    if config["family"] not in {"kpar_formula", "fused_kpar_formula"}:
         return [
             f"            tuning = GeneratedDispatchTuning{_tuning_literal(config)};"
         ]
@@ -1354,17 +1439,20 @@ def _resolved_tuning_lines(config: dict[str, object]) -> list[str]:
     cpt = int(config["cpt"])
     maximum = int(config["max_kb"])
     formula_kind = str(config["formula_kind"])
+    # Widen before the ceil addition: positive int-sized N near INT_MAX is a
+    # legal generic key even though it cannot fit the compact exact-table key.
+    grid_n = f"static_cast<int>((static_cast<long long>(n) + {tile_n} - 1) / {tile_n})"
     if formula_kind == "target_blocks":
         resolver = (
             "resolveGeneratedTargetBlocksKBlocks("
-            f"(n + {tile_n} - 1) / {tile_n}, k / 32, "
+            f"{grid_n}, k / 32, "
             f"{int(config['target_blocks'])}, "
             f"{int(config['min_kgroups_per_cta'])}, {maximum})"
         )
     elif formula_kind == "canonical_target_blocks":
         resolver = (
             "resolveGeneratedCanonicalTargetBlocksKBlocks("
-            f"(n + {tile_n} - 1) / {tile_n}, k / 32, "
+            f"{grid_n}, k / 32, "
             f"{int(config['target_blocks'])}, "
             f"{int(config['min_kgroups_per_cta'])}, {maximum})"
         )
@@ -1697,8 +1785,15 @@ def generate_include(
                 aspect_condition(rule.domain.aspect_bucket),
                 *(predicate_condition(predicate) for predicate in rule.predicates),
             ]
-            if config["family"] == "kpar":
-                conditions.append(f"k / 32 >= {int(config['exact_kb'])}")
+            if config["family"] in {"kpar", "fused_kpar"}:
+                # A complementary predicate tree proves coverage only if every
+                # leaf is total on its geometry domain. Literal partition counts
+                # are exact-overlay evidence, never generic leaves with hidden
+                # admission guards. Shape-resolved formulas carry that policy.
+                raise ValueError(
+                    "literal KPAR counts cannot own generic dispatch; "
+                    f"use a shape-resolved formula: {rule.candidate_id}"
+                )
             lines.extend(render_if_header(conditions, indent="        "))
             lines.extend([
                 "        {",
@@ -2086,6 +2181,14 @@ def main() -> int:
         help="Emit exact M1 entries without uncertified generic rules",
     )
     parser.add_argument(
+        "--retain-auto-policy-json", type=Path,
+        help="With --exact-only, authenticate and retain an installed Auto policy without fitting",
+    )
+    parser.add_argument(
+        "--retain-auto-include", type=Path,
+        help="Installed generated include paired with --retain-auto-policy-json",
+    )
+    parser.add_argument(
         "--certify-generic",
         action="store_true",
         help=(
@@ -2229,6 +2332,20 @@ def main() -> int:
     parser.add_argument("--sealed-driver-runtime", default="")
     parser.add_argument("--sealed-serial-m1-policy-hash", default="")
     args = parser.parse_args()
+
+    retain_auto = args.retain_auto_policy_json is not None
+    if retain_auto != (args.retain_auto_include is not None):
+        parser.error("retaining Auto requires both policy JSON and generated include")
+    if retain_auto:
+        if not args.exact_only or not args.require_fast_m1_complete or (
+            args.profile != MeasurementProfile.PRODUCTION.value
+        ):
+            parser.error("retaining Auto requires --exact-only --require-fast-m1-complete --profile production")
+        if args.verifier_input or args.certified_m1_include:
+            parser.error("exact Auto refresh cannot also republish grouped evidence")
+        validate_installable_policy_artifact(
+            args.retain_auto_policy_json, include_path=args.retain_auto_include,
+        )
 
     sealed_context_values = (
         args.sealed_run_id,
@@ -2697,6 +2814,12 @@ def main() -> int:
             corpus_digest=corpus.digest(),
             registry_digest=candidate_registry_digest(),
             profile=context.profile,
+        )
+    elif retain_auto:
+        generated = refresh_exact_m1_dispatch(
+            args.retain_auto_include.read_text(encoding="utf-8"), entries,
+            corpus_digest=corpus.digest(), registry_digest=candidate_registry_digest(),
+            manifest=load_shape_manifest(args.shape_manifest),
         )
     else:
         generated = generate_include(

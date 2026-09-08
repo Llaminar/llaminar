@@ -3,7 +3,9 @@
  * @brief C++ implementation of ROCm Flash Attention kernel methods
  *
  * Implements ITensorAttention interface by delegating to HIP kernels
- * defined in ROCmFlashAttentionKernels.hip.
+ * defined in ROCmFlashAttentionKernels.hip. Decode owns one capacity-stable
+ * parallel split envelope for ordinary and grouped rows. Deterministic mode
+ * uses the same ordered reduction rather than serializing each KV traversal.
  *
  * Target Architecture: AMD MI50 (gfx906 / Vega 20)
  *
@@ -463,6 +465,8 @@ namespace llaminar2
          * device ordinal. The captured grid therefore remains invariant while
          * the HIP kernel activates the appropriate split and wavefront prefix
          * from device-resident sequence metadata.
+         * Determinism does not alter this envelope: both row modes already
+         * share a fixed split partition and an ascending-partition reducer.
          *
          * gfx906 can retain seven 36-VGPR wavefronts per SIMD for the native
          * FP16 decode kernel. One 256-thread workgroup contributes one
@@ -477,9 +481,6 @@ namespace llaminar2
             int n_heads,
             int device_idx)
         {
-            if (debugEnv().gemm.deterministic)
-                return 1;
-
             if (kv_capacity <= 0 || n_heads <= 0 || device_idx < 0)
             {
                 throw std::invalid_argument(

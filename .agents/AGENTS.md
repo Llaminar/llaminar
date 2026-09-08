@@ -227,6 +227,9 @@ single-source.
 - `.agents/nativevnni-gemm-tuning/SKILL.md`: cross-backend NativeVNNI
   GEMV/GEMM candidate tuning, evidence collection, dispatch installation, and
   corpus certification.
+- `.agents/llama-cpp-comparison/SKILL.md`: matched Release comparisons against
+  llama.cpp, exact bucket-aligned prompts, paired phase/kernel attribution, and
+  overlap-aware performance evidence.
 
 Do not copy skill bodies into `.codex/`, `.claude/`, or `.github/`; add or
 update symlinks. Backend profiler commands, metric interpretation, and tuning

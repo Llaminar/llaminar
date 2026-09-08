@@ -3,7 +3,8 @@
  * @brief Physical CUDA NativeVNNI GEMV shard implementation.
  *
  * Three shape-specific kernel families:
- *   - **Wide**:     N >> K  (LM_Head only, N/K >= 44) — TILE_N columns per CTA, shared-memory A broadcast
+ *   - **Wide**:     N >> K (LM_Head only, N/K >= 44) — TILE_N columns per CTA,
+ *                    cache-broadcast activation loads without CTA barriers
  *   - **KPar**:     default (Attention, FFN_Up, FFN_Down) — K-split across CTAs,
  *                    two-phase reduction via partials buffer (no atomicAdd contention)
  *   - **Direct**:   Small N ≤ 512 (KV projections) — one thread per column, smem A broadcast
@@ -15,8 +16,9 @@
  *   is no completion-order publication regime.
  *
  * All kernels decode the compact native payload inline and use dp4a for INT8 dot products.
- * The A (activation) vector is cached in shared memory once per K-block, eliminating
- * redundant global memory reads that plague the naive one-thread-per-column approach.
+ * WIDE and KPAR read each activation block through the device caches, allowing
+ * their warps to advance independently. Cooperative families use explicit
+ * shared-memory staging only where their intra-CTA data exchange requires it.
  *
  * Dispatch is tuned from the automated native-vnni sweep harness across all supported
  * codebooks and representative Qwen decode shapes.
@@ -24,6 +26,7 @@
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+#include "kernels/cuda/gemm/CUDACanonicalKpartFold.h"
 #include "kernels/common/NativeVNNIDispatchCache.h"
 #include "backends/BackendManager.h"
 #include "utils/DebugEnv.h"
@@ -76,6 +79,10 @@
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_measureGeneratedDispatchNs)
 #define cudaNativeVNNIGemvTuned_fp32 \
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_fp32)
+#define cudaNativeVNNIGemvTuned_fusedKpar_fp32 \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_fusedKpar_fp32)
+#define cudaNativeVNNIGemvTuned_fusedKpar_resources \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_fusedKpar_resources)
 #define cudaNativeVNNIGemvTuned_fp32_withPolicy \
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_fp32_withPolicy)
 #define cudaNativeVNNIGemvTuned_small_m_fp32 \
@@ -313,8 +320,15 @@ namespace
         WIDE,
         KPAR,
         DIRECT,
-        ROWPAR
+        ROWPAR,
+        FUSED_KPAR
     };
+
+    /** @brief Physical publication may differ while the ordered K tree is identical. */
+    static constexpr bool usesOrderedKpartTree(NativeGemvShape shape)
+    {
+        return shape == NativeGemvShape::KPAR || shape == NativeGemvShape::FUSED_KPAR;
+    }
 
 #include "kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc"
 
@@ -432,7 +446,7 @@ namespace
                 return false;
             }
             if (shape_id < static_cast<int>(NativeGemvShape::WIDE) ||
-                shape_id > static_cast<int>(NativeGemvShape::ROWPAR))
+                shape_id > static_cast<int>(NativeGemvShape::FUSED_KPAR))
             {
                 return false;
             }
@@ -792,6 +806,8 @@ namespace
             return "wide";
         case NativeGemvShape::KPAR:
             return "kpar";
+        case NativeGemvShape::FUSED_KPAR:
+            return "fused_kpar";
         case NativeGemvShape::DIRECT:
             return "direct";
         case NativeGemvShape::ROWPAR:
@@ -883,7 +899,7 @@ namespace
                     std::string(shapeName(shape)) +
                     ".tn" + std::to_string(tuning.tile_n) +
                     ".cpt" + std::to_string(tuning.cpt);
-                if (shape == NativeGemvShape::KPAR)
+                if (usesOrderedKpartTree(shape))
                     candidate += ".kb" + std::to_string(effective_kb);
             }
             else
@@ -902,14 +918,14 @@ namespace
         if (M == 1 &&
             (shape == NativeGemvShape::WIDE ||
              shape == NativeGemvShape::DIRECT ||
-             shape == NativeGemvShape::KPAR))
+             usesOrderedKpartTree(shape)))
         {
             std::string candidate =
                 "cuda.nvnni.decode.fast_m1." +
                 std::string(shapeName(shape)) +
                 ".tn" + std::to_string(tuning.tile_n) +
                 ".cpt" + std::to_string(tuning.cpt);
-            if (shape == NativeGemvShape::KPAR)
+            if (usesOrderedKpartTree(shape))
                 candidate += ".kb" + std::to_string(effective_kb);
             return candidate;
         }
@@ -937,7 +953,7 @@ namespace
             return;
 
         int effective_kb = 1;
-        if (shape == NativeGemvShape::KPAR)
+        if (usesOrderedKpartTree(shape))
         {
             effective_kb = resolveKparKBlocks(
                 (N + tuning.tile_n - 1) / tuning.tile_n,
@@ -1130,9 +1146,33 @@ namespace
     //
     // Each CTA processes TILE_N output columns.
     // Each thread owns CPT consecutive columns.
-    // A vector cached in shared memory per K-block (32 bytes = 8 int32_t).
-    // Each thread decodes its weight payload block and dp4a against shared A.
+    // Each warp reads the same activation block through the device caches;
+    // no shared per-iteration state forces different warps to rendezvous.
     // =====================================================================
+    /**
+     * @brief Evaluate independent output columns in ascending canonical K order.
+     *
+     * Activation reads use the same aligned int4 loads as KPAR. Eliminating
+     * the previous shared activation slot removes two CTA barriers per block
+     * without changing payload decoding, contributions, or the FP32 fold.
+     *
+     * @tparam TILE_N Output columns owned by one CTA.
+     * @tparam CPT Consecutive output columns owned by one thread.
+     * @tparam CB Canonical execution codebook of the prepared payload.
+     * @param d_A_int8 Immutable 16-byte-aligned activation row, K elements.
+     * @param d_payload Prepared block-major packed weights.
+     * @param d_scales Canonical FP16 primary scale bits for each weight block.
+     * @param d_mins Optional asymmetric minimum or secondary scale bits.
+     * @param d_emins Optional packed low/high minimum bits for Q2_K.
+     * @param d_C Destination FP32 row, with exactly N writable elements.
+     * @param d_scales_A Per-32-element FP32 activation scales.
+     * @param N Positive output width, including partially populated CTA tails.
+     * @param K Positive input width divisible by the 32-element block size.
+     * @param alpha Scale applied after the ascending block-contribution fold.
+     * @param beta Scale applied to the optional existing output.
+     * @param d_C_existing Optional existing output used when beta is nonzero.
+     * @param d_bias Optional final per-column bias.
+     */
     template <int TILE_N, int CPT, uint8_t CB>
     __global__ void nativeVnniGemv_wide(
         const int8_t *__restrict__ d_A_int8,
@@ -1151,9 +1191,6 @@ namespace
 
         const int blocks_per_row = K / BLOCK_K;
 
-        // Shared memory: 8 int32_t = 32 bytes for the A activation block
-        __shared__ int32_t smem_A[8];
-
         float acc[CPT];
 #pragma unroll
         for (int c = 0; c < CPT; ++c)
@@ -1161,20 +1198,16 @@ namespace
 
         for (int blk = 0; blk < blocks_per_row; ++blk)
         {
-            /*
-             * Every thread must remain alive through both CTA barriers, even
-             * on the final partially populated N tile. Returning threads with
-             * n_base >= N here leaves the valid tail threads waiting at a
-             * CTA-wide barrier and permits them to consume undefined shared
-             * activation state. Invalid columns simply skip their arithmetic
-             * and final publication below.
-             */
-            if (threadIdx.x < 8)
-            {
-                smem_A[threadIdx.x] = *reinterpret_cast<const int32_t *>(
-                    d_A_int8 + blk * BLOCK_K + threadIdx.x * 4);
-            }
-            __syncthreads();
+            // Every lane consumes identical activation bytes. The L1 cache
+            // services those broadcast reads while warps independently fetch
+            // their weights; a shared slot would serialize both ends of every
+            // iteration. K remains block-aligned even on a partial N tile.
+            const int4 *a = reinterpret_cast<const int4 *>(
+                d_A_int8 + blk * BLOCK_K);
+            const int4 lo = a[0];
+            const int4 hi = a[1];
+            const int32_t a_vals[8] = {
+                lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
 
             const float scale_a = d_scales_A[blk];
 
@@ -1194,7 +1227,7 @@ namespace
                 llaminar2::cuda_native_vnni::decode_groups<CB>(payload, packed_groups);
 
                 const float contribution = native_vnni_block_contribution_rn<CB>(
-                    smem_A,
+                    a_vals,
                     packed_groups,
                     payload,
                     d_scales,
@@ -1205,7 +1238,6 @@ namespace
                 acc[c] = __fadd_rn(acc[c], contribution);
             }
 
-            __syncthreads(); // Ensure smem_A is not overwritten before all threads finish
         }
 
 // Write output with alpha/beta/bias
@@ -1340,6 +1372,132 @@ namespace
                 d_C[split_idx * N + n] = alpha * acc[c];
             }
         }
+    }
+
+    /**
+     * @brief Publish one canonical KPAR row without a global intermediate/reducer.
+     * @tparam CB Physical packed codebook owned by this translation-unit shard.
+     * @tparam Columns Compiled output-column width, independent of arithmetic KB.
+     *
+     * Thread x owns a column and thread y owns its unchanged K partition. The
+     * block contribution helper and ascending FP32 fold are exactly those of
+     * the two-dispatch implementation. Only the location of partials changes.
+     * Every lane reaches the single barrier, including tails and empty splits.
+     * Output and existing may alias: each column has exactly one final writer.
+     * All other storage is persistent, caller-owned, and immutable during replay.
+     * @param activations One aligned quantized activation row [K].
+     * @param payload Packed production weight blocks, unchanged by this candidate.
+     * @param scales Primary metadata for [K/32,N].
+     * @param secondary Required asymmetric/dual-scale metadata, otherwise optional.
+     * @param extended_minima Required dual-asymmetric correction metadata.
+     * @param output Final FP32 row [N], with one unique writer per column.
+     * @param activation_scales FP32 activation block scales [K/32].
+     * @param n Positive output-column count.
+     * @param k Positive reduction length in multiples of BLOCK_K.
+     * @param kb Unchanged canonical partition count, equal to blockDim.y.
+     * @param alpha Coefficient applied to each partial before folding.
+     * @param beta Coefficient applied to the existing row after folding.
+     * @param existing Previous output, required when beta is nonzero.
+     * @param bias Optional per-column bias applied last.
+     */
+    template <uint8_t CB, int Columns>
+    __global__ void nativeVnniGemv_fusedKpar(
+        const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
+        const uint16_t *secondary, const uint32_t *extended_minima, float *output,
+        const float *activation_scales, int n, int k, int kb, float alpha,
+        float beta, const float *existing, const float *bias)
+    {
+        extern __shared__ float partials[];
+        const int lane = threadIdx.x;
+        const int partition = threadIdx.y;
+        const int column = blockIdx.x * Columns + lane;
+        const int span = (k / BLOCK_K + kb - 1) / kb;
+        const int begin = partition * span;
+        const int end = min(k / BLOCK_K, begin + span);
+        float accumulator = 0.0f;
+        // Returning for a tail column would strand its peers at the barrier.
+        // Empty partitions also publish alpha*0, including signed-zero policy.
+        if (column < n)
+            for (int block = begin; block < end; ++block)
+            {
+                const auto *a = reinterpret_cast<const int4 *>(activations + block * BLOCK_K);
+                const int4 low = a[0], high = a[1];
+                const int32_t values[8] = {
+                    low.x, low.y, low.z, low.w, high.x, high.y, high.z, high.w};
+                const size_t linear = static_cast<size_t>(block) * n + column;
+                const auto *packed = payload + linear *
+                    llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CB>();
+                int32_t groups[8];
+                llaminar2::cuda_native_vnni::decode_groups_vec<CB>(packed, groups);
+                accumulator = __fadd_rn(accumulator, native_vnni_block_contribution_rn<CB>(
+                    values, groups, packed, scales, secondary, extended_minima,
+                    linear, activation_scales[block]));
+            }
+        partials[partition * Columns + lane] = alpha * accumulator;
+        __syncthreads();
+        if (partition == 0 && column < n)
+        {
+            // Fold, alpha placement, beta, and bias match nativeVnniGemv_reduce.
+            float value = 0.0f;
+            for (int part = 0; part < kb; ++part)
+                value += partials[part * Columns + lane];
+            if (beta != 0.0f)
+                value += beta * existing[column];
+            if (bias)
+                value += bias[column];
+            output[column] = value;
+        }
+    }
+
+    /** @brief Query one exact compiled fold, before capture/timing eligibility. */
+    template <uint8_t CB, int Columns>
+    bool fusedKparResources(const llaminar2::CUDACanonicalKpartFoldPlan &plan,
+                            llaminar2::CUDACanonicalKpartFoldResources &resources)
+    {
+        cudaFuncAttributes attributes{};
+        int active_blocks = 0;
+        if (cudaFuncGetAttributes(&attributes, nativeVnniGemv_fusedKpar<CB, Columns>) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active_blocks, nativeVnniGemv_fusedKpar<CB, Columns>,
+                plan.threads(), plan.sharedBytes()) != cudaSuccess)
+            return false;
+        resources = {attributes.numRegs, attributes.localSizeBytes, attributes.sharedSizeBytes,
+                     attributes.maxThreadsPerBlock, active_blocks};
+        return true;
+    }
+
+    /** @brief Submit one admitted candidate; never alter its arithmetic partition tree. */
+    template <uint8_t CB>
+    bool launchFusedKpar(
+        const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
+        const uint16_t *secondary, const uint32_t *extended_minima, float *output,
+        const float *activation_scales, int n, float alpha, float beta,
+        const float *existing, const float *bias, cudaStream_t stream,
+        const llaminar2::CUDACanonicalKpartFoldPlan &plan)
+    {
+        using Traits = llaminar2::cuda_native_vnni::CodebookTraits<CB>;
+        if constexpr (Traits::is_dual_scale || Traits::is_asymmetric)
+            if (!secondary) return false;
+        if constexpr (Traits::is_dual_scale_asym)
+            if (!extended_minima) return false;
+        const auto launch = [&]<int Columns>() {
+            // Division without n+Columns-1 avoids overflow near the ABI limit.
+            nativeVnniGemv_fusedKpar<CB, Columns><<<
+                1 + (n - 1) / Columns, dim3(Columns, plan.partitions()),
+                plan.sharedBytes(), stream>>>(
+                activations, payload, scales, secondary, extended_minima, output,
+                activation_scales, n, plan.reductionElements(), plan.partitions(),
+                alpha, beta, existing, bias);
+            return cudaGetLastError() == cudaSuccess;
+        };
+        switch (plan.columns())
+        {
+        case llaminar2::CUDACanonicalKpartColumns::Sixteen:
+            return launch.template operator()<16>();
+        case llaminar2::CUDACanonicalKpartColumns::ThirtyTwo:
+            return launch.template operator()<32>();
+        }
+        return false;
     }
 
     // Kernel family 5: ROWPAR (Row-Parallel) — GEMV with one block per output row.
@@ -2475,7 +2633,7 @@ namespace
         cudaStream_t stream)
     {
         int kb = 1;
-        if (serial_shape == NativeGemvShape::KPAR)
+        if (usesOrderedKpartTree(serial_shape))
         {
             const int serial_grid_n =
                 (N + serial_tuning.tile_n - 1) / serial_tuning.tile_n;
@@ -2669,6 +2827,24 @@ namespace
     {
         g_last_effective_kb = 1;
         const int tile_key = tuning.tile_n * 100 + tuning.cpt;
+
+        if (shape == NativeGemvShape::FUSED_KPAR)
+        {
+            // The candidate owns an exact partition identity, not an occupancy
+            // request. Never round it to fit a CTA or silently use another family.
+            if ((tuning.tile_n != 16 && tuning.tile_n != 32) ||
+                tuning.cpt != 1 || tuning.force_two_phase != 1 ||
+                tuning.target_waves != 0 || tuning.mkg != 0 || tuning.max_kb != 0)
+                return false;
+            const auto plan = llaminar2::CUDACanonicalKpartFoldPlan::create(
+                static_cast<llaminar2::CUDACanonicalKpartColumns>(tuning.tile_n),
+                tuning.exact_kb, K);
+            if (!plan) return false;
+            g_last_effective_kb = plan->partitions();
+            return launchFusedKpar<CB>(
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, N, alpha, beta, d_C_existing, d_bias, stream, *plan);
+        }
 
         if (shape == NativeGemvShape::WIDE || shape == NativeGemvShape::DIRECT)
         {
@@ -3010,6 +3186,9 @@ namespace
             case 3:
                 shape = NativeGemvShape::ROWPAR;
                 break;
+            case 6:
+                shape = NativeGemvShape::FUSED_KPAR;
+                break;
             default:
                 return false;
             }
@@ -3141,6 +3320,9 @@ namespace
                 break;
             case 3:
                 shape = NativeGemvShape::ROWPAR;
+                break;
+            case 6:
+                shape = NativeGemvShape::FUSED_KPAR;
                 break;
             default:
                 return false;
@@ -3325,6 +3507,26 @@ namespace
                 cudaGetLastError();
                 return false;
             }
+        }
+
+        if (shape == NativeGemvShape::FUSED_KPAR)
+        {
+            if (tuning.tile_n != 16 && tuning.tile_n != 32) return false;
+            const auto plan = llaminar2::CUDACanonicalKpartFoldPlan::create(
+                static_cast<llaminar2::CUDACanonicalKpartColumns>(tuning.tile_n),
+                tuning.exact_kb, K);
+            if (!plan || tuning.cpt != 1 || tuning.force_two_phase != 1)
+                return false;
+            // Grouped DP4A owns rows jointly and uses its existing ordered
+            // producer/reducer. Column ownership is arithmetic-neutral; freeze
+            // the exact KB from M1, while using its compiled 32-column tile.
+            auto grouped_tuning = tuning;
+            grouped_tuning.tile_n = 32;
+            return dispatchKparSmallMGenerated<CB>(
+                grouped_tuning, grouped_rows,
+                d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
+                d_scales_A, M, N, K, alpha, beta, d_C_existing, d_bias,
+                gemv_ctx, cuda_device_id, stream);
         }
 
         if (shape == NativeGemvShape::KPAR)
@@ -3739,6 +3941,7 @@ extern "C"
             *k_partitions = 1;
             return true;
         case NativeGemvShape::KPAR:
+        case NativeGemvShape::FUSED_KPAR:
         {
             const int resolved_partitions = resolveKparKBlocks(
                 (n + tuning.tile_n - 1) / tuning.tile_n,
@@ -3796,6 +3999,45 @@ extern "C"
             return -1.0;
         }
 #undef LLAMINAR_MEASURE_CUDA_NVNNI_CODEBOOK
+    }
+
+    /** @brief Submit the header-declared fold after public stream/buffer validation. */
+    bool cudaNativeVNNIGemvTuned_fusedKpar_fp32(
+        const int8_t *activations, const uint8_t *payload, const uint16_t *scales,
+        const uint16_t *secondary, const uint32_t *extended_minima, float *output,
+        const float *activation_scales, int n, float alpha, float beta,
+        const float *existing, const float *bias, uint8_t codebook_id, int device,
+        void *raw_stream, const llaminar2::CUDACanonicalKpartFoldPlan &plan)
+    {
+        // The thin public bridge is the single stream/context admission owner.
+        // Shards own only codebook-specific metadata checks and native templates.
+        const auto stream = static_cast<cudaStream_t>(raw_stream);
+        (void)device;
+#define LLAMINAR_LAUNCH_FUSED_KPAR(CB) \
+        case CB: return launchFusedKpar<CB>(activations, payload, scales, secondary, \
+            extended_minima, output, activation_scales, n, alpha, beta, existing, bias, stream, plan)
+        switch (codebook_id)
+        {
+            LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(LLAMINAR_LAUNCH_FUSED_KPAR);
+        default: return false;
+        }
+#undef LLAMINAR_LAUNCH_FUSED_KPAR
+    }
+
+    /** @brief Query one physical codebook's compiled fold geometry and resources. */
+    bool cudaNativeVNNIGemvTuned_fusedKpar_resources(
+        uint8_t codebook_id, const llaminar2::CUDACanonicalKpartFoldPlan &plan,
+        llaminar2::CUDACanonicalKpartFoldResources &resources)
+    {
+#define LLAMINAR_QUERY_FUSED_KPAR(CB) \
+        case CB: return plan.columns() == llaminar2::CUDACanonicalKpartColumns::Sixteen \
+            ? fusedKparResources<CB, 16>(plan, resources) : fusedKparResources<CB, 32>(plan, resources)
+        switch (codebook_id)
+        {
+            LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(LLAMINAR_QUERY_FUSED_KPAR);
+        default: return false;
+        }
+#undef LLAMINAR_QUERY_FUSED_KPAR
     }
 
     bool cudaNativeVNNIGemvTuned_fp32(
@@ -3994,10 +4236,11 @@ extern "C"
     // Sweep config API — set/clear the global override that dispatchCodebook
     // reads to bypass heuristics during automated tuning sweeps.
     //
-    // kernel_family: 0=WIDE, 1=KPAR, 2=DIRECT
+    // kernel_family: 0=WIDE, 1=KPAR, 2=DIRECT, 3=ROWPAR, 6=FUSED_KPAR
     // exact_kb: 0=generated occupancy policy, >0=one exact trainer schedule
     // force_two_phase is retained in corpus ABI v1 as an authenticated
-    // invariant: KPAR requires 1 (ordered partials), all other families use 0.
+    // invariant: both KPAR forms require 1 (ordered partials), others use 0.
+    // The family, not this historical field, distinguishes shared/global publication.
     // =====================================================================
     void cudaNativeVNNIGemvSweep_setConfig(
         int kernel_family, int tile_n, int cpt,
@@ -4005,7 +4248,7 @@ extern "C"
         int exact_kb,
         int force_two_phase)
     {
-        const bool kpar = kernel_family == 1;
+        const bool kpar = kernel_family == 1 || kernel_family == 6;
         if ((kpar && force_two_phase != 1) ||
             (!kpar && force_two_phase != 0))
         {
@@ -4335,6 +4578,8 @@ extern "C" int cudaNativeVNNIGemvTuned_getSerialPartitionN()
 #undef cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule
 #undef cudaNativeVNNIGemvTuned_measureGeneratedDispatchNs
 #undef cudaNativeVNNIGemvTuned_fp32
+#undef cudaNativeVNNIGemvTuned_fusedKpar_fp32
+#undef cudaNativeVNNIGemvTuned_fusedKpar_resources
 #undef cudaNativeVNNIGemvTuned_fp32_withPolicy
 #undef cudaNativeVNNIGemvTuned_small_m_fp32
 #undef cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy

@@ -21,9 +21,9 @@ from typing import Any, Iterable
 from .schema import Backend, SemanticContract
 
 
-CANDIDATE_REGISTRY_VERSION = "native-vnni-candidates-v11"
+CANDIDATE_REGISTRY_VERSION = "native-vnni-candidates-v13"
 COMPATIBLE_CANDIDATE_REGISTRY_VERSIONS = tuple(
-    f"native-vnni-candidates-v{version}" for version in range(1, 12)
+    f"native-vnni-candidates-v{version}" for version in range(1, 14)
 )
 
 ROCM_MOE_GROUPED_PREFILL = "rocm_moe_grouped_prefill"
@@ -743,7 +743,7 @@ def cpu_native_vnni_prefill_registry() -> CandidateRegistry:
 def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
     """Return effective public-M1 and grouped-verifier CUDA candidates.
 
-    Public CUDA M1 decode uses ordered two-phase KPAR publication, but no longer
+    Public CUDA M1 decode uses ordered KPAR publication, but no longer
     collapses every candidate to KB1. An exact KB is part of the arithmetic
     identity because it fixes partition boundaries and FP32 parenthesization.
     The forceable inventory is dense through KB256 so existing and newly learned
@@ -751,6 +751,10 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
     Sweep profiles may use a coarse subset followed by local refinement, but the
     emitted winner must be one of these exact candidates. A winner at KB256 is a
     boundary signal and must expand this axis before policy promotion.
+
+    Fused KPAR preserves that exact arithmetic with CTA-local partials and one
+    output writer. Its two physical widths have different native thread limits;
+    those limits constrain admission, never silently clamp the selected KB.
 
     Grouped runtime-M verifier publication is a separate production candidate. It
     inherits the frozen public-M1 family and tuning for the exact runtime key;
@@ -826,20 +830,65 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
                 workspace="CUDANativeVNNIKPartWorkspace-v2",
             ))
 
+    for columns in (16, 32):
+        for kb in range(1, 1024 // columns + 1):
+            entries.append(_candidate(
+                backend=Backend.CUDA,
+                surface=CUDA_NATIVE_VNNI_GEMV,
+                candidate_id=(
+                    f"cuda.nvnni.decode.fast_m1.fused_kpar.tn{columns}.cpt1.kb{kb}"
+                ),
+                aliases=(),
+                family="cuda_public_m1_fused_kpar",
+                config={
+                    "family": "fused_kpar",
+                    "tile_n": columns,
+                    "cpt": 1,
+                    "target_waves": 0,
+                    "min_kgroups_per_cta": 0,
+                    "max_kb": 0,
+                    "exact_kb": kb,
+                    # Historical ABI spelling authenticates ordered partials;
+                    # the physical family distinguishes shared/global storage.
+                    "force_two_phase": 1,
+                },
+                arithmetic=(
+                    "public-M1 disjoint K-partition outputs and ascending FP32 "
+                    f"reduction, KB={kb}-v3"
+                ),
+                schedule=f"cuda-public-m1-fused-kpar-tn{columns}-kb{kb}-v1",
+                contracts=(SemanticContract.FAST,),
+                resources=("native_vnni_prepared_weights",),
+                workspace="CUDANativeVNNIGemvWorkspace-v1",
+            ))
+
     # Generic policy candidates resolve a concrete exact KB from N and K. The
     # selected formula is deterministic and M-independent; grouped verifier
     # publication therefore receives the same concrete partition tree as
     # serial M1. Their costs are projected only from directly measured exact-KB
     # rows by cuda_shape_resolved.py.
-    for tile_n, cpt in (
-        (128, 1), (128, 2), (256, 2), (256, 4),
-        (64, 1), (64, 2), (32, 1),
-    ):
+    formula_geometries = (
+        *(("kpar", n, cpt, 256) for n, cpt in (
+            (128, 1), (128, 2), (256, 2), (256, 4),
+            (64, 1), (64, 2), (32, 1),
+        )),
+        *(("fused_kpar", n, 1, 1024 // n) for n in (16, 32)),
+    )
+    for physical_family, tile_n, cpt, maximum_kb in formula_geometries:
+        # Only the nominal formula varies with geometry. Its resolved launch
+        # remains one immutable, directly measured exact-KB registry entry.
+        formula_family = f"{physical_family}_formula"
+        schedule_family = physical_family.replace("_", "-")
+        resources = ("native_vnni_prepared_weights",)
+        workspace = "CUDANativeVNNIGemvWorkspace-v1"
+        if physical_family == "kpar":
+            resources += ("ordered_kpart_partials",)
+            workspace = "CUDANativeVNNIKPartWorkspace-v2"
         for target_waves in range(1, 41):
             for min_kgroups_per_cta in (1, 2, 4, 8):
                 target_blocks = 82 * target_waves
                 candidate_id = (
-                    "cuda.nvnni.decode.fast_m1.kpar_formula."
+                    f"cuda.nvnni.decode.fast_m1.{formula_family}."
                     f"tn{tile_n}.cpt{cpt}.tb{target_blocks}."
                     f"mkg{min_kgroups_per_cta}"
                 )
@@ -848,15 +897,15 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
                     surface=CUDA_NATIVE_VNNI_GEMV,
                     candidate_id=candidate_id,
                     aliases=(),
-                    family="cuda_public_m1_kpar_formula",
+                    family=f"cuda_public_m1_{formula_family}",
                     config={
-                        "family": "kpar_formula",
+                        "family": formula_family,
                         "formula_kind": "target_blocks",
                         "tile_n": tile_n,
                         "cpt": cpt,
                         "target_blocks": target_blocks,
                         "min_kgroups_per_cta": min_kgroups_per_cta,
-                        "max_kb": 256,
+                        "max_kb": maximum_kb,
                         "force_two_phase": 1,
                     },
                     arithmetic=(
@@ -864,18 +913,15 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
                         "reduction; absolute target-block nearest-factor formula-v1"
                     ),
                     schedule=(
-                        f"cuda-public-m1-kpar-formula-tn{tile_n}-cpt{cpt}-"
+                        f"cuda-public-m1-{schedule_family}-formula-tn{tile_n}-cpt{cpt}-"
                         f"tb{target_blocks}-mkg{min_kgroups_per_cta}-v1"
                     ),
                     contracts=(SemanticContract.FAST,),
-                    resources=(
-                        "native_vnni_prepared_weights",
-                        "ordered_kpart_partials",
-                    ),
-                    workspace="CUDANativeVNNIKPartWorkspace-v2",
+                    resources=resources,
+                    workspace=workspace,
                 ))
                 canonical_id = (
-                    "cuda.nvnni.decode.fast_m1.kpar_formula."
+                    f"cuda.nvnni.decode.fast_m1.{formula_family}."
                     f"tn{tile_n}.cpt{cpt}.ctb{target_blocks}."
                     f"mkg{min_kgroups_per_cta}"
                 )
@@ -884,15 +930,15 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
                     surface=CUDA_NATIVE_VNNI_GEMV,
                     candidate_id=canonical_id,
                     aliases=(),
-                    family="cuda_public_m1_kpar_formula",
+                    family=f"cuda_public_m1_{formula_family}",
                     config={
-                        "family": "kpar_formula",
+                        "family": formula_family,
                         "formula_kind": "canonical_target_blocks",
                         "tile_n": tile_n,
                         "cpt": cpt,
                         "target_blocks": target_blocks,
                         "min_kgroups_per_cta": min_kgroups_per_cta,
-                        "max_kb": 256,
+                        "max_kb": maximum_kb,
                         "force_two_phase": 1,
                     },
                     arithmetic=(
@@ -901,19 +947,16 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
                         "partition-width formula-v1"
                     ),
                     schedule=(
-                        f"cuda-public-m1-kpar-formula-tn{tile_n}-cpt{cpt}-"
+                        f"cuda-public-m1-{schedule_family}-formula-tn{tile_n}-cpt{cpt}-"
                         f"ctb{target_blocks}-mkg{min_kgroups_per_cta}-v1"
                     ),
                     contracts=(SemanticContract.FAST,),
-                    resources=(
-                        "native_vnni_prepared_weights",
-                        "ordered_kpart_partials",
-                    ),
-                    workspace="CUDANativeVNNIKPartWorkspace-v2",
+                    resources=resources,
+                    workspace=workspace,
                 ))
         for blocks_per_partition in range(1, 65):
             candidate_id = (
-                "cuda.nvnni.decode.fast_m1.kpar_formula."
+                f"cuda.nvnni.decode.fast_m1.{formula_family}."
                 f"tn{tile_n}.cpt{cpt}.bpp{blocks_per_partition}"
             )
             entries.append(_candidate(
@@ -921,14 +964,14 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
                 surface=CUDA_NATIVE_VNNI_GEMV,
                 candidate_id=candidate_id,
                 aliases=(),
-                family="cuda_public_m1_kpar_formula",
+                family=f"cuda_public_m1_{formula_family}",
                 config={
-                    "family": "kpar_formula",
+                    "family": formula_family,
                     "formula_kind": "blocks_per_partition",
                     "tile_n": tile_n,
                     "cpt": cpt,
                     "blocks_per_partition": blocks_per_partition,
-                    "max_kb": 256,
+                    "max_kb": maximum_kb,
                     "force_two_phase": 1,
                 },
                 arithmetic=(
@@ -936,15 +979,12 @@ def cuda_native_vnni_gemv_registry() -> CandidateRegistry:
                     "reduction; fixed K-groups-per-partition formula-v1"
                 ),
                 schedule=(
-                    f"cuda-public-m1-kpar-formula-tn{tile_n}-cpt{cpt}-"
+                    f"cuda-public-m1-{schedule_family}-formula-tn{tile_n}-cpt{cpt}-"
                     f"bpp{blocks_per_partition}-v1"
                 ),
                 contracts=(SemanticContract.FAST,),
-                resources=(
-                    "native_vnni_prepared_weights",
-                    "ordered_kpart_partials",
-                ),
-                workspace="CUDANativeVNNIKPartWorkspace-v2",
+                resources=resources,
+                workspace=workspace,
             ))
 
     for grouped_rows in (2, 4, 8, 16, 32, 64):

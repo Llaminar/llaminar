@@ -1,6 +1,10 @@
 /**
  * @file Test__GpuWorkspaceAllocationPolicy.cpp
  * @brief Source-level guards for capture-sensitive GPU workspace allocation policy.
+ *
+ * These architecture checks forbid hidden allocation, transfer and lifetime
+ * repair paths. Named capture boundaries must share the production lowering
+ * authority; device integration tests separately prove their runtime behavior.
  */
 
 #include <gtest/gtest.h>
@@ -16742,13 +16746,28 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_NE(
         conditional_fragment_lowerer.find("cudaGraphCondTypeIf"),
         std::string::npos);
-    EXPECT_EQ(
-        countOccurrences(
-            conditional_builder,
-            "appendDeviceControlledFragment("),
-        2u)
-        << "Fixed and dynamic selector-gated WHILE must share exactly one typed "
-           "fragment-lowering authority.";
+    // Every model/sampler fragment belongs behind one request-health predicate.
+    // First-sample selection is a body conditional, not a pre-admission prologue.
+    const auto fixed_builder = sliceBetween(
+        conditional_builder,
+        "boolCUDAGraphCapture::buildDeviceControlledWhileLoop(",
+        "boolCUDAGraphCapture::buildDeviceControlledSelectorWhileLoop(");
+    const auto fixed_body = sliceBetween(
+        fixed_builder, "cudaGraph_tloop_body=",
+        "cudaGraphNode_tpredicate_node=");
+    const auto selector_builder = sliceBetween(
+        conditional_builder,
+        "boolCUDAGraphCapture::buildDeviceControlledSelectorWhileLoop(",
+        "returntransaction_tail!=nullptr;");
+    for (const auto *region : {&fixed_body, &selector_builder})
+    {
+        EXPECT_EQ(countOccurrences(*region, "appendDeviceControlledFragment("), 1u)
+            << "Each named program region must reuse the one typed fragment-lowering authority.";
+    }
+    EXPECT_NE(fixed_builder.find(
+        "cudaGraphAddKernelNode(&initial_predicate_node,graph_,nullptr,0,"),
+        std::string::npos)
+        << "Entry health must precede every model or sampler operation.";
     EXPECT_EQ(
         cuda_capture.find("lowerCudaConditionalBodyEventHandoffs"),
         std::string::npos)

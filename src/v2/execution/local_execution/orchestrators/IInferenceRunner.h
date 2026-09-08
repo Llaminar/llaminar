@@ -5,6 +5,9 @@
  * @date December 2025
  *
  * Interface implemented by DeviceGraphOrchestrator for inference execution.
+ * Participant-local operations and terminal responses cross this boundary;
+ * the shared DeviceGenerationContract owns admission and terminal ledger
+ * validation so rank and device runners cannot define conflicting accounting.
  */
 
 #pragma once
@@ -20,6 +23,7 @@
 
 #include "../../../backends/DeviceId.h"
 #include "../../InferenceReadiness.h"
+#include "../../mtp/DeviceGenerationContract.h"
 #include "../../moe/DeviceMoERebalanceABI.h"
 #include "../../moe/MoEOverlayAuthorityExecution.h"
 #include "../../moe/MoEOverlayDeviceControllerRuntimeBinding.h"
@@ -417,38 +421,6 @@ namespace llaminar2
                    meta_stride >= sampling_math::kSpeculativeBatchMetaCount &&
                    stream != nullptr &&
                    response_ready_event != nullptr;
-        }
-    };
-
-    /**
-     * @brief Immutable request used to admit a device-owned generation ledger.
-     *
-     * The leading-row disposition is part of response correctness, not optional
-     * scheduling metadata. A controller reopened after a rejection must consume
-     * the already-emitted correction as verifier row zero without returning it
-     * twice. Keeping geometry, response budget, and row ownership in one value
-     * prevents rank and backend layers from dropping that state independently.
-     */
-    struct DeviceGenerationAdmissionRequest
-    {
-        int request_count = 0; ///< Number of independent device controller rows.
-        int max_new_tokens = 0; ///< New response-token capacity for each row.
-        /** Exact request-owned policy installed in every device controller. */
-        sampling_math::DeviceGenerationDepthPolicy depth_policy =
-            sampling_math::DeviceGenerationDepthPolicy::fixed(0);
-        sampling_math::DeviceGenerationLeadingRowDisposition
-            initial_leading_row_disposition =
-                sampling_math::DeviceGenerationLeadingRowDisposition::
-                    PendingResponse; ///< Uniform row-zero ownership at admission.
-
-        /** @return true when every field describes a legal controller admission. */
-        [[nodiscard]] bool valid() const noexcept
-        {
-            return request_count > 0 && max_new_tokens > 0 &&
-                   depth_policy.valid() &&
-                   sampling_math::
-                       valid_device_generation_leading_row_disposition(
-                           initial_leading_row_disposition);
         }
     };
 

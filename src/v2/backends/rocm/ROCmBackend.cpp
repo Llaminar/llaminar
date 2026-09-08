@@ -1611,10 +1611,15 @@ namespace llaminar2
         DeviceMoERebalanceDispatchTicket *ticket,
         int device_idx,
         void *stream);
+    /** @brief Exact-stream ordinary publication bridge implemented by the sampling TU. */
+    extern "C" bool rocmOps_publish_ordinary_generation_sample(
+        const sampling_math::OrdinaryGenerationPublication &publication,
+        int device_idx, void *stream);
+
     extern "C" bool rocmOps_initialize_device_generation(
         int request_count,
         int max_new_tokens,
-        const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+        const sampling_math::DeviceGenerationPolicy &depth_policy,
         sampling_math::DeviceGenerationLeadingRowDisposition
             initial_leading_row_disposition,
         int response_token_stride,
@@ -3278,7 +3283,7 @@ namespace llaminar2
     bool ROCmBackend::enqueueInitializeDeviceGeneration(
         int request_count,
         int max_new_tokens,
-        const sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+        const sampling_math::DeviceGenerationPolicy &depth_policy,
         sampling_math::DeviceGenerationLeadingRowDisposition
             initial_leading_row_disposition,
         int response_token_stride,
@@ -3289,11 +3294,10 @@ namespace llaminar2
         void *stream)
     {
         if (device_id < 0 || device_id >= device_count_ ||
-            request_count <= 0 || max_new_tokens <= 0 ||
-            !depth_policy.valid() ||
-            !sampling_math::valid_device_generation_leading_row_disposition(
-                initial_leading_row_disposition) ||
-            response_token_stride < max_new_tokens ||
+            request_count <= 0 ||
+            !sampling_math::valid_device_generation_admission(
+                depth_policy, max_new_tokens, initial_leading_row_disposition) ||
+            response_token_stride <= 0 || response_token_stride < max_new_tokens ||
             !response_tokens_device ||
             control_stride < sampling_math::kDeviceGenerationControlCount ||
             !control_device || !stream)
@@ -3312,6 +3316,18 @@ namespace llaminar2
             static_cast<int *>(control_device),
             device_id,
             stream);
+    }
+
+    /** @copydoc IBackend::enqueuePublishOrdinaryGenerationSample */
+    bool ROCmBackend::enqueuePublishOrdinaryGenerationSample(
+        const sampling_math::OrdinaryGenerationPublication &publication,
+        int device_id, void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !publication.valid() || !stream)
+            return false;
+        return rocmOps_publish_ordinary_generation_sample(
+            publication, device_id, stream);
     }
 
     bool ROCmBackend::enqueueInitializeDeviceGenerationDispatchTicket(

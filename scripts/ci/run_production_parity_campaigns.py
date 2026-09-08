@@ -2917,6 +2917,13 @@ def run_production_parity_preflight(
         )
         return return_code, elapsed, tests
 
+    # Ninja can regenerate CMake while building the gate, adding or removing
+    # registrations. CTest below consumes that regenerated inventory, so its
+    # receipt must name those exact tests rather than the pre-build snapshot.
+    unit_tests = discover_production_parity_unit_tests(build_dir)
+    integration_tests = discover_production_parity_preflight_tests(build_dir)
+    tests = unit_tests + integration_tests
+
     unit_command = [
         "ctest",
         "--test-dir",

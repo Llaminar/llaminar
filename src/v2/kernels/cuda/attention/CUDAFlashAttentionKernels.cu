@@ -8,11 +8,13 @@
  * Algorithms implemented:
  * - Flash Attention 2 with Pipelined Prefetching: Optimized for Ampere (SM >= 8.0)
  *   - Uses dedicated producer warps to overlap global-to-shared K/V loads
- *   - Double-buffered shared memory for K/V tiles
+ *   - Vectorized FP16/FP32 cache loads into double-buffered K/V tiles
  *   - Producer/consumer warp specialization
  *   - WMMA (Tensor Core) acceleration for Q @ K^T matmul
  *   - Adaptive tile sizing for head_dim=64, head_dim=128, and head_dim=256
  * - Flash Decoding: Split-K parallelism for single-token decode
+ *   - One terminal partial publication for both empty and nonempty live spans,
+ *     preventing early-exit output addresses from spilling across K/V traversal
  *
  *
  * @author David Sanftenberg
@@ -481,6 +483,86 @@ namespace
     }
 
     /**
+     * @brief Stage one K/V tile with vector loads on the two producer warps.
+     *
+     * Native FP16 storage moves eight unchanged half values per 16-byte load.
+     * FP32 storage loads four floats at a time and preserves the same per-value
+     * round-to-nearest FP16 conversion as the scalar producer. Head dimensions
+     * are multiples of sixteen and launch admission requires aligned K/V bases,
+     * so every source vector and padded shared-memory destination is aligned.
+     * The caller's existing CTA barriers publish the current tile and protect
+     * double-buffer reuse; this helper introduces no extra ordering operation.
+     *
+     * @tparam KV_FP16 True for native half cache storage, false for FP32.
+     * @param K Source cache base, aligned to sixteen bytes.
+     * @param V Source value-cache base with the same geometry and alignment.
+     * @param K_dst Current shared-memory key tile.
+     * @param V_dst Current shared-memory value tile.
+     * @param batch_idx Request index into the cache.
+     * @param kv_stride Physical cache rows per request.
+     * @param n_kv_heads Cache heads per row.
+     * @param kv_head_idx Selected cache head.
+     * @param head_dim Elements per head, divisible by sixteen.
+     * @param smem_stride Half elements per padded shared-memory row.
+     * @param kv_start First logical cache row in this tile.
+     * @param tile_rows Number of valid complete rows to stage.
+     * @param ring_row_origin Physical row representing logical cache row zero.
+     * @param ring_row_capacity Zero for linear storage, positive for a ring.
+     */
+    template <bool KV_FP16>
+    __device__ __forceinline__ void stageFA2KVTile(
+        const void *K, const void *V, half *K_dst, half *V_dst,
+        int batch_idx, int kv_stride, int n_kv_heads, int kv_head_idx,
+        int head_dim, int smem_stride, int kv_start, int tile_rows,
+        int ring_row_origin, int ring_row_capacity)
+    {
+        constexpr int kVectorElements = KV_FP16 ? 8 : 4;
+        const int vectors_per_row = head_dim / kVectorElements;
+        const size_t batch_offset =
+            static_cast<size_t>(batch_idx) * kv_stride * n_kv_heads * head_dim;
+        for (int item = static_cast<int>(threadIdx.x);
+             item < tile_rows * vectors_per_row;
+             item += FA2_PRODUCER_WARPS * WARP_SIZE)
+        {
+            const int row = item / vectors_per_row;
+            const int d = (item % vectors_per_row) * kVectorElements;
+            const int logical_row = kv_start + row;
+            const int physical_row = ring_row_capacity > 0
+                                        ? (ring_row_origin + logical_row) %
+                                              ring_row_capacity
+                                        : logical_row;
+            const size_t source_offset =
+                batch_offset + static_cast<size_t>(physical_row) *
+                                   n_kv_heads * head_dim +
+                kv_head_idx * head_dim + d;
+            half *key_destination = K_dst + row * smem_stride + d;
+            half *value_destination = V_dst + row * smem_stride + d;
+            if constexpr (KV_FP16)
+            {
+                *reinterpret_cast<uint4 *>(key_destination) =
+                    *reinterpret_cast<const uint4 *>(
+                        static_cast<const half *>(K) + source_offset);
+                *reinterpret_cast<uint4 *>(value_destination) =
+                    *reinterpret_cast<const uint4 *>(
+                        static_cast<const half *>(V) + source_offset);
+            }
+            else
+            {
+                const float4 key = *reinterpret_cast<const float4 *>(
+                    static_cast<const float *>(K) + source_offset);
+                const float4 value = *reinterpret_cast<const float4 *>(
+                    static_cast<const float *>(V) + source_offset);
+                auto *key_pairs = reinterpret_cast<half2 *>(key_destination);
+                auto *value_pairs = reinterpret_cast<half2 *>(value_destination);
+                key_pairs[0] = __floats2half2_rn(key.x, key.y);
+                key_pairs[1] = __floats2half2_rn(key.z, key.w);
+                value_pairs[0] = __floats2half2_rn(value.x, value.y);
+                value_pairs[1] = __floats2half2_rn(value.z, value.w);
+            }
+        }
+    }
+
+    /**
      * @brief Flash Attention 2 kernel with pipelined prefetching (Ampere, SM >= 8.0)
      *
      * Uses producer/consumer warp specialization to overlap K/V loads with
@@ -819,49 +901,10 @@ namespace
             half *K_dst_0 = get_K_tile(0);
             half *V_dst_0 = get_V_tile(0);
 
-            const int producer_local_id = warp_id;
-            const int elems_per_producer = (actual_len_0 * head_dim + 1) / 2;
-            const int my_start = producer_local_id * elems_per_producer;
-            const int my_end = min(my_start + elems_per_producer, actual_len_0 * head_dim);
-
-            if constexpr (KV_FP16)
-            {
-                // FP16 path: K/V already half in global — direct copy
-                const half *K_batch_fp16 = static_cast<const half *>(K) + batch_idx * kv_stride * n_kv_heads * head_dim;
-                const half *V_batch_fp16 = static_cast<const half *>(V) + batch_idx * kv_stride * n_kv_heads * head_dim;
-                for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
-                {
-                    int local_row = i / head_dim;
-                    int d = i % head_dim;
-                    const int logical_row = kv_start_0 + local_row;
-                    const int physical_row = ring_row_capacity > 0
-                                                 ? (ring_row_origin + logical_row) %
-                                                       ring_row_capacity
-                                                 : logical_row;
-                    int kv_offset = physical_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
-                    K_dst_0[local_row * smem_stride + d] = K_batch_fp16[kv_offset];
-                    V_dst_0[local_row * smem_stride + d] = V_batch_fp16[kv_offset];
-                }
-            }
-            else
-            {
-                // FP32 path: convert float → half per element
-                const float *K_batch_fp32 = static_cast<const float *>(K) + batch_idx * kv_stride * n_kv_heads * head_dim;
-                const float *V_batch_fp32 = static_cast<const float *>(V) + batch_idx * kv_stride * n_kv_heads * head_dim;
-                for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
-                {
-                    int local_row = i / head_dim;
-                    int d = i % head_dim;
-                    const int logical_row = kv_start_0 + local_row;
-                    const int physical_row = ring_row_capacity > 0
-                                                 ? (ring_row_origin + logical_row) %
-                                                       ring_row_capacity
-                                                 : logical_row;
-                    int kv_offset = physical_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
-                    K_dst_0[local_row * smem_stride + d] = __float2half(K_batch_fp32[kv_offset]);
-                    V_dst_0[local_row * smem_stride + d] = __float2half(V_batch_fp32[kv_offset]);
-                }
-            }
+            stageFA2KVTile<KV_FP16>(
+                K, V, K_dst_0, V_dst_0, batch_idx, kv_stride, n_kv_heads,
+                kv_head_idx, head_dim, smem_stride, kv_start_0, actual_len_0,
+                ring_row_origin, ring_row_capacity);
         }
         __syncthreads();
 
@@ -906,49 +949,10 @@ namespace
                 half *K_dst = get_K_tile(next_stage);
                 half *V_dst = get_V_tile(next_stage);
 
-                const int producer_local_id = warp_id;
-                const int elems_per_producer = (next_actual_len * head_dim + 1) / 2;
-                const int my_start = producer_local_id * elems_per_producer;
-                const int my_end = min(my_start + elems_per_producer, next_actual_len * head_dim);
-
-                if constexpr (KV_FP16)
-                {
-                    // FP16 path: direct half copy from KV cache
-                    const half *K_batch_fp16 = static_cast<const half *>(K) + batch_idx * kv_stride * n_kv_heads * head_dim;
-                    const half *V_batch_fp16 = static_cast<const half *>(V) + batch_idx * kv_stride * n_kv_heads * head_dim;
-                    for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
-                    {
-                        int local_row = i / head_dim;
-                        int d = i % head_dim;
-                        const int logical_row = next_kv_start + local_row;
-                        const int physical_row = ring_row_capacity > 0
-                                                     ? (ring_row_origin + logical_row) %
-                                                           ring_row_capacity
-                                                     : logical_row;
-                        int kv_offset = physical_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
-                        K_dst[local_row * smem_stride + d] = K_batch_fp16[kv_offset];
-                        V_dst[local_row * smem_stride + d] = V_batch_fp16[kv_offset];
-                    }
-                }
-                else
-                {
-                    // FP32 path: float→half conversion per element
-                    const float *K_batch_fp32 = static_cast<const float *>(K) + batch_idx * kv_stride * n_kv_heads * head_dim;
-                    const float *V_batch_fp32 = static_cast<const float *>(V) + batch_idx * kv_stride * n_kv_heads * head_dim;
-                    for (int i = my_start + lane_id; i < my_end; i += WARP_SIZE)
-                    {
-                        int local_row = i / head_dim;
-                        int d = i % head_dim;
-                        const int logical_row = next_kv_start + local_row;
-                        const int physical_row = ring_row_capacity > 0
-                                                     ? (ring_row_origin + logical_row) %
-                                                           ring_row_capacity
-                                                     : logical_row;
-                        int kv_offset = physical_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
-                        K_dst[local_row * smem_stride + d] = __float2half(K_batch_fp32[kv_offset]);
-                        V_dst[local_row * smem_stride + d] = __float2half(V_batch_fp32[kv_offset]);
-                    }
-                }
+                stageFA2KVTile<KV_FP16>(
+                    K, V, K_dst, V_dst, batch_idx, kv_stride, n_kv_heads,
+                    kv_head_idx, head_dim, smem_stride, next_kv_start,
+                    next_actual_len, ring_row_origin, ring_row_capacity);
             }
 
             // ----------------------------------------------------------------
@@ -1618,20 +1622,9 @@ namespace
 
         const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
 
-        if (kv_start >= kv_len_runtime)
-        {
-            if (threadIdx.x == 0)
-            {
-                m_partial[partial_idx] = -FLT_MAX;
-                l_partial[partial_idx] = 0.0f;
-            }
-            float *O_out = O_partial + partial_idx * head_dim;
-            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
-            {
-                O_out[d] = 0.0f;
-            }
-            return;
-        }
+        // Empty ranges use the same zero-initialized online reduction below.
+        // Keeping one terminal partial publisher also avoids retaining an
+        // early-exit output address across the complete K/V traversal.
 
         const int tid = threadIdx.x;
         const int num_threads = blockDim.x;
@@ -1951,20 +1944,9 @@ namespace
         const int kv_start = split_idx * split_size;
         const int kv_end = min(kv_start + split_size, kv_len_runtime);
 
-        if (kv_start >= kv_len_runtime)
-        {
-            if (threadIdx.x == 0)
-            {
-                m_partial[partial_idx] = -FLT_MAX;
-                l_partial[partial_idx] = 0.0f;
-            }
-            float *O_out = O_partial + partial_idx * head_dim;
-            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
-            {
-                O_out[d] = 0.0f;
-            }
-            return;
-        }
+        // Empty ranges use the same zero-initialized online reduction below.
+        // Keeping one terminal partial publisher also avoids retaining an
+        // early-exit output address across the complete K/V traversal.
 
         const int tid = threadIdx.x;
         const int num_threads = blockDim.x;
@@ -2246,20 +2228,9 @@ namespace
 
         const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
 
-        if (kv_start >= kv_len_runtime)
-        {
-            if (threadIdx.x == 0)
-            {
-                m_partial[partial_idx] = -FLT_MAX;
-                l_partial[partial_idx] = 0.0f;
-            }
-            float *O_out = O_partial + partial_idx * head_dim;
-            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
-            {
-                O_out[d] = 0.0f;
-            }
-            return;
-        }
+        // Empty ranges use the same zero-initialized online reduction below.
+        // Keeping one terminal partial publisher also avoids retaining an
+        // early-exit output address across the complete K/V traversal.
 
         const int tid = threadIdx.x;
         const int num_threads = blockDim.x;
@@ -2550,18 +2521,9 @@ namespace
 
         const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
 
-        if (kv_start >= kv_count_rt)
-        {
-            if (threadIdx.x == 0)
-            {
-                m_partial[partial_idx] = -FLT_MAX;
-                l_partial[partial_idx] = 0.0f;
-            }
-            float *O_out = O_partial + partial_idx * head_dim;
-            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
-                O_out[d] = 0.0f;
-            return;
-        }
+        // Empty ranges use the same zero-initialized online reduction below.
+        // Keeping one terminal partial publisher also avoids retaining an
+        // early-exit output address across the complete K/V traversal.
 
         const int tid = threadIdx.x;
         const int num_threads = blockDim.x;
@@ -2947,11 +2909,13 @@ static int fa2_prefill_launch(
     };
     if (!Q || !K || !V || !O || batch_size <= 0 || seq_len <= 0 ||
         kv_len <= 0 ||
+        (reinterpret_cast<uintptr_t>(K) & 15u) != 0 ||
+        (reinterpret_cast<uintptr_t>(V) & 15u) != 0 ||
         !llaminar2::cuda::fa2_policy::isValidFA2HeadMapping(head_mapping) ||
         head_dim <= 0 ||
         head_dim % 16 != 0 || head_dim > 256)
     {
-        printf("[cudaFlashAttn_prefill_fa2] Error: invalid tensor or launch geometry "
+        printf("[cudaFlashAttn_prefill_fa2] Error: invalid tensor (K/V must be 16-byte aligned) or launch geometry "
                "(batch=%d, seq=%d, kv=%d, heads=%d, kv_heads=%d, head_dim=%d)\n",
                batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim);
         return -1;
@@ -3716,6 +3680,8 @@ static int fa2_context_transaction_launch(
 {
     if (!Q || !K || !V || !O || !O_partial || !m_partial || !l_partial ||
         !stream || batch_size <= 0 || seq_len <= 0 || kv_capacity <= 0 ||
+        (reinterpret_cast<uintptr_t>(K) & 15u) != 0 ||
+        (reinterpret_cast<uintptr_t>(V) & 15u) != 0 ||
         n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
         head_dim % WMMA_K != 0 || head_dim > 256 ||
         context_partition_size !=
@@ -3733,7 +3699,7 @@ static int fa2_context_transaction_launch(
          (!device_params ||
           schedule != FA2ContextPartitionSchedule::ContextParallelGrid)))
     {
-        printf("[cudaFlashAttn_context_transaction] Invalid tensor, stream, or "
+        printf("[cudaFlashAttn_context_transaction] Invalid tensor (K/V must be 16-byte aligned), stream, or "
                "partition geometry\n");
         return -1;
     }

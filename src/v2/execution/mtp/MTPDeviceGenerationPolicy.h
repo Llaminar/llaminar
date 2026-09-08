@@ -30,31 +30,31 @@ namespace llaminar2
      * invalid device policy; this function never clamps or substitutes a
      * different execution mode.
      */
-    [[nodiscard]] inline sampling_math::DeviceGenerationDepthPolicy
+    [[nodiscard]] inline sampling_math::DeviceGenerationPolicy
     resolveMTPDeviceGenerationDepthPolicy(const MTPRuntimeConfig &mtp)
     {
-        using sampling_math::DeviceGenerationDepthPolicy;
-        using sampling_math::DeviceGenerationDepthPolicyMode;
+        using sampling_math::DeviceGenerationPolicy;
+        using sampling_math::DeviceGenerationPolicyMode;
 
         const auto rate_to_ppm = [](double rate) -> int
         {
             if (!std::isfinite(rate) || rate < 0.0 || rate > 1.0)
                 return -1;
             return static_cast<int>(std::llround(
-                rate * DeviceGenerationDepthPolicy::kRateScale));
+                rate * DeviceGenerationPolicy::kRateScale));
         };
 
-        DeviceGenerationDepthPolicy policy;
+        DeviceGenerationPolicy policy;
         switch (mtp.depth_policy.mode)
         {
         case MTPDepthPolicyMode::Fixed:
-            policy.mode = DeviceGenerationDepthPolicyMode::Fixed;
+            policy.mode = DeviceGenerationPolicyMode::Fixed;
             policy.minimum_depth = mtp.draft_tokens;
             policy.maximum_depth = mtp.draft_tokens;
             policy.initial_depth = mtp.draft_tokens;
             break;
         case MTPDepthPolicyMode::Observe:
-            policy.mode = DeviceGenerationDepthPolicyMode::Observe;
+            policy.mode = DeviceGenerationPolicyMode::Observe;
             policy.minimum_depth = mtp.depth_policy.min_depth;
             policy.maximum_depth =
                 resolveMTPMaximumExecutionDraftDepth(mtp);
@@ -64,7 +64,7 @@ namespace llaminar2
                 mtp.verify_mode);
             break;
         case MTPDepthPolicyMode::Dynamic:
-            policy.mode = DeviceGenerationDepthPolicyMode::Dynamic;
+            policy.mode = DeviceGenerationPolicyMode::Dynamic;
             policy.minimum_depth = mtp.depth_policy.min_depth;
             policy.maximum_depth =
                 resolveMTPMaximumExecutionDraftDepth(mtp);
@@ -74,8 +74,8 @@ namespace llaminar2
                 mtp.verify_mode);
             break;
         default:
-            // Zero depth is rejected by DeviceGenerationDepthPolicy::valid().
-            policy = DeviceGenerationDepthPolicy::fixed(0);
+            // Zero depth is rejected by DeviceGenerationPolicy::valid().
+            policy = DeviceGenerationPolicy::fixed(0);
             break;
         }
 

@@ -6,14 +6,22 @@ only after validating each cell and chooses the candidate with the lowest
 geometric-mean normalized regret across those aliases. The selected candidate
 must resolve to one concrete physical launch tuple for the whole runtime key;
 an AUTO label is never emitted into production policy.
+
+An additive refresh can retain an installed generated include. Only newly
+authenticated exact keys are replaced: unrelated rows and the runtime selector
+remain byte-for-byte unchanged. A separate receipt distinguishes retained
+policy from newly measured evidence instead of recertifying it by implication.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 import math
 import os
+import re
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
@@ -140,13 +148,16 @@ def validate_dense_overlay_totality(
 
         if normalized != "cuda":
             continue
-        tile_id, k_partitions, bk256, canonical_kpart = entry.launch
+        tile_id, k_partitions, bk256, canonical_kpart, staging = entry.launch
+        if staging not in (0, 1, 2, 3):
+            raise ValueError(f"{key}: invalid CUDA staging schedule")
         if bk256:
             if (
                 key.execution_codebook != 0
                 or tile_id not in {-3, -2}
                 or k_partitions != 1
                 or canonical_kpart
+                or staging
             ):
                 raise ValueError(f"{key}: invalid CUDA BK256 exact winner")
             continue
@@ -164,6 +175,8 @@ def validate_dense_overlay_totality(
                     f"{key}: direct CUDA winner has an invalid partition count"
                 )
             candidate = f"STD:t{tile_id}:full"
+        if staging:
+            candidate += f":stage{staging}"
         if not _cuda_candidate_is_spill_free(
             key.execution_codebook, candidate
         ):
@@ -183,6 +196,7 @@ def _launch_tuple(
             int(row["observed_k_partitions"]),
             int(row["observed_bk256"]),
             int(row["observed_canonical_kpart"]),
+            int(row["observed_staging_schedule"]),
         )
     return (
         int(row["observed_n_tile"]),
@@ -363,9 +377,12 @@ def collect_dense_overlay_entries(
 def _render_cuda(entries: Sequence[DenseOverlayEntry]) -> str:
     rows = []
     for entry in entries:
-        tile_id, k_partitions, bk256, canonical_kpart = entry.launch
+        tile_id, k_partitions, bk256, canonical_kpart, staging = entry.launch
+        staging_names = ("RegisterDecode", "AsyncPayload", "AsyncWeightOperands", "AsyncAllOperands")
         if (
             bk256 not in {0, 1}
+            or staging not in range(len(staging_names))
+            or (bk256 and staging != 0)
             or canonical_kpart not in {0, 1}
             or (canonical_kpart == 0 and k_partitions != 1)
             or (
@@ -380,7 +397,8 @@ def _render_cuda(entries: Sequence[DenseOverlayEntry]) -> str:
             "        {"
             f"{entry.key.execution_codebook}, {entry.key.m}, {entry.key.n}, "
             f"{entry.key.k}, {{{tile_id}, {str(bool(bk256)).lower()}, "
-            f"{str(bool(canonical_kpart)).lower()}}}"
+            f"{str(bool(canonical_kpart)).lower()}, "
+            f"prefill::PrefillStagingSchedule::{staging_names[staging]}}}"
             "},"
         )
     return "\n".join([
@@ -389,6 +407,7 @@ def _render_cuda(entries: Sequence[DenseOverlayEntry]) -> str:
         "",
         "#include <cstddef>",
         "#include <cstdint>",
+        '#include "CUDANativeVNNIPrefillSchedule.h"',
         "",
         "namespace llaminar2::cuda::generated",
         "{",
@@ -397,6 +416,7 @@ def _render_cuda(entries: Sequence[DenseOverlayEntry]) -> str:
         "        int tile_id;",
         "        bool bk256;",
         "        bool canonical_kpart;",
+        "        prefill::PrefillStagingSchedule staging = prefill::PrefillStagingSchedule::RegisterDecode;",
         "    };",
         "",
         "    struct CUDADensePrefillOverlayEntry",
@@ -568,21 +588,132 @@ def render_dense_overlay(entries: Sequence[DenseOverlayEntry]) -> str:
     return _render_cuda(entries) if backend == "cuda" else _render_rocm(entries)
 
 
+def _split_generated_overlay(
+    encoded: str, backend: str,
+) -> tuple[str, dict[DenseOverlayKey, str], str]:
+    """Authenticate the generated ABI and index exact rows without rewriting them.
+
+    This is deliberately not a C++ parser. Only this generator's complete
+    selector skeleton and literal row grammar are accepted. CUDA's omitted
+    staging field denotes the struct's explicit RegisterDecode default, so
+    existing installed rows need not be mechanically reformatted on refresh.
+    """
+
+    if backend not in {"cuda", "rocm"}:
+        raise ValueError("unsupported dense overlay backend")
+    vendor = "CUDA" if backend == "cuda" else "ROCm"
+    marker = f"        k{vendor}DensePrefillOverlayEntries[] = {{\n"
+    empty = _render_cuda(()) if backend == "cuda" else _render_rocm(())
+    expected_prefix, _, expected_suffix = empty.partition(marker)
+    prefix, found, tail = encoded.partition(marker)
+    if not found or prefix != expected_prefix or not tail.endswith(expected_suffix):
+        raise ValueError("retained dense overlay selector ABI mismatch")
+    body = tail[:-len(expected_suffix)]
+    config = (
+        r"-?\d+, (?:true|false), (?:true|false)"
+        r"(?:, prefill::PrefillStagingSchedule::"
+        r"(?:RegisterDecode|AsyncPayload|AsyncWeightOperands|AsyncAllOperands))?"
+        if backend == "cuda" else r"\d+, \d+, \d+, \d+, (?:true|false)"
+    )
+    row_pattern = re.compile(
+        r"        \{(\d+), (\d+), (\d+), (\d+), \{" + config + r"\}\},\n"
+    )
+    rows: dict[DenseOverlayKey, str] = {}
+    for line in body.splitlines(keepends=True):
+        match = row_pattern.fullmatch(line)
+        if not match:
+            raise ValueError("retained dense overlay has a noncanonical row")
+        key = DenseOverlayKey(*(int(value) for value in match.groups()))
+        if not 0 <= key.execution_codebook <= 255 or any(
+            not 0 < value <= 2147483647 for value in (key.m, key.n, key.k)
+        ):
+            raise ValueError("retained dense overlay key is outside the runtime ABI")
+        if key in rows:
+            raise ValueError("duplicate retained dense overlay key")
+        rows[key] = line
+    if not rows or tuple(rows) != tuple(sorted(rows)):
+        raise ValueError("retained dense overlay keys must be nonempty and sorted")
+    return prefix + marker, rows, expected_suffix
+
+
+def retain_dense_overlay_base(
+    base: str, entries: Sequence[DenseOverlayEntry],
+) -> tuple[str, dict[str, object]]:
+    """Overlay certified delta rows while preserving every unrelated base byte.
+
+    The caller must obtain entries through collect_dense_overlay_entries. Base
+    retention is not a new timing or numerical certificate for the old keys;
+    the receipt binds that distinction and the exact immutable input/output.
+    No generic rule, lookup function or arithmetic policy is changed here.
+    """
+
+    delta = render_dense_overlay(entries)
+    backend = entries[0].backend
+    prefix, retained, suffix = _split_generated_overlay(base, backend)
+    _, refreshed, _ = _split_generated_overlay(delta, backend)
+    combined = retained | refreshed
+    encoded = prefix + "".join(combined[key] for key in sorted(combined)) + suffix
+    digest = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return encoded, {
+        "schema": "dense-prefill-additive-exact-overlay-v1",
+        "backend": backend,
+        "base_sha256": digest(base),
+        "measured_delta_sha256": digest(delta),
+        "output_sha256": digest(encoded),
+        "base_keys": len(retained),
+        "refreshed_keys": len(refreshed),
+        "replaced_keys": len(retained.keys() & refreshed.keys()),
+        "retained_keys": len(retained.keys() - refreshed.keys()),
+        "output_keys": len(combined),
+        "base_evidence": "retained installed policy; not remeasured",
+    }
+
+
 def write_dense_overlay(
     output: Path,
     entries: Sequence[DenseOverlayEntry],
+    *,
+    base_include: Path | None = None,
+    retention_receipt: Path | None = None,
 ) -> None:
-    """Atomically publish one generated include after complete validation."""
+    """Publish complete measured rows, optionally retaining an explicit base.
 
+    Retention requires a separate audit receipt. Read the base once before
+    publication, so even an in-place update has one immutable source identity.
+    The summary CSV continues to describe only newly authenticated timing.
+    """
+
+    if (base_include is None) != (retention_receipt is None):
+        raise ValueError("base retention requires both include and receipt paths")
     output = Path(output)
+    encoded = render_dense_overlay(entries)
+    receipt = None
+    if base_include is not None:
+        if retention_receipt.resolve() in {output.resolve(), base_include.resolve()}:
+            raise ValueError("retention receipt must not overwrite an include")
+        encoded, receipt = retain_dense_overlay_base(
+            base_include.read_text(encoding="utf-8"), entries
+        )
+        receipt["base_include"] = str(base_include.resolve())
+        receipt["output_include"] = str(output.resolve())
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = output.with_name(output.name + ".inprogress")
-    encoded = render_dense_overlay(entries)
     with staging.open("w", encoding="utf-8") as handle:
         handle.write(encoded)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(staging, output)
+    if receipt is not None:
+        # Publish the receipt last. Its output digest authenticates the complete
+        # include; an interruption before this point is not a completed audit.
+        retention_receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt_staging = retention_receipt.with_name(retention_receipt.name + ".inprogress")
+        with receipt_staging.open("w", encoding="utf-8") as handle:
+            json.dump(receipt, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(receipt_staging, retention_receipt)
 
 
 def write_overlay_summary(
@@ -635,6 +766,10 @@ def main() -> int:
     parser.add_argument("--summary-csv", type=Path, required=True)
     parser.add_argument("--warmup-runs", type=int, default=DEFAULT_WARMUP_RUNS)
     parser.add_argument("--bench-runs", type=int, default=DEFAULT_BENCH_RUNS)
+    parser.add_argument("--retain-base-include", type=Path,
+                        help="retain unrelated exact rows and the unchanged generated selector")
+    parser.add_argument("--retention-receipt", type=Path,
+                        help="required audit receipt when retaining an installed base")
     args = parser.parse_args()
     entries = collect_dense_overlay_entries(
         args.work_dir,
@@ -642,7 +777,8 @@ def main() -> int:
         warmup_runs=args.warmup_runs,
         bench_runs=args.bench_runs,
     )
-    write_dense_overlay(args.output, entries)
+    write_dense_overlay(args.output, entries, base_include=args.retain_base_include,
+                        retention_receipt=args.retention_receipt)
     write_overlay_summary(args.summary_csv, entries)
     print(f"installed {len(entries)} {args.backend} dense prefill overlays")
     return 0

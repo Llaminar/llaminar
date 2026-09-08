@@ -5933,7 +5933,7 @@ namespace
         {
             return last_device_generation_max_new_tokens_;
         }
-        const sampling_math::DeviceGenerationDepthPolicy &
+        const sampling_math::DeviceGenerationPolicy &
         lastDeviceGenerationDepthPolicy() const
         {
             return last_device_generation_depth_policy_;
@@ -6802,9 +6802,9 @@ namespace
         int device_generation_admission_count_{0};
         int last_device_generation_request_count_{0};
         int last_device_generation_max_new_tokens_{0};
-        sampling_math::DeviceGenerationDepthPolicy
+        sampling_math::DeviceGenerationPolicy
             last_device_generation_depth_policy_ =
-                sampling_math::DeviceGenerationDepthPolicy::fixed(0);
+                sampling_math::DeviceGenerationPolicy::fixed(0);
         sampling_math::DeviceGenerationLeadingRowDisposition
             last_device_generation_initial_leading_row_disposition_{
                 sampling_math::DeviceGenerationLeadingRowDisposition::
@@ -8054,7 +8054,7 @@ namespace
     TEST_F(Test__PrefillDecodeTransition, RequestBatchedMTPContinuationSupportsMaximumDepth)
     {
         constexpr int kMaximumDepth =
-            sampling_math::DeviceGenerationDepthPolicy::
+            sampling_math::DeviceGenerationPolicy::
                 kMaximumSupportedDraftDepth;
         auto [runner, mock] =
             createSingleDeviceRequestBatchRunner(
@@ -13903,7 +13903,7 @@ namespace
             mock->lastDeviceGenerationDepthPolicy();
         EXPECT_EQ(
             admitted_policy.mode,
-            sampling_math::DeviceGenerationDepthPolicyMode::Dynamic);
+            sampling_math::DeviceGenerationPolicyMode::Dynamic);
         EXPECT_EQ(admitted_policy.minimum_depth, 1);
         EXPECT_EQ(admitted_policy.maximum_depth, 3);
         EXPECT_EQ(admitted_policy.initial_depth, 2);

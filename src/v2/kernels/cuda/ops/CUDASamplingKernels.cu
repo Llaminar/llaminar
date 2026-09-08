@@ -5,6 +5,9 @@
  * Provides GPU-side argmax and top-k selection over FP32 logits.
  * Mirrors the ROCm implementations in ROCmArgmaxKernels.hip and
  * ROCmSamplingKernels.hip for cross-backend parity.
+ * Ordinary and speculative generation share the SamplingMath controller ABI:
+ * immutable admission selects the algorithm, and explicit-stream publication
+ * writes persistent response rows without host sampling or token transfers.
  *
  * Kernels:
  *   - Argmax: Two-pass multi-block reduction (pass 1 spreads the vocab across
@@ -5061,6 +5064,23 @@ __global__ void cuda_commit_mtp_greedy_penalty_history_kernel(
 }
 
 /**
+ * @brief Publish one ordinary sample per independent resident request.
+ *
+ * One lane owns each response/continuation transition; the block spans requests,
+ * not vocabulary elements. CUDA and HIP use the identical shared transition,
+ * including failure atomicity and sampler-free forward-only publication.
+ */
+__global__ void cuda_publish_ordinary_generation_sample_kernel(
+    llaminar2::sampling_math::OrdinaryGenerationPublication publication)
+{
+    using namespace llaminar2::sampling_math;
+    const size_t request = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (request >= static_cast<size_t>(publication.request_count))
+        return;
+    (void)publish_ordinary_generation_request(publication, request);
+}
+
+/**
  * @brief Initialize one persistent device-generation controller per request.
  *
  * The response payload is intentionally left untouched.  Its authoritative
@@ -5070,7 +5090,7 @@ __global__ void cuda_commit_mtp_greedy_penalty_history_kernel(
 __global__ void cuda_initialize_device_generation_kernel(
     int request_count,
     int max_new_tokens,
-    llaminar2::sampling_math::DeviceGenerationDepthPolicy depth_policy,
+    llaminar2::sampling_math::DeviceGenerationPolicy depth_policy,
     llaminar2::sampling_math::DeviceGenerationLeadingRowDisposition
         initial_leading_row_disposition,
     int response_token_stride,
@@ -8560,10 +8580,25 @@ extern "C"
         return true;
     }
 
+    /** @brief Enqueue ordinary publication on the exact caller-owned stream. */
+    bool cudaOps_publish_ordinary_generation_sample(
+        const llaminar2::sampling_math::OrdinaryGenerationPublication &publication,
+        int device_idx, void *stream)
+    {
+        if (!publication.valid() || !stream || device_idx < 0)
+            return false;
+        if (cudaSetDevice(device_idx) != cudaSuccess) return false;
+        constexpr int threads = 32;
+        const int blocks = 1 + (publication.request_count - 1) / threads;
+        cuda_publish_ordinary_generation_sample_kernel<<<
+            blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(publication);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
     bool cudaOps_initialize_device_generation(
         int request_count,
         int max_new_tokens,
-        const llaminar2::sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+        const llaminar2::sampling_math::DeviceGenerationPolicy &depth_policy,
         llaminar2::sampling_math::DeviceGenerationLeadingRowDisposition
             initial_leading_row_disposition,
         int response_token_stride,
@@ -8572,12 +8607,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (request_count <= 0 || max_new_tokens <= 0 ||
-            !depth_policy.valid() ||
-            !llaminar2::sampling_math::
-                valid_device_generation_leading_row_disposition(
-                    initial_leading_row_disposition) ||
-            response_token_stride < max_new_tokens ||
+        if (request_count <= 0 ||
+            !llaminar2::sampling_math::valid_device_generation_admission(
+                depth_policy, max_new_tokens, initial_leading_row_disposition) ||
+            response_token_stride <= 0 || response_token_stride < max_new_tokens ||
             control_stride <
                 llaminar2::sampling_math::kDeviceGenerationControlCount ||
             !control || !stream)

@@ -1,4 +1,10 @@
-"""Validated common NativeVNNI observation corpus and runtime key types."""
+"""Validated common NativeVNNI observation corpus and runtime key types.
+
+Immutable keys carry the exact runtime and policy-domain discriminators. Their
+structural hash is memoized for large candidate-set joins, but remains a local
+Python lookup accelerator: canonical evidence digests never depend on it, and
+pickling deliberately omits the process-salted cached value.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +16,7 @@ import tempfile
 from bisect import bisect_right
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -303,6 +309,31 @@ def _digest_serialized_files(
     return "sha256:" + digest.hexdigest()
 
 
+def _memoized_structural_key_hash(key: RuntimeKey | GenericDomain) -> int:
+    """Cache the exact generated-dataclass hash on one immutable key instance.
+
+    Deriving the initial tuple from declared fields keeps new discriminators in
+    the identity automatically. No source field changes; this non-field cache
+    is absent from dataclass serialization and every canonical policy digest.
+    """
+    result = key.__dict__.get("_cached_structural_hash")
+    if result is None:
+        result = hash(tuple(getattr(key, field.name) for field in fields(key)))
+        object.__setattr__(key, "_cached_structural_hash", result)
+    return result
+
+
+def _structural_key_pickle_state(key: RuntimeKey | GenericDomain) -> dict:
+    """Retain only value fields across interpreters with independent hash seeds.
+
+    A warmed string/enum hash is process-salted. Serializing it would make an
+    equal cold key miss a reconstructed dictionary after spawn or another
+    interpreter launch. Pickle reconstructs the unchanged field dictionary and
+    the receiving process computes its own hash on first use.
+    """
+    return {field.name: getattr(key, field.name) for field in fields(key)}
+
+
 @dataclass(frozen=True, order=True)
 class RuntimeKey:
     """Every discriminator available to an exact production resolver."""
@@ -322,6 +353,14 @@ class RuntimeKey:
     k: int
     launch_k_tiles: int = 0
 
+    def __hash__(self) -> int:
+        """Reuse this immutable runtime identity during repeated candidate joins."""
+        return _memoized_structural_key_hash(self)
+
+    def __getstate__(self) -> dict:
+        """Publish value identity without a process-local lookup cache."""
+        return _structural_key_pickle_state(self)
+
 
 @dataclass(frozen=True, order=True)
 class GenericDomain:
@@ -339,6 +378,14 @@ class GenericDomain:
     m: int
     aspect_bucket: AspectBucket
     all_aspects: bool = False
+
+    def __hash__(self) -> int:
+        """Reuse this immutable domain identity during repeated fold joins."""
+        return _memoized_structural_key_hash(self)
+
+    def __getstate__(self) -> dict:
+        """Publish value identity without a process-local lookup cache."""
+        return _structural_key_pickle_state(self)
 
 
 @dataclass(frozen=True, order=True)

@@ -8,6 +8,10 @@
  *   - The production Qwen3.6-35B-A3B FP16-KV attention geometry replayed
  *     through a one-node CUDA graph across every ordinary prefill bucket and
  *     resident contexts through 128K tokens.
+ *   - Dense HD256 attention as a complete captured context-partition pipeline,
+ *     with a bounded exact-point profiler selector and byte-equal direct oracle.
+ *   - Production tensor-dispatched FP16-KV decode at fixed captured geometry,
+ *     with host submission amortized across repeated complete attention nodes.
  *
  * **Tested Configurations**:
  * - Physical query buckets: 64 through 4096 rows
@@ -246,6 +250,14 @@ namespace
         .head_dim = 256,
     };
 
+    /** Physical dense-27B geometry, shared by release inventory and profiling. */
+    inline constexpr AttentionGeometry kQwenDense27BAttention{
+        .release_label = "Qwen3.5/3.6/3.8-27B",
+        .n_heads = 24,
+        .n_kv_heads = 4,
+        .head_dim = 256,
+    };
+
     /**
      * @brief Distinct released Qwen attention geometries used by policy gates.
      *
@@ -261,7 +273,7 @@ namespace
             {"Qwen2.5-14B", 40, 8, 128},
             {"Qwen3.5-0.8B/2B", 8, 2, 256},
             {"Qwen3.5-4B/9B", 16, 4, 256},
-            {"Qwen3.5/3.6-27B", 24, 4, 256},
+            kQwenDense27BAttention,
             {"Qwen3.5/3.6-35B-A3B", 16, 2, 256},
             {"Qwen3.5-122B-A10B/397B-A17B", 32, 2, 256},
         }};
@@ -2056,6 +2068,110 @@ namespace
             printDecodeResult(cfg, latency_us, min_ms * 1000.0, max_ms * 1000.0, tokens_per_sec);
         }
 
+        /**
+         * @brief Time the complete production FP16-KV decode pipeline in capture.
+         * @param geometry Existing catalog head mapping, never a dispatch override.
+         * @param kv_len Logical/cache span held constant for this timing point.
+         *
+         * Warm the real tensor route once to materialize immutable kernel state.
+         * Capture repeated complete attention operations so CPU launch speed is
+         * amortized; data and workspace addresses remain unchanged. Terminal
+         * output must be byte-identical to the untimed production launch.
+         */
+        void runCapturedFP16DecodeBenchmark(
+            const AttentionGeometry &geometry, int kv_len)
+        {
+            const int heads = geometry.n_heads;
+            const int kv_heads = geometry.n_kv_heads;
+            const int width = geometry.head_dim;
+            const size_t q_count = static_cast<size_t>(heads) * width;
+            const size_t kv_count = static_cast<size_t>(kv_len) * kv_heads * width;
+            auto q_data = randomFP32(q_count);
+            auto k_data = randomFP32(kv_count);
+            auto v_data = randomFP32(kv_count);
+            std::vector<uint16_t> k_half(kv_count), v_half(kv_count);
+            for (size_t i = 0; i < kv_count; ++i)
+            {
+                k_half[i] = fp32_to_fp16(k_data[i]);
+                v_half[i] = fp32_to_fp16(v_data[i]);
+            }
+            FP32Tensor q({1, q_count}, DeviceId::cpu());
+            FP32Tensor output({1, q_count}, DeviceId::cpu());
+            FP16Tensor k({static_cast<size_t>(kv_len), static_cast<size_t>(kv_heads * width)}, k_half);
+            FP16Tensor v({static_cast<size_t>(kv_len), static_cast<size_t>(kv_heads * width)}, v_half);
+            std::copy(q_data.begin(), q_data.end(), q.mutable_data());
+            for (TensorBase *tensor : std::array<TensorBase *, 4>{&q, &k, &v, &output})
+                ASSERT_TRUE(tensor->ensureOnDevice(DeviceId::cuda(0), stream_));
+            const auto requirements = kernel_->getWorkspaceRequirements(1, heads, width);
+            workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                DeviceId::cuda(0), requirements.total_bytes_with_alignment());
+            ASSERT_TRUE(workspace_->allocate(requirements));
+            kernel_->bindWorkspace(workspace_.get());
+            ASSERT_TRUE(kernel_->prepareDynamicAttnParams(kv_len, kv_len - 1, 1, stream_));
+            const auto launch = [&]()
+            {
+                return kernel_->compute_tensor(
+                    &q, &k, &v, &output, 1, 1, kv_len, heads, kv_heads, width,
+                    true, -1, nullptr, nullptr, mpi_ctx_.get(), 0,
+                    geometry.head_start, heads, kv_heads, geometry.launchGqaRep());
+            };
+            ASSERT_TRUE(launch());
+            std::vector<float> expected(q_count), observed(q_count);
+            ASSERT_EQ(cudaMemcpyAsync(expected.data(), output.gpu_data_ptr(),
+                q_count * sizeof(float), cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            CUDAGraphCapture captured(stream_, 0);
+            constexpr int operations_per_graph = 64;
+            {
+                // The production scope closes recording even if a launch
+                // throws; tensors must never unwind while capture is active.
+                ScopedBackendGraphCapture capture(captured, "captured_decode_benchmark");
+                ASSERT_TRUE(capture.begin());
+                bool recorded = true;
+                for (int i = 0; i < operations_per_graph; ++i)
+                    recorded = launch() && recorded;
+                capture.finish();
+                ASSERT_TRUE(recorded);
+            }
+            ASSERT_TRUE(captured.instantiate());
+            size_t node_count = 0;
+            ASSERT_EQ(cudaGraphGetNodes(captured.graph(), nullptr, &node_count), cudaSuccess);
+            ASSERT_EQ(node_count, static_cast<size_t>(2 * operations_per_graph));
+            std::vector<cudaGraphNode_t> nodes(node_count);
+            ASSERT_EQ(cudaGraphGetNodes(captured.graph(), nodes.data(), &node_count), cudaSuccess);
+            for (const auto node : nodes)
+            {
+                cudaGraphNodeType type{};
+                ASSERT_EQ(cudaGraphNodeGetType(node, &type), cudaSuccess);
+                ASSERT_EQ(type, cudaGraphNodeTypeKernel);
+            }
+            for (int i = 0; i < 10; ++i)
+                ASSERT_TRUE(captured.launch());
+            std::vector<float> samples;
+            for (int repeat = 0; repeat < 21; ++repeat)
+            {
+                ASSERT_EQ(cudaEventRecord(start_event_, stream_), cudaSuccess);
+                for (int i = 0; i < 10; ++i)
+                    ASSERT_TRUE(captured.launch());
+                ASSERT_EQ(cudaEventRecord(stop_event_, stream_), cudaSuccess);
+                ASSERT_EQ(cudaEventSynchronize(stop_event_), cudaSuccess);
+                float ms = 0;
+                ASSERT_EQ(cudaEventElapsedTime(&ms, start_event_, stop_event_), cudaSuccess);
+                samples.push_back(ms * 1000.0f / (10 * operations_per_graph));
+            }
+            ASSERT_EQ(cudaMemcpyAsync(observed.data(), output.gpu_data_ptr(),
+                q_count * sizeof(float), cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            ASSERT_EQ(std::memcmp(expected.data(), observed.data(), q_count * sizeof(float)), 0);
+            ASSERT_TRUE(std::all_of(observed.begin(), observed.end(), [](float value) { return std::isfinite(value); }));
+            std::sort(samples.begin(), samples.end());
+            std::cout << "captured_decode_fp16kv,heads=" << heads << ",kv_heads=" << kv_heads
+                      << ",head_dim=" << width << ",kv_len=" << kv_len
+                      << ",median_us=" << samples[samples.size() / 2]
+                      << ",min_us=" << samples.front() << ",max_us=" << samples.back()
+                      << ",replay_bytes=exact\n";
+        }
+
         void printTableHeader(const std::string &test_name)
         {
             std::cout << "\n╔══════════════════════════════════════════════════════════════════════════════════════════════╗" << std::endl;
@@ -2240,6 +2356,64 @@ namespace
         ASSERT_TRUE(measured_requested_point)
             << "Requested CUDA attention profiler point is not in the sweep";
         EXPECT_TRUE(benchmark.finalResultIsFinite());
+    }
+
+    /**
+     * @brief Profile the dense HD256 context pipeline at production geometry.
+     *
+     * The conditional parent in a full model cannot expose its child kernel
+     * to every NCU version. This fixture measures the exact production context
+     * producer and ordered reducer plus device-parameter publication in one
+     * three-node captured transaction, without
+     * changing the model's production execution mode. The direct captured
+     * transaction is an independent scheduling oracle, not a timing substitute.
+     * Inputs, persistent summary capacity, and live device parameters match a
+     * 4096-token cache. Every point checks complete output byte equivalence.
+     *
+     * Both LLAMINAR_ATTN_PROFILE_M and LLAMINAR_ATTN_PROFILE_KV_LEN select one
+     * listed point for isolated counters; leave them unset for warmed timing.
+     */
+    TEST_F(CUDAFlashAttentionPerf, Prefill_DenseHD256_CapturedContextPipeline)
+    {
+        constexpr std::array<ProductionPrefillPoint, 8> points{{
+            {64, 64, "short"}, {128, 128, "short"},
+            {512, 512, "short"}, {1024, 1024, "short"},
+            {64, 4096, "prefix"}, {128, 4096, "prefix"},
+            {512, 4096, "prefix"}, {1024, 4096, "prefix"},
+        }};
+        const int requested_m =
+            positiveEnvironmentValue("LLAMINAR_ATTN_PROFILE_M");
+        const int requested_kv =
+            positiveEnvironmentValue("LLAMINAR_ATTN_PROFILE_KV_LEN");
+        ASSERT_EQ(requested_m > 0, requested_kv > 0);
+        const bool profiler_mode = requested_m > 0;
+        CapturedContextPartitionPrefill benchmark(
+            kQwenDense27BAttention, 1024, 4096,
+            llaminar2::cuda::fa2_policy::kFA2CanonicalContextPartitionKeys,
+            /*include_sequence_reference=*/false);
+        ASSERT_TRUE(benchmark.ready()) << benchmark.error();
+        std::cout << "M,kv_len,direct_us,context_us,slots,context_nodes,byte_equal\n";
+        bool measured = false;
+        for (const auto &point : points)
+        {
+            if (profiler_mode &&
+                (point.query_rows != requested_m || point.kv_len != requested_kv))
+                continue;
+            const auto result = benchmark.measure(
+                point, profiler_mode, /*reducer_dimension_warps=*/0);
+            ASSERT_GT(result.direct_latency_us, 0.0) << benchmark.error();
+            ASSERT_GT(result.context_latency_us, 0.0) << benchmark.error();
+            ASSERT_EQ(result.context_graph_nodes, 3u);
+            ASSERT_TRUE(benchmark.canonicalOutputsAreByteEqual())
+                << point.query_rows << '/' << point.kv_len << ':' << benchmark.error();
+            std::cout << point.query_rows << ',' << point.kv_len << ','
+                      << std::fixed << std::setprecision(3)
+                      << result.direct_latency_us << ',' << result.context_latency_us
+                      << ',' << result.context_partition_slots << ','
+                      << result.context_graph_nodes << ",true\n";
+            measured = true;
+        }
+        ASSERT_TRUE(measured) << "Requested attention point is not in the matrix";
     }
 
     /**
@@ -3406,6 +3580,21 @@ namespace
     // ============================================================================
     // Decode Benchmarks (Latency-focused)
     // ============================================================================
+
+    TEST_F(CUDAFlashAttentionPerf, Decode_DenseHD256_CapturedFP16KV)
+    {
+        // Optional exact-point selection is for a separate profiler launch;
+        // ordinary timing covers short, benchmark, and long-context positions.
+        const int selected = positiveEnvironmentValue("LLAMINAR_ATTENTION_DECODE_PROFILE_KV");
+        bool selected_point_ran = false;
+        for (const int kv_len : {64, 512, 768, 1024, 4096, 8192})
+            if (selected == 0 || selected == kv_len)
+            {
+                runCapturedFP16DecodeBenchmark(kQwenDense27BAttention, kv_len);
+                selected_point_ran = true;
+            }
+        ASSERT_TRUE(selected_point_ran) << "Profiler selector is not in the decode timing inventory";
+    }
 
     TEST_F(CUDAFlashAttentionPerf, Decode_VaryingKVCacheLen)
     {

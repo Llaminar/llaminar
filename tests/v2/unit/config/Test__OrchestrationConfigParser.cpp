@@ -12,6 +12,7 @@
  * - YAML parsing for domain-based config
  * - Error handling for malformed input
  * - Validation of enum-type arguments
+ * - Startup CLI publication into an already-read kernel environment snapshot
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -20,6 +21,7 @@
 #include <gtest/gtest.h>
 #include "config/OrchestrationConfigParser.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
+#include "utils/DebugEnv.h"
 
 using namespace llaminar2;
 
@@ -1654,6 +1656,71 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_Deterministic)
     auto config = parser.parseArgs(args.argc(), args.argv());
 
     EXPECT_TRUE(config.deterministic);
+}
+
+/**
+ * @brief Restore the process environment and canonical snapshot after a test.
+ *
+ * Logging may read DebugEnv before CLI parsing. Tests deliberately reproduce
+ * that order without leaving deterministic policy enabled for other tests.
+ */
+class ScopedDeterministicEnvironment
+{
+public:
+    /** @brief Save the caller's inherited deterministic environment value. */
+    ScopedDeterministicEnvironment()
+    {
+        if (const char *value = std::getenv("LLAMINAR_DETERMINISTIC"))
+            previous_ = value;
+    }
+
+    /** @brief Restore both exported state and its canonical parsed snapshot. */
+    ~ScopedDeterministicEnvironment()
+    {
+        if (previous_)
+            setenv("LLAMINAR_DETERMINISTIC", previous_->c_str(), 1);
+        else
+            unsetenv("LLAMINAR_DETERMINISTIC");
+        mutableDebugEnv().reload();
+    }
+
+private:
+    std::optional<std::string> previous_;
+};
+
+TEST(Test__OrchestrationConfigParser,
+     DeterministicPublishesIntoPreviouslyReadKernelPolicy)
+{
+    ScopedDeterministicEnvironment restore;
+    ASSERT_EQ(setenv("LLAMINAR_DETERMINISTIC", "0", 1), 0);
+    mutableDebugEnv().reload();
+    ASSERT_FALSE(debugEnv().gemm.deterministic);
+
+    // Reproduce early logging/splash reads, including policy defaults that
+    // deterministic execution must override on both accelerator backends.
+    mutableDebugEnv().gemm.cuda_concurrent_prefill = true;
+    mutableDebugEnv().rocm.concurrent_prefill = true;
+    mutableDebugEnv().rocm.concurrent_decode = true;
+    mutableDebugEnv().rocm.gdn_concurrent_decode = true;
+
+    ArgvHelper args{"llaminar2", "--deterministic"};
+    OrchestrationConfigParser parser;
+    const auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.deterministic);
+    EXPECT_FLOAT_EQ(config.temperature, 0.0f);
+    EXPECT_STREQ(std::getenv("LLAMINAR_DETERMINISTIC"), "1");
+    EXPECT_TRUE(debugEnv().gemm.deterministic);
+    EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_prefill);
+    EXPECT_FALSE(debugEnv().rocm.concurrent_prefill);
+    EXPECT_FALSE(debugEnv().rocm.concurrent_decode);
+    EXPECT_FALSE(debugEnv().rocm.gdn_concurrent_decode);
+
+    // MPI initialization reparses argv. Publishing the same startup policy
+    // twice must be idempotent, not toggle a backend into a different mode.
+    (void)parser.parseArgs(args.argc(), args.argv());
+    EXPECT_TRUE(debugEnv().gemm.deterministic);
+    EXPECT_FALSE(debugEnv().rocm.concurrent_decode);
 }
 
 // ============================================================================

@@ -13,6 +13,7 @@
 #pragma once
 
 #include "CUDADeviceWorkspace.h"
+#include "CUDACanonicalKpartFold.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,16 @@
     LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL_IMPL(NAME, INDEX)
 
 #define LLAMINAR_DECLARE_CUDA_NVNNI_GEMV_SHARD(INDEX)                   \
+    extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
+        cudaNativeVNNIGemvTuned_fusedKpar_fp32, INDEX)(                 \
+        const int8_t *, const uint8_t *, const uint16_t *,              \
+        const uint16_t *, const uint32_t *, float *, const float *,     \
+        int, float, float, const float *, const float *, uint8_t,       \
+        int, void *, const llaminar2::CUDACanonicalKpartFoldPlan &);    \
+    extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
+        cudaNativeVNNIGemvTuned_fusedKpar_resources, INDEX)(            \
+        uint8_t, const llaminar2::CUDACanonicalKpartFoldPlan &,         \
+        llaminar2::CUDACanonicalKpartFoldResources &);                 \
     extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
         cudaNativeVNNIGemvTuned_supportsCodebook, INDEX)(uint8_t);      \
     extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \

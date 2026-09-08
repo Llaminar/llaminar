@@ -1,19 +1,13 @@
 /**
  * @file ROCmSamplingKernels.hip
- * @brief ROCm/HIP GPU-side sampling kernels for top-k/top-p
+ * @brief ROCm/HIP resident sampling and generation-controller kernels.
  *
- * Provides a GPU-side top-k selection over FP32 logits, returning the top-k
- * (value, index) pairs. Used in combination with host-side softmax + top-p
- * filtering for full top-k/top-p sampling without D2H of full logits.
- *
- * Design:
- *   - Single-block kernel with 32 threads (one warp/half-wavefront)
- *   - Each thread scans n/32 elements, maintaining local top-k via insertion sort
- *   - Shared memory merge step combines all thread-local results
- *   - Output: top-k (value, index) pairs in descending order of value
- *
- * Performance: ~15-25µs for 76K elements, k=40 on MI50
- *   (vs ~600KB D2H that takes ~300µs)
+ * FP32 vocabulary selection, distribution processing and speculative rejection
+ * retain their outputs in persistent device buffers. Ordinary and speculative
+ * response publication use the same SamplingMath controller and exact integer
+ * transitions as CUDA and CPU tests. Every launch requires the caller's exact
+ * non-null stream; admission supplies immutable policy, not a host shadow of
+ * live budgets. Captured kernels perform no allocation or host token transfer.
  */
 
 #include <hip/hip_runtime.h>
@@ -4447,6 +4441,23 @@ __global__ void rocm_publish_device_moe_rebalance_dispatch_ticket_kernel(
 }
 
 /**
+ * @brief Publish one ordinary sample per independent resident request.
+ *
+ * One lane owns each response/continuation transition; the block spans requests,
+ * not vocabulary elements. CUDA and HIP use the identical shared transition,
+ * including failure atomicity and sampler-free forward-only publication.
+ */
+__global__ void rocm_publish_ordinary_generation_sample_kernel(
+    llaminar2::sampling_math::OrdinaryGenerationPublication publication)
+{
+    using namespace llaminar2::sampling_math;
+    const size_t request = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (request >= static_cast<size_t>(publication.request_count))
+        return;
+    (void)publish_ordinary_generation_request(publication, request);
+}
+
+/**
  * @brief Initialize one persistent device-generation controller per request.
  *
  * The response payload is intentionally not cleared.  Its authoritative count
@@ -4456,7 +4467,7 @@ __global__ void rocm_publish_device_moe_rebalance_dispatch_ticket_kernel(
 __global__ void rocm_initialize_device_generation_kernel(
     int request_count,
     int max_new_tokens,
-    llaminar2::sampling_math::DeviceGenerationDepthPolicy depth_policy,
+    llaminar2::sampling_math::DeviceGenerationPolicy depth_policy,
     llaminar2::sampling_math::DeviceGenerationLeadingRowDisposition
         initial_leading_row_disposition,
     int response_token_stride,
@@ -7370,10 +7381,25 @@ bool rocmOps_publish_device_moe_rebalance_dispatch_ticket(
     return true;
 }
 
+/** @brief Enqueue ordinary publication on the exact caller-owned stream. */
+bool rocmOps_publish_ordinary_generation_sample(
+    const llaminar2::sampling_math::OrdinaryGenerationPublication &publication,
+    int device_idx, void *stream)
+{
+    if (!publication.valid() || !stream || device_idx < 0)
+        return false;
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 64;
+    const int blocks = 1 + (publication.request_count - 1) / threads;
+    hipLaunchKernelGGL(rocm_publish_ordinary_generation_sample_kernel,
+        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream), publication);
+    return hipGetLastError() == hipSuccess;
+}
+
 bool rocmOps_initialize_device_generation(
     int request_count,
     int max_new_tokens,
-    const llaminar2::sampling_math::DeviceGenerationDepthPolicy &depth_policy,
+    const llaminar2::sampling_math::DeviceGenerationPolicy &depth_policy,
     llaminar2::sampling_math::DeviceGenerationLeadingRowDisposition
         initial_leading_row_disposition,
     int response_token_stride,
@@ -7382,12 +7408,10 @@ bool rocmOps_initialize_device_generation(
     int device_idx,
     void *stream)
 {
-    if (request_count <= 0 || max_new_tokens <= 0 ||
-        !depth_policy.valid() ||
-        !llaminar2::sampling_math::
-            valid_device_generation_leading_row_disposition(
-                initial_leading_row_disposition) ||
-        response_token_stride < max_new_tokens ||
+    if (request_count <= 0 ||
+        !llaminar2::sampling_math::valid_device_generation_admission(
+            depth_policy, max_new_tokens, initial_leading_row_disposition) ||
+        response_token_stride <= 0 || response_token_stride < max_new_tokens ||
         control_stride <
             llaminar2::sampling_math::kDeviceGenerationControlCount ||
         !control || !stream)

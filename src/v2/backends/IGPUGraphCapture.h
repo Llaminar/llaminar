@@ -40,7 +40,16 @@ namespace llaminar2
         IfDeviceWordNonZero, ///< Execute only when the bound device word is non-zero.
         /** Execute when the validated transaction selector is at least the fragment threshold. */
         IfDeviceSelectorAtLeast,
+        IfDeviceWordZero, ///< Execute only when the bound device word is zero.
     };
+
+    /** @return Whether a fragment reads one exact device-owned scalar. */
+    [[nodiscard]] constexpr bool isDeviceWordConditional(
+        DeviceControlledLoopFragmentExecution execution) noexcept
+    {
+        return execution == DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero ||
+               execution == DeviceControlledLoopFragmentExecution::IfDeviceWordZero;
+    }
 
     /// Result of an in-place graph executable update
     enum class GraphUpdateResult
@@ -189,7 +198,7 @@ namespace llaminar2
         DeviceControlledLoopFragmentExecution execution =
             DeviceControlledLoopFragmentExecution::Always;
         /**
-         * Persistent device scalar used by @ref IfDeviceWordNonZero.
+         * Persistent device scalar used by either device-word predicate.
          *
          * The graph reads this address through a one-thread condition kernel.
          * It must remain stable for the complete executable lifetime.
@@ -200,7 +209,7 @@ namespace llaminar2
          *
          * The enclosing selector contract owns the device address and legal
          * interval. A negative value means that this fragment has no selector
-         * gate, making the three execution policies disjoint by construction.
+         * gate, keeping word and selector policies disjoint by construction.
          */
         int minimum_selector = -1;
 
@@ -215,6 +224,7 @@ namespace llaminar2
                                           minimum_selector < 0;
                 break;
             case DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero:
+            case DeviceControlledLoopFragmentExecution::IfDeviceWordZero:
                 condition_binding_valid = condition_word_device != nullptr &&
                                           minimum_selector < 0;
                 break;
@@ -279,6 +289,8 @@ namespace llaminar2
                 return true;
             case DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero:
                 return conditional_word_nonzero;
+            case DeviceControlledLoopFragmentExecution::IfDeviceWordZero:
+                return !conditional_word_nonzero;
             case DeviceControlledLoopFragmentExecution::
                 IfDeviceSelectorAtLeast:
                 return selector >= fragment.minimum_selector;
@@ -668,8 +680,11 @@ namespace llaminar2
          * multi-stream event handoffs to equivalent direct dependency edges when
          * conditional bodies do not admit event nodes. A root wait or terminal
          * record crosses the fragment boundary and must remain a hard error. The
-         * first iteration is admitted by request admission; subsequent iterations
-         * are controlled exclusively by @p predicate. No D2H copy, host callback,
+         * first and subsequent iterations are controlled exclusively by
+         * @p predicate. First-sample work belongs inside this same guarded body:
+         * a device-word conditional can select its initial frontier, and later
+         * fragments can test completion after sampling exhausts the budget. No
+         * D2H copy, host callback,
          * allocation, or stream synchronization is permitted in the generated
          * graph.
          *
@@ -709,7 +724,8 @@ namespace llaminar2
                 .name = "complete transaction",
                 .capture = &body,
             }};
-            return buildDeviceControlledWhileLoop(fragments, predicate);
+            return buildDeviceControlledWhileLoop(
+                fragments, predicate);
         }
 
         /**

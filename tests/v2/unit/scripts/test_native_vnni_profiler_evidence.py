@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Regression tests for isolated NativeVNNI profiler sidecars."""
+"""Regression tests for isolated NativeVNNI profiler sidecars.
+
+Synthetic records exercise request identity, exact-stream attribution, physical
+dispatch ownership, and feature publication without launching an accelerator.
+Canonical timing remains unchanged by the independently supplied counters.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -57,6 +63,7 @@ from native_vnni_dispatch.profiler_collectors import (  # noqa: E402
     _collect_cpu_batch,
     _collect_cuda_batch,
     _collect_rocm_batch,
+    _convert_ncu_value,
     _cpu_batch_environment,
     _cuda_batch_environment,
     _rocm_batch_environment,
@@ -66,6 +73,7 @@ from native_vnni_dispatch.profiler_collectors import (  # noqa: E402
     _load_incremental_evidence,
     _NCUDispatchRecord,
     _profile_environment,
+    _sha256_files,
     _tool_command,
     _trainer_arguments,
     _validate_gpu_process_batch_size,
@@ -81,6 +89,11 @@ from native_vnni_dispatch.profiler_collectors import (  # noqa: E402
 )
 from native_vnni_dispatch.profiler_checkpoint import (  # noqa: E402
     recover_complete_checkpoint,
+)
+from native_vnni_dispatch.profiler_reparse import (  # noqa: E402
+    _unit_only_record,
+    reparse_cuda_evidence,
+    upgrade_cuda_evidence,
 )
 from native_vnni_dispatch.profiler_evidence import (  # noqa: E402
     EXPECTED_PROFILER_TOOL,
@@ -537,6 +550,29 @@ def profiler_model_fixture(
 
 class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
     """Prove timing isolation, request identity, and stratified profile use."""
+
+    def test_cuda_fused_schedule_owns_partitions_inside_each_cta(self) -> None:
+        """Unseen-shape features distinguish global and shared publication."""
+
+        key = dataclasses.replace(
+            runtime_key(cuda_observation()), projection_n_vector=(129,), aggregate_n=129, k=672, m=1,
+        )
+        def features(family: str, columns: int) -> dict[str, float | str]:
+            return {
+                "config.family": family, "config.tile_n": math.log1p(columns),
+                "config.cpt": math.log1p(1), "config.exact_kb": math.log1p(20),
+            }
+        global_kpar = profiler_model._cuda_decode_schedule_features(key, features("kpar", 32))
+        fused = profiler_model._cuda_decode_schedule_features(key, features("fused_kpar", 16))
+        self.assertEqual(global_kpar["schedule.cuda_decode.producer_tasks"], 100)
+        self.assertEqual(fused["schedule.cuda_decode.producer_tasks"], 9)
+        self.assertEqual(fused["schedule.cuda_decode.threads_per_cta"], 320)
+        self.assertEqual(global_kpar["schedule.cuda_decode.global_partial_bytes"], 10320)
+        self.assertEqual(fused["schedule.cuda_decode.global_partial_bytes"], 0)
+        self.assertEqual(fused["schedule.cuda_decode.shared_partial_bytes_per_cta"], 1280)
+        for candidate in (global_kpar, fused):
+            self.assertEqual(candidate["schedule.cuda_decode.k_partitions"], 20)
+            self.assertAlmostEqual(candidate["schedule.cuda_decode.partition_utilization"], 21 / 40)
 
     def setUp(self) -> None:
         """Keep unit tests independent of native threads and GPU execution."""
@@ -3417,6 +3453,233 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             tuple(_evaluate_placement_fold(task) for task in eager),
         )
 
+    def _read_only_compact_fold_tasks(self, directory: Path):
+        """Prepare device-free CV tasks against immutable row-aligned surfaces."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        seed = "compact-label-cache-unit"
+        predictions = {}
+        for index, (request, points) in enumerate(
+            _domain_profiler_prediction_requests(domain, costs, seed=seed).items()
+        ):
+            inventory = segmented_policy._profiler_prediction_point_inventory(points)
+            path = directory / f"predictions-{index}.f64"
+            np.asarray([0.01 + 0.002 * row for row in range(len(inventory.points))],
+                       dtype="<f8").tofile(path)
+            predictions[request] = segmented_policy.ProfilerPredictionSurface(inventory, path)
+        tasks, _folds = _domain_fold_tasks(
+            domain, costs, max_leaves=1, min_shape_groups_per_leaf=1, seed=seed,
+            profiler_training_pool_key=_profiler_transfer_key(domain),
+            profiler_prediction_cache=predictions, compact=True,
+            feature_policies=(segmented_policy.FeaturePolicy.CONTINUOUS,
+                              segmented_policy.FeaturePolicy.TILE_32),
+        )
+        return tasks
+
+    def test_compact_label_views_reuse_only_label_invariant_work(self) -> None:
+        """Feature/placement alternatives reuse labels, never held-out decisions."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            expected = tuple(segmented_policy._materialize_compact_fold_costs(task)
+                             for task in tasks)
+            cache = segmented_policy._CompactFoldCostViews()
+            with mock.patch.object(segmented_policy, "_materialize_compact_fold_costs",
+                                   wraps=segmented_policy._materialize_compact_fold_costs) as build:
+                actual = tuple(cache.materialize(task) for task in tasks)
+            self.assertEqual(actual, expected)
+            required_views = {
+                (task.fold_index, task.profiler_influence)
+                for task in tasks if task.profiler_influence != ProfilerInfluence.MEASURED_ONLY
+            }
+            self.assertEqual(build.call_count, len(required_views))
+            self.assertLess(build.call_count, len(tasks))
+            self.assertEqual(
+                tuple(_evaluate_placement_fold(task, compact_cost_views=cache) for task in tasks),
+                tuple(_evaluate_placement_fold(task) for task in tasks),
+            )
+            for task, view in zip(tasks, actual):
+                if task.profiler_influence == ProfilerInfluence.MEASURED_ONLY:
+                    self.assertIs(view, task.costs)
+                self.assertEqual(
+                    {(row.runtime_key, row.shape_group_id, row.candidate_id):
+                     (row.max_surface_regret, row.p95_surface_regret, row.mean_surface_regret)
+                     for row in view},
+                    {(row.runtime_key, row.shape_group_id, row.candidate_id):
+                     (row.max_surface_regret, row.p95_surface_regret, row.mean_surface_regret)
+                     for row in task.costs},
+                )
+
+    def test_compact_label_scope_invalidates_changed_inputs(self) -> None:
+        """New costs, held groups or prediction owners may not reuse stale priors."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks if t.profiler_influence == ProfilerInfluence.BOUNDED_PRIOR)
+            cache = segmented_policy._CompactFoldCostViews()
+            initial = cache.materialize(task)
+            self.assertIs(cache.materialize(dataclasses.replace(
+                task, feature_policy=segmented_policy.FeaturePolicy.TILE_64,
+                max_leaves=task.max_leaves+1)), initial)
+            changed_costs = dataclasses.replace(task, costs=(
+                dataclasses.replace(task.costs[0], max_surface_regret=0.025), *task.costs[1:]))
+            changed_groups = dataclasses.replace(task, held_out_groups=frozenset(
+                cost.shape_group_id for cost in task.costs if cost.shape_group_id not in task.held_out_groups))
+            surface = task.profiler_predictions
+            path = Path(directory) / "different-predictions.f64"
+            (np.asarray(surface.values)+0.01).astype("<f8").tofile(path)
+            changed_predictions = dataclasses.replace(task, profiler_predictions=
+                segmented_policy.ProfilerPredictionSurface(surface.inventory, path))
+            for changed in (changed_costs, changed_groups, changed_predictions):
+                with self.subTest(change=changed):
+                    cache.materialize(task)
+                    view = cache.materialize(changed)
+                    self.assertIsNot(view, initial)
+                    self.assertEqual(view, segmented_policy._materialize_compact_fold_costs(changed))
+                    self.assertEqual(cache.retained_view_count, 1)
+            cache.clear()
+            self.assertEqual(cache.retained_view_count, 0)
+
+    def test_compact_label_cache_does_not_retain_mutable_prediction_maps(self) -> None:
+        """Diagnostic mappings remain live inputs rather than cached snapshots."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks if t.profiler_influence == ProfilerInfluence.BOUNDED_PRIOR)
+            values = dict(task.profiler_predictions)
+            mutable = dataclasses.replace(task, profiler_predictions=values)
+            cache = segmented_policy._CompactFoldCostViews()
+            cache.materialize(task)
+            self.assertEqual(cache.retained_view_count, 1)
+            first = cache.materialize(mutable)
+            self.assertEqual(cache.retained_view_count, 0)
+            for point in values:
+                values[point] += 0.01
+            second = cache.materialize(mutable)
+            self.assertNotEqual(first, second)
+            self.assertEqual(second, segmented_policy._materialize_compact_fold_costs(mutable))
+            self.assertEqual(cache.retained_view_count, 0)
+
+    def test_compact_label_cache_rejects_writable_and_rebound_storage(self) -> None:
+        """A surface object's identity cannot hide a changed backing array."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks
+                        if t.profiler_influence == ProfilerInfluence.BOUNDED_PRIOR)
+            cache = segmented_policy._CompactFoldCostViews()
+            first = cache.materialize(task)
+            surface = task.profiler_predictions
+            original = surface.values
+            path = Path(directory) / "rebound.f64"
+            (np.asarray(original) + 0.02).astype("<f8").tofile(path)
+            surface.values = np.memmap(path, mode="r", dtype="<f8")
+            second = cache.materialize(task)
+            self.assertNotEqual(first, second)
+            self.assertEqual(second,
+                             segmented_policy._materialize_compact_fold_costs(task))
+            surface.values = np.array(original)
+            with self.assertRaisesRegex(RuntimeError, "read-only predictions"):
+                cache.materialize(task)
+            self.assertEqual(cache.retained_view_count, 0)
+
+    def test_compact_label_cache_keeps_incomplete_teacher_fatal(self) -> None:
+        """A failed view must never be published as a retained partial tuple."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks
+                        if t.profiler_influence == ProfilerInfluence.CROSS_FITTED_TEACHER)
+            cache = segmented_policy._CompactFoldCostViews()
+            cache.materialize(task)
+            values = np.array(task.profiler_predictions.values)
+            values[0] = np.nan
+            path = Path(directory) / "incomplete.f64"
+            values.tofile(path)
+            broken = dataclasses.replace(task, profiler_predictions=
+                segmented_policy.ProfilerPredictionSurface(
+                    task.profiler_predictions.inventory, path))
+            for _retry in range(2):
+                with self.assertRaisesRegex(RuntimeError, "teacher surface became incomplete"):
+                    cache.materialize(broken)
+                self.assertEqual(cache.retained_view_count, 0)
+
+    def test_compact_label_cache_clear_releases_source_owner(self) -> None:
+        """Clear retires the strong scope references as well as cached labels."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks
+                        if t.profiler_influence == ProfilerInfluence.BOUNDED_PRIOR)
+            surface = weakref.ref(task.profiler_predictions)
+            cache = segmented_policy._CompactFoldCostViews()
+            cache.materialize(task)
+            del task, tasks
+            self.assertIsNotNone(surface())
+            cache.clear()
+            self.assertIsNone(surface())
+
+    def test_accelerated_workers_own_separate_reusable_label_views(self) -> None:
+        """Real worker scheduling reuses each lane's cache and joins before clear."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks
+                        if t.profiler_influence == ProfilerInfluence.BOUNDED_PRIOR)
+            groups = tuple(((2 * i, task), (2 * i + 1, task)) for i in range(4))
+            scorers = [mock.Mock(), mock.Mock()]
+            spec = mock.Mock(label="device-free-label-lanes", lane_count=2)
+            spec.create_scorer.side_effect = scorers
+            connection = mock.Mock()
+            connection.recv.side_effect = [
+                ("task", i) for i in range(4)
+            ] + [("stop",), ("stop",)]
+            caches = {}
+            views = {}
+
+            def evaluate(task, primary_scorer=None, *, compact_cost_views=None):
+                """Exercise host view reuse without creating any GPU session."""
+
+                cache = caches.setdefault(primary_scorer, compact_cost_views)
+                self.assertIs(cache, compact_cost_views)
+                result = cache.materialize(task)
+                self.assertIs(views.setdefault(primary_scorer, result), result)
+                return "independently-evaluated"
+
+            with mock.patch.object(segmented_policy, "arm_policy_worker_parent_death_signal"), \
+                    mock.patch.object(segmented_policy, "_PARALLEL_ACCELERATED_CV_TASK_GROUPS", groups), \
+                    mock.patch.object(segmented_policy, "_evaluate_placement_fold", side_effect=evaluate):
+                segmented_policy._accelerated_worker(spec, "cv", connection, os.getpid())
+
+            messages = [call.args[0] for call in connection.send.call_args_list]
+            self.assertEqual(messages[0], ("ready", 2))
+            self.assertEqual(messages[-1], ("done",))
+            results = [message for message in messages if message[0] == "result"]
+            self.assertEqual(sorted(message[1] for message in results), list(range(4)))
+            self.assertFalse(any(message[0] == "error" for message in messages), messages)
+            self.assertEqual(len(caches), 2)
+            self.assertEqual(len({id(cache) for cache in caches.values()}), 2)
+            self.assertTrue(all(cache.retained_view_count == 0 for cache in caches.values()))
+            for scorer in scorers:
+                scorer.close.assert_called_once_with()
+            connection.close.assert_called_once_with()
+
+    def test_accelerated_worker_retires_partially_created_lanes(self) -> None:
+        """A later scorer-creation failure still releases every earlier owner."""
+
+        scorer = mock.Mock()
+        spec = mock.Mock(label="device-free-partial-lanes", lane_count=2)
+        spec.create_scorer.side_effect = [scorer, RuntimeError("second lane failed")]
+        connection = mock.Mock()
+        with mock.patch.object(segmented_policy, "arm_policy_worker_parent_death_signal"):
+            segmented_policy._accelerated_worker(spec, "cv", connection, os.getpid())
+        scorer.close.assert_called_once_with()
+        message = connection.send.call_args.args[0]
+        self.assertEqual(message[:2], ("error", spec.label))
+        self.assertIn("second lane failed", message[2])
+        connection.close.assert_called_once_with()
+
     def test_compact_profiler_fold_tasks_share_candidate_storage(self) -> None:
         """Tournament expansion must retain one candidate tuple per domain."""
 
@@ -4287,11 +4550,20 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
             )
 
     def test_shape_resolved_formula_is_not_mislabeled_as_physical_launch(self) -> None:
+        """Both publication families must profile their physical witnesses."""
+
+        for family in ("kpar_formula", "fused_kpar_formula"):
+            with self.subTest(family=family):
+                self._assert_cuda_formula_is_not_physical(family)
+
+    def _assert_cuda_formula_is_not_physical(self, family: str) -> None:
+        """Reject a nominal recipe even when its other observation fields pass."""
+
         observation = cuda_observation()
         formula = next(
             candidate
             for candidate in cuda_native_vnni_gemv_registry().entries
-            if candidate.config_json.get("family") == "kpar_formula"
+            if candidate.config_json.get("family") == family
         )
         projected = dataclasses.replace(
             observation,
@@ -4313,10 +4585,17 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
     ) -> None:
         """A cached formula cost must reproduce its projected profiler record."""
 
+        for family in ("kpar_formula", "fused_kpar_formula"):
+            with self.subTest(family=family):
+                self._assert_cuda_formula_cost_resolves_catalog(family)
+
+    def _assert_cuda_formula_cost_resolves_catalog(self, family: str) -> None:
+        """Projected and lazy joins must authenticate the same physical launch."""
+
         formula = next(
             candidate
             for candidate in cuda_native_vnni_gemv_registry().entries
-            if candidate.config_json.get("family") == "kpar_formula"
+            if candidate.config_json.get("family") == family
         )
         concrete_id = resolve_cuda_concrete_candidate_id(formula, 2048, 4096)
         physical = cuda_observation(candidate_id=concrete_id)
@@ -4951,6 +5230,105 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         self.assertEqual(
             exported[0]["gpu.duration_ns.availability"], "measured"
         )
+
+    def test_fused_cuda_profile_retains_one_physical_dispatch(self) -> None:
+        """Ordered arithmetic cannot invent a reducer or inherit another stream.
+
+        The legacy force_two_phase field authenticates arithmetic, not physical
+        launch count. Exercise the complete publication path with global and
+        CTA-local KPAR requests sharing that field and the exact partition tree.
+        """
+
+        for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED):
+            for columns, partitions in (
+                (16, 1), (16, 6), (16, 64),
+                (32, 1), (32, 6), (32, 32),
+            ):
+                with self.subTest(mode=mode, columns=columns, partitions=partitions):
+                    global_row = dataclasses.replace(
+                        cuda_observation(candidate_id=(
+                            "cuda.nvnni.decode.fast_m1.kpar."
+                            f"tn32.cpt1.kb{partitions}"
+                        )),
+                        execution_mode=mode,
+                    )
+                    fused_row = dataclasses.replace(
+                        cuda_observation(candidate_id=(
+                            "cuda.nvnni.decode.fast_m1.fused_kpar."
+                            f"tn{columns}.cpt1.kb{partitions}"
+                        )),
+                        execution_mode=mode,
+                    )
+                    observations = ObservationCorpus((global_row, fused_row))
+                    requests = build_profiler_request_manifest(observations)
+                    by_family = {
+                        request.config_json["family"]: request
+                        for request in requests.requests
+                    }
+                    self.assertEqual(set(by_family), {"kpar", "fused_kpar"})
+                    global_request = by_family["kpar"]
+                    fused_request = by_family["fused_kpar"]
+                    self.assertEqual(
+                        global_request.arithmetic_fingerprint,
+                        fused_request.arithmetic_fingerprint,
+                    )
+                    for request in requests.requests:
+                        self.assertEqual(request.config_json["force_two_phase"], 1)
+                    self.assertNotIn(
+                        "ordered_kpart_partials", fused_request.prepared_resources
+                    )
+
+                    # Interleaved report records model independent streams in a
+                    # shared profiler process. Only the global stream owns the
+                    # reduction, irrespective of ordering in the raw report.
+                    fused_dispatch = dataclasses.replace(
+                        cuda_dispatch(1, "nativeVnniGemv_fusedKpar"),
+                        grid=((fused_row.aggregate_n + columns - 1) // columns, 1, 1),
+                        block=(columns, partitions, 1),
+                    )
+                    partitioned = _partition_cuda_batch_dispatches(
+                        (
+                            _NCUDispatchRecord(42, cuda_dispatch(0, "nativeVnniGemv_kpar")),
+                            _NCUDispatchRecord(77, fused_dispatch),
+                            _NCUDispatchRecord(42, cuda_dispatch(2, "nativeVnniGemv_reduce")),
+                        ),
+                        ((global_request.request_id, 42), (fused_request.request_id, 77)),
+                    )
+                    evidence = evidence_manifest(requests, tuple(
+                        complete_evidence(request, partitioned[request.request_id])
+                        for request in requests.requests
+                    ))
+                    self.assertTrue(validate_profiler_evidence_coverage(requests, evidence).complete)
+                    rows = profiler_feature_rows(observations, requests, evidence)
+                    for family, expected_count in (("kpar", 2), ("fused_kpar", 1)):
+                        selected = tuple(
+                            row for row in rows
+                            if row.observation.config_json["family"] == family
+                        )
+                        self.assertEqual(len(selected), expected_count)
+                        self.assertEqual(
+                            [row.dispatch_index for row in selected], list(range(expected_count))
+                        )
+                        self.assertTrue(all(row.dispatch_count == expected_count for row in selected))
+                        self.assertTrue(all(row.observation.median_us == 11.0 for row in selected))
+                        descriptor = profiler_model._profiler_candidate_descriptor(
+                            by_family[family].request_id, selected
+                        )
+                        self.assertEqual(
+                            descriptor.features["profile.dispatch_count"], math.log1p(expected_count)
+                        )
+                        self.assertEqual(
+                            descriptor.features["profile.compute_dispatch_count"], math.log1p(1)
+                        )
+                        self.assertEqual(
+                            descriptor.features["profile.reduction_dispatch_count"],
+                            math.log1p(expected_count - 1),
+                        )
+                        if family == "fused_kpar":
+                            self.assertEqual(
+                                descriptor.features["profile.block_threads.compute.0"],
+                                math.log1p(columns * partitions),
+                            )
 
     def test_parallel_feature_export_is_byte_identical_to_serial(self) -> None:
         """Ordered worker shards cannot change the canonical feature artifact."""
@@ -5993,6 +6371,118 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         )
         self.assertEqual(dispatches[0].block, (128, 1, 1))
         self.assertEqual(dispatches[0].grid, (16, 1, 1))
+
+    def test_ncu_resource_units_use_decimal_si_not_binary_iec(self) -> None:
+        """The real 0.896 Kbyte allocation is 896 bytes, never 917.504."""
+        for metric in ("gpu.static_shared_memory_bytes", "gpu.dynamic_shared_memory_bytes",
+                       "gpu.local_memory_bytes_per_thread"):
+            for unit, value, expected in (
+                ("Kbyte/block", 0.896, 896), ("Kbyte", 1.024, 1024),
+                ("Mbyte/thread", 0.032768, 32768), ("Gbyte", 1, 1e9),
+                ("byte/block", 896, 896), ("KB", 2, 2000),
+                ("KiB/block", 2, 2048), ("MiB", 1, 1048576),
+                ("GiB", 1, 1073741824),
+            ):
+                with self.subTest(metric=metric, unit=unit):
+                    self.assertEqual(_convert_ncu_value(metric, value, unit), expected)
+        self.assertEqual(_convert_ncu_value("gpu.duration_ns", 1.25, "us"), 1250)
+
+    def test_ncu_reparse_cannot_change_timing_or_dispatch_identity(self) -> None:
+        """Offline correction is limited to byte units, not new measurements."""
+        source = complete_evidence(profiler_request_for_observation(cuda_observation()))
+        original = source.dispatches[0]
+        for change in (dataclasses.replace(original, kernel_name="foreignKernel"),
+                       dataclasses.replace(original, grid=(32, 1, 1)),
+                       dataclasses.replace(original, metrics=tuple(
+                           dataclasses.replace(metric, value=metric.value + 1)
+                           if metric.metric_id == "gpu.duration_ns" else metric
+                           for metric in original.metrics))):
+            with self.subTest(change=change.kernel_name, grid=change.grid):
+                with self.assertRaisesRegex(ValueError, "identity|non-byte"):
+                    _unit_only_record(source, (change,))
+
+    def test_ncu_reparse_authenticated_batch_is_offline_and_source_preserving(self) -> None:
+        """Replay real CSV parsing and stream joining; no GPU/process is allowed."""
+        request = profiler_request_for_observation(cuda_observation())
+        requests = build_profiler_request_manifest(ObservationCorpus((cuda_observation(),)))
+        request = requests.requests[0]
+        old_version = "native-vnni-isolated-profiler-v7-rocm-exact-process-batches"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / "raw"
+            member_dir = raw / request.request_id / "attempt-0001"
+            batch_dir = raw / "_cuda_process_batches" / "one" / "attempt-0001"
+            member_dir.mkdir(parents=True); batch_dir.mkdir(parents=True)
+            plan = _write_gpu_batch_plan(batch_dir / "requests.tsv",
+                _build_gpu_process_batches((request,), 8)[0], {request.request_id: member_dir})
+            metric_rows = (
+                ("gpu__time_duration.sum", "us", "1.25"),
+                ("launch__registers_per_thread", "register/thread", "40"),
+                ("launch__shared_mem_per_block_static", "byte/block", "0"),
+                ("launch__shared_mem_per_block_dynamic", "Kbyte/block", "0.896"),
+                ("sm__maximum_warps_per_active_cycle_pct", "%", "50"),
+                ("sm__warps_active.avg.pct_of_peak_sustained_active", "%", "42"),
+                ("sm__throughput.avg.pct_of_peak_sustained_elapsed", "%", "71"),
+                ("gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed", "%", "36"),
+            )
+            csv_path = batch_dir / "ncu-raw.csv"
+            with csv_path.open("w", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(("ID", "Kernel Name", "Block Size", "Grid Size", "Stream",
+                                 "Metric Name", "Metric Unit", "Metric Value"))
+                for name, unit, value in metric_rows:
+                    writer.writerow((0, "nativeVnniUnit", "(128, 1, 1)", "(16, 1, 1)",
+                                     25, name, unit, value))
+            dispatch = parse_ncu_csv(csv_path, request)[0]
+            old_dispatch = dataclasses.replace(dispatch, metrics=tuple(
+                dataclasses.replace(metric, value=0.896 * 1024)
+                if metric.metric_id == "gpu.dynamic_shared_memory_bytes" else metric
+                for metric in dispatch.metrics))
+            (member_dir / "batch-member.json").write_text(json.dumps({
+                "request_id": request.request_id, "batch_plan_digest": plan,
+                "batch_raw_artifact_digest": _sha256_files(batch_dir),
+                "physical_dispatch_count": 1, "target_launches": 1,
+                "request_launch_order": 0, "stream_id": 25,
+            }))
+            record = dataclasses.replace(complete_evidence(request, (old_dispatch,)),
+                collector_version=old_version, raw_artifact_digest=_sha256_files(member_dir))
+            source = dataclasses.replace(evidence_manifest(requests, ()),
+                collector_version=old_version, evidence=(record,))
+            request_path, source_path, output = root/"requests.json", root/"source.json", root/"out.json"
+            write_profiler_request_manifest(request_path, requests)
+            write_profiler_evidence_manifest(source_path, source)
+            before = source_path.read_bytes()
+            with mock.patch("subprocess.run", side_effect=AssertionError("must remain offline")):
+                report = reparse_cuda_evidence(requests_path=request_path, source_path=source_path,
+                    raw_directory=raw, output_path=output, workers=1)
+            self.assertEqual(report.changed_metric_count, 1)
+            self.assertEqual(source_path.read_bytes(), before)
+            result = read_profiler_evidence_manifest(output).evidence[0]
+            self.assertEqual(result.dispatches, (dispatch,))
+            self.assertEqual(result.command_digest, record.command_digest)
+            self.assertEqual(result.raw_artifact_digest, record.raw_artifact_digest)
+            with self.assertRaisesRegex(ValueError, "new output"):
+                reparse_cuda_evidence(requests_path=request_path, source_path=source_path,
+                    raw_directory=raw, output_path=source_path, workers=1)
+            # Atomic promotion is explicit and idempotent; the original bytes
+            # remain available instead of being silently overwritten.
+            promoted = upgrade_cuda_evidence(requests_path=request_path,
+                source_path=source_path, raw_directory=raw, workers=1)
+            self.assertEqual(promoted.changed_metric_count, 1)
+            backup = Path(str(source_path) + ".before-ncu-si-units-v8.json")
+            self.assertEqual(backup.read_bytes(), before)
+            self.assertEqual(read_profiler_evidence_manifest(source_path).evidence[0], result)
+            self.assertIsNone(upgrade_cuda_evidence(requests_path=request_path,
+                source_path=source_path, raw_directory=raw, workers=1))
+            journal = Path(str(source_path) + ".inprogress.jsonl")
+            journal.write_text("live collector state must not be truncated\n")
+            with self.assertRaisesRegex(ValueError, "unfinished profiler journal"):
+                upgrade_cuda_evidence(requests_path=request_path,
+                    source_path=source_path, raw_directory=raw, workers=1)
+            csv_path.write_text(csv_path.read_text().replace('0.896', '0.897'))
+            with self.assertRaisesRegex(ValueError, "digest mismatch"):
+                reparse_cuda_evidence(requests_path=request_path, source_path=backup,
+                    raw_directory=raw, output_path=root/"tampered.json", workers=1)
 
     def test_ncu_parser_accepts_2025_wide_raw_metric_export(self) -> None:
         """Nsight Compute 2025.3 emits one metric column per dispatch row."""

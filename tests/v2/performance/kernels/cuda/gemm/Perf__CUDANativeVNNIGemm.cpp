@@ -1,6 +1,12 @@
 /**
  * @file Perf__CUDANativeVNNIGemm.cpp
  * @brief Correctness and performance harness for tensor-core native-vnni prefill GEMM.
+ *
+ * Production-prepared weights and persistent explicit-stream workspaces back
+ * every candidate. Full-output serial byte comparisons are separate from
+ * native-event timing, and compiler resource checks reject new spilling
+ * specializations before they can enter the timing corpus. Functional resource
+ * certification is registered independently from the performance tournament.
  */
 
 #include <gtest/gtest.h>
@@ -26,6 +32,7 @@
 #include "CUDANativeVNNIGemmPerfCommon.h"
 #include "../../../../utils/ScopedGPUStream.h"
 #include "kernels/cuda/gemm/CUDANativeVNNIPrefillDiagnostics.h"
+#include "tensors/NativeVnniFormatInfo.h"
 #include "fort.hpp"
 
 using namespace llaminar2::test::native_vnni_gemm_perf;
@@ -38,6 +45,7 @@ using llaminar2::test::TestTensorFactory;
 using llaminar2::TensorBase;
 using llaminar2::WorkspaceDescriptor;
 using llaminar2::WorkspaceRequirements;
+using llaminar2::cuda::prefill::PrefillStagingSchedule;
 
 extern "C"
 {
@@ -90,14 +98,18 @@ namespace
     class ScopedDensePrefillOverlayBypass
     {
     public:
+        /** @brief Preserve thread-local policy while collecting generic evidence. */
         ScopedDensePrefillOverlayBypass()
-            : previous_(cudaNativeVNNIPrefill_getExactOverlayEnabled())
+            : previous_(cudaNativeVNNIPrefill_getExactOverlayEnabled()),
+              previous_staging_(cudaNativeVNNIPrefill_getStagingSchedule())
         {
             cudaNativeVNNIPrefill_setExactOverlayEnabled(false);
         }
 
+        /** @brief Restore both independent policies, including assertion unwinding. */
         ~ScopedDensePrefillOverlayBypass()
         {
+            cudaNativeVNNIPrefill_setStagingSchedule(previous_staging_);
             cudaNativeVNNIPrefill_setExactOverlayEnabled(previous_);
         }
 
@@ -108,6 +120,7 @@ namespace
 
     private:
         bool previous_ = true;
+        PrefillStagingSchedule previous_staging_;
     };
 
     const llaminar2::NativeVnniFormatInfo &requireNativeVnniInfo(
@@ -293,9 +306,18 @@ namespace
 
     TEST_F(CUDANativeVNNIGemmPerf, CompilerResources_AllCodebooksAndCandidates)
     {
-        static constexpr uint8_t codebooks[] = {
-            0, 4, 5, 6, 7, 8, 9, 10,
-            11, 12, 13, 14, 15, 16, 17, 19};
+        // Source aliases and CPU-promoted formats must reach the same resource
+        // gate. A copied ID list previously omitted the expanded-min format.
+        std::set<uint8_t> codebooks;
+        std::set<uint8_t> staged_codebooks;
+        for (const auto &source : llaminar2::native_vnni_formats::kAllSourceFormats)
+        {
+            const auto &format = *source.metadata;
+            codebooks.insert(llaminar2::canonicalDeviceVnniCodebookId(format.codebook_id));
+            codebooks.insert(llaminar2::migrationStableDeviceVnniFormat(format).codebook_id);
+            if (format.payload_bytes == 16 || format.payload_bytes == 20)
+                staged_codebooks.insert(llaminar2::canonicalDeviceVnniCodebookId(format.codebook_id));
+        }
         const std::string csv_path =
             getEnvString("LLAMINAR_TILE_RESOURCE_CSV");
         FILE *csv = nullptr;
@@ -319,27 +341,38 @@ namespace
                 "auxiliary_dynamic_shared_memory_bytes,"
                 "auxiliary_threads_per_block,"
                 "auxiliary_max_threads_per_block,"
-                "auxiliary_max_active_blocks_per_sm,spill_free\n");
+                "auxiliary_max_active_blocks_per_sm,spill_free,staging_schedule\n");
         }
 
         size_t queried = 0;
         size_t spilling = 0;
-        std::set<std::tuple<int, int, int, int>> observed_spilling;
+        std::set<std::tuple<int, int, int, int, int>> observed_spilling;
         const auto inspect = [&](uint8_t codebook,
                                  int tile_id,
                                  int canonical_kpart,
-                                 int ordered_bk256)
+                                 int ordered_bk256,
+                                 PrefillStagingSchedule staging = PrefillStagingSchedule::RegisterDecode)
         {
             CUDADensePrefillKernelResources primary{};
             CUDADensePrefillKernelResources auxiliary{};
-            ASSERT_TRUE(cudaNativeVNNIPrefill_queryCandidateResources(
+            const bool implemented = cudaNativeVNNIPrefill_queryCandidateResources(
                 codebook,
                 tile_id,
                 canonical_kpart,
                 ordered_bk256,
                 /*cuda_device_id=*/0,
                 &primary,
-                &auxiliary));
+                &auxiliary,
+                staging);
+            // Inventory every request, including unsupported physical schedules.
+            // A missing specialization must not silently become RegisterDecode.
+            const bool expected_implemented =
+                staging == PrefillStagingSchedule::RegisterDecode ||
+                (staged_codebooks.contains(codebook) && tile_id >= 0 && tile_id != 1);
+            ASSERT_EQ(implemented, expected_implemented);
+            if (!implemented)
+                return;
+            EXPECT_NE(primary.kernel_symbol, nullptr);
             EXPECT_GT(primary.registers_per_thread, 0);
             EXPECT_GT(primary.threads_per_block, 0);
             EXPECT_GE(
@@ -375,14 +408,15 @@ namespace
                     static_cast<int>(codebook),
                     tile_id,
                     canonical_kpart,
-                    ordered_bk256);
+                    ordered_bk256,
+                    static_cast<int>(staging));
             }
             if (csv)
             {
                 std::fprintf(
                     csv,
                     "%u,%d,%d,%d,%d,%zu,%zu,%zu,%d,%d,%d,"
-                    "%d,%zu,%zu,%zu,%d,%d,%d,%d\n",
+                    "%d,%zu,%zu,%zu,%d,%d,%d,%d,%d\n",
                     static_cast<unsigned>(codebook),
                     tile_id,
                     canonical_kpart,
@@ -401,7 +435,8 @@ namespace
                     auxiliary.threads_per_block,
                     auxiliary.max_threads_per_block,
                     auxiliary.max_active_blocks_per_sm,
-                    spill_free ? 1 : 0);
+                    spill_free ? 1 : 0,
+                    static_cast<int>(staging));
             }
         };
 
@@ -409,8 +444,15 @@ namespace
         {
             for (int tile_id = 0; tile_id < 6; ++tile_id)
             {
-                inspect(codebook, tile_id, 0, 0);
-                inspect(codebook, tile_id, 1, 0);
+                for (PrefillStagingSchedule staging : {
+                         PrefillStagingSchedule::RegisterDecode,
+                         PrefillStagingSchedule::AsyncPayload,
+                         PrefillStagingSchedule::AsyncWeightOperands,
+                         PrefillStagingSchedule::AsyncAllOperands})
+                {
+                    inspect(codebook, tile_id, 0, 0, staging);
+                    inspect(codebook, tile_id, 1, 0, staging);
+                }
             }
         }
         for (int tile_id : {-3, -2})
@@ -429,21 +471,25 @@ namespace
             queried,
             spilling,
             queried - spilling);
-        EXPECT_EQ(queried, 196u);
-        std::set<std::tuple<int, int, int, int>> expected_spilling;
+        EXPECT_EQ(queried, codebooks.size() * 6u * 2u +
+                           staged_codebooks.size() * 5u * 2u * 3u + 4u);
+        std::set<std::tuple<int, int, int, int, int>> expected_spilling;
         for (int codebook : {8, 9, 13, 14})
         {
             for (int tile_id : {1, 4})
-                expected_spilling.emplace(codebook, tile_id, 0, 0);
+                expected_spilling.emplace(codebook, tile_id, 0, 0, 0);
         }
         for (int codebook : {10, 17})
         {
             for (int tile_id : {1, 4, 5})
             {
-                expected_spilling.emplace(codebook, tile_id, 0, 0);
-                expected_spilling.emplace(codebook, tile_id, 1, 0);
+                expected_spilling.emplace(codebook, tile_id, 0, 0, 0);
+                expected_spilling.emplace(codebook, tile_id, 1, 0, 0);
             }
         }
+        for (int codebook : {5, 7})
+            for (int staging : {2, 3})
+                expected_spilling.emplace(codebook, 2, 0, 0, staging);
         EXPECT_EQ(observed_spilling, expected_spilling)
             << "Compiler resource drift changed the launchable candidate set";
     }
@@ -906,6 +952,8 @@ namespace
         int observed_k_partitions;
         int observed_bk256;
         int observed_canonical_kpart;
+        PrefillStagingSchedule staging = PrefillStagingSchedule::RegisterDecode;
+        PrefillStagingSchedule observed_staging = PrefillStagingSchedule::RegisterDecode;
         int primary_registers_per_thread;
         size_t primary_local_memory_bytes_per_thread;
         size_t primary_static_shared_memory_bytes;
@@ -931,6 +979,7 @@ namespace
         int requested_k_partitions;
         std::string tile_name;
         int tiles;
+        PrefillStagingSchedule staging = PrefillStagingSchedule::RegisterDecode;
     };
 
     /**
@@ -942,6 +991,8 @@ namespace
      */
     static void configureSweepTask(const SweepTask &task)
     {
+        if (!cudaNativeVNNIPrefill_setStagingSchedule(task.staging))
+            throw std::runtime_error("unknown CUDA prefill staging identity");
         if (task.strat == Strategy::Auto)
         {
             cudaNativeVNNIPrefill_setBK256Mode(0);
@@ -1022,6 +1073,7 @@ namespace
         cudaNativeVNNIPrefill_setBK256Mode(0);
         cudaNativeVNNIPrefill_setForceTile(-1);
         cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
+        cudaNativeVNNIPrefill_setStagingSchedule(PrefillStagingSchedule::RegisterDecode);
         merge(consumer->getWorkspaceRequirements(m, shape->n, shape->k));
         return merged;
     }
@@ -1330,6 +1382,7 @@ namespace
 
         void buildExactMPrefillOracle()
         {
+            cudaNativeVNNIPrefill_setStagingSchedule(PrefillStagingSchedule::RegisterDecode);
             cudaNativeVNNIPrefill_setBK256Mode(0);
             cudaNativeVNNIPrefill_setForceTile(-1);
             cudaNativeVNNIPrefill_setCanonicalKPartitionMode(false);
@@ -1454,7 +1507,8 @@ namespace
             [execution_codebook_id](
                 int tile_id,
                 bool canonical_kpart,
-                bool ordered_bk256)
+                bool ordered_bk256,
+                PrefillStagingSchedule staging = PrefillStagingSchedule::RegisterDecode)
         {
             CUDADensePrefillKernelResources primary{};
             CUDADensePrefillKernelResources auxiliary{};
@@ -1465,8 +1519,16 @@ namespace
                     ordered_bk256 ? 1 : 0,
                     /*cuda_device_id=*/0,
                     &primary,
-                    &auxiliary))
+                    &auxiliary,
+                    staging))
             {
+                // Async ownership is intentionally unavailable for other
+                // payload widths and the 128-thread, 128-column tile. The
+                // canonical corpus validator independently requires every
+                // structurally supported candidate, so a missing query cannot
+                // silently shrink the installed candidate inventory.
+                if (staging != PrefillStagingSchedule::RegisterDecode)
+                    return false;
                 throw std::runtime_error(
                     "CUDA dense prefill candidate inventory query failed");
             }
@@ -1535,20 +1597,27 @@ namespace
                         // BK64 strategies: iterate tiles
                         for (int tile_id : cfg.tile_ids)
                         {
-                            if (!resource_eligible(
-                                    tile_id,
-                                    strat == Strategy::CanonicalKpart,
-                                    false))
+                            for (PrefillStagingSchedule staging : {
+                                    PrefillStagingSchedule::RegisterDecode,
+                                    PrefillStagingSchedule::AsyncPayload,
+                                    PrefillStagingSchedule::AsyncWeightOperands,
+                                    PrefillStagingSchedule::AsyncAllOperands})
                             {
-                                continue;
+                                if (!resource_eligible(
+                                        tile_id,
+                                        strat == Strategy::CanonicalKpart,
+                                        false, staging))
+                                {
+                                    continue;
+                                }
+                                const int tile_count = cudaNativeVNNIPrefill_getTileCount(tile_id, m, shape.n);
+                                const int candidate_k_partitions =
+                                    strat == Strategy::CanonicalKpart ? 0 : 1;
+                                tasks.push_back(
+                                    {&shape, m, strat, tile_id,
+                                     candidate_k_partitions,
+                                     kAllTiles[tile_id].name, tile_count, staging});
                             }
-                            const int tile_count = cudaNativeVNNIPrefill_getTileCount(tile_id, m, shape.n);
-                            const int candidate_k_partitions =
-                                strat == Strategy::CanonicalKpart ? 0 : 1;
-                            tasks.push_back(
-                                {&shape, m, strat, tile_id,
-                                 candidate_k_partitions,
-                                 kAllTiles[tile_id].name, tile_count});
                         }
                     }
                 }
@@ -1586,7 +1655,7 @@ namespace
                          "auxiliary_dynamic_shared_memory_bytes,"
                          "auxiliary_threads_per_block,"
                          "auxiliary_max_threads_per_block,"
-                         "auxiliary_max_active_blocks_per_sm\n");
+                         "auxiliary_max_active_blocks_per_sm,staging_schedule,observed_staging_schedule\n");
             std::fflush(csv_fp);
         }
 
@@ -1600,7 +1669,7 @@ namespace
                 timing_csv_fp,
                 "backend,phase,format,codebook,shape,m,n,k,tile,tile_id,"
                 "strategy,requested_k_partitions,sample_index,timed_replays,latency_us,"
-                "latency_us_hex\n");
+                "latency_us_hex,staging_schedule\n");
             std::fflush(timing_csv_fp);
         }
 
@@ -1678,6 +1747,9 @@ namespace
                 &probed_k_partitions,
                 &probed_bk256,
                 &probed_canonical_kpart);
+            const auto probed_staging = cudaNativeVNNIPrefill_getLastLaunchStagingSchedule();
+            if (probed_staging != task.staging)
+                throw std::runtime_error("forced CUDA prefill staging did not execute");
 
             CUDADensePrefillKernelResources primary_resources{};
             CUDADensePrefillKernelResources auxiliary_resources{};
@@ -1771,6 +1843,7 @@ namespace
                 &observed_k_partitions,
                 &observed_bk256,
                 &observed_canonical_kpart);
+            const auto observed_staging = cudaNativeVNNIPrefill_getLastLaunchStagingSchedule();
             if (std::tie(
                     observed_tile_id,
                     observed_k_partitions,
@@ -1780,7 +1853,7 @@ namespace
                     probed_tile_id,
                     probed_k_partitions,
                     probed_bk256,
-                    probed_canonical_kpart))
+                    probed_canonical_kpart) || observed_staging != probed_staging)
             {
                 throw std::runtime_error(
                     "CUDA dense prefill route changed after resource proof");
@@ -1798,13 +1871,13 @@ namespace
                     std::fprintf(
                         timing_csv_fp,
                         "cuda,prefill,%s,%u,%s,%d,%d,%d,%s,%d,%s,%d,"
-                        "%zu,1,%.9f,%a\n",
+                        "%zu,1,%.9f,%a,%d\n",
                         resolved_format_name.c_str(),
                         static_cast<unsigned>(source_codebook_id),
                         shape.name.c_str(), task.m, shape.n, shape.k,
                         task.tile_name.c_str(), task.tile_id,
                         strategyName(task.strat), task.requested_k_partitions,
-                        sample_index, latency_us, latency_us);
+                        sample_index, latency_us, latency_us, static_cast<int>(task.staging));
                 }
                 std::fflush(timing_csv_fp);
             }
@@ -1835,6 +1908,8 @@ namespace
             row.observed_k_partitions = observed_k_partitions;
             row.observed_bk256 = observed_bk256;
             row.observed_canonical_kpart = observed_canonical_kpart;
+            row.staging = task.staging;
+            row.observed_staging = observed_staging;
             row.primary_registers_per_thread = primary_registers;
             row.primary_local_memory_bytes_per_thread = primary_local_bytes;
             row.primary_static_shared_memory_bytes =
@@ -1861,7 +1936,7 @@ namespace
                 std::fprintf(csv_fp,
                              "%s,%u,%s,%d,%d,%d,%s,%d,%s,%d,%d,"
                              "%.3f,%.3f,%.9f,%.9f,%d,%zu,%llu,%d,%d,%d,%d,%d,%d,"
-                             "%d,%zu,%zu,%zu,%d,%d,%d,%d,%zu,%zu,%zu,%d,%d,%d\n",
+                             "%d,%zu,%zu,%zu,%d,%d,%d,%d,%zu,%zu,%zu,%d,%d,%d,%d,%d\n",
                              row.format_name.c_str(),
                              static_cast<unsigned>(row.codebook_id),
                              row.shape_name.c_str(), row.m, row.n, row.k,
@@ -1890,7 +1965,8 @@ namespace
                              row.auxiliary_dynamic_shared_memory_bytes,
                              row.auxiliary_threads_per_block,
                              row.auxiliary_max_threads_per_block,
-                             row.auxiliary_max_active_blocks_per_sm);
+                             row.auxiliary_max_active_blocks_per_sm,
+                             static_cast<int>(row.staging), static_cast<int>(row.observed_staging));
                 std::fflush(csv_fp);
             }
         }

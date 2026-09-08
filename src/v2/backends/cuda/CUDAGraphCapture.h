@@ -353,6 +353,7 @@ namespace llaminar2
         [[nodiscard]] bool appendParallelBranch(
             const GPUCapturedParallelBranch &branch) override;
         using IGPUGraphCapture::buildDeviceControlledWhileLoop;
+        /** @copydoc IGPUGraphCapture::buildDeviceControlledWhileLoop */
         bool buildDeviceControlledWhileLoop(
             std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
             const DeviceControlledLoopPredicate &predicate) override;

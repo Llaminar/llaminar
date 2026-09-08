@@ -8079,14 +8079,14 @@ namespace llaminar2
             /** Flat source-fragment span owned by each legal draft depth. */
             std::array<
                 size_t,
-                sampling_math::DeviceGenerationDepthPolicy::
+                sampling_math::DeviceGenerationPolicy::
                         kMaximumSupportedDraftDepth +
                     1>
                 branch_offsets{};
             /** Number of source fragments in each legal draft-depth branch. */
             std::array<
                 size_t,
-                sampling_math::DeviceGenerationDepthPolicy::
+                sampling_math::DeviceGenerationPolicy::
                         kMaximumSupportedDraftDepth +
                     1>
                 branch_fragment_counts{};
@@ -8098,7 +8098,7 @@ namespace llaminar2
             /** Inclusive selector range; equal for a fixed body. */
             int minimum_draft_depth = 0;
             int maximum_draft_depth = 0;
-            /** DeviceGenerationDepthPolicyMode encoded into this executable. */
+            /** DeviceGenerationPolicyMode encoded into this executable. */
             int depth_policy_mode = -1;
             /** Greedy/stochastic compact-outcome topology in every branch. */
             std::optional<DeviceGenerationSamplingMode> sampling_mode;
@@ -8940,11 +8940,13 @@ namespace llaminar2
          * This is request-lifecycle metadata, not a host shadow of mutable
          * controller state. The device remains authoritative for current depth
          * and counters; the retained value only authenticates which captured
-         * fixed/dynamic graph family may consume that controller. It is born
-         * with admission and retired with the same event-ordered request edge.
+         * generation graph family may consume that controller. Retaining the
+         * complete admission also authenticates terminal budget and initial
+         * row ownership without a second accounting value. It is born with
+         * admission and retired with the same event-ordered request edge.
          */
-        std::optional<sampling_math::DeviceGenerationDepthPolicy>
-            active_device_generation_depth_policy_;
+        std::optional<DeviceGenerationAdmissionRequest>
+            active_device_generation_admission_;
         void *stochastic_target_token_ids_dev_ = nullptr; ///< INT32 [target_rows, 256]
         void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [target_rows, 256]
         void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [draft_rows, 256]

@@ -4,6 +4,8 @@
  *
  * Tests ForwardGraphSignature equality/hashing, GraphBuildResult,
  * GraphCacheConfig defaults, and ForwardGraphCache invalidation.
+ * Model-free replay probes also enforce source-definition ownership, one
+ * executable per retained parent, and no launch/recapture on request reset.
  */
 
 #include <gtest/gtest.h>
@@ -2409,6 +2411,11 @@ TEST(Test__GraphSegmentCache,
 TEST(Test__GraphSegmentCache,
      RetainedParentOwnsTransactionZeroAndSteadyReplay)
 {
+    for (const auto policy : {
+             DeviceGraphExecutor::GraphReplayPlanPolicy::RequireRetainedParentComposition,
+             DeviceGraphExecutor::GraphReplayPlanPolicy::RequireCloneableParentComposition})
+    {
+    SCOPED_TRACE(static_cast<int>(policy));
     ComputeGraph graph;
     addFakeSegmentStage(
         graph,
@@ -2512,24 +2519,26 @@ TEST(Test__GraphSegmentCache,
             /*force_recapture=*/false,
             /*defer_final_sync=*/true,
             /*capture_boundary=*/{},
-            DeviceGraphExecutor::GraphReplayPlanPolicy::
-                RequireRetainedParentComposition,
+            policy,
             launch_dependency,
             std::span<const BufferId>{},
             composer);
     };
 
     ASSERT_TRUE(submit());
-    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 1u);
+    const bool independent_sources = policy ==
+        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireCloneableParentComposition;
+    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), independent_sources ? 4u : 1u);
     auto *const parent = gpu_ctx.created_graph_captures_.front();
-    ASSERT_EQ(parent->created_fragments_.size(), 3u);
+    ASSERT_EQ(parent->created_fragments_.size(), independent_sources ? 0u : 3u);
     for (size_t child = 0u; child < 3u; ++child)
     {
-        EXPECT_EQ(
-            parent->created_fragments_[child]->instantiate_calls_, 0);
-        EXPECT_EQ(parent->created_fragments_[child]->launch_calls_, 0);
-        EXPECT_FALSE(
-            parent->created_fragments_[child]->hasExecutable());
+        auto *const source = dynamic_cast<FakeReplayGraphCapture *>(
+            cache.segments[child].capture.get());
+        ASSERT_NE(source, nullptr);
+        EXPECT_EQ(source->instantiate_calls_, 0);
+        EXPECT_EQ(source->launch_calls_, 0);
+        EXPECT_FALSE(source->hasExecutable());
     }
     ASSERT_NE(parent, nullptr);
     EXPECT_EQ(parent->instantiate_calls_, 1);
@@ -2537,8 +2546,7 @@ TEST(Test__GraphSegmentCache,
     EXPECT_TRUE(cache.retained_composed_parent_replay.valid());
     EXPECT_EQ(
         cache.graph_replay_plan_policy,
-        DeviceGraphExecutor::GraphReplayPlanPolicy::
-            RequireRetainedParentComposition);
+        policy);
 
     graph.reset();
     ASSERT_TRUE(submit());
@@ -2546,7 +2554,8 @@ TEST(Test__GraphSegmentCache,
     EXPECT_EQ(parent->instantiate_calls_, 1);
     EXPECT_EQ(parent->launch_calls_, 2);
     for (size_t child = 0u; child < 3u; ++child)
-        EXPECT_EQ(parent->created_fragments_[child]->launch_calls_, 0);
+        EXPECT_EQ(static_cast<FakeReplayGraphCapture *>(
+            cache.segments[child].capture.get())->launch_calls_, 0);
     ASSERT_EQ(phases.size(), 2u);
     EXPECT_EQ(
         phases[0],
@@ -2556,6 +2565,7 @@ TEST(Test__GraphSegmentCache,
         DeviceGraphExecutor::GraphExecutableLaunchPhase::SteadyReplay);
     EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
     EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+    }
 }
 
 /**

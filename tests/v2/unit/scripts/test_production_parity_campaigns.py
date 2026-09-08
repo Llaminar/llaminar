@@ -296,8 +296,10 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 "V2_Integration_ParityCellLifecycle_MPI1",
             ),
         )
-        discover_units.assert_called_once_with(Path("build"))
-        discover.assert_called_once_with(Path("build"))
+        self.assertEqual(discover_units.call_args_list,
+                         [mock.call(Path("build"))] * 2)
+        self.assertEqual(discover.call_args_list,
+                         [mock.call(Path("build"))] * 2)
         self.assertEqual(run_process.call_count, 3)
         build_command = run_process.call_args_list[0].args[0]
         unit_command = run_process.call_args_list[1].args[0]
@@ -310,6 +312,23 @@ class ProductionParityCampaignTest(unittest.TestCase):
             f"^{campaigns.PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
             command,
         )
+
+    def test_preflight_receipt_uses_registrations_after_build_regeneration(self) -> None:
+        """A build-triggered CMake refresh must not certify a stale inventory."""
+        with mock.patch.object(
+            campaigns, "discover_production_parity_unit_tests",
+            side_effect=[("V2_Unit_Old",), ("V2_Unit_New", "V2_Unit_Added")],
+        ), mock.patch.object(
+            campaigns, "discover_production_parity_preflight_tests",
+            side_effect=[("V2_Integration_Old",), ("V2_Integration_New",)],
+        ), mock.patch.object(campaigns, "_run_process", return_value=0):
+            return_code, _, tests = campaigns.run_production_parity_preflight(
+                Path("build"), 60.0
+            )
+        self.assertEqual(return_code, 0)
+        self.assertEqual(tests, (
+            "V2_Unit_New", "V2_Unit_Added", "V2_Integration_New",
+        ))
 
     @mock.patch.object(
         campaigns,

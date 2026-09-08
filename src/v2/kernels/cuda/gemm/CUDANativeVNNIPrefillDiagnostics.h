@@ -6,19 +6,25 @@
  * preserve the arithmetic contract and remain economical. This interface makes
  * the compiler-resource half of that contract explicit: trainers can inspect a
  * concrete tile before timing it, while production-route tests can inspect the
- * exact specialization selected by one untimed launch. These functions query
- * CUDA metadata only; they allocate no memory, transfer no data, launch no
- * kernel, and synchronize no stream or device.
+ * exact specialization selected by one untimed launch. These functions inspect
+ * CUDA metadata or select thread-local diagnostic staging; they allocate no
+ * memory, transfer no data, launch no kernel, and synchronize no stream/device.
  */
 
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include "CUDANativeVNNIPrefillSchedule.h"
 
 /** Compiler and theoretical-occupancy evidence for one CUDA kernel symbol. */
 struct CUDADensePrefillKernelResources
 {
+    /** Exact core-owned CUDA symbol; valid while the queried module is loaded.
+     * Diagnostic fixtures may capture this symbol instead of recompiling the
+     * device header under different flags. It is never serialized as an ID.
+     */
+    const void *kernel_symbol = nullptr;
     int registers_per_thread = 0;
     std::size_t local_memory_bytes_per_thread = 0;
     std::size_t static_shared_memory_bytes = 0;
@@ -30,11 +36,28 @@ struct CUDADensePrefillKernelResources
 
 extern "C"
 {
+    /** @brief Set the calling thread's explicit diagnostic staging selection.
+     * @param schedule Physical operand-delivery schedule; no automatic substitute.
+     * @return False for an unknown value, leaving the prior selection unchanged.
+     * A structurally incompatible tile/codebook is rejected by launch admission.
+     * Production leaves RegisterDecode selected until certified policy owns it.
+     */
+    bool cudaNativeVNNIPrefill_setStagingSchedule(
+        llaminar2::cuda::prefill::PrefillStagingSchedule schedule);
+
+    /** @brief Return the calling thread's current diagnostic staging choice. */
+    llaminar2::cuda::prefill::PrefillStagingSchedule
+    cudaNativeVNNIPrefill_getStagingSchedule();
+
+    /** @brief Return the staging identity published by the last probed launch. */
+    llaminar2::cuda::prefill::PrefillStagingSchedule
+    cudaNativeVNNIPrefill_getLastLaunchStagingSchedule();
+
     /**
      * @brief Inspect the exact primary and auxiliary kernels from the last launch.
      *
      * The caller must first issue one untimed launch on the same host thread.
-     * The launch publishes its tile, BK256 mode, and canonical-reducer identity
+     * The launch publishes its tile, staging, BK256 mode, and reducer identity
      * into thread-local diagnostics; this query resolves those diagnostics to
      * concrete symbols and returns their compiler resources.
      *
@@ -72,6 +95,8 @@ extern "C"
      * @param cuda_device_id CUDA ordinal used for occupancy calculation.
      * @param primary Receives the main GEMM kernel resources.
      * @param auxiliary Receives canonical reducer resources or an all-zero row.
+     * @param staging Exact operand-delivery specialization. BK256 supports only
+     *        RegisterDecode. Unsupported BK64 ownership geometry is rejected.
      * @return `true` when the candidate identity is launchable and queryable.
      */
     bool cudaNativeVNNIPrefill_queryCandidateResources(
@@ -81,5 +106,7 @@ extern "C"
         int ordered_bk256,
         int cuda_device_id,
         CUDADensePrefillKernelResources *primary,
-        CUDADensePrefillKernelResources *auxiliary);
+        CUDADensePrefillKernelResources *auxiliary,
+        llaminar2::cuda::prefill::PrefillStagingSchedule staging =
+            llaminar2::cuda::prefill::PrefillStagingSchedule::RegisterDecode);
 }

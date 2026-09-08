@@ -9,6 +9,52 @@
 
 ---
 
+## Additive dense exact refresh (September 8)
+
+The dense CUDA/ROCm generator now accepts an explicitly retained installed
+base and an audit receipt. It verifies the complete generated selector ABI,
+literal row grammar and sorted/unique runtime keys; replaces only the newly
+authenticated plan's exact keys; and preserves every unrelated base row byte
+for byte. The receipt distinguishes old retained policy from fresh timing and
+binds base/delta/output identities. Auto rules remain unchanged. This avoids
+erasing broad exact coverage when a focused performance investigation refreshes
+only a few production geometries. The initial all-format FFN refresh and its
+pending promotion gates are recorded in the
+[September comparison](../2026-09/2026-09-07-cuda-mtp-off-phase-comparison.md).
+
+## CUDA CTA-local KPAR extension (September 7)
+
+Candidate registry v12 adds `fused_kpar`, a single-CTA publication of the same
+exact-KB arithmetic tree as global KPAR. The candidate's immutable physical
+width is 16 or 32 columns; native thread capacity bounds KB, without rounding.
+Generated dispatch, source-policy export, the strong production GEMM trainer,
+compiler-resource admission, adapter authentication, and emitted family identity
+share this distinction. Grouped DP4A retains its economical row-sharing kernel
+and the exact inherited partition count; tensor-core schedule resolution uses
+the same ordered-tree identity. The profiler surrogate models per-CTA ownership
+and shared/global partial storage from runtime geometry.
+
+The September 7 user decision permits refreshing measured exact entries without
+refitting Auto. The CUDA analyzer's `--retain-auto-policy-json` and
+`--retain-auto-include` composition authenticates the installed base and retains
+its generic/grouped program verbatim. New exact entries require the complete
+strong M1 timing corpus, production-shape filtering, resource evidence, grouped
+byte equivalence and matched real-model correctness/economy gates. The retained
+generic certificate does not certify changed exact choices. Current staging
+and measurements are recorded in the
+[September 7 comparison](../2026-09/2026-09-07-cuda-mtp-off-phase-comparison.md).
+
+The pre-install admission audit found literal fused KB counts were still
+eligible for generic fitting, unlike their global counterparts. Registry v13
+adds shape-resolved fused recipes through the existing formula mechanism;
+projection v2 marks both physical literal-count families exact-only. Generic
+emission now rejects literal counts instead of introducing hidden small-K
+guards. The 4,591 pre-existing candidate identities remain unchanged; the 768
+new virtual recipes obtain costs only from directly measured exact launches.
+The focused regressions cover formula/physical profiler identity, exact-overlay
+precedence, and Python/C++ count agreement below and beyond measured geometry.
+See the September 7 comparison's defect journal for the reproducer and receipts.
+
 ## 1. Executive Decision
 
 Llaminar will use one shared, numerics-constrained dispatch compiler for CPU,
@@ -3181,6 +3227,10 @@ until the one-command path owns a focused regression for each item.
 
 | Defect | Observed failure | Required automatic behavior |
 |---|---|---|
+| Nsight SI byte display units interpreted as IEC (September 7) | A fused CTA with 896 bytes of dynamic shared memory appeared as 917.504 bytes after parsing `0.896 Kbyte/block`. | Export explicit base units, interpret retained decimal prefixes correctly, and offline-reparse authenticated complete batch reports before fitting or mixing generations. Preserve physical commands, timing, raw-report digests and stream attribution; publish a distinct collector generation with the original evidence retained. Missing optional spill counters must not be treated as zero. |
+| Repeated immutable-key hashing in fit-result IPC (September 7) | A ten-second, 489-sample profile of the live CUDA fitter attributed 97.34% of active sample weight to generated dataclass hashes while the parent reconstructed worker result sets. | Cache the unchanged structural hash on immutable runtime/domain keys, exclude process-salted caches from pickle, and prove fresh/warmed equality, replacement, cross-hash-seed reconstruction and a focused economy comparison. This does not change candidate costs, timing evidence or policy identity; the already-running fit retains its imported implementation. |
+| Repeated runtime-key serialization in prediction inventories (September 7) | The live surrogate worker reaches `json.dumps` from `_profiler_prediction_point_inventory` while publishing point-aligned prediction caches. Each candidate repeats its geometry's identical runtime mapping and JSON fields. | Reuse canonical runtime/string fragments within each inventory, retain the original length-framed JSON bytes and SHA-256 exactly, and gate every changed runtime discriminator plus escaped/Unicode strings against the independent historical encoder. Measure host-only inventory construction; do not change predictions, evidence or the imported live fitter. |
+| Repeated fitting-label construction across CV placements (September 7) | A ten-second/489-sample live CV-worker profile attributes 53.58% to `_materialize_compact_fold_costs`, including 27.40% in dataclass replacement/construction. Feature and boundary alternatives repeatedly rebuild identical prior/teacher views. | Retain one active immutable source/held-group/prediction scope per scorer lane and reuse each requested influence view within it. Prove all view values and CPU CV decisions equal the uncached implementation, invalidate on every label-changing input, and keep mutable diagnostic mappings unretained. Cache no measured decisions and add no GPU allocation. |
 | Print-only dry run | `--dry-run` printed a plausible transaction that later failed after route probes because no plan-to-source relationship had been authenticated. | A real preflight must load and authenticate every recipe artifact before any route probe, scorer fit, timing launch, or profiler launch. Dry-run output must say whether it is merely rendering commands or running authenticated preflight. |
 | Historical/current plan role conflation | A historical `full-expansion-r17.5pct.round1` plan was accidentally passed as a current v10 generic-refinement plan and changed the expected route manifest. | The recipe schema must store historical lineage plans separately from current additive refinement plans. Cross-role duplicates are invalid. |
 | Duplicate split provenance | The v9 source split was supplied both as the primary source split and as an additional historical split. | Preflight must reject duplicate split digests and report both recipe fields before fitting. |

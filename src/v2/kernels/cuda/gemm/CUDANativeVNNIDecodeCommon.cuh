@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include "kernels/common/DeviceNativeVNNIContributionContract.h"
+#include "kernels/common/NativeVNNIPackedBits.h"
 
 #include <cstdint>
 #include <iterator>
@@ -297,10 +298,17 @@ namespace llaminar2::cuda_native_vnni
         return static_cast<int8_t>((packed >> shift) & 0xFFu);
     }
 
-    // Per-word IQ4_NL decode: processes both low and high nibbles of a raw uint32
-    // word in one call, producing 2 packed int8 outputs (8 decoded values total).
-    // Computes PRMT selectors and blend masks directly from the raw word using
-    // efficient bitwise packing, avoiding per-nibble extraction overhead.
+    /**
+     * @brief Expand eight IQ4_NL codes with register-only byte permutations.
+     * @param w Four packed bytes, each containing a low and high nibble code.
+     * @param out_lo Four signed lookup bytes for the low nibble of each input byte.
+     * @param out_hi Four signed lookup bytes for the high nibble of each input byte.
+     *
+     * IQ4_NL and IQ4_XS share this physical lookup after weight preparation.
+     * Decode adjacent nibbles before separating their destinations: this avoids
+     * building two packed selectors and two byte-wise blend masks. No scale,
+     * integer dot product, or FP32 reduction arithmetic changes at any caller.
+     */
     __device__ __forceinline__ void iq4nl_decode_word(
         uint32_t w, uint32_t &out_lo, uint32_t &out_hi)
     {
@@ -309,34 +317,23 @@ namespace llaminar2::cuda_native_vnni
         constexpr uint32_t kLut2 = 0x26190d01u; // vals[8..11]
         constexpr uint32_t kLut3 = 0x71594535u; // vals[12..15]
 
-        // --- Low nibbles: bits [3:0] of each byte ---
-        // Pack 4 low nibbles from 8-bit stride to 4-bit PRMT selector:
-        //   byte0[3:0] → sel[3:0], byte1[3:0] → sel[7:4],
-        //   byte2[3:0] → sel[11:8], byte3[3:0] → sel[15:12]
-        const uint32_t w_lo = w & 0x0F0F0F0Fu;
-        const uint32_t lo_merged = (w_lo | (w_lo >> 4)) & 0x00FF00FFu;
-        const uint32_t sel_lo = (lo_merged | (lo_merged >> 8)) & 0xFFFFu;
+        // __byte_perm indexes eight source bytes with each selector's low
+        // three bits. Look up both halves of the sixteen-entry table, then
+        // use each code's bit 3 to choose the corresponding result byte.
+        // 0x3210 preserves positions; OR-ing 4 selects the upper table half.
+        const uint32_t halves = 0x32103210u | ((w >> 1) & 0x44444444u);
+        const uint32_t first = __byte_perm(
+            __byte_perm(kLut0, kLut1, w),
+            __byte_perm(kLut2, kLut3, w), halves);
+        const uint32_t last = __byte_perm(
+            __byte_perm(kLut0, kLut1, w >> 16),
+            __byte_perm(kLut2, kLut3, w >> 16), halves >> 16);
 
-        // --- High nibbles: bits [7:4] of each byte ---
-        const uint32_t w_hi = (w >> 4) & 0x0F0F0F0Fu;
-        const uint32_t hi_merged = (w_hi | (w_hi >> 4)) & 0x00FF00FFu;
-        const uint32_t sel_hi = (hi_merged | (hi_merged >> 8)) & 0xFFFFu;
-
-        // PRMT lookups from both LUT halves
-        const uint32_t lo_from_lo = __byte_perm(kLut0, kLut1, sel_lo);
-        const uint32_t lo_from_hi = __byte_perm(kLut2, kLut3, sel_lo);
-        const uint32_t hi_from_lo = __byte_perm(kLut0, kLut1, sel_hi);
-        const uint32_t hi_from_hi = __byte_perm(kLut2, kLut3, sel_hi);
-
-        // Blend masks from bit 3 of each nibble (bit3==1 means index >= 8)
-        const uint32_t mask_lo = __vsub4(0u, (w >> 3) & 0x01010101u);
-        const uint32_t mask_hi = __vsub4(0u, (w >> 7) & 0x01010101u);
-
-        // Blend: (from_hi & mask) | (from_lo & ~mask) via LOP3 truth table 0xE4
-        asm("lop3.b32 %0, %1, %2, %3, 0xE4;"
-            : "=r"(out_lo) : "r"(lo_from_hi), "r"(lo_from_lo), "r"(mask_lo));
-        asm("lop3.b32 %0, %1, %2, %3, 0xE4;"
-            : "=r"(out_hi) : "r"(hi_from_hi), "r"(hi_from_lo), "r"(mask_hi));
+        // The two intermediate words hold codes [0..3] and [4..7] in nibble
+        // order. Gather even codes into low bytes and odd codes into high
+        // bytes, retaining the packed dp4a operand layout used by all callers.
+        out_lo = __byte_perm(first, last, 0x6420);
+        out_hi = __byte_perm(first, last, 0x7531);
     }
 
     __device__ __forceinline__ uint32_t centered_sub_16(uint32_t value)
@@ -452,6 +449,16 @@ namespace llaminar2::cuda_native_vnni
         return CodebookTraits<CODEBOOK_ID>::payload_bytes;
     }
 
+    /**
+     * @brief Decode one compact source block into eight exact INT8 words.
+     * @tparam CODEBOOK_ID Compile-time source payload/centering contract.
+     * @param payload One immutable 32-element native block.
+     * @param packed_groups Receives the original element order, four per word.
+     *
+     * Bit-plane expansion is integer-only. Scaling and signed/asymmetric
+     * contribution arithmetic remain in the shared FP32 contract, so every
+     * ordinary, grouped, and tensor-core caller observes the same values.
+     */
     template <uint8_t CODEBOOK_ID>
     __device__ __forceinline__ void decode_groups(const uint8_t *payload, int32_t (&packed_groups)[8])
     {
@@ -495,10 +502,12 @@ namespace llaminar2::cuda_native_vnni
                 const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
                 const uint32_t hb4_lo = (qh_bits >> (g * 4)) & 0xFu;
                 const uint32_t hb4_hi = (qh_bits >> (g * 4 + 16)) & 0xFu;
-                const uint32_t hb_lo = ((hb4_lo & 1u) << 4) | ((hb4_lo & 2u) << 11) |
-                                       ((hb4_lo & 4u) << 18) | ((hb4_lo & 8u) << 25);
-                const uint32_t hb_hi = ((hb4_hi & 1u) << 4) | ((hb4_hi & 2u) << 11) |
-                                       ((hb4_hi & 4u) << 18) | ((hb4_hi & 8u) << 25);
+                // The same integer high plane serves Q5_0, Q5_1 and Q5_K.
+                // Signed centering and all FP32 contribution order stay below.
+                const uint32_t hb_lo =
+                    native_vnni::q5HighBitsToPackedBytes(hb4_lo);
+                const uint32_t hb_hi =
+                    native_vnni::q5HighBitsToPackedBytes(hb4_hi);
                 uint32_t lo = (raw & 0x0F0F0F0Fu) | hb_lo;
                 uint32_t hi = ((raw >> 4) & 0x0F0F0F0Fu) | hb_hi;
                 if constexpr (CODEBOOK_ID == 6)

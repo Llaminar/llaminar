@@ -11,6 +11,9 @@
  * The CUTLASS INT8 GEMM, row-wise quantization, output scaling, and
  * blockwise dp4a GEMM kernels have been removed — NativeVNNI is now
  * the sole CUDA GEMM execution path.
+ * Activation scales remain row-major. Optional INT32 block sums are stored
+ * block-major so a tensor-core consumer reads adjacent rows coalescently;
+ * the producer writes that single representation directly, without a transpose.
  */
 
 #include <cuda_runtime.h>
@@ -96,12 +99,19 @@ namespace
      *
      * Each 32-element K-block is independently quantized, so K-parallelism is trivial.
      * Critical for decode (M=1) where a 1D grid wastes 81 of 82 SMs.
+     *
+     * @param A_fp32 Row-major FP32 input, M by K.
+     * @param A_int8 Row-major INT8 output with the same extent.
+     * @param scales_A_blockwise Row-major FP32 scales, M by K/32.
+     * @param sums_A_blockwise Optional block-major INT32 sums, K/32 by M.
+     * @param M Positive physical row count, also the sum buffer's row pitch.
+     * @param K Positive input width divisible by 32.
      */
     __global__ void quantize_activations_blockwise_kernel(
         const float *__restrict__ A_fp32,       // [M × K]
         int8_t *__restrict__ A_int8,            // [M × K] output
         float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
-        int32_t *__restrict__ sums_A_blockwise, // [M × num_blocks] optional quantized activation sums
+        int32_t *__restrict__ sums_A_blockwise, // [num_blocks × M] optional quantized activation sums
         int M, int K)
     {
         const int row = blockIdx.y;
@@ -156,7 +166,10 @@ namespace
                 for (int mask = 16; mask > 0; mask >>= 1)
                     sum_q += __shfl_xor_sync(0xFFFFFFFF, sum_q, mask);
                 if (lane == 0)
-                    sums_A_blockwise[row * num_blocks + b] = sum_q;
+                    // The captured producer and consumer share the same M.
+                    // Adjacent consumer rows now share cache sectors instead
+                    // of gathering one distant sum from each activation row.
+                    sums_A_blockwise[b * M + row] = sum_q;
             }
         }
     }
@@ -238,6 +251,15 @@ extern "C"
 
     /**
      * @brief Quantize FP32 activations and also emit per-32-block INT8 sums.
+     * @param d_A_fp32 Row-major M by K source.
+     * @param d_A_int8 Row-major quantized destination.
+     * @param d_scales_A_blockwise Row-major M by K/32 FP32 scale destination.
+     * @param d_sums_A_blockwise Optional block-major K/32 by M INT32 destination.
+     * @param M Captured physical row count; consumers must use this same pitch.
+     * @param K Input width divisible by 32.
+     * @param cuda_device_id Owning CUDA device ordinal.
+     * @param stream Exact caller-owned execution stream.
+     * @return True after successfully submitting the quantization kernel.
      */
     bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
         const float *d_A_fp32,

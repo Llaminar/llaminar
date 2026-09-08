@@ -155,44 +155,7 @@ endif()
 # v2_orchestration_*, v2_e2e_*) become no-ops, keeping the Release build lean.
 # The add_v2_test() and discover_v2_parity_tests() functions also early-return
 # for non-perf tests when this flag is set.
-if(V2_PERF_TESTS_ONLY)
-    message(STATUS "V2 Tests: Release mode — building performance tests only")
-
-    # Override add_executable: only pass through v2_perf_* targets
-    macro(add_executable target)
-        if("${target}" MATCHES "^v2_perf_")
-            _add_executable(${target} ${ARGN})
-        endif()
-    endmacro()
-
-    # Skip target_link_libraries for non-existent (skipped) targets
-    macro(target_link_libraries target)
-        if(TARGET ${target})
-            _target_link_libraries(${target} ${ARGN})
-        endif()
-    endmacro()
-
-    # Skip target_include_directories for non-existent (skipped) targets
-    macro(target_include_directories target)
-        if(TARGET ${target})
-            _target_include_directories(${target} ${ARGN})
-        endif()
-    endmacro()
-
-    # Skip target_compile_definitions for non-existent (skipped) targets
-    macro(target_compile_definitions target)
-        if(TARGET ${target})
-            _target_compile_definitions(${target} ${ARGN})
-        endif()
-    endmacro()
-
-    # Skip target_compile_options for non-existent (skipped) targets
-    macro(target_compile_options target)
-        if(TARGET ${target})
-            _target_compile_options(${target} ${ARGN})
-        endif()
-    endmacro()
-endif()
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/V2TestTargetSelection.cmake)
 
 # =============================================================================
 # Test Model Fetching Fixture
@@ -1331,6 +1294,49 @@ add_v2_test(V2_Unit_NativeVNNIDispatchCache
     COMMAND $<TARGET_FILE:v2_test_native_vnni_dispatch_cache>
     LABELS "V2;Unit;Kernels;NativeVNNI;MTP;Dispatch;Cache;Regression"
     MPI_PROCS 1
+)
+
+# Compact NativeVNNI bit arithmetic is exhaustively tested without a backend.
+add_executable(v2_test_native_vnni_packed_bits
+    unit/kernels/Test__NativeVNNIPackedBits.cpp)
+target_include_directories(v2_test_native_vnni_packed_bits PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
+target_link_libraries(v2_test_native_vnni_packed_bits PRIVATE
+    GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_NativeVNNIPackedBits
+    COMMAND $<TARGET_FILE:v2_test_native_vnni_packed_bits>
+    LABELS "V2;Unit;Kernels;NativeVNNI;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+# Operand-staging admission is header-only; Unit never loads a CUDA runtime.
+add_executable(v2_test_cuda_prefill_staging_schedule
+    unit/kernels/Test__CUDAPrefillStagingSchedule.cpp)
+target_include_directories(v2_test_cuda_prefill_staging_schedule PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
+target_link_libraries(v2_test_cuda_prefill_staging_schedule PRIVATE
+    GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CUDAPrefillStagingSchedule
+    COMMAND $<TARGET_FILE:v2_test_cuda_prefill_staging_schedule>
+    LABELS "V2;Unit;Kernels;NativeVNNI;Prefill;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+# CTA-local fold planning is header-only and owns no backend state.
+add_executable(v2_test_cuda_canonical_kpart_fold
+    unit/kernels/Test__CUDACanonicalKpartFold.cpp)
+target_include_directories(v2_test_cuda_canonical_kpart_fold PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
+target_link_libraries(v2_test_cuda_canonical_kpart_fold PRIVATE
+    GTest::gtest GTest::gtest_main)
+target_compile_features(v2_test_cuda_canonical_kpart_fold PRIVATE cxx_std_20)
+add_v2_test(V2_Unit_CUDACanonicalKpartFold
+    COMMAND $<TARGET_FILE:v2_test_cuda_canonical_kpart_fold>
+    LABELS "V2;Unit;Kernels;NativeVNNI;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: Logger - thread-safe stderr/file tee behavior
@@ -2499,6 +2505,17 @@ add_test(NAME V2_Unit_AcceleratorBuildTypeFlags
 )
 set_tests_properties(V2_Unit_AcceleratorBuildTypeFlags PROPERTIES
     LABELS "V2;Unit;BuildSystem;CUDA;ROCm;Performance;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_TestTargetSelection
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_test_target_selection.py
+            --cmake ${CMAKE_COMMAND}
+            --ninja ${CMAKE_MAKE_PROGRAM}
+)
+set_tests_properties(V2_Unit_TestTargetSelection PROPERTIES
+    LABELS "V2;Unit;BuildSystem;Regression"
     TIMEOUT 30
 )
 
@@ -6628,6 +6645,97 @@ add_v2_test(V2_Integration_CUDAConcurrentMergedWorkspaceAllFormats
     NO_MODELS
     TIMEOUT 60
 )
+if(HAVE_CUDA)
+    add_executable(v2_integration_cuda_iq4_packed_lookup
+        integration/kernels/cuda/Test__CUDAIQ4PackedLookup.cu)
+    target_link_libraries(v2_integration_cuda_iq4_packed_lookup PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Integration_CUDAIQ4PackedLookup
+        COMMAND $<TARGET_FILE:v2_integration_cuda_iq4_packed_lookup>
+        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;IQ4_NL;IQ4_XS;NativeVNNI;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 30
+    )
+    add_executable(v2_integration_cuda_canonical_kpart_fold
+        integration/kernels/cuda/Test__CUDACanonicalKpartFold.cpp)
+    target_link_libraries(v2_integration_cuda_canonical_kpart_fold PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Integration_CUDACanonicalKpartFoldAllCodebooks
+        COMMAND $<TARGET_FILE:v2_integration_cuda_canonical_kpart_fold>
+        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;AllFormats;NativeVNNI;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 60
+    )
+    add_executable(v2_integration_cuda_native_vnni_wide
+        integration/kernels/cuda/Test__CUDANativeVNNIWide.cpp)
+    target_link_libraries(v2_integration_cuda_native_vnni_wide PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Integration_CUDANativeVNNIWideAllCodebooks
+        COMMAND $<TARGET_FILE:v2_integration_cuda_native_vnni_wide>
+        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;AllFormats;NativeVNNI;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 60
+    )
+    add_executable(v2_integration_cuda_activation_block_sums
+        integration/kernels/cuda/Test__CUDAActivationBlockSums.cpp)
+    target_link_libraries(v2_integration_cuda_activation_block_sums PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Integration_CUDAActivationBlockSums
+        COMMAND $<TARGET_FILE:v2_integration_cuda_activation_block_sums>
+        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;ActivationQuantization;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 60
+    )
+    if(V2_PERF_TESTS_ONLY)
+        set(V2_CUDA_TINY_PROJECTION_TARGET v2_perf_cuda_tiny_projection)
+    else()
+        set(V2_CUDA_TINY_PROJECTION_TARGET v2_integration_cuda_tiny_projection)
+    endif()
+    add_executable(v2_integration_cuda_native_vnni_prefill_staging
+        integration/kernels/cuda/Test__CUDANativeVNNIPrefillStaging.cpp)
+    target_link_libraries(v2_integration_cuda_native_vnni_prefill_staging PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    target_include_directories(v2_integration_cuda_native_vnni_prefill_staging PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2)
+    add_v2_test(V2_Integration_CUDANativeVNNIPrefillStaging
+        COMMAND $<TARGET_FILE:v2_integration_cuda_native_vnni_prefill_staging>
+        LABELS "V2;Integration;CUDA;GEMM;Prefill;GraphCapture;ByteExact;NativeVNNI;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 90
+    )
+    add_executable(${V2_CUDA_TINY_PROJECTION_TARGET}
+        integration/kernels/cuda/Test__CUDATinyProjection.cu)
+    target_link_libraries(${V2_CUDA_TINY_PROJECTION_TARGET} PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Integration_CUDATinyProjectionAllFloatingFormats
+        COMMAND $<TARGET_FILE:${V2_CUDA_TINY_PROJECTION_TARGET}>
+                --gtest_filter=CUDATinyProjection.CapturedAllFloatingFormatsMatchLegacyTree:CUDATinyProjection.ProductionPrefillUsesSharedOperandsWithoutChangingTree
+        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;AllFormats;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 60
+    )
+    add_v2_test(V2_Integration_CUDATinyProjectionSharedOperands
+        COMMAND $<TARGET_FILE:${V2_CUDA_TINY_PROJECTION_TARGET}>
+                --gtest_filter=CUDATinyProjection.SharedOperandCandidatesMatchLegacyTree
+        LABELS "V2;Integration;CUDA;GEMM;GraphCapture;ByteExact;AllFormats;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 60
+    )
+    add_v2_test(V2_Perf_CUDATinyProjection
+        COMMAND $<TARGET_FILE:${V2_CUDA_TINY_PROJECTION_TARGET}>
+                --gtest_filter=*CUDATinyProjectionEconomy.*:CUDATinyProjectionGeometryEconomy.*
+        LABELS "V2;Performance;CUDA;GEMM"
+        MPI_PROCS 1
+        NO_MODELS
+    )
+endif()
 add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristic
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
             --gtest_filter=Test__CUDAGemmParity.NativeVNNIPrefillHeuristicAllFormatsMatchesCPU
@@ -6639,8 +6747,9 @@ add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillBucketMInvariantAllFormats
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
             --gtest_filter=Test__CUDAGemmParity.NativeVNNIPrefillActiveRowsAllFormatsByteExactAcrossMAndBuckets
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;GEMM;Prefill;GraphBucket;BatchInvariant;MTotality;AllFormats;NativeVNNI;ByteExact;Regression"
+    LABELS "V2;Integration;CUDA;GEMM;Prefill;GraphBucket;GraphCapture;BatchInvariant;MTotality;AllFormats;NativeVNNI;ByteExact;Regression"
     MPI_PROCS 1
+    NO_MODELS
 )
 add_v2_test(V2_Integration_CUDA_NativeVNNI_Qwen36AsymmetricTileOverlay
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
@@ -7009,6 +7118,16 @@ add_v2_test(V2_Integration_CUDAFlashAttentionParity
     LABELS "V2;Integration;CUDA;Parity;Attention;FlashAttention;FlashDecode;GQA;FP32;CosineSimilarity"
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
 )
+add_v2_test(V2_Integration_CUDAFlashDecodeEmptyPrefix
+    COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
+            --gtest_filter=Test__CUDAFlashAttentionParity.CapturedEmptyDecodePrefixAllNativeKVFormats
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;Attention;FlashDecode;GraphCapture;KVCache;FP32;FP16;Q8_1;TurboQuant;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    RESOURCE_LOCK cuda_gpu_0
+    TIMEOUT 30
+)
 add_v2_test(V2_Integration_CUDAFlashAttentionQ81Qwen2Prefill
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
             --gtest_filter=Test__CUDAFlashAttentionParity.FlashAttn2_Q81KV_Qwen2PrefillParity
@@ -7019,24 +7138,30 @@ add_v2_test(V2_Integration_CUDAFlashAttentionQ81Qwen2Prefill
 )
 add_v2_test(V2_Integration_CUDAFlashAttentionContextParallelByteExact
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
-            --gtest_filter=Test__CUDAFlashAttentionParity.FA2FixedContextSequenceAndParallelCapturedTransactionsAreByteExact:Test__CUDAFlashAttentionParity.ComputeTensor_DeviceAdaptiveCapturedReplayCrossesRegimesByteExact
+            --gtest_filter=Test__CUDAFlashAttentionParity.FA2FixedContextSequenceAndParallelCapturedTransactionsAreByteExact:Test__CUDAFlashAttentionParity.ComputeTensor_DeviceAdaptiveCapturedReplayCrossesRegimesByteExact:Test__CUDAFlashAttentionParity.FA2QueryPartitions_AllHeadDimsAndTPMappingsAreByteExact:Test__CUDAFlashAttentionParity.FA2VectorKVAlignmentFailsBeforeSubmission
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;Attention;FlashAttention;ContextParallel;GraphCapture;BatchInvariant;ByteExact;AllNativeFormats;FP16;FP32;256K;Regression"
     MPI_PROCS 1
+    NO_MODELS
+    RESOURCE_LOCK cuda_gpu_0
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_Attention
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
-            --gtest_filter=Test__CUDAFlashAttentionParity.CapturedAppendThenAttention_*Qwen36LocalTP*RoPEOnReadRowsMatchSerialDecode
+            --gtest_filter=Test__CUDAFlashAttentionParity.CapturedAppendThenAttention_*
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;LocalTP;FP16;Q8_1;Regression"
+    LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;LocalTP;FP16;Q8_1;TurboQuant;Regression"
     MPI_PROCS 1
+    NO_MODELS
+    RESOURCE_LOCK cuda_gpu_0
 )
 add_v2_test(V2_Integration_CUDARequestBatchResidentKVAttention
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
-            --gtest_filter=Test__CUDAFlashAttentionParity.CapturedRequestBatchFP16CacheMatchesIsolatedPrefillByteExact
+            --gtest_filter=Test__CUDAFlashAttentionParity.CapturedGrowingRequestBatchFP16CacheMatchesIsolatedPrefillByteExact:Test__CUDAFlashAttentionParity.CapturedGrowingMaximumSmallRequestBatchAllStandardKVFormatsMatchesSerialDecodeRows:Test__CUDAFlashAttentionParity.CapturedVariableLengthRequestBatchFP16DecodeMatchesSerialByteExact:Test__CUDAFlashAttentionParity.AttentionStagePrefillRequiresAndUsesDeviceOwnedCache
             --gtest_brief=1
-    LABELS "V2;Integration;CUDA;MTP;Attention;KVCache;GraphCapture;DeviceResident;RequestBatch;BatchInvariant;DecodeEquivalent;FP16;Regression"
+    LABELS "V2;Integration;CUDA;MTP;Attention;KVCache;GraphCapture;DeviceResident;RequestBatch;BatchInvariant;DecodeEquivalent;FP16;FP32;BF16;Q8_1;Regression"
     MPI_PROCS 1
+    NO_MODELS
+    RESOURCE_LOCK cuda_gpu_0
 )
 
 # Test: CUDA attention padding parity for Phase 6 prefill bucket safety
@@ -7073,6 +7198,7 @@ add_v2_test(V2_Integration_GDNPrefillDecodeEquivalence_CUDA
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;GatedDeltaNet;Prefill;DecodeEquivalent;ByteExact;MTotality;FP32;Regression"
     MPI_PROCS 1
+    NO_MODELS
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRecurrence
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
@@ -7080,6 +7206,7 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRecurrence
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;Recurrence;StatePublication;FP32;Regression"
     MPI_PROCS 1
+    NO_MODELS
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_ShortConv
     COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
@@ -7094,6 +7221,7 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNRequestBatch
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;ShortConv;RequestBatch;VariableLength;StatePublication;FP32;Regression"
     MPI_PROCS 1
+    NO_MODELS
 )
 endif()
 
@@ -7225,6 +7353,7 @@ if(HAVE_CUDA)
                 --gtest_filter=CUDANativeVNNIGemmPerf.CompilerResources_AllCodebooksAndCandidates
         LABELS "V2;Integration;CUDA;GEMM;Prefill;NativeVNNI;AllFormats;Resources;Occupancy;NoSpills;Regression"
         MPI_PROCS 1
+        NO_MODELS
     )
     if(TEST V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks)
         set_tests_properties(
@@ -9340,6 +9469,22 @@ add_v2_test(V2_Unit_DeviceGenerationController
     COMMAND $<TARGET_FILE:v2_test_device_generation_controller>
     LABELS "V2;Unit;MTP;SpecDecode;DeviceResident;Lifecycle;ByteExact"
     MPI_PROCS 1
+)
+
+# Ordinary publication is a pure host/device arithmetic contract. Its Unit
+# executable must not initialize or link a GPU backend to check that contract.
+add_executable(v2_test_ordinary_generation_controller
+    unit/mtp/Test__OrdinaryGenerationController.cpp)
+target_compile_features(v2_test_ordinary_generation_controller PRIVATE cxx_std_20)
+target_include_directories(v2_test_ordinary_generation_controller PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
+target_link_libraries(v2_test_ordinary_generation_controller PRIVATE
+    GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_OrdinaryGenerationController
+    COMMAND $<TARGET_FILE:v2_test_ordinary_generation_controller>
+    LABELS "V2;Unit;GenerationController;DeviceResident;Lifecycle;ByteExact"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: vLLM-style MTP verifier graph-forward execution routing
@@ -13820,20 +13965,26 @@ if(HAVE_ROCM)
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;Attention;FlashAttention;ContextParallel;GraphCapture;DeviceResident;BatchInvariant;ByteExact;AllFormats;FP32;FP16;BF16;Q8_1;GQA;TP;256K;Regression;gfx906"
         MPI_PROCS 1
+        NO_MODELS
+        RESOURCE_LOCK rocm_gpu_0
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_Attention
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
-                --gtest_filter=Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_*Qwen36LocalTP*RoPEOnReadRowsMatchSerialDecode
+                --gtest_filter=Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_*
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;LocalTP;FP16;Q8_1;Regression;gfx906"
         MPI_PROCS 1
+        NO_MODELS
+        RESOURCE_LOCK rocm_gpu_0
     )
     add_v2_test(V2_Integration_ROCmRequestBatchResidentKVAttention
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
-                --gtest_filter=Test__ROCmFlashAttentionParity.CapturedRequestBatchAllStandardKVFormatsMatchIsolatedPrefillBytes:Test__ROCmFlashAttentionParity.CapturedVariableLengthRequestBatchAllStandardKVFormatsDecodeMatchesSerialByteExact
+                --gtest_filter=Test__ROCmFlashAttentionParity.CapturedGrowingRequestBatchAllNativeKVFormatsMatchesSerialDecodeRows:Test__ROCmFlashAttentionParity.CapturedVariableLengthRequestBatchAllNativeKVFormatsDecodeMatchesSerialByteExact
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;Attention;KVCache;GraphCapture;DeviceResident;RequestBatch;BatchInvariant;DecodeEquivalent;AllFormats;FP32;FP16;BF16;Q8_1;Regression;gfx906"
         MPI_PROCS 1
+        NO_MODELS
+        RESOURCE_LOCK rocm_gpu_0
     )
     add_v2_test(V2_Integration_ROCmFlashAttentionExternalMask
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity> --gtest_filter=Test__ROCmFlashAttentionParity.RocblasPrefillHonorsExternalMask
@@ -15713,6 +15864,7 @@ message(STATUS "V2 Tests: Added CachedGraphReplayExecution integration tests")
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_gpu_sampling_kernels
         integration/backends/Test__GPUSamplingKernels.cpp
+        integration/backends/Test__OrdinaryDeviceGeneration.cpp
     )
     target_include_directories(v2_integration_gpu_sampling_kernels PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -15767,7 +15919,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
         add_v2_test(V2_Integration_DeviceGenerationController_CUDA
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*CUDA:*DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures*CUDA:*DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered*CUDA
+                --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*CUDA:*DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures*CUDA:*DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered*CUDA:*OrdinaryDeviceGeneration*CUDA
             LABELS "V2;Integration;Backend;GPU;CUDA;MTP;GenerationController;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
             NO_MODELS
@@ -15801,7 +15953,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
         add_v2_test(V2_Integration_DeviceGenerationController_ROCm
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*ROCm:*DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures*ROCm:*DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered*ROCm
+                --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*ROCm:*DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures*ROCm:*DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered*ROCm:*OrdinaryDeviceGeneration*ROCm
             LABELS "V2;Integration;Backend;GPU;ROCm;MTP;GenerationController;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
             NO_MODELS
@@ -17292,6 +17444,9 @@ if(HAVE_CUDA)
     V2_Integration_CUDA_NCCLRetainedParentFragmentReentry
     V2_Integration_CUDA_TPCanonicalRankOrderGraphCapture
     V2_Integration_GDNLinkedStateReassembly_CUDA
+    V2_Integration_GDNPrefillDecodeEquivalence_CUDA
+    V2_Integration_GroupedVerifierRows_CUDA_GDNRecurrence
+    V2_Integration_GroupedVerifierRows_CUDA_GDNRequestBatch
     V2_Integration_GPUDeviceContext_CUDA
     V2_Integration_CUDA_ExpertTierWeightKernels
     V2_Integration_CUDA_MoEOverlayEpoch
@@ -17299,6 +17454,19 @@ if(HAVE_CUDA)
     V2_Integration_CUDAGraphCapture
     V2_Integration_CUDAConcurrentPrefillBiasGraphCapture
     V2_Integration_CUDAConcurrentMergedWorkspaceAllFormats
+    V2_Integration_CUDATinyProjectionAllFloatingFormats
+    V2_Integration_CUDATinyProjectionSharedOperands
+    V2_Integration_CUDANativeVNNIPrefillStaging
+    V2_Integration_CUDANativeVNNIWideAllCodebooks
+    V2_Integration_CUDACanonicalKpartFoldAllCodebooks
+    V2_Integration_CUDAIQ4PackedLookup
+    V2_Integration_CUDAActivationBlockSums
+    V2_Integration_CUDAFlashAttentionContextParallelByteExact
+    V2_Integration_CUDAFlashDecodeEmptyPrefix
+    V2_Integration_GroupedVerifierRows_CUDA_Attention
+    V2_Integration_CUDARequestBatchResidentKVAttention
+    V2_Integration_CUDA_NativeVNNI_PrefillBucketMInvariantAllFormats
+    V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks
     V2_Integration_CUDAFloatingExpertRetirement
     V2_Integration_CUDA_MoEAsyncHistogramCaptureLifecycle
     V2_Integration_CUDA_MoEDeviceResidentGroupedVerifierPublication
@@ -17317,6 +17485,9 @@ if(HAVE_ROCM)
     V2_Integration_GroupedVerifierRows_ROCm_Qwen35GDNOutputProjection
     V2_Integration_ROCm_TPCapturedEpochTransactionGraphCapture
     V2_Integration_ROCm_MappedLinearMemcpyParentGraphCapture
+    V2_Integration_ROCmFlashAttentionContextParallelByteExact
+    V2_Integration_GroupedVerifierRows_ROCm_Attention
+    V2_Integration_ROCmRequestBatchResidentKVAttention
     V2_Integration_GDNLinkedStateReassembly_ROCm
     V2_Integration_GPUDeviceContext_ROCm
     V2_Integration_RCCLRuntimeGenerationRetirement

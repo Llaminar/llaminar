@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import statistics
 import subprocess
 import sys
@@ -67,6 +68,7 @@ from native_vnni_dispatch.cuda_shape_resolved import (  # noqa: E402
     _nearest_factor_kb,
     project_cuda_shape_resolved_candidates,
     resolve_cuda_formula_kb,
+    resolve_cuda_concrete_candidate_id,
 )
 from native_vnni_dispatch.exact_oracle import (  # noqa: E402
     build_exact_winner,
@@ -325,6 +327,52 @@ def candidate_rows_for_aliases(
 
 
 class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
+    def test_immutable_policy_keys_memoize_only_their_structural_hash(self) -> None:
+        """Repeated set joins must reuse hashes without changing value identity."""
+        row = observation(shape_group="key-hash", n=384, k=1024)
+        for key in (runtime_key(row), generic_domain(row)):
+            with self.subTest(key=type(key).__name__):
+                fields = dataclasses.fields(key)
+                expected = hash(tuple(getattr(key, field.name) for field in fields))
+                self.assertEqual(hash(key), expected)
+                self.assertEqual(key.__dict__["_cached_structural_hash"], expected)
+                with mock.patch("native_vnni_dispatch.corpus.fields",
+                                side_effect=AssertionError("warmed hash recomputed fields")):
+                    self.assertEqual(hash(key), expected)
+                    self.assertIn(key, {key})
+                self.assertNotIn("_cached_structural_hash", dataclasses.asdict(key))
+                self.assertNotIn("_cached_structural_hash", key.__getstate__())
+                copied = pickle.loads(pickle.dumps(key))
+                self.assertNotIn("_cached_structural_hash", copied.__dict__)
+                self.assertEqual(copied, key)
+                self.assertEqual(hash(copied), expected)
+                changed = dataclasses.replace(key, architecture_class="another-architecture")
+                self.assertNotEqual(changed, key)
+                self.assertEqual(hash(changed), hash(tuple(
+                    getattr(changed, field.name) for field in fields)))
+
+    def test_immutable_policy_key_pickle_rehashes_under_another_python_seed(self) -> None:
+        """A memoized salted hash may never cross spawn/interpreter boundaries."""
+        row = observation(shape_group="key-hash-seed", n=384, k=1024)
+        keys = (runtime_key(row), generic_domain(row))
+        for key in keys:
+            hash(key)
+        encoded = pickle.dumps({key: "present" for key in keys}).hex()
+        program = (
+            "import dataclasses,pickle,sys; "
+            "values=pickle.loads(bytes.fromhex(sys.argv[1])); "
+            "assert len(values)==2; "
+            "assert all(values[dataclasses.replace(key)]=='present' for key in values); "
+            "assert all(hash(key)==hash(tuple(getattr(key,f.name) for f in "
+            "dataclasses.fields(key))) for key in values)"
+        )
+        for seed in ("1", "8675309"):
+            with self.subTest(seed=seed):
+                subprocess.run([sys.executable, "-c", program, encoded], check=True,
+                    capture_output=True, text=True, timeout=30,
+                    env={**os.environ, "PYTHONHASHSEED": seed,
+                         "PYTHONPATH": str(KERNEL_PERF_ROOT)})
+
     def test_parallel_policy_serializer_preserves_legacy_digest(self) -> None:
         """Fast publication must retain the historical policy artifact bytes."""
 
@@ -1947,7 +1995,15 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             },
             {1, 2, 4, 8},
         )
-        self.assertEqual(len(cuda.entries), 4495)
+        self.assertEqual(len(cuda.entries), 4495 + 64 + 32 + 2 * (40 * 4 * 2 + 64))
+        self.assertEqual(
+            {
+                (entry.config_json["tile_n"], entry.config_json["exact_kb"])
+                for entry in cuda.entries
+                if entry.config_json.get("family") == "fused_kpar"
+            },
+            {(columns, kb) for columns in (16, 32) for kb in range(1, 1024 // columns + 1)},
+        )
         self.assertEqual(
             {
                 entry.config_json["n_block_chunks"]
@@ -1972,7 +2028,7 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 == "canonical_target_blocks"
                 for entry in cuda.entries
             ),
-            1120,
+            9 * 40 * 4,
         )
         self.assertTrue(candidate_registry_digest().startswith("sha256:"))
         with self.assertRaisesRegex(ValueError, "not an explicit candidate"):
@@ -2097,6 +2153,85 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             generic_candidates,
         )
         self.assertNotIn(concrete_id, generic_candidates)
+
+    def test_fused_cuda_formula_inventory_is_total_and_physically_admitted(self) -> None:
+        """Every recipe resolves to a registered CTA even below measured K.
+
+        The exact bridge never clamps a concrete count. Geometry dependence is
+        explicit in the nominal policy and resolves before physical dispatch.
+        """
+
+        registry = cuda_native_vnni_gemv_registry()
+        formulas = [entry for entry in registry.entries
+                    if entry.config_json.get("family") == "fused_kpar_formula"]
+        self.assertEqual(len(formulas), 2 * (40 * 4 * 2 + 64))
+        for formula in formulas:
+            for n in (1, 15, 16, 31, 32, 193, 1024, 248320, 1048576):
+                for k in (32, 64, 96, 128, 992, 1024, 1056, 2016, 2048, 2080, 2656, 1048576):
+                    kb = resolve_cuda_formula_kb(formula, n, k)
+                    physical = registry.resolve(resolve_cuda_concrete_candidate_id(formula, n, k))
+                    config = physical.config_json
+                    self.assertEqual(config["family"], "fused_kpar")
+                    self.assertEqual(config["exact_kb"], kb)
+                    self.assertGreater(kb, 0)
+                    self.assertLessEqual(kb, k // 32)
+                    self.assertLessEqual(kb * int(config["tile_n"]), 1024)
+                    self.assertNotIn("ordered_kpart_partials", physical.prepared_resources)
+
+    def test_fused_cuda_generic_rules_require_shape_resolved_evidence(self) -> None:
+        """Literal CTA partition counts cannot own unseen smaller K values.
+
+        Every fused formula must retain its concrete timing and output witness.
+        Exact overlays still name that physical launch; generic costs instead
+        name a total formula with the CTA-specific partition capacity.
+        """
+
+        registry = cuda_native_vnni_gemv_registry()
+        for columns in (16, 32):
+            with self.subTest(columns=columns):
+                physical = registry.resolve(
+                    f"cuda.nvnni.decode.fast_m1.fused_kpar.tn{columns}.cpt1.kb8"
+                )
+                concrete = dataclasses.replace(
+                    observation(
+                        candidate=physical.candidate_id,
+                        family=physical.candidate_family,
+                        n=192, k=256, m=1,
+                        mode=ExecutionMode.GRAPH_CAPTURED,
+                        contract=SemanticContract.FAST,
+                    ),
+                    backend=Backend.CUDA,
+                    prepared_family_id=format_spec("Q4_0").prepared_family("cuda"),
+                    packing_abi=format_spec("Q4_0").packing_abi("cuda"),
+                    runtime_codebook_id=format_spec("Q4_0").runtime_codebook("cuda"),
+                    observed_candidate_id=physical.candidate_id,
+                    config_json=physical.config_json,
+                    candidate_policy_hash=physical.candidate_policy_hash(),
+                    arithmetic_fingerprint=physical.arithmetic_fingerprint,
+                )
+                projected = project_cuda_shape_resolved_candidates((concrete,))
+                self.assertFalse(projected.observations[0].generic_eligible)
+                formula_id = (
+                    f"cuda.nvnni.decode.fast_m1.fused_kpar_formula.tn{columns}.cpt1.bpp1"
+                )
+                formulas = [row for row in projected if row.candidate_id == formula_id]
+                self.assertEqual(len(formulas), 1)
+                witness = formulas[0]
+                witness.validate()
+                self.assertEqual(witness.effective_candidate_id, physical.candidate_id)
+                self.assertEqual(witness.observed_candidate_id, physical.candidate_id)
+                self.assertEqual(witness.timing_sample_hash, concrete.timing_sample_hash)
+                self.assertEqual(
+                    next(iter(build_exact_winners(projected).values())).candidate_id,
+                    physical.candidate_id,
+                )
+                candidates = {
+                    cost.candidate_id
+                    for costs in build_candidate_point_costs(projected).values()
+                    for cost in costs
+                }
+                self.assertNotIn(physical.candidate_id, candidates)
+                self.assertIn(formula_id, candidates)
 
     def test_shape_resolved_cuda_aliases_share_registry_config_storage(self) -> None:
         """Formula projection must not allocate one config mapping per alias."""
@@ -5024,6 +5159,58 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 parallel_cache[request_key][point],
                 float(request_index),
             )
+
+    def test_prediction_inventory_reuses_exact_runtime_json_fragments(self) -> None:
+        """Every runtime discriminator survives amortized canonical serialization."""
+
+        base = runtime_key(observation())
+        mutations = {
+            "backend": Backend.CUDA,
+            "architecture_class": 'arch-"\\\n\u2603',
+            "semantic_contract": SemanticContract.FAST,
+            "operation_kind": "operation-\t\u00e9",
+            "bundle_signature": "bundle-\r\ud800",
+            "projection_n_vector": (33, 65),
+            "prepared_family_id": "another-prepared-family",
+            "packing_abi": "another-packing-abi",
+            "runtime_codebook_id": base.runtime_codebook_id + 1,
+            "execution_mode": ExecutionMode.EAGER,
+            "m": base.m + 1,
+            "aggregate_n": base.aggregate_n + 1,
+            "k": base.k + 1,
+            "launch_k_tiles": base.launch_k_tiles + 1,
+        }
+        self.assertEqual(set(mutations), {field.name for field in dataclasses.fields(base)})
+        keys = (base, *(dataclasses.replace(base, **{name: value})
+                        for name, value in mutations.items()))
+        names = ("", 'escaped-"\\\n', "unicode-\u2603-\ud800")
+        points = frozenset((key, shape, candidate)
+                           for key in keys for shape in names for candidate in names)
+        expected = hashlib.sha256()
+        for key, shape, candidate in sorted(points):
+            # Independent historical encoder: do not build the oracle with the
+            # fragment implementation whose byte identity is being verified.
+            encoded = json.dumps({
+                "runtime_key": segmented_policy._runtime_key_mapping(key),
+                "shape_group_id": shape,
+                "candidate_id": candidate,
+            }, sort_keys=True, separators=(",", ":")).encode()
+            expected.update(len(encoded).to_bytes(8, byteorder="little"))
+            expected.update(encoded)
+        segmented_policy._profiler_prediction_point_inventory.cache_clear()
+        with mock.patch.object(segmented_policy, "_runtime_key_mapping",
+                               wraps=segmented_policy._runtime_key_mapping) as mapping, \
+             mock.patch.object(type(base), "__lt__",
+                               side_effect=AssertionError("inventory used slow dataclass ordering")):
+            actual = segmented_policy._profiler_prediction_point_inventory(points)
+        self.assertEqual(actual.points, tuple(sorted(points)))
+        self.assertEqual(actual.digest, "sha256:" + expected.hexdigest())
+        self.assertEqual(mapping.call_count, len(keys),
+                         "candidate aliases must not re-encode their runtime key")
+        empty = segmented_policy._profiler_prediction_point_inventory(frozenset())
+        self.assertEqual(empty.points, ())
+        self.assertEqual(empty.digest, "sha256:" + hashlib.sha256().hexdigest())
+        segmented_policy._profiler_prediction_point_inventory.cache_clear()
 
     def test_memmap_teacher_totality_is_vectorized_and_exact(self) -> None:
         """Batched memmap checks reject missing and non-finite predictions."""

@@ -1168,11 +1168,14 @@ namespace llaminar2
     /**
      * @brief Publish one fragment-local IF condition from persistent device state.
      *
-     * A non-zero word admits the complete captured fragment. This deliberately
-     * treats fatal sentinel values as true as well: the fragment owning that
-     * state must execute and publish its precise terminal diagnostic rather
-     * than allowing the parent to skip a poisoned lifecycle edge.
+     * The compile-time polarity preserves the original non-zero predicate's
+     * instructions. Zero selects an ordinary prefill entry directly from the
+     * controller's pending-row word; it needs neither an inverted device flag
+     * nor a host shadow. For non-zero predicates, fatal sentinels remain true
+     * so the owning fragment can publish its precise terminal diagnostic.
+     * @tparam NonZero Whether a non-zero word admits the complete fragment.
      */
+    template <bool NonZero>
     __global__ void updateDeviceControlledFragmentCondition(
         cudaGraphConditionalHandle handle,
         const uint32_t *condition_word)
@@ -1181,7 +1184,7 @@ namespace llaminar2
             return;
         cudaGraphSetConditional(
             handle,
-            condition_word && *condition_word != 0u ? 1u : 0u);
+            condition_word && ((*condition_word != 0u) == NonZero) ? 1u : 0u);
     }
 
     /**
@@ -1296,8 +1299,10 @@ namespace llaminar2
                 &condition_arg,
                 &condition_word_arg};
             cudaKernelNodeParams condition_params{};
-            condition_params.func = reinterpret_cast<void *>(
-                updateDeviceControlledFragmentCondition);
+            condition_params.func = fragment.execution ==
+                    DeviceControlledLoopFragmentExecution::IfDeviceWordZero
+                ? reinterpret_cast<void *>(updateDeviceControlledFragmentCondition<false>)
+                : reinterpret_cast<void *>(updateDeviceControlledFragmentCondition<true>);
             condition_params.gridDim = dim3(1, 1, 1);
             condition_params.blockDim = dim3(1, 1, 1);
             condition_params.sharedMemBytes = 0;
@@ -2034,12 +2039,7 @@ namespace llaminar2
             if (!appended.succeeded())
                 return fail(appended.operation, appended.error);
             transaction_tail = appended.tail;
-            conditional_fragment_count +=
-                fragment.execution ==
-                        DeviceControlledLoopFragmentExecution::
-                            IfDeviceWordNonZero
-                    ? 1u
-                    : 0u;
+            conditional_fragment_count += isDeviceWordConditional(fragment.execution) ? 1u : 0u;
         }
 
         size_t count = 0;
@@ -2454,6 +2454,7 @@ namespace llaminar2
         return snapshot;
     }
 
+    /** @copydoc IGPUGraphCapture::buildDeviceControlledWhileLoop */
     bool CUDAGraphCapture::buildDeviceControlledWhileLoop(
         std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
         const DeviceControlledLoopPredicate &predicate)
@@ -2479,13 +2480,15 @@ namespace llaminar2
 
         size_t transaction_node_count = 0;
         std::vector<const CUDAGraphCapture *> validated_fragments;
-        validated_fragments.reserve(ordered_body_fragments.size());
+        const size_t fragment_count = ordered_body_fragments.size();
+        validated_fragments.reserve(fragment_count);
+        // Validate the complete program before replacing an existing graph.
+        // Every fragment lies behind the same request-health admission edge.
         for (size_t fragment_index = 0;
-             fragment_index < ordered_body_fragments.size();
+             fragment_index < fragment_count;
              ++fragment_index)
         {
-            const DeviceControlledLoopFragment &fragment =
-                ordered_body_fragments[fragment_index];
+            const DeviceControlledLoopFragment &fragment = ordered_body_fragments[fragment_index];
             const auto *cuda_fragment =
                 dynamic_cast<const CUDAGraphCapture *>(fragment.capture);
             if (!fragment.valid() || !cuda_fragment || cuda_fragment == this ||
@@ -2587,8 +2590,8 @@ namespace llaminar2
         error = cudaGraphAddKernelNode(
             &initial_predicate_node,
             graph_,
-            /*dependencies=*/nullptr,
-            /*numDependencies=*/0,
+            nullptr,
+            0,
             &predicate_params);
         if (error != cudaSuccess)
             return fail("cudaGraphAddKernelNode(initial loop predicate)", error);
@@ -2637,11 +2640,7 @@ namespace llaminar2
             if (!appended.succeeded())
                 return fail(appended.operation, appended.error);
             transaction_tail = appended.tail;
-            conditional_fragment_count +=
-                fragment.execution ==
-                DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero
-                    ? 1u
-                    : 0u;
+            conditional_fragment_count += isDeviceWordConditional(fragment.execution) ? 1u : 0u;
         }
 
         cudaGraphNode_t predicate_node = nullptr;
@@ -2789,9 +2788,7 @@ namespace llaminar2
             {
                 if (selector_region_started)
                     selector_region_closed = true;
-                if (fragment.execution ==
-                    DeviceControlledLoopFragmentExecution::
-                        IfDeviceWordNonZero)
+                if (isDeviceWordConditional(fragment.execution))
                 {
                     ++device_word_fragment_count;
                 }

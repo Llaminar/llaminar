@@ -5,7 +5,8 @@
  * The benchmark invokes the same exported entrypoints used by production graph
  * construction. Device buffers, stream, and timing events are persistent; the
  * timed region contains only recurrence launches. M=1 measures ordinary decode,
- * while M={2,4,8,16} compares one grouped verifier launch with the equivalent
+ * The captured M=1 lane times retained GPU work without per-launch host tax.
+ * M={2,4,8,16} compares one grouped verifier launch with the equivalent
  * sequence of scalar launches. The M=425 fixture isolates the exact Qwen 3.6
  * long-prefill geometry for latency and Nsight attachment. Correctness and
  * graph replay are certified by the CUDA GDN integration suite; this file owns
@@ -228,6 +229,53 @@ namespace
                    static_cast<double>(iterations);
         }
 
+        /**
+         * @brief Measure a retained M1 launch chain, independently of host enqueue.
+         * @return Median unprofiled per-step latency in microseconds.
+         *
+         * The fixture's zero state is a recurrence fixed point, so repeated
+         * launches execute the same operations and addresses. Integration
+         * tests separately authenticate nonzero state and every output byte.
+         * Capture, allocation, warmup and result synchronization are untimed.
+         */
+        double timeCapturedScalarUs()
+        {
+            /** @brief Release this test's captured topology before its buffers. */
+            struct GraphOwner
+            {
+                cudaGraph_t graph = nullptr;
+                cudaGraphExec_t executable = nullptr;
+                /** @brief Retire the executable before its graph definition. */
+                ~GraphOwner()
+                {
+                    if (executable) (void)cudaGraphExecDestroy(executable);
+                    if (graph) (void)cudaGraphDestroy(graph);
+                }
+            } graph;
+            constexpr int steps = 128;
+            checkCuda(cudaStreamBeginCapture(timing.stream, cudaStreamCaptureModeThreadLocal),
+                      "cudaStreamBeginCapture(GDN economy)");
+            for (int step = 0; step < steps; ++step)
+                launchScalar(0, scalar_state.get());
+            checkCuda(cudaStreamEndCapture(timing.stream, &graph.graph),
+                      "cudaStreamEndCapture(GDN economy)");
+            checkCuda(cudaGraphInstantiate(&graph.executable, graph.graph, 0),
+                      "cudaGraphInstantiate(GDN economy)");
+            std::array<double, 20> samples{};
+            for (int round = -5; round < static_cast<int>(samples.size()); ++round)
+            {
+                checkCuda(cudaEventRecord(timing.start, timing.stream), "record graph start");
+                checkCuda(cudaGraphLaunch(graph.executable, timing.stream), "launch GDN graph");
+                checkCuda(cudaEventRecord(timing.stop, timing.stream), "record graph stop");
+                checkCuda(cudaEventSynchronize(timing.stop), "observe GDN graph timing");
+                float ms = 0.0f;
+                checkCuda(cudaEventElapsedTime(&ms, timing.start, timing.stop), "read GDN graph timing");
+                if (round >= 0) samples[round] = ms * 1000.0 / steps;
+            }
+            std::sort(samples.begin(), samples.end());
+            return (samples[9] + samples[10]) / 2.0;
+        }
+
         CudaDeviceSelection device;
         CudaTimingContext timing;
         DeviceFloatBuffer q;
@@ -411,6 +459,19 @@ TEST(Perf__CUDAGatedDeltaNetVerifierRows, M1Decode)
     EXPECT_LT(
         average_us,
         positiveEnv("LLAMINAR_CUDA_GDN_M1_MAX_US", 25.0));
+}
+
+/** @brief Expose captured M1 economics without conflating host submission cost. */
+TEST(Perf__CUDAGatedDeltaNetVerifierRows, M1CapturedDecode)
+{
+    GdnBenchmarkFixture fixture;
+    const double median_us = fixture.timeCapturedScalarUs();
+    std::cout << std::fixed << std::setprecision(3)
+              << "backend,case,M,heads,d_k,d_v,median_us\n"
+              << "cuda,gdn_captured,1," << GdnBenchmarkFixture::kHeads << ','
+              << GdnBenchmarkFixture::kKeyWidth << ','
+              << GdnBenchmarkFixture::kValueWidth << ',' << median_us << '\n';
+    EXPECT_GT(median_us, 0.0);
 }
 
 /**

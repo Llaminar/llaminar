@@ -29,7 +29,7 @@ from concurrent.futures import (
     as_completed,
     wait as wait_for_futures,
 )
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from fractions import Fraction
 from functools import cached_property, lru_cache
@@ -187,18 +187,34 @@ def _profiler_prediction_point_inventory(
     never be interpreted against a different point order.
     """
 
-    ordered = tuple(sorted(points))
+    ordered = tuple(sorted(points, key=_profiler_prediction_point_sort_key))
     digest = hashlib.sha256()
+    runtime_fragments: dict[RuntimeKey, bytes] = {}
+    string_fragments: dict[str, bytes] = {}
     for runtime_key, shape_group_id, candidate_id in ordered:
-        encoded = json.dumps(
-            {
-                "runtime_key": _runtime_key_mapping(runtime_key),
-                "shape_group_id": shape_group_id,
-                "candidate_id": candidate_id,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+        runtime_fragment = runtime_fragments.get(runtime_key)
+        if runtime_fragment is None:
+            runtime_fragment = json.dumps(
+                _runtime_key_mapping(runtime_key),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            runtime_fragments[runtime_key] = runtime_fragment
+        candidate_fragment = string_fragments.get(candidate_id)
+        if candidate_fragment is None:
+            candidate_fragment = json.dumps(candidate_id).encode()
+            string_fragments[candidate_id] = candidate_fragment
+        shape_fragment = string_fragments.get(shape_group_id)
+        if shape_fragment is None:
+            shape_fragment = json.dumps(shape_group_id).encode()
+            string_fragments[shape_group_id] = shape_fragment
+        # These are the historical sort_keys=True field order and delimiters.
+        # Every value still comes from the standard JSON encoder, including
+        # escaping, Unicode and surrogate handling. Reuse only complete encoded
+        # values; never interpolate an unescaped candidate or geometry name.
+        encoded = b"".join((b'{"candidate_id":', candidate_fragment,
+                            b',"runtime_key":', runtime_fragment,
+                            b',"shape_group_id":', shape_fragment, b"}"))
         digest.update(len(encoded).to_bytes(8, byteorder="little"))
         digest.update(encoded)
     return _ProfilerPredictionPointInventory(
@@ -1686,8 +1702,8 @@ def _runtime_key_mapping(key: RuntimeKey) -> dict[str, object]:
     }
 
 
-def _profiler_prediction_sort_key(
-    item: tuple[ProfilerPredictionPoint, float | None],
+def _profiler_prediction_point_sort_key(
+    point: ProfilerPredictionPoint,
 ) -> tuple[object, ...]:
     """Return a cheap canonical order for one profiler prediction row.
 
@@ -1700,7 +1716,7 @@ def _profiler_prediction_sort_key(
     canonical order while avoiding that dataclass comparison hot spot.
     """
 
-    (runtime_key, shape_group_id, candidate_id), _prediction = item
+    runtime_key, shape_group_id, candidate_id = point
     return (
         runtime_key.backend.value,
         runtime_key.architecture_class,
@@ -5201,6 +5217,99 @@ def _materialize_compact_fold_costs(
     return tuple((*training, *held_out))
 
 
+@dataclass(frozen=True, eq=False)
+class _CompactFoldLabelScope:
+    """Own the exact immutable inputs of a lane's fitting-label views.
+
+    Identity checks avoid hashing or comparing a million-row cost matrix.
+    Strong references prevent object-ID reuse, and the held-out set remains a
+    value check because it determines which rows may receive training priors.
+    Capture the surface's storage identities as well: rebinding a diagnostic
+    surface object must not preserve labels derived from its former storage.
+    Feature axes, tree budgets and threshold placement do not change labels.
+    """
+
+    costs: tuple[CandidatePointCost, ...]
+    predictions: ProfilerPredictionSurface
+    inventory: _ProfilerPredictionPointInventory
+    values: np.ndarray
+    held_out_groups: frozenset[str]
+
+    def matches(self, task: _CompactFoldTask) -> bool:
+        """Reject every input change capable of changing materialized labels."""
+
+        return (
+            self.costs is task.costs
+            and self.predictions is task.profiler_predictions
+            and self.inventory is self.predictions.inventory
+            and self.values is self.predictions.values
+            and self.held_out_groups == task.held_out_groups
+        )
+
+
+class _CompactFoldCostViews:
+    """Retain one immutable fold's label variants in one scorer lane.
+
+    The bound is one tuple per demanded non-measured profiler influence, not
+    one tuple per feature/placement task or a cache of all previously visited
+    domains. Only read-only production prediction surfaces can be retained;
+    mutable diagnostic mappings must be read anew. No tree, choice, measured
+    regret, or GPU allocation is cached here. A lane is used by at most one
+    executor task at a time, so it needs no cross-thread cache lock.
+    """
+
+    def __init__(self) -> None:
+        """Start without retaining any cost matrix or prediction mapping."""
+
+        self._scope: _CompactFoldLabelScope | None = None
+        self._views: dict[ProfilerInfluence, tuple[CandidatePointCost, ...]] = {}
+
+    @property
+    def retained_view_count(self) -> int:
+        """Expose the bounded live view count for lifecycle regressions."""
+
+        return len(self._views)
+
+    def clear(self) -> None:
+        """Release all lane-owned labels and their immutable source owners."""
+
+        self._views.clear()
+        self._scope = None
+
+    def materialize(self, task: _CompactFoldTask) -> tuple[CandidatePointCost, ...]:
+        """Reuse only identical label inputs; never reuse a CV decision.
+
+        Measured-only tasks already own their canonical tuple and require no
+        construction. Their interleaving must not evict the informed variants
+        of the same fold before the next feature/placement alternative.
+        """
+
+        if task.profiler_influence == ProfilerInfluence.MEASURED_ONLY:
+            return task.costs
+        predictions = task.profiler_predictions
+        if not isinstance(predictions, ProfilerPredictionSurface):
+            self.clear()
+            return _materialize_compact_fold_costs(task)
+        if predictions.values.size and predictions.values.flags.writeable:
+            self.clear()
+            raise RuntimeError("compact CV label cache requires read-only predictions")
+        if self._scope is None or not self._scope.matches(task):
+            self.clear()
+            self._scope = _CompactFoldLabelScope(
+                costs=task.costs,
+                predictions=predictions,
+                inventory=predictions.inventory,
+                values=predictions.values,
+                held_out_groups=task.held_out_groups,
+            )
+        influence = task.profiler_influence
+        if influence not in self._views:
+            # Publication happens only after the complete tuple is built. An
+            # incomplete teacher surface must still fail in the same builder.
+            self._views[influence] = _materialize_compact_fold_costs(task)
+        return self._views[influence]
+
+
 def _cross_validation_cell(
     selected: CandidatePointCost,
     exact: CandidatePointCost,
@@ -5369,6 +5478,8 @@ def _publication_validation_frontier(
 def _evaluate_placement_fold(
     args,
     primary_scorer: NativeVNNILeafPrimaryScorer | None = None,
+    *,
+    compact_cost_views: _CompactFoldCostViews | None = None,
 ) -> _PlacementFoldResult:
     """Fit one fold/placement tree sequence in an isolated worker process."""
 
@@ -5385,7 +5496,11 @@ def _evaluate_placement_fold(
         min_shape_groups_per_leaf,
     ) = _fold_task_components(args)
     if compact_task is not None:
-        costs = _materialize_compact_fold_costs(compact_task)
+        costs = (
+            _materialize_compact_fold_costs(compact_task)
+            if compact_cost_views is None
+            else compact_cost_views.materialize(compact_task)
+        )
     training_costs = [
         cost for cost in costs if cost.shape_group_id not in held_out_groups
     ]
@@ -6881,6 +6996,22 @@ class AcceleratedTaskTiming:
     elapsed_seconds: float
 
 
+@dataclass
+class _AcceleratedScoringLane:
+    """Own one exclusive scorer session and its bounded host label views."""
+
+    scorer: NativeVNNILeafPrimaryScorer
+    compact_cost_views: _CompactFoldCostViews = field(default_factory=_CompactFoldCostViews)
+
+    def close(self) -> None:
+        """Release host views and the scorer after executor tasks have joined."""
+
+        self.compact_cost_views.clear()
+        close = getattr(self.scorer, "close", None)
+        if close is not None:
+            close()
+
+
 def _accelerated_worker(
     spec: PolicyAcceleratorSpec,
     task_kind: str,
@@ -6897,19 +7028,22 @@ def _accelerated_worker(
     """
 
     arm_policy_worker_parent_death_signal(expected_parent_pid)
-    scorers = []
+    lanes: list[_AcceleratedScoringLane] = []
     executor = None
     try:
         lane_count = getattr(spec, "lane_count", 1)
         if lane_count <= 0:
             raise ValueError("policy accelerator lane count must be positive")
-        scorers = [spec.create_scorer() for _lane in range(lane_count)]
+        # Append each owner before creating the next: a later session creation
+        # failure must not strand the sessions that were already initialized.
+        for _lane in range(lane_count):
+            lanes.append(_AcceleratedScoringLane(spec.create_scorer()))
         executor = ThreadPoolExecutor(
             max_workers=lane_count,
             thread_name_prefix=f"native-vnni-{spec.label}",
         )
 
-        def evaluate_task(task_index, scorer):
+        def evaluate_task(task_index, lane):
             """Execute one scheduler item on its lane-owned scorer session."""
 
             started = time.perf_counter()
@@ -6919,7 +7053,8 @@ def _accelerated_worker(
                         original_index,
                         _evaluate_placement_fold(
                             task,
-                            primary_scorer=scorer,
+                            primary_scorer=lane.scorer,
+                            compact_cost_views=lane.compact_cost_views,
                         ),
                     )
                     for original_index, task
@@ -6928,12 +7063,12 @@ def _accelerated_worker(
             elif task_kind == "final":
                 result = _fit_final_domain(
                     _PARALLEL_FINAL_TASKS[task_index],
-                    primary_scorer=scorer,
+                    primary_scorer=lane.scorer,
                 )
             elif task_kind == "final-candidate":
                 result = _fit_accelerated_final_candidate_index(
                     task_index,
-                    scorer,
+                    lane.scorer,
                 )
             else:
                 raise RuntimeError(
@@ -6956,7 +7091,7 @@ def _accelerated_worker(
                 )
             task_index = message[1]
             future = executor.submit(
-                evaluate_task, task_index, scorers[lane_index]
+                evaluate_task, task_index, lanes[lane_index]
             )
             futures[future] = (lane_index, task_index)
 
@@ -6989,10 +7124,8 @@ def _accelerated_worker(
     finally:
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
-        for scorer in scorers:
-            close = getattr(scorer, "close", None)
-            if close is not None:
-                close()
+        for lane in lanes:
+            lane.close()
         connection.close()
 
 

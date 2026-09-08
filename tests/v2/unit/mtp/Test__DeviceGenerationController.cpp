@@ -264,6 +264,42 @@ namespace
 
     TEST(
         Test__DeviceGenerationController,
+        WordPredicatePolarityIsTypedAndPreservedByHostedTickets)
+    {
+        uint32_t word = 0;
+        const auto *capture_identity =
+            reinterpret_cast<const llaminar2::IGPUGraphCapture *>(
+                static_cast<std::uintptr_t>(1));
+        DeviceControlledLoopFragment pending{
+            .name = "pending prefill sample",
+            .capture = capture_identity,
+            .execution = DeviceControlledLoopFragmentExecution::IfDeviceWordZero,
+            .condition_word_device = &word};
+        ASSERT_TRUE(pending.valid());
+        auto consumed = pending;
+        consumed.execution = DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero;
+        ASSERT_TRUE(consumed.valid());
+        EXPECT_FALSE(pending.hasSameExecutionIdentity(consumed));
+        auto incomplete = pending;
+        incomplete.condition_word_device = nullptr;
+        EXPECT_FALSE(incomplete.valid());
+        auto ambiguous = pending;
+        ambiguous.minimum_selector = 0;
+        EXPECT_FALSE(ambiguous.valid());
+
+        for (bool admitted : {false, true})
+        for (bool nonzero : {false, true})
+        {
+            const DeviceControlledLoopTicketSelection ticket{
+                .iteration_admitted = admitted,
+                .conditional_word_nonzero = nonzero};
+            EXPECT_EQ(ticket.selects(pending), admitted && !nonzero);
+            EXPECT_EQ(ticket.selects(consumed), admitted && nonzero);
+        }
+    }
+
+    TEST(
+        Test__DeviceGenerationController,
         SelectorFragmentPolicyRejectsAmbiguousBindingsAndKeysThreshold)
     {
         const auto *capture_identity =
@@ -344,9 +380,9 @@ namespace
     /**
      * @brief Construct an explicit fixed-depth admission policy for one test.
      */
-    DeviceGenerationDepthPolicy fixedDepthPolicy(int depth)
+    DeviceGenerationPolicy fixedDepthPolicy(int depth)
     {
-        return DeviceGenerationDepthPolicy::fixed(depth);
+        return DeviceGenerationPolicy::fixed(depth);
     }
 
     /**
@@ -584,12 +620,12 @@ TEST(Test__DeviceGenerationController,
 TEST(Test__DeviceGenerationController,
      DynamicDispatchTicketPublishesEverySupportedDepthWithoutHostPolicy)
 {
-    DeviceGenerationDepthPolicy policy;
-    policy.mode = DeviceGenerationDepthPolicyMode::Dynamic;
+    DeviceGenerationPolicy policy;
+    policy.mode = DeviceGenerationPolicyMode::Dynamic;
     policy.initial_depth = 1;
     policy.minimum_depth = 1;
     policy.maximum_depth =
-        DeviceGenerationDepthPolicy::kMaximumSupportedDraftDepth;
+        DeviceGenerationPolicy::kMaximumSupportedDraftDepth;
     ASSERT_TRUE(policy.valid());
 
     ControlRow control{};
@@ -649,8 +685,8 @@ TEST(Test__DeviceGenerationController, DynamicPolicyPromotesAndDemotesAcrossEver
 {
     using namespace llaminar2::sampling_math;
 
-    DeviceGenerationDepthPolicy promote_policy;
-    promote_policy.mode = DeviceGenerationDepthPolicyMode::Dynamic;
+    DeviceGenerationPolicy promote_policy;
+    promote_policy.mode = DeviceGenerationPolicyMode::Dynamic;
     promote_policy.initial_depth = 1;
     promote_policy.minimum_depth = 1;
     promote_policy.maximum_depth = 15;
@@ -684,7 +720,7 @@ TEST(Test__DeviceGenerationController, DynamicPolicyPromotesAndDemotesAcrossEver
     EXPECT_EQ(control[kDeviceGenerationControlDepthPromotions], 14);
     EXPECT_EQ(control[kDeviceGenerationControlDepthUpdates], 14);
 
-    DeviceGenerationDepthPolicy demote_policy = promote_policy;
+    DeviceGenerationPolicy demote_policy = promote_policy;
     demote_policy.initial_depth = 15;
     ASSERT_TRUE(initialize_device_generation_control(
         /*max_new_tokens=*/4096,
@@ -714,8 +750,8 @@ TEST(Test__DeviceGenerationController, ObservePolicyCannotMutateActiveGeometry)
 {
     using namespace llaminar2::sampling_math;
 
-    DeviceGenerationDepthPolicy policy;
-    policy.mode = DeviceGenerationDepthPolicyMode::Observe;
+    DeviceGenerationPolicy policy;
+    policy.mode = DeviceGenerationPolicyMode::Observe;
     policy.initial_depth = 4;
     policy.minimum_depth = 1;
     policy.maximum_depth = 15;
@@ -750,8 +786,8 @@ TEST(Test__DeviceGenerationController,
 {
     using namespace llaminar2::sampling_math;
 
-    DeviceGenerationDepthPolicy policy;
-    policy.mode = DeviceGenerationDepthPolicyMode::Dynamic;
+    DeviceGenerationPolicy policy;
+    policy.mode = DeviceGenerationPolicyMode::Dynamic;
     policy.initial_depth = 2;
     policy.minimum_depth = 1;
     policy.maximum_depth = 4;
@@ -833,8 +869,8 @@ TEST(Test__DeviceGenerationController, InvalidPolicyAndSelectorFailHard)
     using namespace llaminar2::sampling_math;
 
     ControlRow control{};
-    const DeviceGenerationDepthPolicy invalid_policy =
-        DeviceGenerationDepthPolicy::fixed(0);
+    const DeviceGenerationPolicy invalid_policy =
+        DeviceGenerationPolicy::fixed(0);
     EXPECT_FALSE(initialize_device_generation_control(
         /*max_new_tokens=*/8,
         /*response_capacity=*/8,

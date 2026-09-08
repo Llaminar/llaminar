@@ -14,6 +14,8 @@
  *   - Explicit wavefront reductions via DPP
  *   - NO WMMA/Matrix Cores - pure VALU implementation
  * - Flash Decoding: Split-K parallelism for single-token decode
+ *   - Ordinary and grouped rows share the same ordered parallel reduction,
+ *     including deterministic mode; there is no serial-only policy branch.
  *
  * MI50 Optimization Strategy:
  *   1. Maximize LDS utilization (64KB per CU)
@@ -1657,8 +1659,8 @@ namespace
      * @brief Reproduce the production scalar ROCm decode policy on device.
      *
      * Grouped rows can own unequal live KV lengths even though graph capture
-     * requires one fixed grid and block shape.  This helper mirrors
-     * The phase kernel launches the maximum physical geometry, then only the
+     * requires one fixed grid and block shape. The phase kernel launches the
+     * maximum physical geometry, then only the
      * split and wavefront prefix selected from the live device-owned KV length
      * participates. Consequently ordinary M=1 and grouped verifier rows retain
      * the same KV partition, wavefront merge order, and reduction order while
@@ -1670,7 +1672,6 @@ namespace
         int n_heads,
         int num_cus,
         int max_launch_splits,
-        bool deterministic,
         bool forced_splits_present,
         int forced_splits,
         bool forced_tpb_present,
@@ -1693,9 +1694,7 @@ namespace
          * silently change grouped verifier arithmetic.
          */
         int requested_cap = 8;
-        if (deterministic)
-            requested_cap = 1;
-        else if (kv_len >= 8192)
+        if (kv_len >= 8192)
             requested_cap = 32;
         else if (n_heads <= 8 && kv_len >= 1024)
             requested_cap = 32;
@@ -1806,7 +1805,6 @@ namespace
         FlashDecodeRowMode row_mode,
         int query_rows_per_request,
         int num_cus,
-        bool deterministic,
         bool forced_splits_present,
         int forced_splits,
         bool forced_tpb_present,
@@ -1851,7 +1849,6 @@ namespace
             n_heads,
             num_cus,
             num_splits,
-            deterministic,
             forced_splits_present,
             forced_splits,
             forced_tpb_present,
@@ -2310,7 +2307,6 @@ namespace
         const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
         FlashDecodeRowMode row_mode,
         int num_cus,
-        bool deterministic,
         bool forced_splits_present,
         int forced_splits,
         bool forced_tpb_present,
@@ -2333,7 +2329,6 @@ namespace
                 n_heads,
                 num_cus,
                 num_splits,
-                deterministic,
                 forced_splits_present,
                 forced_splits,
                 forced_tpb_present,
@@ -2811,7 +2806,6 @@ static int launch_decode(
     (void)hipGetDevice(&current_device);
     const int num_cus = getDeviceConfig(current_device).num_cus;
     const auto &rocm_env = llaminar2::debugEnv().rocm;
-    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
     const bool forced_splits_present =
         rocm_env.fa_decode_num_splits_present &&
         rocm_env.fa_decode_num_splits.has_value();
@@ -2844,7 +2838,6 @@ static int launch_decode(
         FlashDecodeRowMode::OrdinaryBatch,
         /*query_rows_per_request=*/1,
         num_cus,
-        deterministic,
         forced_splits_present,
         forced_splits,
         forced_tpb_present,
@@ -2865,7 +2858,6 @@ static int launch_decode(
         device_params,
         FlashDecodeRowMode::OrdinaryBatch,
         num_cus,
-        deterministic,
         forced_splits_present,
         forced_splits,
         forced_tpb_present,
@@ -2945,7 +2937,6 @@ static int launch_grouped_decode(
     }
 
     const auto &rocm_env = llaminar2::debugEnv().rocm;
-    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
     const bool forced_splits_present =
         rocm_env.fa_decode_num_splits_present &&
         rocm_env.fa_decode_num_splits.has_value();
@@ -2994,7 +2985,6 @@ static int launch_grouped_decode(
         ROW_MODE,
         query_rows_per_request,
         num_cus,
-        deterministic,
         forced_splits_present,
         forced_splits,
         forced_tpb_present,
@@ -3028,7 +3018,6 @@ static int launch_grouped_decode(
         device_params,
         ROW_MODE,
         num_cus,
-        deterministic,
         forced_splits_present,
         forced_splits,
         forced_tpb_present,

@@ -1297,6 +1297,15 @@ namespace llaminar2
             AllowHeterogeneousBoundarySegmentation,
             RequireRetainedParentComposition,
             RequireRetainedParentWithConcurrentTicketService,
+            /**
+             * Record independent graph-only sources for a cloning composer.
+             * Native WHILE bodies require this policy: CUDA's shared-timeline
+             * fragments already belong to their final definition and cannot be
+             * transplanted into another graph. The composer must reject source
+             * node kinds that its native conditional body cannot represent.
+             * Only the final parent is instantiated, just as for a timeline.
+             */
+            RequireCloneableParentComposition,
         };
 
         /** @return Whether @p policy materializes one topology-composed parent. */
@@ -1306,7 +1315,8 @@ namespace llaminar2
             return policy ==
                        GraphReplayPlanPolicy::RequireRetainedParentComposition ||
                    policy == GraphReplayPlanPolicy::
-                                 RequireRetainedParentWithConcurrentTicketService;
+                                 RequireRetainedParentWithConcurrentTicketService ||
+                   policy == GraphReplayPlanPolicy::RequireCloneableParentComposition;
         }
 
         /** @return Whether @p policy admits typed CPU service after parent launch. */

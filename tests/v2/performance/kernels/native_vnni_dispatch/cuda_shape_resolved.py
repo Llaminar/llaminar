@@ -22,7 +22,7 @@ from .schema import NativeVNNIObservation, SemanticContract
 
 CUDA_FORMULA_MAX_KB = 256
 CUDA_SHAPE_RESOLVED_PROJECTION_VERSION = (
-    "native-vnni-cuda-shape-resolved-projection-v1"
+    "native-vnni-cuda-shape-resolved-projection-v2"
 )
 
 
@@ -142,7 +142,7 @@ def resolve_cuda_formula_kb(candidate: CandidateSpec, n: int, k: int) -> int:
     """Resolve one reviewed formula to its concrete exact partition count."""
 
     config = candidate.config_json
-    if config.get("family") != "kpar_formula":
+    if config.get("family") not in {"kpar_formula", "fused_kpar_formula"}:
         raise ValueError(f"{candidate.candidate_id} is not a CUDA KB formula")
     if n <= 0 or k <= 0 or k % 32:
         raise ValueError(f"formula dimensions must satisfy N>0 and K%32==0: {n}x{k}")
@@ -196,11 +196,11 @@ def resolve_cuda_concrete_candidate_id(
     """
 
     config = candidate.config_json
-    if config.get("family") != "kpar_formula":
+    if config.get("family") not in {"kpar_formula", "fused_kpar_formula"}:
         return candidate.candidate_id
     kb = resolve_cuda_formula_kb(candidate, n, k)
     return (
-        "cuda.nvnni.decode.fast_m1.kpar."
+        f"cuda.nvnni.decode.fast_m1.{str(config['family']).removesuffix('_formula')}."
         f"tn{int(config['tile_n'])}.cpt{int(config['cpt'])}.kb{kb}"
     )
 
@@ -229,7 +229,7 @@ def project_cuda_shape_resolved_candidates(
             candidate.config_json,
         )
         for candidate in registry.entries
-        if candidate.config_json.get("family") == "kpar_formula"
+        if candidate.config_json.get("family") in {"kpar_formula", "fused_kpar_formula"}
     )
     grouped: dict[RuntimeKey, list] = defaultdict(list)
     for row in rows_in_corpus:
@@ -247,7 +247,7 @@ def project_cuda_shape_resolved_candidates(
         if (
             row.semantic_contract == SemanticContract.FAST
             and row.m == 1
-            and row.config_json.get("family") == "kpar"
+            and row.config_json.get("family") in {"kpar", "fused_kpar"}
         )
         else row
         for row in rows_in_corpus
