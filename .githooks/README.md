@@ -1,119 +1,68 @@
-# Git Hooks for Llaminar
+# Git hooks for Llaminar
 
-This directory contains Git hook templates for the Llaminar project.
+The tracked hooks in this directory are used directly through Git's
+`core.hooksPath`; do not install separate copies in `.git/hooks`.
 
-## Pre-Commit Hook
+## Pre-commit
 
-The pre-commit hook builds the V2 integration and release configurations, then
-runs the local correctness, E2E, and performance gates before allowing a commit.
+Every branch runs exactly the same two suites, in order:
 
-### What It Does
+1. The full `^V2_Unit_` CTest namespace.
+2. The full `^ProductionParityPreflight$` CTest label.
 
-Feature branches run this 7-step suite:
+The hook configures `build_v2_integration` with CUDA/ROCm enabled and the active
+Ninja executable pinned in `CMAKE_MAKE_PROGRAM`. It builds only `v2_unit_gate`
+and `v2_production_parity_preflight_gate`, whose dependencies derive from the
+canonical CMake test registrations. Script-only tests need no executable build;
+shared fixtures are built once. Build and test parallelism is unrestricted,
+with CTest retaining the registered resource locks and timeouts.
 
-1. **Integration build** - Configures and builds `build_v2_integration` with CUDA and ROCm enabled.
-2. **Unit tests** - Runs all `^V2_Unit_` tests in parallel.
-3. **Focused integration tests** - Proves all-format grouped verifier rows are bitwise serial-decode equivalent, CUDA/ROCm tuning certificates compare complete buffers on explicit streams, 256K-plus-tail prefill is M-total on CPU/CUDA/ROCm, and the Qwen3.6 stochastic MTP depth matrix remains green.
-4. **Focused parity baseline** - Runs the model-family parity baseline through `.githooks/run_parity_baseline.sh`.
-5. **Release build** - Configures and builds `build_v2_release` with CUDA and ROCm enabled for E2E tests.
-6. **E2E server integration tests** - Runs CPU, CUDA, ROCm, long-context, and MoE rebalance probes.
-7. **Performance regression benchmarks** - Runs `.githooks/run_benchmark_check.sh`.
+Configuration, compilation, missing tests, or test failures block the commit
+immediately and leave the underlying diagnostics visible. The hook does not
+run numerical model-parity campaigns, broader integration selections, E2E,
+container builds, Release builds, or performance benchmarks. There are no
+branch exceptions or environment switches that add those gates. Their separate
+manual/CI entry points remain available; passing pre-commit is not model-parity,
+HTTP, or performance certification.
 
-On `develop` and `master`, the hook also runs the broader `^V2_Integration_`
-suite after the focused integration gate. The broader sweep excludes `Parity`,
-`RCCL`, `GroupedVerifierRows`, and `LongContextMTotality` because those have
-dedicated gates.
+## Register or re-register
 
-### Installation
-
-```bash
-cp .githooks/pre-commit .git/hooks/pre-commit
-chmod +x .git/hooks/pre-commit
-```
-
-### Usage
-
-The hook runs automatically before every commit:
+Run from the repository root:
 
 ```bash
-git commit -m "Your commit message"
+chmod +x .githooks/pre-commit
+git config --local core.hooksPath .githooks
+git config --show-origin --get core.hooksPath
 ```
 
-If any check fails, the commit is blocked and the hook prints the matching
-manual command for the failed gate.
+This is idempotent and also retains the tracked Git LFS hooks. Old copied
+hooks under `.git/hooks` are not used while this path is selected.
 
-### Containerized E2E Mode
+## Run manually
 
-By default, the pre-commit E2E server suite launches the local Release
-`build_v2_release/llaminar2` executable. To package the Release runtime image
-and run that same E2E suite against the containerized server instead:
+Exercise Git's registered hook without creating a commit:
 
 ```bash
-LLAMINAR_PRECOMMIT_E2E_CONTAINER=1 git commit -m "Your commit message"
+git hook run pre-commit
 ```
 
-Useful overrides:
+After configuring Integration, the equivalent build/test commands are:
 
 ```bash
-LLAMINAR_PRECOMMIT_E2E_CONTAINER=1 \
-LLAMINAR_E2E_CONTAINER_IMAGE=llaminar:precommit \
-git commit -m "Your commit message"
-
-LLAMINAR_PRECOMMIT_E2E_CONTAINER=1 \
-LLAMINAR_PRECOMMIT_E2E_CONTAINER_BUILD=0 \
-LLAMINAR_E2E_CONTAINER_IMAGE=llaminar:local \
-git commit -m "Your commit message"
+cmake --build build_v2_integration --parallel \
+  --target v2_unit_gate v2_production_parity_preflight_gate
+ctest --test-dir build_v2_integration --output-on-failure --parallel \
+  --no-tests=error -R '^V2_Unit_'
+ctest --test-dir build_v2_integration --output-on-failure --parallel \
+  --no-tests=error -L '^ProductionParityPreflight$'
 ```
 
-You can also run the E2E harness directly against a container:
+To bypass pre-commit explicitly for a WIP checkpoint:
 
 ```bash
-scripts/docker/build-runtime-image.sh --tag llaminar:local --cuda-archs 86
-tests/v2/e2e/server/test_server_e2e.sh \
-  --container-image llaminar:local \
-  --backends "cpu,cuda:0,rocm:0"
+git commit --no-verify -m 'WIP: checkpoint'
 ```
 
-### Manual Commands
-
-```bash
-cmake -B build_v2_integration -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration -DHAVE_CUDA=ON -DHAVE_ROCM=ON
-cmake --build build_v2_integration --parallel
-ctest --test-dir build_v2_integration -R "^V2_Unit_" --output-on-failure --parallel
-ctest --test-dir build_v2_integration -R "^V2_Integration_GroupedVerifierRows_" --output-on-failure --parallel
-ctest --test-dir build_v2_integration -R '^V2_Integration_(PrefillGraphCacheLongContextMTotality_(CUDA|ROCm)|PrefillLongContextMTotality_CPU)$' --output-on-failure --parallel
-.githooks/run_parity_baseline.sh build_v2_integration
-
-cmake -B build_v2_release -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVE_CUDA=ON -DHAVE_ROCM=ON
-cmake --build build_v2_release --parallel
-tests/v2/e2e/server/test_server_e2e.sh --binary build_v2_release/llaminar2 --backends "cpu,cuda:0,rocm:0"
-.githooks/run_benchmark_check.sh
-```
-
-### Override
-
-For WIP commits, bypass the hook explicitly:
-
-```bash
-git commit -m "WIP: debugging" --no-verify
-```
-
-Use `--no-verify` only for work in progress. PR merges must pass the gates.
-
-### CI/CD Integration
-
-GitHub Actions runs the same unit, grouped-verifier, full-buffer trainer
-certificate, and long-context prefill M-totality integration commands in the
-builder-image job. Runtime-image jobs
-then run release-container E2E and benchmark gates.
-
-## Future Hooks
-
-Additional hooks can be added here:
-
-- `pre-push` - Run integration tests before pushing.
-- `commit-msg` - Enforce commit message format.
-- `post-merge` - Rebuild after pulling changes.
-
-Git hooks are not installed automatically when cloning a repository, so each
-developer must install them locally.
+Hook command selection and failure propagation are covered by
+`V2_Unit_PreCommitHook`, using command recorders without running real builds,
+models, accelerators, or modifying Git registration.

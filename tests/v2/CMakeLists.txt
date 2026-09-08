@@ -1,5 +1,7 @@
 # Llaminar V2 Test Suite
-# Test categories: unit, integration, e2e, pytorch_parity
+# Canonical registration for Unit, integration, production parity, E2E and
+# performance. Build gates derive dependencies from these same registrations,
+# including executables passed as arguments to script-based test drivers.
 
 # Note: enable_testing() is called in parent CMakeLists.txt (src/v2/CMakeLists.txt)
 
@@ -248,25 +250,31 @@ function(add_v2_test TEST_NAME)
         ${ARGN}                         # Arguments to parse
     )
 
-    # Unit is an architectural boundary, not merely a display label.  Record
-    # every build target behind that boundary while the typed target identity
-    # is still available; the final v2_unit_gate target then builds the exact
-    # CTest-owned inventory without maintaining a second executable list.
+    # Retain target identities before MPI wrapping or Debug path rewriting.
+    # Script drivers may receive their tested executable in a later argument,
+    # so inspecting only COMMAND[0] would leave clean-build gates incomplete.
+    set(V2_TEST_BUILD_TARGETS "")
+    foreach(V2_TEST_COMMAND_ARG IN LISTS ARG_COMMAND)
+        if(V2_TEST_COMMAND_ARG MATCHES "\\$<TARGET_FILE:([^>]+)>")
+            list(APPEND V2_TEST_BUILD_TARGETS "${CMAKE_MATCH_1}")
+        elseif(TARGET "${V2_TEST_COMMAND_ARG}")
+            list(APPEND V2_TEST_BUILD_TARGETS "${V2_TEST_COMMAND_ARG}")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES V2_TEST_BUILD_TARGETS)
+    set_property(GLOBAL PROPERTY
+        "V2_TEST_BUILD_TARGETS_${TEST_NAME}" "${V2_TEST_BUILD_TARGETS}")
+
+    # Unit is an architectural boundary, not merely a display label. Both
+    # script and binary registrations contribute their declared dependencies.
     if("${TEST_NAME}" MATCHES "^V2_Unit_")
         if(NOT "${ARG_LABELS}" MATCHES "Unit")
             message(FATAL_ERROR
                 "Unit test is missing the Unit label: ${TEST_NAME}")
         endif()
-        list(GET ARG_COMMAND 0 V2_UNIT_TEST_COMMAND)
-        set(V2_UNIT_TEST_TARGET "")
-        if(V2_UNIT_TEST_COMMAND MATCHES "\\$<TARGET_FILE:([^>]+)>")
-            set(V2_UNIT_TEST_TARGET "${CMAKE_MATCH_1}")
-        elseif(TARGET "${V2_UNIT_TEST_COMMAND}")
-            set(V2_UNIT_TEST_TARGET "${V2_UNIT_TEST_COMMAND}")
-        endif()
-        if(V2_UNIT_TEST_TARGET)
+        if(V2_TEST_BUILD_TARGETS)
             set_property(GLOBAL APPEND PROPERTY
-                V2_UNIT_GATE_TARGETS "${V2_UNIT_TEST_TARGET}")
+                V2_UNIT_GATE_TARGETS ${V2_TEST_BUILD_TARGETS})
         endif()
     endif()
     
@@ -2660,6 +2668,15 @@ add_test(NAME V2_Unit_ProductionParityCampaigns
 )
 set_tests_properties(V2_Unit_ProductionParityCampaigns PROPERTIES
     LABELS "V2;Unit;Parity;ProductionPath;CampaignFramework;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_PreCommitHook
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_precommit_hook.py
+)
+set_tests_properties(V2_Unit_PreCommitHook PROPERTIES
+    LABELS "V2;Unit;Hooks;Build;Regression"
     TIMEOUT 30
 )
 
@@ -17668,4 +17685,23 @@ if(NOT V2_PERF_TESTS_ONLY)
         message(FATAL_ERROR "The V2 unit gate has no executable targets")
     endif()
     add_custom_target(v2_unit_gate DEPENDS ${V2_UNIT_GATE_TARGETS})
+
+    # Use the final CTest label inventory, not a second hook-owned executable
+    # list. Shared fixtures are built once; only the labeled tests are run.
+    set(V2_PREFLIGHT_GATE_TARGETS "")
+    foreach(V2_CONFIGURED_TEST IN LISTS V2_CONFIGURED_TESTS)
+        get_property(V2_CONFIGURED_TEST_LABELS
+            TEST ${V2_CONFIGURED_TEST} PROPERTY LABELS)
+        if("ProductionParityPreflight" IN_LIST V2_CONFIGURED_TEST_LABELS)
+            get_property(V2_TEST_BUILD_TARGETS GLOBAL PROPERTY
+                "V2_TEST_BUILD_TARGETS_${V2_CONFIGURED_TEST}")
+            list(APPEND V2_PREFLIGHT_GATE_TARGETS ${V2_TEST_BUILD_TARGETS})
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES V2_PREFLIGHT_GATE_TARGETS)
+    if(NOT V2_PREFLIGHT_GATE_TARGETS)
+        message(FATAL_ERROR "The production preflight gate has no executable targets")
+    endif()
+    add_custom_target(v2_production_parity_preflight_gate
+        DEPENDS ${V2_PREFLIGHT_GATE_TARGETS})
 endif()

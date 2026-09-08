@@ -1,6 +1,6 @@
 ---
 name: model-parity-testing
-description: Run, extend, maintain, and diagnose Llaminar V2 real-weight production parity campaigns against the CPU/FP32 PyTorch-Hugging Face reference. Use when changing inference mathematics, graph capture, model wiring, quantization or KV precision, backends/topologies, MoE Static/Dynamic/LLEP behavior or expert placement, MTP depth/control, parity CSVs, campaign discovery, or the 75-minute precommit/CI parity gate.
+description: Run, extend, maintain, and diagnose Llaminar V2 real-weight production parity campaigns against the CPU/FP32 PyTorch-Hugging Face reference. Use when changing inference mathematics, graph capture, model wiring, quantization or KV precision, backends/topologies, MoE Static/Dynamic/LLEP behavior or expert placement, MTP depth/control, parity CSVs, campaign discovery, the model-free precommit prerequisites, or the 75-minute manual/CI parity gate.
 ---
 
 # Model Parity Testing
@@ -87,13 +87,22 @@ admission and is recorded by the combined preflight receipt.
 Run the same prerequisite phases directly when developing their infrastructure:
 
 ```bash
-cmake --build build_v2_integration --parallel --target v2_unit_gate
+cmake --build build_v2_integration --parallel \
+  --target v2_unit_gate v2_production_parity_preflight_gate
 ctest --test-dir build_v2_integration \
   --output-on-failure --parallel --no-tests=error -R '^V2_Unit_'
 ctest --test-dir build_v2_integration \
   --output-on-failure --parallel --no-tests=error \
   -L '^ProductionParityPreflight$'
 ```
+
+Git pre-commit runs only these two complete model-free suites on every branch.
+The hook builds their CMake-owned dependency targets and does not launch
+numerical campaigns, E2E, containers, Release builds, or benchmarks. Register
+the tracked hooks with `git config --local core.hooksPath .githooks`; see
+`.githooks/README.md`. Passing pre-commit is prerequisite evidence, not a
+numerical, HTTP, or performance certificate. Keep heavier manual/CI gates
+separate unless the user explicitly changes that policy.
 
 For development, run the narrow affected backend or precision first. These are
 diagnostic subsets, not the final economy proof.

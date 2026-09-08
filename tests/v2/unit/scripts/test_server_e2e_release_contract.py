@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Prove canonical server E2E entry points use the deployable Release binary."""
+"""Prove canonical server E2E entry points use the deployable Release binary.
+
+E2E is independent of the model-free pre-commit gate. This test protects its
+standalone harness and Release-only CTest registration, not hook membership.
+"""
 
 from __future__ import annotations
 
@@ -26,20 +30,18 @@ def require(text: str, needle: str, owner: pathlib.Path) -> None:
 
 
 def main() -> int:
-    """Validate harness, precommit, and CTest Release ownership."""
+    """Validate standalone harness and CTest Release ownership."""
 
     args = parse_args()
     root = args.repo_root.resolve()
     build_dir = args.build_dir.resolve()
     harness_path = root / "tests/v2/e2e/server/test_server_e2e.sh"
-    precommit_path = root / ".githooks/pre-commit"
     tests_cmake_path = root / "tests/v2/CMakeLists.txt"
     source_cmake_path = root / "src/v2/CMakeLists.txt"
     cache_path = build_dir / "CMakeCache.txt"
     ctest_manifest_path = build_dir / "tests/v2/CTestTestfile.cmake"
 
     harness = harness_path.read_text(encoding="utf-8")
-    precommit = precommit_path.read_text(encoding="utf-8")
     tests_cmake = tests_cmake_path.read_text(encoding="utf-8")
     source_cmake = source_cmake_path.read_text(encoding="utf-8")
 
@@ -58,16 +60,6 @@ def main() -> int:
         harness_path,
     )
 
-    require(
-        precommit,
-        'E2E_SERVER_ARGS=(--binary "$BUILD_V2_RELEASE/llaminar2"',
-        precommit_path,
-    )
-    require(
-        precommit,
-        'LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS="${LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS:-60}"',
-        precommit_path,
-    )
     require(
         tests_cmake,
         'if(CMAKE_BUILD_TYPE STREQUAL "Release")',

@@ -423,6 +423,13 @@ ctest --test-dir build_v2_integration \
   -R '^V2_Integration_StageDumpIntegrity$' --output-on-failure
 ```
 
+The registered pre-commit hook builds only `v2_unit_gate` and
+`v2_production_parity_preflight_gate`, then runs the full Unit namespace and
+`ProductionParityPreflight` label on every branch. It runs no model campaigns,
+E2E, broader integration selections, or benchmarks. Register the tracked hooks
+with `git config --local core.hooksPath .githooks`; see `.githooks/README.md`.
+Those heavier certifications remain separate manual/CI workflows.
+
 Naming conventions:
 
 - `V2_Unit_*` must remain fast and device-free.

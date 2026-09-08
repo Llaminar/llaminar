@@ -239,6 +239,12 @@ still skip when their optional prerequisite is absent.
 
 ## Model-free prerequisite gates
 
+Git pre-commit runs only the complete Unit and ProductionParityPreflight
+prerequisites on every branch. It builds their CMake-owned executable targets,
+not every Integration/Release target, and never launches a model campaign,
+E2E server, container, or benchmark. Registration and manual invocation are in
+`.githooks/README.md`. Numerical and HTTP certification remain separate gates.
+
 Every aggregate campaign run first builds the CMake-owned `v2_unit_gate` target
 and runs the complete `V2_Unit_*` CTest namespace. It then runs the registered
 `ProductionParityPreflight` CTest label. Both phases precede the model-download
@@ -274,7 +280,8 @@ campaign driver.
 Run both phases independently with:
 
 ```bash
-cmake --build build_v2_integration --parallel --target v2_unit_gate
+cmake --build build_v2_integration --parallel \
+  --target v2_unit_gate v2_production_parity_preflight_gate
 ctest --test-dir build_v2_integration \
   --output-on-failure --parallel --no-tests=error -R '^V2_Unit_'
 ctest --test-dir build_v2_integration \
